@@ -1,0 +1,238 @@
+[package]
+name = "flock-prover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apple-silicon-optimized end-to-end prover for Flock (R1CS over GF(2))."
+
+[features]
+# Forwarded to flock-core. See that crate's manifest for semantics.
+hash-count = ["flock-core/hash-count"]
+unsound-challenger = ["flock-core/unsound-challenger"]
+
+[dependencies]
+flock-core = { path = "../flock-core" }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+
+[dev-dependencies]
+# Tests, benches, and examples use the insecure `RandomChallenger`, gated in
+# flock-core behind its `unsound-challenger` feature. Enabling it dev-only makes
+# it available to test/bench/example builds without leaking into normal builds.
+flock-core = { path = "../flock-core", features = ["unsound-challenger"] }
+# Scalar (no ARMv8.2-SHA3) keccak-f[1600] for the native_hash baseline bench.
+keccak = { workspace = true }
+# Software Keccak-256 baseline for keccak_native_chain.
+sha3 = { workspace = true }
+
+[[bench]]
+name = "ntt"
+harness = false
+
+[[bench]]
+name = "pcs_commit"
+harness = false
+
+[[bench]]
+name = "merkle"
+harness = false
+
+[[bench]]
+name = "field"
+harness = false
+
+[[bench]]
+name = "round1"
+harness = false
+
+[[bench]]
+name = "round1_deg4"
+harness = false
+
+[[bench]]
+name = "round2"
+harness = false
+
+[[bench]]
+name = "rounds3plus"
+harness = false
+
+[[bench]]
+name = "e2e_zerocheck"
+harness = false
+
+[[bench]]
+name = "zerocheck_phases"
+harness = false
+
+[[bench]]
+name = "pcs_open"
+harness = false
+
+[[bench]]
+name = "lincheck"
+harness = false
+
+[[bench]]
+name = "keccak_proof"
+harness = false
+
+[[bench]]
+name = "keccak3_proof"
+harness = false
+
+[[bench]]
+name = "keccak3_profiles"
+harness = false
+
+[[bench]]
+name = "keccak3_slim_proof"
+harness = false
+
+[[bench]]
+name = "keccak3_secure_proof"
+harness = false
+
+[[bench]]
+name = "blake3_proof"
+harness = false
+
+[[bench]]
+name = "blake3_lig_vs_bf"
+harness = false
+
+[[bench]]
+name = "blake3_fast_vs_slim"
+harness = false
+
+[[bench]]
+name = "grinding_sha256"
+harness = false
+
+[[bench]]
+name = "keccak3_lig_vs_bf"
+harness = false
+
+[[bench]]
+name = "sha2_lig_vs_bf"
+harness = false
+
+[[bench]]
+name = "blake3_chain_proof"
+harness = false
+
+[[bench]]
+name = "sha2_proof"
+harness = false
+
+[[bench]]
+name = "sha2_chain_proof"
+harness = false
+
+[[bench]]
+name = "sha2_merkle_proof"
+harness = false
+
+[[bench]]
+name = "lincheck_verify"
+harness = false
+
+[[bench]]
+name = "keccak_native_chain"
+harness = false
+
+[[bench]]
+name = "blake3_native_chain"
+harness = false
+
+[[bench]]
+name = "keccak_chain_proof"
+harness = false
+
+[[bench]]
+name = "padded_vs_dense"
+harness = false
+
+[[bench]]
+name = "genwitness_phase"
+harness = false
+
+[[bench]]
+name = "gamma_bake_probe"
+harness = false
+
+[[bench]]
+name = "streaming_fusion_probe"
+harness = false
+
+[[bench]]
+name = "profile_prover"
+harness = false
+
+[[bench]]
+name = "urm_probe"
+harness = false
+
+[[bench]]
+name = "ntt_butterfly_probe"
+harness = false
+
+[[bench]]
+name = "merkle_probe"
+harness = false
+
+[[bench]]
+name = "eq_build_probe"
+harness = false
+
+[[bench]]
+name = "fold_1b_rows"
+harness = false
+
+[[bench]]
+name = "native_hash"
+harness = false
+
+[[bench]]
+name = "ecore_offload_probe"
+harness = false
+
+[[bench]]
+name = "apply_block_diag_probe"
+harness = false
+
+[[bench]]
+name = "stability_probe"
+harness = false
+
+[[bench]]
+name = "generic_vs_fast_proof"
+harness = false
+
+[[bench]]
+name = "verifier_hash_count"
+harness = false
+required-features = ["hash-count"]
+
+[[bench]]
+name = "witness_lincheck_probe"
+harness = false
+
+[[bench]]
+name = "keccak3_witlc_probe"
+harness = false
+
+[[example]]
+name = "chain_bench"
+required-features = ["unsound-challenger"]
+
+[[bench]]
+name = "permutation"
+harness = false
+
+[lints]
+workspace = true
