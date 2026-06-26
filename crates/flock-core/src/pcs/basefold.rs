@@ -834,6 +834,17 @@ pub fn verify<Ch: Challenger>(
     }
     let log_dim = log_msg_len - log_batch_size;
     let k_code = log_dim + log_inv_rate;
+    // `k_code` is the log2 codeword length, derived from the proof-supplied
+    // `round_messages` count. It feeds `1 << k_code` masks and FRI twiddle
+    // lookups at layers up to `k_code - 1`. The verifier's NTT only carries
+    // `log_domain_size()` layers of twiddles (it is built as
+    // `standard(params.k_code())` for the committed instance), so a proof
+    // claiming a larger codeword would index past the twiddle tables —
+    // panicking inside `AdditiveNttF128::twiddle` — before any Merkle check
+    // could reject it. Bound it up front and reject as a malformed shape.
+    if k_code > ntt.log_domain_size() {
+        return Err(VerifyError::InvalidProofShape);
+    }
     let num_ntts = 1usize << log_batch_size;
     let arities = crate::pcs::compute_fri_arities(log_dim);
     let num_epochs = arities.len();
@@ -1125,4 +1136,59 @@ fn verify_multi_with_dedup(
     let positions_sorted: Vec<usize> = deduped.iter().map(|(p, _)| *p).collect();
     let hashes_sorted: Vec<Hash> = deduped.iter().map(|(_, h)| *h).collect();
     merkle::verify_merkle_multi_proof(root, num_leaves, &positions_sorted, &hashes_sorted, proof)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::challenger::FsChallenger;
+    use crate::ntt::AdditiveNttF128;
+
+    /// A proof whose `round_messages` count implies a codeword dimension larger
+    /// than the verifier's NTT must be rejected with `InvalidProofShape`, not
+    /// panic in the FRI twiddle lookup or the `1 << k_code` mask. Regression
+    /// test for the unbounded proof-controlled `k_code` (audit item: verifier
+    /// robustness against malformed proofs).
+    #[test]
+    fn verify_rejects_oversized_codeword_dim_without_panic() {
+        let log_inv_rate = 1;
+        let log_batch_size = 0;
+        // NTT supports only a 4-layer domain (log_domain_size = 4).
+        let ntt = AdditiveNttF128::standard(4);
+        assert_eq!(ntt.log_domain_size(), 4);
+
+        // round_messages.len() = 10  =>  log_dim = 10, k_code = 11 > 4.
+        // Every other field is left empty: the dimension bound must fire before
+        // they are ever inspected, so an attacker can't even reach the indexing.
+        let proof = BaseFoldProof {
+            round_messages: vec![
+                RoundMessage {
+                    u_0: F128::ZERO,
+                    u_2: F128::ZERO,
+                };
+                10
+            ],
+            post_row_batch_commit: RoundCommitment { root: [0u8; 32] },
+            round_commitments: Vec::new(),
+            final_a: F128::ZERO,
+            final_b: F128::ZERO,
+            final_codeword: Vec::new(),
+            queries: Vec::new(),
+            initial_multi_proof: Vec::new(),
+            post_row_batch_multi_proof: Vec::new(),
+            epoch_multi_proofs: Vec::new(),
+        };
+
+        let mut ch = FsChallenger::new(b"basefold-oob-test");
+        let res = verify(
+            F128::ZERO,
+            &proof,
+            &[0u8; 32],
+            &ntt,
+            log_inv_rate,
+            log_batch_size,
+            &mut ch,
+        );
+        assert_eq!(res, Err(VerifyError::InvalidProofShape));
+    }
 }
