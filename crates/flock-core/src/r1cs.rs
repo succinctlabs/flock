@@ -181,7 +181,8 @@ impl BlockR1cs {
         apply_block_diag_packed(&self.c_0, z_packed, self.m, self.k_log)
     }
 
-    /// BLAKE3 hash of the R1CS instance (parameters + sparse matrices).
+    /// BLAKE3 hash of the R1CS instance: the shape parameters (`m`, `k_log`,
+    /// `k_skip`, `useful_bits`, `const_pin`) and the sparse matrices.
     /// Stable across runs; used to bind the Fiat-Shamir transcript to the
     /// statement being proved.
     ///
@@ -191,10 +192,27 @@ impl BlockR1cs {
     pub fn statement_digest(&self) -> [u8; 32] {
         *self.digest_cache.get_or_init(|| {
             let mut h = blake3::Hasher::new();
-            h.update(b"flock-r1cs-stmt-v0");
+            // Tag bumped v0 -> v1 when useful_bits/const_pin were added to the
+            // absorbed fields, so a v0 transcript can never collide with a v1.
+            h.update(b"flock-r1cs-stmt-v1");
             h.update(&(self.m as u64).to_le_bytes());
             h.update(&(self.k_log as u64).to_le_bytes());
             h.update(&(self.k_skip as u64).to_le_bytes());
+            // Padding boundary: which rows carry witness vs. zero padding. It
+            // changes the lincheck equation, so it is part of the statement.
+            h.update(&(self.useful_bits as u64).to_le_bytes());
+            // Constant-wire pin column, which drives the lincheck β-pin term.
+            // Length-unambiguous Option encoding: 1-byte present/absent tag,
+            // then the column index when present.
+            match self.const_pin {
+                Some(col) => {
+                    h.update(&[1u8]);
+                    h.update(&(col as u64).to_le_bytes());
+                }
+                None => {
+                    h.update(&[0u8]);
+                }
+            }
             absorb_matrix(&mut h, &self.a_0);
             absorb_matrix(&mut h, &self.b_0);
             absorb_matrix(&mut h, &self.c_0);
@@ -704,5 +722,51 @@ mod tests {
         let mut z_nonzero = vec![false; 1 << m];
         z_nonzero[5] = true;
         assert!(!r1cs.satisfies(&z_nonzero));
+    }
+
+    #[test]
+    fn statement_digest_binds_useful_bits_and_const_pin() {
+        // Two instances identical except for `useful_bits` (resp. `const_pin`)
+        // must produce different digests: both change the lincheck / padding
+        // semantics, so the Fiat-Shamir transcript must depend on them. See
+        // statement_digest's v1 tag bump.
+        let k_log = 3;
+        let m = 6;
+        let base = || BlockR1cs {
+            m,
+            k_log,
+            k_skip: 2,
+            useful_bits: 1 << k_log,
+            a_0: identity(1 << k_log),
+            b_0: identity(1 << k_log),
+            c_0: identity(1 << k_log),
+            const_pin: None,
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        };
+
+        let d0 = base().statement_digest();
+        // Determinism: same instance ⇒ same digest.
+        assert_eq!(d0, base().statement_digest());
+
+        // useful_bits is bound.
+        let mut r_ub = base();
+        r_ub.useful_bits = (1 << k_log) - 1;
+        assert_ne!(d0, r_ub.statement_digest(), "useful_bits not bound");
+
+        // const_pin presence is bound (None vs Some).
+        let mut r_pin = base();
+        r_pin.const_pin = Some(0);
+        assert_ne!(d0, r_pin.statement_digest(), "const_pin not bound");
+
+        // const_pin *column index* is bound (Some(0) vs Some(1)), not just
+        // presence — the Option encoding absorbs the value too.
+        let mut r_pin1 = base();
+        r_pin1.const_pin = Some(1);
+        assert_ne!(
+            r_pin.statement_digest(),
+            r_pin1.statement_digest(),
+            "const_pin column index not bound"
+        );
     }
 }
