@@ -1037,7 +1037,34 @@ fn process_one_x_hi(
                     state.partial_c[lane] += cf_c_f * eq_lo_val;
                 }
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
+            {
+                use core::arch::x86_64::*;
+                let convert_ptr = convert.as_ptr() as *const u8;
+                for lane in 0..ELL {
+                    let mut cf_ab = unsafe { _mm_setzero_si128() };
+                    let mut cf_c = unsafe { _mm_setzero_si128() };
+                    for b_med in 0..(1 << N_MEDIUM) {
+                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
+                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
+                        unsafe {
+                            cf_ab = _mm_xor_si128(cf_ab,
+                                _mm_loadu_si128(convert_ptr.add((b_med * 256 + v_ab) * 16) as *const __m128i));
+                            cf_c = _mm_xor_si128(cf_c,
+                                _mm_loadu_si128(convert_ptr.add((b_med * 256 + v_c) * 16) as *const __m128i));
+                        }
+                    }
+                    let cf_ab_f = unsafe {
+                        F128 { lo: _mm_extract_epi64(cf_ab, 0) as u64, hi: _mm_extract_epi64(cf_ab, 1) as u64 }
+                    };
+                    let cf_c_f = unsafe {
+                        F128 { lo: _mm_extract_epi64(cf_c, 0) as u64, hi: _mm_extract_epi64(cf_c, 1) as u64 }
+                    };
+                    state.partial_ab[lane] += cf_ab_f * eq_lo_val;
+                    state.partial_c[lane] += cf_c_f * eq_lo_val;
+                }
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             {
                 for lane in 0..ELL {
                     let mut cf_ab = F128::ZERO;
@@ -1103,7 +1130,34 @@ fn process_one_x_hi(
                     state.partial_c[lane] += cf_c_f * eq_lo_val;
                 }
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
+            {
+                use core::arch::x86_64::*;
+                let convert_ptr = convert.as_ptr() as *const u8;
+                for lane in 0..ELL {
+                    let mut cf_ab = unsafe { _mm_setzero_si128() };
+                    let mut cf_c = unsafe { _mm_setzero_si128() };
+                    for b_med in 0..n_b_med {
+                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
+                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
+                        unsafe {
+                            cf_ab = _mm_xor_si128(cf_ab,
+                                _mm_loadu_si128(convert_ptr.add((b_med * 256 + v_ab) * 16) as *const __m128i));
+                            cf_c = _mm_xor_si128(cf_c,
+                                _mm_loadu_si128(convert_ptr.add((b_med * 256 + v_c) * 16) as *const __m128i));
+                        }
+                    }
+                    let cf_ab_f = unsafe {
+                        F128 { lo: _mm_extract_epi64(cf_ab, 0) as u64, hi: _mm_extract_epi64(cf_ab, 1) as u64 }
+                    };
+                    let cf_c_f = unsafe {
+                        F128 { lo: _mm_extract_epi64(cf_c, 0) as u64, hi: _mm_extract_epi64(cf_c, 1) as u64 }
+                    };
+                    state.partial_ab[lane] += cf_ab_f * eq_lo_val;
+                    state.partial_c[lane] += cf_c_f * eq_lo_val;
+                }
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             {
                 for lane in 0..ELL {
                     let mut cf_ab = F128::ZERO;
@@ -1277,7 +1331,43 @@ fn process_one_x_hi_with_s_hat_v(
                     state.partial_c_1[lane] += cf_c_1_f * eq_lo_val;
                 }
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
+            {
+                use core::arch::x86_64::*;
+                let convert_ptr = convert.as_ptr() as *const u8;
+                for lane in 0..ELL {
+                    let mut cf_ab = unsafe { _mm_setzero_si128() };
+                    let mut cf_c_0 = unsafe { _mm_setzero_si128() };
+                    let mut cf_c_1 = unsafe { _mm_setzero_si128() };
+                    for b_med in 0..(1 << N_MEDIUM) {
+                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
+                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
+                        let v_c_0 = v_c & 0x55;
+                        let v_c_1 = v_c & 0xAA;
+                        unsafe {
+                            cf_ab = _mm_xor_si128(cf_ab,
+                                _mm_loadu_si128(convert_ptr.add((b_med * 256 + v_ab) * 16) as *const __m128i));
+                            cf_c_0 = _mm_xor_si128(cf_c_0,
+                                _mm_loadu_si128(convert_ptr.add((b_med * 256 + v_c_0) * 16) as *const __m128i));
+                            cf_c_1 = _mm_xor_si128(cf_c_1,
+                                _mm_loadu_si128(convert_ptr.add((b_med * 256 + v_c_1) * 16) as *const __m128i));
+                        }
+                    }
+                    let cf_ab_f = unsafe {
+                        F128 { lo: _mm_extract_epi64(cf_ab, 0) as u64, hi: _mm_extract_epi64(cf_ab, 1) as u64 }
+                    };
+                    let cf_c_0_f = unsafe {
+                        F128 { lo: _mm_extract_epi64(cf_c_0, 0) as u64, hi: _mm_extract_epi64(cf_c_0, 1) as u64 }
+                    };
+                    let cf_c_1_f = unsafe {
+                        F128 { lo: _mm_extract_epi64(cf_c_1, 0) as u64, hi: _mm_extract_epi64(cf_c_1, 1) as u64 }
+                    };
+                    state.partial_ab[lane] += cf_ab_f * eq_lo_val;
+                    state.partial_c_0[lane] += cf_c_0_f * eq_lo_val;
+                    state.partial_c_1[lane] += cf_c_1_f * eq_lo_val;
+                }
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             {
                 for lane in 0..ELL {
                     let mut cf_ab = F128::ZERO;
