@@ -300,8 +300,80 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     unsafe {
         bit_transpose_64bytes_neon(input, output)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is baseline on x86_64.
+    unsafe {
+        bit_transpose_64bytes_sse2(input, output)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     bit_transpose_64bytes_scalar(input, output);
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn bit_transpose_64bytes_sse2(input: &[u8; 64], output: &mut [u8; 64]) {
+    use core::arch::x86_64::*;
+    unsafe {
+        // Step 1: byte-level shuffle. Reorder input so each 8-byte group holds
+        // one b_chunk's x_small=0..7 bytes. NEON uses vqtbl4q_u8 (64-byte cross-
+        // register table lookup); SSE2 doesn't have that, so we do it in scalar.
+        // 64 byte moves — fast because both input and shuffled fit in L1.
+        let mut shuffled = [0u8; 64];
+        for b_chunk in 0..8 {
+            for x_small in 0..8 {
+                shuffled[b_chunk * 8 + x_small] = input[x_small * 8 + b_chunk];
+            }
+        }
+
+        // Step 2: delta-swap 8×8 bit transpose on the shuffled layout.
+        // Each 8-byte group is now (shuffled[b_chunk*8 + 0..8]) = the 8 bytes
+        // from x_small=0..7 for one b_chunk. The delta-swap turns each byte's
+        // 8 bits into 8 output bytes' single-bit contributions.
+        let sp = shuffled.as_ptr();
+        let mut y0 = _mm_loadu_si128(sp as *const __m128i);
+        let mut y1 = _mm_loadu_si128(sp.add(16) as *const __m128i);
+        let mut y2 = _mm_loadu_si128(sp.add(32) as *const __m128i);
+        let mut y3 = _mm_loadu_si128(sp.add(48) as *const __m128i);
+
+        let mask1 = _mm_set1_epi64x(0x00AA00AA00AA00AAu64 as i64);
+        let mask2 = _mm_set1_epi64x(0x0000CCCC0000CCCCu64 as i64);
+        let mask3 = _mm_set1_epi64x(0x00000000F0F0F0F0u64 as i64);
+
+        // Round 1: distance 7
+        let t0 = _mm_and_si128(_mm_xor_si128(y0, _mm_srli_epi64(y0, 7)), mask1);
+        let t1 = _mm_and_si128(_mm_xor_si128(y1, _mm_srli_epi64(y1, 7)), mask1);
+        let t2 = _mm_and_si128(_mm_xor_si128(y2, _mm_srli_epi64(y2, 7)), mask1);
+        let t3 = _mm_and_si128(_mm_xor_si128(y3, _mm_srli_epi64(y3, 7)), mask1);
+        y0 = _mm_xor_si128(y0, _mm_xor_si128(t0, _mm_slli_epi64(t0, 7)));
+        y1 = _mm_xor_si128(y1, _mm_xor_si128(t1, _mm_slli_epi64(t1, 7)));
+        y2 = _mm_xor_si128(y2, _mm_xor_si128(t2, _mm_slli_epi64(t2, 7)));
+        y3 = _mm_xor_si128(y3, _mm_xor_si128(t3, _mm_slli_epi64(t3, 7)));
+
+        // Round 2: distance 14
+        let t0 = _mm_and_si128(_mm_xor_si128(y0, _mm_srli_epi64(y0, 14)), mask2);
+        let t1 = _mm_and_si128(_mm_xor_si128(y1, _mm_srli_epi64(y1, 14)), mask2);
+        let t2 = _mm_and_si128(_mm_xor_si128(y2, _mm_srli_epi64(y2, 14)), mask2);
+        let t3 = _mm_and_si128(_mm_xor_si128(y3, _mm_srli_epi64(y3, 14)), mask2);
+        y0 = _mm_xor_si128(y0, _mm_xor_si128(t0, _mm_slli_epi64(t0, 14)));
+        y1 = _mm_xor_si128(y1, _mm_xor_si128(t1, _mm_slli_epi64(t1, 14)));
+        y2 = _mm_xor_si128(y2, _mm_xor_si128(t2, _mm_slli_epi64(t2, 14)));
+        y3 = _mm_xor_si128(y3, _mm_xor_si128(t3, _mm_slli_epi64(t3, 14)));
+
+        // Round 3: distance 28
+        let t0 = _mm_and_si128(_mm_xor_si128(y0, _mm_srli_epi64(y0, 28)), mask3);
+        let t1 = _mm_and_si128(_mm_xor_si128(y1, _mm_srli_epi64(y1, 28)), mask3);
+        let t2 = _mm_and_si128(_mm_xor_si128(y2, _mm_srli_epi64(y2, 28)), mask3);
+        let t3 = _mm_and_si128(_mm_xor_si128(y3, _mm_srli_epi64(y3, 28)), mask3);
+        y0 = _mm_xor_si128(y0, _mm_xor_si128(t0, _mm_slli_epi64(t0, 28)));
+        y1 = _mm_xor_si128(y1, _mm_xor_si128(t1, _mm_slli_epi64(t1, 28)));
+        y2 = _mm_xor_si128(y2, _mm_xor_si128(t2, _mm_slli_epi64(t2, 28)));
+        y3 = _mm_xor_si128(y3, _mm_xor_si128(t3, _mm_slli_epi64(t3, 28)));
+
+        let out_ptr = output.as_mut_ptr();
+        _mm_storeu_si128(out_ptr as *mut __m128i, y0);
+        _mm_storeu_si128(out_ptr.add(16) as *mut __m128i, y1);
+        _mm_storeu_si128(out_ptr.add(32) as *mut __m128i, y2);
+        _mm_storeu_si128(out_ptr.add(48) as *mut __m128i, y3);
+    }
 }
 
 // ---------------------------------------------------------------------------
