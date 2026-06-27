@@ -96,7 +96,14 @@ impl Mul for F128 {
             // SAFETY: aes target feature is enabled at compile time.
             unsafe { aarch64::ghash_mul_binius(self, rhs) }
         }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            x86_simd::ghash_mul(self, rhs)
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
         {
             software::ghash_mul(self, rhs)
         }
@@ -488,6 +495,50 @@ pub mod aarch64 {
 }
 
 // ---------------------------------------------------------------------------
+// x86_64 + PCLMULQDQ: carry-less multiply acceleration.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+pub mod x86_simd {
+    use super::{F128, F256Unreduced, ghash_reduce};
+
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    #[inline]
+    fn clmul64(a: u64, b: u64) -> (u64, u64) {
+        unsafe {
+            let va = _mm_set_epi64x(0, a as i64);
+            let vb = _mm_set_epi64x(0, b as i64);
+            let r = _mm_clmulepi64_si128(va, vb, 0x00);
+            (_mm_extract_epi64(r, 0) as u64, _mm_extract_epi64(r, 1) as u64)
+        }
+    }
+
+    #[inline]
+    pub fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
+        let (ll_lo, ll_hi) = clmul64(a.lo, b.lo);
+        let (lh_lo, lh_hi) = clmul64(a.lo, b.hi);
+        let (hl_lo, hl_hi) = clmul64(a.hi, b.lo);
+        let (hh_lo, hh_hi) = clmul64(a.hi, b.hi);
+        let cr_lo = lh_lo ^ hl_lo;
+        let cr_hi = lh_hi ^ hl_hi;
+        F256Unreduced {
+            r0: ll_lo,
+            r1: ll_hi ^ cr_lo,
+            r2: hh_lo ^ cr_hi,
+            r3: hh_hi,
+        }
+    }
+
+    #[inline]
+    pub fn ghash_mul(a: F128, b: F128) -> F128 {
+        let u = ghash_mul_unreduced(a, b);
+        ghash_reduce(u.r0, u.r1, u.r2, u.r3)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Software fallback: bit-by-bit clmul64. Slow but portable; also the reference
 // the NEON path is checked against in tests.
 // ---------------------------------------------------------------------------
@@ -540,7 +591,14 @@ fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
         // SAFETY: aes target feature is enabled at compile time.
         unsafe { aarch64::ghash_mul_unreduced_neon(a, b) }
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    {
+        x86_simd::ghash_mul_unreduced(a, b)
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    )))]
     {
         software::ghash_mul_unreduced(a, b)
     }
