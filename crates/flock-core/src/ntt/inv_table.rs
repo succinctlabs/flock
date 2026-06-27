@@ -114,6 +114,13 @@ impl InvNttTableByteSingleGf8 {
             unsafe { self.apply_neon_unchecked(bytes, out) };
             return;
         }
+        #[cfg(target_arch = "x86_64")]
+        if self.ell >= 16 {
+            // SAFETY: SSE2 is baseline on x86_64; ell ≥ 16 ⇒ at least one
+            // 128-bit chunk; method validates slice lengths.
+            unsafe { self.apply_sse2(bytes, out) };
+            return;
+        }
         self.apply_scalar(bytes, out);
     }
 
@@ -181,6 +188,56 @@ impl InvNttTableByteSingleGf8 {
                         let v = vld1q_u8(row_b.add(sc * 16));
                         let dst = out_ptr.add(c * 16);
                         vst1q_u8(dst, veorq_u8(vld1q_u8(dst), v));
+                    }
+                }
+            }
+        }
+    }
+
+    /// SSE2 variant of `apply` — same algorithm as `apply_neon_unchecked`,
+    /// using SSE2 128-bit load/store/XOR. The 8-byte half-swap (NEON
+    /// `vextq_u8::<8>`) is implemented via `_mm_shuffle_epi32` with imm 0x4E
+    /// (swap the two 64-bit halves).
+    ///
+    /// # Safety
+    /// SSE2 is baseline on x86_64 — always available. The method validates
+    /// slice lengths.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn apply_sse2(&self, bytes: &[u8], out: &mut [F8]) {
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::*;
+
+        assert_eq!(bytes.len(), self.n_chunks);
+        assert_eq!(out.len(), self.ell);
+        let n128 = self.ell / 16;
+        let base = self.data.as_ptr() as *const u8;
+        let out_ptr = out.as_mut_ptr() as *mut u8;
+
+        unsafe {
+            let row0 = base.add(bytes[0] as usize * self.ell);
+            for c in 0..n128 {
+                let v = _mm_loadu_si128(row0.add(c * 16) as *const __m128i);
+                _mm_storeu_si128(out_ptr.add(c * 16) as *mut __m128i, v);
+            }
+
+            for b in 1..self.n_chunks {
+                let b_high = b >> 1;
+                let b_odd = (b & 1) != 0;
+                let row_b = base.add(bytes[b] as usize * self.ell);
+                if b_odd {
+                    for c in 0..n128 {
+                        let sc = c ^ b_high;
+                        let v = _mm_loadu_si128(row_b.add(sc * 16) as *const __m128i);
+                        let v_swapped = _mm_shuffle_epi32(v, 0x4E);
+                        let dst = out_ptr.add(c * 16) as *mut __m128i;
+                        _mm_storeu_si128(dst, _mm_xor_si128(_mm_loadu_si128(dst), v_swapped));
+                    }
+                } else {
+                    for c in 0..n128 {
+                        let sc = c ^ b_high;
+                        let v = _mm_loadu_si128(row_b.add(sc * 16) as *const __m128i);
+                        let dst = out_ptr.add(c * 16) as *mut __m128i;
+                        _mm_storeu_si128(dst, _mm_xor_si128(_mm_loadu_si128(dst), v));
                     }
                 }
             }

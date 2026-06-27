@@ -158,16 +158,59 @@ impl InvNttTableSToV8Gf8 {
         }
     }
 
-    /// Dispatch helper — uses NEON when available, scalar otherwise.
+    /// Dispatch helper — uses NEON/SSE2 when available, scalar otherwise.
     #[inline]
     pub fn apply(&self, bytes: &[u8], out: &mut [F8]) {
         #[cfg(target_arch = "aarch64")]
         if self.ell_out >= 16 {
-            // SAFETY: aarch64 statically guarantees NEON; the method validates lengths.
             unsafe { self.apply_neon_unchecked(bytes, out) };
             return;
         }
+        #[cfg(target_arch = "x86_64")]
+        if self.ell_out >= 16 {
+            unsafe { self.apply_sse2(bytes, out) };
+            return;
+        }
         self.apply_scalar(bytes, out);
+    }
+
+    /// SSE2 variant — same algorithm as NEON, 128-bit load/store/XOR.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn apply_sse2(&self, bytes: &[u8], out: &mut [F8]) {
+        use core::arch::x86_64::*;
+        assert_eq!(bytes.len(), self.n_chunks);
+        assert_eq!(out.len(), self.ell_out);
+        let n128 = self.ell_out / 16;
+        let base = self.data.as_ptr() as *const u8;
+        let out_ptr = out.as_mut_ptr() as *mut u8;
+        unsafe {
+            let row0 = base.add(bytes[0] as usize * self.ell_out);
+            for c in 0..n128 {
+                let v = _mm_loadu_si128(row0.add(c * 16) as *const __m128i);
+                _mm_storeu_si128(out_ptr.add(c * 16) as *mut __m128i, v);
+            }
+            for b in 1..self.n_chunks {
+                let b_high = b >> 1;
+                let b_odd = (b & 1) != 0;
+                let row_b = base.add(bytes[b] as usize * self.ell_out);
+                if b_odd {
+                    for c in 0..n128 {
+                        let sc = c ^ b_high;
+                        let v = _mm_loadu_si128(row_b.add(sc * 16) as *const __m128i);
+                        let v_swapped = _mm_shuffle_epi32(v, 0x4E);
+                        let dst = out_ptr.add(c * 16) as *mut __m128i;
+                        _mm_storeu_si128(dst, _mm_xor_si128(_mm_loadu_si128(dst), v_swapped));
+                    }
+                } else {
+                    for c in 0..n128 {
+                        let sc = c ^ b_high;
+                        let v = _mm_loadu_si128(row_b.add(sc * 16) as *const __m128i);
+                        let dst = out_ptr.add(c * 16) as *mut __m128i;
+                        _mm_storeu_si128(dst, _mm_xor_si128(_mm_loadu_si128(dst), v));
+                    }
+                }
+            }
+        }
     }
 
     /// NEON variant of `apply` — operates in 16-byte chunks. Mirrors the
