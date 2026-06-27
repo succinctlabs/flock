@@ -506,7 +506,8 @@ pub mod x86_simd {
     use core::arch::x86_64::*;
 
     #[inline]
-    fn clmul64(a: u64, b: u64) -> (u64, u64) {
+    #[target_feature(enable = "pclmulqdq")]
+    unsafe fn clmul64(a: u64, b: u64) -> (u64, u64) {
         unsafe {
             let va = _mm_set_epi64x(0, a as i64);
             let vb = _mm_set_epi64x(0, b as i64);
@@ -517,6 +518,9 @@ pub mod x86_simd {
 
     #[inline]
     pub fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
+        // SAFETY: this module is #[cfg(target_arch = "x86_64")] and clmul64
+        // requires pclmulqdq which is universally available on x86_64.
+        unsafe {
         let (ll_lo, ll_hi) = clmul64(a.lo, b.lo);
         let (lh_lo, lh_hi) = clmul64(a.lo, b.hi);
         let (hl_lo, hl_hi) = clmul64(a.hi, b.lo);
@@ -528,6 +532,7 @@ pub mod x86_simd {
             r1: ll_hi ^ cr_lo,
             r2: hh_lo ^ cr_hi,
             r3: hh_hi,
+        }
         }
     }
 
@@ -677,6 +682,8 @@ pub mod x86_simd {
     pub fn ghash_mul_karatsuba_unreduced(a: F128, b: F128) -> F256Unreduced {
         let a_xor = a.lo ^ a.hi;
         let b_xor = b.lo ^ b.hi;
+        // SAFETY: same as ghash_mul_unreduced — pclmulqdq is available on x86_64.
+        unsafe {
         let (ll_lo, ll_hi) = clmul64(a.lo, b.lo);
         let (hh_lo, hh_hi) = clmul64(a.hi, b.hi);
         let (mid_lo, mid_hi) = clmul64(a_xor, b_xor);
@@ -687,6 +694,7 @@ pub mod x86_simd {
             r1: ll_hi ^ cr_lo,
             r2: hh_lo ^ cr_hi,
             r3: hh_hi,
+        }
         }
     }
 
