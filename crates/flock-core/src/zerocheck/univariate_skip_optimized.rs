@@ -676,7 +676,118 @@ fn shift_reduce_inner_ab_fused_neon(
     }
 }
 
-/// Dispatch helper — picks the fused NEON kernel when available, otherwise scalar.
+/// x86_64 AVX2 version of shift_reduce_inner_ab.
+///
+/// Same algorithm as the scalar version, but uses AVX2 element-wise GF(2^8)
+/// multiply (bitsliced schoolbook) for the 64 lane-wise products, and AVX2
+/// 16-bit shift-accumulate + vectorized reduction. The 8 k-iterations are
+/// macro-unrolled because `_mm256_slli_epi16` requires a compile-time constant.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn shift_reduce_inner_ab_avx2(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    use core::arch::x86_64::*;
+    use crate::field::gf2_8::x86::gf8_mul_vec32_x86_ew;
+
+    unsafe {
+        let mut acc0 = _mm256_setzero_si256(); // lanes 0..15 (16 x u16)
+        let mut acc1 = _mm256_setzero_si256(); // lanes 16..31
+        let mut acc2 = _mm256_setzero_si256(); // lanes 32..47
+        let mut acc3 = _mm256_setzero_si256(); // lanes 48..63
+
+        let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+
+        macro_rules! do_k {
+            ($k:literal) => {{
+                let chunk_off = byte_base_b + $k * N_CHUNKS;
+                inv_table.apply(&a_packed[chunk_off..chunk_off + N_CHUNKS], a_col);
+                inv_table.apply(&b_packed[chunk_off..chunk_off + N_CHUNKS], b_col);
+
+                let a_ptr = a_col.as_ptr() as *const u8;
+                let b_ptr = b_col.as_ptr() as *const u8;
+
+                let a_lo: [u8; 32] = *(a_ptr as *const [u8; 32]);
+                let b_lo: [u8; 32] = *(b_ptr as *const [u8; 32]);
+                let a_hi: [u8; 32] = *(a_ptr.add(32) as *const [u8; 32]);
+                let b_hi: [u8; 32] = *(b_ptr.add(32) as *const [u8; 32]);
+
+                let y_lo = gf8_mul_vec32_x86_ew(&a_lo, &b_lo);
+                let y_hi = gf8_mul_vec32_x86_ew(&a_hi, &b_hi);
+
+                let y0 = _mm256_loadu_si256(y_lo.as_ptr() as *const _);
+                let y1 = _mm256_loadu_si256(y_hi.as_ptr() as *const _);
+
+                let y0_lo128 = _mm256_castsi256_si128(y0);
+                let y0_hi128 = _mm256_extracti128_si256(y0, 1);
+                let y1_lo128 = _mm256_castsi256_si128(y1);
+                let y1_hi128 = _mm256_extracti128_si256(y1, 1);
+
+                let y0_lo_u16 = _mm256_cvtepu8_epi16(y0_lo128);
+                let y0_hi_u16 = _mm256_cvtepu8_epi16(y0_hi128);
+                let y1_lo_u16 = _mm256_cvtepu8_epi16(y1_lo128);
+                let y1_hi_u16 = _mm256_cvtepu8_epi16(y1_hi128);
+
+                acc0 = _mm256_xor_si256(acc0, _mm256_slli_epi16(y0_lo_u16, $k));
+                acc1 = _mm256_xor_si256(acc1, _mm256_slli_epi16(y0_hi_u16, $k));
+                acc2 = _mm256_xor_si256(acc2, _mm256_slli_epi16(y1_lo_u16, $k));
+                acc3 = _mm256_xor_si256(acc3, _mm256_slli_epi16(y1_hi_u16, $k));
+            }};
+        }
+        do_k!(0);
+        do_k!(1);
+        do_k!(2);
+        do_k!(3);
+        do_k!(4);
+        do_k!(5);
+        do_k!(6);
+        do_k!(7);
+
+        // Reduce: split each u16 accumulator into lo/hi bytes, then vectorized
+        // GF(2^8) reduction.
+        let mask_lo = _mm256_set1_epi16(0x00FF);
+        let lo0 = _mm256_and_si256(acc0, mask_lo);
+        let hi0 = _mm256_srli_epi16(acc0, 8);
+        let lo1 = _mm256_and_si256(acc1, mask_lo);
+        let hi1 = _mm256_srli_epi16(acc1, 8);
+        let lo2 = _mm256_and_si256(acc2, mask_lo);
+        let hi2 = _mm256_srli_epi16(acc2, 8);
+        let lo3 = _mm256_and_si256(acc3, mask_lo);
+        let hi3 = _mm256_srli_epi16(acc3, 8);
+
+        // Pack 16 u16 lo/hi pairs into 32 u8 with _mm256_packus_epi16, then fix
+        // the AVX2 lane-crossing with _mm256_permute4x64_epi64.
+        let lo_packed_01 = _mm256_permute4x64_epi64(
+            _mm256_packus_epi16(lo0, lo1), 0b11_01_10_00
+        );
+        let hi_packed_01 = _mm256_permute4x64_epi64(
+            _mm256_packus_epi16(hi0, hi1), 0b11_01_10_00
+        );
+        let lo_packed_23 = _mm256_permute4x64_epi64(
+            _mm256_packus_epi16(lo2, lo3), 0b11_01_10_00
+        );
+        let hi_packed_23 = _mm256_permute4x64_epi64(
+            _mm256_packus_epi16(hi2, hi3), 0b11_01_10_00
+        );
+
+        let r01 = crate::field::gf2_8::x86::gf8_reduce_vec32(lo_packed_01, hi_packed_01);
+        let r23 = crate::field::gf2_8::x86::gf8_reduce_vec32(lo_packed_23, hi_packed_23);
+
+        let p = out.as_mut_ptr();
+        _mm256_storeu_si256(p as *mut _, r01);
+        _mm256_storeu_si256(p.add(32) as *mut _, r23);
+    }
+}
+
+/// Dispatch helper — picks the fused NEON kernel when available, AVX2 on x86_64,
+/// otherwise scalar.
 #[inline]
 fn shift_reduce_inner_ab(
     a_packed: &[u8],
@@ -700,7 +811,26 @@ fn shift_reduce_inner_ab(
             out,
         );
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        // SAFETY: avx2 target_feature is enabled at compile time.
+        unsafe {
+            shift_reduce_inner_ab_avx2(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                out,
+                a_col,
+                b_col,
+            );
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2"),
+    )))]
     {
         shift_reduce_inner_ab_scalar(
             a_packed,

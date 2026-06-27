@@ -117,7 +117,7 @@
 //!   per byte.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
@@ -313,6 +313,173 @@ impl LincheckCircuit for CscCircuit {
             let mut sb = F128::ZERO;
             for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
                 sb += eq_inner[r as usize];
+            }
+            alpha * sa + sb
+        };
+        if self.n_cols < SUMCHECK_PAR_THRESHOLD {
+            return (0..self.n_cols).map(one_col).collect();
+        }
+        let mut out = vec![F128::ZERO; self.n_cols];
+        out.par_iter_mut()
+            .enumerate()
+            .for_each(|(c, slot)| *slot = one_col(c));
+        out
+    }
+}
+
+/// Row-compacted CSC circuit: remaps row indices to a dense `[0, n_unique_rows)`
+/// range during construction so that `fold_alpha_batched_compact` can use a
+/// compact eq_inner table that fits in L1 cache. For MHOT route (2838 unique
+/// rows out of 32768), the compact table is ~44 KiB instead of ~512 KiB.
+///
+/// Use [`build_quirky_eq_table_sparse`] to build the compact eq_inner, then
+/// pass it to [`CompactCscCircuit::fold_alpha_batched_compact`].
+///
+/// Also implements [`LincheckCircuit`] so it can be used as a drop-in
+/// replacement in the standard lincheck prover (accepting full-length
+/// eq_inner). The compact path is available via the dedicated method.
+#[derive(Clone)]
+pub struct CompactCscCircuit {
+    n_cols: usize,
+    n_orig_rows: usize,
+    a_col_ptr: Vec<u32>,
+    a_rows_compact: Vec<u32>,
+    b_col_ptr: Vec<u32>,
+    b_rows_compact: Vec<u32>,
+    /// Sorted original row indices that have at least one nonzero in A or B.
+    pub referenced_rows: Vec<u32>,
+    const_pin: Option<usize>,
+}
+
+impl std::fmt::Debug for CompactCscCircuit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompactCscCircuit")
+            .field("n_cols", &self.n_cols)
+            .field("n_orig_rows", &self.n_orig_rows)
+            .field("n_unique_rows", &self.referenced_rows.len())
+            .field("nnz_a", &self.a_rows_compact.len())
+            .field("nnz_b", &self.b_rows_compact.len())
+            .finish()
+    }
+}
+
+impl CompactCscCircuit {
+    pub fn from_matrices(a_0: &SparseBinaryMatrix, b_0: &SparseBinaryMatrix) -> Self {
+        assert_eq!(a_0.num_rows, b_0.num_rows);
+        assert_eq!(a_0.num_cols, b_0.num_cols);
+
+        let (a_col_ptr, a_rows_orig) = csc_from_rows(a_0);
+        let (b_col_ptr, b_rows_orig) = csc_from_rows(b_0);
+
+        let mut row_set = std::collections::BTreeSet::new();
+        for &r in &a_rows_orig {
+            row_set.insert(r);
+        }
+        for &r in &b_rows_orig {
+            row_set.insert(r);
+        }
+        let referenced_rows: Vec<u32> = row_set.iter().copied().collect();
+
+        let mut orig_to_compact = vec![u32::MAX; a_0.num_rows];
+        for (compact_idx, &orig) in referenced_rows.iter().enumerate() {
+            orig_to_compact[orig as usize] = compact_idx as u32;
+        }
+
+        let a_rows_compact: Vec<u32> = a_rows_orig
+            .iter()
+            .map(|&r| orig_to_compact[r as usize])
+            .collect();
+        let b_rows_compact: Vec<u32> = b_rows_orig
+            .iter()
+            .map(|&r| orig_to_compact[r as usize])
+            .collect();
+
+        Self {
+            n_cols: a_0.num_cols,
+            n_orig_rows: a_0.num_rows,
+            a_col_ptr,
+            a_rows_compact,
+            b_col_ptr,
+            b_rows_compact,
+            referenced_rows,
+            const_pin: None,
+        }
+    }
+
+    pub fn with_const_pin(mut self, const_pin: Option<usize>) -> Self {
+        self.const_pin = const_pin;
+        self
+    }
+
+    /// Number of unique rows referenced by any nonzero in A or B.
+    pub fn n_unique_rows(&self) -> usize {
+        self.referenced_rows.len()
+    }
+
+    /// Fold using a compact eq_inner table (length = `n_unique_rows()`).
+    /// The compact table must be indexed by the remapped row indices.
+    /// Returns a full-length `n_cols` comb_vec.
+    pub fn fold_alpha_batched_compact(
+        &self,
+        alpha: F128,
+        eq_inner_compact: &[F128],
+    ) -> Vec<F128> {
+        use rayon::prelude::*;
+        assert_eq!(
+            eq_inner_compact.len(),
+            self.referenced_rows.len(),
+            "compact eq_inner length must match n_unique_rows"
+        );
+        let one_col = |c: usize| {
+            let mut sa = F128::ZERO;
+            for &r in &self.a_rows_compact
+                [self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize]
+            {
+                sa += eq_inner_compact[r as usize];
+            }
+            let mut sb = F128::ZERO;
+            for &r in &self.b_rows_compact
+                [self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize]
+            {
+                sb += eq_inner_compact[r as usize];
+            }
+            alpha * sa + sb
+        };
+        if self.n_cols < SUMCHECK_PAR_THRESHOLD {
+            return (0..self.n_cols).map(one_col).collect();
+        }
+        let mut out = vec![F128::ZERO; self.n_cols];
+        out.par_iter_mut()
+            .enumerate()
+            .for_each(|(c, slot)| *slot = one_col(c));
+        out
+    }
+}
+
+impl LincheckCircuit for CompactCscCircuit {
+    fn n_cols(&self) -> usize {
+        self.n_cols
+    }
+    fn const_pin_col(&self) -> Option<usize> {
+        self.const_pin
+    }
+    fn fold_alpha_batched(&self, alpha: F128, eq_inner_full: &[F128]) -> Vec<F128> {
+        use rayon::prelude::*;
+        assert_eq!(eq_inner_full.len(), self.n_cols);
+        let one_col = |c: usize| {
+            let mut sa = F128::ZERO;
+            for &r in &self.a_rows_compact
+                [self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize]
+            {
+                // Gather from the full table using the ORIGINAL row index
+                // (referenced_rows maps compact -> original).
+                sa += eq_inner_full[self.referenced_rows[r as usize] as usize];
+            }
+            let mut sb = F128::ZERO;
+            for &r in &self.b_rows_compact
+                [self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize]
+            {
+                sb += eq_inner_full[self.referenced_rows[r as usize] as usize];
             }
             alpha * sa + sb
         };
@@ -1107,6 +1274,36 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
     out
 }
 
+/// Build a **sparse** quirky eq table containing only the entries at the given
+/// `row_indices`. Output has `row_indices.len()` entries, where `out[i]` is the
+/// value that `build_quirky_eq_table` would produce at index `row_indices[i]`.
+///
+/// Each entry is computed directly as `lambda_skip[r % ell_skip] * eq_rest[r >> k_skip]`.
+/// The `eq_rest` table (length `2^(k_log - k_skip)`) is built in full via the
+/// standard doubling construction; only the outer-product gather is sparse.
+///
+/// For MHOT route (2838 referenced rows, k_log=15, k_skip=6): builds
+/// 512 eq_rest + 64 lagrange + 2838 muls ≈ 3414 F128 ops
+/// vs dense: 512 + 64 + 32768 = 33344 ops.
+pub fn build_quirky_eq_table_sparse(
+    z_skip: F128,
+    x_inner_rest: &[F128],
+    k_skip: usize,
+    row_indices: &[u32],
+) -> Vec<F128> {
+    let ell_skip = 1usize << k_skip;
+    let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
+    let eq_rest = build_eq_table(x_inner_rest);
+    let mut out = Vec::with_capacity(row_indices.len());
+    for &r in row_indices {
+        let r = r as usize;
+        let i_skip = r & (ell_skip - 1);
+        let i_rest = r >> k_skip;
+        out.push(lambda_skip[i_skip] * eq_rest[i_rest]);
+    }
+    out
+}
+
 /// Dot product of two equal-length F128 slices.
 fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     assert_eq!(a.len(), b.len());
@@ -1341,6 +1538,124 @@ fn sumcheck_bind_both_and_eval_next(
 }
 
 // ---------------------------------------------------------------------------
+// Deferred-reduction variants: accumulate F256Unreduced products, reduce once.
+// ---------------------------------------------------------------------------
+
+/// Deferred-reduction variant of [`sumcheck_round_eval_par`]. Accumulates
+/// unreduced 256-bit products via XOR, then reduces once at the end. Saves
+/// `(half − 1)` ghash_reduce calls per accumulator (2 accumulators total).
+fn sumcheck_round_eval_par_deferred(c: &[F128], z: &[F128]) -> (F128, F128) {
+    use rayon::prelude::*;
+    let half = c.len() / 2;
+    debug_assert_eq!(z.len(), c.len());
+    let (clo, chi) = c.split_at(half);
+    let (zlo, zhi) = z.split_at(half);
+    if half < SUMCHECK_PAR_THRESHOLD {
+        let mut e1_acc = F256Unreduced::ZERO;
+        let mut einf_acc = F256Unreduced::ZERO;
+        for i in 0..half {
+            e1_acc ^= chi[i].mul_unreduced(zhi[i]);
+            einf_acc ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
+        }
+        return (e1_acc.reduce(), einf_acc.reduce());
+    }
+    (0..half)
+        .into_par_iter()
+        .map(|i| {
+            let e1_i = chi[i].mul_unreduced(zhi[i]);
+            let einf_i = (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
+            (e1_i, einf_i)
+        })
+        .reduce(
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+        )
+        .into_reduced()
+}
+
+/// Deferred-reduction variant of [`sumcheck_bind_both_and_eval_next`].
+/// The bind step (per-element writes) still uses eager F128 multiply because
+/// each result is stored, not accumulated. Only the two accumulation sums
+/// `e1` and `einf` benefit from deferred reduction.
+fn sumcheck_bind_both_and_eval_next_deferred(
+    comb: &mut Vec<F128>,
+    z: &mut Vec<F128>,
+    r: F128,
+) -> (F128, F128) {
+    use rayon::prelude::*;
+    let len = comb.len();
+    debug_assert_eq!(z.len(), len);
+    let half = len / 2;
+    let half2 = half / 2;
+    debug_assert!(half2 >= 1, "fused step needs a well-defined next round");
+
+    let (c_lo, c_hi) = comb.split_at_mut(half);
+    let (cq0, cq1) = c_lo.split_at_mut(half2);
+    let (cq2, cq3) = c_hi.split_at(half2);
+    let (z_lo, z_hi) = z.split_at_mut(half);
+    let (zq0, zq1) = z_lo.split_at_mut(half2);
+    let (zq2, zq3) = z_hi.split_at(half2);
+
+    let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
+        let mut e1_acc = F256Unreduced::ZERO;
+        let mut einf_acc = F256Unreduced::ZERO;
+        for i in 0..half2 {
+            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
+            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
+            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
+            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
+            cq0[i] = lo;
+            cq1[i] = hi;
+            zq0[i] = zlo;
+            zq1[i] = zhi;
+            e1_acc ^= hi.mul_unreduced(zhi);
+            einf_acc ^= (hi + lo).mul_unreduced(zhi + zlo);
+        }
+        (e1_acc.reduce(), einf_acc.reduce())
+    } else {
+        cq0.par_iter_mut()
+            .zip(cq1.par_iter_mut())
+            .zip(cq2.par_iter())
+            .zip(cq3.par_iter())
+            .zip(zq0.par_iter_mut())
+            .zip(zq1.par_iter_mut())
+            .zip(zq2.par_iter())
+            .zip(zq3.par_iter())
+            .map(|(((((((c0, c1), c2), c3), z0), z1), z2), z3)| {
+                let lo = *c0 + r * (*c2 + *c0);
+                let hi = *c1 + r * (*c3 + *c1);
+                let zlo = *z0 + r * (*z2 + *z0);
+                let zhi = *z1 + r * (*z3 + *z1);
+                *c0 = lo;
+                *c1 = hi;
+                *z0 = zlo;
+                *z1 = zhi;
+                (hi.mul_unreduced(zhi), (hi + lo).mul_unreduced(zhi + zlo))
+            })
+            .reduce(
+                || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+                |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+            )
+            .into_reduced()
+    };
+
+    comb.truncate(half);
+    z.truncate(half);
+    (e1, einf)
+}
+
+trait IntoReduced {
+    fn into_reduced(self) -> (F128, F128);
+}
+
+impl IntoReduced for (F256Unreduced, F256Unreduced) {
+    #[inline]
+    fn into_reduced(self) -> (F128, F128) {
+        (self.0.reduce(), self.1.reduce())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
 
@@ -1552,7 +1867,7 @@ fn prove_padded_inner<Ch: Challenger>(
         // Round 0's message is the only standalone evaluation pass; every later
         // round's message falls out of binding the previous round (fold +
         // next-eval fused into one pass — see `sumcheck_bind_both_and_eval_next`).
-        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb_vec, &z_vec);
+        let (mut e1, mut einf) = sumcheck_round_eval_par_deferred(&comb_vec, &z_vec);
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
             challenger.observe_f128(einf);
@@ -1561,7 +1876,7 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
+                let (ne1, neinf) = sumcheck_bind_both_and_eval_next_deferred(&mut comb_vec, &mut z_vec, r);
                 e1 = ne1;
                 einf = neinf;
             } else {
@@ -2389,5 +2704,388 @@ mod tests {
             ),
             Err(VerifyError::KSkipExceedsKLog { .. })
         ));
+    }
+
+    // ---- Deferred-reduction correctness ----
+
+    /// The deferred-reduction `sumcheck_round_eval_par_deferred` must produce
+    /// bit-identical output to the eager `sumcheck_round_eval_par` for all
+    /// table sizes (both sequential and parallel branches).
+    #[test]
+    fn deferred_round_eval_matches_eager() {
+        for &half_log in &[2usize, 4, 8, 13] {
+            let half = 1usize << half_log;
+            let len = half * 2;
+            let mut rng = Rng::new(9000 + half_log as u64);
+            let c = rng.f128_vec(len);
+            let z = rng.f128_vec(len);
+
+            let (e1_eager, einf_eager) = sumcheck_round_eval_par(&c, &z);
+            let (e1_def, einf_def) = sumcheck_round_eval_par_deferred(&c, &z);
+
+            assert_eq!(
+                e1_eager, e1_def,
+                "e1 mismatch at half_log={half_log}"
+            );
+            assert_eq!(
+                einf_eager, einf_def,
+                "einf mismatch at half_log={half_log}"
+            );
+        }
+    }
+
+    /// The deferred-reduction `sumcheck_bind_both_and_eval_next_deferred` must
+    /// produce bit-identical output AND identical side-effects (table mutations)
+    /// to the eager variant.
+    #[test]
+    fn deferred_bind_eval_next_matches_eager() {
+        for &half2_log in &[1usize, 3, 6, 13] {
+            let half2 = 1usize << half2_log;
+            let len = half2 * 4;
+            let mut rng = Rng::new(9100 + half2_log as u64);
+            let comb_orig = rng.f128_vec(len);
+            let z_orig = rng.f128_vec(len);
+            let r = rng.f128();
+
+            let mut comb_eager = comb_orig.clone();
+            let mut z_eager = z_orig.clone();
+            let (e1_eager, einf_eager) =
+                sumcheck_bind_both_and_eval_next(&mut comb_eager, &mut z_eager, r);
+
+            let mut comb_def = comb_orig.clone();
+            let mut z_def = z_orig.clone();
+            let (e1_def, einf_def) =
+                sumcheck_bind_both_and_eval_next_deferred(&mut comb_def, &mut z_def, r);
+
+            assert_eq!(e1_eager, e1_def, "e1 mismatch at half2_log={half2_log}");
+            assert_eq!(
+                einf_eager, einf_def,
+                "einf mismatch at half2_log={half2_log}"
+            );
+            assert_eq!(
+                comb_eager, comb_def,
+                "comb side-effect mismatch at half2_log={half2_log}"
+            );
+            assert_eq!(
+                z_eager, z_def,
+                "z side-effect mismatch at half2_log={half2_log}"
+            );
+        }
+    }
+
+    /// Full lincheck prove/verify roundtrip using the deferred-reduction path
+    /// (which is now the default in `prove_padded_inner`). This re-runs the
+    /// same cases as `prove_verify_roundtrip_honest` to confirm transcript
+    /// compatibility.
+    #[test]
+    fn deferred_reduction_lincheck_matches_eager() {
+        for &(m, k_log, k_skip) in &[
+            (10usize, 4, 0),
+            (10, 4, 2),
+            (10, 4, 4),
+            (12, 5, 3),
+            (14, 7, 6),
+            (14, 7, 0),
+        ] {
+            let k = 1usize << k_log;
+            let mut rng = Rng::new(55 + (m * 100 + k_log * 10 + k_skip) as u64);
+
+            let nnz_per_mat = k * 2;
+            let a_0 = random_sparse_matrix(k, nnz_per_mat, &mut rng);
+            let b_0 = random_sparse_matrix(k, nnz_per_mat, &mut rng);
+
+            let z = rng.bits(1 << m);
+            let a = apply_block_diag(&a_0, &z, k_log);
+            let b = apply_block_diag(&b_0, &z, k_log);
+            let z_packed = pack_z_lincheck(&z, m, k_log);
+
+            let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+            let v_a = mle_eval_bool_quirky(&a, m, k_log, k_skip, &x_ab);
+            let v_b = mle_eval_bool_quirky(&b, m, k_log, k_skip, &x_ab);
+
+            let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+            let mut ch_p = FsChallenger::new(b"flock-test-v0");
+            let (proof, claim_p) =
+                prove(&z_packed, m, k_log, k_skip, &circuit, &x_ab, &mut ch_p);
+
+            let mut ch_v = FsChallenger::new(b"flock-test-v0");
+            let claim_v = verify(
+                m, k_log, k_skip, &circuit, &x_ab, v_a, v_b, &proof, &mut ch_v,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "deferred verify rejected honest proof at m={m},k_log={k_log},k_skip={k_skip}: {e:?}"
+                )
+            });
+
+            assert_eq!(
+                claim_p, claim_v,
+                "claim mismatch at m={m}, k_log={k_log}, k_skip={k_skip}"
+            );
+
+            let pt = QuirkyPoint {
+                z_skip: claim_v.r_inner_skip,
+                x_inner_rest: claim_v.r_inner_rest.clone(),
+                x_outer: x_ab.x_outer.clone(),
+            };
+            assert_eq!(
+                claim_v.w,
+                mle_eval_bool_quirky(&z, m, k_log, k_skip, &pt),
+                "w wrong at m={m}, k_log={k_log}, k_skip={k_skip}"
+            );
+        }
+    }
+
+    // ---- Sparse eq_inner correctness ----
+
+    #[test]
+    fn sparse_eq_inner_matches_dense() {
+        for &(k_log, k_skip) in &[
+            (4usize, 0),
+            (4, 2),
+            (6, 3),
+            (8, 4),
+            (10, 6),
+            (15, 6),
+        ] {
+            let k = 1usize << k_log;
+            let mut rng = Rng::new(7700 + k_log as u64 * 100 + k_skip as u64);
+            let x_inner_rest = rng.f128_vec(k_log - k_skip);
+            let z_skip = rng.f128();
+
+            let dense = build_quirky_eq_table(z_skip, &x_inner_rest, k_skip);
+            assert_eq!(dense.len(), k);
+
+            let useful = k / 4;
+            let nnz_per_mat = useful * 2;
+            let a_0 = random_sparse_matrix_in_range(k, useful, nnz_per_mat, &mut rng);
+            let b_0 = random_sparse_matrix_in_range(k, useful, nnz_per_mat, &mut rng);
+
+            let compact = CompactCscCircuit::from_matrices(&a_0, &b_0);
+            let sparse = build_quirky_eq_table_sparse(
+                z_skip,
+                &x_inner_rest,
+                k_skip,
+                &compact.referenced_rows,
+            );
+            assert_eq!(sparse.len(), compact.n_unique_rows());
+
+            for (compact_idx, &orig_row) in compact.referenced_rows.iter().enumerate() {
+                assert_eq!(
+                    sparse[compact_idx], dense[orig_row as usize],
+                    "mismatch at orig_row={orig_row}, k_log={k_log}, k_skip={k_skip}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_csc_fold_matches_dense_csc() {
+        for &(k_log, k_skip) in &[
+            (4usize, 0),
+            (4, 2),
+            (6, 3),
+            (8, 4),
+            (10, 6),
+        ] {
+            let k = 1usize << k_log;
+            let mut rng = Rng::new(8800 + k_log as u64 * 100 + k_skip as u64);
+            let x_inner_rest = rng.f128_vec(k_log - k_skip);
+            let z_skip = rng.f128();
+            let alpha = rng.f128();
+
+            let useful = k / 4;
+            let nnz_per_mat = useful * 2;
+            let a_0 = random_sparse_matrix_in_range(k, useful, nnz_per_mat, &mut rng);
+            let b_0 = random_sparse_matrix_in_range(k, useful, nnz_per_mat, &mut rng);
+
+            let dense_csc = CscCircuit::from_matrices(&a_0, &b_0);
+            let compact = CompactCscCircuit::from_matrices(&a_0, &b_0);
+
+            let eq_inner_dense = build_quirky_eq_table(z_skip, &x_inner_rest, k_skip);
+            let eq_inner_sparse = build_quirky_eq_table_sparse(
+                z_skip,
+                &x_inner_rest,
+                k_skip,
+                &compact.referenced_rows,
+            );
+
+            let comb_dense = dense_csc.fold_alpha_batched(alpha, &eq_inner_dense);
+            let comb_compact = compact.fold_alpha_batched_compact(alpha, &eq_inner_sparse);
+
+            assert_eq!(
+                comb_dense, comb_compact,
+                "fold mismatch at k_log={k_log}, k_skip={k_skip}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_csc_trait_fold_matches_dense() {
+        for &(k_log, k_skip) in &[(4usize, 2), (6, 3), (8, 4)] {
+            let k = 1usize << k_log;
+            let mut rng = Rng::new(9900 + k_log as u64 * 100 + k_skip as u64);
+            let x_inner_rest = rng.f128_vec(k_log - k_skip);
+            let z_skip = rng.f128();
+            let alpha = rng.f128();
+
+            let useful = k / 4;
+            let nnz_per_mat = useful * 2;
+            let a_0 = random_sparse_matrix_in_range(k, useful, nnz_per_mat, &mut rng);
+            let b_0 = random_sparse_matrix_in_range(k, useful, nnz_per_mat, &mut rng);
+
+            let dense_csc = CscCircuit::from_matrices(&a_0, &b_0);
+            let compact = CompactCscCircuit::from_matrices(&a_0, &b_0);
+
+            let eq_inner = build_quirky_eq_table(z_skip, &x_inner_rest, k_skip);
+
+            let comb_dense = dense_csc.fold_alpha_batched(alpha, &eq_inner);
+            let comb_trait = compact.fold_alpha_batched(alpha, &eq_inner);
+
+            assert_eq!(
+                comb_dense, comb_trait,
+                "trait-fold mismatch at k_log={k_log}, k_skip={k_skip}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_csc_prove_verify_roundtrip() {
+        for &(m, k_log, k_skip) in &[
+            (10usize, 4, 2),
+            (12, 5, 3),
+            (14, 7, 6),
+        ] {
+            let k = 1usize << k_log;
+            let mut rng = Rng::new(10100 + (m * 100 + k_log * 10 + k_skip) as u64);
+
+            let useful = k / 3;
+            let nnz_per_mat = useful * 2;
+            let a_0 = random_sparse_matrix_in_range(k, useful, nnz_per_mat, &mut rng);
+            let b_0 = random_sparse_matrix_in_range(k, useful, nnz_per_mat, &mut rng);
+
+            let z = rng.bits(1 << m);
+            let a = apply_block_diag(&a_0, &z, k_log);
+            let b = apply_block_diag(&b_0, &z, k_log);
+            let z_packed = pack_z_lincheck(&z, m, k_log);
+
+            let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+            let v_a = mle_eval_bool_quirky(&a, m, k_log, k_skip, &x_ab);
+            let v_b = mle_eval_bool_quirky(&b, m, k_log, k_skip, &x_ab);
+
+            let compact = CompactCscCircuit::from_matrices(&a_0, &b_0);
+            let mut ch_p = FsChallenger::new(b"flock-test-v0");
+            let (proof, claim_p) =
+                prove(&z_packed, m, k_log, k_skip, &compact, &x_ab, &mut ch_p);
+
+            let mut ch_v = FsChallenger::new(b"flock-test-v0");
+            let claim_v = verify(
+                m, k_log, k_skip, &compact, &x_ab, v_a, v_b, &proof, &mut ch_v,
+            )
+            .unwrap_or_else(|e| {
+                panic!("compact verify rejected at m={m},k_log={k_log},k_skip={k_skip}: {e:?}")
+            });
+
+            assert_eq!(
+                claim_p, claim_v,
+                "claim mismatch at m={m}, k_log={k_log}, k_skip={k_skip}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_eq_inner_speedup_measurement() {
+        let k_log = 15usize;
+        let k_skip = 6usize;
+        let k = 1usize << k_log;
+        let useful = 3094;
+        let mut rng = Rng::new(5555);
+        let x_inner_rest = rng.f128_vec(k_log - k_skip);
+        let z_skip = rng.f128();
+        let alpha = rng.f128();
+
+        let nnz_per_mat = useful * 3;
+        let a_0 = random_sparse_matrix_in_range(k, useful, nnz_per_mat, &mut rng);
+        let b_0 = random_sparse_matrix_in_range(k, useful, nnz_per_mat, &mut rng);
+
+        let dense_csc = CscCircuit::from_matrices(&a_0, &b_0);
+        let compact = CompactCscCircuit::from_matrices(&a_0, &b_0);
+
+        eprintln!(
+            "K={k}, useful_rows={useful}, n_unique_rows={}, a_nnz={}, b_nnz={}",
+            compact.n_unique_rows(),
+            compact.a_rows_compact.len(),
+            compact.b_rows_compact.len(),
+        );
+
+        let n_iter = 50;
+
+        let mut dense_times = Vec::with_capacity(n_iter);
+        for _ in 0..n_iter {
+            let t = std::time::Instant::now();
+            let eq = build_quirky_eq_table(z_skip, &x_inner_rest, k_skip);
+            let _comb = dense_csc.fold_alpha_batched(alpha, &eq);
+            dense_times.push(t.elapsed());
+        }
+
+        let mut sparse_times = Vec::with_capacity(n_iter);
+        for _ in 0..n_iter {
+            let t = std::time::Instant::now();
+            let eq = build_quirky_eq_table_sparse(
+                z_skip,
+                &x_inner_rest,
+                k_skip,
+                &compact.referenced_rows,
+            );
+            let _comb = compact.fold_alpha_batched_compact(alpha, &eq);
+            sparse_times.push(t.elapsed());
+        }
+
+        dense_times.sort();
+        sparse_times.sort();
+
+        let dense_median = dense_times[n_iter / 2].as_secs_f64() * 1e3;
+        let sparse_median = sparse_times[n_iter / 2].as_secs_f64() * 1e3;
+        let speedup = dense_median / sparse_median;
+
+        eprintln!(
+            "  dense  (build_quirky_eq + fold): median {dense_median:.3} ms"
+        );
+        eprintln!(
+            "  sparse (build_sparse + fold_compact): median {sparse_median:.3} ms"
+        );
+        eprintln!("  speedup: {speedup:.2}x");
+        eprintln!(
+            "  savings: {:.3} ms ({:.1}%)",
+            dense_median - sparse_median,
+            (1.0 - sparse_median / dense_median) * 100.0
+        );
+    }
+
+    fn random_sparse_matrix_in_range(
+        k: usize,
+        useful_rows: usize,
+        nnz: usize,
+        rng: &mut Rng,
+    ) -> SparseBinaryMatrix {
+        let mut rows: Vec<Vec<usize>> = vec![Vec::new(); k];
+        let mut seen = std::collections::HashSet::new();
+        let mut count = 0;
+        while count < nnz {
+            let r = (rng.next_u64() as usize) % useful_rows;
+            let c = (rng.next_u64() as usize) % k;
+            if seen.insert((r, c)) {
+                rows[r].push(c);
+                count += 1;
+            }
+        }
+        for row in &mut rows {
+            row.sort();
+        }
+        SparseBinaryMatrix {
+            num_rows: k,
+            num_cols: k,
+            rows,
+        }
     }
 }

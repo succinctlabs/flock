@@ -663,6 +663,33 @@ pub mod x86_simd {
         }
     }
 
+    /// Karatsuba 3-PCLMULQDQ variant: computes the full reduced F128 product
+    /// using 3 carry-less multiplies instead of schoolbook's 4.
+    #[inline]
+    pub fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
+        let u = ghash_mul_karatsuba_unreduced(a, b);
+        ghash_reduce(u.r0, u.r1, u.r2, u.r3)
+    }
+
+    /// Karatsuba 3-PCLMULQDQ unreduced: returns the 256-bit product
+    /// without mod-p reduction.
+    #[inline]
+    pub fn ghash_mul_karatsuba_unreduced(a: F128, b: F128) -> F256Unreduced {
+        let a_xor = a.lo ^ a.hi;
+        let b_xor = b.lo ^ b.hi;
+        let (ll_lo, ll_hi) = clmul64(a.lo, b.lo);
+        let (hh_lo, hh_hi) = clmul64(a.hi, b.hi);
+        let (mid_lo, mid_hi) = clmul64(a_xor, b_xor);
+        let cr_lo = mid_lo ^ ll_lo ^ hh_lo;
+        let cr_hi = mid_hi ^ ll_hi ^ hh_hi;
+        F256Unreduced {
+            r0: ll_lo,
+            r1: ll_hi ^ cr_lo,
+            r2: hh_lo ^ cr_hi,
+            r3: hh_hi,
+        }
+    }
+
     /// Runtime check for the VPCLMULQDQ feature (needed by vec2/vec4).
     #[inline]
     pub fn has_vpclmulqdq() -> bool {
@@ -1014,5 +1041,81 @@ mod tests {
             assert_eq!(r[0], gamma * high, "gamma * high");
             assert_eq!(r[1], high * high, "high * high");
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn karatsuba_matches_schoolbook() {
+        let mut rng = Rng::new(42);
+        for _ in 0..1000 {
+            let a = rng.next_f128();
+            let b = rng.next_f128();
+            let schoolbook = x86_simd::ghash_mul(a, b);
+            let karatsuba = x86_simd::ghash_mul_karatsuba(a, b);
+            assert_eq!(schoolbook, karatsuba, "mismatch for a={a:?}, b={b:?}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn karatsuba_unreduced_matches_schoolbook_unreduced() {
+        let mut rng = Rng::new(43);
+        for _ in 0..1000 {
+            let a = rng.next_f128();
+            let b = rng.next_f128();
+            let sb = x86_simd::ghash_mul_unreduced(a, b);
+            let ka = x86_simd::ghash_mul_karatsuba_unreduced(a, b);
+            assert_eq!(sb, ka, "unreduced mismatch for a={a:?}, b={b:?}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn karatsuba_edge_cases() {
+        let one = F128::ONE;
+        let zero = F128::ZERO;
+        let gamma = F128::generator();
+        let high = F128 { lo: 0, hi: 1u64 << 63 };
+        let max = F128 { lo: u64::MAX, hi: u64::MAX };
+
+        assert_eq!(x86_simd::ghash_mul_karatsuba(one, gamma), gamma);
+        assert_eq!(x86_simd::ghash_mul_karatsuba(zero, gamma), zero);
+        assert_eq!(x86_simd::ghash_mul_karatsuba(high, high), high * high);
+        assert_eq!(x86_simd::ghash_mul_karatsuba(max, max), max * max);
+        assert_eq!(x86_simd::ghash_mul_karatsuba(gamma, high), gamma * high);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn karatsuba_microbench() {
+        let mut rng = Rng::new(99);
+        let n = 10_000_000usize;
+        let pairs: Vec<(F128, F128)> = (0..64).map(|_| (rng.next_f128(), rng.next_f128())).collect();
+
+        // Schoolbook
+        let start = std::time::Instant::now();
+        let mut acc_sb = F128::ZERO;
+        for i in 0..n {
+            let (a, b) = pairs[i & 63];
+            acc_sb += x86_simd::ghash_mul(a, b);
+        }
+        let sb_elapsed = start.elapsed();
+
+        // Karatsuba
+        let start = std::time::Instant::now();
+        let mut acc_ka = F128::ZERO;
+        for i in 0..n {
+            let (a, b) = pairs[i & 63];
+            acc_ka += x86_simd::ghash_mul_karatsuba(a, b);
+        }
+        let ka_elapsed = start.elapsed();
+
+        assert_eq!(acc_sb, acc_ka, "accumulators must match");
+        let sb_ns = sb_elapsed.as_nanos() as f64 / n as f64;
+        let ka_ns = ka_elapsed.as_nanos() as f64 / n as f64;
+        eprintln!("F128 mul x86 microbench ({n} muls):");
+        eprintln!("  schoolbook (4 PCLMUL): {sb_ns:.2} ns/mul");
+        eprintln!("  karatsuba  (3 PCLMUL): {ka_ns:.2} ns/mul");
+        eprintln!("  ratio (sb/ka):         {:.3}x", sb_ns / ka_ns);
     }
 }

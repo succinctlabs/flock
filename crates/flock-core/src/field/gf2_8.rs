@@ -218,6 +218,220 @@ pub mod neon {
     }
 }
 
+// ---------------------------------------------------------------------------
+// x86_64 AVX2 helpers: 32-lane GF(2^8) operations.
+//
+// Two functions:
+//   gf8_mul_vec32_x86  — scalar × vector (VPSHUFB split-nibble lookup)
+//   gf8_mul_vec32_x86_ew — element-wise vector × vector (bitsliced schoolbook)
+//
+// Both require AVX2. The split-nibble lookup (scalar×vector) uses two
+// precomputed 16-entry tables T_lo[i] = a*i mod p, T_hi[i] = a*(i<<4) mod p,
+// then VPSHUFB does 32 parallel lookups per table.
+//
+// The element-wise multiply decomposes each lane's multiply into the
+// schoolbook form: accumulate (bit_j(a) AND b) << j, with inline modular
+// reduction (xtime) at each step to keep the intermediate in 8 bits.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+pub mod x86 {
+    use super::{F8, gf8_reduce};
+
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    /// Scalar-by-vector GF(2^8) multiply: compute `a_scalar * b[i]` for 32 lanes.
+    ///
+    /// Uses VPSHUFB split-nibble lookup: decompose each b[i] into low/high nibbles,
+    /// look up `a * nibble_val` from precomputed tables, XOR the halves.
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn gf8_mul_vec32_x86(a_scalar: u8, b: &[u8; 32]) -> [u8; 32] {
+        unsafe {
+            // Build the two 16-entry lookup tables.
+            let mut tbl_lo = [0u8; 16];
+            let mut tbl_hi = [0u8; 16];
+            for i in 0u8..16 {
+                tbl_lo[i as usize] = (F8(a_scalar) * F8(i)).0;
+                tbl_hi[i as usize] = (F8(a_scalar) * F8(i << 4)).0;
+            }
+
+            // Broadcast each 16-byte table into both 128-bit lanes of a __m256i.
+            // VPSHUFB operates independently on each 128-bit lane, so both lanes
+            // need identical table contents.
+            let tlo = _mm256_broadcastsi128_si256(_mm_loadu_si128(tbl_lo.as_ptr() as *const _));
+            let thi = _mm256_broadcastsi128_si256(_mm_loadu_si128(tbl_hi.as_ptr() as *const _));
+
+            let bv = _mm256_loadu_si256(b.as_ptr() as *const _);
+            let nibble_mask = _mm256_set1_epi8(0x0F);
+
+            let b_lo = _mm256_and_si256(bv, nibble_mask);
+            let b_hi = _mm256_and_si256(_mm256_srli_epi16(bv, 4), nibble_mask);
+
+            let r_lo = _mm256_shuffle_epi8(tlo, b_lo);
+            let r_hi = _mm256_shuffle_epi8(thi, b_hi);
+
+            let result = _mm256_xor_si256(r_lo, r_hi);
+            let mut out = [0u8; 32];
+            _mm256_storeu_si256(out.as_mut_ptr() as *mut _, result);
+            out
+        }
+    }
+
+    /// Element-wise GF(2^8) multiply: compute `a[i] * b[i]` for 32 lanes.
+    ///
+    /// Uses bitsliced schoolbook multiplication with inline xtime reduction.
+    /// At each step j (0..7), if bit j of a[i] is set, XOR the running product
+    /// of b into the accumulator. Then apply xtime (multiply b by x, reducing
+    /// mod the AES polynomial x^8+x^4+x^3+x+1).
+    ///
+    /// This avoids the need for wide (16-bit) intermediates by reducing after
+    /// every shift.
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn gf8_mul_vec32_x86_ew(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+        unsafe {
+            let av = _mm256_loadu_si256(a.as_ptr() as *const _);
+            let bv = _mm256_loadu_si256(b.as_ptr() as *const _);
+
+            let poly = _mm256_set1_epi8(0x1Bu8 as i8); // x^4+x^3+x+1
+            let zero = _mm256_setzero_si256();
+            let one_bit = _mm256_set1_epi8(1);
+
+            let mut acc = zero;
+            let mut shifted_b = bv; // b * x^j at step j
+
+            // Bit 0: if a[i] & 1, XOR b into acc.
+            let mask0 = _mm256_cmpeq_epi8(
+                _mm256_and_si256(av, one_bit),
+                one_bit,
+            );
+            acc = _mm256_xor_si256(acc, _mm256_and_si256(mask0, shifted_b));
+
+            // Bits 1..7: xtime shifted_b, then conditionally XOR.
+            macro_rules! do_bit {
+                ($bit:expr) => {{
+                    // xtime: shifted_b = (shifted_b << 1) ^ (0x1B if high bit was set)
+                    let high_bits = _mm256_cmpgt_epi8(zero, shifted_b); // -1 if byte >= 0x80
+                    let sb_shifted = _mm256_add_epi8(shifted_b, shifted_b); // << 1 (mod 256)
+                    let reduce = _mm256_and_si256(high_bits, poly);
+                    shifted_b = _mm256_xor_si256(sb_shifted, reduce);
+
+                    // Extract bit $bit of each a[i]: shift right, mask, compare.
+                    let a_bit = _mm256_and_si256(
+                        _mm256_srli_epi16(av, $bit),
+                        one_bit,
+                    );
+                    let mask = _mm256_cmpeq_epi8(a_bit, one_bit);
+                    acc = _mm256_xor_si256(acc, _mm256_and_si256(mask, shifted_b));
+                }};
+            }
+            do_bit!(1);
+            do_bit!(2);
+            do_bit!(3);
+            do_bit!(4);
+            do_bit!(5);
+            do_bit!(6);
+            do_bit!(7);
+
+            let mut out = [0u8; 32];
+            _mm256_storeu_si256(out.as_mut_ptr() as *mut _, acc);
+            out
+        }
+    }
+
+    /// 32-lane GF(2^8) modular reduction: reduce 32 u16 values (stored as
+    /// interleaved low/high byte vectors) modulo x^8+x^4+x^3+x+1.
+    ///
+    /// Input: `lo` contains the low bytes, `hi` contains the high bytes of the
+    /// 15-bit carry-less products. Output: 32 reduced GF(2^8) bytes.
+    ///
+    /// Uses VPSHUFB split-nibble lookup for the reduction polynomial multiply.
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn gf8_reduce_vec32(lo: __m256i, hi: __m256i) -> __m256i {
+        unsafe {
+            // h folds back as: h ^ (h<<1) ^ (h<<3) ^ (h<<4)
+            // This can overflow into bits 8..11, needing a second fold.
+            // Use VPSHUFB: build a 16-entry table for the fold of each nibble of h.
+
+            // Stage 1: fold h (7 bits max) into lo.
+            // For each possible h (0..127), fold(h) = h ^ (h<<1) ^ (h<<3) ^ (h<<4).
+            // The result is at most 12 bits. We keep the low byte and the carry.
+            // But h is at most 7 bits (degree 14 product → 7 high bits), so h in 0..127.
+            // fold(h) fits in 12 bits; the low 8 bits XOR into lo, bits 8..11 need second fold.
+
+            // Build tables: for nibble values 0..15, compute the fold contribution.
+            // T_lo_nib[i] = fold(i) & 0xFF, T_hi_nib[i] = fold(i<<4) & 0xFFFF split into lo/hi bytes.
+            // But fold(h) = h ^ (h<<1) ^ (h<<3) ^ (h<<4) where h is 7-bit.
+            // We split h into h_lo (bits 0..3) and h_hi (bits 4..6).
+            // fold is linear in GF(2), so fold(h) = fold(h_lo) ^ fold(h_hi << 4).
+
+            let mut tbl_lo_lo = [0u8; 16]; // fold(i) low byte, for i = low nibble of h
+            let mut tbl_lo_hi = [0u8; 16]; // fold(i) high byte
+            let mut tbl_hi_lo = [0u8; 16]; // fold(i<<4) low byte
+            let mut tbl_hi_hi = [0u8; 16]; // fold(i<<4) high byte
+
+            for i in 0u16..16 {
+                let f1 = i ^ (i << 1) ^ (i << 3) ^ (i << 4);
+                tbl_lo_lo[i as usize] = (f1 & 0xFF) as u8;
+                tbl_lo_hi[i as usize] = ((f1 >> 8) & 0xFF) as u8;
+
+                let ih = i << 4;
+                let f2 = ih ^ (ih << 1) ^ (ih << 3) ^ (ih << 4);
+                tbl_hi_lo[i as usize] = (f2 & 0xFF) as u8;
+                tbl_hi_hi[i as usize] = ((f2 >> 8) & 0xFF) as u8;
+            }
+
+            let t_lo_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(tbl_lo_lo.as_ptr() as *const _));
+            let t_lo_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(tbl_lo_hi.as_ptr() as *const _));
+            let t_hi_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(tbl_hi_lo.as_ptr() as *const _));
+            let t_hi_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(tbl_hi_hi.as_ptr() as *const _));
+
+            let nibble_mask = _mm256_set1_epi8(0x0F);
+            let h_lo_nib = _mm256_and_si256(hi, nibble_mask);
+            let h_hi_nib = _mm256_and_si256(_mm256_srli_epi16(hi, 4), nibble_mask);
+
+            // Stage-1 fold: 16-bit result split into lo/hi parts.
+            let fold_lo = _mm256_xor_si256(
+                _mm256_shuffle_epi8(t_lo_lo, h_lo_nib),
+                _mm256_shuffle_epi8(t_hi_lo, h_hi_nib),
+            );
+            let fold_hi = _mm256_xor_si256(
+                _mm256_shuffle_epi8(t_lo_hi, h_lo_nib),
+                _mm256_shuffle_epi8(t_hi_hi, h_hi_nib),
+            );
+
+            // XOR fold low byte into lo to get stage-1 result low byte.
+            let s1_lo = _mm256_xor_si256(lo, fold_lo);
+
+            // Stage 2: fold_hi has bits 8..11 (at most 4 bits). Apply same reduction.
+            // For 4-bit h2, fold(h2) is at most 12 bits, but since h2 < 16, the
+            // high bits after fold are at most 4 more bits. For h2 in 0..15:
+            // fold(h2) = h2 ^ (h2<<1) ^ (h2<<3) ^ (h2<<4), max 8 bits for h2<8.
+            // Actually h2 can be up to 0x0F. fold(0x0F) = 0x0F ^ 0x1E ^ 0x78 ^ 0xF0 = 0x81.
+            // So stage-2 result fits in 8 bits.
+            let mut tbl_s2 = [0u8; 16];
+            for i in 0u16..16 {
+                let f = i ^ (i << 1) ^ (i << 3) ^ (i << 4);
+                tbl_s2[i as usize] = (f & 0xFF) as u8;
+                // Verify no overflow: assert f < 256
+            }
+            let t_s2 = _mm256_broadcastsi128_si256(_mm_loadu_si128(tbl_s2.as_ptr() as *const _));
+            let s2_fold = _mm256_shuffle_epi8(t_s2, fold_hi);
+
+            _mm256_xor_si256(s1_lo, s2_fold)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +569,140 @@ mod tests {
             };
             let result: [u8; 16] = unsafe { transmute(result_vec) };
             assert_eq!(result, expected, "a={:02x?}, b={:02x?}", a_arr, b_arr);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn gf8_vpshufb_matches_scalar() {
+        // Exhaustive: for all 256 × 256 input pairs, VPSHUFB scalar×vector
+        // must match the scalar reference.
+        for a_val in 0u16..=255 {
+            let a = a_val as u8;
+            // Process b in batches of 32.
+            let mut b_arr = [0u8; 32];
+            for b_base in (0u16..=255).step_by(32) {
+                for j in 0..32u16 {
+                    let bv = b_base + j;
+                    b_arr[j as usize] = if bv <= 255 { bv as u8 } else { 0 };
+                }
+                let result = unsafe { super::x86::gf8_mul_vec32_x86(a, &b_arr) };
+                for j in 0..32u16 {
+                    let bv = b_base + j;
+                    if bv <= 255 {
+                        let expected = (F8(a) * F8(bv as u8)).0;
+                        assert_eq!(
+                            result[j as usize], expected,
+                            "gf8_mul_vec32_x86 mismatch: a=0x{a:02x}, b=0x{:02x}",
+                            bv as u8
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn gf8_mul_vec32_x86_matches_scalar() {
+        // 32 random pairs, batch multiply, check each matches scalar.
+        let mut rng = Rng::new(0xABCD1234);
+        for _ in 0..512 {
+            let a_scalar = (rng.next_u64() & 0xff) as u8;
+            let mut b_arr = [0u8; 32];
+            for j in 0..32 {
+                b_arr[j] = (rng.next_u64() & 0xff) as u8;
+            }
+            let result = unsafe { super::x86::gf8_mul_vec32_x86(a_scalar, &b_arr) };
+            for j in 0..32 {
+                let expected = (F8(a_scalar) * F8(b_arr[j])).0;
+                assert_eq!(
+                    result[j], expected,
+                    "scalar×vec mismatch: a=0x{a_scalar:02x}, b[{j}]=0x{:02x}",
+                    b_arr[j]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn gf8_mul_vec32_ew_x86_matches_scalar() {
+        // Element-wise: 32 random pairs, verify against scalar F8 mul.
+        let mut rng = Rng::new(0xF00DCAFE);
+        for _ in 0..512 {
+            let mut a_arr = [0u8; 32];
+            let mut b_arr = [0u8; 32];
+            for j in 0..32 {
+                a_arr[j] = (rng.next_u64() & 0xff) as u8;
+                b_arr[j] = (rng.next_u64() & 0xff) as u8;
+            }
+            let result = unsafe { super::x86::gf8_mul_vec32_x86_ew(&a_arr, &b_arr) };
+            for j in 0..32 {
+                let expected = (F8(a_arr[j]) * F8(b_arr[j])).0;
+                assert_eq!(
+                    result[j], expected,
+                    "ew mismatch at lane {j}: a=0x{:02x}, b=0x{:02x}",
+                    a_arr[j], b_arr[j]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn gf8_mul_vec32_ew_x86_exhaustive_sample() {
+        // Sample 256 a-values × 32 random b-values each for broader coverage.
+        let mut rng = Rng::new(0xBEEFBEEF);
+        for a_val in 0u8..=255 {
+            let mut a_arr = [a_val; 32];
+            let mut b_arr = [0u8; 32];
+            for j in 0..32 {
+                b_arr[j] = (rng.next_u64() & 0xff) as u8;
+                a_arr[j] = a_val; // keep constant for this row
+            }
+            let result = unsafe { super::x86::gf8_mul_vec32_x86_ew(&a_arr, &b_arr) };
+            for j in 0..32 {
+                let expected = (F8(a_val) * F8(b_arr[j])).0;
+                assert_eq!(
+                    result[j], expected,
+                    "ew-exhaust mismatch: a=0x{a_val:02x}, b=0x{:02x}",
+                    b_arr[j]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn gf8_reduce_vec32_matches_scalar() {
+        // Verify vectorized reduction against the scalar gf8_reduce.
+        let mut rng = Rng::new(0xDEAD5678);
+        for _ in 0..1024 {
+            let mut lo_arr = [0u8; 32];
+            let mut hi_arr = [0u8; 32];
+            for j in 0..32 {
+                let val = (rng.next_u64() & 0x7FFF) as u16; // 15-bit product
+                lo_arr[j] = (val & 0xFF) as u8;
+                hi_arr[j] = ((val >> 8) & 0xFF) as u8;
+            }
+            let result = unsafe {
+                use core::arch::x86_64::*;
+                let lo = _mm256_loadu_si256(lo_arr.as_ptr() as *const _);
+                let hi = _mm256_loadu_si256(hi_arr.as_ptr() as *const _);
+                let r = super::x86::gf8_reduce_vec32(lo, hi);
+                let mut out = [0u8; 32];
+                _mm256_storeu_si256(out.as_mut_ptr() as *mut _, r);
+                out
+            };
+            for j in 0..32 {
+                let val = (lo_arr[j] as u16) | ((hi_arr[j] as u16) << 8);
+                let expected = gf8_reduce(val);
+                assert_eq!(
+                    result[j], expected,
+                    "reduce mismatch at lane {j}: val=0x{val:04x}"
+                );
+            }
         }
     }
 
