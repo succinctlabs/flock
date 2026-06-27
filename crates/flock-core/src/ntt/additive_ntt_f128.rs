@@ -205,16 +205,7 @@ impl AdditiveNttF128 {
         assert!(log_d <= self.log_domain_size());
         assert!(start_layer <= log_d);
 
-        // Scalar; SIMD/parallel variants below dispatch from `forward_transform_interleaved`
-        // on supported targets.
-        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-        {
-            self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, start_layer);
-        }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-        {
-            self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
-        }
+        self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, start_layer);
     }
 
     /// Scalar reference for the interleaved forward NTT.
@@ -265,14 +256,12 @@ impl AdditiveNttF128 {
     /// inputs to avoid rayon overhead; for large inputs it uses an in-place
     /// scalar butterfly per lane (per-lane vectorization is future work — the
     /// big win at large `m` is cache locality + thread parallelism).
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     pub fn forward_transform_interleaved_parallel(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, 0);
     }
 
     /// Parallel interleaved forward NTT from `start_layer` (see
     /// [`Self::forward_transform_interleaved_from_layer`]).
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     pub fn forward_transform_interleaved_parallel_from_layer(
         &self,
         data: &mut [F128],
