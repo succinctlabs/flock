@@ -136,13 +136,87 @@ fn butterfly_par(data: &mut [F128], lambda: F128, num_ntts: usize) {
         .for_each(|(t, b)| butterfly_row_pair_neon(t, b, lambda));
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
+unsafe fn butterfly_row_pair_x86(top_row: &mut [F128], bot_row: &mut [F128], lambda: F128) {
+    use crate::field::gf2_128::x86_simd::ghash_mul_vec2_x86;
+
+    debug_assert_eq!(top_row.len(), bot_row.len());
+    let num_ntts = top_row.len();
+    // SAFETY: avx2+vpclmulqdq enabled by target_feature on this function.
+    unsafe {
+        let mut lane = 0usize;
+        while lane < num_ntts {
+            let t0 = top_row[lane];
+            let t1 = top_row[lane + 1];
+            let b0 = bot_row[lane];
+            let b1 = bot_row[lane + 1];
+
+            let prod = ghash_mul_vec2_x86([lambda, lambda], [b0, b1]);
+
+            let new_t0 = F128 {
+                lo: t0.lo ^ prod[0].lo,
+                hi: t0.hi ^ prod[0].hi,
+            };
+            let new_t1 = F128 {
+                lo: t1.lo ^ prod[1].lo,
+                hi: t1.hi ^ prod[1].hi,
+            };
+            let new_b0 = F128 {
+                lo: b0.lo ^ new_t0.lo,
+                hi: b0.hi ^ new_t0.hi,
+            };
+            let new_b1 = F128 {
+                lo: b1.lo ^ new_t1.lo,
+                hi: b1.hi ^ new_t1.hi,
+            };
+
+            top_row[lane] = new_t0;
+            top_row[lane + 1] = new_t1;
+            bot_row[lane] = new_b0;
+            bot_row[lane + 1] = new_b1;
+
+            lane += 2;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn butterfly_x86(data: &mut [F128], lambda: F128, num_ntts: usize) {
+    let rows = data.len() / num_ntts;
+    let half = rows >> 1;
+    let half_offset = half * num_ntts;
+    let (top, bot) = data.split_at_mut(half_offset);
+    for row in 0..half {
+        let off = row * num_ntts;
+        let top_row = &mut top[off..off + num_ntts];
+        let bot_row = &mut bot[off..off + num_ntts];
+        // SAFETY: caller checks VPCLMULQDQ availability before entering the
+        // x86 path (see `butterfly` dispatch below).
+        unsafe { butterfly_row_pair_x86(top_row, bot_row, lambda) };
+    }
+}
+
 #[inline]
 fn butterfly(data: &mut [F128], lambda: F128, num_ntts: usize) {
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     {
         butterfly_neon(data, lambda, num_ntts);
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    #[cfg(all(target_arch = "x86_64", not(all(target_arch = "aarch64", target_feature = "aes"))))]
+    {
+        if crate::field::gf2_128::x86_simd::has_vpclmulqdq() {
+            butterfly_x86(data, lambda, num_ntts);
+        } else {
+            butterfly_scalar(data, lambda, num_ntts);
+        }
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        target_arch = "x86_64",
+    )))]
     {
         butterfly_scalar(data, lambda, num_ntts);
     }

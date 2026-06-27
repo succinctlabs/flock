@@ -536,6 +536,144 @@ pub mod x86_simd {
         let u = ghash_mul_unreduced(a, b);
         ghash_reduce(u.r0, u.r1, u.r2, u.r3)
     }
+
+    /// 2-wide F128 multiply using AVX2 VPCLMULQDQ.
+    ///
+    /// `_mm256_clmulepi64_epi128` performs two independent 64x64 carry-less
+    /// multiplies (one per 128-bit lane). Four such instructions give the
+    /// full schoolbook product for both F128 multiplies; the four unreduced
+    /// 64-bit words per product are then extracted and reduced via the
+    /// scalar `ghash_reduce`.
+    ///
+    /// # Safety
+    /// Caller must ensure `avx2` and `vpclmulqdq` are available.
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    pub unsafe fn ghash_mul_vec2_x86(a: [F128; 2], b: [F128; 2]) -> [F128; 2] {
+        // SAFETY: caller ensures avx2+vpclmulqdq are available.
+        unsafe {
+            // Pack: lane0 = elem[0], lane1 = elem[1]. Within each 128-bit
+            // lane the layout is [lo64, hi64].
+            let va = _mm256_set_epi64x(
+                a[1].hi as i64, a[1].lo as i64,
+                a[0].hi as i64, a[0].lo as i64,
+            );
+            let vb = _mm256_set_epi64x(
+                b[1].hi as i64, b[1].lo as i64,
+                b[0].hi as i64, b[0].lo as i64,
+            );
+
+            // IMM8 bits: bit0 selects a's half, bit4 selects b's half.
+            let p_ll = _mm256_clmulepi64_epi128(va, vb, 0x00); // lo*lo
+            let p_lh = _mm256_clmulepi64_epi128(va, vb, 0x10); // lo*hi
+            let p_hl = _mm256_clmulepi64_epi128(va, vb, 0x01); // hi*lo
+            let p_hh = _mm256_clmulepi64_epi128(va, vb, 0x11); // hi*hi
+
+            let cross = _mm256_xor_si256(p_lh, p_hl);
+
+            // Per-lane unreduced product: r0=ll.lo, r1=ll.hi^cr.lo,
+            // r2=hh.lo^cr.hi, r3=hh.hi. Extract via 128-bit lane split,
+            // then scalar reduce.
+            let ll_0 = _mm256_castsi256_si128(p_ll);
+            let ll_1 = _mm256_extracti128_si256(p_ll, 1);
+            let hh_0 = _mm256_castsi256_si128(p_hh);
+            let hh_1 = _mm256_extracti128_si256(p_hh, 1);
+            let cr_0 = _mm256_castsi256_si128(cross);
+            let cr_1 = _mm256_extracti128_si256(cross, 1);
+
+            let r0_0 = _mm_extract_epi64(ll_0, 0) as u64;
+            let r1_0 = (_mm_extract_epi64(ll_0, 1) as u64) ^ (_mm_extract_epi64(cr_0, 0) as u64);
+            let r2_0 = (_mm_extract_epi64(hh_0, 0) as u64) ^ (_mm_extract_epi64(cr_0, 1) as u64);
+            let r3_0 = _mm_extract_epi64(hh_0, 1) as u64;
+
+            let r0_1 = _mm_extract_epi64(ll_1, 0) as u64;
+            let r1_1 = (_mm_extract_epi64(ll_1, 1) as u64) ^ (_mm_extract_epi64(cr_1, 0) as u64);
+            let r2_1 = (_mm_extract_epi64(hh_1, 0) as u64) ^ (_mm_extract_epi64(cr_1, 1) as u64);
+            let r3_1 = _mm_extract_epi64(hh_1, 1) as u64;
+
+            [
+                ghash_reduce(r0_0, r1_0, r2_0, r3_0),
+                ghash_reduce(r0_1, r1_1, r2_1, r3_1),
+            ]
+        }
+    }
+
+    /// 4-wide F128 multiply using AVX-512 VPCLMULQDQ.
+    ///
+    /// `_mm512_clmulepi64_epi128` performs four independent 64x64 carry-less
+    /// multiplies (one per 128-bit lane). Four instructions give the full
+    /// schoolbook product for all 4 F128 multiplies; then scalar reduction.
+    ///
+    /// # Safety
+    /// Caller must ensure `avx512f`, `avx512vl`, and `vpclmulqdq` are available.
+    #[target_feature(enable = "avx512f,avx512vl,vpclmulqdq")]
+    pub unsafe fn ghash_mul_vec4_x86(a: [F128; 4], b: [F128; 4]) -> [F128; 4] {
+        // SAFETY: caller ensures avx512f+avx512vl+vpclmulqdq are available.
+        unsafe {
+            let va = _mm512_set_epi64(
+                a[3].hi as i64, a[3].lo as i64,
+                a[2].hi as i64, a[2].lo as i64,
+                a[1].hi as i64, a[1].lo as i64,
+                a[0].hi as i64, a[0].lo as i64,
+            );
+            let vb = _mm512_set_epi64(
+                b[3].hi as i64, b[3].lo as i64,
+                b[2].hi as i64, b[2].lo as i64,
+                b[1].hi as i64, b[1].lo as i64,
+                b[0].hi as i64, b[0].lo as i64,
+            );
+
+            let p_ll = _mm512_clmulepi64_epi128(va, vb, 0x00);
+            let p_lh = _mm512_clmulepi64_epi128(va, vb, 0x10);
+            let p_hl = _mm512_clmulepi64_epi128(va, vb, 0x01);
+            let p_hh = _mm512_clmulepi64_epi128(va, vb, 0x11);
+
+            let cross = _mm512_xor_si512(p_lh, p_hl);
+
+            // Extract each 128-bit lane, build unreduced words, reduce.
+            let ll_0 = _mm512_castsi512_si128(p_ll);
+            let ll_1 = _mm512_extracti64x2_epi64(p_ll, 1);
+            let ll_2 = _mm512_extracti64x2_epi64(p_ll, 2);
+            let ll_3 = _mm512_extracti64x2_epi64(p_ll, 3);
+            let hh_0 = _mm512_castsi512_si128(p_hh);
+            let hh_1 = _mm512_extracti64x2_epi64(p_hh, 1);
+            let hh_2 = _mm512_extracti64x2_epi64(p_hh, 2);
+            let hh_3 = _mm512_extracti64x2_epi64(p_hh, 3);
+            let cr_0 = _mm512_castsi512_si128(cross);
+            let cr_1 = _mm512_extracti64x2_epi64(cross, 1);
+            let cr_2 = _mm512_extracti64x2_epi64(cross, 2);
+            let cr_3 = _mm512_extracti64x2_epi64(cross, 3);
+
+            macro_rules! reduce_lane {
+                ($ll:expr, $hh:expr, $cr:expr) => {{
+                    ghash_reduce(
+                        _mm_extract_epi64($ll, 0) as u64,
+                        (_mm_extract_epi64($ll, 1) as u64) ^ (_mm_extract_epi64($cr, 0) as u64),
+                        (_mm_extract_epi64($hh, 0) as u64) ^ (_mm_extract_epi64($cr, 1) as u64),
+                        _mm_extract_epi64($hh, 1) as u64,
+                    )
+                }};
+            }
+
+            [
+                reduce_lane!(ll_0, hh_0, cr_0),
+                reduce_lane!(ll_1, hh_1, cr_1),
+                reduce_lane!(ll_2, hh_2, cr_2),
+                reduce_lane!(ll_3, hh_3, cr_3),
+            ]
+        }
+    }
+
+    /// Runtime check for the VPCLMULQDQ feature (needed by vec2/vec4).
+    #[inline]
+    pub fn has_vpclmulqdq() -> bool {
+        std::is_x86_feature_detected!("vpclmulqdq")
+    }
+
+    /// Runtime check for AVX-512F (needed by vec4).
+    #[inline]
+    pub fn has_avx512f() -> bool {
+        std::is_x86_feature_detected!("avx512f")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -804,6 +942,77 @@ mod tests {
             assert_eq!(sw, ka);
             assert_eq!(sw, kb);
             assert_eq!(sw, bi);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_vec2_matches_scalar() {
+        if !x86_simd::has_vpclmulqdq() {
+            eprintln!("VPCLMULQDQ not available, skipping x86_vec2_matches_scalar");
+            return;
+        }
+        let mut rng = Rng::new(12);
+        for _ in 0..256 {
+            let a0 = rng.next_f128();
+            let a1 = rng.next_f128();
+            let b0 = rng.next_f128();
+            let b1 = rng.next_f128();
+            let expected = [a0 * b0, a1 * b1];
+            // SAFETY: VPCLMULQDQ availability checked above.
+            let result = unsafe { x86_simd::ghash_mul_vec2_x86([a0, a1], [b0, b1]) };
+            assert_eq!(result[0], expected[0], "vec2 lane 0");
+            assert_eq!(result[1], expected[1], "vec2 lane 1");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_vec4_matches_scalar() {
+        if !x86_simd::has_vpclmulqdq() || !x86_simd::has_avx512f() {
+            eprintln!("VPCLMULQDQ or AVX-512F not available, skipping x86_vec4_matches_scalar");
+            return;
+        }
+        let mut rng = Rng::new(13);
+        for _ in 0..256 {
+            let a: [F128; 4] = [
+                rng.next_f128(), rng.next_f128(),
+                rng.next_f128(), rng.next_f128(),
+            ];
+            let b: [F128; 4] = [
+                rng.next_f128(), rng.next_f128(),
+                rng.next_f128(), rng.next_f128(),
+            ];
+            let expected = [a[0] * b[0], a[1] * b[1], a[2] * b[2], a[3] * b[3]];
+            // SAFETY: VPCLMULQDQ + AVX-512F availability checked above.
+            let result = unsafe { x86_simd::ghash_mul_vec4_x86(a, b) };
+            for i in 0..4 {
+                assert_eq!(result[i], expected[i], "vec4 lane {i}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_vec2_edge_cases() {
+        if !x86_simd::has_vpclmulqdq() {
+            eprintln!("VPCLMULQDQ not available, skipping x86_vec2_edge_cases");
+            return;
+        }
+        let one = F128::ONE;
+        let zero = F128::ZERO;
+        let gamma = F128::generator();
+        let high = F128 { lo: 0, hi: 1u64 << 63 };
+
+        // SAFETY: VPCLMULQDQ availability checked above.
+        unsafe {
+            let r = x86_simd::ghash_mul_vec2_x86([one, zero], [gamma, gamma]);
+            assert_eq!(r[0], gamma, "1 * gamma");
+            assert_eq!(r[1], zero, "0 * gamma");
+
+            let r = x86_simd::ghash_mul_vec2_x86([gamma, high], [high, high]);
+            assert_eq!(r[0], gamma * high, "gamma * high");
+            assert_eq!(r[1], high * high, "high * high");
         }
     }
 }

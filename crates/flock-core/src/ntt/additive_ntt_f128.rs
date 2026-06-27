@@ -146,7 +146,18 @@ impl AdditiveNttF128 {
         {
             self.forward_transform_batched(data);
         }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        #[cfg(all(target_arch = "x86_64", not(all(target_arch = "aarch64", target_feature = "aes"))))]
+        {
+            if crate::field::gf2_128::x86_simd::has_vpclmulqdq() {
+                self.forward_transform_x86(data);
+            } else {
+                self.forward_transform_scalar(data);
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            target_arch = "x86_64",
+        )))]
         {
             self.forward_transform_scalar(data);
         }
@@ -444,6 +455,50 @@ impl AdditiveNttF128 {
                         block += 2;
                     }
                     // Scalar tail (num_blocks odd — only when num_blocks = 1).
+                    while block < num_blocks {
+                        let twiddle = self.twiddle(layer, block);
+                        let idx0 = block * 2;
+                        let idx1 = idx0 + 1;
+                        let v = data[idx1];
+                        let new_u = data[idx0] + v * twiddle;
+                        data[idx0] = new_u;
+                        data[idx1] = v + new_u;
+                        block += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Single-threaded x86 forward transform (uses `ghash_mul_vec2_x86` to
+    /// batch 2 butterflies per VPCLMULQDQ pair).
+    #[cfg(target_arch = "x86_64")]
+    pub fn forward_transform_x86(&self, data: &mut [F128]) {
+        let log_d = log2_pow2(data.len());
+        assert!(log_d <= self.log_domain_size());
+
+        for layer in 0..log_d {
+            let num_blocks = 1usize << layer;
+            let block_size = 1usize << (log_d - layer);
+            let block_size_half = block_size >> 1;
+            // SAFETY: caller verifies VPCLMULQDQ at runtime before calling.
+            unsafe {
+                if block_size_half >= 2 {
+                    for block in 0..num_blocks {
+                        let twiddle = self.twiddle(layer, block);
+                        let block_start = block * block_size;
+                        let chunk = &mut data[block_start..block_start + block_size];
+                        butterfly_block_x86(chunk, twiddle, block_size_half);
+                    }
+                } else {
+                    debug_assert_eq!(block_size_half, 1);
+                    let mut block = 0;
+                    while block + 1 < num_blocks {
+                        let t_a = self.twiddle(layer, block);
+                        let t_b = self.twiddle(layer, block + 1);
+                        butterfly_across_blocks_x86(data, block * 2, t_a, t_b);
+                        block += 2;
+                    }
                     while block < num_blocks {
                         let twiddle = self.twiddle(layer, block);
                         let idx0 = block * 2;
@@ -910,6 +965,109 @@ unsafe fn butterfly_across_blocks_neon_in_chunk(chunk: &mut [F128], t_a: F128, t
     chunk[3] = new_v_b;
 }
 
+// ---------------------------------------------------------------------------
+// x86 butterfly helpers — batch 2 F128 butterflies per ghash_mul_vec2_x86.
+// ---------------------------------------------------------------------------
+
+/// Two butterflies within a single block (shared twiddle), using AVX2
+/// VPCLMULQDQ. Mirrors [`butterfly_block_neon`]: processes pairs in steps
+/// of 2, sharing the twiddle across the vec2 call.
+///
+/// # Safety
+/// Caller must ensure `avx2` and `vpclmulqdq` are available.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
+unsafe fn butterfly_block_x86(chunk: &mut [F128], twiddle: F128, half: usize) {
+    use crate::field::gf2_128::x86_simd::ghash_mul_vec2_x86;
+    debug_assert!(half >= 2);
+    debug_assert_eq!(chunk.len(), 2 * half);
+    let mut idx0 = 0;
+    while idx0 < half {
+        let idx1 = idx0 + half;
+        let u_a = chunk[idx0];
+        let v_a = chunk[idx1];
+        let u_b = chunk[idx0 + 1];
+        let v_b = chunk[idx1 + 1];
+
+        // SAFETY: avx2+vpclmulqdq enabled by target_feature on this function.
+        let prod = unsafe { ghash_mul_vec2_x86([twiddle, twiddle], [v_a, v_b]) };
+
+        let new_u_a = F128 {
+            lo: u_a.lo ^ prod[0].lo,
+            hi: u_a.hi ^ prod[0].hi,
+        };
+        let new_u_b = F128 {
+            lo: u_b.lo ^ prod[1].lo,
+            hi: u_b.hi ^ prod[1].hi,
+        };
+        let new_v_a = F128 {
+            lo: v_a.lo ^ new_u_a.lo,
+            hi: v_a.hi ^ new_u_a.hi,
+        };
+        let new_v_b = F128 {
+            lo: v_b.lo ^ new_u_b.lo,
+            hi: v_b.hi ^ new_u_b.hi,
+        };
+
+        chunk[idx0] = new_u_a;
+        chunk[idx1] = new_v_a;
+        chunk[idx0 + 1] = new_u_b;
+        chunk[idx1 + 1] = new_v_b;
+        idx0 += 2;
+    }
+}
+
+/// Two butterflies across 2 adjacent blocks (deepest layer, different
+/// twiddles), using AVX2 VPCLMULQDQ.
+///
+/// # Safety
+/// Caller must ensure `avx2` and `vpclmulqdq` are available.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
+unsafe fn butterfly_across_blocks_x86(data: &mut [F128], base: usize, t_a: F128, t_b: F128) {
+    // SAFETY: caller's target-feature guarantees cover this call.
+    unsafe { butterfly_across_blocks_x86_in_chunk(&mut data[base..base + 4], t_a, t_b) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
+unsafe fn butterfly_across_blocks_x86_in_chunk(chunk: &mut [F128], t_a: F128, t_b: F128) {
+    use crate::field::gf2_128::x86_simd::ghash_mul_vec2_x86;
+    debug_assert_eq!(chunk.len(), 4);
+    let u_a = chunk[0];
+    let v_a = chunk[1];
+    let u_b = chunk[2];
+    let v_b = chunk[3];
+
+    // SAFETY: avx2+vpclmulqdq enabled by target_feature on this function.
+    let prod = unsafe { ghash_mul_vec2_x86([t_a, t_b], [v_a, v_b]) };
+
+    let new_u_a = F128 {
+        lo: u_a.lo ^ prod[0].lo,
+        hi: u_a.hi ^ prod[0].hi,
+    };
+    let new_u_b = F128 {
+        lo: u_b.lo ^ prod[1].lo,
+        hi: u_b.hi ^ prod[1].hi,
+    };
+    let new_v_a = F128 {
+        lo: v_a.lo ^ new_u_a.lo,
+        hi: v_a.hi ^ new_u_a.hi,
+    };
+    let new_v_b = F128 {
+        lo: v_b.lo ^ new_u_b.lo,
+        hi: v_b.hi ^ new_u_b.hi,
+    };
+
+    chunk[0] = new_u_a;
+    chunk[1] = new_v_a;
+    chunk[2] = new_u_b;
+    chunk[3] = new_v_b;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,6 +1291,28 @@ mod tests {
         // At layer log_d - 1 = 3, there are 2^3 = 8 blocks. twiddle(3, b) for b ∈ 0..8.
         for b in 0..8 {
             let _t = ntt.twiddle(log_d - 1, b);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_ntt_matches_scalar() {
+        if !crate::field::gf2_128::x86_simd::has_vpclmulqdq() {
+            eprintln!("VPCLMULQDQ not available, skipping x86_ntt_matches_scalar");
+            return;
+        }
+        let mut rng = Rng::new(0xBB5);
+        for log_d in 1..=10 {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let original = rand_vec(&mut rng, 1 << log_d);
+            let mut v_scalar = original.clone();
+            ntt.forward_transform_scalar(&mut v_scalar);
+            let mut v_x86 = original.clone();
+            ntt.forward_transform_x86(&mut v_x86);
+            assert_eq!(
+                v_x86, v_scalar,
+                "x86 disagrees with scalar at log_d={log_d}"
+            );
         }
     }
 }
