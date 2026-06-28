@@ -96,7 +96,15 @@ impl Mul for F128 {
             // SAFETY: aes target feature is enabled at compile time.
             unsafe { aarch64::ghash_mul_binius(self, rhs) }
         }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            // SAFETY: pclmulqdq + sse4.1 target features are enabled at compile time.
+            unsafe { x86_64::ghash_mul_binius(self, rhs) }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
         {
             software::ghash_mul(self, rhs)
         }
@@ -488,6 +496,182 @@ pub mod aarch64 {
 }
 
 // ---------------------------------------------------------------------------
+// x86_64 + PCLMULQDQ: carry-less-multiply path, the direct sibling of the
+// aarch64 PMULL code above. `_mm_clmulepi64_si128` is the x86 equivalent of
+// `vmull_p64`; the binius schoolbook-4 + 2-stage reduction is identical, only
+// the intrinsics differ. Gated on `pclmulqdq` (enabled here via
+// `-C target-cpu=native` on Granite Rapids, which also implies `sse4.1`).
+// ---------------------------------------------------------------------------
+
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+pub mod x86_64 {
+    use super::{F128, F256Unreduced, ghash_reduce};
+    use core::arch::x86_64::*;
+
+    /// Load an `F128` into a 128-bit register: lane 0 = `lo`, lane 1 = `hi`.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn load(a: F128) -> __m128i {
+        // SAFETY: sse2 is baseline on x86_64.
+        unsafe { _mm_set_epi64x(a.hi as i64, a.lo as i64) }
+    }
+
+    // imm8 selector for `_mm_clmulepi64_si128`: bit0 picks the qword of the
+    // first operand (0 = low / 1 = high), bit4 the second operand. So
+    // 0x00 = lo·lo, 0x10 = lo·hi, 0x01 = hi·lo, 0x11 = hi·hi.
+
+    /// Full 256-bit carry-less product `a · b`, no mod-p reduction. The standard
+    /// middle-cross fold is baked in (mirrors `aarch64::ghash_mul_unreduced_neon`
+    /// and `software::ghash_mul_unreduced` exactly).
+    ///
+    /// # Safety
+    /// Requires `pclmulqdq` + `sse4.1` (statically enabled here).
+    #[target_feature(enable = "sse4.1,pclmulqdq")]
+    pub unsafe fn ghash_mul_unreduced_clmul(a: F128, b: F128) -> F256Unreduced {
+        // SAFETY: function carries the required target features.
+        unsafe {
+            let va = load(a);
+            let vb = load(b);
+            let p_ll = _mm_clmulepi64_si128::<0x00>(va, vb); // a.lo · b.lo
+            let p_lh = _mm_clmulepi64_si128::<0x10>(va, vb); // a.lo · b.hi
+            let p_hl = _mm_clmulepi64_si128::<0x01>(va, vb); // a.hi · b.lo
+            let p_hh = _mm_clmulepi64_si128::<0x11>(va, vb); // a.hi · b.hi
+
+            let ll_lo = _mm_extract_epi64::<0>(p_ll) as u64;
+            let ll_hi = _mm_extract_epi64::<1>(p_ll) as u64;
+            let hh_lo = _mm_extract_epi64::<0>(p_hh) as u64;
+            let hh_hi = _mm_extract_epi64::<1>(p_hh) as u64;
+            let cross = _mm_xor_si128(p_lh, p_hl);
+            let cr_lo = _mm_extract_epi64::<0>(cross) as u64;
+            let cr_hi = _mm_extract_epi64::<1>(cross) as u64;
+
+            F256Unreduced {
+                r0: ll_lo,
+                r1: ll_hi ^ cr_lo,
+                r2: hh_lo ^ cr_hi,
+                r3: hh_hi,
+            }
+        }
+    }
+
+    /// Schoolbook 4 CLMUL + scalar `ghash_reduce`. Independent reference path
+    /// for the cross-check test.
+    ///
+    /// # Safety
+    /// Requires `pclmulqdq` + `sse4.1` (statically enabled here).
+    #[target_feature(enable = "sse4.1,pclmulqdq")]
+    pub unsafe fn ghash_mul_schoolbook(a: F128, b: F128) -> F128 {
+        // SAFETY: function carries the required target features.
+        unsafe {
+            let u = ghash_mul_unreduced_clmul(a, b);
+            ghash_reduce(u.r0, u.r1, u.r2, u.r3)
+        }
+    }
+
+    /// Binius-style: schoolbook 4 CLMUL + recursive 2-stage reduction (2 CLMUL),
+    /// staying ≤128 bits between stages. Direct translation of
+    /// `aarch64::ghash_mul_binius`; this is the default `Mul` path on x86.
+    /// `_mm_slli_si128::<8>(v)` produces `{0, v.lo}` (the x86 analogue of
+    /// `vextq_u64::<1>(zero, v)`); `_mm_clmulepi64_si128::<0x01>(v, c87)` is
+    /// `clmul(v.hi, 0x87)`.
+    ///
+    /// # Safety
+    /// Requires `pclmulqdq` + `sse4.1` (statically enabled here).
+    #[target_feature(enable = "sse4.1,pclmulqdq")]
+    pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
+        // SAFETY: function carries the required target features.
+        unsafe {
+            let va = load(a);
+            let vb = load(b);
+            let c87 = _mm_set_epi64x(0, 0x87);
+
+            let t0 = _mm_clmulepi64_si128::<0x00>(va, vb);
+            let t1a = _mm_clmulepi64_si128::<0x10>(va, vb);
+            let t1b = _mm_clmulepi64_si128::<0x01>(va, vb);
+            let t2 = _mm_clmulepi64_si128::<0x11>(va, vb);
+            let mut t1 = _mm_xor_si128(t1a, t1b);
+
+            // First reduce: t1 = t1 + x^64 · t2 (mod p).
+            let t2_shifted = _mm_slli_si128::<8>(t2); // {0, t2.lo}
+            t1 = _mm_xor_si128(t1, t2_shifted);
+            let t2_red = _mm_clmulepi64_si128::<0x01>(t2, c87); // clmul(t2.hi, 0x87)
+            t1 = _mm_xor_si128(t1, t2_red);
+
+            // Second reduce: t0 = t0 + x^64 · t1 (mod p).
+            let mut t0 = t0;
+            let t1_shifted = _mm_slli_si128::<8>(t1);
+            t0 = _mm_xor_si128(t0, t1_shifted);
+            let t1_red = _mm_clmulepi64_si128::<0x01>(t1, c87); // clmul(t1.hi, 0x87)
+            t0 = _mm_xor_si128(t0, t1_red);
+
+            F128 {
+                lo: _mm_extract_epi64::<0>(t0) as u64,
+                hi: _mm_extract_epi64::<1>(t0) as u64,
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4-wide (AVX-512 VPCLMULQDQ): the same binius schoolbook-4 + 2-stage
+    // reduction, applied lane-wise across the four 128-bit lanes of a ZMM.
+    // `_mm512_clmulepi64_epi128` is the 4-lane VPCLMULQDQ; `_mm512_bslli_epi128`
+    // is the per-128-lane analogue of `_mm_slli_si128`. Used by the interleaved
+    // NTT to multiply a run of F128 by a shared (broadcast) twiddle.
+    // -----------------------------------------------------------------------
+
+    /// 4 independent GF(2¹²⁸) products in registers (ZMM in, ZMM out): each
+    /// 128-bit lane `i` holds `a_i · b_i`. Internal hot kernel for the NTT.
+    ///
+    /// # Safety
+    /// Requires avx512f + avx512bw + vpclmulqdq (statically enabled under
+    /// `-C target-cpu=native` on Granite Rapids).
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+    pub unsafe fn ghash_mul_zmm(va: __m512i, vb: __m512i) -> __m512i {
+        // SAFETY: function carries the required target features.
+        unsafe {
+            let c87 = _mm512_set1_epi64(0x87);
+            let t0 = _mm512_clmulepi64_epi128::<0x00>(va, vb);
+            let t1a = _mm512_clmulepi64_epi128::<0x10>(va, vb);
+            let t1b = _mm512_clmulepi64_epi128::<0x01>(va, vb);
+            let t2 = _mm512_clmulepi64_epi128::<0x11>(va, vb);
+            let mut t1 = _mm512_xor_si512(t1a, t1b);
+
+            // First reduce: t1 += x^64 · t2 (mod p), per lane.
+            t1 = _mm512_xor_si512(t1, _mm512_bslli_epi128::<8>(t2));
+            t1 = _mm512_xor_si512(t1, _mm512_clmulepi64_epi128::<0x01>(t2, c87));
+
+            // Second reduce: t0 += x^64 · t1 (mod p), per lane.
+            let mut t0 = t0;
+            t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
+            t0 = _mm512_xor_si512(t0, _mm512_clmulepi64_epi128::<0x01>(t1, c87));
+            t0
+        }
+    }
+
+    /// Array convenience wrapper around [`ghash_mul_zmm`] for tests / non-hot
+    /// callers. `[F128; 4]` is 64 contiguous bytes = one ZMM.
+    ///
+    /// # Safety
+    /// Requires avx512f + avx512bw + vpclmulqdq (statically enabled here).
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+    pub unsafe fn ghash_mul_vec4(a: [F128; 4], b: [F128; 4]) -> [F128; 4] {
+        // SAFETY: function carries the required target features; [F128;4] is
+        // 64-byte contiguous, matching a 512-bit load/store.
+        unsafe {
+            let va = _mm512_loadu_si512(a.as_ptr() as *const __m512i);
+            let vb = _mm512_loadu_si512(b.as_ptr() as *const __m512i);
+            let r = ghash_mul_zmm(va, vb);
+            let mut out = [F128::ZERO; 4];
+            _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, r);
+            out
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Software fallback: bit-by-bit clmul64. Slow but portable; also the reference
 // the NEON path is checked against in tests.
 // ---------------------------------------------------------------------------
@@ -540,7 +724,15 @@ fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
         // SAFETY: aes target feature is enabled at compile time.
         unsafe { aarch64::ghash_mul_unreduced_neon(a, b) }
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    {
+        // SAFETY: pclmulqdq + sse4.1 target features are enabled at compile time.
+        unsafe { x86_64::ghash_mul_unreduced_clmul(a, b) }
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    )))]
     {
         software::ghash_mul_unreduced(a, b)
     }
@@ -746,6 +938,51 @@ mod tests {
             assert_eq!(sw, ka);
             assert_eq!(sw, kb);
             assert_eq!(sw, bi);
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    #[test]
+    fn all_x86_variants_agree() {
+        // The PCLMULQDQ paths must agree bit-for-bit with the scalar software
+        // reference over random inputs — the correctness oracle for the port.
+        let mut rng = Rng::new(8);
+        for _ in 0..128 {
+            let a = rng.next_f128();
+            let b = rng.next_f128();
+            let sw = software::ghash_mul(a, b);
+            let sb = unsafe { x86_64::ghash_mul_schoolbook(a, b) };
+            let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
+            let unred = unsafe { x86_64::ghash_mul_unreduced_clmul(a, b) }.reduce();
+            assert_eq!(sw, sb, "x86 schoolbook");
+            assert_eq!(sw, bi, "x86 binius");
+            assert_eq!(sw, unred, "x86 unreduced+reduce");
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[test]
+    fn x86_mul_vec4_matches_scalar() {
+        // The AVX-512 4-wide kernel must agree lane-for-lane with the scalar
+        // reference — the oracle for the NTT's wide multiply.
+        let mut rng = Rng::new(99);
+        for _ in 0..128 {
+            let a = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+            let b = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+            let r = unsafe { x86_64::ghash_mul_vec4(a, b) };
+            for i in 0..4 {
+                assert_eq!(r[i], software::ghash_mul(a[i], b[i]), "lane {i}");
+            }
         }
     }
 }
