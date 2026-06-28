@@ -200,7 +200,22 @@ impl AdditiveNttF128 {
         {
             self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, start_layer);
         }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        {
+            self.forward_transform_interleaved_x86_from_layer(data, num_ntts, start_layer);
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )
+        )))]
         {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
         }
@@ -240,6 +255,71 @@ impl AdditiveNttF128 {
                         let new_u = data[off_top + lane] + v * twiddle;
                         data[off_top + lane] = new_u;
                         data[off_bot + lane] = v + new_u;
+                    }
+                }
+            }
+        }
+    }
+
+    /// x86-64 (AVX-512 VPCLMULQDQ) interleaved forward NTT — the x86 sibling of
+    /// the NEON path. Identical butterfly to the scalar reference, but exploits
+    /// that **all butterflies in a block share one twiddle**: within a block the
+    /// `top` half `[0, half_elems)` and `bot` half `[half_elems, 2·half_elems)`
+    /// are contiguous and pair index-for-index, so the inner loop flattens to a
+    /// run of `half_elems` butterflies multiplied **4 F128 at a time** by the
+    /// broadcast twiddle via [`x86_64::ghash_mul_zmm`]. `num_ntts`-agnostic;
+    /// the scalar tail handles deep layers where `half_elems < 4`.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    pub fn forward_transform_interleaved_x86_from_layer(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        use crate::field::gf2_128::x86_64::ghash_mul_zmm;
+        use core::arch::x86_64::*;
+        let n_total = data.len();
+        let log_d = log2_pow2(n_total / num_ntts);
+
+        for layer in start_layer..log_d {
+            let num_blocks = 1usize << layer;
+            let block_size = 1usize << (log_d - layer);
+            let half_elems = (block_size >> 1) * num_ntts;
+            let block_elems = block_size * num_ntts;
+            for block in 0..num_blocks {
+                let twiddle = self.twiddle(layer, block);
+                let block_start = block * block_elems;
+                // SAFETY: avx512f/avx512bw/vpclmulqdq are statically enabled
+                // (target-cpu=native on Granite Rapids). All accesses stay within
+                // data[block_start .. block_start + block_elems]; the top range
+                // [0, half_elems) and bot range [half_elems, 2·half_elems) are
+                // disjoint, so the raw-pointer reads/writes do not alias.
+                unsafe {
+                    let tw = _mm512_broadcast_i32x4(_mm_loadu_si128(
+                        &twiddle as *const F128 as *const __m128i,
+                    ));
+                    let base = data.as_mut_ptr().add(block_start);
+                    let mut i = 0usize;
+                    while i + 4 <= half_elems {
+                        let top_p = base.add(i) as *mut __m512i;
+                        let bot_p = base.add(half_elems + i) as *mut __m512i;
+                        let vbot = _mm512_loadu_si512(bot_p as *const __m512i);
+                        let vtop = _mm512_loadu_si512(top_p as *const __m512i);
+                        let new_u = _mm512_xor_si512(vtop, ghash_mul_zmm(vbot, tw));
+                        _mm512_storeu_si512(top_p, new_u);
+                        _mm512_storeu_si512(bot_p, _mm512_xor_si512(vbot, new_u));
+                        i += 4;
+                    }
+                    while i < half_elems {
+                        let v = *base.add(half_elems + i);
+                        let new_u = *base.add(i) + v * twiddle;
+                        *base.add(i) = new_u;
+                        *base.add(half_elems + i) = v + new_u;
+                        i += 1;
                     }
                 }
             }
@@ -1083,6 +1163,34 @@ mod tests {
                 assert_eq!(
                     v_par, v_scalar,
                     "interleaved parallel mismatch at log_d={log_d}, num_ntts={num_ntts}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn interleaved_x86_matches_scalar() {
+        // The AVX-512 interleaved transform must agree with the scalar reference.
+        // Covers num_ntts=1 (across-element flattening), the vectorized path
+        // (num_ntts≥4), and small log_d where the scalar tail (half_elems<4) runs.
+        let mut rng = Rng::new(0xCC3);
+        for log_d in [1usize, 4, 10, 14, 17] {
+            for &num_ntts in &[1usize, 2, 4, 8, 32] {
+                let ntt = AdditiveNttF128::standard(log_d);
+                let n_total = (1 << log_d) * num_ntts;
+                let original = rand_vec(&mut rng, n_total);
+                let mut v_scalar = original.clone();
+                ntt.forward_transform_interleaved_scalar(&mut v_scalar, num_ntts);
+                let mut v_x86 = original.clone();
+                ntt.forward_transform_interleaved_x86_from_layer(&mut v_x86, num_ntts, 0);
+                assert_eq!(
+                    v_x86, v_scalar,
+                    "interleaved x86 mismatch at log_d={log_d}, num_ntts={num_ntts}"
                 );
             }
         }
