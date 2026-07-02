@@ -1,0 +1,188 @@
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:258:27
+    |
+258 |                 let out = unsafe { std::slice::from_raw_parts_mut(sb.add(w * 64), 64) };
+    |                           ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+277 |             push_z!(S0_W + i, &lanes[i]);
+    |             ---------------------------- in this macro invocation
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:258:27
+    |
+258 |                 let out = unsafe { std::slice::from_raw_parts_mut(sb.add(w * 64), 64) };
+    |                           ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+287 |         push_z!(CONST_W, &one);
+    |         ---------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:258:27
+    |
+258 |                 let out = unsafe { std::slice::from_raw_parts_mut(sb.add(w * 64), 64) };
+    |                           ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+319 |                     push_z!(w, &t[i]);
+    |                     ----------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:258:27
+    |
+258 |                 let out = unsafe { std::slice::from_raw_parts_mut(sb.add(w * 64), 64) };
+    |                           ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+338 |             push_z!(S24_W + i, &lanes[i]);
+    |             ----------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:261:13
+    |
+261 |             unsafe { wz.push(w, vals) };
+    |             ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+277 |             push_z!(S0_W + i, &lanes[i]);
+    |             ---------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:261:13
+    |
+261 |             unsafe { wz.push(w, vals) };
+    |             ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+287 |         push_z!(CONST_W, &one);
+    |         ---------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:261:13
+    |
+261 |             unsafe { wz.push(w, vals) };
+    |             ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+319 |                     push_z!(w, &t[i]);
+    |                     ----------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:261:13
+    |
+261 |             unsafe { wz.push(w, vals) };
+    |             ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+338 |             push_z!(S24_W + i, &lanes[i]);
+    |             ----------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `flock-autoresearch-probes` (lib) generated 8 warnings
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.02s
+     Running `target/release/e2_zerocheck --hash all --m 23,26,29 --iters 3 --tsv ../results/e2_2026-07-02.tsv`
+
+== keccak: m=23 (n_log=7, useful 333/512 chunks), 1 threads ==
+verification gates (roundtrip + padded==dense): OK
+config                median ms     min ms
+rowmajor-dense             5.26       5.00
+rowmajor-padded            3.32       3.31
+l1-dense                   4.25       4.18
+l1-suffix-skip             2.96       2.96
+
+== keccak: m=26 (n_log=10, useful 333/512 chunks), 1 threads ==
+verification gates (roundtrip + padded==dense): OK
+config                median ms     min ms
+rowmajor-dense            29.44      29.38
+rowmajor-padded           21.05      20.91
+l1-dense                  29.09      29.08
+l1-suffix-skip            20.94      20.86
+
+== keccak: m=29 (n_log=13, useful 333/512 chunks), 1 threads ==
+verification gates (roundtrip + padded==dense): OK
+config                median ms     min ms
+rowmajor-dense           233.00     231.72
+rowmajor-padded          165.96     164.94
+l1-dense                 239.44     233.62
+l1-suffix-skip           165.24     164.91
+
+== sha2: m=23 (n_log=8, useful 246/256 chunks), 1 threads ==
+verification gates (roundtrip + padded==dense): OK
+config                median ms     min ms
+rowmajor-dense             4.05       3.97
+rowmajor-padded            3.88       3.84
+l1-dense                   3.96       3.96
+l1-suffix-skip             3.89       3.85
+
+== sha2: m=26 (n_log=11, useful 246/256 chunks), 1 threads ==
+verification gates (roundtrip + padded==dense): OK
+config                median ms     min ms
+rowmajor-dense            28.97      28.97
+rowmajor-padded           28.32      28.06
+l1-dense                  29.16      29.09
+l1-suffix-skip            28.14      28.08
+
+== sha2: m=29 (n_log=14, useful 246/256 chunks), 1 threads ==
+verification gates (roundtrip + padded==dense): OK
+config                median ms     min ms
+rowmajor-dense           229.45     228.16
+rowmajor-padded          223.75     222.63
+l1-dense                 229.45     228.90
+l1-suffix-skip           222.24     221.03
+
+== blake3: m=23 (n_log=9, useful 121/128 chunks), 1 threads ==
+verification gates (roundtrip + padded==dense): OK
+config                median ms     min ms
+rowmajor-dense             4.03       4.01
+rowmajor-padded            3.84       3.84
+l1-dense                   3.99       3.99
+l1-suffix-skip             3.85       3.79
+
+== blake3: m=26 (n_log=12, useful 121/128 chunks), 1 threads ==
+verification gates (roundtrip + padded==dense): OK
+config                median ms     min ms
+rowmajor-dense            29.18      29.08
+rowmajor-padded           34.15      28.67
+l1-dense                  29.29      29.25
+l1-suffix-skip            27.87      27.87
+
+== blake3: m=29 (n_log=15, useful 121/128 chunks), 1 threads ==
+verification gates (roundtrip + padded==dense): OK
+config                median ms     min ms
+rowmajor-dense           228.83     228.77
+rowmajor-padded          222.42     222.12
+l1-dense                 229.21     228.96
+l1-suffix-skip           219.64     217.66

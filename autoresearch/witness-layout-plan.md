@@ -439,3 +439,89 @@ Corrected conclusions:
    permutation compute; sha2/blake3 are compute-bound in field packing, so
    layout choice barely registers — which is exactly the parity we wanted
    to demonstrate.
+
+### E2 — zerocheck control (DONE — parity everywhere, padding for free)
+
+`bin/e2_zerocheck.rs`, `tests/e2_zerocheck_oracle.rs`; raw:
+`results/e2_2026-07-02.tsv`. Four configs on real witness data
+(row-major/L1′ × dense/padded), all hashes × m ∈ {23, 26, 29} × 1/8 threads.
+
+Verification gates (all green): prove→verify roundtrip per config; padded
+proof **byte-identical** to dense on the same buffers; truthfulness oracle —
+the L1′ claims equal a from-scratch quirky-MLE evaluation (φ₈-Lagrange on
+the 6 skip dims × eq on the rest) of the L1′ buffers at the claim points.
+
+Results:
+- **Dense: L1′ = row-major within ±3% in all 18 cells** (keccak m29: 34.0
+  vs 35.7 ms multi, 239 vs 233 ms single). The address-bit-generic argument
+  is now empirical.
+- **Padded: L1′ suffix-skip matches or beats per-block padding** (keccak
+  m29 single: 165.2 vs 166.0 ms; m23 single: 2.96 vs 3.32) — and it needs
+  NO new machinery: L1′ padding is exactly `PaddingSpec { k_log: m,
+  useful-prefix }` (one giant block), because padding chunk-columns coalesce
+  into one contiguous suffix.
+
+### E3 — lincheck fold directly from L1′ (DONE — stripe droppable; kernel WIP)
+
+`src/lincheck_fold.rs`, `bin/e3_lincheck_fold.rs`, `tests/e3_fold_oracle.rs`;
+raw: `results/e3_2026-07-02.tsv`.
+
+The fused fold reads L1′ chunk-columns directly (contiguous 1 KB tile
+loads), runs the 8×64 bit-transposes in-register, and accumulates through
+the same 256-entry sum tables — **byte-identical z_vec** vs production's
+stripe fold (fast kernel + naive reference, keccak + sha2, several m).
+
+Performance: fused beats the *portable* stripe kernel at m ≤ 26 and ties at
+m = 29, but production's hand-tuned NEON **oblock** kernel is still
+~2.2–2.7× ahead of it at m = 29 (keccak multi 2.8 vs 7.5 ms; a first NEON
+pass on the inner loop didn't close it — the gap sits in byte extraction:
+transpose-then-gather vs streaming stripe bytes; an oblock-style port with
+Q-register accumulators is the known fix). Totals today:
+`witgen(no-stripe)+fused` wins at m ≤ 26, loses at m = 29.
+
+**Decision: keep the stripe.** Under L1′ the direct producer emits it
+nearly free (≈0.3 ms multi / 2.5 ms single at keccak m29), so dropping it
+is an optional follow-up gated on the kernel port — not a blocker.
+
+### E6 — end-to-end prove/verify on L1′ (DONE — works, parity)
+
+`src/e6.rs`, `bin/e6_end_to_end.rs`, `tests/e6_roundtrip.rs`; raw:
+`results/e6_2026-07-02.tsv`. Full pipeline on the L1′-committed witness
+(keccak, BaseFold): direct witness → `pcs::commit` → zerocheck
+(suffix-padded) → lincheck (unmodified — its stripe/circuit/point inputs
+are layout-independent) → batched PCS open at **address-ordered** points:
+
+- `x_full_c = zc.r_rest` verbatim (already address-ordered — simpler than
+  the row-major bookkeeping);
+- `x_full_ab = [r_inner_rest[0]] ++ x_outer ++ r_inner_rest[1..]`;
+- the unmodified `verifier::verify_claims` consumes these via `ZClaim`s
+  carrying the full vector in `x_inner_rest` (its PCS step just
+  concatenates segments). **Zero flock-core changes were needed.**
+
+Gates (green): prove→verify roundtrip at every size; prover/verifier claim
+equality; tamper rejection (zerocheck message, final eval, lincheck
+z_partial).
+
+Timing vs production `prove_fast_basefold` (keccak, scratch-recycled
+buffers in both):
+
+| m | 8-core: PROD → L1′ | 1-core: PROD → L1′ |
+|---|---|---|
+| 23 | 6.06 → 5.90 (0.97×) | 10.6 → 10.3 (0.97×) |
+| 26 | 14.96 → 15.50 (1.04×) | 57.5 → 61.3 (1.07×) |
+| 29 | 82.6 → 86.4 (1.05×) | 452 → 492 (1.09×) |
+
+Verify: +0.2–0.4 ms (~1.05×) — same verifier work, minor point-assembly
+copies. The residual prover gap is attributed and closable: (a) the probe
+par-zeroes all three witness buffers in full (production's builder memsets
+per-group inside witness gen; an L1′-native producer would zero only the
+padding columns once per recycled buffer); (b) no `s_hat_v` precomputes
+(production skips two `fold_1b_rows` passes; re-deriving the captures under
+the L1′ suffix ordering is mechanical). Phase breakdown at m29 multi:
+commit 24.4 vs 23.9, zerocheck 27.7 vs 25.4, lincheck 5.5 vs 5.2, open
+20.3 vs 26.7 (L1′ *faster* despite no precomputes).
+
+**Bottom line: the full L1′ pipeline proves and verifies with zero protocol
+or kernel changes, at ≈5% (multi) / ≈9% (single) of production — entirely
+from accounted, closable bookkeeping residuals.** The layout is viable
+end-to-end.
