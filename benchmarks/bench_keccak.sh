@@ -177,6 +177,14 @@ P3_MT_EXTRA="${P3_MT_EXTRA-10 11 13}"
 # (3·2^17 ≈ 26 GB) would not fit a 24 GB box.
 FLOCK_MT_EXTRA="${FLOCK_MT_EXTRA-17}"
 
+# Binius64-ONLY extra multi-threaded sizes, above its default cap (B64_MAX_LOG2).
+# Run with the cap forced off (run_b64_size "$h" force) in the main (MT) pass.
+# Empty by default: binius64's frontend build doesn't fit a 24 GB box above 2^14
+# (2^14 build peaks ~34 GB, 2^15 ~65 GB thrashes/hangs — see B64_MAX_LOG2 notes
+# below), so there is no extra size to add unless you're on a bigger box. Set
+# e.g. B64_MT_EXTRA="15" to opt in there.
+B64_MT_EXTRA="${B64_MT_EXTRA-}"
+
 # ST_LOG2S — on/off TOGGLE for the single-threaded pass (non-empty = run it,
 # "" = skip). It no longer sets the single-threaded sizes: those now come from
 # each prover's own *_ST_SIZES list (sweep_provers picks the list by mode, not
