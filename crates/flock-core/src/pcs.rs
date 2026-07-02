@@ -22,6 +22,7 @@
 
 pub mod basefold;
 pub mod commit;
+pub mod jagged;
 pub mod ligerito;
 pub mod pack;
 pub mod ring_switch;
