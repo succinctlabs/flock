@@ -26,6 +26,8 @@ python3 flock_perf.py     # wall-clock: batch proving vs K-times separate provin
 Some environments (e.g. conda) print harmless `OMP`/`numba`/`TBB` warnings to
 stderr on import; ignore them (or append `2>/dev/null`).
 
+Running `test_flock.py` doubles as a guided tour of the protocol: each section pretty-prints the actual math it verifies - field arithmetic, the eq weights, every sumcheck round's message/check/challenge, the PCS opening, and a phase-by-phase replay of the whole verifier - using worked examples small enough to redo by hand.
+
 ## What it proves
 
 - **Base circuit F** (one AND gate): `a * b = c` over F2, witness `z0 = [1, a, b, c]`.
@@ -89,3 +91,32 @@ Two classic `galois` traps, documented where they bite in the code:
 - breaking the chain (valid gates, but `out_i != x_{i+1}`) -> **glue** rejects;
 - tampering a PCS evaluation or a committed column -> **PCS** rejects;
 - tampering a sumcheck message -> **sumcheck** rejects.
+
+## Benchmark results
+
+Verbatim output of `python3 flock_perf.py` (single run on an otherwise idle machine):
+
+```text
+   K | prove batch  prove sep speedup | verify batch verify sep speedup | #proofs b/s
+--------------------------------------------------------------------------------------------
+   2 |      23.3ms     22.7ms   0.97x |      213.6ms    284.5ms   1.33x |    1/2
+   4 |      31.2ms     45.9ms   1.47x |      287.0ms    567.9ms   1.98x |    1/4
+   8 |      44.7ms     88.1ms   1.97x |      355.7ms   1106.8ms   3.11x |    1/8
+  16 |      80.7ms    168.4ms   2.09x |      456.6ms   2208.6ms   4.84x |    1/16
+  32 |     173.5ms    363.9ms   2.10x |      593.2ms   4447.3ms   7.50x |    1/32
+  64 |     463.3ms    702.5ms   1.52x |      903.3ms   8863.5ms   9.81x |    1/64
+
+note: SEPARATE cannot prove the hash-chain (out_i = x_{i+1}) - that
+cross-instance binding exists only in the BATCH witness (glue G).
+```
+
+The paper's headline survives even in unoptimized Python: one batch proof beats K separate proofs (prove up to ~2.1x, verify up to ~9.8x at K = 64), the verifier checks 1 proof instead of K, and the K separate proofs cannot express the cross-instance chain at all.
+
+**Hardware:** MacBook Pro, Apple M1 Max - 10 cores (8 performance + 2 efficiency), 64 GB RAM, macOS 15.7.4; Python 3.8.5 (conda) with `galois` 0.4.10, `numpy` 1.24.4.
+
+**Available memory at run time** (captured immediately before the run, 2026-07-02 11:33 +0800):
+
+- `memory_pressure`: system-wide memory free percentage 42% (~27 GB of the 64 GB available).
+- `vm_stat` (16 KiB pages): 3,734 pages free plus 875,469 pages inactive (~13.4 GB directly reclaimable).
+  macOS deliberately keeps raw free pages near zero and reclaims inactive/compressed memory on demand, so `memory_pressure`'s 42% is the meaningful availability figure.
+- `sysctl hw.memsize`: 68,719,476,736 bytes (64 GB) total.
