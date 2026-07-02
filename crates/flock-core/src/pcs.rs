@@ -647,24 +647,33 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             }
         }
     }
+    // Scatter every sparse PD claim into b_combined first, then recompute round0
+    // ONCE. The per-claim round0 assignment is an overwrite (not an accumulate),
+    // so only a single reduction over the fully-scattered b_combined is needed —
+    // replacing O(n_pd · 2^L) full sweeps (the prove bottleneck) with O(Σ support
+    // + 2^L). Result is bit-identical (F128 addition is commutative).
+    let mut any_sparse_pd = false;
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         if let DirectEqInd::Sparse(eq) = &pd.eq_ind {
             sparse_scatter_add_parallel(&mut b_combined, eq, *g);
-            let (u0_fix, u2_fix) = b_combined
-                .par_chunks(2)
-                .enumerate()
-                .map(|(i, chunk)| {
-                    let a0 = packed_witness[2 * i];
-                    let a1 = packed_witness[2 * i + 1];
-                    (a0 * chunk[0], (a0 + a1) * (chunk[0] + chunk[1]))
-                })
-                .reduce(
-                    || (F128::ZERO, F128::ZERO),
-                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-                );
-            round0_u0 = u0_fix;
-            round0_u2 = u2_fix;
+            any_sparse_pd = true;
         }
+    }
+    if any_sparse_pd {
+        let (u0_fix, u2_fix) = b_combined
+            .par_chunks(2)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let a0 = packed_witness[2 * i];
+                let a1 = packed_witness[2 * i + 1];
+                (a0 * chunk[0], (a0 + a1) * (chunk[0] + chunk[1]))
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            );
+        round0_u0 = u0_fix;
+        round0_u2 = u2_fix;
     }
     if trace {
         eprintln!(
