@@ -23,7 +23,7 @@ from mle import bind_first, num_vars
 
 def _lagrange_interpolate_eval(xs, ys, at):
     """Evaluate, at point `at`, the polynomial through points (xs[i], ys[i]) over F.
-    (Same Lagrange idea as the RareSkills homework, specialized to small degree.)"""
+    (Standard Lagrange interpolation, specialized to small degree.)"""
     # NOTE: use fresh GF(0)/GF(1) and non-in-place ops. `x = ONE; x *= y` would
     # mutate the shared global ONE in place (galois scalars are 0-d arrays).
     total = GF(0)

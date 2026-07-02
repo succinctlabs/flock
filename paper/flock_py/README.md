@@ -2,9 +2,8 @@
 
 A from-scratch, readable Python port of **Flock** - the protocol in
 `../flock-paper.pdf`, implemented for real in this repo's Rust crates
-(`crates/flock-core`, `crates/flock-prover`) - written as an educational
-reference in the RareSkills style: `galois` + `numpy`, heavy comments,
-correctness over performance. Read it next to the paper to understand *what*
+(`crates/flock-core`, `crates/flock-prover`) - written as a heavily-commented
+educational reference: `galois` + `numpy`, correctness over performance. Read it next to the paper to understand *what*
 the protocol does; read the Rust to see *how* to make it fast.
 
 It proves a **batch of AND-gates wired into a hash-chain**, over the paper's own
