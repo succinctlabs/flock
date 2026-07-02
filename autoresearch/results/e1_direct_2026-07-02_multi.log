@@ -1,0 +1,215 @@
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:258:27
+    |
+258 |                 let out = unsafe { std::slice::from_raw_parts_mut(sb.add(w * 64), 64) };
+    |                           ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+277 |             push_z!(S0_W + i, &lanes[i]);
+    |             ---------------------------- in this macro invocation
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:258:27
+    |
+258 |                 let out = unsafe { std::slice::from_raw_parts_mut(sb.add(w * 64), 64) };
+    |                           ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+287 |         push_z!(CONST_W, &one);
+    |         ---------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:258:27
+    |
+258 |                 let out = unsafe { std::slice::from_raw_parts_mut(sb.add(w * 64), 64) };
+    |                           ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+319 |                     push_z!(w, &t[i]);
+    |                     ----------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:258:27
+    |
+258 |                 let out = unsafe { std::slice::from_raw_parts_mut(sb.add(w * 64), 64) };
+    |                           ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+338 |             push_z!(S24_W + i, &lanes[i]);
+    |             ----------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:261:13
+    |
+261 |             unsafe { wz.push(w, vals) };
+    |             ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+277 |             push_z!(S0_W + i, &lanes[i]);
+    |             ---------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:261:13
+    |
+261 |             unsafe { wz.push(w, vals) };
+    |             ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+287 |         push_z!(CONST_W, &one);
+    |         ---------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:261:13
+    |
+261 |             unsafe { wz.push(w, vals) };
+    |             ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+319 |                     push_z!(w, &t[i]);
+    |                     ----------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unnecessary `unsafe` block
+   --> src/keccak_vwide.rs:261:13
+    |
+261 |             unsafe { wz.push(w, vals) };
+    |             ^^^^^^ unnecessary `unsafe` block
+...
+274 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+338 |             push_z!(S24_W + i, &lanes[i]);
+    |             ----------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `push_z` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `flock-autoresearch-probes` (lib) generated 8 warnings
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/e1_witness_gen --hash all --m 23,26,29 --iters 5 --groups auto --tsv ../results/e1_direct_2026-07-02.tsv`
+
+== keccak: m=23 (k_log=16, n_log=7, 128 instances, useful 333/512 chunks), 3x0.001 GB out, 8 threads ==
+correctness check: OK
+variant                     median ms     min ms   GB/s (med)
+production-driver+stripe (G=8)       0.18       0.16         17.7
+row-major (G=8)                  0.15       0.08         20.5
+L1-full (G=8)                    0.16       0.15         19.3
+L1-useful-nt (G=8)               0.13       0.10         23.9
+L1-useful-stripe-nt (G=8)        0.17       0.16         18.9
+compute-only (G=8)               0.11       0.09         29.6
+L1-direct-stripe (G=8)           0.11       0.08         28.1
+
+== keccak: m=26 (k_log=16, n_log=10, 1024 instances, useful 333/512 chunks), 3x0.008 GB out, 8 threads ==
+correctness check: OK
+variant                     median ms     min ms   GB/s (med)
+production-driver+stripe (G=8)       1.47       1.09         17.1
+row-major (G=8)                  0.29       0.27         87.7
+L1-full (G=64)                   0.83       0.77         30.3
+L1-useful-nt (G=64)              0.55       0.44         45.6
+L1-useful-stripe-nt (G=64)       0.76       0.63         33.1
+compute-only (G=64)              0.31       0.29         81.9
+L1-direct-stripe (G=8)           0.40       0.39         62.8
+
+== keccak: m=29 (k_log=16, n_log=13, 8192 instances, useful 333/512 chunks), 3x0.067 GB out, 8 threads ==
+correctness check: OK
+variant                     median ms     min ms   GB/s (med)
+production-driver+stripe (G=8)       6.92       6.43         29.1
+row-major (G=8)                  2.21       2.11         90.9
+L1-full (G=64)                   7.41       7.18         27.2
+L1-useful-nt (G=64)              3.51       3.45         57.4
+L1-useful-stripe-nt (G=64)       5.01       4.99         40.2
+compute-only (G=64)              2.03       2.01         99.3
+L1-direct-stripe (G=8)           2.90       2.83         69.5
+
+== sha2: m=23 (k_log=15, n_log=8, 256 instances, useful 246/256 chunks), 3x0.001 GB out, 8 threads ==
+correctness check: OK
+variant                     median ms     min ms   GB/s (med)
+production-driver+stripe (G=8)       0.17       0.15         19.1
+row-major (G=8)                  0.10       0.09         32.8
+L1-full (G=16)                   0.19       0.18         16.5
+L1-useful-nt (G=16)              0.21       0.16         14.6
+L1-useful-stripe-nt (G=16)       0.20       0.12         16.1
+compute-only (G=16)              0.21       0.11         15.3
+L1-direct-stripe (G=8)           0.14       0.11         23.2
+
+== sha2: m=26 (k_log=15, n_log=11, 2048 instances, useful 246/256 chunks), 3x0.008 GB out, 8 threads ==
+correctness check: OK
+variant                     median ms     min ms   GB/s (med)
+production-driver+stripe (G=8)       1.20       1.13         20.9
+row-major (G=8)                  0.43       0.42         58.1
+L1-full (G=64)                   0.93       0.90         27.0
+L1-useful-nt (G=64)              0.85       0.70         29.7
+L1-useful-stripe-nt (G=64)       1.00       0.87         25.3
+compute-only (G=64)              0.65       0.56         38.4
+L1-direct-stripe (G=8)           0.68       0.66         36.9
+
+== sha2: m=29 (k_log=15, n_log=14, 16384 instances, useful 246/256 chunks), 3x0.067 GB out, 8 threads ==
+correctness check: OK
+variant                     median ms     min ms   GB/s (med)
+production-driver+stripe (G=8)       8.90       8.08         22.6
+row-major (G=8)                  3.18       3.08         63.2
+L1-full (G=64)                   8.44       8.39         23.9
+L1-useful-nt (G=64)              5.29       5.03         38.1
+L1-useful-stripe-nt (G=64)       6.64       6.62         30.3
+compute-only (G=64)              3.47       3.44         58.1
+L1-direct-stripe (G=8)           4.81       4.74         41.9
+
+== blake3: m=23 (k_log=14, n_log=9, 512 instances, useful 121/128 chunks), 3x0.001 GB out, 8 threads ==
+correctness check: OK
+variant                     median ms     min ms   GB/s (med)
+production-driver+stripe (G=8)       0.17       0.15         18.4
+row-major (G=8)                  0.12       0.11         26.3
+L1-full (G=32)                   0.20       0.18         15.8
+L1-useful-nt (G=32)              0.26       0.15         12.2
+L1-useful-stripe-nt (G=32)       0.27       0.18         11.7
+compute-only (G=32)              0.22       0.14         14.5
+L1-direct-stripe (G=8)           0.14       0.13         22.8
+
+== blake3: m=26 (k_log=14, n_log=12, 4096 instances, useful 121/128 chunks), 3x0.008 GB out, 8 threads ==
+correctness check: OK
+variant                     median ms     min ms   GB/s (med)
+production-driver+stripe (G=8)       1.28       1.23         19.6
+row-major (G=8)                  0.52       0.46         48.2
+L1-full (G=64)                   0.97       0.93         25.9
+L1-useful-nt (G=64)              0.73       0.73         34.3
+L1-useful-stripe-nt (G=64)       0.99       0.92         25.5
+compute-only (G=64)              0.67       0.57         37.8
+L1-direct-stripe (G=8)           0.70       0.68         36.2
+
+== blake3: m=29 (k_log=14, n_log=15, 32768 instances, useful 121/128 chunks), 3x0.067 GB out, 8 threads ==
+correctness check: OK
+variant                     median ms     min ms   GB/s (med)
+production-driver+stripe (G=8)       8.84       7.96         22.8
+row-major (G=8)                  3.43       3.38         58.8
+L1-full (G=64)                   8.57       8.27         23.5
+L1-useful-nt (G=64)              4.79       4.52         42.0
+L1-useful-stripe-nt (G=64)       6.34       6.18         31.8
+compute-only (G=64)              4.07       3.97         49.5
+L1-direct-stripe (G=8)           5.00       4.94         40.3
