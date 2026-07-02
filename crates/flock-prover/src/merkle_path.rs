@@ -137,30 +137,25 @@ fn lagrange_eval_degree3(
     let omega = OMEGA;
     let opo = omega_plus_1();
 
-    // Each L_p(r) = Π_{p' ≠ p} (r - p') / (p - p'). In char 2 subtraction == addition.
-    // Denominators are constants (per choice of points).
-
-    // L_0(r) = (r+1)(r+ω)(r+(ω+1)) / [1 · ω · (ω+1)]
+    // Each L_p(r) = Π_{p' ≠ p} (r - p') / (p - p'). In char 2 subtraction == addition,
+    // and all four denominators collapse to the same constant:
+    //   d_0 = 1·ω·(ω+1), d_1 = 1·(1+ω)·ω, d_ω = ω·(ω+1)·1, d_{ω+1} = (ω+1)·ω·1,
+    // each equal to ω·(ω+1). Factor out one precomputed inverse instead of four
+    // per-call Fermat inversions; field ops are exact so the value is unchanged.
     let n0 = (r + one) * (r + omega) * (r + opo);
-    let d0 = omega * opo;
-    let l0 = n0 * d0.inv();
-
-    // L_1(r) = r(r+ω)(r+(ω+1)) / [1 · (1+ω) · ((1+ω+1) = ω)]
     let n1 = r * (r + omega) * (r + opo);
-    let d1 = (one + omega) * omega;
-    let l1 = n1 * d1.inv();
-
-    // L_ω(r) = r(r+1)(r+(ω+1)) / [ω · (ω+1) · ((ω+ω+1) = 1)]
     let n2 = r * (r + one) * (r + opo);
-    let d2 = omega * opo;
-    let l2 = n2 * d2.inv();
-
-    // L_{ω+1}(r) = r(r+1)(r+ω) / [(ω+1) · ω · ((ω+1)+ω = 1)]
     let n3 = r * (r + one) * (r + omega);
-    let d3 = opo * omega;
-    let l3 = n3 * d3.inv();
 
-    q_0 * l0 + q_1 * l1 + q_omega * l2 + q_omega_plus_1 * l3
+    (q_0 * n0 + q_1 * n1 + q_omega * n2 + q_omega_plus_1 * n3) * lagrange_inv_denom()
+}
+
+/// (ω·(ω+1))⁻¹ — the shared Lagrange denominator over {0, 1, ω, ω+1} in char 2.
+#[inline]
+fn lagrange_inv_denom() -> F128 {
+    use std::sync::OnceLock;
+    static INV: OnceLock<F128> = OnceLock::new();
+    *INV.get_or_init(|| (OMEGA * omega_plus_1()).inv())
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +664,41 @@ mod tests {
             x_l_slot: 1,
             x_r_slot: 2,
         }
+    }
+
+    #[test]
+    fn lagrange_inv_denom_is_inverse() {
+        assert_eq!(lagrange_inv_denom() * (OMEGA * omega_plus_1()), F128::ONE);
+    }
+
+    #[test]
+    fn lagrange_constant_inverse_matches_reference() {
+        // Reference: the pre-optimization form with four per-term Fermat inversions.
+        fn reference(q_0: F128, q_1: F128, q_omega: F128, q_omega_plus_1: F128, r: F128) -> F128 {
+            let one = F128::ONE;
+            let omega = OMEGA;
+            let opo = omega_plus_1();
+            let n0 = (r + one) * (r + omega) * (r + opo);
+            let l0 = n0 * (omega * opo).inv();
+            let n1 = r * (r + omega) * (r + opo);
+            let l1 = n1 * ((one + omega) * omega).inv();
+            let n2 = r * (r + one) * (r + opo);
+            let l2 = n2 * (omega * opo).inv();
+            let n3 = r * (r + one) * (r + omega);
+            let l3 = n3 * (opo * omega).inv();
+            q_0 * l0 + q_1 * l1 + q_omega * l2 + q_omega_plus_1 * l3
+        }
+        let mut rng = Rng::new(0x1A65EED);
+        for _ in 0..1000 {
+            let (a, b, c, d, r) = (rng.f128(), rng.f128(), rng.f128(), rng.f128(), rng.f128());
+            assert_eq!(lagrange_eval_degree3(a, b, c, d, r), reference(a, b, c, d, r));
+        }
+        // Boundary points: r ∈ {0, 1, ω, ω+1} must reproduce the four inputs.
+        let (a, b, c, d) = (rng.f128(), rng.f128(), rng.f128(), rng.f128());
+        assert_eq!(lagrange_eval_degree3(a, b, c, d, F128::ZERO), a);
+        assert_eq!(lagrange_eval_degree3(a, b, c, d, F128::ONE), b);
+        assert_eq!(lagrange_eval_degree3(a, b, c, d, OMEGA), c);
+        assert_eq!(lagrange_eval_degree3(a, b, c, d, omega_plus_1()), d);
     }
 
     #[test]
