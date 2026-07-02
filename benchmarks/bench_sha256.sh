@@ -1,38 +1,50 @@
 #!/usr/bin/env bash
-# bench_sha256.sh — SHA-256 compression proving: Flock vs binius64, single- and
-# multi-threaded. Default sweep 2^10/2^11/2^12/2^13/2^14 for both provers, plus
-# 2^16/2^18 for flock only (binius64 caps at 2^14; see the caps below). The SHA-256
-# sibling of bench_keccak.sh (same caching, prover-selection, two-table layout).
+# bench_sha256.sh — SHA-256 compression proving: Flock vs binius64, Spartan-Hyrax
+# and NeutronNova, single- and multi-threaded. The SHA-256 sibling of
+# bench_keccak.sh (same caching, prover-selection, two-table layout). Every prover
+# SWEEPS a range of sizes and the aggregator reports its peak throughput (and the
+# size at which it peaks): flock/binius64 sweep the shared 2^h list (HASH_LOG2S),
+# while spartan2/neutronnova sweep their own compression-count lists.
 #
 # - flock:     `cargo bench --bench sha2_proof` (N independent SHA-256
-#              compressions; prove_fast, incl. witness gen).
+#              compressions; prove_fast, incl. witness gen). Swept over HASH_LOG2S
+#              up to FLOCK_MAX_LOG2 (2^16; Ligerito thrashes at 2^18 on 24 GB).
 # - binius64:  `HASH=sha256 binius64/setup.sh` — N independent SHA-256
-#              compressions via the tracked sha256_compressions.rs example.
-# - spartan2:  `spartan2/setup.sh` — microsoft/Spartan2's own sha256_spartan
-#              criterion bench (T256HyraxEngine: 256-bit curve field, Hyrax PCS).
-#              Workload differs from the other two: ONE SHA-256 hash of a fixed
-#              1 KiB / 2 KiB message = 17 / 33 sequentially-dependent
-#              compressions (cf. Flock sha2_chain_proof), not N independent
-#              compressions — and the sizes are fixed upstream, so spartan2
-#              ignores the 2^h sweep and always contributes those two rows.
+#              compressions via the tracked sha256_compressions.rs example. Swept
+#              over HASH_LOG2S up to B64_MAX_LOG2 (2^14; its single-threaded
+#              circuit builder is impractically slow past that), so 2^16 is
+#              effectively flock-only.
+# - spartan2:  microsoft/Spartan2's sha256_spartan criterion bench (T256Hyrax-
+#              Engine: 256-bit curve field, Hyrax PCS). Proves ONE monolithic
+#              SHA-256 R1CS over a small preimage = a chain of sequentially-
+#              dependent compressions (cf. Flock sha2_chain_proof), not N
+#              independent ones. Being monolithic (no folding) its throughput is
+#              flat then DECLINES with size, so we sweep small preimages
+#              (SPARTAN_SIZES) and report the peak. See run_spartan2.
+# - neutronnova: microsoft/Spartan2's sha256_neutronnova folding bench. Folds N
+#              single-block compressions, so it scales with the
+#              batch; we sweep NN_SIZES and report the throughput peak. Its larger
+#              sizes / ST runs are minutes each. See run_neutronnova.
 #
 # plonky3 (no SHA-256 AIR) and hashcaster (no SHA-256 circuit) are excluded —
 # neither can prove SHA-256 out of the box.
 #
 # Usage: bench_sha256.sh [PROVER ...]   (no args = all). PROVER ∈
-#   flock|binius64|spartan2 (alias: both = flock+binius64, all = everything).
-#   $ONLY works too.
-#   e.g.  ./bench_sha256.sh flock        ./bench_sha256.sh spartan2
+#   flock | binius64 | spartan2 | neutronnova  (aliases: nn = neutronnova,
+#   both = flock+binius64, all = everything). $ONLY works too.
+#   e.g.  ./bench_sha256.sh flock        ./bench_sha256.sh neutronnova
 #
 # Single-threaded comparison: after the main (P-core) pass, each selected prover
-# is re-run single-threaded (RAYON_NUM_THREADS=1) over $ST_LOG2S (default = the
-# sweep) and printed as a second table. ST_LOG2S="" skips it.
+# is re-run single-threaded (RAYON_NUM_THREADS=1) — flock/binius64 over $ST_LOG2S,
+# spartan2/neutronnova re-sweeping their own lists at 1 thread — and printed as a
+# second table. ST_LOG2S="" skips the flock/binius64 single-thread sweep.
 #
 # Caching: every result is saved under bench-sha256-cache/<prover>_2^<h>_t<threads>.
 # A plain `./bench_sha256.sh` reuses cached rows and only runs what's missing;
 # naming a prover re-runs it fresh. USE_CACHE=1 reuses even with args; NO_CACHE=1
-# forces fresh runs (still caching). Knobs: HASH_LOG2S (sweep, default "10 11 12 13 14 16 18"),
-# ST_LOG2S, RAYON_NUM_THREADS. See ../CLAUDE.md "External Benchmarks".
+# forces fresh runs (still caching). Knobs: HASH_LOG2S (flock/binius64 MT sweep,
+# default "10 11 12 13 14 16"), ST_LOG2S, SPARTAN_SIZES, NN_SIZES, FLOCK_MAX_LOG2,
+# B64_MAX_LOG2, RAYON_NUM_THREADS. See ../CLAUDE.md "External Benchmarks".
 
 set -euo pipefail
 
@@ -86,7 +98,7 @@ set -- ${_pos[@]+"${_pos[@]}"}
 [[ "$COOLDOWN" =~ ^[0-9]+$ ]] || { echo "--cooldown expects a non-negative integer (seconds), got '$COOLDOWN'" >&2; exit 1; }
 
 # Prover selection (CLI args or $ONLY; default all).
-do_flock=false; do_b64=false; do_spartan=false
+do_flock=false; do_b64=false; do_spartan=false; do_nn=false
 if [[ $# -gt 0 ]]; then REQUESTED=("$@")
 elif [[ -n "${ONLY:-}" ]]; then
 	# shellcheck disable=SC2206
@@ -96,10 +108,11 @@ for tok in "${REQUESTED[@]}"; do
 	case "$tok" in
 		flock)            do_flock=true ;;
 		binius64)         do_b64=true ;;
-		spartan2|spartan) do_spartan=true ;;
+		spartan2|spartan) do_spartan=true ;;          # Spartan-Hyrax (sha256_spartan)
+		neutronnova|nn)   do_nn=true ;;               # NeutronNova folding (sha256_neutronnova)
 		both)             do_flock=true; do_b64=true ;;
-		all)              do_flock=true; do_b64=true; do_spartan=true ;;
-		*) echo "unknown prover '$tok' (flock|binius64|spartan2|both|all)" >&2; exit 1 ;;
+		all)              do_flock=true; do_b64=true; do_spartan=true; do_nn=true ;;
+		*) echo "unknown prover '$tok' (flock|binius64|spartan2|neutronnova|both|all)" >&2; exit 1 ;;
 	esac
 done
 
@@ -154,6 +167,16 @@ to_ms() {
 		mult = (u=="s") ? 1000 : (u=="ms") ? 1 : (u=="µs"||u=="us") ? 0.001 : (u=="ns") ? 1e-6 : 0
 		if (mult == 0) { print "n/a"; exit }
 		printf "%.2f ms", v * mult
+	}'
+}
+
+# to_secs "value unit" -> seconds as a float, or empty if unparseable.
+to_secs() {
+	awk -v s="${1:-}" 'BEGIN {
+		n = split(s, a, " "); if (n < 2) exit
+		v = a[1]; u = a[2]
+		m = (u=="s") ? 1 : (u=="ms") ? 1e-3 : (u=="µs"||u=="us") ? 1e-6 : (u=="ns") ? 1e-9 : 0
+		if (m > 0) printf "%.6f", v * m
 	}'
 }
 human_size() {
@@ -271,77 +294,141 @@ run_b64_size() {
 	else run_b64 "$(printf '%03d%d' "$h" 1)" "$h" "$n"; fi
 }
 
-# --- spartan2 (microsoft/Spartan2 sha256_spartan criterion bench) -------------
-# Proves ONE SHA-256 hash of a fixed-size message with the T256HyraxEngine:
-# 1 KiB = ceil((1024+9)/64) = 17 sequentially-dependent compressions, 2 KiB = 33.
-# The sizes are hardcoded upstream, so spartan2 ignores the 2^h sweep and always
-# contributes these two rows (per thread count). Criterion is filtered to the
-# prove/verify groups (setup/prep_prove are skipped — not part of any other
-# prover's reported time). "size:compressions" pairs:
-SPARTAN_SIZES="1024:17 2048:33"
+# --- spartan2 (microsoft/Spartan2 sha256_spartan, Hyrax engine) ---------------
+# Proves ONE monolithic SHA-256 R1CS over a `bytes`-byte preimage (compressions
+# = ceil((bytes+9)/64): 1 KiB->17, 2 KiB->33, 4 KiB->65, 8 KiB->129). Being
+# monolithic (no folding), its throughput is flat at the small sizes and then
+# DECLINES as the circuit grows, so we sweep only up to 129 compressions and the
+# aggregator reports the (small-size) peak. Reported prover time is prep_prove +
+# prove (witness gen + commit + proof; only the one-time `setup` is excluded),
+# matching Flock's witness-gen-inclusive accounting. SPARTAN_SIZES entries are
+# "bytes:exp" (exp = nearest log2 of the compression count); override to change.
+SPARTAN_SIZES="${SPARTAN_SIZES:-1024:4 2048:5 4096:6 8192:7}"
 
-spartan_label() { case "$1" in 1024) echo "1KiB" ;; 2048) echo "2KiB" ;; *) echo "${1}B" ;; esac; }
-
-# spartan_time GROUP SIZE LOG — criterion median "value unit" for
-# spartan_sha256/GROUP/SIZE/t$THREADS (id line and time may share a line or not).
-spartan_time() {
-	awk -v id="spartan_sha256/$1/$2/t$THREADS" '
+# crit_time PREFIX GROUP SIZE LOG — criterion median "value unit" for
+# PREFIX/GROUP/SIZE/t$THREADS (id line and time may share a line or not).
+crit_time() {
+	awk -v id="$1/$2/$3/t$THREADS" '
 		index($0, id) { f = 1 }
 		f && /time:/ {
 			gsub(/[][]/, "")
 			for (i = 1; i <= NF; i++) if ($i == "time:") { print $(i+3)" "$(i+4); exit }
-		}' "$3"
+		}' "$4"
 }
+spartan_time()     { crit_time spartan_sha256     "$1" "$2" "$3"; }  # Hyrax
+neutronnova_time() { crit_time neutronnova_sha256 "$1" "$2" "$3"; }  # folding
 
-# run_spartan2 — one sha256_spartan run at $THREADS covers both fixed sizes.
+# run_spartan2 — sweep sha256_spartan over SPARTAN_SIZES at $THREADS (one bench
+# run covers all sizes via SP_BYTES). compressions kc = ceil((bytes+9)/64).
 run_spartan2() {
-	local log status spec sz_b kc label key prove_vu secs thr vfy psz uncached
+	local log status spec sz_b exp kc label key prep_s prove_s secs thr prove vfy psz uncached bytes
 	uncached=()
 	for spec in $SPARTAN_SIZES; do
-		sz_b="${spec%%:*}"; label="$(spartan_label "$sz_b")"
-		cache_lookup spartan2 "$label" && continue
+		exp="${spec##*:}"
+		cache_lookup spartan2 "$exp" && continue   # label = compression exp
 		uncached+=("$spec")
 	done
 	(( ${#uncached[@]} > 0 )) || return 0
+	# Byte sizes to measure drive sha256_spartan via SP_BYTES.
+	bytes="$(printf '%s,' "${uncached[@]%%:*}")"; bytes="${bytes%,}"
 	echo
-	echo "############### spartan2 — sha256_spartan (1KiB/2KiB preimage, t$THREADS) ###############"
+	echo "############### spartan2 — sha256_spartan (${bytes} B, t$THREADS) ###############"
 	log="$(mktemp)"
 	set +e
-	SPARTAN_BENCH=spartan SPARTAN_FILTER='^spartan_sha256/(prove|verify)/' BENCH_THREADS="$THREADS" \
+	SP_BYTES="$bytes" SPARTAN_BENCH=spartan SPARTAN_FILTER='^spartan_sha256/(prep_prove|prove|verify)/' BENCH_THREADS="$THREADS" \
 		bash "$BASE/spartan2/setup.sh" 2>&1 | tee "$log"
 	status="${PIPESTATUS[0]}"
 	set -e
 	for spec in "${uncached[@]}"; do
-		sz_b="${spec%%:*}"; kc="${spec##*:}"; label="$(spartan_label "$sz_b")"
+		sz_b="${spec%%:*}"; exp="${spec##*:}"; kc=$(( (sz_b + 72) / 64 )); label="$exp"
 		key="$(printf '%04d2' "$sz_b")"
 		if [[ "$status" -ne 0 ]]; then
-			add_row spartan2 "$label" "$key"$'\t'"spartan2"$'\t'"$label ($kc)"$'\t'"-"$'\t'"FAILED"$'\t'"-"$'\t'"-"$'\t'"-"$'\t'"-"
+			add_row spartan2 "$label" "$key"$'\t'"spartan2"$'\t'"2^$exp ($kc)"$'\t'"-"$'\t'"FAILED"$'\t'"-"$'\t'"-"$'\t'"-"$'\t'"-"
 			continue
 		fi
-		prove_vu="$(spartan_time prove "$sz_b" "$log")"
-		secs="$(awk -v s="$prove_vu" 'BEGIN {
-			n = split(s, a, " "); if (n < 2) exit
-			v = a[1]; u = a[2]
-			m = (u=="s") ? 1 : (u=="ms") ? 1e-3 : (u=="µs"||u=="us") ? 1e-6 : (u=="ns") ? 1e-9 : 0
-			if (m > 0) printf "%.6f", v * m
-		}')"
+		# prover time = prep_prove + prove (witness gen + commit + the proof),
+		# matching Flock's witness-gen-inclusive accounting.
+		prep_s="$(to_secs "$(spartan_time prep_prove "$sz_b" "$log")")"
+		prove_s="$(to_secs "$(spartan_time prove "$sz_b" "$log")")"
+		secs="$(awk -v p="${prep_s:-}" -v q="${prove_s:-}" 'BEGIN { if (p == "" || q == "") exit; printf "%.6f", p + q }')"
 		vfy="$(to_ms "$(spartan_time verify "$sz_b" "$log")")"
 		psz="$(human_size "$(awk -v sz="$sz_b" '$0 ~ ("msg=" sz "B") && /proof_size=/ {
 			for (i = 1; i <= NF; i++) if ($i ~ /^proof_size=/) { sub(/proof_size=/, "", $i); print $i; exit }
 		}' "$log")")"
 		if [[ -z "$secs" ]]; then
-			ROWS+=("$key"$'\t'"spartan2"$'\t'"$label ($kc)"$'\t'"$kc"$'\t'"?"$'\t'"?"$'\t'"$vfy"$'\t'"$psz"$'\t'"n/a")  # parse failed; don't cache
+			ROWS+=("$key"$'\t'"spartan2"$'\t'"2^$exp ($kc)"$'\t'"$kc"$'\t'"?"$'\t'"?"$'\t'"$vfy"$'\t'"$psz"$'\t'"n/a")  # parse failed; don't cache
 		else
 			thr="$(awk -v v="$secs" -v n="$kc" 'BEGIN { t = n / v; printf (t < 100 ? "%.1f" : "%.0f"), t }')"
 			prove="$(awk -v v="$secs" 'BEGIN { printf "%.3f", v }')"
-			add_row spartan2 "$label" "$key"$'\t'"spartan2"$'\t'"$label ($kc)"$'\t'"$kc"$'\t'"$thr"$'\t'"$prove"$'\t'"$vfy"$'\t'"$psz"$'\t'"n/a"
+			add_row spartan2 "$label" "$key"$'\t'"spartan2"$'\t'"2^$exp ($kc)"$'\t'"$kc"$'\t'"$thr"$'\t'"$prove"$'\t'"$vfy"$'\t'"$psz"$'\t'"n/a"
+		fi
+	done
+	rm -f "$log"
+}
+
+# --- neutronnova (microsoft/Spartan2 sha256_neutronnova folding bench) --------
+# Folds N single-block SHA-256 compressions (N = size/64 = bytes/64). Unlike
+# Hyrax (stuck at its fixed 1/2 KiB preimages), NeutronNova folds an arbitrary
+# number of steps, so we SWEEP its batch size and let the aggregator report the
+# throughput PEAK. The default sweeps 16 -> 1024 compressions (2^4 .. 2^10): the
+# curve climbs to ~512 (2^9) then regresses at 2^10, so the max lands at 512.
+# Reported prover time is prep_prove + prove (matching run_spartan2 and Flock's
+# witness-gen-inclusive accounting), cached one row per size under the
+# `neutronnova` key. NN_SIZES entries are "bytes:exp" (exp = log2 of the
+# compression count); override to narrow it, e.g. NN_SIZES="32768:9".
+# NOTE: under criterion's 10-sample windows the 2^10 point (and ST runs) are
+# slow -- minutes each; narrow NN_SIZES for a quick pass.
+NN_SIZES="${NN_SIZES:-1024:4 2048:5 4096:6 8192:7 16384:8 32768:9 65536:10}"
+
+run_neutronnova() {
+	local log status spec sz_b exp kc label key prep_s prove_s secs thr prove vfy psz uncached bytes
+	uncached=()
+	for spec in $NN_SIZES; do
+		exp="${spec##*:}"
+		cache_lookup neutronnova "$exp" && continue   # label = compression exp
+		uncached+=("$spec")
+	done
+	(( ${#uncached[@]} > 0 )) || return 0
+	# Byte sizes to measure drive sha256_neutronnova via NN_BYTES.
+	bytes="$(printf '%s,' "${uncached[@]%%:*}")"; bytes="${bytes%,}"
+	echo
+	echo "############### neutronnova — sha256_neutronnova (${bytes} B, t$THREADS) ###############"
+	log="$(mktemp)"
+	set +e
+	NN_BYTES="$bytes" SPARTAN_BENCH=neutronnova SPARTAN_FILTER='^neutronnova_sha256/(prep_prove|prove|verify)/' BENCH_THREADS="$THREADS" \
+		bash "$BASE/spartan2/setup.sh" 2>&1 | tee "$log"
+	status="${PIPESTATUS[0]}"
+	set -e
+	for spec in "${uncached[@]}"; do
+		sz_b="${spec%%:*}"; exp="${spec##*:}"; kc=$(( sz_b / 64 )); label="$exp"
+		key="$(printf '%04d3' "$sz_b")"
+		if [[ "$status" -ne 0 ]]; then
+			add_row neutronnova "$label" "$key"$'\t'"neutronnova"$'\t'"2^$exp ($kc)"$'\t'"-"$'\t'"FAILED"$'\t'"-"$'\t'"-"$'\t'"-"$'\t'"-"
+			continue
+		fi
+		# prover time = prep_prove + prove (witness gen + commit + the proof),
+		# matching Flock's witness-gen-inclusive accounting.
+		prep_s="$(to_secs "$(neutronnova_time prep_prove "$sz_b" "$log")")"
+		prove_s="$(to_secs "$(neutronnova_time prove "$sz_b" "$log")")"
+		secs="$(awk -v p="${prep_s:-}" -v q="${prove_s:-}" 'BEGIN { if (p == "" || q == "") exit; printf "%.6f", p + q }')"
+		vfy="$(to_ms "$(neutronnova_time verify "$sz_b" "$log")")"
+		psz="$(human_size "$(awk -v sz="$sz_b" '$0 ~ ("size=" sz "B") && /proof_size=/ {
+			for (i = 1; i <= NF; i++) if ($i ~ /^proof_size=/) { sub(/proof_size=/, "", $i); print $i; exit }
+		}' "$log")")"
+		if [[ -z "$secs" ]]; then
+			ROWS+=("$key"$'\t'"neutronnova"$'\t'"2^$exp ($kc)"$'\t'"$kc"$'\t'"?"$'\t'"?"$'\t'"$vfy"$'\t'"$psz"$'\t'"n/a")  # parse failed; don't cache
+		else
+			thr="$(awk -v v="$secs" -v n="$kc" 'BEGIN { t = n / v; printf (t < 100 ? "%.1f" : "%.0f"), t }')"
+			prove="$(awk -v v="$secs" 'BEGIN { printf "%.3f", v }')"
+			add_row neutronnova "$label" "$key"$'\t'"neutronnova"$'\t'"2^$exp ($kc)"$'\t'"$kc"$'\t'"$thr"$'\t'"$prove"$'\t'"$vfy"$'\t'"$psz"$'\t'"n/a"
 		fi
 	done
 	rm -f "$log"
 }
 
 # sweep_provers SIZES — run selected provers over the sizes at the current threads.
-# (spartan2's sizes are fixed upstream; it runs once per pass, not per size.)
+# (spartan2/neutronnova sweep their own lists — SPARTAN_SIZES / NN_SIZES — so each
+# runs once per pass as a single batched bench, not once per $sizes entry.)
 sweep_provers() {
 	local sizes="$1" h
 	if [[ "$do_flock" == true ]]; then run_flock "$sizes"; fi
@@ -349,6 +436,7 @@ sweep_provers() {
 		if [[ "$do_b64" == true ]]; then run_b64_size "$h"; fi
 	done
 	if [[ "$do_spartan" == true ]]; then run_spartan2; fi
+	if [[ "$do_nn" == true ]]; then run_neutronnova; fi
 }
 
 # Main (multi-thread) pass, then the single-thread pass.
@@ -367,10 +455,11 @@ fi
 # sec_label NAME — targeted provable-security bits (config property).
 sec_label() {
 	case "$1" in
-		flock)    echo "~100" ;;
-		binius64) echo "~96"  ;;   # FRI query-phase accounting
-		spartan2) echo "~128" ;;   # T256 curve DL (computational), Hyrax PCS
-		*)        echo "n/a"  ;;
+		flock)       echo "~100" ;;
+		binius64)    echo "~96"  ;;   # FRI query-phase accounting
+		spartan2)    echo "~128" ;;   # T256 curve DL (computational), Hyrax PCS
+		neutronnova) echo "~128" ;;   # same T256 curve, NeutronNova folding
+		*)           echo "n/a"  ;;
 	esac
 }
 
@@ -380,10 +469,11 @@ sec_label() {
 # stale for cached rows).
 prover_order() {
 	case "$1" in
-		flock)    echo 0 ;;
-		binius64) echo 1 ;;
-		spartan2) echo 2 ;;
-		*)        echo 9 ;;
+		flock)       echo 0 ;;
+		binius64)    echo 1 ;;
+		spartan2)    echo 2 ;;
+		neutronnova) echo 3 ;;
+		*)           echo 9 ;;
 	esac
 }
 
@@ -439,13 +529,16 @@ if (( ${#ROWS[@]} > ST_START )); then
 fi
 echo
 echo "  notes: flock/binius64 prove N INDEPENDENT SHA-256 compressions (compress(IV, m_i));"
-echo "         spartan2 proves ONE SHA-256 hash of a fixed 1KiB/2KiB message = 17/33 sequentially-"
-echo "         dependent compressions (its bench's hardcoded sizes; cf. Flock sha2_chain_proof),"
-echo "         so its throughput is not directly comparable to the independent-compression rows."
+echo "         spartan2 (Hyrax) proves ONE monolithic SHA-256 R1CS over a small (swept) preimage ="
+echo "         a chain of sequentially-dependent compressions (cf. Flock sha2_chain_proof) — flat then"
+echo "         declining throughput, so the peak is reported; neutronnova FOLDS N single-block"
+echo "         compressions (swept), scaling with the batch. Neither is directly comparable to the"
+echo "         independent-compression rows."
 echo "         'security' = targeted provable bits (flock ~100 UDR, binius64 ~96 FRI query-phase,"
-echo "         spartan2 ~128 computational from T256 curve DL). 'prove' is prover time; throughput ="
-echo "         compressions / prove, end-to-end incl. witness gen (spartan2: criterion median of its"
-echo "         prove group — witness synthesis included, setup/prep_prove not). flock proof size = commitment +"
-echo "         proof (bincode); spartan2 = bincode proof. Results cached under bench-sha256-cache/"
-echo "         and reused on a plain default run; name a prover to re-measure, NO_CACHE=1 to refresh."
+echo "         spartan2/neutronnova ~128 computational from T256 curve DL). 'prove' is prover time;"
+echo "         throughput = compressions / prove, end-to-end incl. witness gen (spartan2/neutronnova:"
+echo "         prep_prove + prove criterion medians — witness synthesis + commit + proof; only the"
+echo "         one-time setup is excluded). flock proof size = commitment + proof (bincode);"
+echo "         spartan2/neutronnova = bincode proof. Results cached under bench-sha256-cache/ and"
+echo "         reused on a plain default run; name a prover to re-measure, NO_CACHE=1 to refresh."
 echo "         plonky3 (no SHA-256 AIR) and hashcaster (no SHA-256 circuit) are excluded."

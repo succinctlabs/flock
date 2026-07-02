@@ -66,6 +66,24 @@ else
 	echo "spartan2 already present in $DIR, skipping clone."
 fi
 
+# Apply the size-override patches (idempotent). Stock sha256_neutronnova and
+# sha256_spartan hardcode their compression counts; these patches add NN_BYTES /
+# SP_BYTES env knobs so ../bench_sha256.sh can sweep batch sizes (NeutronNova up
+# to its throughput peak; Spartan-Hyrax up to where its monolithic cost makes
+# throughput decline). The clone's .git was stripped above, so apply with
+# `patch`, not `git apply`. Sentinel for each: the env-var name in the bench.
+for spec in "neutronnova_nn_bytes.patch:sha256_neutronnova.rs:NN_BYTES" \
+            "spartan_sp_bytes.patch:sha256_spartan.rs:SP_BYTES"; do
+	pf="${spec%%:*}"; rest="${spec#*:}"; bench="${rest%%:*}"; sentinel="${rest##*:}"
+	[[ -f "$DIR/$pf" ]] || continue
+	if grep -q "$sentinel" "$DIR/benches/$bench" 2>/dev/null; then
+		echo "$sentinel patch already applied, skipping."
+	else
+		echo "Applying $sentinel size-override patch ..."
+		patch -p1 -d "$DIR" < "$DIR/$pf"
+	fi
+done
+
 # Thread sweep for Spartan2's bench harness. Default: P-core count only, like
 # the other benchmarks setups (binius64, plonky3) and Flock itself.
 if [[ -n "${BENCH_THREADS:-}" ]]; then
