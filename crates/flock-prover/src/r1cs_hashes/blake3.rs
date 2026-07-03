@@ -689,6 +689,15 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
         K
     }
 
+    /// Advertise the constant-wire pin so lincheck adds the β-pin term when
+    /// this walker is used directly. The matrix-based circuit carries it via
+    /// `BlockR1cs::{sparse,csc}_lincheck_circuit` (`const_pin =
+    /// Some(Z_CONST_POS)`); the walker must match, or the all-zero-witness
+    /// soundness gap reopens. See `docs/const-wire-pin.md`.
+    fn const_pin_col(&self) -> Option<usize> {
+        Some(Z_CONST_POS)
+    }
+
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
         let mut comb = vec![F128::ZERO; K];
@@ -1887,6 +1896,14 @@ mod tests {
         let sparse = SparseMatrixCircuit::new(&a_0, &b_0);
         let walker = Blake3LincheckCircuit;
         assert_eq!(sparse.n_cols(), walker.n_cols());
+
+        // The walker must advertise the same constant-wire pin the live matrix
+        // circuit carries (the setup sets const_pin = Some(Z_CONST_POS)), or
+        // the lincheck β-pin term is silently dropped when the walker is used
+        // directly, reopening the all-zero-witness gap.
+        let pinned = SparseMatrixCircuit::new(&a_0, &b_0).with_const_pin(Some(Z_CONST_POS));
+        assert_eq!(walker.const_pin_col(), Some(Z_CONST_POS));
+        assert_eq!(walker.const_pin_col(), pinned.const_pin_col());
 
         let n_cols = walker.n_cols();
         let alpha = F128 {
