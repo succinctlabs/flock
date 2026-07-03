@@ -525,3 +525,48 @@ commit 24.4 vs 23.9, zerocheck 27.7 vs 25.4, lincheck 5.5 vs 5.2, open
 or kernel changes, at ≈5% (multi) / ≈9% (single) of production — entirely
 from accounted, closable bookkeeping residuals.** The layout is viable
 end-to-end.
+
+### E6b — all hashes × both backends + residuals closed (DONE — parity)
+
+`src/e6.rs` (hash-generic core), `bin/e6_end_to_end.rs`,
+`tests/e6_roundtrip.rs`; raw: `results/e6b_2026-07-03.tsv`.
+
+Changes over E6: (a) generic over the hash encoder — keccak uses its
+`KeccakLincheckCircuit` walker, sha2/blake3 their cached
+`csc_lincheck_circuit`; (b) **Ligerito backend** (the production PCS) via
+`open_batch_mixed_ligerito_with_precomputed_s_hat_v` +
+`verify_claims_ligerito`; (c) both residuals closed:
+- *suffix-only zeroing* — the direct producers now fully write the useful
+  chunk-column prefix (keccak grew explicit zero rows for its intra-slot
+  gap words), so recycled buffers only zero the padding suffix;
+- *s_hat_v precomputes* — the zerocheck two-bank `s_hat_v_c` capture is
+  address-generic and used as-is; the AB-side `s_hat_v_from_z_vec`
+  derivation applies **verbatim** (z_vec's index layout and the chunk-tail
+  coords are unchanged under L1′; the batch fold is already inside z_vec).
+
+Gates (all green): roundtrips for 3 hashes × 2 backends; precomputed-path
+proofs **byte-identical** (bincode) to the plain path; tamper rejection;
+3-round recycled-buffer reuse on dirty scratch buffers.
+
+Prove ratios L1′/production (median; BF = BaseFold, LIG = Ligerito):
+
+| hash | m | 8-core BF | 8-core LIG | 1-core BF | 1-core LIG |
+|---|---|---|---|---|---|
+| keccak | 23 | 0.96 | 0.99 | 0.89 | 0.99 |
+| keccak | 26 | 0.99 | 1.06 | 1.01 | 1.00 |
+| keccak | 29 | 1.03 | 1.00 | — | 1.01 |
+| sha2 | 23 | 1.07 | 0.99 | 1.00 | 0.94 |
+| sha2 | 26 | 0.99 | 0.94 | 1.00 | 1.02 |
+| sha2 | 29 | 1.00 | 1.02 | — | 1.01 |
+| blake3 | 23 | 0.95 | 0.81 | 0.98 | 1.01 |
+| blake3 | 26 | 1.04 | 1.03 | 1.00 | 1.00 |
+| blake3 | 29 | 1.03 | 1.00 | — | 1.01 |
+
+30 measured cells, mean ratio ≈ 1.00, all within ±7% (mostly ±3%, i.e.
+run-to-run noise). Verify times equal production's (±0.2 ms).
+
+**FINAL ANSWER to the plan's question: the batch-major (L1′) layout costs
+nothing end-to-end — parity across every hash, size, backend, and thread
+regime, with the production PCS, at full soundness (roundtrip + tamper
+gates).** The fold-log_n-first / jagged multi-table design can proceed on
+this layout without a performance tax.

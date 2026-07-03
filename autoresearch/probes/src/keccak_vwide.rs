@@ -271,12 +271,27 @@ unsafe fn build_group(
         }
     }
 
+    let zeros: VLane = [0u64; V];
     unsafe {
         // state_0 self-loops: z = a = v, b = 1.
         for i in 0..N_LANES {
             push_z!(S0_W + i, &lanes[i]);
             wa.push(S0_W + i, &lanes[i]);
             wb.push(S0_W + i, &ones);
+        }
+        wz.flush();
+        wa.flush();
+        wb.flush();
+
+        // Explicit zero rows for the intra-slot gap words 26..32 (between
+        // state_0's end and the state_24 slot) so the useful chunk-column
+        // prefix [0, useful_chunks) is FULLY written — callers then only
+        // need to zero the suffix, never the interior (recycled-buffer
+        // contract).
+        for w in (S0_W + N_LANES + 1)..S24_W {
+            push_z!(w, &zeros);
+            wa.push(w, &zeros);
+            wb.push(w, &zeros);
         }
         wz.flush();
         wa.flush();
@@ -342,15 +357,33 @@ unsafe fn build_group(
         wz.flush();
         wa.flush();
         wb.flush();
+
+        // Zero rows for the gap words 58..64 (between state_24's end and the
+        // constant word) — see the 26..32 fill above.
+        for w in (S24_W + N_LANES + 1)..CONST_W {
+            push_z!(w, &zeros);
+            wa.push(w, &zeros);
+            wb.push(w, &zeros);
+        }
+        wz.flush();
+        wa.flush();
+        wb.flush();
     }
 }
 
+/// Useful chunk-columns per block: the producer fully writes columns
+/// `[0, USEFUL_CHUNKS)`; callers must zero columns `[USEFUL_CHUNKS, 512)`
+/// (a contiguous buffer suffix) before first use of a recycled buffer.
+pub const USEFUL_CHUNKS: usize =
+    flock_prover::r1cs_hashes::keccak::USEFUL_BITS.div_ceil(128);
+
 /// The direct L1′ keccak producer: parallel over V-instance groups.
 ///
-/// `z`/`a`/`b` are L1′-layout u64 buffers (`2^n_log · 1024` u64s each) that
-/// MUST be zeroed before first use (padding words are never written; reuse
-/// across calls is fine). `stripe`, when `Some`, must be
-/// `(2^n_log / 8) · 2^16` bytes, likewise pre-zeroed.
+/// `z`/`a`/`b` are L1′-layout u64 buffers (`2^n_log · 1024` u64s each).
+/// Chunk-columns `[0, USEFUL_CHUNKS)` are fully written every call; the
+/// suffix `[USEFUL_CHUNKS, 512)` is never written and must be zero (zero it
+/// once per recycled buffer). `stripe`, when `Some`, must be
+/// `(2^n_log / 8) · 2^16` bytes with its useful rows likewise fully written.
 pub fn build_l1_direct(
     states: &[State],
     n_log: usize,

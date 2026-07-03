@@ -1,14 +1,19 @@
-//! E6 — end-to-end timing: L1′ prove (probe pipeline) vs production
-//! `KeccakSetup::prove_fast_basefold`, plus verify times. Both pipelines
-//! include witness generation.
+//! E6 — end-to-end timing: L1′ pipeline vs production `prove_fast*`, per
+//! hash and PCS backend. Both pipelines include witness generation and use
+//! scratch-recycled buffers.
 //!
-//! Usage: cargo run --release --bin e6_end_to_end -- [--m 23,26,29]
-//!   [--iters 5] [--tsv out.tsv]
+//! Usage: cargo run --release --bin e6_end_to_end --
+//!   [--hash all|keccak|sha2|blake3] [--backend both|basefold|ligerito]
+//!   [--m 23,26,29] [--iters 5] [--tsv out.tsv]
 
-use flock_autoresearch_probes::e6::{keccak_setup, prove_l1_keccak, verify_l1_keccak};
-use flock_autoresearch_probes::keccak_witness::random_state;
+use flock_autoresearch_probes::e6::{
+    L1HashSpec, prove_l1_basefold, prove_l1_ligerito, setup, verify_l1_basefold,
+    verify_l1_ligerito,
+};
+use flock_autoresearch_probes::{blake3_vwide, blake3_witness, keccak_vwide, keccak_witness,
+    sha2_vwide, sha2_witness};
 use flock_core::challenger::FsChallenger;
-use flock_prover::r1cs_hashes::keccak::{K_LOG, KeccakSetup, State};
+use flock_core::lincheck::LincheckCircuit;
 use std::io::Write;
 use std::time::Instant;
 
@@ -31,107 +36,296 @@ fn time_median<F: FnMut()>(mut f: F, iters: usize) -> (f64, f64) {
     (ts[ts.len() / 2], ts[0])
 }
 
+struct Report {
+    tsv: Option<String>,
+    hash: &'static str,
+    m: usize,
+    threads: usize,
+}
+
+impl Report {
+    fn row(&self, name: &str, (med, min): (f64, f64)) {
+        println!("{:<26} {:>10.2} {:>10.2}", name, med * 1e3, min * 1e3);
+        if let Some(p) = &self.tsv {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .expect("open tsv");
+            writeln!(
+                f,
+                "{}\t{}\t{}\t{}\t{:.4}\t{:.4}",
+                self.hash,
+                self.m,
+                self.threads,
+                name,
+                med * 1e3,
+                min * 1e3
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// Production prove/verify closures per backend, so the generic runner can
+/// treat all hashes uniformly.
+#[allow(clippy::too_many_arguments)]
+fn run_hash<S: Sync>(
+    hash: &'static str,
+    r1cs: flock_core::r1cs::BlockR1cs,
+    circuit: &dyn LincheckCircuit,
+    inputs: &[S],
+    direct: &(dyn Fn(&[S], usize, Option<&mut [u8]>, &mut [u64], &mut [u64], &mut [u64]) + Sync),
+    prod_basefold: &dyn Fn(&[S], &mut FsChallenger),
+    prod_ligerito: Option<&dyn Fn(&[S], &mut FsChallenger)>,
+    backends: &[&str],
+    iters: usize,
+    tsv: &Option<String>,
+) {
+    let (r1cs, pcs_params) = setup(r1cs);
+    let m = r1cs.m;
+    let spec = L1HashSpec {
+        r1cs: &r1cs,
+        circuit,
+        direct,
+    };
+    let rep = Report {
+        tsv: tsv.clone(),
+        hash,
+        m,
+        threads: rayon::current_num_threads(),
+    };
+    eprintln!(
+        "\n== {hash} e2e: m={m} ({} instances), {} threads ==",
+        inputs.len(),
+        rep.threads
+    );
+
+    if backends.contains(&"basefold") {
+        // Gate: roundtrip.
+        let mut ch = FsChallenger::new(b"flock-e6-v1");
+        let res = prove_l1_basefold(&spec, &pcs_params, inputs, true, &mut ch);
+        let mut chv = FsChallenger::new(b"flock-e6-v1");
+        verify_l1_basefold(&r1cs, circuit, &res.commitment, &res.proof, &mut chv)
+            .expect("L1' basefold roundtrip");
+        eprintln!("basefold roundtrip: OK");
+
+        rep.row(
+            "prove-production-bf",
+            time_median(
+                || {
+                    let mut ch = FsChallenger::new(b"flock-e6-v1");
+                    prod_basefold(inputs, &mut ch);
+                },
+                iters,
+            ),
+        );
+        rep.row(
+            "prove-l1-bf",
+            time_median(
+                || {
+                    let mut ch = FsChallenger::new(b"flock-e6-v1");
+                    std::hint::black_box(prove_l1_basefold(
+                        &spec,
+                        &pcs_params,
+                        inputs,
+                        true,
+                        &mut ch,
+                    ));
+                },
+                iters,
+            ),
+        );
+        rep.row(
+            "verify-l1-bf",
+            time_median(
+                || {
+                    let mut ch = FsChallenger::new(b"flock-e6-v1");
+                    std::hint::black_box(
+                        verify_l1_basefold(&r1cs, circuit, &res.commitment, &res.proof, &mut ch)
+                            .unwrap(),
+                    );
+                },
+                iters,
+            ),
+        );
+    }
+
+    if backends.contains(&"ligerito") {
+        if let Some(prod_lig) = prod_ligerito {
+            let mut ch = FsChallenger::new(b"flock-e6-v1");
+            let res = prove_l1_ligerito(&spec, &pcs_params, inputs, true, &mut ch);
+            let mut chv = FsChallenger::new(b"flock-e6-v1");
+            verify_l1_ligerito(
+                &r1cs,
+                circuit,
+                &res.commitment,
+                &res.proof,
+                &pcs_params,
+                &mut chv,
+            )
+            .expect("L1' ligerito roundtrip");
+            eprintln!("ligerito roundtrip: OK");
+
+            rep.row(
+                "prove-production-lig",
+                time_median(
+                    || {
+                        let mut ch = FsChallenger::new(b"flock-e6-v1");
+                        prod_lig(inputs, &mut ch);
+                    },
+                    iters,
+                ),
+            );
+            rep.row(
+                "prove-l1-lig",
+                time_median(
+                    || {
+                        let mut ch = FsChallenger::new(b"flock-e6-v1");
+                        std::hint::black_box(prove_l1_ligerito(
+                            &spec,
+                            &pcs_params,
+                            inputs,
+                            true,
+                            &mut ch,
+                        ));
+                    },
+                    iters,
+                ),
+            );
+            rep.row(
+                "verify-l1-lig",
+                time_median(
+                    || {
+                        let mut ch = FsChallenger::new(b"flock-e6-v1");
+                        std::hint::black_box(
+                            verify_l1_ligerito(
+                                &r1cs,
+                                circuit,
+                                &res.commitment,
+                                &res.proof,
+                                &pcs_params,
+                                &mut ch,
+                            )
+                            .unwrap(),
+                        );
+                    },
+                    iters,
+                ),
+            );
+        }
+    }
+}
+
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
     let args: Vec<String> = std::env::args().collect();
+    let hashes: Vec<&str> = match parse_flag(&args, "--hash").as_deref() {
+        None | Some("all") => vec!["keccak", "sha2", "blake3"],
+        Some("keccak") => vec!["keccak"],
+        Some("sha2") => vec!["sha2"],
+        Some("blake3") => vec!["blake3"],
+        Some(o) => panic!("unknown hash {o}"),
+    };
+    let backends: Vec<&str> = match parse_flag(&args, "--backend").as_deref() {
+        None | Some("both") => vec!["basefold", "ligerito"],
+        Some("basefold") => vec!["basefold"],
+        Some("ligerito") => vec!["ligerito"],
+        Some(o) => panic!("unknown backend {o}"),
+    };
     let ms: Vec<usize> = parse_flag(&args, "--m").map_or_else(
         || vec![23, 26, 29],
         |v| v.split(',').map(|s| s.parse().unwrap()).collect(),
     );
     let iters: usize = parse_flag(&args, "--iters").map_or(5, |v| v.parse().unwrap());
     let tsv = parse_flag(&args, "--tsv");
-    let threads = rayon::current_num_threads();
 
-    for &m in &ms {
-        let n_log = m - K_LOG;
-        let n = 1usize << n_log;
-        eprintln!("\n== keccak e2e: m={m} ({n} instances), {threads} threads ==");
-        let states: Vec<State> = (0..n as u64).map(random_state).collect();
-
-        // ---- L1' pipeline: roundtrip gate, then timing.
-        let (r1cs, pcs_params) = keccak_setup(n_log);
-        {
-            let mut chp = FsChallenger::new(b"flock-e6-v0");
-            let res = prove_l1_keccak(&r1cs, &pcs_params, &states, &mut chp);
-            let mut chv = FsChallenger::new(b"flock-e6-v0");
-            verify_l1_keccak(&r1cs, &res.commitment, &res.proof, &mut chv)
-                .expect("L1' roundtrip");
-            eprintln!("L1' prove->verify roundtrip: OK");
-        }
-
-        // ---- Production pipeline (BaseFold): roundtrip gate, then timing.
-        let setup = KeccakSetup::new(n);
-        {
-            let mut chp = FsChallenger::new(b"flock-e6-v0");
-            let (proof, commitment, _) = setup.prove_fast_basefold(&states, &mut chp);
-            let mut chv = FsChallenger::new(b"flock-e6-v0");
-            setup
-                .verify_basefold(&commitment, &proof, &mut chv)
-                .expect("production roundtrip");
-            eprintln!("production prove->verify roundtrip: OK");
-        }
-
-        let mut rows: Vec<(&str, f64, f64)> = Vec::new();
-
-        let t = time_median(
-            || {
-                let mut ch = FsChallenger::new(b"flock-e6-v0");
-                std::hint::black_box(setup.prove_fast_basefold(&states, &mut ch));
-            },
-            iters,
-        );
-        rows.push(("prove-production", t.0, t.1));
-
-        let t = time_median(
-            || {
-                let mut ch = FsChallenger::new(b"flock-e6-v0");
-                std::hint::black_box(prove_l1_keccak(&r1cs, &pcs_params, &states, &mut ch));
-            },
-            iters,
-        );
-        rows.push(("prove-l1", t.0, t.1));
-
-        // Verify timings (single proof each).
-        let mut chp = FsChallenger::new(b"flock-e6-v0");
-        let (p_prod, c_prod, _) = setup.prove_fast_basefold(&states, &mut chp);
-        let t = time_median(
-            || {
-                let mut ch = FsChallenger::new(b"flock-e6-v0");
-                std::hint::black_box(setup.verify_basefold(&c_prod, &p_prod, &mut ch).unwrap());
-            },
-            iters,
-        );
-        rows.push(("verify-production", t.0, t.1));
-
-        let mut chp = FsChallenger::new(b"flock-e6-v0");
-        let res = prove_l1_keccak(&r1cs, &pcs_params, &states, &mut chp);
-        let t = time_median(
-            || {
-                let mut ch = FsChallenger::new(b"flock-e6-v0");
-                std::hint::black_box(
-                    verify_l1_keccak(&r1cs, &res.commitment, &res.proof, &mut ch).unwrap(),
-                );
-            },
-            iters,
-        );
-        rows.push(("verify-l1", t.0, t.1));
-
-        println!("{:<20} {:>10} {:>10}", "variant", "median ms", "min ms");
-        for (name, med, min) in &rows {
-            println!("{:<20} {:>10.2} {:>10.2}", name, med * 1e3, min * 1e3);
-            if let Some(p) = &tsv {
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(p)
-                    .expect("open tsv");
-                writeln!(
-                    f,
-                    "keccak\t{m}\t{K_LOG}\t{n_log}\t{threads}\t{name}\t{:.4}\t{:.4}",
-                    med * 1e3,
-                    min * 1e3
-                )
-                .unwrap();
+    for hash in &hashes {
+        for &m in &ms {
+            match *hash {
+                "keccak" => {
+                    use flock_prover::r1cs_hashes::keccak::{
+                        K_LOG, KeccakLincheckCircuit, KeccakSetup, build_block_r1cs,
+                    };
+                    let n_log = m - K_LOG;
+                    let n = 1usize << n_log;
+                    let inputs: Vec<_> =
+                        (0..n as u64).map(keccak_witness::random_state).collect();
+                    let prod = KeccakSetup::new(n);
+                    run_hash(
+                        "keccak",
+                        build_block_r1cs(n_log),
+                        &KeccakLincheckCircuit,
+                        &inputs,
+                        &keccak_vwide::build_l1_direct,
+                        &|st, ch| {
+                            std::hint::black_box(prod.prove_fast_basefold(st, ch));
+                        },
+                        Some(&|st, ch| {
+                            std::hint::black_box(prod.prove_fast(st, ch));
+                        }),
+                        &backends,
+                        iters,
+                        &tsv,
+                    );
+                }
+                "sha2" => {
+                    use flock_prover::r1cs_hashes::sha2::{
+                        K_LOG, Sha256HybridSetup, build_block_r1cs,
+                    };
+                    let n_log = m - K_LOG;
+                    let n = 1usize << n_log;
+                    let inputs: Vec<_> =
+                        (0..n as u64).map(sha2_witness::random_input).collect();
+                    let prod = Sha256HybridSetup::new(n);
+                    let r1cs = build_block_r1cs(n_log);
+                    let circuit = r1cs.csc_lincheck_circuit().clone();
+                    run_hash(
+                        "sha2",
+                        r1cs,
+                        &circuit,
+                        &inputs,
+                        &sha2_vwide::build_l1_direct,
+                        &|st, ch| {
+                            std::hint::black_box(prod.prove_fast_basefold(st, ch));
+                        },
+                        Some(&|st, ch| {
+                            std::hint::black_box(prod.prove_fast(st, ch));
+                        }),
+                        &backends,
+                        iters,
+                        &tsv,
+                    );
+                }
+                "blake3" => {
+                    use flock_prover::r1cs_hashes::blake3::{
+                        Blake3Setup, K_LOG, build_block_r1cs,
+                    };
+                    let n_log = m - K_LOG;
+                    let n = 1usize << n_log;
+                    let inputs: Vec<_> =
+                        (0..n as u64).map(blake3_witness::random_input).collect();
+                    let prod = Blake3Setup::new(n);
+                    let r1cs = build_block_r1cs(n_log);
+                    let circuit = r1cs.csc_lincheck_circuit().clone();
+                    run_hash(
+                        "blake3",
+                        r1cs,
+                        &circuit,
+                        &inputs,
+                        &blake3_vwide::build_l1_direct,
+                        &|st, ch| {
+                            std::hint::black_box(prod.prove_fast_basefold(st, ch));
+                        },
+                        Some(&|st, ch| {
+                            std::hint::black_box(prod.prove_fast(st, ch));
+                        }),
+                        &backends,
+                        iters,
+                        &tsv,
+                    );
+                }
+                _ => unreachable!(),
             }
         }
     }
