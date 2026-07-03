@@ -1834,7 +1834,7 @@ pub fn generate_witness_batch_major(
         n_blocks_log,
         K_LOG,
         USEFUL_BITS,
-        |group, rz, ra, rb| build_group_batch_major(group, rz, ra, rb),
+        build_group_batch_major,
     )
 }
 

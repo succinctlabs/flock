@@ -549,7 +549,7 @@ where
         SendPtr(b.as_mut_ptr() as *mut u64),
     );
     let sp = SendPtr(stripe.as_ptr() as *mut u64);
-    let inputs_ref = &inputs[..];
+    let inputs_ref = inputs;
 
     (0..n_total / BM_V).into_par_iter().for_each_init(
         || {

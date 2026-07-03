@@ -1453,7 +1453,7 @@ pub fn generate_witness_batch_major(
     );
     let sp = SendPtr(stripe.as_ptr() as *mut u64);
     let padding: State = [false; STATE_BITS];
-    let states_ref = &initial_states[..];
+    let states_ref = initial_states;
     let padding_ref = &padding;
 
     (0..n_total / BM_V).into_par_iter().for_each(move |g| {
