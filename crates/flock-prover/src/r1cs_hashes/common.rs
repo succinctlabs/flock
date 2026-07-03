@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use flock_core::bits::transpose_8_u64s_to_64_bytes;
 use flock_core::field::F128;
-use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
+use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 
 /// OR the low 32 bits of `val` into `buf` starting at bit-offset `bit_off`.
 /// Handles u64 straddling when `bit_off % 64 > 32`.
@@ -176,6 +176,7 @@ pub(crate) fn build_block_r1cs_with_matrices(
         a_0,
         b_0,
         c_0: identity(k),
+        layout: WitnessLayout::RowMajor,
         const_pin,
         digest_cache: OnceLock::new(),
         csc_cache: OnceLock::new(),
@@ -343,3 +344,239 @@ pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
     out
 }
 
+
+// ---------------------------------------------------------------------------
+// Batch-major (WitnessLayout::BatchMajor) witness-producer plumbing.
+//
+// The batch-major producers simulate V = 8 instances in lockstep and write
+// witness words directly at their batch-major addresses: the word-row for
+// block-u64 index `w` across the 8 instances is exactly one 128-byte
+// chunk-row (= one cache line) at dest word `((w >> 1) << n_log) + o0`,
+// stored non-temporally (dest lines are fully overwritten and not re-read
+// soon, so write-allocate reads are pure waste). V = 8 also equals the
+// lincheck stripe group, so the byte-stripe is transposed from the in-flight
+// rows at zero extra reads.
+//
+// Producer contract: chunk-columns `[0, useful_chunks)` are FULLY written
+// every call; the padding suffix `[useful_chunks, k/128)` columns are never
+// written (the generators zero that contiguous buffer suffix themselves, so
+// recycled scratch buffers stay valid).
+// ---------------------------------------------------------------------------
+
+/// Instances per lockstep group (= one lincheck-stripe group; one chunk-row
+/// emission = 128 B).
+pub(crate) const BM_V: usize = 8;
+/// One interleaved word-row: the same block-u64 index across BM_V instances.
+pub(crate) type BmRow = [u64; BM_V];
+
+/// Raw-pointer wrapper for the disjoint per-group strided writes.
+#[derive(Copy, Clone)]
+pub(crate) struct SendPtr(pub *mut u64);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+impl SendPtr {
+    /// Method (not field) access so `move` closures capture the whole
+    /// wrapper — field capture would move the bare `*mut u64` (`!Send`).
+    pub(crate) fn get(self) -> *mut u64 {
+        self.0
+    }
+}
+
+/// V-wide `or_u32_at_bit`: OR the V instances' 32-bit values into row `w`
+/// (and `w + 1` on straddle) at bit offset `bit`.
+#[inline(always)]
+pub(crate) fn or_u32_row(rows: &mut [BmRow], bit: usize, vals: &[u32; BM_V]) {
+    let w = bit >> 6;
+    let s = bit & 63;
+    for j in 0..BM_V {
+        rows[w][j] |= (vals[j] as u64) << s;
+    }
+    if s > 32 {
+        for j in 0..BM_V {
+            rows[w + 1][j] |= (vals[j] as u64) >> (64 - s);
+        }
+    }
+}
+
+/// V-wide `or_bit_at`: set bit `bit` in every instance's row.
+#[inline(always)]
+pub(crate) fn or_bit_row(rows: &mut [BmRow], bit: usize) {
+    let w = bit >> 6;
+    let s = bit & 63;
+    for j in 0..BM_V {
+        rows[w][j] |= 1u64 << s;
+    }
+}
+
+/// Non-temporal store of one interleaved 128-byte chunk-row.
+#[inline(always)]
+pub(crate) unsafe fn nt_store_row(src: *const u64, dst: *mut u64) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!(
+            "ldp {t0:q}, {t1:q}, [{s}]",
+            "stnp {t0:q}, {t1:q}, [{d}]",
+            "ldp {t0:q}, {t1:q}, [{s}, #32]",
+            "stnp {t0:q}, {t1:q}, [{d}, #32]",
+            "ldp {t0:q}, {t1:q}, [{s}, #64]",
+            "stnp {t0:q}, {t1:q}, [{d}, #64]",
+            "ldp {t0:q}, {t1:q}, [{s}, #96]",
+            "stnp {t0:q}, {t1:q}, [{d}, #96]",
+            s = in(reg) src, d = in(reg) dst,
+            t0 = out(vreg) _, t1 = out(vreg) _,
+            options(nostack),
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, 2 * BM_V);
+    }
+}
+
+/// NT-flush `useful_chunks` chunk-rows of an interleaved row buffer to the
+/// batch-major destination (dest word index `(c << n_log) + o0`).
+///
+/// SAFETY: caller guarantees dest sizing and per-group disjointness.
+#[inline]
+pub(crate) unsafe fn flush_rows_nt(
+    rows: &[BmRow],
+    dest: *mut u64,
+    o0: usize,
+    n_log: usize,
+    useful_chunks: usize,
+) {
+    debug_assert!(2 * useful_chunks <= rows.len());
+    for c in 0..useful_chunks {
+        let even = &rows[2 * c];
+        let odd = &rows[2 * c + 1];
+        let mut buf = [0u64; 2 * BM_V];
+        for j in 0..BM_V {
+            buf[2 * j] = even[j];
+            buf[2 * j + 1] = odd[j];
+        }
+        unsafe {
+            nt_store_row(buf.as_ptr(), dest.add(((c << n_log) + o0) * 2));
+        }
+    }
+}
+
+/// Transpose the z rows into the lincheck byte-stripe for one V = 8 group.
+/// Only `useful_words` rows are written (the stripe tail stays zero).
+#[inline]
+pub(crate) unsafe fn stripe_from_rows(
+    rows: &[BmRow],
+    stripe: *mut u8,
+    o0: usize,
+    u64_per_block: usize,
+    useful_words: usize,
+) {
+    let base = (o0 / 8) * u64_per_block * 64;
+    for (w, row) in rows.iter().enumerate().take(useful_words) {
+        let out = unsafe { std::slice::from_raw_parts_mut(stripe.add(base + w * 64), 64) };
+        transpose_8_u64s_to_64_bytes(row, out);
+    }
+}
+
+/// V-wide [`add_carry_parts`]: per-instance `(sum, left, right, carry_aux)`.
+#[inline(always)]
+pub(crate) fn add_carry_parts_v(
+    x: &[u32; BM_V],
+    y: &[u32; BM_V],
+) -> ([u32; BM_V], [u32; BM_V], [u32; BM_V], [u32; BM_V]) {
+    const MASK_LO31: u32 = 0x7FFF_FFFF;
+    let mut sum = [0u32; BM_V];
+    let mut left = [0u32; BM_V];
+    let mut right = [0u32; BM_V];
+    let mut carry = [0u32; BM_V];
+    for j in 0..BM_V {
+        let s = x[j].wrapping_add(y[j]);
+        let cin = s ^ x[j] ^ y[j];
+        let l = (x[j] ^ cin) & MASK_LO31;
+        let r = (y[j] ^ cin) & MASK_LO31;
+        sum[j] = s;
+        left[j] = l;
+        right[j] = r;
+        carry[j] = l & r;
+    }
+    (sum, left, right, carry)
+}
+
+/// Shared driver for the interleaved-row batch-major producers (sha2,
+/// blake3 — the bit-packed encoders): parallel over V-instance groups, each
+/// group builds its rows via `per_group(group_inputs, rows)` then NT-flushes
+/// the useful chunks and transposes the stripe. Padding slots use `padding`
+/// (required, matching the row-major driver's const-wire-pin behavior).
+///
+/// Returns `(z, a, b, stripe)`; z/a/b come from the scratch pool with the
+/// padding suffix zeroed (the producers fully write the useful prefix).
+pub(crate) fn drive_witness_batch_major<S: Sync, F>(
+    inputs: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    per_group: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
+{
+    use rayon::prelude::*;
+
+    let n_total = 1usize << n_blocks_log;
+    assert!(inputs.len() <= n_total);
+    assert!(n_total >= BM_V);
+    let u64_per_block = (1usize << k_log) / 64;
+    let useful_chunks = useful_bits.div_ceil(128);
+    let useful_words = useful_bits.div_ceil(64);
+    let total_f128 = n_total * (u64_per_block / 2);
+
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let stripe = vec![0u8; n_total * u64_per_block * 8];
+    // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
+    // the producers fully rewrite the useful prefix every call.
+    let tail = useful_chunks << n_blocks_log;
+    for buf in [&mut z, &mut a, &mut b] {
+        buf[tail..]
+            .par_chunks_mut(1 << 16)
+            .for_each(|c| c.fill(F128::ZERO));
+    }
+
+    let (zp, ap, bp) = (
+        SendPtr(z.as_mut_ptr() as *mut u64),
+        SendPtr(a.as_mut_ptr() as *mut u64),
+        SendPtr(b.as_mut_ptr() as *mut u64),
+    );
+    let sp = SendPtr(stripe.as_ptr() as *mut u64);
+    let inputs_ref = &inputs[..];
+
+    (0..n_total / BM_V).into_par_iter().for_each_init(
+        || {
+            (
+                vec![[0u64; BM_V]; u64_per_block],
+                vec![[0u64; BM_V]; u64_per_block],
+                vec![[0u64; BM_V]; u64_per_block],
+            )
+        },
+        move |(rz, ra, rb), g| {
+            rz[..useful_words].fill([0u64; BM_V]);
+            ra[..useful_words].fill([0u64; BM_V]);
+            rb[..useful_words].fill([0u64; BM_V]);
+            let o0 = g * BM_V;
+            let group: [&S; BM_V] = std::array::from_fn(|j| {
+                inputs_ref.get(o0 + j).unwrap_or(padding)
+            });
+            per_group(group, rz, ra, rb);
+            // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
+            unsafe {
+                flush_rows_nt(rz, zp.get(), o0, n_blocks_log, useful_chunks);
+                flush_rows_nt(ra, ap.get(), o0, n_blocks_log, useful_chunks);
+                flush_rows_nt(rb, bp.get(), o0, n_blocks_log, useful_chunks);
+                stripe_from_rows(rz, sp.get() as *mut u8, o0, u64_per_block, useful_words);
+            }
+        },
+    );
+
+    (z, a, b, stripe)
+}

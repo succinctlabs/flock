@@ -311,6 +311,12 @@ pub fn prove_merkle_path_generic<Ch: Challenger>(
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> (MerklePathProof, Commitment) {
+    assert_eq!(
+        r1cs.layout,
+        flock_core::r1cs::WitnessLayout::RowMajor,
+        "chain/merkle wrappers require the row-major witness layout (their \
+         shift sumcheck and extra claims are not yet ported to batch-major)"
+    );
     let trace = std::env::var("MERKLE_TRACE").is_ok();
 
     // ---- Core: commit → zerocheck → lincheck.
@@ -553,6 +559,12 @@ pub fn prove_merkle_paths_generic<Ch: Challenger>(
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> (MerklePathProof, Commitment) {
+    assert_eq!(
+        r1cs.layout,
+        flock_core::r1cs::WitnessLayout::RowMajor,
+        "chain/merkle wrappers require the row-major witness layout (their \
+         shift sumcheck and extra claims are not yet ported to batch-major)"
+    );
     let trace = std::env::var("MERKLE_TRACE").is_ok();
 
     let t = if trace {
@@ -795,6 +807,12 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> (MerklePathProofLigerito, Commitment) {
+    assert_eq!(
+        r1cs.layout,
+        flock_core::r1cs::WitnessLayout::RowMajor,
+        "chain/merkle wrappers require the row-major witness layout (their \
+         shift sumcheck and extra claims are not yet ported to batch-major)"
+    );
     let trace = std::env::var("MERKLE_TRACE").is_ok();
 
     let log_n = r1cs.m - LOG_PACKING;

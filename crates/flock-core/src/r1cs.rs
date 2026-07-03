@@ -17,6 +17,31 @@ pub struct SparseBinaryMatrix {
     pub rows: Vec<Vec<usize>>,
 }
 
+/// Memory/variable layout of the committed witness (address bit `i` of the
+/// packed buffer = MLE variable `i`).
+///
+/// - **RowMajor** (legacy): `addr = [k_log inner bits | n_log batch bits]` —
+///   each instance is one contiguous `2^k_log`-bit block.
+/// - **BatchMajor**: `addr = [7 in-word bits | n_log batch | k_log−7 chunk]`
+///   — column-major at 128-bit chunk granularity. The sumcheck binds the
+///   batch dims right after the univariate skip + one in-word round (the
+///   fold-log_n-first order required for jagged multi-table composition),
+///   the batch dims live over the ring-switch suffix (packed words), and
+///   per-block zero padding coalesces into one contiguous buffer suffix.
+///
+/// Convention for **`ZClaim` points under BatchMajor**: `x_inner_rest`
+/// holds only the address-dim-6 coordinate and `x_outer` holds
+/// `[batch…, chunk…]`, so the PCS-side concatenation
+/// `x_inner_rest ++ x_outer` yields the address-ordered suffix for the
+/// committed polynomial. (Lincheck's *semantic* `QuirkyPoint` is unchanged
+/// in both layouts.) Requires `k_log ≥ 7` and `k_skip = 6`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WitnessLayout {
+    #[default]
+    RowMajor,
+    BatchMajor,
+}
+
 /// Block-diagonal R1CS instance.
 ///
 /// Total witness length: `N = 2^m = 2^k_log · 2^n_log`.
@@ -40,6 +65,10 @@ pub struct BlockR1cs {
     pub a_0: SparseBinaryMatrix,
     pub b_0: SparseBinaryMatrix,
     pub c_0: SparseBinaryMatrix,
+    /// Memory/variable layout of the committed witness (see [`WitnessLayout`]).
+    /// Bound into [`Self::statement_digest`]; the prover and verifier derive
+    /// their claim-point assembly from it.
+    pub layout: WitnessLayout,
     /// Column of a constant-one wire to pin to 1 across all blocks, or `None`.
     /// Drives the lincheck constant-wire pin for matrix-based encoders whose
     /// circuit is built from these matrices (BLAKE3, SHA-2 via
@@ -72,6 +101,7 @@ impl Clone for BlockR1cs {
             a_0: self.a_0.clone(),
             b_0: self.b_0.clone(),
             c_0: self.c_0.clone(),
+            layout: self.layout,
             const_pin: self.const_pin,
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),
@@ -181,6 +211,116 @@ impl BlockR1cs {
         apply_block_diag_packed(&self.c_0, z_packed, self.m, self.k_log)
     }
 
+    // -----------------------------------------------------------------------
+    // Layout-aware protocol bookkeeping — the single source of truth for how
+    // the zerocheck's address-ordered challenges map to lincheck's semantic
+    // quirky point and to the PCS claims' address-ordered points. Shared by
+    // `flock_prover::prover::prove_fast_core` and `verifier::verify_core`
+    // (any divergence between the two is a transcript break, so both call
+    // these).
+    // -----------------------------------------------------------------------
+
+    /// Witness padding descriptor for URM / PCS work-skipping under this
+    /// layout. RowMajor: per-block useful prefix (padding interleaved at
+    /// each block's tail). BatchMajor: the padding chunk-columns coalesce
+    /// into ONE contiguous buffer suffix, expressed as a single giant block
+    /// (`k_log = m`) with a useful prefix.
+    pub fn padding_spec(&self) -> crate::zerocheck::PaddingSpec {
+        match self.layout {
+            WitnessLayout::RowMajor => crate::zerocheck::PaddingSpec {
+                k_log: self.k_log,
+                useful_bits_per_block: self.useful_bits,
+            },
+            WitnessLayout::BatchMajor => crate::zerocheck::PaddingSpec {
+                k_log: self.m,
+                useful_bits_per_block: self.useful_bits.div_ceil(128) << (7 + self.n_log()),
+            },
+        }
+    }
+
+    /// Lincheck's **semantic** quirky point from the zerocheck claim: split
+    /// the address-ordered `mlv_challenges` into (inner-rest, outer=batch)
+    /// coordinates. RowMajor address order is `[inner-rest | batch]`;
+    /// BatchMajor is `[dim6 | batch | chunk]` with the inner-rest coords
+    /// being `[dim6, chunk…]`.
+    pub fn x_ab_from_mlv(
+        &self,
+        z_skip: crate::field::F128,
+        mlv: &[crate::field::F128],
+    ) -> crate::lincheck::QuirkyPoint {
+        let inner_rest_len = self.k_log - self.k_skip;
+        assert_eq!(mlv.len(), self.m - self.k_skip);
+        match self.layout {
+            WitnessLayout::RowMajor => crate::lincheck::QuirkyPoint {
+                z_skip,
+                x_inner_rest: mlv[..inner_rest_len].to_vec(),
+                x_outer: mlv[inner_rest_len..].to_vec(),
+            },
+            WitnessLayout::BatchMajor => {
+                assert!(self.k_log >= 7 && self.k_skip == 6, "BatchMajor needs k_log >= 7, k_skip = 6");
+                let n_log = self.n_log();
+                let mut x_inner_rest = Vec::with_capacity(inner_rest_len);
+                x_inner_rest.push(mlv[0]);
+                x_inner_rest.extend_from_slice(&mlv[1 + n_log..]);
+                crate::lincheck::QuirkyPoint {
+                    z_skip,
+                    x_inner_rest,
+                    x_outer: mlv[1..1 + n_log].to_vec(),
+                }
+            }
+        }
+    }
+
+    /// Address-ordered `ZClaim` point for the AB claim after lincheck
+    /// replaces the inner coordinates with `(r_inner_skip, r_inner_rest)`.
+    /// See [`WitnessLayout`] for the BatchMajor point convention.
+    pub fn ab_claim_point(
+        &self,
+        r_inner_skip: crate::field::F128,
+        r_inner_rest: &[crate::field::F128],
+        x_outer: &[crate::field::F128],
+    ) -> crate::lincheck::QuirkyPoint {
+        match self.layout {
+            WitnessLayout::RowMajor => crate::lincheck::QuirkyPoint {
+                z_skip: r_inner_skip,
+                x_inner_rest: r_inner_rest.to_vec(),
+                x_outer: x_outer.to_vec(),
+            },
+            WitnessLayout::BatchMajor => {
+                let mut suffix = Vec::with_capacity(x_outer.len() + r_inner_rest.len() - 1);
+                suffix.extend_from_slice(x_outer);
+                suffix.extend_from_slice(&r_inner_rest[1..]);
+                crate::lincheck::QuirkyPoint {
+                    z_skip: r_inner_skip,
+                    x_inner_rest: vec![r_inner_rest[0]],
+                    x_outer: suffix,
+                }
+            }
+        }
+    }
+
+    /// Address-ordered `ZClaim` point for the C claim from the zerocheck's
+    /// `r_rest` (which is address-ordered in both layouts).
+    pub fn c_claim_point(
+        &self,
+        z_skip: crate::field::F128,
+        r_rest: &[crate::field::F128],
+    ) -> crate::lincheck::QuirkyPoint {
+        let inner_rest_len = self.k_log - self.k_skip;
+        match self.layout {
+            WitnessLayout::RowMajor => crate::lincheck::QuirkyPoint {
+                z_skip,
+                x_inner_rest: r_rest[..inner_rest_len].to_vec(),
+                x_outer: r_rest[inner_rest_len..].to_vec(),
+            },
+            WitnessLayout::BatchMajor => crate::lincheck::QuirkyPoint {
+                z_skip,
+                x_inner_rest: vec![r_rest[0]],
+                x_outer: r_rest[1..].to_vec(),
+            },
+        }
+    }
+
     /// BLAKE3 hash of the R1CS instance (parameters + sparse matrices).
     /// Stable across runs; used to bind the Fiat-Shamir transcript to the
     /// statement being proved.
@@ -191,10 +331,16 @@ impl BlockR1cs {
     pub fn statement_digest(&self) -> [u8; 32] {
         *self.digest_cache.get_or_init(|| {
             let mut h = blake3::Hasher::new();
-            h.update(b"flock-r1cs-stmt-v0");
+            h.update(b"flock-r1cs-stmt-v1");
             h.update(&(self.m as u64).to_le_bytes());
             h.update(&(self.k_log as u64).to_le_bytes());
             h.update(&(self.k_skip as u64).to_le_bytes());
+            // The layout determines which polynomial a given witness commits
+            // to — it is part of the statement.
+            h.update(&[match self.layout {
+                WitnessLayout::RowMajor => 0u8,
+                WitnessLayout::BatchMajor => 1u8,
+            }]);
             absorb_matrix(&mut h, &self.a_0);
             absorb_matrix(&mut h, &self.b_0);
             absorb_matrix(&mut h, &self.c_0);
@@ -667,6 +813,7 @@ mod tests {
             a_0: identity(1 << k_log),
             b_0: identity(1 << k_log),
             c_0: identity(1 << k_log),
+            layout: WitnessLayout::RowMajor,
             const_pin: None,
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),
@@ -695,6 +842,7 @@ mod tests {
             a_0: zero.clone(),
             b_0: zero,
             c_0: identity(1 << k_log),
+            layout: WitnessLayout::RowMajor,
             const_pin: None,
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),

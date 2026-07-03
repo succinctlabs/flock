@@ -106,7 +106,12 @@ fn bench_one(n_keccaks: usize, n_runs: usize) {
         witness_bytes >> 20
     );
 
-    let setup = KeccakSetup::new(n_keccaks);
+    // KECCAK_BATCH_MAJOR=1 switches the witness layout (WitnessLayout::BatchMajor).
+    let setup = if std::env::var_os("KECCAK_BATCH_MAJOR").is_some() {
+        KeccakSetup::new_batch_major(n_keccaks)
+    } else {
+        KeccakSetup::new(n_keccaks)
+    };
     let mk_states = |seed: u64| {
         let mut rng = Rng::new(seed);
         (0..n_keccaks)

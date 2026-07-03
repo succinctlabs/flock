@@ -270,6 +270,12 @@ pub fn prove_chain_generic<Ch: Challenger>(
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> (ChainProof, Commitment) {
+    assert_eq!(
+        r1cs.layout,
+        flock_core::r1cs::WitnessLayout::RowMajor,
+        "chain/merkle wrappers require the row-major witness layout (their \
+         shift sumcheck and extra claims are not yet ported to batch-major)"
+    );
     let trace = std::env::var("CHAIN_TRACE").is_ok();
 
     // ---- Core: commit → zerocheck → lincheck → base claims (ab, c).
@@ -388,6 +394,12 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> (ChainProofLigerito, Commitment) {
+    assert_eq!(
+        r1cs.layout,
+        flock_core::r1cs::WitnessLayout::RowMajor,
+        "chain/merkle wrappers require the row-major witness layout (their \
+         shift sumcheck and extra claims are not yet ported to batch-major)"
+    );
     let log_n = r1cs.m - flock_core::pcs::LOG_PACKING;
     let lig_config = flock_core::pcs::ligerito::prover_config_for(
         log_n,

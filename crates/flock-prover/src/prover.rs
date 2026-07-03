@@ -128,6 +128,13 @@ pub fn prove<Ch: Challenger>(
     pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> (R1csProof, Commitment, R1csClaim) {
+    assert_eq!(
+        r1cs.layout,
+        flock_core::r1cs::WitnessLayout::RowMajor,
+        "the generic matrix-driven provers assume the row-major layout \
+         (block-diagonal apply + lincheck stripe packing); batch-major \
+         setups must use the per-hash prove_fast paths"
+    );
     assert_eq!(z_packed.len(), 1usize << (r1cs.m - 7));
     assert_eq!(pcs_params.m, r1cs.m);
 
@@ -173,10 +180,7 @@ pub fn prove<Ch: Challenger>(
     let z_packed_lincheck = pack_z_lincheck_from_packed(z_packed, r1cs.m, r1cs.k_log);
 
     // ---- Zerocheck.
-    let padding = zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
     let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
         a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
     );
@@ -188,12 +192,7 @@ pub fn prove<Ch: Challenger>(
     //   - `mlv_challenges[0..k_log-k_skip]` binds the inner-rest bits (between
     //      the skip dim and the lincheck inner boundary).
     //   - `mlv_challenges[k_log-k_skip..]` binds the outer bits.
-    let inner_rest_len = r1cs.k_log - r1cs.k_skip;
-    let x_ab = QuirkyPoint {
-        z_skip: zc_claim.z,
-        x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
-        x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
-    };
+    let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     // ---- Lincheck. Capture pre-sumcheck z_vec to skip fold_1b_rows for AB
     // at PCS-open time.
@@ -211,21 +210,13 @@ pub fn prove<Ch: Challenger>(
 
     // ---- Build the two z-claims for the PCS.
     let ab = ZClaim {
-        point: QuirkyPoint {
-            z_skip: lc_claim.r_inner_skip,
-            x_inner_rest: lc_claim.r_inner_rest.clone(),
-            x_outer: x_ab.x_outer.clone(),
-        },
+        point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,
     };
     // c-claim: zerocheck gives `ĉ(point_c) = c_eval` where ĉ is the MLE of
     // `C·z`. Since `C = I`, ĉ = ẑ and the c-claim is already a z-claim.
     let c = ZClaim {
-        point: QuirkyPoint {
-            z_skip: zc_claim.z,
-            x_inner_rest: zc_claim.r_rest[..inner_rest_len].to_vec(),
-            x_outer: zc_claim.r_rest[inner_rest_len..].to_vec(),
-        },
+        point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
 
@@ -270,6 +261,13 @@ pub fn prove_ligerito<Ch: Challenger>(
     pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    assert_eq!(
+        r1cs.layout,
+        flock_core::r1cs::WitnessLayout::RowMajor,
+        "the generic matrix-driven provers assume the row-major layout \
+         (block-diagonal apply + lincheck stripe packing); batch-major \
+         setups must use the per-hash prove_fast paths"
+    );
     assert_eq!(z_packed.len(), 1usize << (r1cs.m - 7));
     assert_eq!(pcs_params.m, r1cs.m);
 
@@ -306,20 +304,12 @@ pub fn prove_ligerito<Ch: Challenger>(
     };
     let z_packed_lincheck = pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
 
-    let padding = zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
     let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
         a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
     );
 
-    let inner_rest_len = r1cs.k_log - r1cs.k_skip;
-    let x_ab = QuirkyPoint {
-        z_skip: zc_claim.z,
-        x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
-        x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
-    };
+    let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
@@ -335,19 +325,11 @@ pub fn prove_ligerito<Ch: Challenger>(
     );
 
     let ab = ZClaim {
-        point: QuirkyPoint {
-            z_skip: lc_claim.r_inner_skip,
-            x_inner_rest: lc_claim.r_inner_rest.clone(),
-            x_outer: x_ab.x_outer.clone(),
-        },
+        point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,
     };
     let c = ZClaim {
-        point: QuirkyPoint {
-            z_skip: zc_claim.z,
-            x_inner_rest: zc_claim.r_rest[..inner_rest_len].to_vec(),
-            x_outer: zc_claim.r_rest[inner_rest_len..].to_vec(),
-        },
+        point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
 
@@ -410,10 +392,7 @@ pub fn prove_fast_from_witness<Ch: Challenger>(
     // ---- Single batched PCS open over the two base claims. AB-claim's
     // s_hat_v is precomputed from lincheck's pre-sumcheck z_vec, skipping
     // fold_1b_rows for that claim.
-    let padding = zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = core.s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(core.s_hat_v_c.as_slice());
     let pcs_open = open_claims_with_precomputed(
@@ -482,10 +461,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         challenger,
     );
 
-    let padding = zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let pcs_open = open_claims_with_precomputed_ligerito(
@@ -587,10 +563,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     };
     bind_statement(challenger, r1cs, &commitment);
 
-    let padding = zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
     let (zc_proof, zc_claim, s_hat_v_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
         let a_packed: &[u8] = unsafe {
@@ -621,12 +594,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
-    let inner_rest_len = r1cs.k_log - r1cs.k_skip;
-    let x_ab = QuirkyPoint {
-        z_skip: zc_claim.z,
-        x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
-        x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
-    };
+    let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
@@ -645,19 +613,11 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     drop(z_packed_lincheck);
 
     let ab = ZClaim {
-        point: QuirkyPoint {
-            z_skip: lc_claim.r_inner_skip,
-            x_inner_rest: lc_claim.r_inner_rest.clone(),
-            x_outer: x_ab.x_outer.clone(),
-        },
+        point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,
     };
     let c = ZClaim {
-        point: QuirkyPoint {
-            z_skip: zc_claim.z,
-            x_inner_rest: zc_claim.r_rest[..inner_rest_len].to_vec(),
-            x_outer: zc_claim.r_rest[inner_rest_len..].to_vec(),
-        },
+        point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
 
@@ -739,10 +699,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
 
-    let padding = zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
 
     // --- zerocheck ---
     let t0 = Instant::now();
@@ -773,12 +730,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
-    let inner_rest_len = r1cs.k_log - r1cs.k_skip;
-    let x_ab = QuirkyPoint {
-        z_skip: zc_claim.z,
-        x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
-        x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
-    };
+    let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
@@ -794,19 +746,11 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     );
     drop(z_packed_lincheck);
     let ab = ZClaim {
-        point: QuirkyPoint {
-            z_skip: lc_claim.r_inner_skip,
-            x_inner_rest: lc_claim.r_inner_rest.clone(),
-            x_outer: x_ab.x_outer.clone(),
-        },
+        point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,
     };
     let c = ZClaim {
-        point: QuirkyPoint {
-            z_skip: zc_claim.z,
-            x_inner_rest: zc_claim.r_rest[..inner_rest_len].to_vec(),
-            x_outer: zc_claim.r_rest[inner_rest_len..].to_vec(),
-        },
+        point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
     let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {

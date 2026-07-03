@@ -1253,6 +1253,35 @@ impl Sha256HybridSetup {
         Self::with_log_inv_rate(n_compressions, 1)
     }
 
+    /// [`Self::new`] with the **batch-major** witness layout (see
+    /// [`flock_core::r1cs::WitnessLayout`]). The generic matrix provers and
+    /// chain/Merkle wrappers still require row-major.
+    pub fn new_batch_major(n_compressions: usize) -> Self {
+        let mut s = Self::new(n_compressions);
+        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
+        s
+    }
+
+    /// Fast-path witness generation dispatched on the r1cs's witness layout.
+    fn generate_witness_ab(
+        &self,
+        compressions: &[([u32; 8], [u32; 16])],
+    ) -> (
+        Vec<flock_core::field::F128>,
+        Vec<flock_core::field::F128>,
+        Vec<flock_core::field::F128>,
+        Vec<u8>,
+    ) {
+        match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log())
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                generate_witness_batch_major(compressions, self.n_blocks_log())
+            }
+        }
+    }
+
     pub fn with_log_inv_rate(n_compressions: usize, log_inv_rate: usize) -> Self {
         // Rate keys the legacy profiles: 1 -> Fast, 2 -> Slim.
         let profile = match log_inv_rate {
@@ -1341,7 +1370,7 @@ impl Sha256HybridSetup {
         compressions: &[([u32; 8], [u32; 16])],
     ) -> Vec<flock_core::field::F128> {
         let (z_packed, _a, _b, _stripe) =
-            generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log());
+            self.generate_witness_ab(compressions);
         z_packed
     }
 
@@ -1376,7 +1405,7 @@ impl Sha256HybridSetup {
     ) {
         assert_eq!(compressions.len(), self.n_compressions);
         let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log());
+            self.generate_witness_ab(compressions);
         crate::prover::prove_fast_from_witness(
             &self.r1cs,
             &self.pcs_params,
@@ -1420,7 +1449,7 @@ impl Sha256HybridSetup {
         // RAYON_NUM_THREADS=1 stays truly serial (no extra thread).
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log())
+                self.generate_witness_ab(compressions)
             });
         crate::prover::prove_fast_ligerito_from_witness(
             &self.r1cs,
@@ -1451,7 +1480,7 @@ impl Sha256HybridSetup {
         assert_eq!(compressions.len(), self.n_compressions);
         let t0 = std::time::Instant::now();
         let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log());
+            self.generate_witness_ab(compressions);
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
@@ -1779,7 +1808,7 @@ impl Sha256HybridSetup {
             "bit vector length mismatch"
         );
         let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log());
+            self.generate_witness_ab(compressions);
         super::merkle_path_common::prove_merkle_path_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -1869,7 +1898,7 @@ impl Sha256HybridSetup {
             self.n_blocks_log(),
         );
         let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log());
+            self.generate_witness_ab(compressions);
         super::merkle_path_common::prove_merkle_paths_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -1954,7 +1983,7 @@ impl Sha256HybridSetup {
             "bit vector length mismatch"
         );
         let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log());
+            self.generate_witness_ab(compressions);
         super::merkle_path_common::prove_merkle_paths_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -2040,7 +2069,7 @@ impl Sha256HybridSetup {
             self.n_blocks_log(),
         );
         let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log());
+            self.generate_witness_ab(compressions);
         super::merkle_path_common::prove_merkle_paths_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -2105,6 +2134,185 @@ impl Sha256HybridSetup {
 // Tests
 // ───────────────────────────────────────────────────────────────────────────
 
+
+// ---------------------------------------------------------------------------
+// Batch-major witness producer (WitnessLayout::BatchMajor).
+//
+// V = 8 compressions in lockstep ([u32; 8] lanes — the adds/sigmas
+// auto-vectorize); witness fields are OR'd V-wide into an L1-resident
+// interleaved row buffer (already batch-major order) and NT-flushed per
+// useful 128-bit chunk by the shared driver. See
+// `common::drive_witness_batch_major`.
+// ---------------------------------------------------------------------------
+
+use super::common::{BM_V, BmRow, add_carry_parts_v, or_bit_row, or_u32_row};
+
+#[inline(always)]
+fn map_v(x: &[u32; BM_V], f: impl Fn(u32) -> u32) -> [u32; BM_V] {
+    std::array::from_fn(|j| f(x[j]))
+}
+#[inline(always)]
+fn xor_v(x: &[u32; BM_V], y: &[u32; BM_V]) -> [u32; BM_V] {
+    std::array::from_fn(|j| x[j] ^ y[j])
+}
+#[inline(always)]
+fn and_v(x: &[u32; BM_V], y: &[u32; BM_V]) -> [u32; BM_V] {
+    std::array::from_fn(|j| x[j] & y[j])
+}
+
+struct BmRows<'a> {
+    z: &'a mut [BmRow],
+    a: &'a mut [BmRow],
+    b: &'a mut [BmRow],
+}
+
+/// z = a = v, b = all-ones (free-witness tautology rows).
+#[inline(always)]
+fn bm_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
+    or_u32_row(rows.z, bit, vals);
+    or_u32_row(rows.a, bit, vals);
+    or_u32_row(rows.b, bit, &[0xFFFF_FFFF; BM_V]);
+}
+
+/// Inline add: carry rows only.
+#[inline(always)]
+fn bm_add_inline(
+    rows: &mut BmRows<'_>,
+    x: &[u32; BM_V],
+    y: &[u32; BM_V],
+    carry_bit: usize,
+) -> [u32; BM_V] {
+    let (sum, left, right, carry) = add_carry_parts_v(x, y);
+    or_u32_row(rows.z, carry_bit, &carry);
+    or_u32_row(rows.a, carry_bit, &left);
+    or_u32_row(rows.b, carry_bit, &right);
+    sum
+}
+
+/// Build one V = 8 group of compressions into interleaved rows. Mirrors
+/// [`build_block_ab_packed_into`] field-for-field (the lockstep test below
+/// pins byte-equality against the row-major driver).
+fn build_group_batch_major(
+    inputs: [&([u32; 8], [u32; 16]); BM_V],
+    rz: &mut [BmRow],
+    ra: &mut [BmRow],
+    rb: &mut [BmRow],
+) {
+    let mut rows = BmRows { z: rz, a: ra, b: rb };
+    let h_in: [[u32; BM_V]; 8] = std::array::from_fn(|w| std::array::from_fn(|j| inputs[j].0[w]));
+    let m: [[u32; BM_V]; 16] = std::array::from_fn(|i| std::array::from_fn(|j| inputs[j].1[i]));
+
+    or_bit_row(rows.z, Z_CONST_POS);
+    or_bit_row(rows.a, Z_CONST_POS);
+    or_bit_row(rows.b, Z_CONST_POS);
+
+    for w in 0..H_WORDS {
+        bm_write_lin(&mut rows, h_bit(w, 0), &h_in[w]);
+    }
+    for i in 0..M_WORDS {
+        bm_write_lin(&mut rows, m_bit(i, 0), &m[i]);
+    }
+
+    // Message schedule.
+    let mut w_sched: Vec<[u32; BM_V]> = Vec::with_capacity(64);
+    w_sched.extend_from_slice(&m);
+    for t in 16..64 {
+        let s_0 = bm_add_inline(
+            &mut rows,
+            &map_v(&w_sched[t - 2], small_sigma1),
+            &w_sched[t - 7],
+            sched_carry_bit(t, 0, 0),
+        );
+        let s_1 = bm_add_inline(
+            &mut rows,
+            &s_0,
+            &map_v(&w_sched[t - 15], small_sigma0),
+            sched_carry_bit(t, 1, 0),
+        );
+        let w_t = bm_add_inline(&mut rows, &s_1, &w_sched[t - 16], sched_carry_bit(t, 2, 0));
+        bm_write_lin(&mut rows, w_bit(t, 0), &w_t);
+        w_sched.push(w_t);
+    }
+
+    // 64 rounds.
+    let mut aa = h_in[0];
+    let mut bb = h_in[1];
+    let mut cc = h_in[2];
+    let mut dd = h_in[3];
+    let mut ee = h_in[4];
+    let mut ff = h_in[5];
+    let mut gg = h_in[6];
+    let mut hh = h_in[7];
+    for r in 0..N_ROUNDS {
+        let f_xor_g = xor_v(&ff, &gg);
+        let ch_and_v = and_v(&ee, &f_xor_g);
+        or_u32_row(rows.z, ch_and_bit(r, 0), &ch_and_v);
+        or_u32_row(rows.a, ch_and_bit(r, 0), &ee);
+        or_u32_row(rows.b, ch_and_bit(r, 0), &f_xor_g);
+        let ch_out = xor_v(&ch_and_v, &gg);
+
+        let b_xor_a = xor_v(&bb, &aa);
+        let c_xor_a = xor_v(&cc, &aa);
+        let maj_and_v = and_v(&b_xor_a, &c_xor_a);
+        or_u32_row(rows.z, maj_and_bit(r, 0), &maj_and_v);
+        or_u32_row(rows.a, maj_and_bit(r, 0), &b_xor_a);
+        or_u32_row(rows.b, maj_and_bit(r, 0), &c_xor_a);
+        let maj_out = xor_v(&maj_and_v, &aa);
+
+        let k_r = [SHA256_K[r]; BM_V];
+        let t1_0 = bm_add_inline(&mut rows, &hh, &map_v(&ee, big_sigma1), round_carry_bit(r, 0, 0));
+        let t1_1 = bm_add_inline(&mut rows, &t1_0, &ch_out, round_carry_bit(r, 1, 0));
+        let t1_2 = bm_add_inline(&mut rows, &t1_1, &k_r, round_carry_bit(r, 2, 0));
+        let t1 = bm_add_inline(&mut rows, &t1_2, &w_sched[r], round_carry_bit(r, 3, 0));
+        bm_write_lin(&mut rows, t1_bit(r, 0), &t1);
+
+        let t2 = bm_add_inline(&mut rows, &map_v(&aa, big_sigma0), &maj_out, round_carry_bit(r, 4, 0));
+        let e_new = bm_add_inline(&mut rows, &dd, &t1, round_carry_bit(r, 5, 0));
+        bm_write_lin(&mut rows, e_new_bit(r, 0), &e_new);
+        let a_new = bm_add_inline(&mut rows, &t1, &t2, round_carry_bit(r, 6, 0));
+        bm_write_lin(&mut rows, a_new_bit(r, 0), &a_new);
+
+        hh = gg;
+        gg = ff;
+        ff = ee;
+        ee = e_new;
+        dd = cc;
+        cc = bb;
+        bb = aa;
+        aa = a_new;
+    }
+
+    // Output feed-forward.
+    let final_state = [aa, bb, cc, dd, ee, ff, gg, hh];
+    for w in 0..N_OUT_WORDS {
+        let sum = bm_add_inline(&mut rows, &final_state[w], &h_in[w], out_carry_bit(w, 0));
+        bm_write_lin(&mut rows, h_out_bit(w, 0), &sum);
+    }
+}
+
+/// Batch-major counterpart of [`generate_witness_with_ab_packed_and_lincheck`]
+/// — `(z, a, b, z_lincheck)` with z/a/b in the batch-major layout. Padding
+/// slots run a compression of the all-zero input (constant wire = 1).
+pub fn generate_witness_batch_major(
+    compressions: &[([u32; 8], [u32; 16])],
+    n_blocks_log: usize,
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<u8>,
+) {
+    let padding: ([u32; 8], [u32; 16]) = ([0u32; 8], [0u32; 16]);
+    super::common::drive_witness_batch_major(
+        compressions,
+        &padding,
+        n_blocks_log,
+        K_LOG,
+        USEFUL_BITS,
+        |group, rz, ra, rb| build_group_batch_major(group, rz, ra, rb),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2125,6 +2333,66 @@ mod tests {
         fn next_block(&mut self) -> [u32; 16] {
             std::array::from_fn(|_| self.next_u32())
         }
+    }
+
+    /// Batch-major witness equality vs the row-major driver (word-transpose
+    /// + identical stripe), incl. padding slots via a non-power-of-two count.
+    #[test]
+    fn batch_major_witness_matches_row_major_transposed() {
+        for (n_inputs, n_log) in [(8usize, 3usize), (11, 4)] {
+            let mut rng = Rng::new(0xBA7C_5A + n_log as u64);
+            let inputs: Vec<([u32; 8], [u32; 16])> = (0..n_inputs)
+                .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+                .collect();
+
+            let (z_r, a_r, b_r, stripe_r) =
+                generate_witness_with_ab_packed_and_lincheck(&inputs, n_log);
+            let (z_b, a_b, b_b, stripe_b) = generate_witness_batch_major(&inputs, n_log);
+
+            assert_eq!(stripe_b, stripe_r, "stripe diverged (n_log={n_log})");
+
+            let chunks_per_block = K / 128;
+            let transpose = |row: &[flock_core::field::F128]| {
+                let mut out = vec![flock_core::field::F128::ZERO; row.len()];
+                for o in 0..1usize << n_log {
+                    for c in 0..chunks_per_block {
+                        out[(c << n_log) + o] = row[o * chunks_per_block + c];
+                    }
+                }
+                out
+            };
+            assert_eq!(z_b, transpose(&z_r), "z diverged (n_log={n_log})");
+            assert_eq!(a_b, transpose(&a_r), "a diverged (n_log={n_log})");
+            assert_eq!(b_b, transpose(&b_r), "b diverged (n_log={n_log})");
+        }
+    }
+
+    /// Batch-major end-to-end roundtrip (BaseFold) + tamper rejection.
+    #[test]
+    fn batch_major_prove_fast_basefold_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+
+        let setup = Sha256HybridSetup::new_batch_major(8);
+        let mut rng = Rng::new(0xBA7C_F012);
+        let inputs: Vec<([u32; 8], [u32; 16])> = (0..8)
+            .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+            .collect();
+
+        let mut ch_p = FsChallenger::new(b"flock-test-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast_basefold(&inputs, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-test-v0");
+        let claim_v = setup
+            .verify_basefold(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("batch-major verifier rejected: {e:?}"));
+        assert_eq!(claim_p, claim_v);
+
+        let mut bad = proof.clone();
+        bad.zerocheck.final_a_eval.lo ^= 1;
+        let mut ch = FsChallenger::new(b"flock-test-v0");
+        assert!(
+            setup.verify_basefold(&commitment, &bad, &mut ch).is_err(),
+            "tampered batch-major proof accepted"
+        );
     }
 
     /// Row-by-row R1CS check `(A·z) ⊙ (B·z) = (C·z) = z`.
