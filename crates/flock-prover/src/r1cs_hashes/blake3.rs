@@ -1568,9 +1568,7 @@ impl Blake3Setup {
             self.n_blocks,
             self.n_block_slots(),
         );
-        let n_log = self.n_blocks_log();
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(blocks, n_log);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(blocks);
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         super::chain_common::prove_chain_generic(
             &self.r1cs,
@@ -1593,9 +1591,7 @@ impl Blake3Setup {
     ) -> (super::chain_common::ChainProofLigerito, Commitment) {
         assert_eq!(blocks.len(), self.n_blocks);
         assert_eq!(self.n_blocks, self.n_block_slots());
-        let n_log = self.n_blocks_log();
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(blocks, n_log);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(blocks);
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         super::chain_common::prove_chain_ligerito_generic(
             &self.r1cs,

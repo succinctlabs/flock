@@ -1047,9 +1047,7 @@ impl KeccakSetup {
             self.n_keccaks,
             self.n_keccak_slots(),
         );
-        let n_log = self.n_keccaks_log();
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(initial_states, n_log);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness(initial_states);
         crate::r1cs_hashes::chain_common::prove_chain_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -1077,9 +1075,7 @@ impl KeccakSetup {
     ) {
         assert_eq!(initial_states.len(), self.n_keccaks);
         assert_eq!(self.n_keccaks, self.n_keccak_slots());
-        let n_log = self.n_keccaks_log();
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(initial_states, n_log);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness(initial_states);
         crate::r1cs_hashes::chain_common::prove_chain_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -1937,6 +1933,102 @@ mod tests {
             matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
+    }
+
+    /// Batch-major chain: the packed-pos fold must produce IDENTICAL In/Out
+    /// vectors from the batch-major and row-major witnesses (same semantic
+    /// content, different addressing), pinning `fold_in_out`'s batch-major
+    /// word addressing.
+    #[test]
+    fn batch_major_chain_fold_matches_row_major() {
+        use crate::r1cs_hashes::chain_common::{ChainFold, fold_in_out};
+        let n_log = 3;
+        let mut rng = Rng::new(0xF01D_BA7C);
+        let inputs: Vec<State> = (0..8).map(|_| random_state(&mut rng)).collect();
+        let (z_r, _, _, _) = generate_witness_with_ab_packed_and_lincheck(&inputs, n_log);
+        let (z_b, _, _, _) = generate_witness_batch_major(&inputs, n_log);
+
+        let tau_pos: Vec<F128> = (0..CHAIN_LAYOUT.tau_pos_len())
+            .map(|i| F128 {
+                lo: rng.next_u64() ^ i as u64,
+                hi: rng.next_u64(),
+            })
+            .collect();
+        let fold = ChainFold::new(&CHAIN_LAYOUT, tau_pos);
+        let (in_r, out_r) = fold_in_out(
+            &CHAIN_LAYOUT,
+            flock_core::r1cs::WitnessLayout::RowMajor,
+            &z_r,
+            &fold,
+        );
+        let (in_b, out_b) = fold_in_out(
+            &CHAIN_LAYOUT,
+            flock_core::r1cs::WitnessLayout::BatchMajor,
+            &z_b,
+            &fold,
+        );
+        assert_eq!(in_b, in_r, "In fold diverged across layouts");
+        assert_eq!(out_b, out_r, "Out fold diverged across layouts");
+    }
+
+    /// Batch-major chain prove -> verify roundtrip (BaseFold, K=8) + rejection
+    /// of a wrong public output endpoint.
+    #[test]
+    fn batch_major_prove_chain_basefold_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        let setup = KeccakSetup::new_batch_major(8);
+        let mut rng = Rng::new(0xBA7C_CA11);
+        let x0 = random_state(&mut rng);
+        let mut inputs = Vec::with_capacity(8);
+        let mut cur = x0;
+        for _ in 0..8 {
+            inputs.push(cur);
+            keccak_f(&mut cur);
+        }
+        let x_last = cur;
+
+        let mut chp = FsChallenger::new(b"flock-test-v0");
+        let (proof, comm) = setup.prove_chain_basefold(&inputs, &mut chp);
+        let mut chv = FsChallenger::new(b"flock-test-v0");
+        setup
+            .verify_chain_basefold(&comm, &proof, &x0, &x_last, &mut chv)
+            .expect("batch-major chain must verify");
+
+        // Wrong endpoint must be rejected.
+        let mut bad_last = x_last;
+        bad_last[0] = !bad_last[0];
+        let mut chv = FsChallenger::new(b"flock-test-v0");
+        assert!(
+            setup
+                .verify_chain_basefold(&comm, &proof, &x0, &bad_last, &mut chv)
+                .is_err(),
+            "wrong endpoint accepted under batch-major"
+        );
+    }
+
+    /// Batch-major chain roundtrip on the Ligerito backend (K=64, m=22) —
+    /// covers the mixed open (2 ring-switched + 1 packed-direct claim) with
+    /// the batch-major point ordering. Ignored like the row-major variant.
+    #[test]
+    #[ignore]
+    fn batch_major_prove_chain_ligerito_roundtrip() {
+        use flock_core::challenger::RandomChallenger;
+        let setup = KeccakSetup::new_batch_major(64);
+        let mut rng = Rng::new(0xBA7C_11C7);
+        let x0 = random_state(&mut rng);
+        let mut inputs = Vec::with_capacity(64);
+        let mut cur = x0;
+        for _ in 0..64 {
+            inputs.push(cur);
+            keccak_f(&mut cur);
+        }
+        let x_last = cur;
+        let mut chp = RandomChallenger::new(0xCA2);
+        let (proof, comm) = setup.prove_chain(&inputs, &mut chp);
+        let mut chv = RandomChallenger::new(0xCA2);
+        setup
+            .verify_chain(&comm, &proof, &x0, &x_last, &mut chv)
+            .expect("batch-major ligerito chain must verify");
     }
 
     /// Chain prove → verify roundtrip (Ligerito default). K=64 → m=22.

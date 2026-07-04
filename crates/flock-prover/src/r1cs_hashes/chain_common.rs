@@ -129,6 +129,7 @@ impl ChainFold {
 /// mul-adds (16 for keccak, 2 for blake3/sha2).
 pub fn fold_in_out(
     layout: &ChainLayout,
+    wl: flock_core::r1cs::WitnessLayout,
     packed: &[F128],
     fold: &ChainFold,
 ) -> (Vec<F128>, Vec<F128>) {
@@ -145,24 +146,35 @@ pub fn fold_in_out(
         "packed witness length must be a whole number of blocks"
     );
     let n_inst = packed.len() / block_packed;
+    let n_log = n_inst.trailing_zeros() as usize;
 
     let eq_tau = build_eq_table(&fold.tau_pos);
 
-    let fold_one = |base: usize| -> F128 {
+    // Word address of within-block word `w` of instance `i`: row-major puts
+    // instances contiguous (`i·block + w`); batch-major puts word-columns
+    // contiguous (`(w << n_log) + i`).
+    let word_addr = move |i: usize, w: usize| -> usize {
+        match wl {
+            flock_core::r1cs::WitnessLayout::RowMajor => i * block_packed + w,
+            flock_core::r1cs::WitnessLayout::BatchMajor => (w << n_log) + i,
+        }
+    };
+
+    let fold_one = |i: usize, base: usize| -> F128 {
         let mut acc = F128::ZERO;
         for pos in 0..n_packed_per_region {
-            acc += eq_tau[pos] * packed[base + pos];
+            acc += eq_tau[pos] * packed[word_addr(i, base + pos)];
         }
         acc
     };
 
     let in_vals: Vec<F128> = (0..n_inst)
         .into_par_iter()
-        .map(|i| fold_one(i * block_packed + in_pos_base))
+        .map(|i| fold_one(i, in_pos_base))
         .collect();
     let out_vals: Vec<F128> = (0..n_inst)
         .into_par_iter()
-        .map(|i| fold_one(i * block_packed + out_pos_base))
+        .map(|i| fold_one(i, out_pos_base))
         .collect();
 
     (in_vals, out_vals)
@@ -182,20 +194,12 @@ pub fn fold_in_out(
 /// `build_eq_sparse` to skip the zero-coord halvings.
 pub fn assemble_chain_claim(
     layout: &ChainLayout,
+    wl: flock_core::r1cs::WitnessLayout,
     fold: &ChainFold,
     claims: &crate::chain::ChainClaims,
 ) -> PackedDirectClaim {
-    let high = layout.high_zeros();
-    let point_len = fold.tau_pos.len() + 1 + high + claims.instance_point.len();
-    let mut point = Vec::with_capacity(point_len);
-    point.extend_from_slice(&fold.tau_pos);
-    point.push(claims.sel0);
-    point.extend(std::iter::repeat_n(F128::ZERO, high));
-    point.extend_from_slice(&claims.instance_point);
-    debug_assert_eq!(point.len(), point_len);
-
+    let point = build_chain_claim_point(layout, wl, fold, claims);
     let sparse_eq = flock_core::pcs::ring_switch::build_eq_sparse(&point);
-
     PackedDirectClaim {
         point,
         value: claims.value,
@@ -206,18 +210,30 @@ pub fn assemble_chain_claim(
 /// Verifier-side helper: build the chain-claim point identically to
 /// [`assemble_chain_claim`] but without constructing the sparse eq tensor (the
 /// verifier evaluates `eq_eval(point, basefold_challenges)` directly).
+/// Word-index claim point over `L = m − LOG_PACKING` coords, ordered by the
+/// witness layout's address decomposition of a word index:
+/// - RowMajor: `word = (inst << (k_log−7)) | in_block`
+///   → `[τ_pos…, sel0, 0^high, instance…]`;
+/// - BatchMajor: `word = (in_block << n_log) | inst`
+///   → `[instance…, τ_pos…, sel0, 0^high]`.
 fn build_chain_claim_point(
     layout: &ChainLayout,
+    wl: flock_core::r1cs::WitnessLayout,
     fold: &ChainFold,
     claims: &crate::chain::ChainClaims,
 ) -> Vec<F128> {
     let high = layout.high_zeros();
     let point_len = fold.tau_pos.len() + 1 + high + claims.instance_point.len();
     let mut point = Vec::with_capacity(point_len);
+    if wl == flock_core::r1cs::WitnessLayout::BatchMajor {
+        point.extend_from_slice(&claims.instance_point);
+    }
     point.extend_from_slice(&fold.tau_pos);
     point.push(claims.sel0);
     point.extend(std::iter::repeat_n(F128::ZERO, high));
-    point.extend_from_slice(&claims.instance_point);
+    if wl == flock_core::r1cs::WitnessLayout::RowMajor {
+        point.extend_from_slice(&claims.instance_point);
+    }
     debug_assert_eq!(point.len(), point_len);
     point
 }
@@ -270,12 +286,6 @@ pub fn prove_chain_generic<Ch: Challenger>(
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> (ChainProof, Commitment) {
-    assert_eq!(
-        r1cs.layout,
-        flock_core::r1cs::WitnessLayout::RowMajor,
-        "chain/merkle wrappers require the row-major witness layout (their \
-         shift sumcheck and extra claims are not yet ported to batch-major)"
-    );
     let trace = std::env::var("CHAIN_TRACE").is_ok();
 
     // ---- Core: commit → zerocheck → lincheck → base claims (ab, c).
@@ -311,7 +321,7 @@ pub fn prove_chain_generic<Ch: Challenger>(
     };
     let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = ChainFold::new(layout, tau_pos);
-    let (in_vals, out_vals) = fold_in_out(layout, &core.z_packed, &fold);
+    let (in_vals, out_vals) = fold_in_out(layout, r1cs.layout, &core.z_packed, &fold);
     if let Some(t) = t {
         eprintln!(
             "[chain] {:<18} {:>8.2} ms",
@@ -327,7 +337,7 @@ pub fn prove_chain_generic<Ch: Challenger>(
         None
     };
     let (shift, claims) = crate::chain::prove_chain_shift(&in_vals, &out_vals, challenger);
-    let chain_claim = assemble_chain_claim(layout, &fold, &claims);
+    let chain_claim = assemble_chain_claim(layout, r1cs.layout, &fold, &claims);
     if let Some(t) = t {
         eprintln!(
             "[chain] {:<18} {:>8.2} ms",
@@ -342,10 +352,7 @@ pub fn prove_chain_generic<Ch: Challenger>(
     } else {
         None
     };
-    let padding = flock_core::zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
     let pre_ab: Option<&[flock_core::field::F128]> = core.s_hat_v_ab.as_deref();
@@ -394,12 +401,6 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> (ChainProofLigerito, Commitment) {
-    assert_eq!(
-        r1cs.layout,
-        flock_core::r1cs::WitnessLayout::RowMajor,
-        "chain/merkle wrappers require the row-major witness layout (their \
-         shift sumcheck and extra claims are not yet ported to batch-major)"
-    );
     let log_n = r1cs.m - flock_core::pcs::LOG_PACKING;
     let lig_config = flock_core::pcs::ligerito::prover_config_for(
         log_n,
@@ -421,15 +422,12 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
 
     let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = ChainFold::new(layout, tau_pos);
-    let (in_vals, out_vals) = fold_in_out(layout, &core.z_packed, &fold);
+    let (in_vals, out_vals) = fold_in_out(layout, r1cs.layout, &core.z_packed, &fold);
 
     let (shift, claims) = crate::chain::prove_chain_shift(&in_vals, &out_vals, challenger);
-    let chain_claim = assemble_chain_claim(layout, &fold, &claims);
+    let chain_claim = assemble_chain_claim(layout, r1cs.layout, &fold, &claims);
 
-    let padding = flock_core::zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
     // Destructure core to move z_packed by value into the open (saves a 128 MB
@@ -501,7 +499,7 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
     let claims = crate::chain::verify_chain_shift(&proof.shift, x0_r, xlast_r, n_log, challenger)
         .map_err(ChainVerifyError::Shift)?;
 
-    let chain_point = build_chain_claim_point(layout, &fold, &claims);
+    let chain_point = build_chain_claim_point(layout, r1cs.layout, &fold, &claims);
     let ab_x_outer = crate::prover::quirky_x_outer_full(&ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&c.point);
     let pd_ref = PackedDirectClaimRef {
@@ -596,7 +594,7 @@ pub fn verify_chain_generic<Ch: Challenger>(
     //      mixed batched open. ab/c go through ring-switch; chain goes
     //      packed-direct.
     let t = std::time::Instant::now();
-    let chain_point = build_chain_claim_point(layout, &fold, &claims);
+    let chain_point = build_chain_claim_point(layout, r1cs.layout, &fold, &claims);
     let ab_x_outer = crate::prover::quirky_x_outer_full(&ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&c.point);
     let pd_ref = PackedDirectClaimRef {

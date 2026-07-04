@@ -1633,9 +1633,7 @@ impl Sha256HybridSetup {
             self.n_compressions,
             self.n_block_slots(),
         );
-        let n_log = self.n_blocks_log();
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(compressions, n_log);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
         super::chain_common::prove_chain_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -1660,9 +1658,7 @@ impl Sha256HybridSetup {
     ) {
         assert_eq!(compressions.len(), self.n_compressions);
         assert_eq!(self.n_compressions, self.n_block_slots());
-        let n_log = self.n_blocks_log();
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(compressions, n_log);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
         super::chain_common::prove_chain_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -2846,6 +2842,31 @@ mod tests {
         setup
             .verify_merkle_path(&commitment, &proof, &leaf, &root, &b, &mut chv)
             .expect("honest merkle path must verify");
+    }
+
+    /// Batch-major Merkle path prove -> verify roundtrip (BaseFold, n=8) +
+    /// wrong-leaf rejection.
+    #[test]
+    fn batch_major_prove_merkle_path_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        let setup = Sha256HybridSetup::new_batch_major(8);
+        let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0xBA7C_BEEF);
+        let mut ch = FsChallenger::new(b"sha2-merkle-test");
+        let (proof, commitment) = setup.prove_merkle_path(&blocks, &b, &mut ch);
+        let mut chv = FsChallenger::new(b"sha2-merkle-test");
+        setup
+            .verify_merkle_path(&commitment, &proof, &leaf, &root, &b, &mut chv)
+            .expect("batch-major merkle path must verify");
+
+        let mut bad_leaf = leaf;
+        bad_leaf[0] ^= 1;
+        let mut chv = FsChallenger::new(b"sha2-merkle-test");
+        assert!(
+            setup
+                .verify_merkle_path(&commitment, &proof, &bad_leaf, &root, &b, &mut chv)
+                .is_err(),
+            "wrong leaf accepted under batch-major"
+        );
     }
 
     #[test]
