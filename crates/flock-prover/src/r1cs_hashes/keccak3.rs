@@ -511,7 +511,10 @@ impl KeccakSetup {
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
-    pub fn with_profile(n_keccaks: usize, profile: flock_core::pcs::ligerito::LigeritoProfile) -> Self {
+    pub fn with_profile(
+        n_keccaks: usize,
+        profile: flock_core::pcs::ligerito::LigeritoProfile,
+    ) -> Self {
         Self::with_profile_and_rate(n_keccaks, profile, profile.log_inv_rate())
     }
 
@@ -830,8 +833,8 @@ mod tests {
     #[test]
     #[ignore = "timing comparison; run manually with --nocapture"]
     fn pack_win() {
-        use flock_core::challenger::FsChallenger;
         use crate::r1cs_hashes::keccak as k1;
+        use flock_core::challenger::FsChallenger;
         use std::time::Instant;
 
         let n = 6144usize;
@@ -938,8 +941,8 @@ mod tests {
     /// (z[Z_CONST] = 1, folded into lincheck) must now reject it.
     #[test]
     fn all_zero_witness_rejected() {
-        use flock_core::challenger::FsChallenger;
         use crate::r1cs_hashes::keccak::keccak_f;
+        use flock_core::challenger::FsChallenger;
 
         let n_keccaks = 49; // m = 22 (m22_fast)
         let setup = KeccakSetup::new(n_keccaks);

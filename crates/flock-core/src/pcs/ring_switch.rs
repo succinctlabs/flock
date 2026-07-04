@@ -1240,8 +1240,6 @@ pub fn fold_1b_rows_naive(packed_witness: &[F128], suffix_tensor: &[F128]) -> Ve
     // Empty accumulator allocator returns Vec<F128>(n) for the fold's init.
     let zero_acc = || vec![F128::ZERO; n];
 
-    
-
     packed_witness
         .par_iter()
         .zip(suffix_tensor.par_iter())

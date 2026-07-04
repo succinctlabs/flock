@@ -546,9 +546,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // incremental round-0 prime adjustment), so they only require
     // `pd_dense.is_empty()`, not `packed_direct.is_empty()`. This keeps the two
     // big ab/c claims on the fused fold instead of materializing them.
-    let use_fast = !rs_deferred.is_empty()
-        && rs_deferred.len() == rs_results.len()
-        && pd_dense.is_empty();
+    let use_fast =
+        !rs_deferred.is_empty() && rs_deferred.len() == rs_results.len() && pd_dense.is_empty();
 
     let (mut round0_u0, mut round0_u2) = if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
@@ -661,8 +660,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             // full O(L) re-pass over b_combined. The prime is linear in
             // b_combined, so the delta from scattering `g·eq` equals
             // Σ adjust_prime_for_delta(idx, g·val) over the live positions.
-            let (du0, du2) =
-                sparse_scatter_add_parallel(&mut b_combined, packed_witness, eq, *g);
+            let (du0, du2) = sparse_scatter_add_parallel(&mut b_combined, packed_witness, eq, *g);
             round0_u0 += du0;
             round0_u2 += du2;
         }

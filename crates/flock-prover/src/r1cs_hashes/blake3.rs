@@ -1308,7 +1308,10 @@ impl Blake3Setup {
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
-    pub fn with_profile(n_blocks: usize, profile: flock_core::pcs::ligerito::LigeritoProfile) -> Self {
+    pub fn with_profile(
+        n_blocks: usize,
+        profile: flock_core::pcs::ligerito::LigeritoProfile,
+    ) -> Self {
         Self::with_profile_and_rate(n_blocks, profile, profile.log_inv_rate())
     }
 
@@ -2348,9 +2351,12 @@ mod tests {
         let zeros: Vec<Compression> = vec![([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32); n];
         let (mut z, mut a, mut b, mut zlc) =
             generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_blocks_log());
-        z.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
-        a.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
-        b.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
+        z.iter_mut()
+            .for_each(|v| *v = flock_core::field::F128::ZERO);
+        a.iter_mut()
+            .for_each(|v| *v = flock_core::field::F128::ZERO);
+        b.iter_mut()
+            .for_each(|v| *v = flock_core::field::F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let mut ch_p = FsChallenger::new(b"poc");

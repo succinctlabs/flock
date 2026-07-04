@@ -62,13 +62,13 @@
 //! the slow `prove` path will report "everything satisfied vacuously" for
 //! this encoding — only use `prove_fast`/`prove_chain`.
 
+use crate::r1cs_hashes::chain_common::{ChainLayout, ChainProof, ChainVerifyError};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProof};
 use flock_core::r1cs::BlockR1cs;
-use crate::r1cs_hashes::chain_common::{ChainLayout, ChainProof, ChainVerifyError};
 use flock_core::verifier;
 
 // ===========================================================================
@@ -883,7 +883,10 @@ impl KeccakSetup {
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
-    pub fn with_profile(n_keccaks: usize, profile: flock_core::pcs::ligerito::LigeritoProfile) -> Self {
+    pub fn with_profile(
+        n_keccaks: usize,
+        profile: flock_core::pcs::ligerito::LigeritoProfile,
+    ) -> Self {
         Self::with_profile_and_rate(n_keccaks, profile, profile.log_inv_rate())
     }
 

@@ -19,10 +19,10 @@
 //! coords, so its contents are invisible to the sumcheck but participate in
 //! the multilinear extension over the slot-selector dimensions.
 
+use crate::merkle_path::{MerklePathShiftProof, SlotLayout};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::build_eq_table;
-use crate::merkle_path::{MerklePathShiftProof, SlotLayout};
 use flock_core::pcs::{
     Commitment, DirectEqInd, LOG_PACKING, PackedDirectClaim, PackedDirectClaimRef, PcsParams,
 };
@@ -816,9 +816,12 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     let trace = std::env::var("MERKLE_TRACE").is_ok();
 
     let log_n = r1cs.m - LOG_PACKING;
-    let lig_config =
-        flock_core::pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
-            .expect("Ligerito config for merkle-path prove; bump m for tiny instances");
+    let lig_config = flock_core::pcs::ligerito::prover_config_for(
+        log_n,
+        pcs_params.log_batch_size,
+        pcs_params.profile,
+    )
+    .expect("Ligerito config for merkle-path prove; bump m for tiny instances");
 
     // ---- Core: commit → zerocheck → lincheck.
     let t = if trace {

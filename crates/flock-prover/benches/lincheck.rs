@@ -151,14 +151,30 @@ fn main() {
                 FOLD_IBLOCK.store(false, Ordering::Relaxed); // default (oblock if n_log≥16)
                 let mut ch = FsChallenger::new(b"flock-bench-v0");
                 let t0 = Instant::now();
-                let (p, c) = prove(black_box(z_packed), m, K_LOG, K_SKIP, &circuit, black_box(x_ab), &mut ch);
+                let (p, c) = prove(
+                    black_box(z_packed),
+                    m,
+                    K_LOG,
+                    K_SKIP,
+                    &circuit,
+                    black_box(x_ab),
+                    &mut ch,
+                );
                 def_min = def_min.min(t0.elapsed().as_secs_f64() * 1000.0);
                 cs ^= p.z_partial[0].lo ^ c.w.lo;
 
                 FOLD_IBLOCK.store(true, Ordering::Relaxed); // forced iblock
                 let mut ch = FsChallenger::new(b"flock-bench-v0");
                 let t0 = Instant::now();
-                let (p, c) = prove(black_box(z_packed), m, K_LOG, K_SKIP, &circuit, black_box(x_ab), &mut ch);
+                let (p, c) = prove(
+                    black_box(z_packed),
+                    m,
+                    K_LOG,
+                    K_SKIP,
+                    &circuit,
+                    black_box(x_ab),
+                    &mut ch,
+                );
                 ib_min = ib_min.min(t0.elapsed().as_secs_f64() * 1000.0);
                 cs ^= p.z_partial[0].lo ^ c.w.lo;
             }

@@ -845,7 +845,8 @@ impl LigeritoLevelConfig {
                 // has size 1, so (per Diamond and Gruen) the MCA-commutes step
                 // holds with error ε directly — the Johnson regime's 2^{ℓ-1}
                 // row union is unnecessary. So eps_pg = 128 − log₂ a.
-                let log_a = paper_thm_1_4_log_a(self.log_inv_rate, self.log_msg_cols, proximity_loss);
+                let log_a =
+                    paper_thm_1_4_log_a(self.log_inv_rate, self.log_msg_cols, proximity_loss);
                 let eps_pg = ANALYSIS_LOG_Q - log_a;
                 let per_q =
                     udr_per_query_bits(self.log_inv_rate, self.log_msg_cols, proximity_loss);
@@ -1060,13 +1061,14 @@ impl LigeritoSecurityConfig {
             // OOD binding must reach target on its own (no grind covers it;
             // escalate ood_samples instead).
             if let Some(ood) = lv.expected_eps_ood_bits
-                && ood + 1e-3 < lv.target_security_bits as f64 {
-                    return Err(format!(
-                        "L{i}: expected_eps_ood_bits ({ood:.2}) < target ({}); \
+                && ood + 1e-3 < lv.target_security_bits as f64
+            {
+                return Err(format!(
+                    "L{i}: expected_eps_ood_bits ({ood:.2}) < target ({}); \
                          increase ood_samples",
-                        lv.target_security_bits
-                    ));
-                }
+                    lv.target_security_bits
+                ));
+            }
 
             if lv.target_security_bits < self.target_security_bits {
                 return Err(format!(
@@ -1279,7 +1281,8 @@ impl LigeritoSecurityConfig {
                     // No row-union penalty in the unique-decoding regime (list
                     // size 1): per Diamond and Gruen, MCA-commutes holds with
                     // error ε directly (vs the Johnson regime's 2^{ℓ-1} factor).
-                    let eps_pg = ANALYSIS_LOG_Q - paper_thm_1_4_log_a(rate, cols, UDR_PROXIMITY_LOSS);
+                    let eps_pg =
+                        ANALYSIS_LOG_Q - paper_thm_1_4_log_a(rate, cols, UDR_PROXIMITY_LOSS);
                     (
                         SoundnessRegime::Udr,
                         None,
