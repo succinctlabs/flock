@@ -2380,9 +2380,12 @@ mod tests {
         let zeros: Vec<([u32; 8], [u32; 16])> = vec![([0u32; 8], [0u32; 16]); n];
         let (mut z, mut a, mut b, mut zlc) =
             generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_blocks_log());
-        z.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
-        a.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
-        b.iter_mut().for_each(|v| *v = flock_core::field::F128::ZERO);
+        z.iter_mut()
+            .for_each(|v| *v = flock_core::field::F128::ZERO);
+        a.iter_mut()
+            .for_each(|v| *v = flock_core::field::F128::ZERO);
+        b.iter_mut()
+            .for_each(|v| *v = flock_core::field::F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let mut ch_p = FsChallenger::new(b"poc");

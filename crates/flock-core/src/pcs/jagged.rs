@@ -259,7 +259,9 @@ fn generate_f_and_claim(
             let g0 = ci * CHUNK;
             let q_chunk = &q[g0..g0 + b_chunk.len()];
             // Column containing g0 (== num_columns sentinel once g0 ≥ area).
-            let mut col = prefix.partition_point(|&t| t <= g0 as u64).saturating_sub(1);
+            let mut col = prefix
+                .partition_point(|&t| t <= g0 as u64)
+                .saturating_sub(1);
             let mut acc = F128::ZERO;
             for (local, slot) in b_chunk.iter_mut().enumerate() {
                 let i = g0 + local;
@@ -388,7 +390,7 @@ pub fn verify<C: Challenger>(
 #[inline]
 fn fold_round_claim(claim: F128, g_one: F128, g_inf: F128, r: F128) -> F128 {
     let g0 = claim + g_one; // char-2: G(0) = claim - G(1)
-                            // G(X) = g0 + (G(1) + g0 + g_inf)·X + g_inf·X²
+    // G(X) = g0 + (G(1) + g0 + g_inf)·X + g_inf·X²
     g0 + (g_one + g0 + g_inf) * r + g_inf * (r * r)
 }
 
@@ -536,7 +538,6 @@ fn fold_and_round_oop_par(
         .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (s, t)| (p + s, q + t))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,7 +570,10 @@ mod tests {
     /// `q̂(point)` directly = ⟨q, eq(point, ·)⟩.
     fn mle_eval(q: &[F128], point: &[F128]) -> F128 {
         let eq = build_eq_table(point);
-        q.iter().zip(eq.iter()).map(|(&a, &b)| a * b).fold(F128::ZERO, |s, x| s + x)
+        q.iter()
+            .zip(eq.iter())
+            .map(|(&a, &b)| a * b)
+            .fold(F128::ZERO, |s, x| s + x)
     }
 
     /// A small random jagged config + dense data, with total area < 2^m.
@@ -626,9 +630,7 @@ mod tests {
         let eq_row = build_eq_table(&z_row);
         let eq_col = build_eq_table(&z_col);
         for i in 0..params.area() {
-            let z_idx: Vec<F128> = (0..params.m)
-                .map(|bit| int_bit(i, bit))
-                .collect();
+            let z_idx: Vec<F128> = (0..params.m).map(|bit| int_bit(i, bit)).collect();
             let got = f_hat_t(&params, &z_row, &z_col, &z_idx);
             let (row, col) = params.unrank(i);
             let want = eq_row[row] * eq_col[col];
@@ -895,9 +897,17 @@ mod tests {
         let m = 25usize;
         let len = 1usize << m;
         let half = len / 2;
-        let a: Vec<F128> = (0..len).map(|i| F128 { lo: i as u64, hi: i as u64 }).collect();
+        let a: Vec<F128> = (0..len)
+            .map(|i| F128 {
+                lo: i as u64,
+                hi: i as u64,
+            })
+            .collect();
         let b = a.clone();
-        let r = F128 { lo: 0x9E37, hi: 0x1234 };
+        let r = F128 {
+            lo: 0x9E37,
+            hi: 0x1234,
+        };
         const REPS: usize = 6;
         const CHUNK: usize = 1 << 13; // coarse: 8K outputs / task
 
@@ -913,7 +923,10 @@ mod tests {
         let sp = |s: Duration, p: Duration| s.as_secs_f64() / p.as_secs_f64();
         let gbps = |bytes: usize, t: Duration| bytes as f64 / t.as_secs_f64() / 1e9;
 
-        eprintln!("\n[scaling diag] m={m}, threads={}", rayon::current_num_threads());
+        eprintln!(
+            "\n[scaling diag] m={m}, threads={}",
+            rayon::current_num_threads()
+        );
 
         // --- memcpy baseline: read len, write len (the raw bandwidth ceiling) ---
         let mut dst = crate::alloc_uninit_f128_vec(len);
@@ -926,7 +939,11 @@ mod tests {
         let bytes = len * 32; // read+write 16B each
         eprintln!(
             "  memcpy        : serial {:>7.1?} ({:>4.0} GB/s)  parallel {:>7.1?} ({:>4.0} GB/s)  {:.2}x",
-            ts, gbps(bytes, ts), tp, gbps(bytes, tp), sp(ts, tp)
+            ts,
+            gbps(bytes, ts),
+            tp,
+            gbps(bytes, tp),
+            sp(ts, tp)
         );
 
         // --- fold (read len, write half): fine (par_iter_mut) vs coarse ---
@@ -953,7 +970,12 @@ mod tests {
         let bytes = half * 16 * 3; // read 2, write 1
         eprintln!(
             "  fold   serial {:>7.1?} ({:>4.0} GB/s)  par.fine {:>7.1?} {:.2}x  par.coarse {:>7.1?} {:.2}x",
-            ts, gbps(bytes, ts), tp_fine, sp(ts, tp_fine), tp_coarse, sp(ts, tp_coarse)
+            ts,
+            gbps(bytes, ts),
+            tp_fine,
+            sp(ts, tp_fine),
+            tp_coarse,
+            sp(ts, tp_coarse)
         );
 
         // --- real round message (contiguous a+b read): round_msg vs round_msg_par ---
@@ -982,7 +1004,12 @@ mod tests {
         let rd_bytes = len * 16 * 2; // read all of a and b
         eprintln!(
             "  round_msg serial {:>7.1?} ({:>4.0} GB/s)  par.fine {:>7.1?} {:.2}x  par.coarse {:>7.1?} {:.2}x",
-            ts, gbps(rd_bytes, ts), tp_fine, sp(ts, tp_fine), tp_coarse, sp(ts, tp_coarse)
+            ts,
+            gbps(rd_bytes, ts),
+            tp_fine,
+            sp(ts, tp_fine),
+            tp_coarse,
+            sp(ts, tp_coarse)
         );
         // slice/chunks_exact iteration: no per-element bounds checks.
         let tp_slice = bench(&mut || {
@@ -1003,7 +1030,9 @@ mod tests {
         });
         eprintln!(
             "  round_msg par.slice(chunks_exact)   {:>7.1?} ({:>4.0} GB/s)  {:.2}x",
-            tp_slice, gbps(rd_bytes, tp_slice), sp(ts, tp_slice)
+            tp_slice,
+            gbps(rd_bytes, tp_slice),
+            sp(ts, tp_slice)
         );
 
         // --- per-round breakdown of the actual parallel-fused sumcheck ---
@@ -1022,10 +1051,20 @@ mod tests {
                 let t = Instant::now();
                 if cur > 2 {
                     (_g1, _gi) = fold_and_round_oop_par(
-                        &av[..cur], &bv[..cur], r, &mut sa[..half_r], &mut sb[..half_r],
+                        &av[..cur],
+                        &bv[..cur],
+                        r,
+                        &mut sa[..half_r],
+                        &mut sb[..half_r],
                     );
                 } else {
-                    fold_oop_par(&av[..cur], &bv[..cur], r, &mut sa[..half_r], &mut sb[..half_r]);
+                    fold_oop_par(
+                        &av[..cur],
+                        &bv[..cur],
+                        r,
+                        &mut sa[..half_r],
+                        &mut sb[..half_r],
+                    );
                 }
                 std::mem::swap(&mut av, &mut sa);
                 std::mem::swap(&mut bv, &mut sb);
@@ -1037,7 +1076,11 @@ mod tests {
         let tail: Duration = round_t[6..].iter().sum(); // rounds with cur ≤ 2^20
         eprintln!(
             "  sumcheck per-round: total {:.1?} | r0 {:.1?} r1 {:.1?} r2 {:.1?} | tail(r6+, cur≤2^19) {:.2?} ({:.0}%)",
-            total, round_t[1], round_t[2], round_t[3], tail,
+            total,
+            round_t[1],
+            round_t[2],
+            round_t[3],
+            tail,
             100.0 * tail.as_secs_f64() / total.as_secs_f64()
         );
         std::hint::black_box(&out);

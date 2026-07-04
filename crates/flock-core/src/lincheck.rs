@@ -1077,11 +1077,14 @@ fn partial_fold_packed_z_best(
             // n_log ≥ 16; below that the L1-resident `iblock` wins. `FOLD_IBLOCK` forces
             // iblock everywhere (bench A/B).
             let n_log = m - k_log;
-            if n_log >= OBLOCK_MIN_N_LOG
-                && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
+            if n_log >= OBLOCK_MIN_N_LOG && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
             {
                 return partial_fold_packed_z_neon_oblock_padded(
-                    z_packed, m, k_log, useful_bits, eq_outer,
+                    z_packed,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_outer,
                 );
             }
             partial_fold_packed_z_neon_iblock_padded(z_packed, m, k_log, useful_bits, eq_outer)
@@ -2213,7 +2216,10 @@ mod tests {
             (22, 14, 15_409),  // padded, non-byte-aligned (k=16384)
         ];
         for &(m, k_log, useful_bits) in cases {
-            assert!(n_log_ok_for_tile(m, k_log, NEON_TILE_T), "case must be tile-eligible");
+            assert!(
+                n_log_ok_for_tile(m, k_log, NEON_TILE_T),
+                "case must be tile-eligible"
+            );
             let k = 1usize << k_log;
             let n_log = m - k_log;
             let n_blocks = 1usize << n_log;
@@ -2229,7 +2235,8 @@ mod tests {
             let eq = build_eq_table(&rng.f128_vec(n_log));
             let want =
                 partial_fold_packed_z_neon_iblock_padded(&z_packed, m, k_log, useful_bits, &eq);
-            let got = partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
+            let got =
+                partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
         }
     }

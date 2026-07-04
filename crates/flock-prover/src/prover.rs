@@ -154,12 +154,7 @@ pub fn prove<Ch: Challenger>(
     // identical to the bit packing the zerocheck consumes, so a raw cast
     // suffices — no allocation, no copy.
     let cast = |v: &[F128]| -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                v.as_ptr() as *const u8,
-                std::mem::size_of_val(v),
-            )
-        }
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
     let a_packed: &[u8] = cast(&a_packed_f128);
     let b_packed: &[u8] = cast(&b_packed_f128);
@@ -290,12 +285,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         r1cs.apply_c_packed(&z_packed)
     };
     let cast = |v: &[F128]| -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                v.as_ptr() as *const u8,
-                std::mem::size_of_val(v),
-            )
-        }
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
     let a_packed: &[u8] = cast(&a_packed_f128);
     let b_packed: &[u8] = cast(&b_packed_f128);
