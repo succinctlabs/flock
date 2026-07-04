@@ -163,6 +163,7 @@ impl MerklePathFold {
 /// `s = sel_slot | (side << 1)`, matching the cube convention.
 pub fn fold_all_slots(
     layout: &MerkleLayout,
+    wl: flock_core::r1cs::WitnessLayout,
     packed: &[F128],
     fold: &MerklePathFold,
 ) -> [Vec<F128>; 4] {
@@ -178,13 +179,23 @@ pub fn fold_all_slots(
         "packed witness length must be a whole number of blocks"
     );
     let n_inst = packed.len() / block_packed;
+    let n_log = n_inst.trailing_zeros() as usize;
 
     let eq_tau = build_eq_table(&fold.tau_pos);
 
-    let fold_one = |base: usize| -> F128 {
+    // Word address of within-block word `w` of instance `i` (see
+    // `chain_common::fold_in_out`).
+    let word_addr = move |i: usize, w: usize| -> usize {
+        match wl {
+            flock_core::r1cs::WitnessLayout::RowMajor => i * block_packed + w,
+            flock_core::r1cs::WitnessLayout::BatchMajor => (w << n_log) + i,
+        }
+    };
+
+    let fold_one = |i: usize, base: usize| -> F128 {
         let mut acc = F128::ZERO;
         for pos in 0..n_packed_per_slot {
-            acc += eq_tau[pos] * packed[base + pos];
+            acc += eq_tau[pos] * packed[word_addr(i, base + pos)];
         }
         acc
     };
@@ -195,7 +206,7 @@ pub fn fold_all_slots(
         let slot_offset = slot_base_packed + slot_idx * n_packed_per_slot;
         *vec_out = (0..n_inst)
             .into_par_iter()
-            .map(|i| fold_one(i * block_packed + slot_offset))
+            .map(|i| fold_one(i, slot_offset))
             .collect();
     }
     results
@@ -218,19 +229,11 @@ pub fn fold_all_slots(
 /// `eq_ind(point)` sparse with a `2^high_zeros ×` density reduction.
 pub fn assemble_merkle_path_claim(
     layout: &MerkleLayout,
+    wl: flock_core::r1cs::WitnessLayout,
     fold: &MerklePathFold,
     claims: &crate::merkle_path::MerklePathClaims,
 ) -> PackedDirectClaim {
-    let high = layout.high_zeros();
-    let point_len = fold.tau_pos.len() + 2 + high + claims.instance_point.len();
-    let mut point = Vec::with_capacity(point_len);
-    point.extend_from_slice(&fold.tau_pos);
-    point.push(claims.sel_slot);
-    point.push(claims.side);
-    point.extend(std::iter::repeat_n(F128::ZERO, high));
-    point.extend_from_slice(&claims.instance_point);
-    debug_assert_eq!(point.len(), point_len);
-
+    let point = build_merkle_claim_point(layout, wl, fold, claims);
     let sparse_eq = flock_core::pcs::ring_switch::build_eq_sparse(&point);
     PackedDirectClaim {
         point,
@@ -241,19 +244,29 @@ pub fn assemble_merkle_path_claim(
 
 /// Verifier-side helper: build the claim point identically to
 /// [`assemble_merkle_path_claim`] without constructing the sparse eq tensor.
+/// Word-index claim point ordered by the witness layout's address
+/// decomposition (see `chain_common::build_chain_claim_point`):
+/// RowMajor `[τ_pos…, sel_slot, side, 0^high, instance…]`;
+/// BatchMajor `[instance…, τ_pos…, sel_slot, side, 0^high]`.
 fn build_merkle_claim_point(
     layout: &MerkleLayout,
+    wl: flock_core::r1cs::WitnessLayout,
     fold: &MerklePathFold,
     claims: &crate::merkle_path::MerklePathClaims,
 ) -> Vec<F128> {
     let high = layout.high_zeros();
     let point_len = fold.tau_pos.len() + 2 + high + claims.instance_point.len();
     let mut point = Vec::with_capacity(point_len);
+    if wl == flock_core::r1cs::WitnessLayout::BatchMajor {
+        point.extend_from_slice(&claims.instance_point);
+    }
     point.extend_from_slice(&fold.tau_pos);
     point.push(claims.sel_slot);
     point.push(claims.side);
     point.extend(std::iter::repeat_n(F128::ZERO, high));
-    point.extend_from_slice(&claims.instance_point);
+    if wl == flock_core::r1cs::WitnessLayout::RowMajor {
+        point.extend_from_slice(&claims.instance_point);
+    }
     debug_assert_eq!(point.len(), point_len);
     point
 }
@@ -345,7 +358,7 @@ pub fn prove_merkle_path_generic<Ch: Challenger>(
     };
     let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
-    let slot_vals = fold_all_slots(layout, &core.z_packed, &fold);
+    let slot_vals = fold_all_slots(layout, r1cs.layout, &core.z_packed, &fold);
     if let Some(t) = t {
         eprintln!(
             "[merkle] {:<18} {:>8.2} ms",
@@ -374,7 +387,7 @@ pub fn prove_merkle_path_generic<Ch: Challenger>(
         layout.slot_layout(),
         challenger,
     );
-    let merkle_claim = assemble_merkle_path_claim(layout, &fold, &claims);
+    let merkle_claim = assemble_merkle_path_claim(layout, r1cs.layout, &fold, &claims);
     if let Some(t) = t {
         eprintln!(
             "[merkle] {:<18} {:>8.2} ms",
@@ -389,10 +402,7 @@ pub fn prove_merkle_path_generic<Ch: Challenger>(
     } else {
         None
     };
-    let padding = flock_core::zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
     let pre_ab: Option<&[flock_core::field::F128]> = core.s_hat_v_ab.as_deref();
@@ -499,7 +509,7 @@ pub fn verify_merkle_path_generic<Ch: Challenger>(
 
     // ---- Verify the mixed batched open (2 ring-switched + 1 packed-direct).
     let t = std::time::Instant::now();
-    let merkle_point = build_merkle_claim_point(layout, &fold, &claims);
+    let merkle_point = build_merkle_claim_point(layout, r1cs.layout, &fold, &claims);
     let ab_x_outer = crate::prover::quirky_x_outer_full(&ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&c.point);
     let pd_ref = PackedDirectClaimRef {
@@ -585,7 +595,7 @@ pub fn prove_merkle_paths_generic<Ch: Challenger>(
     };
     let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
-    let slot_vals = fold_all_slots(layout, &core.z_packed, &fold);
+    let slot_vals = fold_all_slots(layout, r1cs.layout, &core.z_packed, &fold);
     if let Some(t) = t {
         eprintln!(
             "[merkle] {:<18} {:>8.2} ms",
@@ -613,7 +623,7 @@ pub fn prove_merkle_paths_generic<Ch: Challenger>(
         layout.slot_layout(),
         challenger,
     );
-    let merkle_claim = assemble_merkle_path_claim(layout, &fold, &claims);
+    let merkle_claim = assemble_merkle_path_claim(layout, r1cs.layout, &fold, &claims);
     if let Some(t) = t {
         eprintln!(
             "[merkle] {:<18} {:>8.2} ms",
@@ -627,10 +637,7 @@ pub fn prove_merkle_paths_generic<Ch: Challenger>(
     } else {
         None
     };
-    let padding = flock_core::zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
     let pre_ab: Option<&[flock_core::field::F128]> = core.s_hat_v_ab.as_deref();
@@ -745,7 +752,7 @@ pub fn verify_merkle_paths_generic<Ch: Challenger>(
     }
 
     let t = std::time::Instant::now();
-    let merkle_point = build_merkle_claim_point(layout, &fold, &claims);
+    let merkle_point = build_merkle_claim_point(layout, r1cs.layout, &fold, &claims);
     let ab_x_outer = crate::prover::quirky_x_outer_full(&ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&c.point);
     let pd_ref = PackedDirectClaimRef {
@@ -837,7 +844,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     };
     let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
-    let slot_vals = fold_all_slots(layout, &core.z_packed, &fold);
+    let slot_vals = fold_all_slots(layout, r1cs.layout, &core.z_packed, &fold);
     if let Some(t) = t {
         eprintln!(
             "[merkle] {:<18} {:>8.2} ms",
@@ -866,7 +873,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
         layout.slot_layout(),
         challenger,
     );
-    let merkle_claim = assemble_merkle_path_claim(layout, &fold, &claims);
+    let merkle_claim = assemble_merkle_path_claim(layout, r1cs.layout, &fold, &claims);
     if let Some(t) = t {
         eprintln!(
             "[merkle] {:<18} {:>8.2} ms",
@@ -881,10 +888,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     } else {
         None
     };
-    let padding = flock_core::zerocheck::PaddingSpec {
-        k_log: r1cs.k_log,
-        useful_bits_per_block: r1cs.useful_bits,
-    };
+    let padding = r1cs.padding_spec();
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
     // Destructure core to move z_packed by value into the open (saves a large
@@ -987,7 +991,7 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
     )
     .map_err(MerklePathVerifyError::Shift)?;
 
-    let merkle_point = build_merkle_claim_point(layout, &fold, &claims);
+    let merkle_point = build_merkle_claim_point(layout, r1cs.layout, &fold, &claims);
     let ab_x_outer = crate::prover::quirky_x_outer_full(&ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&c.point);
     let pd_ref = PackedDirectClaimRef {

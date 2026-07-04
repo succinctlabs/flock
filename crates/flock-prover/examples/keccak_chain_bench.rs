@@ -114,7 +114,12 @@ fn bench(n_keccaks: usize, n_runs: usize) {
     let mut io = (Vec::new(), Vec::new());
     for _ in 0..n_runs {
         let t = Instant::now();
-        io = fold_in_out(&CHAIN_LAYOUT, &z_packed, &fold);
+        io = fold_in_out(
+            &CHAIN_LAYOUT,
+            flock_prover::r1cs::WitnessLayout::RowMajor,
+            &z_packed,
+            &fold,
+        );
         best_fold = best_fold.min(t.elapsed().as_secs_f64());
     }
     let (in_vals, out_vals) = io;

@@ -913,6 +913,33 @@ impl KeccakSetup {
         }
     }
 
+    /// [`Self::new`] with the **batch-major** witness layout (see
+    /// [`flock_core::r1cs::WitnessLayout`]): fold-log_n-first variable
+    /// order, contiguous padding suffix, direct-write witness producer.
+    /// Chain/Merkle wrappers still require the row-major layout.
+    pub fn new_batch_major(n_keccaks: usize) -> Self {
+        let mut s = Self::new(n_keccaks);
+        // Safe to set post-construction: the digest/csc caches are lazy and
+        // untouched by `new`.
+        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
+        s
+    }
+
+    /// Witness generation dispatched on the r1cs's witness layout.
+    fn generate_witness(
+        &self,
+        initial_states: &[State],
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_keccaks_log())
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                generate_witness_batch_major(initial_states, self.n_keccaks_log())
+            }
+        }
+    }
+
     pub fn m(&self) -> usize {
         self.r1cs.m
     }
@@ -932,7 +959,7 @@ impl KeccakSetup {
     ) -> (R1csProof, Commitment, R1csClaim) {
         assert_eq!(initial_states.len(), self.n_keccaks);
         let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_keccaks_log());
+            self.generate_witness(initial_states);
         crate::prover::prove_fast_from_witness(
             &self.r1cs,
             &self.pcs_params,
@@ -972,7 +999,7 @@ impl KeccakSetup {
         assert_eq!(initial_states.len(), self.n_keccaks);
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_keccaks_log())
+                self.generate_witness(initial_states)
             });
         crate::prover::prove_fast_ligerito_from_witness(
             &self.r1cs,
@@ -1020,9 +1047,7 @@ impl KeccakSetup {
             self.n_keccaks,
             self.n_keccak_slots(),
         );
-        let n_log = self.n_keccaks_log();
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(initial_states, n_log);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness(initial_states);
         crate::r1cs_hashes::chain_common::prove_chain_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -1050,9 +1075,7 @@ impl KeccakSetup {
     ) {
         assert_eq!(initial_states.len(), self.n_keccaks);
         assert_eq!(self.n_keccaks, self.n_keccak_slots());
-        let n_log = self.n_keccaks_log();
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(initial_states, n_log);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness(initial_states);
         crate::r1cs_hashes::chain_common::prove_chain_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -1126,6 +1149,334 @@ impl KeccakSetup {
             challenger,
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// Batch-major witness producer (WitnessLayout::BatchMajor).
+//
+// V = 8 keccak instances simulated in lockstep ([[u64; 8]; 25] lane-major
+// state — every θ/ρπ/χ/ι op is a SIMD-friendly array op) with witness words
+// written DIRECTLY at their batch-major addresses. Keccak's block layout is
+// u64-aligned, so rows go straight from simulation registers to one 128-byte
+// non-temporal chunk-row store; the lincheck stripe is transposed from the
+// same in-flight rows (V = 8 = one stripe group). No staging buffer, no
+// transpose pass; each output byte is written exactly once.
+//
+// The emission fully writes chunk-columns [0, useful_chunks) — including
+// explicit zero rows for the intra-slot gap words — so the driver only
+// zeroes the contiguous padding suffix of the recycled scratch buffers.
+// ---------------------------------------------------------------------------
+
+use super::common::{BM_V, SendPtr, nt_store_row};
+
+type VLane = [u64; BM_V];
+type VLanes = [[u64; BM_V]; N_LANES];
+
+#[inline(always)]
+fn theta_v(s: &mut VLanes) {
+    let mut c = [[0u64; BM_V]; 5];
+    for x in 0..5 {
+        for y in 0..5 {
+            for j in 0..BM_V {
+                c[x][j] ^= s[x + 5 * y][j];
+            }
+        }
+    }
+    let mut d = [[0u64; BM_V]; 5];
+    for x in 0..5 {
+        for j in 0..BM_V {
+            d[x][j] = c[(x + 4) % 5][j] ^ c[(x + 1) % 5][j].rotate_left(1);
+        }
+    }
+    for i in 0..N_LANES {
+        let x = i % 5;
+        for j in 0..BM_V {
+            s[i][j] ^= d[x][j];
+        }
+    }
+}
+
+#[inline(always)]
+fn rho_pi_v(s_in: &VLanes) -> VLanes {
+    let mut out = [[0u64; BM_V]; N_LANES];
+    for y in 0..5 {
+        for x in 0..5 {
+            let a = (x + 3 * y) % 5;
+            let b = x;
+            let r = RHO_OFFSETS[a][b] % 64;
+            for j in 0..BM_V {
+                out[x + 5 * y][j] = s_in[a + 5 * b][j].rotate_left(r);
+            }
+        }
+    }
+    out
+}
+
+/// Pairs even/odd u64 halves of each 128-bit chunk and emits contiguous
+/// NT-store runs at the batch-major destination. Word-rows must arrive with
+/// each odd index directly following its even partner (keccak's natural
+/// emission order guarantees this); a held even half is completed with a
+/// zero odd half at region boundaries (always genuine padding words).
+struct RowWriter {
+    dest: *mut u64,
+    o0_x2: usize,
+    n_log: usize,
+    pending_w: usize, // block-u64 index of a held even half; usize::MAX = none
+    pending: VLane,
+}
+
+impl RowWriter {
+    fn new(dest: *mut u64, o0: usize, n_log: usize) -> Self {
+        Self {
+            dest,
+            o0_x2: o0 * 2,
+            n_log,
+            pending_w: usize::MAX,
+            pending: [0u64; BM_V],
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn emit(&mut self, c: usize, even: &VLane, odd: &VLane) {
+        let mut buf = [0u64; 2 * BM_V];
+        for j in 0..BM_V {
+            buf[2 * j] = even[j];
+            buf[2 * j + 1] = odd[j];
+        }
+        unsafe {
+            nt_store_row(
+                buf.as_ptr(),
+                self.dest.add((c << self.n_log) * 2 + self.o0_x2),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn push(&mut self, w: usize, vals: &VLane) {
+        if w & 1 == 1 {
+            debug_assert_eq!(self.pending_w, w - 1, "odd half without its even partner");
+            let pending = self.pending;
+            self.pending_w = usize::MAX;
+            unsafe { self.emit(w >> 1, &pending, vals) };
+        } else {
+            unsafe { self.flush() };
+            self.pending_w = w;
+            self.pending = *vals;
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn flush(&mut self) {
+        if self.pending_w != usize::MAX {
+            let (w, pending) = (self.pending_w, self.pending);
+            self.pending_w = usize::MAX;
+            unsafe { self.emit(w >> 1, &pending, &[0u64; BM_V]) };
+        }
+    }
+}
+
+/// Build one group of V = 8 instances directly into batch-major dest buffers
+/// (+ this group's lincheck stripe).
+///
+/// SAFETY: distinct groups write disjoint instance word ranges and stripe
+/// regions; dest padding suffix is pre-zeroed by the caller.
+unsafe fn build_group_batch_major(
+    states: [&State; BM_V],
+    o0: usize,
+    n_log: usize,
+    z: *mut u64,
+    a: *mut u64,
+    b: *mut u64,
+    stripe: *mut u8,
+) {
+    use flock_core::bits::transpose_8_u64s_to_64_bytes;
+
+    let mut wz = RowWriter::new(z, o0, n_log);
+    let mut wa = RowWriter::new(a, o0, n_log);
+    let mut wb = RowWriter::new(b, o0, n_log);
+    let ones: VLane = [u64::MAX; BM_V];
+    let one: VLane = [1u64; BM_V];
+    let zeros: VLane = [0u64; BM_V];
+
+    let stripe_base = unsafe { stripe.add((o0 / 8) * U64_PER_BLOCK * 64) };
+    macro_rules! push_z {
+        ($w:expr, $vals:expr) => {{
+            let w: usize = $w;
+            let vals: &VLane = $vals;
+            // Callers expand this macro only inside the surrounding
+            // `unsafe` emission blocks.
+            let out = std::slice::from_raw_parts_mut(stripe_base.add(w * 64), 64);
+            transpose_8_u64s_to_64_bytes(vals, out);
+            wz.push(w, vals);
+        }};
+    }
+
+    // Initial lanes, instance-minor.
+    let mut lanes: VLanes = [[0u64; BM_V]; N_LANES];
+    for (j, s) in states.iter().enumerate() {
+        let l = state_to_lanes(s);
+        for i in 0..N_LANES {
+            lanes[i][j] = l[i];
+        }
+    }
+
+    let s0_w = state_u64_base(0);
+    let s24_w = state_u64_base(24);
+    unsafe {
+        // state_0 self-loops: z = a = v, b = 1.
+        for i in 0..N_LANES {
+            push_z!(s0_w + i, &lanes[i]);
+            wa.push(s0_w + i, &lanes[i]);
+            wb.push(s0_w + i, &ones);
+        }
+        wz.flush();
+        wa.flush();
+        wb.flush();
+
+        // Explicit zero rows for the intra-slot gap words so the useful
+        // chunk-column prefix is FULLY written (recycled-buffer contract).
+        for w in (s0_w + N_LANES + 1)..s24_w {
+            push_z!(w, &zeros);
+            wa.push(w, &zeros);
+            wb.push(w, &zeros);
+        }
+        wz.flush();
+        wa.flush();
+        wb.flush();
+
+        // Constant word (bit 0 of word 64): z = a = b = 1. Word 64 is even;
+        // its odd partner is t_0's first row, pushed next.
+        push_z!(Z_CONST_U64, &one);
+        wa.push(Z_CONST_U64, &one);
+        wb.push(Z_CONST_U64, &one);
+
+        // 24 rounds; t rows are word-sequential.
+        for r in 0..N_ROUNDS {
+            let mut b_state = lanes;
+            theta_v(&mut b_state);
+            let b_state = rho_pi_v(&b_state);
+
+            let mut t = [[0u64; BM_V]; N_LANES];
+            let mut next = [[0u64; BM_V]; N_LANES];
+            for y in 0..5 {
+                for x in 0..5 {
+                    let i = x + 5 * y;
+                    let i1 = (x + 1) % 5 + 5 * y;
+                    let i2 = (x + 2) % 5 + 5 * y;
+                    for j in 0..BM_V {
+                        t[i][j] = (!b_state[i1][j]) & b_state[i2][j];
+                        next[i][j] = b_state[i][j] ^ t[i][j];
+                    }
+                }
+            }
+            for j in 0..BM_V {
+                next[0][j] ^= ROUND_CONSTANTS[r];
+            }
+
+            let t_base = t_u64_base(r);
+            for y in 0..5 {
+                for x in 0..5 {
+                    let i = x + 5 * y;
+                    let w = t_base + i;
+                    push_z!(w, &t[i]);
+                    let mut av = [0u64; BM_V];
+                    let i1 = (x + 1) % 5 + 5 * y;
+                    for j in 0..BM_V {
+                        av[j] = !b_state[i1][j];
+                    }
+                    wa.push(w, &av);
+                    wb.push(w, &b_state[(x + 2) % 5 + 5 * y]);
+                }
+            }
+
+            lanes = next;
+        }
+        wz.flush();
+        wa.flush();
+        wb.flush();
+
+        // state_24 pin rows: z = a = state_24, b = 1.
+        for i in 0..N_LANES {
+            push_z!(s24_w + i, &lanes[i]);
+            wa.push(s24_w + i, &lanes[i]);
+            wb.push(s24_w + i, &ones);
+        }
+        wz.flush();
+        wa.flush();
+        wb.flush();
+
+        // Zero rows for the gap words between state_24's end and the
+        // constant word.
+        for w in (s24_w + N_LANES + 1)..Z_CONST_U64 {
+            push_z!(w, &zeros);
+            wa.push(w, &zeros);
+            wb.push(w, &zeros);
+        }
+        wz.flush();
+        wa.flush();
+        wb.flush();
+    }
+}
+
+/// Batch-major counterpart of [`generate_witness_with_ab_packed_and_lincheck`]:
+/// produces `(z, a, b, z_lincheck)` with z/a/b in the **batch-major** layout
+/// (`addr = [7 in-word | n_log batch | k_log−7 chunk]`). Same padding-slot
+/// semantics (padding slots run keccak_f(0) so the constant wire is 1 in
+/// every block); the byte-stripe is identical to the row-major driver's.
+pub fn generate_witness_batch_major(
+    initial_states: &[State],
+    n_keccaks_log: usize,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+    use rayon::prelude::*;
+
+    let n_total = 1usize << n_keccaks_log;
+    assert!(initial_states.len() <= n_total);
+    assert!(n_total >= BM_V, "batch-major needs n_total >= 8");
+    let useful_chunks = USEFUL_BITS.div_ceil(128);
+    let total_f128 = n_total * (U64_PER_BLOCK / 2);
+
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let stripe = vec![0u8; n_total * U64_PER_BLOCK * 8];
+    // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
+    // the group builder fully rewrites the useful prefix every call.
+    let tail = useful_chunks << n_keccaks_log;
+    for buf in [&mut z, &mut a, &mut b] {
+        buf[tail..]
+            .par_chunks_mut(1 << 16)
+            .for_each(|c| c.fill(F128::ZERO));
+    }
+
+    let (zp, ap, bp) = (
+        SendPtr(z.as_mut_ptr() as *mut u64),
+        SendPtr(a.as_mut_ptr() as *mut u64),
+        SendPtr(b.as_mut_ptr() as *mut u64),
+    );
+    let sp = SendPtr(stripe.as_ptr() as *mut u64);
+    let padding: State = [false; STATE_BITS];
+    let states_ref = initial_states;
+    let padding_ref = &padding;
+
+    (0..n_total / BM_V).into_par_iter().for_each(move |g| {
+        let o0 = g * BM_V;
+        let group: [&State; BM_V] =
+            std::array::from_fn(|j| states_ref.get(o0 + j).unwrap_or(padding_ref));
+        // SAFETY: disjoint per-group ranges; suffix pre-zeroed above.
+        unsafe {
+            build_group_batch_major(
+                group,
+                o0,
+                n_keccaks_log,
+                zp.get(),
+                ap.get(),
+                bp.get(),
+                sp.get() as *mut u8,
+            )
+        }
+    });
+
+    (z, a, b, stripe)
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,6 +1805,87 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
+    /// Batch-major witness equality: `generate_witness_batch_major`'s
+    /// `(z, a, b)` must be exactly the word-transpose of the row-major
+    /// driver's output (word (o, c) ↦ (c << n_log) + o), and the byte-stripe
+    /// must be identical. Exercises padding slots via a non-power-of-two
+    /// instance count.
+    #[test]
+    fn batch_major_witness_matches_row_major_transposed() {
+        for (n_inputs, n_log) in [(8usize, 3usize), (13, 4)] {
+            let mut rng = Rng::new(0xBA7C_4 + n_log as u64);
+            let inputs: Vec<State> = (0..n_inputs).map(|_| random_state(&mut rng)).collect();
+
+            let (z_r, a_r, b_r, stripe_r) =
+                generate_witness_with_ab_packed_and_lincheck(&inputs, n_log);
+            let (z_b, a_b, b_b, stripe_b) = generate_witness_batch_major(&inputs, n_log);
+
+            assert_eq!(stripe_b, stripe_r, "stripe diverged (n_log={n_log})");
+
+            let chunks_per_block = U64_PER_BLOCK / 2;
+            let transpose = |row: &[F128]| -> Vec<F128> {
+                let mut out = vec![F128::ZERO; row.len()];
+                for o in 0..1usize << n_log {
+                    for c in 0..chunks_per_block {
+                        out[(c << n_log) + o] = row[o * chunks_per_block + c];
+                    }
+                }
+                out
+            };
+            assert_eq!(z_b, transpose(&z_r), "z diverged (n_log={n_log})");
+            assert_eq!(a_b, transpose(&a_r), "a diverged (n_log={n_log})");
+            assert_eq!(b_b, transpose(&b_r), "b diverged (n_log={n_log})");
+        }
+    }
+
+    /// Batch-major end-to-end roundtrip (BaseFold): prove on the
+    /// batch-major-committed witness, verify with the layout-aware verifier;
+    /// claims must agree and a tampered proof must be rejected.
+    #[test]
+    fn batch_major_prove_fast_basefold_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+
+        let setup = KeccakSetup::new_batch_major(8);
+        let mut rng = Rng::new(0xBA7C_F011);
+        let inputs: Vec<State> = (0..8).map(|_| random_state(&mut rng)).collect();
+
+        let mut ch_p = FsChallenger::new(b"flock-test-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast_basefold(&inputs, &mut ch_p);
+
+        let mut ch_v = FsChallenger::new(b"flock-test-v0");
+        let claim_v = setup
+            .verify_basefold(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("batch-major verifier rejected: {e:?}"));
+        assert_eq!(claim_p, claim_v);
+
+        let mut bad = proof.clone();
+        bad.zerocheck.final_a_eval.lo ^= 1;
+        let mut ch = FsChallenger::new(b"flock-test-v0");
+        assert!(
+            setup.verify_basefold(&commitment, &bad, &mut ch).is_err(),
+            "tampered batch-major proof accepted"
+        );
+    }
+
+    /// Batch-major Ligerito roundtrip at K = 64 (m = 22, the smallest
+    /// embedded Ligerito config). Ignored by default like the row-major
+    /// Ligerito roundtrip above; run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn batch_major_prove_fast_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        let setup = KeccakSetup::new_batch_major(64);
+        let mut rng = Rng::new(0xBA7C_2170);
+        let inputs: Vec<State> = (0..64).map(|_| random_state(&mut rng)).collect();
+        let mut ch_p = FsChallenger::new(b"flock-lig-keccak-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast(&inputs, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-lig-keccak-v0");
+        let claim_v = setup
+            .verify(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("batch-major ligerito verifier rejected: {e:?}"));
+        assert_eq!(claim_p, claim_v);
+    }
+
     /// Constant-wire pin (docs/const-wire-pin.md). A non-power-of-two count gives
     /// padding blocks (filled with keccak_f(0), constant = 1) so the honest proof
     /// still verifies; the all-zero witness — encoding the FALSE keccak_f(0) = 0 —
@@ -1501,6 +1933,102 @@ mod tests {
             matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
+    }
+
+    /// Batch-major chain: the packed-pos fold must produce IDENTICAL In/Out
+    /// vectors from the batch-major and row-major witnesses (same semantic
+    /// content, different addressing), pinning `fold_in_out`'s batch-major
+    /// word addressing.
+    #[test]
+    fn batch_major_chain_fold_matches_row_major() {
+        use crate::r1cs_hashes::chain_common::{ChainFold, fold_in_out};
+        let n_log = 3;
+        let mut rng = Rng::new(0xF01D_BA7C);
+        let inputs: Vec<State> = (0..8).map(|_| random_state(&mut rng)).collect();
+        let (z_r, _, _, _) = generate_witness_with_ab_packed_and_lincheck(&inputs, n_log);
+        let (z_b, _, _, _) = generate_witness_batch_major(&inputs, n_log);
+
+        let tau_pos: Vec<F128> = (0..CHAIN_LAYOUT.tau_pos_len())
+            .map(|i| F128 {
+                lo: rng.next_u64() ^ i as u64,
+                hi: rng.next_u64(),
+            })
+            .collect();
+        let fold = ChainFold::new(&CHAIN_LAYOUT, tau_pos);
+        let (in_r, out_r) = fold_in_out(
+            &CHAIN_LAYOUT,
+            flock_core::r1cs::WitnessLayout::RowMajor,
+            &z_r,
+            &fold,
+        );
+        let (in_b, out_b) = fold_in_out(
+            &CHAIN_LAYOUT,
+            flock_core::r1cs::WitnessLayout::BatchMajor,
+            &z_b,
+            &fold,
+        );
+        assert_eq!(in_b, in_r, "In fold diverged across layouts");
+        assert_eq!(out_b, out_r, "Out fold diverged across layouts");
+    }
+
+    /// Batch-major chain prove -> verify roundtrip (BaseFold, K=8) + rejection
+    /// of a wrong public output endpoint.
+    #[test]
+    fn batch_major_prove_chain_basefold_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        let setup = KeccakSetup::new_batch_major(8);
+        let mut rng = Rng::new(0xBA7C_CA11);
+        let x0 = random_state(&mut rng);
+        let mut inputs = Vec::with_capacity(8);
+        let mut cur = x0;
+        for _ in 0..8 {
+            inputs.push(cur);
+            keccak_f(&mut cur);
+        }
+        let x_last = cur;
+
+        let mut chp = FsChallenger::new(b"flock-test-v0");
+        let (proof, comm) = setup.prove_chain_basefold(&inputs, &mut chp);
+        let mut chv = FsChallenger::new(b"flock-test-v0");
+        setup
+            .verify_chain_basefold(&comm, &proof, &x0, &x_last, &mut chv)
+            .expect("batch-major chain must verify");
+
+        // Wrong endpoint must be rejected.
+        let mut bad_last = x_last;
+        bad_last[0] = !bad_last[0];
+        let mut chv = FsChallenger::new(b"flock-test-v0");
+        assert!(
+            setup
+                .verify_chain_basefold(&comm, &proof, &x0, &bad_last, &mut chv)
+                .is_err(),
+            "wrong endpoint accepted under batch-major"
+        );
+    }
+
+    /// Batch-major chain roundtrip on the Ligerito backend (K=64, m=22) —
+    /// covers the mixed open (2 ring-switched + 1 packed-direct claim) with
+    /// the batch-major point ordering. Ignored like the row-major variant.
+    #[test]
+    #[ignore]
+    fn batch_major_prove_chain_ligerito_roundtrip() {
+        use flock_core::challenger::RandomChallenger;
+        let setup = KeccakSetup::new_batch_major(64);
+        let mut rng = Rng::new(0xBA7C_11C7);
+        let x0 = random_state(&mut rng);
+        let mut inputs = Vec::with_capacity(64);
+        let mut cur = x0;
+        for _ in 0..64 {
+            inputs.push(cur);
+            keccak_f(&mut cur);
+        }
+        let x_last = cur;
+        let mut chp = RandomChallenger::new(0xCA2);
+        let (proof, comm) = setup.prove_chain(&inputs, &mut chp);
+        let mut chv = RandomChallenger::new(0xCA2);
+        setup
+            .verify_chain(&comm, &proof, &x0, &x_last, &mut chv)
+            .expect("batch-major ligerito chain must verify");
     }
 
     /// Chain prove → verify roundtrip (Ligerito default). K=64 → m=22.

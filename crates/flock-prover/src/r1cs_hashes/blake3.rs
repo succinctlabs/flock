@@ -1262,6 +1262,35 @@ pub struct Blake3Setup {
 impl Blake3Setup {
     /// Build a setup for `n_blocks` BLAKE3 compressions with PCS
     /// `log_inv_rate = 1`.
+    /// [`Self::new`] with the **batch-major** witness layout (see
+    /// [`flock_core::r1cs::WitnessLayout`]). The generic matrix provers and
+    /// chain/Merkle wrappers still require row-major.
+    pub fn new_batch_major(n_blocks: usize) -> Self {
+        let mut s = Self::new(n_blocks);
+        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
+        s
+    }
+
+    /// Fast-path witness generation dispatched on the r1cs's witness layout.
+    fn generate_witness_ab(
+        &self,
+        blocks: &[Compression],
+    ) -> (
+        Vec<flock_core::field::F128>,
+        Vec<flock_core::field::F128>,
+        Vec<flock_core::field::F128>,
+        Vec<u8>,
+    ) {
+        match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log())
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                generate_witness_batch_major(blocks, self.n_blocks_log())
+            }
+        }
+    }
+
     pub fn new(n_blocks: usize) -> Self {
         Self::with_log_inv_rate(n_blocks, 1)
     }
@@ -1346,8 +1375,7 @@ impl Blake3Setup {
     /// Packed witness trace for the generic (matrix-driven) provers — see
     /// `Sha256HybridSetup::generate_witness_packed`.
     pub fn generate_witness_packed(&self, blocks: &[Compression]) -> Vec<F128> {
-        let (z_packed, _a, _b, _stripe) =
-            generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log());
+        let (z_packed, _a, _b, _stripe) = self.generate_witness_ab(blocks);
         z_packed
     }
 
@@ -1375,7 +1403,7 @@ impl Blake3Setup {
     ) -> (R1csProof, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
         let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log());
+            self.generate_witness_ab(blocks);
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         crate::prover::prove_fast_from_witness(
             &self.r1cs,
@@ -1408,7 +1436,7 @@ impl Blake3Setup {
         assert_eq!(blocks.len(), self.n_blocks);
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log())
+                self.generate_witness_ab(blocks)
             });
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         crate::prover::prove_fast_ligerito_from_witness(
@@ -1440,7 +1468,7 @@ impl Blake3Setup {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
         let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log());
+            self.generate_witness_ab(blocks);
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
@@ -1540,9 +1568,7 @@ impl Blake3Setup {
             self.n_blocks,
             self.n_block_slots(),
         );
-        let n_log = self.n_blocks_log();
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(blocks, n_log);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(blocks);
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         super::chain_common::prove_chain_generic(
             &self.r1cs,
@@ -1565,9 +1591,7 @@ impl Blake3Setup {
     ) -> (super::chain_common::ChainProofLigerito, Commitment) {
         assert_eq!(blocks.len(), self.n_blocks);
         assert_eq!(self.n_blocks, self.n_block_slots());
-        let n_log = self.n_blocks_log();
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(blocks, n_log);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(blocks);
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         super::chain_common::prove_chain_ligerito_generic(
             &self.r1cs,
@@ -1652,6 +1676,169 @@ impl Blake3Setup {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Batch-major witness producer (WitnessLayout::BatchMajor).
+//
+// V = 8 compressions in lockstep ([u32; 8] lanes); witness fields OR'd
+// V-wide into an L1-resident interleaved row buffer (already batch-major
+// order), NT-flushed per useful 128-bit chunk by the shared driver. See
+// `common::drive_witness_batch_major`.
+// ---------------------------------------------------------------------------
+
+use super::common::{BM_V, BmRow, add_carry_parts_v, or_bit_row, or_u32_row};
+
+#[inline(always)]
+fn bm_xor_rotr(x: &[u32; BM_V], y: &[u32; BM_V], r: u32) -> [u32; BM_V] {
+    std::array::from_fn(|j| (x[j] ^ y[j]).rotate_right(r))
+}
+
+struct BmRows<'a> {
+    z: &'a mut [BmRow],
+    a: &'a mut [BmRow],
+    b: &'a mut [BmRow],
+}
+
+#[inline(always)]
+fn bm_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
+    or_u32_row(rows.z, bit, vals);
+    or_u32_row(rows.a, bit, vals);
+    or_u32_row(rows.b, bit, &[0xFFFF_FFFF; BM_V]);
+}
+
+#[inline(always)]
+fn bm_add_inline(
+    rows: &mut BmRows<'_>,
+    x: &[u32; BM_V],
+    y: &[u32; BM_V],
+    carry_bit: usize,
+) -> [u32; BM_V] {
+    let (sum, left, right, carry) = add_carry_parts_v(x, y);
+    or_u32_row(rows.z, carry_bit, &carry);
+    or_u32_row(rows.a, carry_bit, &left);
+    or_u32_row(rows.b, carry_bit, &right);
+    sum
+}
+
+/// Build one V = 8 group of compressions into interleaved rows. Mirrors
+/// [`build_block_witness_ab_packed_into`] field-for-field (byte-equality is
+/// pinned by the lockstep test below).
+fn build_group_batch_major(
+    inputs: [&Compression; BM_V],
+    rz: &mut [BmRow],
+    ra: &mut [BmRow],
+    rb: &mut [BmRow],
+) {
+    let mut rows = BmRows {
+        z: rz,
+        a: ra,
+        b: rb,
+    };
+    let cv: [[u32; BM_V]; 8] = std::array::from_fn(|w| std::array::from_fn(|j| inputs[j].0[w]));
+    let m: [[u32; BM_V]; 16] = std::array::from_fn(|i| std::array::from_fn(|j| inputs[j].1[i]));
+    let counter_lo: [u32; BM_V] = std::array::from_fn(|j| inputs[j].2 as u32);
+    let counter_hi: [u32; BM_V] = std::array::from_fn(|j| (inputs[j].2 >> 32) as u32);
+    let block_len: [u32; BM_V] = std::array::from_fn(|j| inputs[j].3);
+    let flags: [u32; BM_V] = std::array::from_fn(|j| inputs[j].4);
+
+    or_bit_row(rows.z, Z_CONST_POS);
+    or_bit_row(rows.a, Z_CONST_POS);
+    or_bit_row(rows.b, Z_CONST_POS);
+
+    for w in 0..8 {
+        bm_write_lin(&mut rows, cv_bit(w, 0), &cv[w]);
+    }
+    for i in 0..16 {
+        bm_write_lin(&mut rows, m_bit(i, 0), &m[i]);
+    }
+    bm_write_lin(&mut rows, T_LO_BASE, &counter_lo);
+    bm_write_lin(&mut rows, T_HI_BASE, &counter_hi);
+    bm_write_lin(&mut rows, BLEN_BASE, &block_len);
+    bm_write_lin(&mut rows, FLAGS_BASE, &flags);
+
+    let mut state: [[u32; BM_V]; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        [BLAKE3_IV[0]; BM_V],
+        [BLAKE3_IV[1]; BM_V],
+        [BLAKE3_IV[2]; BM_V],
+        [BLAKE3_IV[3]; BM_V],
+        counter_lo,
+        counter_hi,
+        block_len,
+        flags,
+    ];
+    let msg_idx = per_round_msg_idx();
+    for r in 0..N_ROUNDS {
+        for g_in_round in 0..N_G_PER_ROUND {
+            let g = r * N_G_PER_ROUND + g_in_round;
+            let [la, lb, lc, ld] = G_LANES[g_in_round];
+            let [mx_i, my_i] = msg_idx[r][g_in_round];
+            let mx = m[mx_i];
+            let my = m[my_i];
+
+            let a_val = state[la];
+            let b_val = state[lb];
+            let c_val = state[lc];
+            let d_val = state[ld];
+
+            let tmp_0 = bm_add_inline(&mut rows, &a_val, &b_val, g_add_carry_bit(g, ADD_TMP0, 0));
+            let a_1 = bm_add_inline(&mut rows, &tmp_0, &mx, g_add_carry_bit(g, ADD_A1, 0));
+            let d_1 = bm_xor_rotr(&d_val, &a_1, 16);
+            let c_1 = bm_add_inline(&mut rows, &c_val, &d_1, g_add_carry_bit(g, ADD_C1, 0));
+            let b_1 = bm_xor_rotr(&b_val, &c_1, 12);
+            let tmp_1 = bm_add_inline(&mut rows, &a_1, &b_1, g_add_carry_bit(g, ADD_TMP1, 0));
+            let a_2 = bm_add_inline(&mut rows, &tmp_1, &my, g_add_carry_bit(g, ADD_A2, 0));
+            let d_2 = bm_xor_rotr(&d_1, &a_2, 8);
+            let c_2 = bm_add_inline(&mut rows, &c_1, &d_2, g_add_carry_bit(g, ADD_C2, 0));
+            let b_new = bm_xor_rotr(&b_1, &c_2, 7);
+            let d_new = d_2;
+            bm_write_lin(&mut rows, g_lin_bit(g, LIN_B_NEW, 0), &b_new);
+            bm_write_lin(&mut rows, g_lin_bit(g, LIN_D_NEW, 0), &d_new);
+
+            state[la] = a_2;
+            state[lb] = b_new;
+            state[lc] = c_2;
+            state[ld] = d_new;
+        }
+    }
+
+    for w in 0..8 {
+        let lo: [u32; BM_V] = std::array::from_fn(|j| state[w][j] ^ state[w + 8][j]);
+        let hi: [u32; BM_V] = std::array::from_fn(|j| state[w + 8][j] ^ cv[w][j]);
+        bm_write_lin(&mut rows, out_lo_bit(w, 0), &lo);
+        bm_write_lin(&mut rows, out_hi_bit(w, 0), &hi);
+    }
+}
+
+/// Batch-major counterpart of [`generate_witness_with_ab_packed_and_lincheck`]
+/// — `(z, a, b, z_lincheck)` with z/a/b in the batch-major layout. Padding
+/// slots run a compression of the all-zero input (constant wire = 1).
+pub fn generate_witness_batch_major(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<u8>,
+) {
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+    super::common::drive_witness_batch_major(
+        blocks,
+        &padding,
+        n_blocks_log,
+        K_LOG,
+        USEFUL_BITS,
+        build_group_batch_major,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1675,6 +1862,76 @@ mod tests {
     const CHUNK_START: u32 = 1 << 0;
     const CHUNK_END: u32 = 1 << 1;
     const ROOT: u32 = 1 << 3;
+
+    /// Batch-major witness equality vs the row-major driver (word-transpose
+    /// + identical stripe), incl. padding slots via a non-power-of-two count.
+    #[test]
+    fn batch_major_witness_matches_row_major_transposed() {
+        for (n_inputs, n_log) in [(8usize, 3usize), (11, 4)] {
+            let mut rng = Rng::new(0xBA7C_B3 + n_log as u64);
+            let inputs: Vec<Compression> = (0..n_inputs)
+                .map(|_| {
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                    let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+                    (cv, m, counter, 64u32, 11u32)
+                })
+                .collect();
+
+            let (z_r, a_r, b_r, stripe_r) =
+                generate_witness_with_ab_packed_and_lincheck(&inputs, n_log);
+            let (z_b, a_b, b_b, stripe_b) = generate_witness_batch_major(&inputs, n_log);
+
+            assert_eq!(stripe_b, stripe_r, "stripe diverged (n_log={n_log})");
+
+            let chunks_per_block = K / 128;
+            let transpose = |row: &[flock_core::field::F128]| {
+                let mut out = vec![flock_core::field::F128::ZERO; row.len()];
+                for o in 0..1usize << n_log {
+                    for c in 0..chunks_per_block {
+                        out[(c << n_log) + o] = row[o * chunks_per_block + c];
+                    }
+                }
+                out
+            };
+            assert_eq!(z_b, transpose(&z_r), "z diverged (n_log={n_log})");
+            assert_eq!(a_b, transpose(&a_r), "a diverged (n_log={n_log})");
+            assert_eq!(b_b, transpose(&b_r), "b diverged (n_log={n_log})");
+        }
+    }
+
+    /// Batch-major end-to-end roundtrip (BaseFold) + tamper rejection.
+    #[test]
+    fn batch_major_prove_fast_basefold_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+
+        let setup = Blake3Setup::new_batch_major(8);
+        let mut rng = Rng::new(0xBA7C_F013);
+        let inputs: Vec<Compression> = (0..8)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+                (cv, m, counter, 64u32, 11u32)
+            })
+            .collect();
+
+        let mut ch_p = FsChallenger::new(b"flock-test-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast_basefold(&inputs, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-test-v0");
+        let claim_v = setup
+            .verify_basefold(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("batch-major verifier rejected: {e:?}"));
+        assert_eq!(claim_p, claim_v);
+
+        let mut bad = proof.clone();
+        bad.zerocheck.final_a_eval.lo ^= 1;
+        let mut ch = FsChallenger::new(b"flock-test-v0");
+        assert!(
+            setup.verify_basefold(&commitment, &bad, &mut ch).is_err(),
+            "tampered batch-major proof accepted"
+        );
+    }
 
     #[test]
     fn layout_constants() {
