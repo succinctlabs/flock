@@ -1248,7 +1248,10 @@ impl RowWriter {
             buf[2 * j + 1] = odd[j];
         }
         unsafe {
-            nt_store_row(buf.as_ptr(), self.dest.add((c << self.n_log) * 2 + self.o0_x2));
+            nt_store_row(
+                buf.as_ptr(),
+                self.dest.add((c << self.n_log) * 2 + self.o0_x2),
+            );
         }
     }
 

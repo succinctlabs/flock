@@ -1375,8 +1375,7 @@ impl Blake3Setup {
     /// Packed witness trace for the generic (matrix-driven) provers — see
     /// `Sha256HybridSetup::generate_witness_packed`.
     pub fn generate_witness_packed(&self, blocks: &[Compression]) -> Vec<F128> {
-        let (z_packed, _a, _b, _stripe) =
-            self.generate_witness_ab(blocks);
+        let (z_packed, _a, _b, _stripe) = self.generate_witness_ab(blocks);
         z_packed
     }
 
@@ -1681,7 +1680,6 @@ impl Blake3Setup {
 // Tests
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // Batch-major witness producer (WitnessLayout::BatchMajor).
 //
@@ -1734,7 +1732,11 @@ fn build_group_batch_major(
     ra: &mut [BmRow],
     rb: &mut [BmRow],
 ) {
-    let mut rows = BmRows { z: rz, a: ra, b: rb };
+    let mut rows = BmRows {
+        z: rz,
+        a: ra,
+        b: rb,
+    };
     let cv: [[u32; BM_V]; 8] = std::array::from_fn(|w| std::array::from_fn(|j| inputs[j].0[w]));
     let m: [[u32; BM_V]; 16] = std::array::from_fn(|i| std::array::from_fn(|j| inputs[j].1[i]));
     let counter_lo: [u32; BM_V] = std::array::from_fn(|j| inputs[j].2 as u32);

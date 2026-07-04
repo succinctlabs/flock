@@ -1369,8 +1369,7 @@ impl Sha256HybridSetup {
         &self,
         compressions: &[([u32; 8], [u32; 16])],
     ) -> Vec<flock_core::field::F128> {
-        let (z_packed, _a, _b, _stripe) =
-            self.generate_witness_ab(compressions);
+        let (z_packed, _a, _b, _stripe) = self.generate_witness_ab(compressions);
         z_packed
     }
 
@@ -1807,8 +1806,7 @@ impl Sha256HybridSetup {
             self.n_block_slots(),
             "bit vector length mismatch"
         );
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            self.generate_witness_ab(compressions);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
         super::merkle_path_common::prove_merkle_path_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -1897,8 +1895,7 @@ impl Sha256HybridSetup {
             path_log,
             self.n_blocks_log(),
         );
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            self.generate_witness_ab(compressions);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
         super::merkle_path_common::prove_merkle_paths_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -1982,8 +1979,7 @@ impl Sha256HybridSetup {
             self.n_block_slots(),
             "bit vector length mismatch"
         );
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            self.generate_witness_ab(compressions);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
         super::merkle_path_common::prove_merkle_paths_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -2068,8 +2064,7 @@ impl Sha256HybridSetup {
             path_log,
             self.n_blocks_log(),
         );
-        let (z_packed, a_packed, b_packed, z_lincheck) =
-            self.generate_witness_ab(compressions);
+        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
         super::merkle_path_common::prove_merkle_paths_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -2134,7 +2129,6 @@ impl Sha256HybridSetup {
 // Tests
 // ───────────────────────────────────────────────────────────────────────────
 
-
 // ---------------------------------------------------------------------------
 // Batch-major witness producer (WitnessLayout::BatchMajor).
 //
@@ -2198,7 +2192,11 @@ fn build_group_batch_major(
     ra: &mut [BmRow],
     rb: &mut [BmRow],
 ) {
-    let mut rows = BmRows { z: rz, a: ra, b: rb };
+    let mut rows = BmRows {
+        z: rz,
+        a: ra,
+        b: rb,
+    };
     let h_in: [[u32; BM_V]; 8] = std::array::from_fn(|w| std::array::from_fn(|j| inputs[j].0[w]));
     let m: [[u32; BM_V]; 16] = std::array::from_fn(|i| std::array::from_fn(|j| inputs[j].1[i]));
 
@@ -2260,13 +2258,23 @@ fn build_group_batch_major(
         let maj_out = xor_v(&maj_and_v, &aa);
 
         let k_r = [SHA256_K[r]; BM_V];
-        let t1_0 = bm_add_inline(&mut rows, &hh, &map_v(&ee, big_sigma1), round_carry_bit(r, 0, 0));
+        let t1_0 = bm_add_inline(
+            &mut rows,
+            &hh,
+            &map_v(&ee, big_sigma1),
+            round_carry_bit(r, 0, 0),
+        );
         let t1_1 = bm_add_inline(&mut rows, &t1_0, &ch_out, round_carry_bit(r, 1, 0));
         let t1_2 = bm_add_inline(&mut rows, &t1_1, &k_r, round_carry_bit(r, 2, 0));
         let t1 = bm_add_inline(&mut rows, &t1_2, &w_sched[r], round_carry_bit(r, 3, 0));
         bm_write_lin(&mut rows, t1_bit(r, 0), &t1);
 
-        let t2 = bm_add_inline(&mut rows, &map_v(&aa, big_sigma0), &maj_out, round_carry_bit(r, 4, 0));
+        let t2 = bm_add_inline(
+            &mut rows,
+            &map_v(&aa, big_sigma0),
+            &maj_out,
+            round_carry_bit(r, 4, 0),
+        );
         let e_new = bm_add_inline(&mut rows, &dd, &t1, round_carry_bit(r, 5, 0));
         bm_write_lin(&mut rows, e_new_bit(r, 0), &e_new);
         let a_new = bm_add_inline(&mut rows, &t1, &t2, round_carry_bit(r, 6, 0));

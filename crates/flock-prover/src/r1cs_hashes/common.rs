@@ -344,7 +344,6 @@ pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
     out
 }
 
-
 // ---------------------------------------------------------------------------
 // Batch-major (WitnessLayout::BatchMajor) witness-producer plumbing.
 //
@@ -564,9 +563,8 @@ where
             ra[..useful_words].fill([0u64; BM_V]);
             rb[..useful_words].fill([0u64; BM_V]);
             let o0 = g * BM_V;
-            let group: [&S; BM_V] = std::array::from_fn(|j| {
-                inputs_ref.get(o0 + j).unwrap_or(padding)
-            });
+            let group: [&S; BM_V] =
+                std::array::from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(padding));
             per_group(group, rz, ra, rb);
             // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
             unsafe {

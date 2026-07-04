@@ -257,7 +257,10 @@ impl BlockR1cs {
                 x_outer: mlv[inner_rest_len..].to_vec(),
             },
             WitnessLayout::BatchMajor => {
-                assert!(self.k_log >= 7 && self.k_skip == 6, "BatchMajor needs k_log >= 7, k_skip = 6");
+                assert!(
+                    self.k_log >= 7 && self.k_skip == 6,
+                    "BatchMajor needs k_log >= 7, k_skip = 6"
+                );
                 let n_log = self.n_log();
                 let mut x_inner_rest = Vec::with_capacity(inner_rest_len);
                 x_inner_rest.push(mlv[0]);
