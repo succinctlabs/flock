@@ -1,0 +1,76 @@
+# Formatting + Clippy gate. Runner scheme follows succinctlabs/sp1
+# (.github/workflows/pr.yml `lint` job): runs-on self-hosted runners.
+#
+# arm64 runner on purpose: flock's hot kernels are aarch64/NEON paths behind
+# `cfg(target_arch = "aarch64")` — clippy on arm64 type-checks them instead
+# of the scalar fallbacks.
+
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Formatting & Clippy
+    runs-on:
+      [
+        runs-on,
+        runner=16cpu-linux-arm64,
+        spot=false,
+        "run-id=${{ github.run_id }}",
+      ]
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Get stable toolchain date (cache key)
+        id: rust-version
+        shell: bash
+        run: |
+          # Cache key tracks the stable release so a new Rust version
+          # invalidates the cached toolchain instead of updating in place
+          # (same scheme as sp1's setup action).
+          STABLE_DATE=$(curl -sS https://static.rust-lang.org/dist/channel-rust-stable-date.txt)
+          echo "date=$STABLE_DATE" >> $GITHUB_OUTPUT
+
+      - name: rust-cache
+        # actions/cache@v4.2.3 (pinned by sha, matching sp1)
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.rustup/
+            target/
+          key: flock-lint-${{ runner.arch }}-${{ runner.os }}-${{ steps.rust-version.outputs.date }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            flock-lint-${{ runner.arch }}-${{ runner.os }}-${{ steps.rust-version.outputs.date }}-
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        shell: bash
+        run: |
+          if ! command -v rustup &> /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --component rustfmt --component clippy
+          rustup default stable
+          rustc --version && cargo fmt --version && cargo clippy --version
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
