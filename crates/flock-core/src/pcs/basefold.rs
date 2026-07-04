@@ -1114,12 +1114,13 @@ fn verify_multi_with_dedup(
     let mut deduped: Vec<(usize, Hash)> = Vec::with_capacity(paired.len());
     for (p, h) in paired {
         if let Some(last) = deduped.last()
-            && last.0 == p {
-                if last.1 != h {
-                    return false;
-                }
-                continue;
+            && last.0 == p
+        {
+            if last.1 != h {
+                return false;
             }
+            continue;
+        }
         deduped.push((p, h));
     }
     let positions_sorted: Vec<usize> = deduped.iter().map(|(p, _)| *p).collect();

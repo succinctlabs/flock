@@ -34,9 +34,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::r1cs_hashes::chain_common::ChainProof;
 use flock_core::pcs::Commitment;
 use flock_core::proof::R1csProof;
-use crate::r1cs_hashes::chain_common::ChainProof;
 
 /// Magic bytes prepended to every serialized proof. Lets readers reject
 /// random binary data early.
@@ -411,8 +411,8 @@ impl std::error::Error for BundleReadError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flock_core::challenger::FsChallenger;
     use crate::r1cs_hashes::blake3::{Blake3Setup, Compression, blake3_compress, cv_to_phys_bits};
+    use flock_core::challenger::FsChallenger;
 
     /// SplitMix64.
     struct Rng(u64);

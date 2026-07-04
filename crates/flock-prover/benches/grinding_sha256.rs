@@ -22,10 +22,9 @@ fn has_leading_zero_bits(h: &[u8; 32], n: u32) -> bool {
             return false;
         }
     }
-    if extra_bits > 0
-        && (h[full_bytes] >> (8 - extra_bits)) != 0 {
-            return false;
-        }
+    if extra_bits > 0 && (h[full_bytes] >> (8 - extra_bits)) != 0 {
+        return false;
+    }
     true
 }
 

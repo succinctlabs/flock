@@ -120,10 +120,11 @@ fn perf_core_count() -> usize {
             .args(["-n", "hw.perflevel0.physicalcpu"])
             .output()
             && let Ok(s) = std::str::from_utf8(&out.stdout)
-                && let Ok(n) = s.trim().parse::<usize>()
-                    && n > 0 {
-                        return n;
-                    }
+            && let Ok(n) = s.trim().parse::<usize>()
+            && n > 0
+        {
+            return n;
+        }
     }
     std::thread::available_parallelism()
         .map(|n| n.get())

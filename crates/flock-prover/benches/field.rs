@@ -13,9 +13,9 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::field::gf2_128::software;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use flock_prover::field::gf2_128::aarch64;
+use flock_prover::field::gf2_128::software;
 use flock_prover::field::{F8, F128, F256Unreduced};
 
 const N: usize = 100_000_000;

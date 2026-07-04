@@ -88,9 +88,15 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
 
     let mut ch_v = FsChallenger::new(b"flock-lig-r1cs-v0");
     let lc_circuit = r1cs.sparse_lincheck_circuit();
-    let claim_v =
-        verifier::verify_ligerito(&r1cs, &commitment, &proof, &lc_circuit, &pcs_params, &mut ch_v)
-            .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
+    let claim_v = verifier::verify_ligerito(
+        &r1cs,
+        &commitment,
+        &proof,
+        &lc_circuit,
+        &pcs_params,
+        &mut ch_v,
+    )
+    .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
     assert_eq!(claim_p, claim_v);
 }
 
