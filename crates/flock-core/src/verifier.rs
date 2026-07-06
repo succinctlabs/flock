@@ -17,6 +17,11 @@ pub enum VerifyError {
     Lincheck(lincheck::VerifyError),
     PcsAb(pcs::VerifyError),
     PcsC(pcs::VerifyError),
+    /// The R1CS instance has a non-identity `C_0`. The pipeline assumes the
+    /// circuit-R1CS shape `C = I` (the c-claim is taken as a direct z-claim),
+    /// so any other instance would be checked against the wrong relation —
+    /// reject it rather than verify unsoundly.
+    NonIdentityC0,
 }
 
 /// Dedicated single-thread rayon pool that the verifier runs inside.
@@ -144,7 +149,7 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
         pcs_params.log_batch_size,
         pcs_params.profile,
     )
-    .expect("Ligerito default verifier config");
+    .map_err(pcs::VerifyError::UnsupportedConfig)?;
     pcs::verify_opening_batch_ligerito_mixed(
         commitment,
         &values,
@@ -190,6 +195,13 @@ fn verify_core_inner<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), VerifyError> {
+    // The verifier assumes the circuit-R1CS shape `C = I`: the c-claim below is
+    // built as a direct z-claim, which only matches the prover when `C_0` is
+    // the identity. Reject any other instance up front instead of silently
+    // checking it against the wrong relation.
+    if !r1cs.c0_is_identity() {
+        return Err(VerifyError::NonIdentityC0);
+    }
     let trace = std::env::var("VERIFY_TRACE").is_ok();
     let fmt = |s: f64| -> String {
         let ms = s * 1000.0;
@@ -309,5 +321,115 @@ mod tests {
     fn verifier_pool_is_single_threaded() {
         let n = super::verifier_pool().install(rayon::current_num_threads);
         assert_eq!(n, 1, "verifier_pool must have exactly one worker thread");
+    }
+
+    /// `verify_core` must reject an R1CS whose `C_0` is not the identity rather
+    /// than build the c-claim against the wrong relation. The guard fires before
+    /// any proof field is touched, so junk (empty) sub-proofs are fine.
+    #[test]
+    fn verify_core_rejects_non_identity_c0() {
+        use super::*;
+        use crate::lincheck::LincheckProof;
+        use crate::pcs::PcsParams;
+        use crate::r1cs::{BlockR1cs, SparseBinaryMatrix};
+        use crate::zerocheck::ZerocheckProof;
+        use std::sync::OnceLock;
+
+        let k_log = 2;
+        let k = 1usize << k_log;
+        let zero = || SparseBinaryMatrix {
+            num_rows: k,
+            num_cols: k,
+            rows: vec![Vec::new(); k],
+        };
+        // c_0 = zero matrix  =>  c0_is_identity() == false.
+        let r1cs = BlockR1cs {
+            m: 4,
+            k_log,
+            k_skip: 1,
+            useful_bits: k,
+            a_0: zero(),
+            b_0: zero(),
+            c_0: zero(),
+            const_pin: None,
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
+        };
+        assert!(!r1cs.c0_is_identity());
+
+        let commitment = Commitment {
+            root: [0u8; 32],
+            params: PcsParams {
+                m: 4,
+                log_inv_rate: 1,
+                log_batch_size: 0,
+                profile: Default::default(),
+            },
+        };
+        let zc = ZerocheckProof {
+            round1_ab: Vec::new(),
+            round1_c: Vec::new(),
+            multilinear_rounds: Vec::new(),
+            final_a_eval: F128::ZERO,
+            final_b_eval: F128::ZERO,
+            final_c_eval: F128::ZERO,
+        };
+        let lc = LincheckProof {
+            rounds: Vec::new(),
+            z_partial: Vec::new(),
+        };
+        let lc_circuit = r1cs.sparse_lincheck_circuit();
+        let mut ch = crate::challenger::RandomChallenger::new(0);
+
+        let res = super::verify_core(&r1cs, &zc, &lc, &commitment, &lc_circuit, &mut ch);
+        assert_eq!(res.unwrap_err(), VerifyError::NonIdentityC0);
+    }
+
+    /// A commitment whose `PcsParams` have no embedded Ligerito security config
+    /// (`m = 8` is outside the registered 22..=35 range) must surface a
+    /// structured `UnsupportedConfig` error, not panic in `.expect`. The bound
+    /// fires before the opening proof is inspected, so a junk proof is fine.
+    #[test]
+    fn verify_claims_ligerito_rejects_unsupported_config() {
+        use super::*;
+        use crate::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof};
+        use crate::pcs::{BatchOpeningProofLigerito, PcsParams};
+
+        let commitment = Commitment {
+            root: [0u8; 32],
+            params: PcsParams {
+                m: 8,
+                log_inv_rate: 1,
+                log_batch_size: 0,
+                profile: Default::default(),
+            },
+        };
+        let junk = LigeritoProof {
+            initial_root: [0u8; 32],
+            initial_proof: RecursiveProof {
+                opened_rows: Vec::new(),
+                merkle_proof: Vec::new(),
+            },
+            recursive_roots: Vec::new(),
+            recursive_proofs: Vec::new(),
+            final_proof: FinalProof {
+                yr: Vec::new(),
+                opened_rows: Vec::new(),
+                merkle_proof: Vec::new(),
+            },
+            sumcheck_transcript: Vec::new(),
+            grinding_nonces: Vec::new(),
+            ood_values: Vec::new(),
+            fold_grinding_nonces: Vec::new(),
+        };
+        let pcs_open = BatchOpeningProofLigerito {
+            ring_switches: Vec::new(),
+            ligerito: junk,
+        };
+        let params = commitment.params.clone();
+        let mut ch = crate::challenger::RandomChallenger::new(0);
+
+        let res = verify_claims_ligerito(&commitment, &[], &pcs_open, &params, &mut ch);
+        assert!(matches!(res, Err(pcs::VerifyError::UnsupportedConfig(_))));
     }
 }

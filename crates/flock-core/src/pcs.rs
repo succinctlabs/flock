@@ -85,6 +85,11 @@ pub enum VerifyError {
     /// evaluation at the sampled challenges. Indicates the prover's BaseFold
     /// final value is inconsistent with `rs_eq_ind`.
     FinalBMismatch,
+    /// The committed `PcsParams` (`m` / `profile` / `log_batch_size`) have no
+    /// embedded Ligerito security config, so the verifier can't derive a config
+    /// to check the opening. Surfaced instead of panicking on a malformed or
+    /// unsupported commitment.
+    UnsupportedConfig(String),
 }
 
 /// `eq_ind` representation for a packed-direct claim. The contributed value at
