@@ -497,96 +497,35 @@ unsafe fn fused_apply_one_k<const K: i32>(
         let mut db3 = vld1q_u8(rb0.add(48));
 
         // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
+        // (EOR3-folding these was measured ~1% SLOWER — this path is load-bound,
+        // not XOR-chain-bound — so kept as 7 plain 2-input applies.)
         xor_apply_byte_into_8_regs::<0, true>(
-            table_base,
-            *a_row.add(1),
-            *b_row.add(1),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
+            table_base, *a_row.add(1), *b_row.add(1),
+            &mut da0, &mut da1, &mut da2, &mut da3, &mut db0, &mut db1, &mut db2, &mut db3,
         );
         xor_apply_byte_into_8_regs::<1, false>(
-            table_base,
-            *a_row.add(2),
-            *b_row.add(2),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
+            table_base, *a_row.add(2), *b_row.add(2),
+            &mut da0, &mut da1, &mut da2, &mut da3, &mut db0, &mut db1, &mut db2, &mut db3,
         );
         xor_apply_byte_into_8_regs::<1, true>(
-            table_base,
-            *a_row.add(3),
-            *b_row.add(3),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
+            table_base, *a_row.add(3), *b_row.add(3),
+            &mut da0, &mut da1, &mut da2, &mut da3, &mut db0, &mut db1, &mut db2, &mut db3,
         );
         xor_apply_byte_into_8_regs::<2, false>(
-            table_base,
-            *a_row.add(4),
-            *b_row.add(4),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
+            table_base, *a_row.add(4), *b_row.add(4),
+            &mut da0, &mut da1, &mut da2, &mut da3, &mut db0, &mut db1, &mut db2, &mut db3,
         );
         xor_apply_byte_into_8_regs::<2, true>(
-            table_base,
-            *a_row.add(5),
-            *b_row.add(5),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
+            table_base, *a_row.add(5), *b_row.add(5),
+            &mut da0, &mut da1, &mut da2, &mut da3, &mut db0, &mut db1, &mut db2, &mut db3,
         );
         xor_apply_byte_into_8_regs::<3, false>(
-            table_base,
-            *a_row.add(6),
-            *b_row.add(6),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
+            table_base, *a_row.add(6), *b_row.add(6),
+            &mut da0, &mut da1, &mut da2, &mut da3, &mut db0, &mut db1, &mut db2, &mut db3,
         );
         xor_apply_byte_into_8_regs::<3, true>(
-            table_base,
-            *a_row.add(7),
-            *b_row.add(7),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
+            table_base, *a_row.add(7), *b_row.add(7),
+            &mut da0, &mut da1, &mut da2, &mut da3, &mut db0, &mut db1, &mut db2, &mut db3,
         );
 
         // F_8 multiply lane-wise (4 × 16 lanes = 64 total).
@@ -886,6 +825,33 @@ fn process_one_x_hi(
                 for lane in 0..ELL {
                     let mut cf_ab = vdupq_n_u8(0);
                     let mut cf_c = vdupq_n_u8(0);
+                    // EOR3 (FEAT_SHA3) fold: two b_med per step, two table lookups
+                    // combined into the accumulator with one 3-input XOR. Identical
+                    // result (XOR associative); halves the XOR-instruction count.
+                    // Gated on FEAT_SHA3 (M-series, ARMv8.2+ with SHA3); plain
+                    // veorq fallback otherwise (e.g. Graviton2).
+                    #[cfg(target_feature = "sha3")]
+                    {
+                        let mut b_med = 0;
+                        while b_med < (1 << N_MEDIUM) {
+                            let v_ab0 = state.chunk_ab_bytes[b_med][lane] as usize;
+                            let v_c0 = state.chunk_c_bytes[b_med][lane] as usize;
+                            let v_ab1 = state.chunk_ab_bytes[b_med + 1][lane] as usize;
+                            let v_c1 = state.chunk_c_bytes[b_med + 1][lane] as usize;
+                            cf_ab = veor3q_u8(
+                                cf_ab,
+                                vld1q_u8(convert_ptr.add((b_med * 256 + v_ab0) * 16)),
+                                vld1q_u8(convert_ptr.add(((b_med + 1) * 256 + v_ab1) * 16)),
+                            );
+                            cf_c = veor3q_u8(
+                                cf_c,
+                                vld1q_u8(convert_ptr.add((b_med * 256 + v_c0) * 16)),
+                                vld1q_u8(convert_ptr.add(((b_med + 1) * 256 + v_c1) * 16)),
+                            );
+                            b_med += 2;
+                        }
+                    }
+                    #[cfg(not(target_feature = "sha3"))]
                     for b_med in 0..(1 << N_MEDIUM) {
                         let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
                         let v_c = state.chunk_c_bytes[b_med][lane] as usize;
@@ -1111,6 +1077,39 @@ fn process_one_x_hi_with_s_hat_v(
                     let mut cf_ab = vdupq_n_u8(0);
                     let mut cf_c_0 = vdupq_n_u8(0);
                     let mut cf_c_1 = vdupq_n_u8(0);
+                    // EOR3 (FEAT_SHA3) fold: process two b_med per step, combining
+                    // two table lookups into the accumulator with a single 3-input
+                    // XOR. XOR is associative/commutative so the result is identical
+                    // to the 2-input chain; this halves the XOR-instruction count
+                    // (48 veorq/lane -> 24 veor3q/lane). Gated on FEAT_SHA3; plain
+                    // veorq fallback otherwise.
+                    #[cfg(target_feature = "sha3")]
+                    {
+                        let mut b_med = 0;
+                        while b_med < (1 << N_MEDIUM) {
+                            let v_ab0 = state.chunk_ab_bytes[b_med][lane] as usize;
+                            let v_c0 = state.chunk_c_bytes[b_med][lane] as usize;
+                            let v_ab1 = state.chunk_ab_bytes[b_med + 1][lane] as usize;
+                            let v_c1 = state.chunk_c_bytes[b_med + 1][lane] as usize;
+                            cf_ab = veor3q_u8(
+                                cf_ab,
+                                vld1q_u8(convert_ptr.add((b_med * 256 + v_ab0) * 16)),
+                                vld1q_u8(convert_ptr.add(((b_med + 1) * 256 + v_ab1) * 16)),
+                            );
+                            cf_c_0 = veor3q_u8(
+                                cf_c_0,
+                                vld1q_u8(convert_ptr.add((b_med * 256 + (v_c0 & 0x55)) * 16)),
+                                vld1q_u8(convert_ptr.add(((b_med + 1) * 256 + (v_c1 & 0x55)) * 16)),
+                            );
+                            cf_c_1 = veor3q_u8(
+                                cf_c_1,
+                                vld1q_u8(convert_ptr.add((b_med * 256 + (v_c0 & 0xAA)) * 16)),
+                                vld1q_u8(convert_ptr.add(((b_med + 1) * 256 + (v_c1 & 0xAA)) * 16)),
+                            );
+                            b_med += 2;
+                        }
+                    }
+                    #[cfg(not(target_feature = "sha3"))]
                     for b_med in 0..(1 << N_MEDIUM) {
                         let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
                         let v_c = state.chunk_c_bytes[b_med][lane] as usize;
