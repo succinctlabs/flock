@@ -1544,6 +1544,109 @@ mod tests {
         );
     }
 
+    /// The full jagged reduction at the 2^30-bit packed-witness point: a
+    /// 2^30-bit trace packed into F128 (128 bits each) is a dense `q` of 2^23
+    /// field elements — `m = 23`, with 2^12 uniform columns (`n = 11`).
+    /// Best-of-3 for: main sumcheck prover, assist prover, both verifier
+    /// paths (direct `f̂_t` vs assist).
+    ///
+    /// `cargo test --release -p flock-core pcs::jagged::tests::runtime_bits30 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "heavy benchmark; run explicitly with --release --ignored --nocapture"]
+    fn runtime_bits30() {
+        use std::time::Instant;
+
+        let _ = crate::init_perf_thread_pool();
+        let (n, k, m) = (11usize, 12usize, 23usize); // 2^30 bits / 128 = 2^23 elems
+        let cols = 1usize << k;
+        let height = (1u64 << m) / cols as u64;
+        let params = JaggedParams::from_heights(&vec![height; cols], n, m);
+        assert_eq!(params.area(), 1u64 << m);
+
+        let len = 1usize << m;
+        let mut q = vec![F128::ZERO; len];
+        for (i, qi) in q.iter_mut().enumerate() {
+            *qi = F128 {
+                lo: i as u64,
+                hi: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            };
+        }
+        let mut rc = RandomChallenger::new(0x0B17_5300);
+        let z_row = sample_vec(&mut rc, n);
+        let z_col = sample_vec(&mut rc, k);
+
+        let best3 = |f: &mut dyn FnMut() -> std::time::Duration| {
+            (0..3).map(|_| f()).min().unwrap()
+        };
+
+        // Warm-up (thread pool + page faults).
+        let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+        let _ = prove(&params, &q, &z_row, &z_col, &mut ch);
+
+        // Main jagged sumcheck prover (B-generation + rounds).
+        let t_prove = best3(&mut || {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            let t = Instant::now();
+            std::hint::black_box(prove(&params, &q, &z_row, &z_col, &mut ch));
+            t.elapsed()
+        });
+
+        // Main + assist, and keep one transcript for the verifier runs.
+        let mut t_both = std::time::Duration::MAX;
+        let mut kept = None;
+        for _ in 0..3 {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            let t = Instant::now();
+            let out = prove_with_assist(&params, &q, &z_row, &z_col, &mut ch);
+            t_both = t_both.min(t.elapsed());
+            kept = Some(out);
+        }
+        let (proof, assist, v) = kept.unwrap();
+
+        // Verifier, direct f̂_t path.
+        let t_verify_direct = best3(&mut || {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            let t = Instant::now();
+            std::hint::black_box(
+                verify(&params, &z_row, &z_col, v, &proof, &mut ch).expect("verify"),
+            );
+            t.elapsed()
+        });
+
+        // Verifier, assist path.
+        let t_verify_assist = best3(&mut || {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            let t = Instant::now();
+            std::hint::black_box(
+                verify_with_assist(&params, &z_row, &z_col, v, &proof, &assist, &mut ch)
+                    .expect("verify_with_assist"),
+            );
+            t.elapsed()
+        });
+
+        let main_bytes = (2 * proof.rounds.len() + 1) * 16;
+        let assist_bytes = (2 * assist.rounds.len() + 1) * 16;
+        eprintln!("  threads: {}", rayon::current_num_threads());
+        eprintln!("  witness: 2^{m} F128 = {} MiB (2^30 bits packed)", len * 16 >> 20);
+        eprintln!("  sumcheck prover ({m} rounds)          : {t_prove:>9.3?}");
+        eprintln!(
+            "  + assist prover ({} rounds)          : {:>9.3?}  (assist ≈ {:.3?}, {:.1}% of prover)",
+            assist.rounds.len(),
+            t_both,
+            t_both.saturating_sub(t_prove),
+            100.0 * t_both.saturating_sub(t_prove).as_secs_f64() / t_both.as_secs_f64()
+        );
+        eprintln!("  verifier, direct f̂_t (2^{k} BP evals): {t_verify_direct:>9.3?}");
+        eprintln!(
+            "  verifier, assist                      : {t_verify_assist:>9.3?}  ({:.1}x)",
+            t_verify_direct.as_secs_f64() / t_verify_assist.as_secs_f64()
+        );
+        eprintln!(
+            "  proof: main {main_bytes} B + assist {assist_bytes} B = {} B",
+            main_bytes + assist_bytes
+        );
+    }
+
     /// Assist runtimes at the realistic size (matches `runtime_m25`: m=25,
     /// 2^12 columns): direct verifier `f̂_t` vs assist prover / assist verifier.
     ///
