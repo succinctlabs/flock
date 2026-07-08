@@ -64,9 +64,10 @@
 //!
 //! Variables bind in **layer-interleaved order** `c_0, d_0, c_1, d_1, …`
 //! (LSB-first, matching the branching program's read order), which lets the
-//! prover use Lemma 4.6 prefix/suffix streaming ([`prove_assist`]): shared
-//! per-layer transition matrices, per-column suffix vectors, and an advancing
-//! prefix row vector make each round two 4-element dot products per column —
+//! prover use Lemma 4.6 prefix/suffix streaming ([`prove_assist`]): per-column
+//! suffix vectors stored layer-major, sparse two-entry transition rows, and an
+//! advancing prefix row vector reduce each layer to a single 6-multiplication-
+//! per-column bucketing pass from which **both** round messages derive —
 //! `O(m·2^k)` total. The naive per-round DP prover is retained as a
 //! transcript-identical reference. The verifier finishes with one
 //! `Ĝ(ρ)` DP plus `W(ρ)` at `2(m+1)` multiplications per distinct column —
@@ -511,55 +512,70 @@ fn assist_w_at(cols: &[(F128, u64, u64)], rho: &[F128], m: usize) -> F128 {
     acc
 }
 
-/// One layer's four boolean-`(c,d)` transition matrices, `[c + 2d][s][s']`.
-type LayerMats = [[[F128; 4]; 4]; 4];
+/// Column-chunk size for the assist's parallel passes: coarse enough to
+/// amortize rayon task overhead at typical column counts (2^k in the
+/// hundreds–thousands), fine enough to load-balance a P-core pool.
+const ASSIST_CHUNK: usize = 256;
 
-/// Per-layer BP transition matrices with the row/index coordinates pinned:
-/// `mats[c + 2d][s][s'] = Σ_{(a,b) ∈ {0,1}²} eq((z_row[ℓ], z_index[ℓ]), (a,b))
-/// · [transition(a,b,c,d,s) = s']`. Shared by every column; entries are sums
-/// of the layer's 4-entry eq table, so no multiplications beyond building it.
-fn assist_layer_mats(z_row: &[F128], z_index: &[F128], m: usize) -> Vec<LayerMats> {
-    (0..=m)
-        .map(|layer| {
-            let eq4 = build_eq_table(&[point_bit(z_row, layer), point_bit(z_index, layer)]);
-            let mut mats = [[[F128::ZERO; 4]; 4]; 4];
-            for (cd, mat) in mats.iter_mut().enumerate() {
-                let (c, d) = (cd & 1 != 0, cd & 2 != 0);
-                for (s, row) in mat.iter_mut().enumerate() {
-                    for (ab, &w) in eq4.iter().enumerate() {
-                        let (a, b) = (ab & 1 != 0, (ab >> 1) & 1 != 0);
-                        if let Some(out) = transition(a, b, c, d, s) {
-                            row[out] += w;
-                        }
-                    }
-                }
+/// The two surviving transitions of each `(c + 2d, state)` row of a layer
+/// matrix: the addition check forces the index bit `b` once `a` is chosen, so
+/// each row has exactly two entries `(index into the layer's eq4 table, next
+/// state)` — and they are layer-independent (a layer only supplies its eq4
+/// table `eq((z_row[ℓ], z_index[ℓ]), ·)`).
+fn assist_sparse_transitions() -> [[[(usize, usize); 2]; 4]; 4] {
+    let mut table = [[[(0usize, 0usize); 2]; 4]; 4];
+    for (cd, rows) in table.iter_mut().enumerate() {
+        let (c, d) = (cd & 1 != 0, cd & 2 != 0);
+        for (s, row) in rows.iter_mut().enumerate() {
+            for (a, entry) in row.iter_mut().enumerate() {
+                let b = (a + (s & 1) + c as usize) & 1 == 1;
+                let out =
+                    transition(a == 1, b, c, d, s).expect("the forced index bit never rejects");
+                *entry = (a + 2 * (b as usize), out);
             }
-            mats
-        })
-        .collect()
+        }
+    }
+    table
 }
 
-/// One column's suffix vectors `S[ℓ] = M_ℓ(bits)·M_{ℓ+1}(bits)···M_m(bits)·e_S`
-/// for `ℓ ∈ 0..=m+1` (`S[m+1] = e_S`), a single backward pass selecting each
-/// layer's boolean-`(c,d)` matrix by the column's height bits. `S[0][INITIAL]`
-/// is the column's full `ĝ` value, so β falls out of this precomputation.
-fn assist_suffix(mats: &[LayerMats], t_c: u64, t_next: u64, m: usize) -> Vec<[F128; 4]> {
-    let mut out = vec![[F128::ZERO; 4]; m + 2];
-    out[m + 1][STATE_SUCCESS] = F128::ONE;
-    for layer in (0..=m).rev() {
-        let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
-        let mat = &mats[layer][cd];
-        let prev = out[layer + 1];
-        let mut v = [F128::ZERO; 4];
-        for (s, slot) in v.iter_mut().enumerate() {
-            *slot = mat[s][0] * prev[0]
-                + mat[s][1] * prev[1]
-                + mat[s][2] * prev[2]
-                + mat[s][3] * prev[3];
-        }
-        out[layer] = v;
+/// All columns' suffix vectors `S_y[ℓ] = M_ℓ(bits_y)···M_m(bits_y)·e_S`, laid
+/// out **layer-major** (`rows[ℓ·n_cols + y]`) so each sumcheck round streams
+/// one contiguous row. Built with one parallel pass per layer, `m → 0`; a
+/// column costs 8 multiplications per layer (two surviving transitions per
+/// state). Row 0's `INITIAL` entries are the columns' full `ĝ` values.
+fn assist_suffix_rows(
+    cols: &[(F128, u64, u64)],
+    eq4s: &[[F128; 4]],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+    m: usize,
+) -> Vec<[F128; 4]> {
+    use rayon::prelude::*;
+    let n_cols = cols.len();
+    let mut rows = vec![[F128::ZERO; 4]; (m + 2) * n_cols];
+    for seed in &mut rows[(m + 1) * n_cols..] {
+        seed[STATE_SUCCESS] = F128::ONE;
     }
-    out
+    for layer in (0..=m).rev() {
+        let (head, tail) = rows.split_at_mut((layer + 1) * n_cols);
+        let dst = &mut head[layer * n_cols..];
+        let src = &tail[..n_cols];
+        let eq4 = &eq4s[layer];
+        dst.par_chunks_mut(ASSIST_CHUNK)
+            .zip(src.par_chunks(ASSIST_CHUNK))
+            .zip(cols.par_chunks(ASSIST_CHUNK))
+            .for_each(|((dc, sc), cc)| {
+                for ((dv, sv), &(_, t_c, t_next)) in dc.iter_mut().zip(sc).zip(cc) {
+                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+                    let rows_cd = &sparse[cd];
+                    for (s, slot) in dv.iter_mut().enumerate() {
+                        let (i0, o0) = rows_cd[s][0];
+                        let (i1, o1) = rows_cd[s][1];
+                        *slot = eq4[i0] * sv[o0] + eq4[i1] * sv[o1];
+                    }
+                }
+            });
+    }
+    rows
 }
 
 #[inline]
@@ -567,25 +583,45 @@ fn dot4(u: &[F128; 4], v: &[F128; 4]) -> F128 {
     u[0] * v[0] + u[1] * v[1] + u[2] * v[2] + u[3] * v[3]
 }
 
+#[inline]
+fn add4(a: &[F128; 4], b: &[F128; 4]) -> [F128; 4] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
+}
+
+/// `x·a + y·b`, component-wise.
+#[inline]
+fn comb4(x: F128, a: &[F128; 4], y: F128, b: &[F128; 4]) -> [F128; 4] {
+    [
+        x * a[0] + y * b[0],
+        x * a[1] + y * b[1],
+        x * a[2] + y * b[2],
+        x * a[3] + y * b[3],
+    ]
+}
+
 /// Prover for the assist sumcheck: proves `β = f̂_t(z_row, z_col, z_index)` =
 /// `Σ_{(c,d)} W(c,d)·ĝ(z_row, z_index, c, d)` over the `2(m+1)` height
 /// variables, bound in interleaved order `c_0, d_0, c_1, d_1, …` (LSB first).
 ///
-/// Lemma 4.6 streaming ("assist with storage"): with per-layer transition
-/// matrices `M_ℓ` (row/index pinned; [`assist_layer_mats`]), the partially
-/// bound `ĝ` at round `j` factors as
+/// Lemma 4.6 streaming ("assist with storage"), one parallel pass per
+/// **layer**: the pass folds the previous layer's two challenges into each
+/// column's running weight `we_y = w_y·E_y` and accumulates the four bucketed
+/// sums `B[cbit + 2·dbit] = Σ_y we_y·S_y[ℓ+1]` — 6 multiplications per column,
+/// streaming one contiguous suffix row ([`assist_suffix_rows`]). Both round
+/// messages then come from the buckets alone:
 ///
 /// ```text
-///   Ĝ_y(x) = b_ℓᵀ · M_ℓ(mixed with x) · S_y[ℓ+1],
+///   Ĝ_y(x) = b_ℓᵀ · M_ℓ(mixed with x) · S_y[ℓ+1]
+///   c-round:  G(1) = u₁ᵀB₁ + u₃ᵀB₃,   G(∞) = (u₀+u₁)ᵀ(B₀+B₁) + (u₂+u₃)ᵀ(B₂+B₃)
+///   d-round:  M_ℓ(r_c, x) is a linear combination of the boolean matrices, so
+///             folding r_c into the u's and B's gives the message — no second
+///             column pass.
 /// ```
 ///
-/// where the prefix row vector `b_ℓᵀ = e_Iᵀ·M_0(ρ)···M_{ℓ-1}(ρ)` is shared by
-/// all columns and advanced once per layer, and the suffix vectors `S_y`
-/// ([`assist_suffix`]) are one `O(m)` backward pass per column, computed up
-/// front (β is their `[0][INITIAL]` entry). Each round message is then two
-/// 4-element dot products per column — `O(m·2^k)` multiplications total
-/// instead of the naive `O(m²·2^k)` ([`prove_assist_naive`], which produces a
-/// bit-identical transcript).
+/// Here `u[cd]ᵀ = b_ℓᵀ·M_ℓ^{(c,d)}` are shared row vectors and the prefix
+/// `b_ℓᵀ = e_Iᵀ·M_0(ρ)···M_{ℓ-1}(ρ)` advances once per layer. `O(m·2^k)`
+/// multiplications total instead of the naive `O(m²·2^k)`
+/// ([`prove_assist_naive`], which produces a bit-identical transcript).
 pub fn prove_assist<C: Challenger>(
     params: &JaggedParams,
     z_row: &[F128],
@@ -599,17 +635,22 @@ pub fn prove_assist<C: Challenger>(
     assert_eq!(z_col.len(), params.k);
     assert_eq!(z_index.len(), m);
     let cols = assist_columns(params, z_col);
+    let n_cols = cols.len();
 
-    let mats = assist_layer_mats(z_row, z_index, m);
-    let suffixes: Vec<Vec<[F128; 4]>> = cols
-        .par_iter()
-        .map(|&(_, t_c, t_next)| assist_suffix(&mats, t_c, t_next, m))
+    let eq4s: Vec<[F128; 4]> = (0..=m)
+        .map(|layer| {
+            let t = build_eq_table(&[point_bit(z_row, layer), point_bit(z_index, layer)]);
+            [t[0], t[1], t[2], t[3]]
+        })
         .collect();
+    let sparse = assist_sparse_transitions();
+    let sfx = assist_suffix_rows(&cols, &eq4s, &sparse, m);
 
+    // β = Σ_y w_y·ĝ_y — the INITIAL entries of suffix row 0.
     let beta = cols
         .par_iter()
-        .zip(suffixes.par_iter())
-        .map(|(&(w, _, _), sfx)| w * sfx[0][STATE_INITIAL])
+        .zip(sfx[..n_cols].par_iter())
+        .map(|(&(w, _, _), s)| w * s[STATE_INITIAL])
         .reduce(|| F128::ZERO, |x, y| x + y);
 
     challenger.observe_label(b"flock-jagged-assist-v0");
@@ -617,86 +658,85 @@ pub fn prove_assist<C: Challenger>(
 
     let mut prefix_row = [F128::ZERO; 4];
     prefix_row[STATE_INITIAL] = F128::ONE;
-    let mut prefix_eq = vec![F128::ONE; cols.len()];
+    let mut we: Vec<F128> = cols.iter().map(|&(w, _, _)| w).collect();
+    let mut prev_ch: Option<(F128, F128)> = None;
     let mut rounds = Vec::with_capacity(2 * (m + 1));
     for layer in 0..=m {
-        // u[c + 2d]ᵀ = b_ℓᵀ·M_ℓ^{(c,d)} — shared by every column this layer.
+        let row = &sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
+
+        // The layer's only column pass.
+        let buckets = we
+            .par_chunks_mut(ASSIST_CHUNK)
+            .zip(cols.par_chunks(ASSIST_CHUNK))
+            .zip(row.par_chunks(ASSIST_CHUNK))
+            .map(|((wc, cc), sc)| {
+                let mut b = [[F128::ZERO; 4]; 4];
+                for ((w_e, &(_, t_c, t_next)), s) in wc.iter_mut().zip(cc).zip(sc) {
+                    if let Some((rc, rd)) = prev_ch {
+                        let pl = layer - 1;
+                        let ec = if (t_c >> pl) & 1 == 1 { rc } else { F128::ONE + rc };
+                        let ed = if (t_next >> pl) & 1 == 1 { rd } else { F128::ONE + rd };
+                        *w_e *= ec * ed;
+                    }
+                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+                    let v = *w_e;
+                    let bk = &mut b[cd];
+                    bk[0] += v * s[0];
+                    bk[1] += v * s[1];
+                    bk[2] += v * s[2];
+                    bk[3] += v * s[3];
+                }
+                b
+            })
+            .reduce(
+                || [[F128::ZERO; 4]; 4],
+                |mut x, y| {
+                    for (xv, yv) in x.iter_mut().zip(&y) {
+                        *xv = add4(xv, yv);
+                    }
+                    x
+                },
+            );
+
+        // u[c + 2d]ᵀ = b_ℓᵀ·M_ℓ^{(c,d)}, via the sparse transition rows.
+        let eq4 = &eq4s[layer];
         let mut u = [[F128::ZERO; 4]; 4];
         for (cd, uv) in u.iter_mut().enumerate() {
-            for (sp, slot) in uv.iter_mut().enumerate() {
-                *slot = prefix_row[0] * mats[layer][cd][0][sp]
-                    + prefix_row[1] * mats[layer][cd][1][sp]
-                    + prefix_row[2] * mats[layer][cd][2][sp]
-                    + prefix_row[3] * mats[layer][cd][3][sp];
+            for (s, &bs) in prefix_row.iter().enumerate() {
+                let (i0, o0) = sparse[cd][s][0];
+                let (i1, o1) = sparse[cd][s][1];
+                uv[o0] += bs * eq4[i0];
+                uv[o1] += bs * eq4[i1];
             }
         }
 
-        // c-round: Ĝ_y(x) = u[x + 2·d_bit]ᵀ·S_y[ℓ+1] for x ∈ {0, 1}.
-        let (g_one, g_inf) = cols
-            .par_iter()
-            .zip(prefix_eq.par_iter())
-            .zip(suffixes.par_iter())
-            .map(|((&(w, t_c, t_next), &e), sfx)| {
-                let db = ((t_next >> layer) & 1) as usize;
-                let s = &sfx[layer + 1];
-                let g0 = dot4(&u[2 * db], s);
-                let g1 = dot4(&u[1 + 2 * db], s);
-                let we = w * e;
-                let one_term = if (t_c >> layer) & 1 == 1 { we * g1 } else { F128::ZERO };
-                (one_term, we * (g0 + g1))
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(a, b), (c, d)| (a + c, b + d),
-            );
+        // c-round.
+        let g_one = dot4(&u[1], &buckets[1]) + dot4(&u[3], &buckets[3]);
+        let g_inf = dot4(&add4(&u[0], &u[1]), &add4(&buckets[0], &buckets[1]))
+            + dot4(&add4(&u[2], &u[3]), &add4(&buckets[2], &buckets[3]));
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
         let rc = challenger.sample_f128();
         rounds.push((g_one, g_inf));
-        for (&(_, t_c, _), e) in cols.iter().zip(prefix_eq.iter_mut()) {
-            *e *= if (t_c >> layer) & 1 == 1 { rc } else { F128::ONE + rc };
-        }
 
-        // Fold c at rc: ud[x]ᵀ = b_ℓᵀ·M_ℓ(rc, x) = (1+rc)·u[2x] + rc·u[1+2x].
+        // d-round from the same buckets: ud[x]ᵀ = b_ℓᵀ·M_ℓ(rc, x) and
+        // D[db] = Σ_{y: dbit=db} we·eq(cbit_y, rc)·S_y, both by folding rc.
         let rc1 = F128::ONE + rc;
-        let mut ud = [[F128::ZERO; 4]; 2];
-        for (x, uv) in ud.iter_mut().enumerate() {
-            for (sp, slot) in uv.iter_mut().enumerate() {
-                *slot = rc1 * u[2 * x][sp] + rc * u[2 * x + 1][sp];
-            }
-        }
-
-        // d-round: Ĝ_y(x) = ud[x]ᵀ·S_y[ℓ+1].
-        let (g_one, g_inf) = cols
-            .par_iter()
-            .zip(prefix_eq.par_iter())
-            .zip(suffixes.par_iter())
-            .map(|((&(w, _, t_next), &e), sfx)| {
-                let s = &sfx[layer + 1];
-                let g0 = dot4(&ud[0], s);
-                let g1 = dot4(&ud[1], s);
-                let we = w * e;
-                let one_term = if (t_next >> layer) & 1 == 1 { we * g1 } else { F128::ZERO };
-                (one_term, we * (g0 + g1))
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(a, b), (c, d)| (a + c, b + d),
-            );
+        let ud0 = comb4(rc1, &u[0], rc, &u[1]);
+        let ud1 = comb4(rc1, &u[2], rc, &u[3]);
+        let d0 = comb4(rc1, &buckets[0], rc, &buckets[1]);
+        let d1 = comb4(rc1, &buckets[2], rc, &buckets[3]);
+        let g_one = dot4(&ud1, &d1);
+        let g_inf = dot4(&add4(&ud0, &ud1), &add4(&d0, &d1));
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
         let rd = challenger.sample_f128();
         rounds.push((g_one, g_inf));
-        for (&(_, _, t_next), e) in cols.iter().zip(prefix_eq.iter_mut()) {
-            *e *= if (t_next >> layer) & 1 == 1 { rd } else { F128::ONE + rd };
-        }
 
         // Advance the prefix past the now fully-bound layer:
         // b_{ℓ+1}ᵀ = b_ℓᵀ·M_ℓ(rc, rd) = (1+rd)·ud[0] + rd·ud[1].
-        let rd1 = F128::ONE + rd;
-        for sp in 0..4 {
-            prefix_row[sp] = rd1 * ud[0][sp] + rd * ud[1][sp];
-        }
+        prefix_row = comb4(F128::ONE + rd, &ud0, rd, &ud1);
+        prev_ch = Some((rc, rd));
     }
 
     JaggedAssistProof { beta, rounds }
