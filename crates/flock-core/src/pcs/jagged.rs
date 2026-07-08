@@ -286,12 +286,16 @@ pub struct DenseClaim {
 /// (contiguous, jagged) columns filling `B` and accumulating its share of `v`.
 /// The column walk skips height-0 columns naturally and costs O(1) amortized per
 /// element, so there is no per-element binary search.
+/// Returns `(B, v, G(1), G(∞))`: the second sumcheck multilinear, the claim,
+/// **and the first round message**, all from one pass. Fusing the message in
+/// is free traffic-wise (the pass already streams `q` and `B` pair-by-pair)
+/// and removes the prover's separate `round_msg_par` pass over 2·2^m elements.
 fn generate_f_and_claim(
     params: &JaggedParams,
     q: &[F128],
     z_row: &[F128],
     z_col: &[F128],
-) -> (Vec<F128>, F128) {
+) -> (Vec<F128>, F128, F128, F128) {
     use rayon::prelude::*;
     let len = 1usize << params.m;
     let area = params.area() as usize;
@@ -300,9 +304,23 @@ fn generate_f_and_claim(
     let prefix = &params.col_prefix_sums;
     let mut b = crate::alloc_uninit_f128_vec(len);
 
-    // ~1 MB chunks: one binary search amortized over 64K elements.
+    if len == 1 {
+        // m = 0: single element, no sumcheck rounds (and no pairs).
+        let bi = if area == 0 {
+            F128::ZERO
+        } else {
+            let col = prefix.partition_point(|&t| t == 0).saturating_sub(1);
+            eq_row[0] * eq_col[col]
+        };
+        b[0] = bi;
+        return (b, q[0] * bi, F128::ZERO, F128::ZERO);
+    }
+
+    // ~1 MB chunks: one binary search amortized over 64K elements. CHUNK is
+    // even and len is a power of two ≥ 2, so message pairs never straddle
+    // chunks.
     const CHUNK: usize = 1 << 16;
-    let v = b
+    let (v, g_one, g_inf) = b
         .par_chunks_mut(CHUNK)
         .enumerate()
         .map(|(ci, b_chunk)| {
@@ -313,24 +331,44 @@ fn generate_f_and_claim(
                 .partition_point(|&t| t <= g0 as u64)
                 .saturating_sub(1);
             let mut acc = F128::ZERO;
-            for (local, slot) in b_chunk.iter_mut().enumerate() {
-                let i = g0 + local;
-                if i >= area {
-                    *slot = F128::ZERO;
-                    continue;
-                }
-                while (i as u64) >= prefix[col + 1] {
-                    col += 1;
-                }
-                let row = i - prefix[col] as usize;
-                let bi = eq_row[row] * eq_col[col];
-                *slot = bi;
-                acc += q_chunk[local] * bi;
+            let mut m_one = F128::ZERO;
+            let mut m_inf = F128::ZERO;
+            let mut i = g0;
+            for (bp, qp) in b_chunk
+                .chunks_exact_mut(2)
+                .zip(q_chunk.chunks_exact(2))
+            {
+                let b0 = if i >= area {
+                    F128::ZERO
+                } else {
+                    while (i as u64) >= prefix[col + 1] {
+                        col += 1;
+                    }
+                    eq_row[i - prefix[col] as usize] * eq_col[col]
+                };
+                let b1 = if i + 1 >= area {
+                    F128::ZERO
+                } else {
+                    while ((i + 1) as u64) >= prefix[col + 1] {
+                        col += 1;
+                    }
+                    eq_row[i + 1 - prefix[col] as usize] * eq_col[col]
+                };
+                bp[0] = b0;
+                bp[1] = b1;
+                let t = qp[1] * b1;
+                acc += qp[0] * b0 + t;
+                m_one += t;
+                m_inf += (qp[0] + qp[1]) * (b0 + b1);
+                i += 2;
             }
-            acc
+            (acc, m_one, m_inf)
         })
-        .reduce(|| F128::ZERO, |x, y| x + y);
-    (b, v)
+        .reduce(
+            || (F128::ZERO, F128::ZERO, F128::ZERO),
+            |(a, b1, c), (d, e, f)| (a + d, b1 + e, c + f),
+        );
+    (b, v, g_one, g_inf)
 }
 
 /// Prover for the jagged reduction. Given the dense multilinear `q` (length
@@ -367,35 +405,44 @@ fn prove_main<C: Challenger>(
     challenger.observe_label(b"flock-jagged-v0");
 
     // Second sumcheck multilinear B[i] = eq(row_t(i), z_row)·eq(col_t(i), z_col)
-    // over the boolean cube (= f̂_t(z_row, z_col, ·) on {0,1}^m), and the claim
-    // v = Σ_i q(i)·B(i) = p̂(z_row, z_col) — one fused parallel pass.
-    let (b, v) = generate_f_and_claim(params, q, z_row, z_col);
+    // over the boolean cube (= f̂_t(z_row, z_col, ·) on {0,1}^m), the claim
+    // v = Σ_i q(i)·B(i) = p̂(z_row, z_col), AND the first round message — one
+    // fused parallel pass, so `q` and `B` are not re-read for round 1's message.
+    let (b, v, mut g_one, mut g_inf) = generate_f_and_claim(params, q, z_row, z_col);
 
     // Product-of-two-multilinears sumcheck, binding the low index bit each
     // round — parallel and fused: each fold pass also computes the next round's
-    // message, halving passes over the (bandwidth-bound) witness. We ping-pong
-    // between `a/bb` and the scratch `sa/sb`. F128 addition is XOR, so the
-    // parallel tree reduction is bit-identical to a serial fold.
-    let mut a = q.to_vec();
-    let mut bb = b;
+    // message, halving passes over the (bandwidth-bound) witness. Round 1 folds
+    // straight out of the borrowed `q` and the owned `b` (q is never copied);
+    // rounds 2+ ping-pong `a/bb` (len/4 buffers) with the scratch `sa/sb`
+    // (len/2 buffers) — the write always fits the smaller of the pair. F128
+    // addition is XOR, so the parallel tree reduction is bit-identical to a
+    // serial fold.
     let mut sa = crate::alloc_uninit_f128_vec(len / 2);
     let mut sb = crate::alloc_uninit_f128_vec(len / 2);
+    let mut a = crate::alloc_uninit_f128_vec(len / 4);
+    let mut bb = crate::alloc_uninit_f128_vec(len / 4);
     let mut cur = len;
     let mut rounds = Vec::with_capacity(m);
     let mut point = Vec::with_capacity(m);
-    let (mut g_one, mut g_inf) = round_msg_par(&a[..cur], &bb[..cur]);
-    for _ in 0..m {
+    for round in 0..m {
         let half = cur / 2;
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
         let r = challenger.sample_f128();
         rounds.push((g_one, g_inf));
         point.push(r);
+        let (a_src, b_src): (&[F128], &[F128]) = if round == 0 { (q, &b) } else { (&a, &bb) };
         if cur > 2 {
-            (g_one, g_inf) =
-                fold_and_round_oop_par(&a[..cur], &bb[..cur], r, &mut sa[..half], &mut sb[..half]);
+            (g_one, g_inf) = fold_and_round_oop_par(
+                &a_src[..cur],
+                &b_src[..cur],
+                r,
+                &mut sa[..half],
+                &mut sb[..half],
+            );
         } else {
-            fold_oop_par(&a[..cur], &bb[..cur], r, &mut sa[..half], &mut sb[..half]);
+            fold_oop_par(&a_src[..cur], &b_src[..cur], r, &mut sa[..half], &mut sb[..half]);
         }
         std::mem::swap(&mut a, &mut sa);
         std::mem::swap(&mut bb, &mut sb);
@@ -403,10 +450,8 @@ fn prove_main<C: Challenger>(
     }
 
     debug_assert_eq!(cur, 1);
-    let proof = JaggedSumcheckProof {
-        rounds,
-        q_eval: a[0],
-    };
+    let q_eval = if m == 0 { q[0] } else { a[0] };
+    let proof = JaggedSumcheckProof { rounds, q_eval };
     (proof, v, point)
 }
 
@@ -912,9 +957,10 @@ fn fold_round_claim(claim: F128, g_one: F128, g_inf: F128, r: F128) -> F128 {
 }
 
 /// Degree-2 round message `(G(1), G(∞))` for `Σ_{x'} a(X,x')·b(X,x')`, low bit
-/// bound: `a(0,x') = a[2x']`, `a(1,x') = a[2x'+1]`. Serial reference (the
-/// production path uses [`round_msg_par`]); retained for the `runtime_m25`
-/// serial-vs-parallel benchmark.
+/// bound: `a(0,x') = a[2x']`, `a(1,x') = a[2x'+1]`. Serial reference; retained
+/// for the `runtime_m25` serial-vs-parallel benchmark. (The production path
+/// gets round 1's message fused into [`generate_f_and_claim`] and later
+/// messages from the fused fold kernels.)
 #[allow(dead_code)]
 #[inline]
 fn round_msg(a: &[F128], b: &[F128]) -> (F128, F128) {
@@ -977,7 +1023,9 @@ fn fold_and_round_fused(a: &mut Vec<F128>, b: &mut Vec<F128>, r: F128) -> (F128,
 /// Iterates contiguous slice chunks with `chunks_exact(2)` rather than indexing
 /// `a[2*x]`: eliminating the per-element bounds checks lifts the reduction from
 /// ~2.6× to ~6× parallel scaling (hits the memory-bandwidth ceiling). See
-/// `scaling_diag`.
+/// `scaling_diag`. No longer on the production path (round 1's message is
+/// fused into [`generate_f_and_claim`]); retained for the runtime benchmarks.
+#[allow(dead_code)]
 fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
     use rayon::prelude::*;
     const C: usize = 1 << 14;
@@ -1402,9 +1450,10 @@ mod tests {
             t_gen_ser = t_gen_ser.min(t0.elapsed());
             std::hint::black_box(&bs);
 
-            // Parallel fused helper (the production path).
+            // Parallel fused helper (the production path; also emits round 1's
+            // message, so it does slightly more work than the serial baseline).
             let t1 = Instant::now();
-            let (bp, vp) = generate_f_and_claim(&params, &q, &z_row, &z_col);
+            let (bp, vp, _g1, _gi) = generate_f_and_claim(&params, &q, &z_row, &z_col);
             t_gen_par = t_gen_par.min(t1.elapsed());
             assert_eq!(vs, vp, "parallel gen must match serial");
             b = bp;
@@ -1627,7 +1676,7 @@ mod tests {
         let main_bytes = (2 * proof.rounds.len() + 1) * 16;
         let assist_bytes = (2 * assist.rounds.len() + 1) * 16;
         eprintln!("  threads: {}", rayon::current_num_threads());
-        eprintln!("  witness: 2^{m} F128 = {} MiB (2^30 bits packed)", len * 16 >> 20);
+        eprintln!("  witness: 2^{m} F128 = {} MiB (2^30 bits packed)", (len * 16) >> 20);
         eprintln!("  sumcheck prover ({m} rounds)          : {t_prove:>9.3?}");
         eprintln!(
             "  + assist prover ({} rounds)          : {:>9.3?}  (assist ≈ {:.3?}, {:.1}% of prover)",
@@ -1645,6 +1694,106 @@ mod tests {
             "  proof: main {main_bytes} B + assist {assist_bytes} B = {} B",
             main_bytes + assist_bytes
         );
+    }
+
+    /// Phase breakdown of the jagged sumcheck prover at the 2^30-bit point —
+    /// diagnostic companion to `runtime_bits30`. Mirrors `prove_main` with a
+    /// timer per phase and implied memory bandwidth (each phase's compulsory
+    /// traffic / time) to show how far each sits from the streaming floor.
+    ///
+    /// `cargo test --release -p flock-core pcs::jagged::tests::bits30_breakdown -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic; run with --release --ignored --nocapture"]
+    fn bits30_breakdown() {
+        use std::time::Instant;
+
+        let _ = crate::init_perf_thread_pool();
+        let (n, k, m) = (11usize, 12usize, 23usize);
+        let cols = 1usize << k;
+        let height = (1u64 << m) / cols as u64;
+        let params = JaggedParams::from_heights(&vec![height; cols], n, m);
+        let len = 1usize << m;
+        let mut q = vec![F128::ZERO; len];
+        for (i, qi) in q.iter_mut().enumerate() {
+            *qi = F128 {
+                lo: i as u64,
+                hi: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            };
+        }
+        let mut rc = RandomChallenger::new(0x0B17_5301);
+        let z_row = sample_vec(&mut rc, n);
+        let z_col = sample_vec(&mut rc, k);
+
+        // Warm-up.
+        {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            let _ = prove(&params, &q, &z_row, &z_col, &mut ch);
+        }
+
+        let mb = |bytes: usize, secs: f64| bytes as f64 / secs / 1e9;
+        for trial in 0..3 {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            ch.observe_label(b"flock-jagged-v0");
+
+            let t = Instant::now();
+            let (b, _v, mut g_one, mut g_inf) = generate_f_and_claim(&params, &q, &z_row, &z_col);
+            let t_gen = t.elapsed();
+
+            let t = Instant::now();
+            let mut sa = crate::alloc_uninit_f128_vec(len / 2);
+            let mut sb = crate::alloc_uninit_f128_vec(len / 2);
+            let mut a = crate::alloc_uninit_f128_vec(len / 4);
+            let mut bb = crate::alloc_uninit_f128_vec(len / 4);
+            let t_alloc = t.elapsed();
+
+            let mut cur = len;
+            let mut per_round = Vec::with_capacity(m);
+            for round in 0..m {
+                let half = cur / 2;
+                ch.observe_f128(g_one);
+                ch.observe_f128(g_inf);
+                let r = ch.sample_f128();
+                let t = Instant::now();
+                let (a_src, b_src): (&[F128], &[F128]) =
+                    if round == 0 { (&q, &b) } else { (&a, &bb) };
+                if cur > 2 {
+                    (g_one, g_inf) = fold_and_round_oop_par(
+                        &a_src[..cur],
+                        &b_src[..cur],
+                        r,
+                        &mut sa[..half],
+                        &mut sb[..half],
+                    );
+                } else {
+                    fold_oop_par(&a_src[..cur], &b_src[..cur], r, &mut sa[..half], &mut sb[..half]);
+                }
+                per_round.push(t.elapsed());
+                std::mem::swap(&mut a, &mut sa);
+                std::mem::swap(&mut bb, &mut sb);
+                cur = half;
+            }
+            let t_rounds: std::time::Duration = per_round.iter().sum();
+            let total = t_gen + t_alloc + t_rounds;
+
+            eprintln!("--- trial {trial}  (total {total:.3?})");
+            eprintln!(
+                "  gen B + claim + round-1 msg : {t_gen:>9.3?}  ({:>5.1} GB/s of 256 MB r+w)",
+                mb(2 * len * 16, t_gen.as_secs_f64())
+            );
+            eprintln!("  buffer alloc    : {t_alloc:>9.3?}");
+            // Fold round j reads 2·cur and writes cur elements (two arrays each).
+            let round_bytes = |j: usize| 3 * (len >> j) * 16;
+            let tail: std::time::Duration = per_round[4..].iter().sum();
+            for (j, d) in per_round.iter().take(4).enumerate() {
+                eprintln!(
+                    "  fold+msg round {:>2}: {d:>8.3?}  ({:>5.1} GB/s of {} MB)",
+                    j + 1,
+                    mb(round_bytes(j), d.as_secs_f64()),
+                    round_bytes(j) >> 20
+                );
+            }
+            eprintln!("  rounds 5..{m}     : {tail:>8.3?}");
+        }
     }
 
     /// Assist runtimes at the realistic size (matches `runtime_m25`: m=25,
