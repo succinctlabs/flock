@@ -63,9 +63,12 @@
 //! heights — are merged up front, so the prover pays per *distinct* pair.
 //!
 //! Variables bind in **layer-interleaved order** `c_0, d_0, c_1, d_1, …`
-//! (LSB-first, matching the branching program's read order) so the naive
-//! per-round DP prover can later be swapped for the Lemma 4.6 prefix/suffix
-//! streaming without changing the transcript. The verifier finishes with one
+//! (LSB-first, matching the branching program's read order), which lets the
+//! prover use Lemma 4.6 prefix/suffix streaming ([`prove_assist`]): shared
+//! per-layer transition matrices, per-column suffix vectors, and an advancing
+//! prefix row vector make each round two 4-element dot products per column —
+//! `O(m·2^k)` total. The naive per-round DP prover is retained as a
+//! transcript-identical reference. The verifier finishes with one
 //! `Ĝ(ρ)` DP plus `W(ρ)` at `2(m+1)` multiplications per distinct column —
 //! `~35×` fewer multiplications than direct `f̂_t` at `m=25, k=10`, and no
 //! height-dependent branching. Round messages use the codebase's char-2-safe
@@ -508,18 +511,206 @@ fn assist_w_at(cols: &[(F128, u64, u64)], rho: &[F128], m: usize) -> F128 {
     acc
 }
 
+/// One layer's four boolean-`(c,d)` transition matrices, `[c + 2d][s][s']`.
+type LayerMats = [[[F128; 4]; 4]; 4];
+
+/// Per-layer BP transition matrices with the row/index coordinates pinned:
+/// `mats[c + 2d][s][s'] = Σ_{(a,b) ∈ {0,1}²} eq((z_row[ℓ], z_index[ℓ]), (a,b))
+/// · [transition(a,b,c,d,s) = s']`. Shared by every column; entries are sums
+/// of the layer's 4-entry eq table, so no multiplications beyond building it.
+fn assist_layer_mats(z_row: &[F128], z_index: &[F128], m: usize) -> Vec<LayerMats> {
+    (0..=m)
+        .map(|layer| {
+            let eq4 = build_eq_table(&[point_bit(z_row, layer), point_bit(z_index, layer)]);
+            let mut mats = [[[F128::ZERO; 4]; 4]; 4];
+            for (cd, mat) in mats.iter_mut().enumerate() {
+                let (c, d) = (cd & 1 != 0, cd & 2 != 0);
+                for (s, row) in mat.iter_mut().enumerate() {
+                    for (ab, &w) in eq4.iter().enumerate() {
+                        let (a, b) = (ab & 1 != 0, (ab >> 1) & 1 != 0);
+                        if let Some(out) = transition(a, b, c, d, s) {
+                            row[out] += w;
+                        }
+                    }
+                }
+            }
+            mats
+        })
+        .collect()
+}
+
+/// One column's suffix vectors `S[ℓ] = M_ℓ(bits)·M_{ℓ+1}(bits)···M_m(bits)·e_S`
+/// for `ℓ ∈ 0..=m+1` (`S[m+1] = e_S`), a single backward pass selecting each
+/// layer's boolean-`(c,d)` matrix by the column's height bits. `S[0][INITIAL]`
+/// is the column's full `ĝ` value, so β falls out of this precomputation.
+fn assist_suffix(mats: &[LayerMats], t_c: u64, t_next: u64, m: usize) -> Vec<[F128; 4]> {
+    let mut out = vec![[F128::ZERO; 4]; m + 2];
+    out[m + 1][STATE_SUCCESS] = F128::ONE;
+    for layer in (0..=m).rev() {
+        let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+        let mat = &mats[layer][cd];
+        let prev = out[layer + 1];
+        let mut v = [F128::ZERO; 4];
+        for (s, slot) in v.iter_mut().enumerate() {
+            *slot = mat[s][0] * prev[0]
+                + mat[s][1] * prev[1]
+                + mat[s][2] * prev[2]
+                + mat[s][3] * prev[3];
+        }
+        out[layer] = v;
+    }
+    out
+}
+
+#[inline]
+fn dot4(u: &[F128; 4], v: &[F128; 4]) -> F128 {
+    u[0] * v[0] + u[1] * v[1] + u[2] * v[2] + u[3] * v[3]
+}
+
 /// Prover for the assist sumcheck: proves `β = f̂_t(z_row, z_col, z_index)` =
 /// `Σ_{(c,d)} W(c,d)·ĝ(z_row, z_index, c, d)` over the `2(m+1)` height
 /// variables, bound in interleaved order `c_0, d_0, c_1, d_1, …` (LSB first).
 ///
-/// Naive round messages (SP1-style): the eq side of each column is maintained
-/// incrementally (`prefix_eq`), while the `ĝ` side is re-evaluated per round
-/// with the full layer DP — `O(m²·2^k)` multiplications overall, parallel over
-/// columns. Because the column's height bits are boolean, the tail sum of each
-/// round message collapses to one partially-bound `ĝ` evaluation per column
-/// per evaluation point (Lemma 5.1); the planned Lemma 4.6 prefix/suffix
-/// streaming replaces the per-round DPs without changing the transcript.
+/// Lemma 4.6 streaming ("assist with storage"): with per-layer transition
+/// matrices `M_ℓ` (row/index pinned; [`assist_layer_mats`]), the partially
+/// bound `ĝ` at round `j` factors as
+///
+/// ```text
+///   Ĝ_y(x) = b_ℓᵀ · M_ℓ(mixed with x) · S_y[ℓ+1],
+/// ```
+///
+/// where the prefix row vector `b_ℓᵀ = e_Iᵀ·M_0(ρ)···M_{ℓ-1}(ρ)` is shared by
+/// all columns and advanced once per layer, and the suffix vectors `S_y`
+/// ([`assist_suffix`]) are one `O(m)` backward pass per column, computed up
+/// front (β is their `[0][INITIAL]` entry). Each round message is then two
+/// 4-element dot products per column — `O(m·2^k)` multiplications total
+/// instead of the naive `O(m²·2^k)` ([`prove_assist_naive`], which produces a
+/// bit-identical transcript).
 pub fn prove_assist<C: Challenger>(
+    params: &JaggedParams,
+    z_row: &[F128],
+    z_col: &[F128],
+    z_index: &[F128],
+    challenger: &mut C,
+) -> JaggedAssistProof {
+    use rayon::prelude::*;
+    let m = params.m;
+    assert_eq!(z_row.len(), params.n);
+    assert_eq!(z_col.len(), params.k);
+    assert_eq!(z_index.len(), m);
+    let cols = assist_columns(params, z_col);
+
+    let mats = assist_layer_mats(z_row, z_index, m);
+    let suffixes: Vec<Vec<[F128; 4]>> = cols
+        .par_iter()
+        .map(|&(_, t_c, t_next)| assist_suffix(&mats, t_c, t_next, m))
+        .collect();
+
+    let beta = cols
+        .par_iter()
+        .zip(suffixes.par_iter())
+        .map(|(&(w, _, _), sfx)| w * sfx[0][STATE_INITIAL])
+        .reduce(|| F128::ZERO, |x, y| x + y);
+
+    challenger.observe_label(b"flock-jagged-assist-v0");
+    challenger.observe_f128(beta);
+
+    let mut prefix_row = [F128::ZERO; 4];
+    prefix_row[STATE_INITIAL] = F128::ONE;
+    let mut prefix_eq = vec![F128::ONE; cols.len()];
+    let mut rounds = Vec::with_capacity(2 * (m + 1));
+    for layer in 0..=m {
+        // u[c + 2d]ᵀ = b_ℓᵀ·M_ℓ^{(c,d)} — shared by every column this layer.
+        let mut u = [[F128::ZERO; 4]; 4];
+        for (cd, uv) in u.iter_mut().enumerate() {
+            for (sp, slot) in uv.iter_mut().enumerate() {
+                *slot = prefix_row[0] * mats[layer][cd][0][sp]
+                    + prefix_row[1] * mats[layer][cd][1][sp]
+                    + prefix_row[2] * mats[layer][cd][2][sp]
+                    + prefix_row[3] * mats[layer][cd][3][sp];
+            }
+        }
+
+        // c-round: Ĝ_y(x) = u[x + 2·d_bit]ᵀ·S_y[ℓ+1] for x ∈ {0, 1}.
+        let (g_one, g_inf) = cols
+            .par_iter()
+            .zip(prefix_eq.par_iter())
+            .zip(suffixes.par_iter())
+            .map(|((&(w, t_c, t_next), &e), sfx)| {
+                let db = ((t_next >> layer) & 1) as usize;
+                let s = &sfx[layer + 1];
+                let g0 = dot4(&u[2 * db], s);
+                let g1 = dot4(&u[1 + 2 * db], s);
+                let we = w * e;
+                let one_term = if (t_c >> layer) & 1 == 1 { we * g1 } else { F128::ZERO };
+                (one_term, we * (g0 + g1))
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a, b), (c, d)| (a + c, b + d),
+            );
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let rc = challenger.sample_f128();
+        rounds.push((g_one, g_inf));
+        for (&(_, t_c, _), e) in cols.iter().zip(prefix_eq.iter_mut()) {
+            *e *= if (t_c >> layer) & 1 == 1 { rc } else { F128::ONE + rc };
+        }
+
+        // Fold c at rc: ud[x]ᵀ = b_ℓᵀ·M_ℓ(rc, x) = (1+rc)·u[2x] + rc·u[1+2x].
+        let rc1 = F128::ONE + rc;
+        let mut ud = [[F128::ZERO; 4]; 2];
+        for (x, uv) in ud.iter_mut().enumerate() {
+            for (sp, slot) in uv.iter_mut().enumerate() {
+                *slot = rc1 * u[2 * x][sp] + rc * u[2 * x + 1][sp];
+            }
+        }
+
+        // d-round: Ĝ_y(x) = ud[x]ᵀ·S_y[ℓ+1].
+        let (g_one, g_inf) = cols
+            .par_iter()
+            .zip(prefix_eq.par_iter())
+            .zip(suffixes.par_iter())
+            .map(|((&(w, _, t_next), &e), sfx)| {
+                let s = &sfx[layer + 1];
+                let g0 = dot4(&ud[0], s);
+                let g1 = dot4(&ud[1], s);
+                let we = w * e;
+                let one_term = if (t_next >> layer) & 1 == 1 { we * g1 } else { F128::ZERO };
+                (one_term, we * (g0 + g1))
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a, b), (c, d)| (a + c, b + d),
+            );
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let rd = challenger.sample_f128();
+        rounds.push((g_one, g_inf));
+        for (&(_, _, t_next), e) in cols.iter().zip(prefix_eq.iter_mut()) {
+            *e *= if (t_next >> layer) & 1 == 1 { rd } else { F128::ONE + rd };
+        }
+
+        // Advance the prefix past the now fully-bound layer:
+        // b_{ℓ+1}ᵀ = b_ℓᵀ·M_ℓ(rc, rd) = (1+rd)·ud[0] + rd·ud[1].
+        let rd1 = F128::ONE + rd;
+        for sp in 0..4 {
+            prefix_row[sp] = rd1 * ud[0][sp] + rd * ud[1][sp];
+        }
+    }
+
+    JaggedAssistProof { beta, rounds }
+}
+
+/// Naive (SP1-style) reference for [`prove_assist`]: the eq side of each
+/// column is maintained incrementally (`prefix_eq`), while the `ĝ` side is
+/// re-evaluated per round with the full layer DP — `O(m²·2^k)` multiplications
+/// overall. Produces a transcript **bit-identical** to the streaming prover
+/// (same algebra over exact field ops); retained as the correctness reference
+/// (`assist_streamed_matches_naive`) and for the `runtime_assist_m25`
+/// comparison.
+#[allow(dead_code)]
+fn prove_assist_naive<C: Challenger>(
     params: &JaggedParams,
     z_row: &[F128],
     z_col: &[F128],
@@ -1000,6 +1191,30 @@ mod tests {
     }
 
     #[test]
+    fn assist_streamed_matches_naive() {
+        // The Lemma 4.6 streaming prover and the naive per-round-DP prover
+        // compute the same polynomials with exact field ops — the transcripts
+        // must be bit-identical.
+        let mut ch = RandomChallenger::new(0x57EA_4E46);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (2, 4, 6), (5, 1, 5)] {
+            for _ in 0..5 {
+                let (params, _q) = random_instance(&mut ch, n, k, m);
+                let z_row = sample_vec(&mut ch, n);
+                let z_col = sample_vec(&mut ch, k);
+                let z_idx = sample_vec(&mut ch, m);
+
+                let mut ch_a = FsChallenger::new(b"flock-jagged-assist-test");
+                let streamed = prove_assist(&params, &z_row, &z_col, &z_idx, &mut ch_a);
+                let mut ch_b = FsChallenger::new(b"flock-jagged-assist-test");
+                let naive = prove_assist_naive(&params, &z_row, &z_col, &z_idx, &mut ch_b);
+
+                assert_eq!(streamed.beta, naive.beta, "β mismatch n={n} k={k} m={m}");
+                assert_eq!(streamed.rounds, naive.rounds, "rounds mismatch n={n} k={k} m={m}");
+            }
+        }
+    }
+
+    #[test]
     fn assist_handles_degenerate_heights() {
         // Zero-height runs (collapsed terms) and an all-zero instance.
         let mut ch = RandomChallenger::new(0xDE6E_0000);
@@ -1319,6 +1534,12 @@ mod tests {
         let t_prove = t1.elapsed();
         assert_eq!(proof.beta, direct);
 
+        let t1n = Instant::now();
+        let mut nch = FsChallenger::new(b"flock-jagged-assist-bench");
+        let naive = prove_assist_naive(&params, &z_row, &z_col, &z_idx, &mut nch);
+        let t_prove_naive = t1n.elapsed();
+        assert_eq!(naive.rounds, proof.rounds, "provers must agree");
+
         let t2 = Instant::now();
         let mut vch = FsChallenger::new(b"flock-jagged-assist-bench");
         let beta = verify_assist(&params, &z_row, &z_col, &z_idx, &proof, &mut vch)
@@ -1328,7 +1549,11 @@ mod tests {
 
         eprintln!("  threads: {}", rayon::current_num_threads());
         eprintln!("  verifier, direct f̂_t (2^{k} BP evals): {t_direct:>9.3?}");
-        eprintln!("  assist prover  ({} rounds)            : {t_prove:>9.3?}", proof.rounds.len());
+        eprintln!(
+            "  assist prover, streamed ({} rounds)   : {t_prove:>9.3?}  (naive: {t_prove_naive:.3?}, {:.1}x)",
+            proof.rounds.len(),
+            t_prove_naive.as_secs_f64() / t_prove.as_secs_f64()
+        );
         eprintln!("  assist verifier (1 BP eval + W(ρ))    : {t_verify:>9.3?}");
         eprintln!(
             "  verifier speedup: {:.1}x   proof size: {} B",
