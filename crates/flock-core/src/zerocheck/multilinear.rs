@@ -43,6 +43,17 @@ use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
+mod kernels;
+
+#[cfg(target_arch = "aarch64")]
+use kernels::aarch64::fold_one_row_neon_unchecked_8;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecked_8};
+
 /// Returns `(pair_in_block_mask, useful_pairs_inclusive)` for the round-2
 /// fused-fold kernel. A pair (post-URM chunks `2k`, `2k+1`) is fully inside
 /// padding iff `(k & pair_in_block_mask) >= useful_pairs_inclusive` — those
@@ -387,101 +398,6 @@ impl UniSkipFoldTable {
             acc += self.data[j * 256 + bytes[j] as usize];
         }
         acc
-    }
-}
-
-/// NEON one-row fold: 8 aligned 16-byte loads + 8 XORs, hand-unrolled for
-/// `n_chunks = 8` (the k_skip=6 protocol size). Returns the folded F128.
-///
-/// The table is `Vec<F128>` with each entry 16-byte aligned (F128 is
-/// `repr(C, align(16))`), so every `vld1q_u8` lands on an aligned address.
-///
-/// # Safety
-/// Caller must guarantee `table_data` points to ≥ 8 × 256 × 16 valid bytes
-/// (an `n_chunks ≥ 8` table) and `bytes_ptr` to ≥ 8 valid bytes.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fold_one_row_neon_unchecked_8(table_data: *const u8, bytes_ptr: *const u8) -> F128 {
-    use core::arch::aarch64::*;
-    unsafe {
-        const STRIDE: usize = 256 * 16;
-        let mut acc = vld1q_u8(table_data.add((*bytes_ptr) as usize * 16));
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(1 * STRIDE + (*bytes_ptr.add(1)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(2 * STRIDE + (*bytes_ptr.add(2)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(3 * STRIDE + (*bytes_ptr.add(3)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(4 * STRIDE + (*bytes_ptr.add(4)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(5 * STRIDE + (*bytes_ptr.add(5)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(6 * STRIDE + (*bytes_ptr.add(6)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(7 * STRIDE + (*bytes_ptr.add(7)) as usize * 16)),
-        );
-        let acc_u64 = vreinterpretq_u64_u8(acc);
-        F128 {
-            lo: vgetq_lane_u64::<0>(acc_u64),
-            hi: vgetq_lane_u64::<1>(acc_u64),
-        }
-    }
-}
-
-/// Fold the four rows for one round-2 pair in parallel x86 SIMD registers.
-/// Returns `[a0, a1, b0, b1]`.
-///
-/// The table lookups are data-dependent, so they remain four independent
-/// aligned 128-bit loads per chunk. Keeping four XOR chains in flight exposes
-/// their load-level parallelism; the caller then batches four returned pairs
-/// into the AVX-512 GHASH message kernel.
-///
-/// # Safety
-/// `table_data` must point to an 8 × 256 `F128` table and every row pointer
-/// must expose 8 readable bytes.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[inline(always)]
-unsafe fn fold_round2_pair_x86_unchecked_8(
-    table_data: *const F128,
-    a0_bytes: *const u8,
-    a1_bytes: *const u8,
-    b0_bytes: *const u8,
-    b1_bytes: *const u8,
-) -> [F128; 4] {
-    use core::arch::x86_64::*;
-
-    // SAFETY: the caller guarantees all table and row bounds. Every table
-    // entry is 16-byte aligned because F128 has align(16).
-    unsafe {
-        let rows = [a0_bytes, a1_bytes, b0_bytes, b1_bytes];
-        let mut acc = [_mm_setzero_si128(); 4];
-        for chunk in 0..8 {
-            let table_chunk = table_data.add(chunk * 256);
-            for lane in 0..4 {
-                let entry = table_chunk.add(*rows[lane].add(chunk) as usize);
-                acc[lane] = _mm_xor_si128(acc[lane], _mm_load_si128(entry.cast::<__m128i>()));
-            }
-        }
-        // F128 is exactly two u64 words and accepts every bit pattern.
-        acc.map(|value| core::mem::transmute::<__m128i, F128>(value))
     }
 }
 
@@ -860,122 +776,6 @@ pub fn fold_and_compute_round_pair_optimized(
     (a_new, b_new, m1, mi)
 }
 
-/// x86 fused fold plus next-round message for one worker chunk.
-///
-/// Each four-message iteration folds eight `a` and `b` outputs, stores them
-/// for the next round, and consumes the same ZMM registers for the current
-/// message before they leave registers. This removes the immediate output
-/// readback performed by the portable two-pass path.
-///
-/// # Safety
-/// Input/output lengths must satisfy `input.len() == 2 * output.len()` and
-/// `output.len() == 2 * eq_lo.len()`. AVX-512F and VPCLMULQDQ are cfg-gated.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-unsafe fn fold_and_message_x86_avx512(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    r_fold: F128,
-    eq_lo: &[F128],
-) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
-    use core::arch::x86_64::*;
-
-    debug_assert_eq!(a_in.len(), 2 * a_out.len());
-    debug_assert_eq!(b_in.len(), 2 * b_out.len());
-    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
-
-    // Fold four adjacent output elements and return them in one ZMM.
-    #[inline(always)]
-    unsafe fn fold_x4(
-        src: *const F128,
-        r: __m512i,
-        even_idx: __m512i,
-        odd_idx: __m512i,
-    ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
-        use core::arch::x86_64::*;
-
-        // SAFETY: caller supplies eight readable F128 values at src.
-        unsafe {
-            let lo = _mm512_loadu_si512(src.cast::<__m512i>());
-            let hi = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
-            let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
-            let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
-        }
-    }
-
-    // SAFETY: the function's length invariants bound all loads/stores and the
-    // cfg gate supplies every intrinsic feature.
-    unsafe {
-        let r = _mm512_broadcast_i32x4(_mm_set_epi64x(r_fold.hi as i64, r_fold.lo as i64));
-        // Select even/odd F128 lanes from two concatenated ZMM inputs. The same
-        // selectors deinterleave fold inputs and gather message a0/a1 lanes.
-        let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-        let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
-        let mut p1_wide = WideGhashX4::zero();
-        let mut pinf_wide = WideGhashX4::zero();
-        let mut p1_tail = F256Unreduced::ZERO;
-        let mut pinf_tail = F256Unreduced::ZERO;
-        let mut x_lo = 0;
-
-        while x_lo + 4 <= eq_lo.len() {
-            let output = 2 * x_lo;
-            let a_lo = fold_x4(a_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let a_hi = fold_x4(a_in.as_ptr().add(2 * (output + 4)), r, even_idx, odd_idx);
-            let b_lo = fold_x4(b_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let b_hi = fold_x4(b_in.as_ptr().add(2 * (output + 4)), r, even_idx, odd_idx);
-
-            _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_lo);
-            _mm512_storeu_si512(a_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), a_hi);
-            _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_lo);
-            _mm512_storeu_si512(b_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), b_hi);
-
-            let a0 = _mm512_permutex2var_epi64(a_lo, even_idx, a_hi);
-            let a1 = _mm512_permutex2var_epi64(a_lo, odd_idx, a_hi);
-            let b0 = _mm512_permutex2var_epi64(b_lo, even_idx, b_hi);
-            let b1 = _mm512_permutex2var_epi64(b_lo, odd_idx, b_hi);
-            let g1 = ghash_mul_x4(a1, b1);
-            let g_inf = ghash_mul_x4(_mm512_xor_si512(a0, a1), _mm512_xor_si512(b0, b1));
-            let eq = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-            p1_wide.mul_acc(eq, g1);
-            pinf_wide.mul_acc(eq, g_inf);
-            x_lo += 4;
-        }
-
-        // Power-of-two eq blocks leave either no tail or exactly two pairs.
-        if x_lo < eq_lo.len() {
-            debug_assert_eq!(eq_lo.len() - x_lo, 2);
-            let output = 2 * x_lo;
-            let a_folded = fold_x4(a_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let b_folded = fold_x4(b_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_folded);
-            _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_folded);
-
-            for lane in 0..2 {
-                let o = output + 2 * lane;
-                let a0 = a_out[o];
-                let a1 = a_out[o + 1];
-                let b0 = b_out[o];
-                let b1 = b_out[o + 1];
-                let eq = eq_lo[x_lo + lane];
-                p1_tail ^= eq.mul_unreduced(a1 * b1);
-                pinf_tail ^= eq.mul_unreduced((a0 + a1) * (b0 + b1));
-            }
-        }
-
-        p1_tail ^= p1_wide.fold();
-        pinf_tail ^= pinf_wide.fold();
-        (p1_tail.reduce(), pinf_tail.reduce())
-    }
-}
-
 /// Buffer-reusing variant of [`fold_and_compute_round_pair_optimized`]: writes
 /// the folded `a`/`b` into the caller-provided `a_out`/`b_out` (each length
 /// `a.len() / 2`) instead of allocating. Returns `(r_next[0] · G(1), G(∞))`.
@@ -1039,30 +839,11 @@ pub fn fold_and_compute_round_pair_into(
                 target_feature = "vpclmulqdq"
             )))]
             let (p1, pinf) = {
-                // Fold a_in→a_out, b_in→b_out at r_fold: a_out[t] = a_in[2t]·(1+r) +
-                // a_in[2t+1]·r — the LSB butterfly. Vectorized via the shared
-                // fold_lsb kernels; the message loop below reads the folded values.
-                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-                // SAFETY: aes guaranteed by the cfg gate.
-                unsafe {
-                    crate::pcs::ligerito::fold_lsb_neon(a_in, 0, a_out, r_fold);
-                    crate::pcs::ligerito::fold_lsb_neon(b_in, 0, b_out, r_fold);
-                }
-                #[cfg(not(any(
-                    all(
-                        target_arch = "x86_64",
-                        target_feature = "avx512f",
-                        target_feature = "vpclmulqdq"
-                    ),
-                    all(target_arch = "aarch64", target_feature = "aes"),
-                )))]
-                {
-                    let one_plus_r = F128::ONE + r_fold;
-                    for t in 0..a_out.len() {
-                        a_out[t] = a_in[2 * t] * one_plus_r + a_in[2 * t + 1] * r_fold;
-                        b_out[t] = b_in[2 * t] * one_plus_r + b_in[2 * t + 1] * r_fold;
-                    }
-                }
+                // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
+                // selects the architecture kernel; this loop only consumes
+                // the resulting values to build the message.
+                crate::field::f128_slice::fold_pairs(a_in, 0, a_out, r_fold);
+                crate::field::f128_slice::fold_pairs(b_in, 0, b_out, r_fold);
 
                 let mut p1_acc = F256Unreduced::ZERO;
                 let mut pinf_acc = F256Unreduced::ZERO;

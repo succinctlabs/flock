@@ -43,6 +43,8 @@
 
 use crate::field::F128;
 
+mod kernels;
+
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
 /// Returns `evals` where `evals[i] = [Ŵ_i(β_i), Ŵ_i(β_{i+1}), …, Ŵ_i(β_{ℓ-1})]`.
@@ -475,7 +477,7 @@ impl AdditiveNttF128 {
                         let twiddle = self.twiddle(layer, block);
                         let block_start = block * block_size;
                         let chunk = &mut data[block_start..block_start + block_size];
-                        butterfly_block_neon(chunk, twiddle, block_size_half);
+                        kernels::butterfly_neon_block(chunk, twiddle, block_size_half);
                     }
                 } else {
                     // Deepest layer (half = 1): batch across 2 adjacent blocks
@@ -486,7 +488,7 @@ impl AdditiveNttF128 {
                     while block + 1 < num_blocks {
                         let t_a = self.twiddle(layer, block);
                         let t_b = self.twiddle(layer, block + 1);
-                        butterfly_across_blocks_neon(data, block * 2, t_a, t_b);
+                        kernels::butterfly_neon_block_pair(data, block * 2, t_a, t_b);
                         block += 2;
                     }
                     // Scalar tail (num_blocks odd — only when num_blocks = 1).
@@ -533,7 +535,7 @@ impl AdditiveNttF128 {
                     .zip(twiddles.par_iter())
                     .for_each(|(chunk, &twiddle)| {
                         // SAFETY: aes target feature enabled.
-                        unsafe { butterfly_block_neon(chunk, twiddle, block_size_half) };
+                        unsafe { kernels::butterfly_neon_block(chunk, twiddle, block_size_half) };
                     });
             } else if block_size_half >= 2 {
                 // Few large blocks — process sequentially with NEON.
@@ -542,7 +544,7 @@ impl AdditiveNttF128 {
                     for block in 0..num_blocks {
                         let twiddle = self.twiddle(layer, block);
                         let block_start = block * block_size;
-                        butterfly_block_neon(
+                        kernels::butterfly_neon_block(
                             &mut data[block_start..block_start + block_size],
                             twiddle,
                             block_size_half,
@@ -562,7 +564,7 @@ impl AdditiveNttF128 {
                         |(chunk, twiddle_pair)| {
                             // SAFETY: aes target feature enabled.
                             unsafe {
-                                butterfly_across_blocks_neon_in_chunk(
+                                kernels::butterfly_neon_block_pair_chunk(
                                     chunk,
                                     twiddle_pair[0],
                                     twiddle_pair[1],
@@ -624,7 +626,7 @@ impl AdditiveNttF128 {
                     .zip(twiddles.par_iter())
                     .for_each(|(chunk, &t)| {
                         // SAFETY: aes target feature enabled.
-                        unsafe { butterfly_block_neon(chunk, t, block_size_half) };
+                        unsafe { kernels::butterfly_neon_block(chunk, t, block_size_half) };
                     });
             } else {
                 // Few large blocks at very top layers: sequential NEON.
@@ -632,7 +634,7 @@ impl AdditiveNttF128 {
                     for block in 0..num_blocks {
                         let t = self.twiddle(layer, block);
                         let block_start = block * block_size;
-                        butterfly_block_neon(
+                        kernels::butterfly_neon_block(
                             &mut data[block_start..block_start + block_size],
                             t,
                             block_size_half,
@@ -659,7 +661,9 @@ impl AdditiveNttF128 {
                         let block = &mut sub_data[block_start..block_start + block_size];
                         if block_size_half >= 2 {
                             // SAFETY: aes target feature enabled.
-                            unsafe { butterfly_block_neon(block, twiddle, block_size_half) };
+                            unsafe {
+                                kernels::butterfly_neon_block(block, twiddle, block_size_half)
+                            };
                         } else {
                             // Deepest layer: 1 pair per block, scalar.
                             let v = block[1];
@@ -719,7 +723,7 @@ fn butterfly_interleaved_block_par_rows(
     top.par_chunks_mut(num_ntts)
         .zip(bot.par_chunks_mut(num_ntts))
         .for_each(|(top_row, bot_row)| {
-            butterfly_row_pair(top_row, bot_row, twiddle);
+            kernels::butterfly_row_pair(top_row, bot_row, twiddle);
         });
 }
 
@@ -748,10 +752,12 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     let stride = quarter * num_ntts;
     debug_assert_eq!(block.len(), 4 * stride);
 
-    let do_one =
-        |row_a: &mut [F128], row_b: &mut [F128], row_c: &mut [F128], row_d: &mut [F128]| {
-            butterfly_fused_2layer_rows(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
-        };
+    let do_one = |row_a: &mut [F128],
+                  row_b: &mut [F128],
+                  row_c: &mut [F128],
+                  row_d: &mut [F128]| {
+        kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
+    };
 
     // Split the block into four quarters, then zip row-wise. Each rayon task
     // processes one quarter-row index = 4 logical rows of work.
@@ -803,364 +809,11 @@ fn butterfly_interleaved_block(
     let (top, bot) = block.split_at_mut(off_bot);
     for r in 0..block_size_half {
         let o = r * num_ntts;
-        butterfly_row_pair(
+        kernels::butterfly_row_pair(
             &mut top[o..o + num_ntts],
             &mut bot[o..o + num_ntts],
             twiddle,
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// x86_64 AVX-512 + VPCLMULQDQ SoA butterfly kernels — multiply 4 SoA lanes per
-// VPCLMULQDQ via `gf2_128::x86_64::ghash_mul_x4`. The twiddle is shared across
-// all lanes of a row pair, so it is broadcast once. On any other target these
-// dispatchers fall back to the scalar per-lane loop (unchanged behaviour — the
-// aarch64 path keeps relying on the compiler's ILP across the field muls).
-// ---------------------------------------------------------------------------
-
-/// Butterfly one `(top, bot)` row pair across all lanes with a shared twiddle:
-/// `new_top = top + twiddle·bot; new_bot = bot + new_top`. `top`/`bot` have
-/// equal length (= `num_ntts`).
-#[inline]
-fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    {
-        // SAFETY: the cfg gate guarantees the kernel's target features.
-        unsafe { butterfly_row_pair_avx512(top, bot, twiddle) };
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    )))]
-    butterfly_row_pair_scalar(top, bot, twiddle);
-}
-
-#[inline]
-fn butterfly_row_pair_scalar(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
-    for lane in 0..top.len() {
-        let v = bot[lane];
-        let new_u = top[lane] + v * twiddle;
-        top[lane] = new_u;
-        bot[lane] = v + new_u;
-    }
-}
-
-/// Fused two-layer butterfly over four equal-length rows `(a, b, c, d)`:
-/// layer L butterflies `(a,c)` and `(b,d)` with `t_outer`; layer L+1 then
-/// butterflies `(a,b)` with `t_inner_a` and `(c,d)` with `t_inner_b`. Matches
-/// the scalar `do_one` in [`butterfly_interleaved_fused_2layer_par_rows`].
-#[inline]
-fn butterfly_fused_2layer_rows(
-    a: &mut [F128],
-    b: &mut [F128],
-    c: &mut [F128],
-    d: &mut [F128],
-    t_outer: F128,
-    t_inner_a: F128,
-    t_inner_b: F128,
-) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    {
-        // SAFETY: the cfg gate guarantees the kernel's target features.
-        unsafe { butterfly_fused_2layer_avx512(a, b, c, d, t_outer, t_inner_a, t_inner_b) };
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    )))]
-    butterfly_fused_2layer_scalar(a, b, c, d, t_outer, t_inner_a, t_inner_b);
-}
-
-#[inline]
-fn butterfly_fused_2layer_scalar(
-    a: &mut [F128],
-    b: &mut [F128],
-    c: &mut [F128],
-    d: &mut [F128],
-    t_outer: F128,
-    t_inner_a: F128,
-    t_inner_b: F128,
-) {
-    for lane in 0..a.len() {
-        let mut xa = a[lane];
-        let mut xb = b[lane];
-        let mut xc = c[lane];
-        let mut xd = d[lane];
-        let na = xa + xc * t_outer;
-        xc += na;
-        xa = na;
-        let nb = xb + xd * t_outer;
-        xd += nb;
-        xb = nb;
-        let na2 = xa + xb * t_inner_a;
-        xb += na2;
-        xa = na2;
-        let nc2 = xc + xd * t_inner_b;
-        xd += nc2;
-        xc = nc2;
-        a[lane] = xa;
-        b[lane] = xb;
-        c[lane] = xc;
-        d[lane] = xd;
-    }
-}
-
-/// 4-lane-wide x86 kernel behind [`butterfly_row_pair`].
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_row_pair_avx512(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
-    use core::arch::x86_64::*;
-    // SAFETY: caller carries avx512f+vpclmulqdq.
-    unsafe {
-        let lam = _mm512_broadcast_i32x4(_mm_set_epi64x(twiddle.hi as i64, twiddle.lo as i64));
-        let n = top.len();
-        let lanes = n & !3;
-        let mut i = 0;
-        while i < lanes {
-            let t = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
-            let v = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
-            let nt = _mm512_xor_si512(t, ghash_mul_x4(lam, v));
-            let nb = _mm512_xor_si512(v, nt);
-            _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, nt);
-            _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
-            i += 4;
-        }
-        butterfly_row_pair_scalar(&mut top[i..n], &mut bot[i..n], twiddle);
-    }
-}
-
-/// 4-lane-wide x86 kernel behind [`butterfly_fused_2layer_rows`].
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_avx512(
-    a: &mut [F128],
-    b: &mut [F128],
-    c: &mut [F128],
-    d: &mut [F128],
-    t_outer: F128,
-    t_inner_a: F128,
-    t_inner_b: F128,
-) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
-    use core::arch::x86_64::*;
-    // SAFETY: caller carries avx512f+vpclmulqdq.
-    unsafe {
-        let bcast = |f: F128| _mm512_broadcast_i32x4(_mm_set_epi64x(f.hi as i64, f.lo as i64));
-        let to = bcast(t_outer);
-        let tia = bcast(t_inner_a);
-        let tib = bcast(t_inner_b);
-        let n = a.len();
-        let lanes = n & !3;
-        let mut i = 0;
-        while i < lanes {
-            let mut va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
-            let mut vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
-            let mut vc = _mm512_loadu_si512(c.as_ptr().add(i) as *const __m512i);
-            let mut vd = _mm512_loadu_si512(d.as_ptr().add(i) as *const __m512i);
-            // Layer L: (a,c) and (b,d) with t_outer.
-            let na = _mm512_xor_si512(va, ghash_mul_x4(to, vc));
-            vc = _mm512_xor_si512(vc, na);
-            va = na;
-            let nb = _mm512_xor_si512(vb, ghash_mul_x4(to, vd));
-            vd = _mm512_xor_si512(vd, nb);
-            vb = nb;
-            // Layer L+1: (a,b) with t_inner_a; (c,d) with t_inner_b.
-            let na2 = _mm512_xor_si512(va, ghash_mul_x4(tia, vb));
-            vb = _mm512_xor_si512(vb, na2);
-            va = na2;
-            let nc2 = _mm512_xor_si512(vc, ghash_mul_x4(tib, vd));
-            vd = _mm512_xor_si512(vd, nc2);
-            vc = nc2;
-            _mm512_storeu_si512(a.as_mut_ptr().add(i) as *mut __m512i, va);
-            _mm512_storeu_si512(b.as_mut_ptr().add(i) as *mut __m512i, vb);
-            _mm512_storeu_si512(c.as_mut_ptr().add(i) as *mut __m512i, vc);
-            _mm512_storeu_si512(d.as_mut_ptr().add(i) as *mut __m512i, vd);
-            i += 4;
-        }
-        butterfly_fused_2layer_scalar(
-            &mut a[i..n],
-            &mut b[i..n],
-            &mut c[i..n],
-            &mut d[i..n],
-            t_outer,
-            t_inner_a,
-            t_inner_b,
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Fused 4-layer SoA butterfly. Reads each top-layer block once, applies FOUR
-// consecutive NTT layers in registers (a 16-point radix-2 butterfly DAG), and
-// writes once — quartering the top-layer DRAM passes vs the unfused path
-// (⌈n_top/4⌉ instead of n_top). The 16 rows of one butterfly group are the
-// `r`-th row of each of the block's 16 equal sixteenths:
-//   v[i] = row (i*sixteenth + r),  i ∈ 0..16.
-// Layer L  (stride 8): pairs (v[i], v[i+8]),            twiddle t[0].
-// Layer L+1(stride 4): pairs (v[8s+i], v[8s+i+4]),      twiddle t[1+s]      (s∈0..2).
-// Layer L+2(stride 2): pairs (v[4s+i], v[4s+i+2]),      twiddle t[3+s]      (s∈0..4).
-// Layer L+3(stride 1): pairs (v[2s],   v[2s+1]),        twiddle t[7+s]      (s∈0..8).
-// where t[1+s]=twiddle(L+1,2b+s), t[3+s]=twiddle(L+2,4b+s), t[7+s]=twiddle(L+3,8b+s).
-// ---------------------------------------------------------------------------
-
-/// Scalar reference for the 16-point fused butterfly (also the tail/fallback).
-#[inline]
-fn fused4_butterfly_scalar(x: &mut [F128; 16], t: &[F128; 15]) {
-    #[inline(always)]
-    fn bf(x: &mut [F128; 16], u: usize, v: usize, tw: F128) {
-        let nu = x[u] + x[v] * tw;
-        x[v] += nu;
-        x[u] = nu;
-    }
-    for i in 0..8 {
-        bf(x, i, i + 8, t[0]);
-    }
-    for s in 0..2 {
-        for i in 0..4 {
-            bf(x, 8 * s + i, 8 * s + i + 4, t[1 + s]);
-        }
-    }
-    for s in 0..4 {
-        for i in 0..2 {
-            bf(x, 4 * s + i, 4 * s + i + 2, t[3 + s]);
-        }
-    }
-    for s in 0..8 {
-        bf(x, 2 * s, 2 * s + 1, t[7 + s]);
-    }
-}
-
-/// Process one fused-4 row group (`r`) across all `num_ntts` lanes in place.
-#[inline]
-unsafe fn fused4_one_r(
-    ptr: *mut F128,
-    sixteenth: usize,
-    num_ntts: usize,
-    r: usize,
-    t: &[F128; 15],
-) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    {
-        // SAFETY: avx512f+vpclmulqdq guaranteed by the cfg gate; caller upholds
-        // the disjoint-row-group contract.
-        unsafe { fused4_one_r_avx512(ptr, sixteenth, num_ntts, r, t) };
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    )))]
-    // SAFETY: caller upholds the disjoint-row-group contract.
-    unsafe {
-        for lane in 0..num_ntts {
-            let mut x = [F128 { lo: 0, hi: 0 }; 16];
-            for i in 0..16 {
-                x[i] = *ptr.add((i * sixteenth + r) * num_ntts + lane);
-            }
-            fused4_butterfly_scalar(&mut x, t);
-            for i in 0..16 {
-                *ptr.add((i * sixteenth + r) * num_ntts + lane) = x[i];
-            }
-        }
-    }
-}
-
-/// 4-lane-wide x86 kernel behind [`fused4_one_r`].
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn fused4_one_r_avx512(
-    ptr: *mut F128,
-    sixteenth: usize,
-    num_ntts: usize,
-    r: usize,
-    t: &[F128; 15],
-) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
-    use core::arch::x86_64::*;
-    // SAFETY: caller carries avx512f+vpclmulqdq and the disjoint-row contract.
-    unsafe {
-        let bcast = |f: F128| _mm512_broadcast_i32x4(_mm_set_epi64x(f.hi as i64, f.lo as i64));
-        let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
-        let lanes = num_ntts & !3;
-        let mut lane = 0;
-        while lane < lanes {
-            let mut x = [_mm512_setzero_si512(); 16];
-            for i in 0..16 {
-                x[i] = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
-            }
-            // `$tw` is a pre-broadcast __m512i; `new_u = u ^ tw·v; new_v = v ^ new_u`.
-            macro_rules! bf {
-                ($u:expr, $v:expr, $tw:expr) => {{
-                    let nu = _mm512_xor_si512(x[$u], ghash_mul_x4($tw, x[$v]));
-                    x[$v] = _mm512_xor_si512(x[$v], nu);
-                    x[$u] = nu;
-                }};
-            }
-            let to = bcast(t[0]);
-            for i in 0..8 {
-                bf!(i, i + 8, to);
-            }
-            for s in 0..2 {
-                let tw = bcast(t[1 + s]);
-                for i in 0..4 {
-                    bf!(8 * s + i, 8 * s + i + 4, tw);
-                }
-            }
-            for s in 0..4 {
-                let tw = bcast(t[3 + s]);
-                for i in 0..2 {
-                    bf!(4 * s + i, 4 * s + i + 2, tw);
-                }
-            }
-            for s in 0..8 {
-                let tw = bcast(t[7 + s]);
-                bf!(2 * s, 2 * s + 1, tw);
-            }
-            for i in 0..16 {
-                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, x[i]);
-            }
-            lane += 4;
-        }
-        // Scalar tail for the last `num_ntts & 3` lanes (none when divisible by 4).
-        while lane < num_ntts {
-            let mut x = [F128 { lo: 0, hi: 0 }; 16];
-            for i in 0..16 {
-                x[i] = *row(i).add(lane);
-            }
-            fused4_butterfly_scalar(&mut x, t);
-            for i in 0..16 {
-                *row(i).add(lane) = x[i];
-            }
-            lane += 1;
-        }
     }
 }
 
@@ -1184,12 +837,16 @@ fn butterfly_interleaved_fused_4layer_par_rows(
     if sixteenth < PARALLEL_ROW_THRESHOLD {
         for r in 0..sixteenth {
             // SAFETY: row group r writes disjoint rows of this block.
-            unsafe { fused4_one_r(base as *mut F128, sixteenth, num_ntts, r, t) };
+            unsafe {
+                kernels::butterfly_fused_4layer_row(base as *mut F128, sixteenth, num_ntts, r, t)
+            };
         }
     } else {
         (0..sixteenth).into_par_iter().for_each(|r| {
             // SAFETY: distinct r → disjoint row groups → no aliasing.
-            unsafe { fused4_one_r(base as *mut F128, sixteenth, num_ntts, r, t) };
+            unsafe {
+                kernels::butterfly_fused_4layer_row(base as *mut F128, sixteenth, num_ntts, r, t)
+            };
         });
     }
 }
@@ -1201,111 +858,6 @@ fn log2_pow2(n: usize) -> usize {
         "length must be a positive power of 2"
     );
     n.trailing_zeros() as usize
-}
-
-// ---------------------------------------------------------------------------
-// NEON butterfly helpers — batch 2 F128 butterflies per `ghash_mul_vec2_neon`.
-// ---------------------------------------------------------------------------
-
-/// Two butterflies within a single block (shared twiddle).
-///
-/// `chunk` is one block of length `2 * half`. Pairs (idx0, idx0 + half) for
-/// idx0 = 0..half are butterflied. We process two consecutive idx0's at once
-/// to share the twiddle across the `ghash_mul_vec2_neon` call.
-///
-/// Precondition: `half >= 2`. (At deepest layer where half=1, use
-/// [`butterfly_across_blocks_neon`] instead.)
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn butterfly_block_neon(chunk: &mut [F128], twiddle: F128, half: usize) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
-    debug_assert!(half >= 2);
-    debug_assert_eq!(chunk.len(), 2 * half);
-    let mut idx0 = 0;
-    while idx0 < half {
-        let idx1 = idx0 + half;
-        let u_a = chunk[idx0];
-        let v_a = chunk[idx1];
-        let u_b = chunk[idx0 + 1];
-        let v_b = chunk[idx1 + 1];
-
-        // SAFETY: aes target feature enabled.
-        let prod = unsafe { ghash_mul_vec2_neon([twiddle, twiddle], [v_a, v_b]) };
-
-        let new_u_a = F128 {
-            lo: u_a.lo ^ prod[0].lo,
-            hi: u_a.hi ^ prod[0].hi,
-        };
-        let new_u_b = F128 {
-            lo: u_b.lo ^ prod[1].lo,
-            hi: u_b.hi ^ prod[1].hi,
-        };
-        let new_v_a = F128 {
-            lo: v_a.lo ^ new_u_a.lo,
-            hi: v_a.hi ^ new_u_a.hi,
-        };
-        let new_v_b = F128 {
-            lo: v_b.lo ^ new_u_b.lo,
-            hi: v_b.hi ^ new_u_b.hi,
-        };
-
-        chunk[idx0] = new_u_a;
-        chunk[idx1] = new_v_a;
-        chunk[idx0 + 1] = new_u_b;
-        chunk[idx1 + 1] = new_v_b;
-        idx0 += 2;
-    }
-}
-
-/// Two butterflies across 2 adjacent blocks at the deepest layer (each block
-/// has just 1 pair, i.e., block_size_half = 1). The two pairs have DIFFERENT
-/// twiddles.
-///
-/// Operates on `data[base..base+4]` = (block0_lo, block0_hi, block1_lo, block1_hi).
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn butterfly_across_blocks_neon(data: &mut [F128], base: usize, t_a: F128, t_b: F128) {
-    // SAFETY: caller's `aes` target-feature attribute covers this call.
-    unsafe { butterfly_across_blocks_neon_in_chunk(&mut data[base..base + 4], t_a, t_b) };
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn butterfly_across_blocks_neon_in_chunk(chunk: &mut [F128], t_a: F128, t_b: F128) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
-    debug_assert_eq!(chunk.len(), 4);
-    let u_a = chunk[0];
-    let v_a = chunk[1];
-    let u_b = chunk[2];
-    let v_b = chunk[3];
-
-    // SAFETY: aes target feature enabled.
-    let prod = unsafe { ghash_mul_vec2_neon([t_a, t_b], [v_a, v_b]) };
-
-    let new_u_a = F128 {
-        lo: u_a.lo ^ prod[0].lo,
-        hi: u_a.hi ^ prod[0].hi,
-    };
-    let new_u_b = F128 {
-        lo: u_b.lo ^ prod[1].lo,
-        hi: u_b.hi ^ prod[1].hi,
-    };
-    let new_v_a = F128 {
-        lo: v_a.lo ^ new_u_a.lo,
-        hi: v_a.hi ^ new_u_a.hi,
-    };
-    let new_v_b = F128 {
-        lo: v_b.lo ^ new_u_b.lo,
-        hi: v_b.hi ^ new_u_b.hi,
-    };
-
-    chunk[0] = new_u_a;
-    chunk[1] = new_v_a;
-    chunk[2] = new_u_b;
-    chunk[3] = new_v_b;
 }
 
 #[cfg(test)]

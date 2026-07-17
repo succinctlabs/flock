@@ -32,12 +32,38 @@
 
 use std::sync::OnceLock;
 
-use crate::field::gf2_8::gf8_reduce;
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
 use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
+
+mod kernels;
+
+#[cfg(all(test, target_arch = "aarch64"))]
+use kernels::aarch64::{
+    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
+};
+#[cfg(all(test, target_arch = "aarch64"))]
+use kernels::bit_transpose_64bytes_scalar;
+#[cfg(all(
+    test,
+    any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "gfni")
+    )
+))]
+use kernels::shift_reduce_inner_ab_scalar;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+use kernels::x86_64::shift_reduce_inner_ab_x86_avx512;
+#[cfg(all(test, target_arch = "x86_64", target_feature = "gfni"))]
+use kernels::x86_64::shift_reduce_inner_ab_x86_sse;
 
 // ---------------------------------------------------------------------------
 // Protocol constants — fixed by the optimization design.
@@ -195,175 +221,9 @@ fn convert_table() -> &'static [F128] {
     CONVERT_TABLE_CACHE.get_or_init(build_convert_table)
 }
 
-// ---------------------------------------------------------------------------
-// Bit transpose for C (scalar form of `bit_transpose_64bytes`).
-//
-// Input layout :  byte at offset (x_small * 8 + b_chunk) — bit t holds c at
-//                 lane = 8*b_chunk + t with inner_K = x_small.
-// Output layout:  byte at offset (b_chunk * 8 + t)        — bit K holds c at
-//                 lane = 8*b_chunk + t with inner_K = K.
-//
-// So `out[lane]`'s 8 bits are the inner_K-direction polynomial of c at lane.
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-fn bit_transpose_64bytes_scalar(input: &[u8; 64], output: &mut [u8; 64]) {
-    output.iter_mut().for_each(|x| *x = 0);
-    for byte_idx in 0..64 {
-        let x_small = byte_idx / 8;
-        let b_chunk = byte_idx % 8;
-        for t in 0..8 {
-            let bit = (input[byte_idx] >> t) & 1;
-            if bit != 0 {
-                output[b_chunk * 8 + t] |= 1u8 << x_small;
-            }
-        }
-    }
-}
-
-/// NEON 64-byte bit-transpose. Two-stage:
-///   1. `vqtbl4q_u8` reorders the 64 input bytes so each 8-byte group within
-///      the output is one byte-chunk's worth of `x_small=0..8` bytes.
-///   2. Three rounds of bit-swap at distances 7, 14, 28 across `uint64x2_t`
-///      lanes do the actual 8×8 bit transpose.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
-    use core::arch::aarch64::*;
-
-    unsafe {
-        let in_ptr = input.as_ptr();
-        let v0 = vld1q_u8(in_ptr);
-        let v1 = vld1q_u8(in_ptr.add(16));
-        let v2 = vld1q_u8(in_ptr.add(32));
-        let v3 = vld1q_u8(in_ptr.add(48));
-        let table = uint8x16x4_t(v0, v1, v2, v3);
-
-        // vqtbl4q indexes that bring bytes belonging to byte-chunk b ∈ 0..8
-        // into contiguous 8-byte runs, packed two-chunks-per-Q-reg.
-        const IDX0: [u8; 16] = [0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57];
-        const IDX1: [u8; 16] = [2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59];
-        const IDX2: [u8; 16] = [4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61];
-        const IDX3: [u8; 16] = [6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
-
-        let mut y0 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX0.as_ptr())));
-        let mut y1 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX1.as_ptr())));
-        let mut y2 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX2.as_ptr())));
-        let mut y3 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX3.as_ptr())));
-
-        let mask1 = vdupq_n_u64(0x00AA00AA00AA00AA);
-        let mask2 = vdupq_n_u64(0x0000CCCC0000CCCC);
-        let mask3 = vdupq_n_u64(0x00000000F0F0F0F0);
-
-        // Round 1: distance 7.
-        let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<7>(y0)), mask1);
-        let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<7>(y1)), mask1);
-        let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<7>(y2)), mask1);
-        let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<7>(y3)), mask1);
-        y0 = veorq_u64(y0, veorq_u64(t0, vshlq_n_u64::<7>(t0)));
-        y1 = veorq_u64(y1, veorq_u64(t1, vshlq_n_u64::<7>(t1)));
-        y2 = veorq_u64(y2, veorq_u64(t2, vshlq_n_u64::<7>(t2)));
-        y3 = veorq_u64(y3, veorq_u64(t3, vshlq_n_u64::<7>(t3)));
-
-        // Round 2: distance 14.
-        let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<14>(y0)), mask2);
-        let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<14>(y1)), mask2);
-        let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<14>(y2)), mask2);
-        let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<14>(y3)), mask2);
-        y0 = veorq_u64(y0, veorq_u64(t0, vshlq_n_u64::<14>(t0)));
-        y1 = veorq_u64(y1, veorq_u64(t1, vshlq_n_u64::<14>(t1)));
-        y2 = veorq_u64(y2, veorq_u64(t2, vshlq_n_u64::<14>(t2)));
-        y3 = veorq_u64(y3, veorq_u64(t3, vshlq_n_u64::<14>(t3)));
-
-        // Round 3: distance 28.
-        let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<28>(y0)), mask3);
-        let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<28>(y1)), mask3);
-        let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<28>(y2)), mask3);
-        let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<28>(y3)), mask3);
-        y0 = veorq_u64(y0, veorq_u64(t0, vshlq_n_u64::<28>(t0)));
-        y1 = veorq_u64(y1, veorq_u64(t1, vshlq_n_u64::<28>(t1)));
-        y2 = veorq_u64(y2, veorq_u64(t2, vshlq_n_u64::<28>(t2)));
-        y3 = veorq_u64(y3, veorq_u64(t3, vshlq_n_u64::<28>(t3)));
-
-        let out_ptr = output.as_mut_ptr();
-        vst1q_u8(out_ptr, vreinterpretq_u8_u64(y0));
-        vst1q_u8(out_ptr.add(16), vreinterpretq_u8_u64(y1));
-        vst1q_u8(out_ptr.add(32), vreinterpretq_u8_u64(y2));
-        vst1q_u8(out_ptr.add(48), vreinterpretq_u8_u64(y3));
-    }
-}
-
-/// AVX-512 (VBMI) 64-byte bit-transpose — direct port of the NEON two-stage
-/// algorithm. `_mm512_permutexvar_epi8` does the byte-gather (NEON `vqtbl4q`)
-/// in one instruction; the three masked bit-swap rounds (distances 7/14/28)
-/// are identical to the NEON version, applied to all eight 64-bit lanes at once.
-///
-/// Replaces `bit_transpose_64bytes_scalar` (512 branchy bit ops/call) — which
-/// profiling showed was ~85% of round1's time on x86.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi"
-))]
-#[target_feature(enable = "avx512vbmi,avx512bw,avx512f")]
-unsafe fn bit_transpose_64bytes_avx512(input: &[u8; 64], output: &mut [u8; 64]) {
-    use core::arch::x86_64::*;
-    // Gather index = NEON IDX0 ++ IDX1 ++ IDX2 ++ IDX3 (the 8×8 byte transpose).
-    #[rustfmt::skip]
-    const IDX: [i8; 64] = [
-        0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
-        2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
-        4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
-        6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
-    ];
-    unsafe {
-        let inp = _mm512_loadu_si512(input.as_ptr() as *const __m512i);
-        let idx = _mm512_loadu_si512(IDX.as_ptr() as *const __m512i);
-        let mut y = _mm512_permutexvar_epi8(idx, inp); // y[i] = input[IDX[i]]
-
-        let mask1 = _mm512_set1_epi64(0x00AA00AA00AA00AAu64 as i64);
-        let mask2 = _mm512_set1_epi64(0x0000CCCC0000CCCCu64 as i64);
-        let mask3 = _mm512_set1_epi64(0x00000000F0F0F0F0u64 as i64);
-
-        let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<7>(y)), mask1);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<7>(t)));
-        let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<14>(y)), mask2);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<14>(t)));
-        let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<28>(y)), mask3);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<28>(t)));
-
-        _mm512_storeu_si512(output.as_mut_ptr() as *mut __m512i, y);
-    }
-}
-
 #[inline]
 pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: aarch64 statically guarantees NEON.
-    unsafe {
-        bit_transpose_64bytes_neon(input, output)
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "avx512vbmi"
-    ))]
-    // SAFETY: all target features required by the kernel are enabled.
-    unsafe {
-        bit_transpose_64bytes_avx512(input, output)
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw",
-            target_feature = "avx512vbmi"
-        ),
-    )))]
-    bit_transpose_64bytes_scalar(input, output);
+    kernels::bit_transpose_64bytes(input, output);
 }
 
 // ---------------------------------------------------------------------------
@@ -378,458 +238,6 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 // Output `out[lane]` is the F_8 representative of Σ_K x^K · y_K[lane] mod p.
 // ---------------------------------------------------------------------------
 
-// Intermediate-stage NEON kernel: scalar `inv_table.apply` writing to
-// `a_col`/`b_col` Vecs, then NEON `gf8_mul_vec16` from those Vecs. Superseded
-// by `shift_reduce_inner_ab_fused_neon` which keeps everything register-
-// resident; kept under `#[allow(dead_code)]` as a cross-check oracle.
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
-fn shift_reduce_inner_ab_neon(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
-    b_med: usize,
-    out: &mut [u8; 64],
-    a_col: &mut [F8],
-    b_col: &mut [F8],
-) {
-    use crate::field::gf2_8::neon::{gf8_mul_vec16, gf8_reduce_vec16};
-    use core::arch::aarch64::*;
-
-    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-
-    // Four (lo, hi) pairs of u16x8 accumulators = 64 u16 lanes total, matching
-    // the 64 lanes of the inv-NTT output.
-    unsafe {
-        let mut acc0_lo = vdupq_n_u16(0);
-        let mut acc0_hi = vdupq_n_u16(0);
-        let mut acc1_lo = vdupq_n_u16(0);
-        let mut acc1_hi = vdupq_n_u16(0);
-        let mut acc2_lo = vdupq_n_u16(0);
-        let mut acc2_hi = vdupq_n_u16(0);
-        let mut acc3_lo = vdupq_n_u16(0);
-        let mut acc3_hi = vdupq_n_u16(0);
-
-        // Per-K step: scalar inv-NTT apply into a_col/b_col, then NEON load +
-        // 4× gf8_mul_vec16 + 8× vshll_n_u8::<K> + 8× veorq_u16 into the accs.
-        // K is `const` so vshll_n_u8 specializes per call site.
-        macro_rules! step_k {
-            ($k:literal) => {{
-                let chunk_off = byte_base_b + $k * N_CHUNKS;
-                inv_table.apply(&a_packed[chunk_off..chunk_off + N_CHUNKS], a_col);
-                inv_table.apply(&b_packed[chunk_off..chunk_off + N_CHUNKS], b_col);
-                let a_ptr = a_col.as_ptr() as *const u8;
-                let b_ptr = b_col.as_ptr() as *const u8;
-                let y0 = gf8_mul_vec16(vld1q_u8(a_ptr), vld1q_u8(b_ptr));
-                let y1 = gf8_mul_vec16(vld1q_u8(a_ptr.add(16)), vld1q_u8(b_ptr.add(16)));
-                let y2 = gf8_mul_vec16(vld1q_u8(a_ptr.add(32)), vld1q_u8(b_ptr.add(32)));
-                let y3 = gf8_mul_vec16(vld1q_u8(a_ptr.add(48)), vld1q_u8(b_ptr.add(48)));
-                acc0_lo = veorq_u16(acc0_lo, vshll_n_u8::<$k>(vget_low_u8(y0)));
-                acc0_hi = veorq_u16(acc0_hi, vshll_n_u8::<$k>(vget_high_u8(y0)));
-                acc1_lo = veorq_u16(acc1_lo, vshll_n_u8::<$k>(vget_low_u8(y1)));
-                acc1_hi = veorq_u16(acc1_hi, vshll_n_u8::<$k>(vget_high_u8(y1)));
-                acc2_lo = veorq_u16(acc2_lo, vshll_n_u8::<$k>(vget_low_u8(y2)));
-                acc2_hi = veorq_u16(acc2_hi, vshll_n_u8::<$k>(vget_high_u8(y2)));
-                acc3_lo = veorq_u16(acc3_lo, vshll_n_u8::<$k>(vget_low_u8(y3)));
-                acc3_hi = veorq_u16(acc3_hi, vshll_n_u8::<$k>(vget_high_u8(y3)));
-            }};
-        }
-
-        step_k!(0);
-        step_k!(1);
-        step_k!(2);
-        step_k!(3);
-        step_k!(4);
-        step_k!(5);
-        step_k!(6);
-        step_k!(7);
-
-        // Final F_8 reduction: each (acc_lo, acc_hi) pair → 16 reduced u8 values.
-        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
-        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
-        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
-        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
-
-        let out_ptr = out.as_mut_ptr();
-        vst1q_u8(out_ptr, r0);
-        vst1q_u8(out_ptr.add(16), r1);
-        vst1q_u8(out_ptr.add(32), r2);
-        vst1q_u8(out_ptr.add(48), r3);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Fused NEON inner kernel: inv_NTT apply + F_8 mul + shift_reduce, all in
-// NEON registers (no Vec<F8> round-trip).
-//
-// `xor_apply_byte_into_8_regs::<BH, ODD>` handles one byte position (b ≥ 1).
-// `BH` (= b >> 1) selects which chunk-index XOR to apply; `ODD` (= b & 1)
-// switches on the within-chunk half-swap. Both const-generic so the compiler
-// dead-code-eliminates the if-branch and folds the chunk-index XORs.
-//
-// `fused_apply_one_k::<K>` runs one full K-row: the initial b=0 plain load,
-// 7 calls to the byte helper for b=1..7 (with the specific protocol BH/ODD
-// pattern), one 16-lane F_8 mul per output chunk, and finally widen-shift-XOR
-// into the per-(K, lane) 16-bit accumulators.
-// ---------------------------------------------------------------------------
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
-    table_base: *const u8,
-    a_byte: u8,
-    b_byte: u8,
-    da0: &mut core::arch::aarch64::uint8x16_t,
-    da1: &mut core::arch::aarch64::uint8x16_t,
-    da2: &mut core::arch::aarch64::uint8x16_t,
-    da3: &mut core::arch::aarch64::uint8x16_t,
-    db0: &mut core::arch::aarch64::uint8x16_t,
-    db1: &mut core::arch::aarch64::uint8x16_t,
-    db2: &mut core::arch::aarch64::uint8x16_t,
-    db3: &mut core::arch::aarch64::uint8x16_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let ra = table_base.add(a_byte as usize * 64);
-        let rb = table_base.add(b_byte as usize * 64);
-        let va0 = vld1q_u8(ra.add((0 ^ BH) * 16));
-        let va1 = vld1q_u8(ra.add((1 ^ BH) * 16));
-        let va2 = vld1q_u8(ra.add((2 ^ BH) * 16));
-        let va3 = vld1q_u8(ra.add((3 ^ BH) * 16));
-        let vb0 = vld1q_u8(rb.add((0 ^ BH) * 16));
-        let vb1 = vld1q_u8(rb.add((1 ^ BH) * 16));
-        let vb2 = vld1q_u8(rb.add((2 ^ BH) * 16));
-        let vb3 = vld1q_u8(rb.add((3 ^ BH) * 16));
-        let (va0, va1, va2, va3, vb0, vb1, vb2, vb3) = if ODD {
-            (
-                vextq_u8::<8>(va0, va0),
-                vextq_u8::<8>(va1, va1),
-                vextq_u8::<8>(va2, va2),
-                vextq_u8::<8>(va3, va3),
-                vextq_u8::<8>(vb0, vb0),
-                vextq_u8::<8>(vb1, vb1),
-                vextq_u8::<8>(vb2, vb2),
-                vextq_u8::<8>(vb3, vb3),
-            )
-        } else {
-            (va0, va1, va2, va3, vb0, vb1, vb2, vb3)
-        };
-        *da0 = veorq_u8(*da0, va0);
-        *da1 = veorq_u8(*da1, va1);
-        *da2 = veorq_u8(*da2, va2);
-        *da3 = veorq_u8(*da3, va3);
-        *db0 = veorq_u8(*db0, vb0);
-        *db1 = veorq_u8(*db1, vb1);
-        *db2 = veorq_u8(*db2, vb2);
-        *db3 = veorq_u8(*db3, vb3);
-    }
-}
-
-/// Process one K-row: 8 byte positions of `a` and `b` via the inv_NTT table,
-/// F_8 multiply, widen-shift by K, XOR into the four `(acc_lo, acc_hi)` pairs.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fused_apply_one_k<const K: i32>(
-    table_base: *const u8,
-    a_row: *const u8,
-    b_row: *const u8,
-    acc0_lo: &mut core::arch::aarch64::uint16x8_t,
-    acc0_hi: &mut core::arch::aarch64::uint16x8_t,
-    acc1_lo: &mut core::arch::aarch64::uint16x8_t,
-    acc1_hi: &mut core::arch::aarch64::uint16x8_t,
-    acc2_lo: &mut core::arch::aarch64::uint16x8_t,
-    acc2_hi: &mut core::arch::aarch64::uint16x8_t,
-    acc3_lo: &mut core::arch::aarch64::uint16x8_t,
-    acc3_hi: &mut core::arch::aarch64::uint16x8_t,
-) {
-    use crate::field::gf2_8::neon::gf8_mul_vec16;
-    use core::arch::aarch64::*;
-    unsafe {
-        // b = 0: identity permutation — plain load of the 4 chunks.
-        let ra0 = table_base.add(*a_row as usize * 64);
-        let rb0 = table_base.add(*b_row as usize * 64);
-        let mut da0 = vld1q_u8(ra0);
-        let mut da1 = vld1q_u8(ra0.add(16));
-        let mut da2 = vld1q_u8(ra0.add(32));
-        let mut da3 = vld1q_u8(ra0.add(48));
-        let mut db0 = vld1q_u8(rb0);
-        let mut db1 = vld1q_u8(rb0.add(16));
-        let mut db2 = vld1q_u8(rb0.add(32));
-        let mut db3 = vld1q_u8(rb0.add(48));
-
-        // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
-        xor_apply_byte_into_8_regs::<0, true>(
-            table_base,
-            *a_row.add(1),
-            *b_row.add(1),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
-        );
-        xor_apply_byte_into_8_regs::<1, false>(
-            table_base,
-            *a_row.add(2),
-            *b_row.add(2),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
-        );
-        xor_apply_byte_into_8_regs::<1, true>(
-            table_base,
-            *a_row.add(3),
-            *b_row.add(3),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
-        );
-        xor_apply_byte_into_8_regs::<2, false>(
-            table_base,
-            *a_row.add(4),
-            *b_row.add(4),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
-        );
-        xor_apply_byte_into_8_regs::<2, true>(
-            table_base,
-            *a_row.add(5),
-            *b_row.add(5),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
-        );
-        xor_apply_byte_into_8_regs::<3, false>(
-            table_base,
-            *a_row.add(6),
-            *b_row.add(6),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
-        );
-        xor_apply_byte_into_8_regs::<3, true>(
-            table_base,
-            *a_row.add(7),
-            *b_row.add(7),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
-        );
-
-        // F_8 multiply lane-wise (4 × 16 lanes = 64 total).
-        let y0 = gf8_mul_vec16(da0, db0);
-        let y1 = gf8_mul_vec16(da1, db1);
-        let y2 = gf8_mul_vec16(da2, db2);
-        let y3 = gf8_mul_vec16(da3, db3);
-
-        // Widen-shift by K, XOR into the 16-bit accumulators.
-        *acc0_lo = veorq_u16(*acc0_lo, vshll_n_u8::<K>(vget_low_u8(y0)));
-        *acc0_hi = veorq_u16(*acc0_hi, vshll_n_u8::<K>(vget_high_u8(y0)));
-        *acc1_lo = veorq_u16(*acc1_lo, vshll_n_u8::<K>(vget_low_u8(y1)));
-        *acc1_hi = veorq_u16(*acc1_hi, vshll_n_u8::<K>(vget_high_u8(y1)));
-        *acc2_lo = veorq_u16(*acc2_lo, vshll_n_u8::<K>(vget_low_u8(y2)));
-        *acc2_hi = veorq_u16(*acc2_hi, vshll_n_u8::<K>(vget_high_u8(y2)));
-        *acc3_lo = veorq_u16(*acc3_lo, vshll_n_u8::<K>(vget_low_u8(y3)));
-        *acc3_hi = veorq_u16(*acc3_hi, vshll_n_u8::<K>(vget_high_u8(y3)));
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn shift_reduce_inner_ab_fused_neon(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
-    b_med: usize,
-    out: &mut [u8; 64],
-) {
-    use crate::field::gf2_8::neon::gf8_reduce_vec16;
-    use core::arch::aarch64::*;
-
-    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-    let table_base = inv_table.data_ptr();
-
-    unsafe {
-        let mut acc0_lo = vdupq_n_u16(0);
-        let mut acc0_hi = vdupq_n_u16(0);
-        let mut acc1_lo = vdupq_n_u16(0);
-        let mut acc1_hi = vdupq_n_u16(0);
-        let mut acc2_lo = vdupq_n_u16(0);
-        let mut acc2_hi = vdupq_n_u16(0);
-        let mut acc3_lo = vdupq_n_u16(0);
-        let mut acc3_hi = vdupq_n_u16(0);
-
-        // 8 K-iterations — each consumes N_CHUNKS = 8 packed witness bytes
-        // for `a` and `b`. K is a const generic so `vshll_n_u8::<K>` specializes.
-        macro_rules! do_k {
-            ($k:literal) => {{
-                let off = byte_base_b + $k * N_CHUNKS;
-                fused_apply_one_k::<$k>(
-                    table_base,
-                    a_packed.as_ptr().add(off),
-                    b_packed.as_ptr().add(off),
-                    &mut acc0_lo,
-                    &mut acc0_hi,
-                    &mut acc1_lo,
-                    &mut acc1_hi,
-                    &mut acc2_lo,
-                    &mut acc2_hi,
-                    &mut acc3_lo,
-                    &mut acc3_hi,
-                );
-            }};
-        }
-        do_k!(0);
-        do_k!(1);
-        do_k!(2);
-        do_k!(3);
-        do_k!(4);
-        do_k!(5);
-        do_k!(6);
-        do_k!(7);
-
-        // Reduce 16-bit accs → 16-byte F_8 results (4 × 16 lanes).
-        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
-        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
-        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
-        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
-
-        let p = out.as_mut_ptr();
-        vst1q_u8(p, r0);
-        vst1q_u8(p.add(16), r1);
-        vst1q_u8(p.add(32), r2);
-        vst1q_u8(p.add(48), r3);
-    }
-}
-
-/// SSE/GFNI x86 kernel. The inverse-NTT apply uses its best available x86 path,
-/// writes two 64-byte columns, and this kernel multiplies them four XMM chunks
-/// at a time. Kept as the fallback for GFNI CPUs without AVX-512.
-#[inline]
-#[allow(dead_code)] // unused in native AVX-512 builds; exercised by its oracle test
-#[cfg(all(target_arch = "x86_64", target_feature = "gfni"))]
-#[target_feature(enable = "gfni,sse2")]
-unsafe fn shift_reduce_inner_ab_x86_sse(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
-    b_med: usize,
-    out: &mut [u8; 64],
-    a_col: &mut [F8],
-    b_col: &mut [F8],
-) {
-    use core::arch::x86_64::*;
-    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-
-    // SAFETY: function carries gfni+sse2; raw loads/stores stay within the
-    // validated `a_col`/`b_col` (len ELL) and `out` ([u8; 64]) buffers.
-    unsafe {
-        // 4 byte-accumulators × 16 lanes = ELL = 64 lanes, reduced F_8 values.
-        let mut acc = [_mm_setzero_si128(); 4];
-        for k in 0..8usize {
-            let chunk_off = byte_base_b + k * N_CHUNKS;
-            inv_table.apply(&a_packed[chunk_off..chunk_off + N_CHUNKS], a_col);
-            inv_table.apply(&b_packed[chunk_off..chunk_off + N_CHUNKS], b_col);
-            let a_ptr = a_col.as_ptr() as *const u8;
-            let b_ptr = b_col.as_ptr() as *const u8;
-            let xk = _mm_set1_epi8((1u8 << k) as i8); // x^k as an F_8 byte; k=0 ⇒ 1
-            for c in 0..4usize {
-                let av = _mm_loadu_si128(a_ptr.add(c * 16) as *const __m128i);
-                let bv = _mm_loadu_si128(b_ptr.add(c * 16) as *const __m128i);
-                // y = (a·b) · x^k in F_8. For k=0, xk=1 ⇒ second mul is identity.
-                let y = _mm_gf2p8mul_epi8(_mm_gf2p8mul_epi8(av, bv), xk);
-                acc[c] = _mm_xor_si128(acc[c], y);
-            }
-        }
-        let out_ptr = out.as_mut_ptr();
-        for c in 0..4usize {
-            _mm_storeu_si128(out_ptr.add(c * 16) as *mut __m128i, acc[c]);
-        }
-    }
-}
-
-/// Fused AVX-512/GFNI x86 kernel. Each inverse-NTT apply returns all 64 F_8
-/// evaluations in one ZMM register; the product and x^k scaling stay 64-wide
-/// and register-resident through the final XOR accumulation.
-#[inline]
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "gfni",
-    target_feature = "avx512f",
-    target_feature = "avx512bw"
-))]
-#[target_feature(enable = "gfni,avx512f,avx512bw")]
-unsafe fn shift_reduce_inner_ab_x86_avx512(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
-    b_med: usize,
-    out: &mut [u8; 64],
-) {
-    use core::arch::x86_64::*;
-    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-
-    // SAFETY: the caller's packed-input bounds guarantee 8 readable bytes at
-    // every K-row offset. The table has the protocol-fixed ell=64/chunks=8
-    // shape, and `out` is exactly one writable ZMM register.
-    unsafe {
-        let mut acc = _mm512_setzero_si512();
-        for k in 0..8usize {
-            let off = byte_base_b + k * N_CHUNKS;
-            let av = inv_table.apply_x86_avx512_register_unchecked(a_packed.as_ptr().add(off));
-            let bv = inv_table.apply_x86_avx512_register_unchecked(b_packed.as_ptr().add(off));
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            // x^0 is the multiplicative identity, so avoid one GFNI operation
-            // for the first row.
-            let scaled = if k == 0 {
-                product
-            } else {
-                _mm512_gf2p8mul_epi8(product, _mm512_set1_epi8((1u8 << k) as i8))
-            };
-            acc = _mm512_xor_si512(acc, scaled);
-        }
-        _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
-    }
-}
-
 fn shift_reduce_inner_ab(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -840,104 +248,16 @@ fn shift_reduce_inner_ab(
     a_col: &mut [F8],
     b_col: &mut [F8],
 ) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _ = (a_col, b_col); // unused in the fused path
-        shift_reduce_inner_ab_fused_neon(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            out,
-        );
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    ))]
-    {
-        let _ = (a_col, b_col); // register-fused path has no column scratch
-        // SAFETY: all required target features are enabled at compile time.
-        unsafe {
-            shift_reduce_inner_ab_x86_avx512(
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                b_med,
-                out,
-            );
-        }
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        not(all(target_feature = "avx512f", target_feature = "avx512bw"))
-    ))]
-    {
-        // SAFETY: gfni is enabled at compile time; SSE2 is baseline on x86_64.
-        unsafe {
-            shift_reduce_inner_ab_x86_sse(
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                b_med,
-                out,
-                a_col,
-                b_col,
-            );
-        }
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        all(target_arch = "x86_64", target_feature = "gfni"),
-    )))]
-    {
-        shift_reduce_inner_ab_scalar(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            out,
-            a_col,
-            b_col,
-        );
-    }
-}
-
-/// Kept under `#[allow(dead_code)]` because on aarch64 the dispatcher only
-/// reaches `_neon` — but this scalar version remains the non-aarch64 fallback
-/// AND the cross-check oracle used by `neon_inner_matches_scalar_inner`.
-#[allow(dead_code)]
-fn shift_reduce_inner_ab_scalar(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
-    b_med: usize,
-    out: &mut [u8; 64],
-    a_col: &mut [F8],
-    b_col: &mut [F8],
-) {
-    let mut acc: [u16; 64] = [0u16; 64];
-    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-    for k in 0..8 {
-        let chunk_off = byte_base_b + k * N_CHUNKS;
-        inv_table.apply(&a_packed[chunk_off..chunk_off + N_CHUNKS], a_col);
-        inv_table.apply(&b_packed[chunk_off..chunk_off + N_CHUNKS], b_col);
-        for lane in 0..ELL {
-            let y = (a_col[lane] * b_col[lane]).0 as u16;
-            acc[lane] ^= y << k;
-        }
-    }
-    for lane in 0..ELL {
-        out[lane] = gf8_reduce(acc[lane]);
-    }
+    kernels::shift_reduce_inner_ab(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out,
+        a_col,
+        b_col,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,49 +394,15 @@ fn process_one_x_hi(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                use core::arch::aarch64::*;
-                let convert_ptr = convert.as_ptr() as *const u8;
-                for lane in 0..ELL {
-                    let mut cf_ab = vdupq_n_u8(0);
-                    let mut cf_c = vdupq_n_u8(0);
-                    for b_med in 0..(1 << N_MEDIUM) {
-                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
-                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
-                        cf_ab =
-                            veorq_u8(cf_ab, vld1q_u8(convert_ptr.add((b_med * 256 + v_ab) * 16)));
-                        cf_c = veorq_u8(cf_c, vld1q_u8(convert_ptr.add((b_med * 256 + v_c) * 16)));
-                    }
-                    let cf_ab_u64 = vreinterpretq_u64_u8(cf_ab);
-                    let cf_c_u64 = vreinterpretq_u64_u8(cf_c);
-                    let cf_ab_f = F128 {
-                        lo: vgetq_lane_u64::<0>(cf_ab_u64),
-                        hi: vgetq_lane_u64::<1>(cf_ab_u64),
-                    };
-                    let cf_c_f = F128 {
-                        lo: vgetq_lane_u64::<0>(cf_c_u64),
-                        hi: vgetq_lane_u64::<1>(cf_c_u64),
-                    };
-                    state.partial_ab[lane] += cf_ab_f * eq_lo_val;
-                    state.partial_c[lane] += cf_c_f * eq_lo_val;
-                }
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                for lane in 0..ELL {
-                    let mut cf_ab = F128::ZERO;
-                    let mut cf_c = F128::ZERO;
-                    for b_med in 0..(1 << N_MEDIUM) {
-                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
-                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
-                        cf_ab += convert[b_med * 256 + v_ab];
-                        cf_c += convert[b_med * 256 + v_c];
-                    }
-                    state.partial_ab[lane] += cf_ab * eq_lo_val;
-                    state.partial_c[lane] += cf_c * eq_lo_val;
-                }
-            }
+            kernels::accumulate_convert(
+                &state.chunk_ab_bytes,
+                &state.chunk_c_bytes,
+                1 << N_MEDIUM,
+                convert,
+                eq_lo_val,
+                &mut state.partial_ab,
+                &mut state.partial_c,
+            );
         } else {
             // Partial path: n_b_med ∈ (0, 1 << N_MEDIUM). At most one
             // within_hash_outer value per [`PaddingSpec`] lands here (the
@@ -1140,49 +426,15 @@ fn process_one_x_hi(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                use core::arch::aarch64::*;
-                let convert_ptr = convert.as_ptr() as *const u8;
-                for lane in 0..ELL {
-                    let mut cf_ab = vdupq_n_u8(0);
-                    let mut cf_c = vdupq_n_u8(0);
-                    for b_med in 0..n_b_med {
-                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
-                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
-                        cf_ab =
-                            veorq_u8(cf_ab, vld1q_u8(convert_ptr.add((b_med * 256 + v_ab) * 16)));
-                        cf_c = veorq_u8(cf_c, vld1q_u8(convert_ptr.add((b_med * 256 + v_c) * 16)));
-                    }
-                    let cf_ab_u64 = vreinterpretq_u64_u8(cf_ab);
-                    let cf_c_u64 = vreinterpretq_u64_u8(cf_c);
-                    let cf_ab_f = F128 {
-                        lo: vgetq_lane_u64::<0>(cf_ab_u64),
-                        hi: vgetq_lane_u64::<1>(cf_ab_u64),
-                    };
-                    let cf_c_f = F128 {
-                        lo: vgetq_lane_u64::<0>(cf_c_u64),
-                        hi: vgetq_lane_u64::<1>(cf_c_u64),
-                    };
-                    state.partial_ab[lane] += cf_ab_f * eq_lo_val;
-                    state.partial_c[lane] += cf_c_f * eq_lo_val;
-                }
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                for lane in 0..ELL {
-                    let mut cf_ab = F128::ZERO;
-                    let mut cf_c = F128::ZERO;
-                    for b_med in 0..n_b_med {
-                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
-                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
-                        cf_ab += convert[b_med * 256 + v_ab];
-                        cf_c += convert[b_med * 256 + v_c];
-                    }
-                    state.partial_ab[lane] += cf_ab * eq_lo_val;
-                    state.partial_c[lane] += cf_c * eq_lo_val;
-                }
-            }
+            kernels::accumulate_convert(
+                &state.chunk_ab_bytes,
+                &state.chunk_c_bytes,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                &mut state.partial_ab,
+                &mut state.partial_c,
+            );
         }
     }
 
@@ -1238,76 +490,6 @@ impl WorkerStateWithSHatV {
             local_res_ab: [F128::ZERO; ELL],
             local_res_c_s_0: [F128::ZERO; ELL],
             local_res_c_s_1: [F128::ZERO; ELL],
-        }
-    }
-}
-
-/// x86 AVX-512 convert-table fold for the two-bank C path. Table lookups stay
-/// scalar because their byte-selected addresses are irregular, while four
-/// lanes of each resulting F128 accumulator are multiplied by `eq_lo_val` in
-/// one VPCLMULQDQ batch before being XORed into the worker partials.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
-    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
-    chunk_c_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
-    n_b_med: usize,
-    convert: &[F128],
-    eq_lo_val: F128,
-    partial_ab: &mut [F128; ELL],
-    partial_c_0: &mut [F128; ELL],
-    partial_c_1: &mut [F128; ELL],
-) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
-    use core::arch::x86_64::*;
-    debug_assert!(n_b_med <= 1 << N_MEDIUM);
-    debug_assert_eq!(ELL % 4, 0);
-
-    // SAFETY: the fixed-size input/partial arrays contain every four-lane load
-    // and store below. Convert indices are `b_med * 256 + u8`, bounded by the
-    // 16*256-entry table. The cfg gate supplies both required target features.
-    unsafe {
-        let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
-        for lane in (0..ELL).step_by(4) {
-            let mut cf_ab = [F128::ZERO; 4];
-            let mut cf_c_0 = [F128::ZERO; 4];
-            let mut cf_c_1 = [F128::ZERO; 4];
-            for b_med in 0..n_b_med {
-                let table_base = b_med * 256;
-                for j in 0..4 {
-                    let v_ab = chunk_ab_bytes[b_med][lane + j] as usize;
-                    let v_c = chunk_c_bytes[b_med][lane + j] as usize;
-                    cf_ab[j] += convert[table_base + v_ab];
-                    cf_c_0[j] += convert[table_base + (v_c & 0x55)];
-                    cf_c_1[j] += convert[table_base + (v_c & 0xAA)];
-                }
-            }
-
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
-            let scaled_c_0 =
-                ghash_mul_x4(f128x4_set(cf_c_0[0], cf_c_0[1], cf_c_0[2], cf_c_0[3]), eq);
-            let scaled_c_1 =
-                ghash_mul_x4(f128x4_set(cf_c_1[0], cf_c_1[1], cf_c_1[2], cf_c_1[3]), eq);
-
-            let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
-            let c0_ptr = partial_c_0.as_mut_ptr().add(lane) as *mut __m512i;
-            let c1_ptr = partial_c_1.as_mut_ptr().add(lane) as *mut __m512i;
-            _mm512_storeu_si512(
-                ab_ptr,
-                _mm512_xor_si512(_mm512_loadu_si512(ab_ptr), scaled_ab),
-            );
-            _mm512_storeu_si512(
-                c0_ptr,
-                _mm512_xor_si512(_mm512_loadu_si512(c0_ptr), scaled_c_0),
-            );
-            _mm512_storeu_si512(
-                c1_ptr,
-                _mm512_xor_si512(_mm512_loadu_si512(c1_ptr), scaled_c_1),
-            );
         }
     }
 }
@@ -1368,94 +550,16 @@ fn process_one_x_hi_with_s_hat_v(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                use core::arch::aarch64::*;
-                let convert_ptr = convert.as_ptr() as *const u8;
-                for lane in 0..ELL {
-                    let mut cf_ab = vdupq_n_u8(0);
-                    let mut cf_c_0 = vdupq_n_u8(0);
-                    let mut cf_c_1 = vdupq_n_u8(0);
-                    for b_med in 0..(1 << N_MEDIUM) {
-                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
-                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
-                        let v_c_0 = v_c & 0x55;
-                        let v_c_1 = v_c & 0xAA;
-                        cf_ab =
-                            veorq_u8(cf_ab, vld1q_u8(convert_ptr.add((b_med * 256 + v_ab) * 16)));
-                        cf_c_0 = veorq_u8(
-                            cf_c_0,
-                            vld1q_u8(convert_ptr.add((b_med * 256 + v_c_0) * 16)),
-                        );
-                        cf_c_1 = veorq_u8(
-                            cf_c_1,
-                            vld1q_u8(convert_ptr.add((b_med * 256 + v_c_1) * 16)),
-                        );
-                    }
-                    let cf_ab_u64 = vreinterpretq_u64_u8(cf_ab);
-                    let cf_c_0_u64 = vreinterpretq_u64_u8(cf_c_0);
-                    let cf_c_1_u64 = vreinterpretq_u64_u8(cf_c_1);
-                    let cf_ab_f = F128 {
-                        lo: vgetq_lane_u64::<0>(cf_ab_u64),
-                        hi: vgetq_lane_u64::<1>(cf_ab_u64),
-                    };
-                    let cf_c_0_f = F128 {
-                        lo: vgetq_lane_u64::<0>(cf_c_0_u64),
-                        hi: vgetq_lane_u64::<1>(cf_c_0_u64),
-                    };
-                    let cf_c_1_f = F128 {
-                        lo: vgetq_lane_u64::<0>(cf_c_1_u64),
-                        hi: vgetq_lane_u64::<1>(cf_c_1_u64),
-                    };
-                    state.partial_ab[lane] += cf_ab_f * eq_lo_val;
-                    state.partial_c_0[lane] += cf_c_0_f * eq_lo_val;
-                    state.partial_c_1[lane] += cf_c_1_f * eq_lo_val;
-                }
-            }
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: the cfg gate supplies the SIMD features; fixed-size state
-            // arrays and the convert table satisfy the helper's bounds.
-            unsafe {
-                accumulate_convert_with_s_hat_v_x86_avx512(
-                    &state.chunk_ab_bytes,
-                    &state.chunk_c_bytes,
-                    1 << N_MEDIUM,
-                    convert,
-                    eq_lo_val,
-                    &mut state.partial_ab,
-                    &mut state.partial_c_0,
-                    &mut state.partial_c_1,
-                );
-            }
-            #[cfg(not(any(
-                target_arch = "aarch64",
-                all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "vpclmulqdq"
-                )
-            )))]
-            {
-                for lane in 0..ELL {
-                    let mut cf_ab = F128::ZERO;
-                    let mut cf_c_0 = F128::ZERO;
-                    let mut cf_c_1 = F128::ZERO;
-                    for b_med in 0..(1 << N_MEDIUM) {
-                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
-                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
-                        cf_ab += convert[b_med * 256 + v_ab];
-                        cf_c_0 += convert[b_med * 256 + (v_c & 0x55)];
-                        cf_c_1 += convert[b_med * 256 + (v_c & 0xAA)];
-                    }
-                    state.partial_ab[lane] += cf_ab * eq_lo_val;
-                    state.partial_c_0[lane] += cf_c_0 * eq_lo_val;
-                    state.partial_c_1[lane] += cf_c_1 * eq_lo_val;
-                }
-            }
+            kernels::accumulate_convert_with_s_hat_v(
+                &state.chunk_ab_bytes,
+                &state.chunk_c_bytes,
+                1 << N_MEDIUM,
+                convert,
+                eq_lo_val,
+                &mut state.partial_ab,
+                &mut state.partial_c_0,
+                &mut state.partial_c_1,
+            );
         } else {
             for b_med in 0..n_b_med {
                 shift_reduce_inner_ab(
@@ -1475,94 +579,16 @@ fn process_one_x_hi_with_s_hat_v(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                use core::arch::aarch64::*;
-                let convert_ptr = convert.as_ptr() as *const u8;
-                for lane in 0..ELL {
-                    let mut cf_ab = vdupq_n_u8(0);
-                    let mut cf_c_0 = vdupq_n_u8(0);
-                    let mut cf_c_1 = vdupq_n_u8(0);
-                    for b_med in 0..n_b_med {
-                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
-                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
-                        let v_c_0 = v_c & 0x55;
-                        let v_c_1 = v_c & 0xAA;
-                        cf_ab =
-                            veorq_u8(cf_ab, vld1q_u8(convert_ptr.add((b_med * 256 + v_ab) * 16)));
-                        cf_c_0 = veorq_u8(
-                            cf_c_0,
-                            vld1q_u8(convert_ptr.add((b_med * 256 + v_c_0) * 16)),
-                        );
-                        cf_c_1 = veorq_u8(
-                            cf_c_1,
-                            vld1q_u8(convert_ptr.add((b_med * 256 + v_c_1) * 16)),
-                        );
-                    }
-                    let cf_ab_u64 = vreinterpretq_u64_u8(cf_ab);
-                    let cf_c_0_u64 = vreinterpretq_u64_u8(cf_c_0);
-                    let cf_c_1_u64 = vreinterpretq_u64_u8(cf_c_1);
-                    let cf_ab_f = F128 {
-                        lo: vgetq_lane_u64::<0>(cf_ab_u64),
-                        hi: vgetq_lane_u64::<1>(cf_ab_u64),
-                    };
-                    let cf_c_0_f = F128 {
-                        lo: vgetq_lane_u64::<0>(cf_c_0_u64),
-                        hi: vgetq_lane_u64::<1>(cf_c_0_u64),
-                    };
-                    let cf_c_1_f = F128 {
-                        lo: vgetq_lane_u64::<0>(cf_c_1_u64),
-                        hi: vgetq_lane_u64::<1>(cf_c_1_u64),
-                    };
-                    state.partial_ab[lane] += cf_ab_f * eq_lo_val;
-                    state.partial_c_0[lane] += cf_c_0_f * eq_lo_val;
-                    state.partial_c_1[lane] += cf_c_1_f * eq_lo_val;
-                }
-            }
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: the cfg gate supplies the SIMD features; fixed-size state
-            // arrays and the convert table satisfy the helper's bounds.
-            unsafe {
-                accumulate_convert_with_s_hat_v_x86_avx512(
-                    &state.chunk_ab_bytes,
-                    &state.chunk_c_bytes,
-                    n_b_med,
-                    convert,
-                    eq_lo_val,
-                    &mut state.partial_ab,
-                    &mut state.partial_c_0,
-                    &mut state.partial_c_1,
-                );
-            }
-            #[cfg(not(any(
-                target_arch = "aarch64",
-                all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "vpclmulqdq"
-                )
-            )))]
-            {
-                for lane in 0..ELL {
-                    let mut cf_ab = F128::ZERO;
-                    let mut cf_c_0 = F128::ZERO;
-                    let mut cf_c_1 = F128::ZERO;
-                    for b_med in 0..n_b_med {
-                        let v_ab = state.chunk_ab_bytes[b_med][lane] as usize;
-                        let v_c = state.chunk_c_bytes[b_med][lane] as usize;
-                        cf_ab += convert[b_med * 256 + v_ab];
-                        cf_c_0 += convert[b_med * 256 + (v_c & 0x55)];
-                        cf_c_1 += convert[b_med * 256 + (v_c & 0xAA)];
-                    }
-                    state.partial_ab[lane] += cf_ab * eq_lo_val;
-                    state.partial_c_0[lane] += cf_c_0 * eq_lo_val;
-                    state.partial_c_1[lane] += cf_c_1 * eq_lo_val;
-                }
-            }
+            kernels::accumulate_convert_with_s_hat_v(
+                &state.chunk_ab_bytes,
+                &state.chunk_c_bytes,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                &mut state.partial_ab,
+                &mut state.partial_c_0,
+                &mut state.partial_c_1,
+            );
         }
     }
 
