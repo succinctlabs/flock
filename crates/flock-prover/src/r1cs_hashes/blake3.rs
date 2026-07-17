@@ -173,15 +173,20 @@ pub const G_MSG_IDX: [[usize; 2]; N_G_PER_ROUND] = [
 // out_hi) packs after the two slots. The re-layout is purely a change of these
 // base offsets — all bit placement goes through the `*_bit` accessors below.
 pub const SLOT_BITS: usize = 256; // 2^8, one 256-bit chaining value
+// Slot-aligned layout: every externally meaningful region (cv, out, the two
+// message halves, and the domain fields) starts on a 256-bit slot boundary so
+// each can be addressed by a structured MLE claim point (tau_pos, slot sel,
+// instance). The domain fields and the z-constant share one aligned slot whose
+// contents are all protocol constants, making the whole slot pinnable.
 pub const CV_BASE: usize = 0; // input region, slot 0: [0, 256)
 pub const OUT_LO_BASE: usize = SLOT_BITS; // output region, slot 1: [256, 512)
-pub const Z_CONST_POS: usize = 2 * SLOT_BITS; // 512
-pub const M_BASE: usize = Z_CONST_POS + 1; // 513
-pub const T_LO_BASE: usize = M_BASE + 16 * WORD_BITS; // 1025
-pub const T_HI_BASE: usize = T_LO_BASE + WORD_BITS; // 1057
-pub const BLEN_BASE: usize = T_HI_BASE + WORD_BITS; // 1089
-pub const FLAGS_BASE: usize = BLEN_BASE + WORD_BITS; // 1121
-pub const GS_BASE: usize = FLAGS_BASE + WORD_BITS; // 1153
+pub const M_BASE: usize = 2 * SLOT_BITS; // 512, slots 2-3: [512, 1024)
+pub const T_LO_BASE: usize = M_BASE + 16 * WORD_BITS; // 1024, domain slot: [1024, 1280)
+pub const T_HI_BASE: usize = T_LO_BASE + WORD_BITS; // 1056
+pub const BLEN_BASE: usize = T_HI_BASE + WORD_BITS; // 1088
+pub const FLAGS_BASE: usize = BLEN_BASE + WORD_BITS; // 1120
+pub const Z_CONST_POS: usize = FLAGS_BASE + WORD_BITS; // 1152 (inside the domain slot)
+pub const GS_BASE: usize = T_LO_BASE + SLOT_BITS; // 1280 (slot-aligned)
 pub const OUT_HI_BASE: usize = GS_BASE + N_G * G_STRIDE; // 15,153
 pub const USEFUL_BITS: usize = OUT_HI_BASE + 8 * WORD_BITS; // 15,409
 
@@ -1820,19 +1825,28 @@ mod tests {
 
     #[test]
     fn layout_constants() {
-        // I/O-aligned layout: cv in slot 0, out_lo in slot 1 (both 256-bit).
+        // Slot-aligned layout: cv slot 0, out_lo slot 1, m slots 2-3, and the
+        // domain fields (t, blen, flags, z-const) in one aligned slot, so all
+        // externally meaningful regions are addressable by structured MLE
+        // claim points.
         assert_eq!(CV_BASE, 0);
         assert_eq!(OUT_LO_BASE, 256);
-        assert_eq!(Z_CONST_POS, 512);
-        assert_eq!(M_BASE, 513);
-        assert_eq!(GS_BASE, 1153);
+        assert_eq!(M_BASE, 512);
+        assert_eq!(T_LO_BASE, 1024);
+        assert_eq!(Z_CONST_POS, 1152);
+        assert_eq!(GS_BASE, 1280);
         assert_eq!(G_STRIDE, 250);
         assert_eq!(N_G, 56);
-        assert_eq!(OUT_HI_BASE, 15_153);
-        assert_eq!(USEFUL_BITS, 15_409);
+        assert_eq!(OUT_HI_BASE, 15_280);
+        assert_eq!(USEFUL_BITS, 15_536);
         assert!(USEFUL_BITS <= K);
-        assert_eq!(CV_BASE % SLOT_BITS, 0);
-        assert_eq!(OUT_LO_BASE % SLOT_BITS, 0);
+        // Every claim-addressable region is 256-bit slot aligned.
+        for base in [CV_BASE, OUT_LO_BASE, M_BASE, M_BASE + SLOT_BITS, T_LO_BASE, GS_BASE] {
+            assert_eq!(base % SLOT_BITS, 0);
+        }
+        // The domain slot [T_LO_BASE, GS_BASE) holds only protocol constants:
+        // t_lo, t_hi, blen, flags, z-const, zero padding.
+        assert_eq!(Z_CONST_POS + 1 + 127, GS_BASE);
     }
 
     /// Reference compression matches the `blake3` crate for empty input
