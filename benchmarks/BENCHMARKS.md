@@ -60,7 +60,8 @@ benchmarks/bench_hash_throughput.sh
 ```
 
 The runner prints a Markdown table ready to paste into the README. Defaults are
-best-of-3 measurements at batches 2¹⁰, 2¹², and 2¹⁴. Override them with
+best-of-3 measurements at batches 2¹⁰, 2¹², 2¹⁴, 2¹⁶, and 2¹⁸. Throughput is
+rendered in thousands of hashes per second (`k hashes/s`). Override them with
 `LOG2S="..."`, `RUNS=N`, and `MT_THREADS=N`. Every point includes an untimed
 warm-up proof that is verified before the timed trials.
 

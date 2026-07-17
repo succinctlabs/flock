@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG2S="${LOG2S:-10 12 14}"
+LOG2S="${LOG2S:-10 12 14 16 18}"
 RUNS="${RUNS:-3}"
 
 if [[ -z "${MT_THREADS:-}" ]]; then
@@ -59,13 +59,14 @@ lookup() {
 		-v hash="$hash" -v layout="$layout" -v batch="$batch" -v threads="$threads" \
 		'$1 == "RESULT" && $2 == hash && $3 == layout && $4 == batch && $5 == threads {
 			found = 1
-			printf "%.1f", $7
+			printf "%.1f", $7 / 1000
 			exit
 		}
 		END { if (!found) exit 1 }' "$results"
 }
 
 echo
+echo "Throughput in thousands of hashes per second (k hashes/s; higher is better)."
 echo "| Hash | Batch | 1T row-major | 1T batch-major | ${MT_THREADS}T row-major | ${MT_THREADS}T batch-major |"
 echo "|---|---:|---:|---:|---:|---:|"
 for hash_spec in "sha2:SHA-256" "blake3:BLAKE3" "keccak:Keccak-f[1600]"; do
