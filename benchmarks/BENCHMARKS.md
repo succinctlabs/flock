@@ -49,6 +49,23 @@ cross-prover comparison tables.
 
 ---
 
+## README hash throughput matrix
+
+Regenerate the README table across SHA-256, BLAKE3, and Keccak-f[1600], at
+multiple batch sizes, with row-major and batch-major witnesses, using one
+thread and the machine's physical-core count:
+
+```bash
+benchmarks/bench_hash_throughput.sh
+```
+
+The runner prints a Markdown table ready to paste into the README. Defaults are
+best-of-3 measurements at batches 2¹⁰, 2¹², and 2¹⁴. Override them with
+`LOG2S="..."`, `RUNS=N`, and `MT_THREADS=N`. Every point includes an untimed
+warm-up proof that is verified before the timed trials.
+
+---
+
 ## 1. Native hashing baseline
 
 Per-core software-hashing throughput (the "Native" reference row):

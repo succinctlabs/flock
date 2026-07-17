@@ -166,6 +166,10 @@ name = "native_hash"
 harness = false
 
 [[bench]]
+name = "hash_throughput"
+harness = false
+
+[[bench]]
 name = "ecore_offload_probe"
 harness = false
 
