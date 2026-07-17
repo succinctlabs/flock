@@ -194,7 +194,7 @@ fn bench_keccak(batch: usize, layout: BenchLayout, runs: usize) {
 }
 
 fn parse_log2_batches() -> Vec<u32> {
-    let value = std::env::var("HASH_BENCH_LOG2S").unwrap_or_else(|_| "10 12 14".to_owned());
+    let value = std::env::var("HASH_BENCH_LOG2S").unwrap_or_else(|_| "10 12 14 16 18".to_owned());
     let batches: Vec<u32> = value
         .split([',', ' '])
         .filter(|part| !part.is_empty())

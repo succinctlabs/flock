@@ -58,28 +58,36 @@ cores / 64 hardware threads, 256 GB RAM), measured on Linux x86-64 on
 **AVX-512 + VPCLMULQDQ** (the CPU also supports AVX and AVX2). Multi-threaded
 runs use the 32 physical cores, without SMT.
 
+Throughput in thousands of hashes per second (`k hashes/s`; higher is better):
+
 | Hash | Batch | 1T row-major | 1T batch-major | 32T row-major | 32T batch-major |
 |---|---:|---:|---:|---:|---:|
-| SHA-256 | 1024 | 30283.6 | 32211.1 | 84197.8 | 80355.8 |
-| SHA-256 | 4096 | 34595.0 | 33473.0 | 174886.0 | 144259.7 |
-| SHA-256 | 16384 | 31518.9 | 32845.5 | 248985.2 | 248710.1 |
-| BLAKE3 | 1024 | 35346.7 | 35921.0 | 112434.0 | 99394.9 |
-| BLAKE3 | 4096 | 56776.5 | 58900.6 | 234164.2 | 217310.7 |
-| BLAKE3 | 16384 | 60884.7 | 63222.0 | 409967.1 | 402883.6 |
-| Keccak-f[1600] | 1024 | 19005.0 | 18947.8 | 57544.3 | 54681.3 |
-| Keccak-f[1600] | 4096 | 19388.2 | 19574.2 | 105399.0 | 105880.0 |
-| Keccak-f[1600] | 16384 | 19047.8 | 18782.5 | 137969.2 | 143392.7 |
+| SHA-256 | 1024 | 30.3 | 30.2 | 58.7 | 85.0 |
+| SHA-256 | 4096 | 34.0 | 33.5 | 135.8 | 145.1 |
+| SHA-256 | 16384 | 33.0 | 32.3 | 200.3 | 240.3 |
+| SHA-256 | 65536 | 32.3 | 32.0 | 249.2 | 271.3 |
+| SHA-256 | 262144 | 31.5 | 31.0 | 296.9 | 305.3 |
+| BLAKE3 | 1024 | 34.5 | 34.1 | 105.3 | 109.0 |
+| BLAKE3 | 4096 | 54.7 | 54.0 | 217.7 | 227.1 |
+| BLAKE3 | 16384 | 61.4 | 62.7 | 394.7 | 411.7 |
+| BLAKE3 | 65536 | 62.4 | 64.8 | 541.0 | 540.4 |
+| BLAKE3 | 262144 | 64.1 | 64.8 | 633.9 | 629.8 |
+| Keccak-f[1600] | 1024 | 17.9 | 19.2 | 57.5 | 54.9 |
+| Keccak-f[1600] | 4096 | 18.7 | 19.9 | 109.5 | 106.9 |
+| Keccak-f[1600] | 16384 | 18.1 | 19.0 | 135.4 | 141.6 |
+| Keccak-f[1600] | 65536 | 18.4 | 18.6 | 156.1 | 164.1 |
+| Keccak-f[1600] | 262144 | 18.3 | 17.6 | 159.9 | 164.3 |
 
-All results are hashes/s from the full default Ligerito `prove_fast` path,
-including witness generation and proof construction. SHA-256 and BLAKE3 count
-compression functions; Keccak counts Keccak-f[1600] permutations. “Batch” is
-the number of independent hash operations proved together. Each value is the
-best of three measured proofs after one untimed warm-up; the warm-up proof is
-also verified. Row-major stores each hash witness contiguously, while
-batch-major groups corresponding witness chunks across the batch. The Keccak
-rows use the single-permutation encoder so the two layouts are directly
-comparable; the separate 3-wide Keccak benchmark remains available for maximum
-Keccak throughput.
+The figures measure the full default Ligerito `prove_fast` path, including
+witness generation and proof construction. SHA-256 and BLAKE3 count compression
+functions; Keccak counts Keccak-f[1600] permutations. “Batch” is the number of
+independent hash operations proved together. Each value is the best of three
+measured proofs after one untimed warm-up; the warm-up proof is also verified.
+Row-major stores each hash witness contiguously, while batch-major groups
+corresponding witness chunks across the batch. The Keccak rows use the
+single-permutation encoder so the two layouts are directly comparable; the
+separate 3-wide Keccak benchmark remains available for maximum Keccak
+throughput.
 
 Regenerate the complete table with:
 
