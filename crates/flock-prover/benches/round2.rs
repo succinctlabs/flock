@@ -60,7 +60,20 @@ fn main() {
     let _ = flock_prover::init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — NEON path active)");
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    println!("(target: x86_64 + AVX-512/VPCLMULQDQ path active)");
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )
+    )))]
     println!("(target: scalar fallback)");
 
     for &m in &[16usize, 20, 24, 26, 28, 29] {
@@ -111,9 +124,9 @@ fn main() {
         let mut cs_msg = 0u64;
         for run in 0..n_runs {
             let label = if n_runs == 1 {
-                String::from("fused fold + round-2 msg (NEON)")
+                String::from("fused fold + round-2 msg")
             } else {
-                format!("fused fold + round-2 msg (NEON, run {})", run + 1)
+                format!("fused fold + round-2 msg (run {})", run + 1)
             };
             let t0 = Instant::now();
             let (a_mlv, b_mlv, m1, minf) = uni_skip_fold_and_round_pair_optimized_packed(

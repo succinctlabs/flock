@@ -157,8 +157,13 @@ fn bench_merkle_tree(num_leaves: usize, leaf_size: usize) {
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
-    println!("(target: aarch64 + sha2 — HW SHA-256 crypto extension path active)");
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha2")))]
+    println!("(target: aarch64 + sha2 — four-way HW SHA-256 path active)");
+    #[cfg(all(target_arch = "x86_64", target_feature = "sha"))]
+    println!("(target: x86_64 + SHA-NI — four-way HW SHA-256 path active)");
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "sha2"),
+        all(target_arch = "x86_64", target_feature = "sha")
+    )))]
     println!("(target: software fallback path — HW SHA-256 NOT active)");
 
     header("Streaming SHA-256 (single digest over a large buffer)");

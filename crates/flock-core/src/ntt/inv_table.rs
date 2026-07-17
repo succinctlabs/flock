@@ -28,9 +28,12 @@ pub struct InvNttTableByteSingleGf8 {
     pub k: usize,
     pub ell: usize,
     pub n_chunks: usize,
-    /// `data[w * ell .. (w+1) * ell]` = T_0[w], the XOR-sum of columns of `M`
-    /// indexed by the set bits of `w`.
+    /// Backing allocation for the table plus at most 63 bytes of alignment
+    /// padding. The logical table starts at `data_offset`.
     data: Vec<F8>,
+    /// Start of the logical table inside `data`, chosen so every 64-byte row
+    /// in the production `ell = 64` table starts on a cache-line boundary.
+    data_offset: usize,
 }
 
 impl InvNttTableByteSingleGf8 {
@@ -48,7 +51,15 @@ impl InvNttTableByteSingleGf8 {
             "n_chunks must fit the i'/chunk XOR encoding"
         );
 
-        let mut data = vec![F8::ZERO; 256 * ell];
+        // Vec<F8> only promises byte alignment. Over-allocate and select a
+        // cache-line-aligned logical start so an AVX-512 row load never
+        // straddles two cache lines.
+        const TABLE_ALIGNMENT: usize = 64;
+        let table_len = 256 * ell;
+        let mut data = vec![F8::ZERO; table_len + TABLE_ALIGNMENT - 1];
+        let data_offset = (TABLE_ALIGNMENT - (data.as_ptr() as usize & (TABLE_ALIGNMENT - 1)))
+            & (TABLE_ALIGNMENT - 1);
+        let table = &mut data[data_offset..data_offset + table_len];
 
         // Compute the 8 unit-column images cols[t] = fwd_NTT_Λ ∘ inv_NTT_S (e_t)
         // for t ∈ 0..8. The remaining columns of M are XOR-shifted versions.
@@ -67,19 +78,19 @@ impl InvNttTableByteSingleGf8 {
         // with one XOR per entry.
         for t in 0..8 {
             let entry_start = (1usize << t) * ell;
-            data[entry_start..entry_start + ell].copy_from_slice(&cols[t]);
+            table[entry_start..entry_start + ell].copy_from_slice(&cols[t]);
         }
         for w in 3usize..256 {
             if (w & (w - 1)) == 0 {
                 continue; // skip powers of 2 (already written)
             }
-            let lo_bit = w & w.wrapping_neg(); // w & -w
+            let lo_bit = w.isolate_lowest_one();
             let parent = w ^ lo_bit;
             // Borrow-checker friendly: read parent + bit_v slices, then write entry.
             let (parent_off, bit_off, entry_off) = (parent * ell, lo_bit * ell, w * ell);
             for i in 0..ell {
-                let v = data[parent_off + i] + data[bit_off + i];
-                data[entry_off + i] = v;
+                let v = table[parent_off + i] + table[bit_off + i];
+                table[entry_off + i] = v;
             }
         }
 
@@ -88,6 +99,7 @@ impl InvNttTableByteSingleGf8 {
             ell,
             n_chunks,
             data,
+            data_offset,
         }
     }
 
@@ -96,7 +108,14 @@ impl InvNttTableByteSingleGf8 {
     /// without losing the register-fused layout.
     #[inline]
     pub fn data_ptr(&self) -> *const u8 {
-        self.data.as_ptr() as *const u8
+        // SAFETY: `data_offset` selects a position within the over-allocated
+        // buffer and the allocation cannot move while borrowed through self.
+        unsafe { self.data.as_ptr().add(self.data_offset) as *const u8 }
+    }
+
+    #[inline]
+    fn table(&self) -> &[F8] {
+        &self.data[self.data_offset..self.data_offset + 256 * self.ell]
     }
 
     /// Apply M to a single byte-packed row, in place.
@@ -114,6 +133,19 @@ impl InvNttTableByteSingleGf8 {
             unsafe { self.apply_neon_unchecked(bytes, out) };
             return;
         }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        if self.ell == 64 {
+            // SAFETY: feature-gated avx512f; ell == 64 as required.
+            unsafe { self.apply_x86_avx512_unchecked(bytes, out) };
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.ell >= 16 {
+            // SAFETY: x86_64 statically guarantees SSE2; ell ≥ 16 ⇒ at least
+            // one 128-bit chunk; method validates slice lengths.
+            unsafe { self.apply_x86_unchecked(bytes, out) };
+            return;
+        }
         self.apply_scalar(bytes, out);
     }
 
@@ -123,9 +155,10 @@ impl InvNttTableByteSingleGf8 {
         assert_eq!(bytes.len(), self.n_chunks);
         assert_eq!(out.len(), self.ell);
         out.iter_mut().for_each(|x| *x = F8::ZERO);
+        let table = self.table();
         for (b, &byte_b) in bytes.iter().enumerate() {
             let row_off = byte_b as usize * self.ell;
-            let row = &self.data[row_off..row_off + self.ell];
+            let row = &table[row_off..row_off + self.ell];
             let shift = 8 * b;
             for i in 0..self.ell {
                 out[i] += row[i ^ shift];
@@ -152,7 +185,7 @@ impl InvNttTableByteSingleGf8 {
         assert_eq!(bytes.len(), self.n_chunks);
         assert_eq!(out.len(), self.ell);
         let n128 = self.ell / 16; // 4 for ell = 64
-        let base = self.data.as_ptr() as *const u8;
+        let base = self.data_ptr();
         let out_ptr = out.as_mut_ptr() as *mut u8;
 
         unsafe {
@@ -184,6 +217,131 @@ impl InvNttTableByteSingleGf8 {
                     }
                 }
             }
+        }
+    }
+
+    /// x86_64 variant of `apply` — operates in 16-byte chunks. Direct port of
+    /// [`apply_neon_unchecked`]: SSE2 `_mm_loadu_si128` / `_mm_xor_si128` /
+    /// `_mm_storeu_si128`, with the odd-`b` 8-byte half-swap (`vextq_u8::<8>`)
+    /// realized as `_mm_shuffle_epi32::<0x4E>` (swap the two 64-bit halves).
+    ///
+    /// Replaces the scalar inner loop whose `row[i ^ shift]` gather defeats
+    /// auto-vectorization — this is the single hottest function in the prover.
+    ///
+    /// # Safety
+    /// Caller must be on x86_64 (statically true at the dispatch site). The
+    /// method validates slice lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sse2")]
+    pub unsafe fn apply_x86_unchecked(&self, bytes: &[u8], out: &mut [F8]) {
+        use core::arch::x86_64::*;
+        assert_eq!(bytes.len(), self.n_chunks);
+        assert_eq!(out.len(), self.ell);
+        let n128 = self.ell / 16; // 4 for ell = 64
+        let base = self.data_ptr();
+        let out_ptr = out.as_mut_ptr() as *mut u8;
+
+        unsafe {
+            // b = 0: identity permutation — straight copy from row 0.
+            let row0 = base.add(bytes[0] as usize * self.ell);
+            for c in 0..n128 {
+                let v = _mm_loadu_si128(row0.add(c * 16) as *const __m128i);
+                _mm_storeu_si128(out_ptr.add(c * 16) as *mut __m128i, v);
+            }
+
+            // b ≥ 1: XOR with table row[bytes[b]], permuted.
+            for b in 1..self.n_chunks {
+                let b_high = b >> 1;
+                let b_odd = (b & 1) != 0;
+                let row_b = base.add(bytes[b] as usize * self.ell);
+                if b_odd {
+                    for c in 0..n128 {
+                        let sc = c ^ b_high;
+                        let v = _mm_loadu_si128(row_b.add(sc * 16) as *const __m128i);
+                        // Swap the two 64-bit halves (NEON vextq_u8::<8>(v, v)).
+                        let v_swapped = _mm_shuffle_epi32::<0x4E>(v);
+                        let dst = out_ptr.add(c * 16) as *mut __m128i;
+                        _mm_storeu_si128(dst, _mm_xor_si128(_mm_loadu_si128(dst), v_swapped));
+                    }
+                } else {
+                    for c in 0..n128 {
+                        let sc = c ^ b_high;
+                        let v = _mm_loadu_si128(row_b.add(sc * 16) as *const __m128i);
+                        let dst = out_ptr.add(c * 16) as *mut __m128i;
+                        _mm_storeu_si128(dst, _mm_xor_si128(_mm_loadu_si128(dst), v));
+                    }
+                }
+            }
+        }
+    }
+
+    /// AVX-512 variant for the production `ell = 64` case: the whole output is
+    /// one `__m512i` (the four 16-byte chunks of [`apply_x86_unchecked`]). The
+    /// per-`b` chunk permutation `sc = c ^ (b>>1)` becomes a single
+    /// `shuffle_i64x2` (128-bit-lane permute), the odd-`b` 64-bit half-swap a
+    /// `shuffle_epi32::<0x4E>`, and the running XOR stays in a register —
+    /// stored once at the end. 4× fewer load/store/XOR ops than the SSE path.
+    ///
+    /// # Safety
+    /// Caller must be on x86_64 with `avx512f`, and `self.ell == 64`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn apply_x86_avx512_unchecked(&self, bytes: &[u8], out: &mut [F8]) {
+        assert_eq!(bytes.len(), self.n_chunks);
+        assert_eq!(out.len(), self.ell);
+        debug_assert_eq!(self.ell, 64, "avx512 apply is specialized for ell = 64");
+        // SAFETY: `bytes` contains `n_chunks == 8` readable bytes and `out`
+        // contains `ell == 64` writable bytes.
+        unsafe {
+            use core::arch::x86_64::*;
+            let acc = self.apply_x86_avx512_register_unchecked(bytes.as_ptr());
+            _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
+        }
+    }
+
+    /// Register-returning AVX-512 inverse-NTT apply for the production
+    /// `ell = 64`, `n_chunks = 8` case. This is the computation behind
+    /// [`Self::apply_x86_avx512_unchecked`] without the final store, allowing
+    /// fused consumers to keep the 64 F_8 outputs in a ZMM register.
+    ///
+    /// # Safety
+    /// Caller must have `avx512f`, `self.ell == 64`, `self.n_chunks == 8`, and
+    /// `bytes` must point to eight readable bytes.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub(crate) unsafe fn apply_x86_avx512_register_unchecked(
+        &self,
+        bytes: *const u8,
+    ) -> core::arch::x86_64::__m512i {
+        use core::arch::x86_64::*;
+        debug_assert_eq!(self.ell, 64, "avx512 apply is specialized for ell = 64");
+        debug_assert_eq!(self.n_chunks, 8, "avx512 apply expects eight input bytes");
+        let base = self.data_ptr();
+        // SAFETY: the caller guarantees eight readable input bytes. Every table
+        // index is a u8 and each table row contains exactly 64 readable bytes.
+        unsafe {
+            let row0 = base.add(*bytes as usize * self.ell);
+            let mut acc = _mm512_loadu_si512(row0 as *const __m512i);
+            for b in 1..8 {
+                let row_b = base.add(*bytes.add(b) as usize * self.ell);
+                let v = _mm512_loadu_si512(row_b as *const __m512i);
+                // Output lane c reads source lane c ^ (b >> 1).
+                let perm = match b >> 1 {
+                    0 => v,
+                    1 => _mm512_shuffle_i64x2::<0xB1>(v, v),
+                    2 => _mm512_shuffle_i64x2::<0x4E>(v, v),
+                    _ => _mm512_shuffle_i64x2::<0x1B>(v, v),
+                };
+                // Odd b swaps the two 64-bit halves within every 128-bit lane.
+                let perm = if b & 1 != 0 {
+                    _mm512_shuffle_epi32::<0x4E>(perm)
+                } else {
+                    perm
+                };
+                acc = _mm512_xor_si512(acc, perm);
+            }
+            acc
         }
     }
 
@@ -239,6 +397,16 @@ mod tests {
         ntt_s.inverse(&mut v);
         ntt_l.forward(&mut v);
         v
+    }
+
+    #[test]
+    fn table_storage_is_cache_line_aligned() {
+        for k in 3..=7 {
+            let ntt_s = AdditiveNttGf8::new(k, F8::ZERO);
+            let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
+            let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+            assert_eq!(table.data_ptr() as usize % 64, 0, "k={k}");
+        }
     }
 
     #[test]
@@ -323,6 +491,49 @@ mod tests {
                     "scalar/neon apply disagree at k={k}, bytes={:02x?}",
                     bytes
                 );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn apply_x86_matches_apply_scalar() {
+        // Cover k=4 (n_chunks=2, n128=1), k=5, and k=6 (n_chunks=8, n128=4 —
+        // the headline protocol size).
+        for &k in &[4usize, 5, 6] {
+            let ntt_s = AdditiveNttGf8::new(k, F8::ZERO);
+            let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
+            let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+            let n_chunks = table.n_chunks;
+            let ell = table.ell;
+
+            let mut rng = Rng::new(100 + k as u64);
+            for _ in 0..32 {
+                let bytes: Vec<u8> = (0..n_chunks)
+                    .map(|_| (rng.next_u64() & 0xff) as u8)
+                    .collect();
+                let mut out_scalar = vec![F8::ZERO; ell];
+                let mut out_x86 = vec![F8::ZERO; ell];
+                table.apply_scalar(&bytes, &mut out_scalar);
+                // SAFETY: on x86_64.
+                unsafe { table.apply_x86_unchecked(&bytes, &mut out_x86) };
+                assert_eq!(
+                    out_scalar, out_x86,
+                    "scalar/x86 apply disagree at k={k}, bytes={:02x?}",
+                    bytes
+                );
+                // AVX-512 path is specialized for ell == 64 (k = 6).
+                #[cfg(target_feature = "avx512f")]
+                if ell == 64 {
+                    let mut out_avx = vec![F8::ZERO; ell];
+                    // SAFETY: build carries avx512f; ell == 64.
+                    unsafe { table.apply_x86_avx512_unchecked(&bytes, &mut out_avx) };
+                    assert_eq!(
+                        out_scalar, out_avx,
+                        "scalar/avx512 apply disagree at k={k}, bytes={:02x?}",
+                        bytes
+                    );
+                }
             }
         }
     }

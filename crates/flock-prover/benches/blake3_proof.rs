@@ -94,7 +94,12 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         witness_bytes >> 20
     );
 
-    let setup = Blake3Setup::new(n_blocks);
+    // BLAKE3_BATCH_MAJOR=1 switches the witness layout (WitnessLayout::BatchMajor).
+    let setup = if std::env::var_os("BLAKE3_BATCH_MAJOR").is_some() {
+        Blake3Setup::new_batch_major(n_blocks)
+    } else {
+        Blake3Setup::new(n_blocks)
+    };
     // Generate n_runs + 2 distinct block vectors so each run hits a fresh
     // witness (and therefore a fresh Fiat-Shamir transcript). The first is
     // used for warm-up; the rest for measurements + one spare.

@@ -16,6 +16,8 @@ use std::time::Instant;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use flock_prover::field::gf2_128::aarch64;
 use flock_prover::field::gf2_128::software;
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+use flock_prover::field::gf2_128::x86_64;
 use flock_prover::field::{F8, F128, F256Unreduced};
 
 const N: usize = 100_000_000;
@@ -252,7 +254,7 @@ macro_rules! bench_mul_throughput {
 }
 
 fn bench_f128_mul() {
-    header("F128 mul — all PMULL variants (aarch64 + aes path)");
+    header("F128 mul — hardware variants");
 
     // The default `Mul` impl dispatches to `aarch64::ghash_mul_binius` on
     // M-series with aes enabled, but we benchmark all four variants directly
@@ -285,9 +287,44 @@ fn bench_f128_mul() {
             aarch64::ghash_mul_binius(a, b)
         });
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     {
-        eprintln!("  (aarch64+aes path disabled — software fallback only)");
+        // SAFETY: pclmulqdq is enabled at compile time; every function also
+        // declares the sse4.1 feature it requires.
+        bench_mul_latency!("x86 schoolbook (latency)", |a, b| unsafe {
+            x86_64::ghash_mul_schoolbook(a, b)
+        });
+        bench_mul_throughput!("x86 schoolbook (throughput)", |a, b| unsafe {
+            x86_64::ghash_mul_schoolbook(a, b)
+        });
+        bench_mul_latency!("x86 karatsuba (latency)", |a, b| unsafe {
+            x86_64::ghash_mul_karatsuba(a, b)
+        });
+        bench_mul_throughput!("x86 karatsuba (throughput)", |a, b| unsafe {
+            x86_64::ghash_mul_karatsuba(a, b)
+        });
+        bench_mul_latency!(
+            "x86 karatsuba+barrett (latency)  ← default Mul impl",
+            |a, b| unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) }
+        );
+        bench_mul_throughput!("x86 karatsuba+barrett (throughput)", |a, b| unsafe {
+            x86_64::ghash_mul_karatsuba_barrett(a, b)
+        });
+        bench_mul_latency!("x86 binius (latency)", |a, b| unsafe {
+            x86_64::ghash_mul_binius(a, b)
+        });
+        bench_mul_throughput!("x86 binius (throughput)", |a, b| unsafe {
+            x86_64::ghash_mul_binius(a, b)
+        });
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    )))]
+    {
+        eprintln!("  (hardware carry-less multiply path disabled)");
     }
 
     // Software fallback (bit-loop) — for reference / cross-platform sanity.
@@ -423,8 +460,13 @@ fn main() {
     // Quick build-config sanity print so the reader knows which path is hot.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — PMULL path active)");
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-    println!("(target: software fallback path — NEON/PMULL disabled)");
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    println!("(target: x86_64 + pclmulqdq — PCLMUL path active)");
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    )))]
+    println!("(target: software fallback path — hardware CLMUL disabled)");
 
     println!("(N = {} iterations per measurement)", N);
     println!("Reference (M-series single-thread, prior C++ baseline):");

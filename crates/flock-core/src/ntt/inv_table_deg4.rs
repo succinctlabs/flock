@@ -107,7 +107,7 @@ impl InvNttTableSToV8Gf8 {
             if (w & (w - 1)) == 0 {
                 continue; // skip powers of 2
             }
-            let lo_bit = w & w.wrapping_neg();
+            let lo_bit = w.isolate_lowest_one();
             let parent = w ^ lo_bit;
             let (parent_off, bit_off, entry_off) =
                 (parent * ell_out, lo_bit * ell_out, w * ell_out);

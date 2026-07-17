@@ -1,4 +1,5 @@
-//! Binary Merkle tree with SHA-256, ARM crypto-extension accelerated.
+//! Binary Merkle tree with SHA-256, using four-way hardware SHA interleaving
+//! on supported ARM and x86-64 targets.
 //!
 //! Layout for `num_leaves = 2^k` leaves:
 //!   tree[0..num_leaves]                              = leaf hashes (level k)
@@ -24,6 +25,29 @@ use sha2::{Digest, Sha256};
 
 pub type Hash = [u8; 32];
 
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "sha2"),
+    all(target_arch = "x86_64", target_feature = "sha")
+))]
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "sha2"),
+    all(target_arch = "x86_64", target_feature = "sha")
+))]
+const SHA256_IV: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
 /// 4-way interleaved SHA-256 using ARM crypto-extension intrinsics.
 ///
 /// The M-series SHA unit is pipelined: a single dependent compress
@@ -36,24 +60,8 @@ pub type Hash = [u8; 32];
 /// Digests are byte-identical to `Sha256::digest`.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
 mod sha256x4 {
-    use super::Hash;
+    use super::{Hash, SHA256_IV, SHA256_K};
     use core::arch::aarch64::*;
-
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-
-    const IV_ABCD: [u32; 4] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a];
-    const IV_EFGH: [u32; 4] = [0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
 
     /// One interleaved compression round over 4 independent states.
     /// `blocks[i]` must be ≥ 64 bytes; only the first 64 are consumed.
@@ -80,7 +88,7 @@ mod sha256x4 {
 
             macro_rules! rounds4 {
                 ($msg:expr, $ki:expr) => {{
-                    let kv = vld1q_u32(K.as_ptr().add($ki));
+                    let kv = vld1q_u32(SHA256_K.as_ptr().add($ki));
                     for i in 0..4 {
                         let wk = vaddq_u32($msg[i], kv);
                         let t = abcd[i];
@@ -126,8 +134,8 @@ mod sha256x4 {
         debug_assert!(out.len() >= 4);
 
         unsafe {
-            let mut abcd = [vld1q_u32(IV_ABCD.as_ptr()); 4];
-            let mut efgh = [vld1q_u32(IV_EFGH.as_ptr()); 4];
+            let mut abcd = [vld1q_u32(SHA256_IV.as_ptr()); 4];
+            let mut efgh = [vld1q_u32(SHA256_IV.as_ptr().add(4)); 4];
 
             // Full 64-byte blocks.
             let n_full = len / 64;
@@ -174,6 +182,186 @@ mod sha256x4 {
                 let be_hi = vrev32q_u8(vreinterpretq_u8_u32(efgh[i]));
                 vst1q_u8(out[i].as_mut_ptr(), be_lo);
                 vst1q_u8(out[i].as_mut_ptr().add(16), be_hi);
+            }
+        }
+    }
+}
+
+/// Four SHA-256 streams interleaved across the x86 SHA-NI pipeline.
+///
+/// SHA-NI accelerates one stream but retains a dependent state chain. Running
+/// four independent states round-for-round exposes enough instruction-level
+/// parallelism for bulk Merkle leaves and same-level parent nodes.
+#[cfg(all(target_arch = "x86_64", target_feature = "sha"))]
+mod sha256x4 {
+    use super::{Hash, SHA256_IV, SHA256_K};
+    use core::arch::x86_64::*;
+
+    #[inline(always)]
+    unsafe fn schedule(v0: __m128i, v1: __m128i, v2: __m128i, v3: __m128i) -> __m128i {
+        unsafe {
+            let t1 = _mm_sha256msg1_epu32(v0, v1);
+            let t2 = _mm_alignr_epi8(v3, v2, 4);
+            _mm_sha256msg2_epu32(_mm_add_epi32(t1, t2), v3)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn rounds4(
+        abef: &mut [__m128i; 4],
+        cdgh: &mut [__m128i; 4],
+        words: &[__m128i; 4],
+        group: usize,
+    ) {
+        unsafe {
+            let k = _mm_set_epi32(
+                SHA256_K[4 * group + 3] as i32,
+                SHA256_K[4 * group + 2] as i32,
+                SHA256_K[4 * group + 1] as i32,
+                SHA256_K[4 * group] as i32,
+            );
+            for stream in 0..4 {
+                let wk = _mm_add_epi32(words[stream], k);
+                cdgh[stream] = _mm_sha256rnds2_epu32(cdgh[stream], abef[stream], wk);
+                let wk_hi = _mm_shuffle_epi32(wk, 0x0e);
+                abef[stream] = _mm_sha256rnds2_epu32(abef[stream], cdgh[stream], wk_hi);
+            }
+        }
+    }
+
+    /// Compress one block for each of four independent SHA-256 states.
+    ///
+    /// # Safety
+    /// Every block pointer must expose 64 readable bytes. The module cfg
+    /// guarantees SHA-NI, SSE2, SSSE3, and SSE4.1 on the compiled target.
+    #[inline(always)]
+    unsafe fn compress4(abef: &mut [__m128i; 4], cdgh: &mut [__m128i; 4], blocks: [*const u8; 4]) {
+        unsafe {
+            let endian = _mm_set_epi64x(
+                0x0c0d_0e0f_0809_0a0bu64 as i64,
+                0x0405_0607_0001_0203u64 as i64,
+            );
+            let mut w0 = [_mm_setzero_si128(); 4];
+            let mut w1 = [_mm_setzero_si128(); 4];
+            let mut w2 = [_mm_setzero_si128(); 4];
+            let mut w3 = [_mm_setzero_si128(); 4];
+            for stream in 0..4 {
+                let data = blocks[stream].cast::<__m128i>();
+                w0[stream] = _mm_shuffle_epi8(_mm_loadu_si128(data), endian);
+                w1[stream] = _mm_shuffle_epi8(_mm_loadu_si128(data.add(1)), endian);
+                w2[stream] = _mm_shuffle_epi8(_mm_loadu_si128(data.add(2)), endian);
+                w3[stream] = _mm_shuffle_epi8(_mm_loadu_si128(data.add(3)), endian);
+            }
+
+            let abef_saved = *abef;
+            let cdgh_saved = *cdgh;
+
+            macro_rules! schedule_rounds4 {
+                ($dst:ident, $v1:ident, $v2:ident, $v3:ident, $group:expr) => {{
+                    for stream in 0..4 {
+                        $dst[stream] =
+                            schedule($dst[stream], $v1[stream], $v2[stream], $v3[stream]);
+                    }
+                    rounds4(abef, cdgh, &$dst, $group);
+                }};
+            }
+
+            rounds4(abef, cdgh, &w0, 0);
+            rounds4(abef, cdgh, &w1, 1);
+            rounds4(abef, cdgh, &w2, 2);
+            rounds4(abef, cdgh, &w3, 3);
+            schedule_rounds4!(w0, w1, w2, w3, 4);
+            schedule_rounds4!(w1, w2, w3, w0, 5);
+            schedule_rounds4!(w2, w3, w0, w1, 6);
+            schedule_rounds4!(w3, w0, w1, w2, 7);
+            schedule_rounds4!(w0, w1, w2, w3, 8);
+            schedule_rounds4!(w1, w2, w3, w0, 9);
+            schedule_rounds4!(w2, w3, w0, w1, 10);
+            schedule_rounds4!(w3, w0, w1, w2, 11);
+            schedule_rounds4!(w0, w1, w2, w3, 12);
+            schedule_rounds4!(w1, w2, w3, w0, 13);
+            schedule_rounds4!(w2, w3, w0, w1, 14);
+            schedule_rounds4!(w3, w0, w1, w2, 15);
+
+            for stream in 0..4 {
+                abef[stream] = _mm_add_epi32(abef[stream], abef_saved[stream]);
+                cdgh[stream] = _mm_add_epi32(cdgh[stream], cdgh_saved[stream]);
+            }
+        }
+    }
+
+    /// Hash four equal-length inputs, producing standard SHA-256 digests.
+    #[inline]
+    pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
+        let len = inputs[0].len();
+        debug_assert!(inputs.iter().all(|input| input.len() == len));
+        debug_assert!(out.len() >= 4);
+
+        // SAFETY: the module is compiled only with SHA-NI enabled. Full-block
+        // pointers and fixed tail buffers satisfy compress4's 64-byte bound.
+        unsafe {
+            let state = SHA256_IV.as_ptr().cast::<__m128i>();
+            let dcba = _mm_loadu_si128(state);
+            let efgh = _mm_loadu_si128(state.add(1));
+            let cdab = _mm_shuffle_epi32(dcba, 0xb1);
+            let efgh = _mm_shuffle_epi32(efgh, 0x1b);
+            let abef_initial = _mm_alignr_epi8(cdab, efgh, 8);
+            let cdgh_initial = _mm_blend_epi16(efgh, cdab, 0xf0);
+            let mut abef = [abef_initial; 4];
+            let mut cdgh = [cdgh_initial; 4];
+
+            for block in 0..(len / 64) {
+                compress4(
+                    &mut abef,
+                    &mut cdgh,
+                    [
+                        inputs[0].as_ptr().add(block * 64),
+                        inputs[1].as_ptr().add(block * 64),
+                        inputs[2].as_ptr().add(block * 64),
+                        inputs[3].as_ptr().add(block * 64),
+                    ],
+                );
+            }
+
+            let rem = len % 64;
+            let tail_blocks = if rem < 56 { 1 } else { 2 };
+            let mut tails = [[0u8; 128]; 4];
+            for stream in 0..4 {
+                tails[stream][..rem].copy_from_slice(&inputs[stream][len - rem..]);
+                tails[stream][rem] = 0x80;
+                tails[stream][tail_blocks * 64 - 8..tail_blocks * 64]
+                    .copy_from_slice(&((len as u64) * 8).to_be_bytes());
+            }
+            for block in 0..tail_blocks {
+                compress4(
+                    &mut abef,
+                    &mut cdgh,
+                    [
+                        tails[0].as_ptr().add(block * 64),
+                        tails[1].as_ptr().add(block * 64),
+                        tails[2].as_ptr().add(block * 64),
+                        tails[3].as_ptr().add(block * 64),
+                    ],
+                );
+            }
+
+            let endian = _mm_set_epi64x(
+                0x0c0d_0e0f_0809_0a0bu64 as i64,
+                0x0405_0607_0001_0203u64 as i64,
+            );
+            for stream in 0..4 {
+                let feba = _mm_shuffle_epi32(abef[stream], 0x1b);
+                let dchg = _mm_shuffle_epi32(cdgh[stream], 0xb1);
+                let dcba = _mm_blend_epi16(feba, dchg, 0xf0);
+                let hgef = _mm_alignr_epi8(dchg, feba, 8);
+                _mm_storeu_si128(
+                    out[stream].as_mut_ptr().cast::<__m128i>(),
+                    _mm_shuffle_epi8(dcba, endian),
+                );
+                _mm_storeu_si128(
+                    out[stream].as_mut_ptr().add(16).cast::<__m128i>(),
+                    _mm_shuffle_epi8(hgef, endian),
+                );
             }
         }
     }
@@ -268,7 +456,10 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
     let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
 
     // 1. Leaves — fully parallel; 4-way interleaved SHA where available.
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "sha2"),
+        all(target_arch = "x86_64", target_feature = "sha")
+    ))]
     {
         tree[..num_leaves]
             .par_chunks_mut(4)
@@ -298,7 +489,10 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
                 }
             });
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha2")))]
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "sha2"),
+        all(target_arch = "x86_64", target_feature = "sha")
+    )))]
     {
         tree[..num_leaves]
             .par_iter_mut()
@@ -318,7 +512,10 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
 
         // 4 parents at a time = 8 contiguous children = 256 contiguous bytes;
         // each parent hashes its 64-byte child pair, interleaved 4-way.
-        #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "sha2"),
+            all(target_arch = "x86_64", target_feature = "sha")
+        ))]
         {
             let read_bytes: &[u8] =
                 unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
@@ -359,7 +556,10 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
                     .for_each(|(outs, children)| hash_quad(outs, children));
             }
         }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "sha2")))]
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "sha2"),
+            all(target_arch = "x86_64", target_feature = "sha")
+        )))]
         {
             write
                 .par_iter_mut()

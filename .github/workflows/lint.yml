@@ -1,9 +1,9 @@
 # Formatting + Clippy gate. Runner scheme follows succinctlabs/sp1
 # (.github/workflows/pr.yml `lint` job): runs-on self-hosted runners.
 #
-# arm64 runner on purpose: flock's hot kernels are aarch64/NEON paths behind
-# `cfg(target_arch = "aarch64")` — clippy on arm64 type-checks them instead
-# of the scalar fallbacks.
+# Both architecture legs matter: arm64 type-checks the NEON kernels, while the
+# x86_64 leg enables a representative AVX-512 target so those kernels cannot
+# accumulate target-specific lint or type-checking failures.
 
 name: Lint
 
@@ -19,16 +19,27 @@ concurrency:
 
 jobs:
   lint:
-    name: Formatting & Clippy
+    name: Formatting & Clippy (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: 16cpu-linux-arm64
+            rustflags: -C target-cpu=native
+          - arch: x86_64-avx512
+            runner: 16cpu-linux-x64
+            rustflags: -C target-cpu=znver4
     runs-on:
       [
         runs-on,
-        runner=16cpu-linux-arm64,
+        "runner=${{ matrix.runner }}",
         spot=false,
         "run-id=${{ github.run_id }}",
       ]
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6

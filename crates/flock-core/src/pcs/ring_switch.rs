@@ -198,11 +198,27 @@ pub fn fold_1b_rows_multi_padded(
     // scalar as divisibility drops (only at toy m).
     if k == 2 {
         if packed_witness.len().is_multiple_of(16) {
-            let a0 =
-                fold_1b_rows_1way_mfr_16wide_padded(packed_witness, suffix_tensors[0], padding);
-            let a1 =
-                fold_1b_rows_1way_mfr_16wide_padded(packed_witness, suffix_tensors[1], padding);
-            return vec![a0, a1];
+            // x86_64: one fused 2-way scan (shares gather + bit-transpose).
+            // aarch64: two independent 1-way scans (measured better there —
+            // the fused kernel's register pressure ate the win on M-series).
+            #[cfg(target_arch = "x86_64")]
+            {
+                let (a0, a1) = fold_1b_rows_2way_mfr_16wide_padded(
+                    packed_witness,
+                    suffix_tensors[0],
+                    suffix_tensors[1],
+                    padding,
+                );
+                return vec![a0, a1];
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let a0 =
+                    fold_1b_rows_1way_mfr_16wide_padded(packed_witness, suffix_tensors[0], padding);
+                let a1 =
+                    fold_1b_rows_1way_mfr_16wide_padded(packed_witness, suffix_tensors[1], padding);
+                return vec![a0, a1];
+            }
         }
         if packed_witness.len().is_multiple_of(8) {
             let (a0, a1) = fold_1b_rows_2way_mfr_8wide_padded(
@@ -824,6 +840,91 @@ pub fn fold_1b_rows_1way_mfr_16wide_padded(
 pub fn fold_1b_rows_1way_mfr_16wide_k4(packed_witness: &[F128], t: &[F128]) -> Vec<F128> {
     let m = LOG_PACKING + (packed_witness.len().trailing_zeros() as usize);
     fold_1b_rows_1way_mfr_16wide_padded(packed_witness, t, &PaddingSpec::dense(m))
+}
+
+pub fn fold_1b_rows_2way_mfr_16wide_padded(
+    packed_witness: &[F128],
+    t0: &[F128],
+    t1: &[F128],
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+    let n = 1 << LOG_PACKING;
+    assert_eq!(t0.len(), packed_witness.len());
+    assert_eq!(t1.len(), packed_witness.len());
+    assert!(packed_witness.len().is_multiple_of(16));
+    let skip = ChunkPadding::new(padding, 16);
+
+    packed_witness
+        .par_chunks(16)
+        .zip(t0.par_chunks(16))
+        .zip(t1.par_chunks(16))
+        .enumerate()
+        .fold(
+            || (vec![F128::ZERO; n], vec![F128::ZERO; n]),
+            |(mut a0, mut a1), (chunk_idx, ((m_chunk, t0_chunk), t1_chunk))| {
+                if skip.skip(chunk_idx) {
+                    return (a0, a1);
+                }
+                let t0_0 = subset_sums_4([t0_chunk[0], t0_chunk[1], t0_chunk[2], t0_chunk[3]]);
+                let t0_1 = subset_sums_4([t0_chunk[4], t0_chunk[5], t0_chunk[6], t0_chunk[7]]);
+                let t0_2 = subset_sums_4([t0_chunk[8], t0_chunk[9], t0_chunk[10], t0_chunk[11]]);
+                let t0_3 = subset_sums_4([t0_chunk[12], t0_chunk[13], t0_chunk[14], t0_chunk[15]]);
+                let t1_0 = subset_sums_4([t1_chunk[0], t1_chunk[1], t1_chunk[2], t1_chunk[3]]);
+                let t1_1 = subset_sums_4([t1_chunk[4], t1_chunk[5], t1_chunk[6], t1_chunk[7]]);
+                let t1_2 = subset_sums_4([t1_chunk[8], t1_chunk[9], t1_chunk[10], t1_chunk[11]]);
+                let t1_3 = subset_sums_4([t1_chunk[12], t1_chunk[13], t1_chunk[14], t1_chunk[15]]);
+
+                let mut m_bytes = [[0u8; 16]; 16];
+                for (e, slot) in m_bytes.iter_mut().enumerate() {
+                    slot[..8].copy_from_slice(&m_chunk[e].lo.to_le_bytes());
+                    slot[8..].copy_from_slice(&m_chunk[e].hi.to_le_bytes());
+                }
+
+                for r_byte in 0..16 {
+                    let lo8: u64 = (m_bytes[0][r_byte] as u64)
+                        | ((m_bytes[1][r_byte] as u64) << 8)
+                        | ((m_bytes[2][r_byte] as u64) << 16)
+                        | ((m_bytes[3][r_byte] as u64) << 24)
+                        | ((m_bytes[4][r_byte] as u64) << 32)
+                        | ((m_bytes[5][r_byte] as u64) << 40)
+                        | ((m_bytes[6][r_byte] as u64) << 48)
+                        | ((m_bytes[7][r_byte] as u64) << 56);
+                    let hi8: u64 = (m_bytes[8][r_byte] as u64)
+                        | ((m_bytes[9][r_byte] as u64) << 8)
+                        | ((m_bytes[10][r_byte] as u64) << 16)
+                        | ((m_bytes[11][r_byte] as u64) << 24)
+                        | ((m_bytes[12][r_byte] as u64) << 32)
+                        | ((m_bytes[13][r_byte] as u64) << 40)
+                        | ((m_bytes[14][r_byte] as u64) << 48)
+                        | ((m_bytes[15][r_byte] as u64) << 56);
+                    let tlo = transpose_8x8_bits(lo8).to_le_bytes();
+                    let thi = transpose_8x8_bits(hi8).to_le_bytes();
+                    let base = r_byte * 8;
+                    for p in 0..8 {
+                        let m_lo = tlo[p];
+                        let m_hi = thi[p];
+                        let lo_lo = (m_lo & 0x0F) as usize;
+                        let lo_hi = (m_lo >> 4) as usize;
+                        let hi_lo = (m_hi & 0x0F) as usize;
+                        let hi_hi = (m_hi >> 4) as usize;
+                        a0[base + p] += t0_0[lo_lo] + t0_1[lo_hi] + t0_2[hi_lo] + t0_3[hi_hi];
+                        a1[base + p] += t1_0[lo_lo] + t1_1[lo_hi] + t1_2[hi_lo] + t1_3[hi_hi];
+                    }
+                }
+                (a0, a1)
+            },
+        )
+        .reduce(
+            || (vec![F128::ZERO; n], vec![F128::ZERO; n]),
+            |(mut a0, mut a1), (b0, b1)| {
+                for r in 0..n {
+                    a0[r] += b0[r];
+                    a1[r] += b1[r];
+                }
+                (a0, a1)
+            },
+        )
 }
 
 /// Tensor-split sibling of [`fold_1b_rows_1way_mfr_16wide_padded`]. Instead of
@@ -3351,6 +3452,27 @@ mod tests {
     }
 
     /// `subset_sums_4` matches the obvious specification.
+    #[test]
+    fn mfr_fold_16wide_2way_matches_scalar() {
+        let mut rng = Rng::new(0x161616);
+        for &m in &[11usize, 12, 14, 16] {
+            let l = m - 7;
+            let pw_len = 1usize << l; // divisible by 16 for l >= 4 (m >= 11)
+            let pw: Vec<F128> = (0..pw_len).map(|_| rng.f128()).collect();
+            let suffix0: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+            let suffix1: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+            let t0 = build_eq(&suffix0);
+            let t1 = build_eq(&suffix1);
+
+            let s0_ref = fold_1b_rows_naive(&pw, &t0);
+            let s1_ref = fold_1b_rows_naive(&pw, &t1);
+            let dense = PaddingSpec::dense(m);
+            let (s0, s1) = fold_1b_rows_2way_mfr_16wide_padded(&pw, &t0, &t1, &dense);
+            assert_eq!(s0, s0_ref, "2-way 16wide s0 m={m}");
+            assert_eq!(s1, s1_ref, "2-way 16wide s1 m={m}");
+        }
+    }
+
     #[test]
     fn subset_sums_4_correctness() {
         let mut rng = Rng::new(0xABCD);

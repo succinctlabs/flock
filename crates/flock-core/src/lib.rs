@@ -103,16 +103,23 @@ pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<crate::field::F128> {
 /// Cached [`perf_core_count`]. The uncached version may spawn `sysctl`; this
 /// memoizes it so hot paths can cheaply ask "is the current rayon pool the
 /// homogeneous P-core pool?" (i.e. `current_num_threads() <= this`).
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn perf_core_count_cached() -> usize {
     use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(perf_core_count)
 }
 
-/// Best-effort count of performance cores. On macOS, queries
-/// `hw.perflevel0.physicalcpu` (= P-core count on Apple silicon, =
-/// physical CPU count on Intel). Elsewhere, falls back to
-/// `std::thread::available_parallelism()`.
+/// Best-effort count of **physical** performance cores used to size the
+/// prover's thread pool. The hot phases are CLMUL-heavy and/or
+/// memory-bandwidth-bound; SMT siblings share the core's execution ports and
+/// add no DRAM bandwidth, so running 2 threads per physical core only adds
+/// contention (on a 32C/64T Threadripper the prove is ~16% faster at 32 threads
+/// than 64). On macOS, queries `hw.perflevel0.physicalcpu` (= P-core count on
+/// Apple silicon, = physical CPU count on Intel). On Linux, `available_
+/// parallelism()` counts SMT siblings, so derive physical cores from `/sys`
+/// topology and clamp that host-wide count to the process's affinity/cgroup
+/// availability. Elsewhere, falls back to `available_parallelism()`.
 fn perf_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
@@ -126,7 +133,47 @@ fn perf_core_count() -> usize {
             return n;
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(n) = linux_physical_cores()
+            && n > 0
+        {
+            let available = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            return n.min(available);
+        }
+    }
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// Count distinct physical cores via `/sys` topology: one entry per unique
+/// `(physical_package_id, core_id)` over the online `cpuN` directories. Returns
+/// `None` if the topology can't be read (caller falls back to logical count).
+#[cfg(target_os = "linux")]
+fn linux_physical_cores() -> Option<usize> {
+    use std::collections::HashSet;
+    let mut cores: HashSet<(String, String)> = HashSet::new();
+    for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let Some(rest) = name.strip_prefix("cpu") else {
+            continue;
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            continue; // skip "cpufreq", "cpuidle", etc.
+        }
+        let topo = path.join("topology");
+        let core_id = std::fs::read_to_string(topo.join("core_id")).ok();
+        let pkg = std::fs::read_to_string(topo.join("physical_package_id")).ok();
+        if let (Some(c), Some(p)) = (core_id, pkg) {
+            cores.insert((p.trim().to_owned(), c.trim().to_owned()));
+        }
+    }
+    (!cores.is_empty()).then_some(cores.len())
 }

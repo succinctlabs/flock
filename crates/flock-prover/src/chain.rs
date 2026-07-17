@@ -396,7 +396,7 @@ pub fn fold_contiguous_regions(
     for bo in 0..n_bytes {
         let t = &mut tab[bo];
         for v in 1usize..256 {
-            let lsb = v & v.wrapping_neg(); // lowest set bit
+            let lsb = v.isolate_lowest_one();
             let bit = lsb.trailing_zeros() as usize;
             t[v] = t[v ^ lsb] + region_weights[8 * bo + bit];
         }

@@ -55,8 +55,8 @@ pub fn pack_witness(z: &[bool], m: usize) -> Vec<F128> {
     #[inline]
     fn pack64(b: &[u8]) -> u64 {
         let mut w = 0u64;
-        for (i, ch) in b.chunks_exact(8).enumerate() {
-            let x = u64::from_le_bytes(ch.try_into().unwrap());
+        for (i, ch) in b.as_chunks::<8>().0.iter().enumerate() {
+            let x = u64::from_le_bytes(*ch);
             w |= (x.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * i);
         }
         w

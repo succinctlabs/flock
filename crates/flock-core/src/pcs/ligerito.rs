@@ -2533,6 +2533,106 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
     *evals = folded;
 }
 
+/// Fold `dst[t] = src[2j]·(1+r) + src[2j+1]·r` (j = base+t) 4 lanes at a time.
+/// Deinterleaves the even/odd 128-bit lanes of two consecutive `__m512i` loads
+/// (`permutex2var`), then applies `new = even + r·(even+odd)` — algebraically
+/// identical to `even·(1+r) + odd·r`, so bit-identical to the scalar fold.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`. The source must satisfy
+/// `src.len() >= 2 * (base + dst.len())` so both inputs to every folded pair
+/// are readable.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn fold_lsb_avx512(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    debug_assert!(
+        base <= src.len() / 2 && dst.len() <= src.len() / 2 - base,
+        "fold source must contain both elements for every destination pair"
+    );
+    // SAFETY: caller carries avx512f+vpclmulqdq and guarantees the source
+    // contains both inputs for every destination element.
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        // u64-element selectors: even 128-bit lanes -> {0,1,4,5,8,9,12,13},
+        // odd -> {2,3,6,7,10,11,14,15} over concat(lo, hi).
+        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let len = dst.len();
+        let lanes = len & !3;
+        let mut t = 0;
+        while t < lanes {
+            let s = 2 * (base + t);
+            let lo = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
+            let hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
+            let even = _mm512_permutex2var_epi64(lo, idx_even, hi);
+            let odd = _mm512_permutex2var_epi64(lo, idx_odd, hi);
+            let new = _mm512_xor_si512(even, ghash_mul_x4(r_bcast, _mm512_xor_si512(even, odd)));
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
+            t += 4;
+        }
+        // Scalar tail (len % 4; never hit on the power-of-two parallel chunks).
+        let one_plus_r = F128::ONE + r;
+        while t < len {
+            let s = 2 * (base + t);
+            dst[t] = src[s] * one_plus_r + src[s + 1] * r;
+            t += 1;
+        }
+    }
+}
+
+/// NEON sibling of [`fold_lsb_avx512`]: `dst[t] = src[2j]·(1+r) + src[2j+1]·r`
+/// (j = base+t), 2 lanes per `ghash_mul_vec2_neon`. Uses the same
+/// `new = even + r·(even+odd)` form (algebraically identical to
+/// `even·(1+r) + odd·r`), mirroring [`butterfly_block_neon`]'s structure.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+pub(crate) unsafe fn fold_lsb_neon(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
+    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+    let len = dst.len();
+    let lanes = len & !1;
+    let mut t = 0;
+    while t < lanes {
+        let s = 2 * (base + t);
+        let e0 = src[s];
+        let o0 = src[s + 1];
+        let e1 = src[s + 2];
+        let o1 = src[s + 3];
+        // even ⊕ odd, per lane.
+        let x0 = F128 {
+            lo: e0.lo ^ o0.lo,
+            hi: e0.hi ^ o0.hi,
+        };
+        let x1 = F128 {
+            lo: e1.lo ^ o1.lo,
+            hi: e1.hi ^ o1.hi,
+        };
+        // r·(even⊕odd) for both lanes in one call.
+        // SAFETY: caller carries the aes target feature.
+        let prod = unsafe { ghash_mul_vec2_neon([r, r], [x0, x1]) };
+        dst[t] = F128 {
+            lo: e0.lo ^ prod[0].lo,
+            hi: e0.hi ^ prod[0].hi,
+        };
+        dst[t + 1] = F128 {
+            lo: e1.lo ^ prod[1].lo,
+            hi: e1.hi ^ prod[1].hi,
+        };
+        t += 2;
+    }
+    // Scalar tail (len odd; never hit on the power-of-two parallel chunks).
+    let one_plus_r = F128::ONE + r;
+    while t < len {
+        let s = 2 * (base + t);
+        dst[t] = src[s] * one_plus_r + src[s + 1] * r;
+        t += 1;
+    }
+}
+
 /// Fused fold + next-round message in a SINGLE parallel pass.
 ///
 /// Replaces the three separate passes a sumcheck fold otherwise needs
@@ -2580,8 +2680,21 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
     // power of two, so every chunk has even length and starts at an even
     // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
     const CHUNK: usize = 2048;
-    let mut nf = crate::alloc_uninit_f128_vec(half);
-    let mut nb = crate::alloc_uninit_f128_vec(half);
+    // On x86_64, pull the fold outputs from the prewarmed scratch pool (the
+    // prover gives the previous round's buffers back in `SumcheckProver::fold`),
+    // so the initial sumcheck reuses resident pages instead of faulting ~128 MB
+    // of fresh memory every round. On aarch64 this pooling measured slower, so
+    // there we allocate fresh each round.
+    #[cfg(target_arch = "x86_64")]
+    let (mut nf, mut nb) = (
+        crate::scratch::take_f128(half),
+        crate::scratch::take_f128(half),
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let (mut nf, mut nb) = (
+        crate::alloc_uninit_f128_vec(half),
+        crate::alloc_uninit_f128_vec(half),
+    );
     let (u_0, u_2) = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -2592,6 +2705,31 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
             let mut u0 = F128::ZERO;
             let mut u2 = F128::ZERO;
             // Fold this slice, then pair up the just-folded values for the msg.
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            // SAFETY: the cfg gate guarantees the target features; f and b
+            // each contain exactly two source elements per output element.
+            unsafe {
+                fold_lsb_avx512(f, base, fc, r);
+                fold_lsb_avx512(b, base, bc, r);
+            }
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            // SAFETY: cfg gate guarantees the aes target feature (PMULL).
+            unsafe {
+                fold_lsb_neon(f, base, fc, r);
+                fold_lsb_neon(b, base, bc, r);
+            }
+            #[cfg(not(any(
+                all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ),
+                all(target_arch = "aarch64", target_feature = "aes"),
+            )))]
             for t in 0..len {
                 let j = base + t;
                 fc[t] = f[2 * j] * one_plus_r + f[2 * j + 1] * r;
@@ -2671,8 +2809,21 @@ impl SumcheckProver {
         // message in one parallel pass (was three passes). See
         // [`fold_and_msg_lsb`].
         let (nf, nb, msg) = fold_and_msg_lsb(&self.f, &self.combined_basis, r);
-        self.f = nf;
-        self.combined_basis = nb;
+        // On x86_64, recycle the just-consumed buffers into the scratch pool
+        // (same ownership as the Drop impl) so the next round's
+        // `fold_and_msg_lsb` takes resident pages. aarch64 measured slower with
+        // this pooling, so there we just move the new buffers in and drop the
+        // old ones.
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
+            crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.f = nf;
+            self.combined_basis = nb;
+        }
         self.transcript.push(msg);
         msg
     }
@@ -4910,6 +5061,47 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The NEON sumcheck fold must match the scalar `src[2j]·(1+r)+src[2j+1]·r`
+    /// bit-for-bit (runs only on aarch64+aes, i.e. on Apple Silicon / Mac).
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn fold_lsb_neon_matches_scalar() {
+        // Inline splitmix64.
+        let mut state: u64 = 0xF01D_0BA5_1234_5678;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for _ in 0..256 {
+            let half = 1 + (next() as usize % 50);
+            let base = next() as usize % 8;
+            let n = 2 * (base + half);
+            let mut src = Vec::with_capacity(n);
+            for _ in 0..n {
+                src.push(F128::new(next(), next()));
+            }
+            let r = F128::new(next(), next());
+            let one_plus_r = F128::ONE + r;
+
+            let mut dst_neon = vec![F128::ZERO; half];
+            // SAFETY: aarch64+aes guaranteed by the cfg gate.
+            unsafe { fold_lsb_neon(&src, base, &mut dst_neon, r) };
+
+            let mut dst_scalar = vec![F128::ZERO; half];
+            for t in 0..half {
+                let s = 2 * (base + t);
+                dst_scalar[t] = src[s] * one_plus_r + src[s + 1] * r;
+            }
+            assert_eq!(
+                dst_neon, dst_scalar,
+                "fold_lsb_neon != scalar (half={half}, base={base})"
+            );
+        }
+    }
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the

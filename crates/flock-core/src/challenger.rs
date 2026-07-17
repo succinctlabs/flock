@@ -290,7 +290,9 @@ impl Challenger for FsChallenger {
         let mut buf = vec![0u8; n * 16];
         self.squeeze_into(&mut buf);
         self.absorb(&buf);
-        buf.chunks_exact(16)
+        buf.as_chunks::<16>()
+            .0
+            .iter()
             .map(|c| F128 {
                 lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
                 hi: u64::from_le_bytes(c[8..].try_into().unwrap()),

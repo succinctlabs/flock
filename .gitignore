@@ -52,3 +52,6 @@ skills-lock.json
 
 # Autoresearch loop artifacts (results TSVs, verify scripts, raw bench logs)
 autoresearch/
+
+# Local working notes (review docs, scratch write-ups) — not part of the project
+docs/local/

@@ -81,7 +81,20 @@ fn main() {
     let _ = flock_prover::init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — NEON path active)");
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    println!("(target: x86_64 + AVX-512/VPCLMULQDQ fused path active)");
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )
+    )))]
     println!("(target: scalar fallback)");
 
     // For each m, simulate the state entering round 3:

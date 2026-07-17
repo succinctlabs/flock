@@ -469,7 +469,12 @@ fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
         .map(|(ac, bc)| {
             let mut g1 = F128::ZERO;
             let mut gi = F128::ZERO;
-            for (ap, bp) in ac.chunks_exact(2).zip(bc.chunks_exact(2)) {
+            for (ap, bp) in ac
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(bc.as_chunks::<2>().0.iter())
+            {
                 g1 += ap[1] * bp[1];
                 gi += (ap[0] + ap[1]) * (bp[0] + bp[1]);
             }
@@ -517,10 +522,12 @@ fn fold_and_round_oop_par(
             let mut g1 = F128::ZERO;
             let mut gi = F128::ZERO;
             for (((op, opb), aq), bq) in oa
-                .chunks_exact_mut(2)
-                .zip(ob.chunks_exact_mut(2))
-                .zip(ain.chunks_exact(4))
-                .zip(bin.chunks_exact(4))
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(ob.as_chunks_mut::<2>().0.iter_mut())
+                .zip(ain.as_chunks::<4>().0.iter())
+                .zip(bin.as_chunks::<4>().0.iter())
             {
                 let na0 = aq[0] + r * (aq[1] + aq[0]);
                 let na1 = aq[2] + r * (aq[3] + aq[2]);
@@ -1019,7 +1026,12 @@ mod tests {
                 .map(|(ac, bc)| {
                     let mut g1 = F128::ZERO;
                     let mut gi = F128::ZERO;
-                    for (ap, bp) in ac.chunks_exact(2).zip(bc.chunks_exact(2)) {
+                    for (ap, bp) in ac
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .zip(bc.as_chunks::<2>().0.iter())
+                    {
                         g1 += ap[1] * bp[1];
                         gi += (ap[0] + ap[1]) * (bp[0] + bp[1]);
                     }
