@@ -1,15 +1,15 @@
 //! Serialize / deserialize proofs to bytes (and files).
 //!
-//! Two bundle types: [`R1csProofBundle`] for the base R1CS proof and
-//! [`ChainProofBundle`] for the hash-chain proof. Both pair a proof with its
-//! commitment (which the verifier needs); the chain bundle additionally
-//! carries the public endpoint bits.
+//! Two bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof and
+//! [`ChainProofBundleLigerito`] for the hash-chain proof. Both pair a proof
+//! with its commitment (which the verifier needs); the chain bundle
+//! additionally carries the public endpoint bits.
 //!
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
 //!   byte  5       VERSION                  (currently 1)
-//!   bytes 6..7    flavor: 0 = R1cs, 1 = Chain
+//!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain (0/1 reserved: legacy BaseFold)
 //!   bytes 7..     bincode-serialized payload
 //! ```
 //!
@@ -20,12 +20,12 @@
 //!
 //! ## Round-trip example
 //! ```ignore
-//! let bundle = R1csProofBundle { commitment, proof };
+//! let bundle = R1csProofBundleLigerito { commitment, proof };
 //! let bytes = bundle.to_bytes();
 //! std::fs::write("proof.bin", &bytes)?;
 //! ...
 //! let bytes = std::fs::read("proof.bin")?;
-//! let bundle = R1csProofBundle::from_bytes(&bytes)?;
+//! let bundle = R1csProofBundleLigerito::from_bytes(&bytes)?;
 //! // Then call e.g. `setup.verify(&bundle.commitment, &bundle.proof, ...)`.
 //! ```
 
@@ -34,9 +34,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::r1cs_hashes::chain_common::ChainProof;
 use flock_core::pcs::Commitment;
-use flock_core::proof::R1csProof;
 
 /// Magic bytes prepended to every serialized proof. Lets readers reject
 /// random binary data early.
@@ -82,9 +80,8 @@ impl HashKind {
 }
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
-/// bundle a file holds without parsing the payload first.
-const FLAVOR_R1CS: u8 = 0;
-const FLAVOR_CHAIN: u8 = 1;
+/// bundle a file holds without parsing the payload first. Values 0/1 are
+/// reserved: they were the legacy BaseFold R1cs/Chain flavors.
 const FLAVOR_R1CS_LIGERITO: u8 = 2;
 const FLAVOR_CHAIN_LIGERITO: u8 = 3;
 
@@ -99,7 +96,7 @@ pub enum DeserializeError {
     /// The version byte didn't match this build's `VERSION`. The number is
     /// the version found in the file.
     UnsupportedVersion(u8),
-    /// The flavor byte was neither `0` (R1cs) nor `1` (Chain).
+    /// The flavor byte was neither `2` (R1cs Ligerito) nor `3` (Chain Ligerito).
     UnknownFlavor(u8),
     /// `from_bytes` was called with a slice shorter than `HEADER_LEN`.
     Truncated,
@@ -140,9 +137,9 @@ impl From<bincode::Error> for DeserializeError {
 /// (or a `*Setup`) on the verifier side — that's a public artifact derived
 /// from the setup parameters, not part of the proof.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct R1csProofBundle {
+pub struct R1csProofBundleLigerito {
     pub commitment: Commitment,
-    pub proof: R1csProof,
+    pub proof: flock_core::proof::R1csProofLigerito,
 }
 
 /// Bundles a hash-chain proof with its commitment + public endpoint bits
@@ -150,23 +147,6 @@ pub struct R1csProofBundle {
 /// returned by per-hash `*_to_phys_bits` helpers — `region_bits` long each)
 /// plus the [`HashKind`] discriminator so a verifier can pick the right
 /// per-hash setup from the bundle alone.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChainProofBundle {
-    pub hash_kind: HashKind,
-    pub commitment: Commitment,
-    pub proof: ChainProof,
-    pub cv_0_phys: Vec<bool>,
-    pub cv_last_phys: Vec<bool>,
-}
-
-/// Ligerito-backend mirror of [`R1csProofBundle`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct R1csProofBundleLigerito {
-    pub commitment: Commitment,
-    pub proof: flock_core::proof::R1csProofLigerito,
-}
-
-/// Ligerito-backend mirror of [`ChainProofBundle`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainProofBundleLigerito {
     pub hash_kind: HashKind,
@@ -225,11 +205,7 @@ fn parse_header(bytes: &[u8], expected_flavor: u8) -> Result<&[u8], DeserializeE
         return Err(DeserializeError::UnsupportedVersion(v));
     }
     let flavor = bytes[6];
-    if flavor != FLAVOR_R1CS
-        && flavor != FLAVOR_CHAIN
-        && flavor != FLAVOR_R1CS_LIGERITO
-        && flavor != FLAVOR_CHAIN_LIGERITO
-    {
+    if flavor != FLAVOR_R1CS_LIGERITO && flavor != FLAVOR_CHAIN_LIGERITO {
         return Err(DeserializeError::UnknownFlavor(flavor));
     }
     if flavor != expected_flavor {
@@ -239,44 +215,6 @@ fn parse_header(bytes: &[u8], expected_flavor: u8) -> Result<&[u8], DeserializeE
         });
     }
     Ok(&bytes[HEADER_LEN..])
-}
-
-impl R1csProofBundle {
-    /// Serialize to a self-contained byte vector. Format: 7-byte header
-    /// (magic + version + flavor=0) followed by bincode payload.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
-        write_header(&mut out, FLAVOR_R1CS);
-        // bincode default config: variable-length integer encoding for Vec
-        // lengths etc., little-endian. Deterministic across runs.
-        bincode::serialize_into(&mut out, self).expect("bincode serialize R1csProofBundle");
-        out
-    }
-
-    /// Inverse of [`Self::to_bytes`]. Validates magic/version/flavor before
-    /// deserializing.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
-        let payload = parse_header(bytes, FLAVOR_R1CS)?;
-        Ok(bincode::deserialize(payload)?)
-    }
-}
-
-impl ChainProofBundle {
-    /// Serialize to a self-contained byte vector. Format: 7-byte header
-    /// (magic + version + flavor=1) followed by bincode payload.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
-        write_header(&mut out, FLAVOR_CHAIN);
-        bincode::serialize_into(&mut out, self).expect("bincode serialize ChainProofBundle");
-        out
-    }
-
-    /// Inverse of [`Self::to_bytes`]. Validates magic/version/flavor before
-    /// deserializing.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
-        let payload = parse_header(bytes, FLAVOR_CHAIN)?;
-        Ok(bincode::deserialize(payload)?)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,38 +243,6 @@ pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 
-/// Convenience: write the bundle's bytes to `path` in one call.
-pub fn write_r1cs_bundle_to_file<P: AsRef<Path>>(
-    path: P,
-    bundle: &R1csProofBundle,
-) -> io::Result<()> {
-    write_bytes_to_file(path, &bundle.to_bytes())
-}
-
-/// Convenience: read a `R1csProofBundle` from `path`.
-pub fn read_r1cs_bundle_from_file<P: AsRef<Path>>(
-    path: P,
-) -> Result<R1csProofBundle, BundleReadError> {
-    let bytes = read_bytes_from_file(path).map_err(BundleReadError::Io)?;
-    R1csProofBundle::from_bytes(&bytes).map_err(BundleReadError::Deserialize)
-}
-
-/// Convenience: write the chain bundle's bytes to `path` in one call.
-pub fn write_chain_bundle_to_file<P: AsRef<Path>>(
-    path: P,
-    bundle: &ChainProofBundle,
-) -> io::Result<()> {
-    write_bytes_to_file(path, &bundle.to_bytes())
-}
-
-/// Convenience: read a `ChainProofBundle` from `path`.
-pub fn read_chain_bundle_from_file<P: AsRef<Path>>(
-    path: P,
-) -> Result<ChainProofBundle, BundleReadError> {
-    let bytes = read_bytes_from_file(path).map_err(BundleReadError::Io)?;
-    ChainProofBundle::from_bytes(&bytes).map_err(BundleReadError::Deserialize)
-}
-
 /// Write a Ligerito chain bundle to `path`.
 pub fn write_chain_bundle_ligerito_to_file<P: AsRef<Path>>(
     path: P,
@@ -351,38 +257,6 @@ pub fn read_chain_bundle_ligerito_from_file<P: AsRef<Path>>(
 ) -> Result<ChainProofBundleLigerito, BundleReadError> {
     let bytes = read_bytes_from_file(path).map_err(BundleReadError::Io)?;
     ChainProofBundleLigerito::from_bytes(&bytes).map_err(BundleReadError::Deserialize)
-}
-
-/// Backend-agnostic chain bundle wrapper. Dispatches on the on-disk `FLAVOR`
-/// byte at read time, so callers (e.g. the CLI's verify path) don't need to
-/// know the backend up front.
-#[derive(Clone, Debug)]
-pub enum AnyChainBundle {
-    BaseFold(ChainProofBundle),
-    Ligerito(ChainProofBundleLigerito),
-}
-
-/// Read a chain bundle of either backend flavor from `path`. Peeks at the
-/// flavor byte to decide; returns an [`AnyChainBundle`] for the caller to
-/// dispatch on.
-pub fn read_any_chain_bundle_from_file<P: AsRef<Path>>(
-    path: P,
-) -> Result<AnyChainBundle, BundleReadError> {
-    let bytes = read_bytes_from_file(path).map_err(BundleReadError::Io)?;
-    if bytes.len() < HEADER_LEN {
-        return Err(BundleReadError::Deserialize(DeserializeError::Truncated));
-    }
-    match bytes[6] {
-        FLAVOR_CHAIN => ChainProofBundle::from_bytes(&bytes)
-            .map(AnyChainBundle::BaseFold)
-            .map_err(BundleReadError::Deserialize),
-        FLAVOR_CHAIN_LIGERITO => ChainProofBundleLigerito::from_bytes(&bytes)
-            .map(AnyChainBundle::Ligerito)
-            .map_err(BundleReadError::Deserialize),
-        other => Err(BundleReadError::Deserialize(
-            DeserializeError::UnknownFlavor(other),
-        )),
-    }
 }
 
 /// Combined error returned by file-read helpers: either IO failed or the
@@ -447,37 +321,10 @@ mod tests {
         (blocks, cv0, cv)
     }
 
-    /// Legacy BaseFold bundle roundtrip at small K=8 (m=17).
+    /// Default Ligerito bundle roundtrip, byte-flip rejection, and file
+    /// roundtrip. Requires m ≥ 21 — use n_blocks=256 (m=22 with K_LOG=14).
     #[test]
-    fn r1cs_bundle_basefold_roundtrip() {
-        let setup = Blake3Setup::new(8);
-        let (blocks, _, _) = honest_chain(8, 0xDEAD_BEEF);
-        let mut ch = FsChallenger::new(b"flock-proofio-test");
-        let (proof, commitment, _claim) = setup.prove_fast_basefold(&blocks, &mut ch);
-
-        let bundle = R1csProofBundle {
-            commitment: commitment.clone(),
-            proof: proof.clone(),
-        };
-        let bytes = bundle.to_bytes();
-
-        assert_eq!(&bytes[0..5], &MAGIC);
-        assert_eq!(bytes[5], VERSION);
-        assert_eq!(bytes[6], FLAVOR_R1CS);
-
-        let bundle2 = R1csProofBundle::from_bytes(&bytes).expect("must round-trip");
-        assert_eq!(bundle2.commitment.root, commitment.root);
-
-        let mut chv = FsChallenger::new(b"flock-proofio-test");
-        setup
-            .verify_basefold(&bundle2.commitment, &bundle2.proof, &mut chv)
-            .expect("verify round-tripped R1cs proof");
-    }
-
-    /// Default Ligerito bundle roundtrip. Requires m ≥ 21 — use n_blocks=128
-    /// (m=22 with K_LOG=14).
-    #[test]
-    #[ignore]
+    #[ignore] // Heavier — run with `cargo test r1cs_bundle_roundtrip -- --ignored --nocapture`
     fn r1cs_bundle_roundtrip() {
         // K=256 → n_log=8 → m=22 with BLAKE3 K_LOG=14 (smallest Ligerito target).
         let setup = Blake3Setup::new(256);
@@ -502,6 +349,32 @@ mod tests {
             .verify(&bundle2.commitment, &bundle2.proof, &mut chv)
             .expect("verify round-tripped Ligerito R1cs proof");
 
+        // Byte-flipping inside the payload should make verification reject.
+        // The flip can either fail deserialization OR succeed-then-fail-at-
+        // verify; either is acceptable evidence the proof was consumed.
+        let flip_at = HEADER_LEN + (bytes.len() - HEADER_LEN) / 2;
+        let mut mutated = bytes.clone();
+        mutated[flip_at] ^= 0xFF;
+        match R1csProofBundleLigerito::from_bytes(&mutated) {
+            Err(_) => {}
+            Ok(bundle3) => {
+                let mut chv = FsChallenger::new(b"flock-proofio-lig");
+                let res = setup.verify(&bundle3.commitment, &bundle3.proof, &mut chv);
+                assert!(res.is_err(), "verify must reject byte-mutated proof");
+            }
+        }
+
+        // File roundtrip.
+        let path = std::env::temp_dir().join("flock-proofio-roundtrip.bin");
+        write_bytes_to_file(&path, &bytes).expect("write");
+        let read_back = read_bytes_from_file(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        let bundle4 = R1csProofBundleLigerito::from_bytes(&read_back).expect("file round-trip");
+        let mut chv = FsChallenger::new(b"flock-proofio-lig");
+        setup
+            .verify(&bundle4.commitment, &bundle4.proof, &mut chv)
+            .expect("verify after file round-trip");
+
         eprintln!(
             "Ligerito R1csProofBundle: {} bytes ({:.1} KB)",
             bytes.len(),
@@ -509,15 +382,16 @@ mod tests {
         );
     }
 
-    /// Legacy BaseFold chain bundle roundtrip at small K=8.
+    /// Ligerito chain bundle roundtrip. Requires m ≥ 21 — n=256 blocks.
     #[test]
-    fn chain_bundle_basefold_roundtrip_and_verify() {
-        let setup = Blake3Setup::new(8);
-        let (blocks, cv_0, cv_last) = honest_chain(8, 0xC0FFEE);
+    #[ignore] // Heavier — run with `cargo test chain_bundle_roundtrip -- --ignored --nocapture`
+    fn chain_bundle_roundtrip_and_verify() {
+        let setup = Blake3Setup::new(256);
+        let (blocks, cv_0, cv_last) = honest_chain(256, 0xC0FFEE);
         let mut ch = FsChallenger::new(b"flock-proofio-test");
-        let (proof, commitment) = setup.prove_chain_basefold(&blocks, &mut ch);
+        let (proof, commitment) = setup.prove_chain(&blocks, &mut ch);
 
-        let bundle = ChainProofBundle {
+        let bundle = ChainProofBundleLigerito {
             hash_kind: HashKind::Blake3,
             commitment: commitment.clone(),
             proof: proof.clone(),
@@ -525,15 +399,15 @@ mod tests {
             cv_last_phys: cv_to_phys_bits(&cv_last),
         };
         let bytes = bundle.to_bytes();
-        assert_eq!(bytes[6], FLAVOR_CHAIN);
+        assert_eq!(bytes[6], FLAVOR_CHAIN_LIGERITO);
 
-        let bundle2 = ChainProofBundle::from_bytes(&bytes).expect("chain round-trip");
+        let bundle2 = ChainProofBundleLigerito::from_bytes(&bytes).expect("chain round-trip");
         assert_eq!(bundle2.cv_0_phys, bundle.cv_0_phys);
         assert_eq!(bundle2.cv_last_phys, bundle.cv_last_phys);
 
         let mut chv = FsChallenger::new(b"flock-proofio-test");
         setup
-            .verify_chain_basefold(
+            .verify_chain(
                 &bundle2.commitment,
                 &bundle2.proof,
                 &cv_0,
@@ -548,8 +422,8 @@ mod tests {
         let mut bytes = vec![0u8; HEADER_LEN + 10];
         bytes[0..5].copy_from_slice(b"NOPE!");
         bytes[5] = VERSION;
-        bytes[6] = FLAVOR_R1CS;
-        let res = R1csProofBundle::from_bytes(&bytes);
+        bytes[6] = FLAVOR_R1CS_LIGERITO;
+        let res = R1csProofBundleLigerito::from_bytes(&bytes);
         assert!(matches!(res, Err(DeserializeError::BadMagic)));
     }
 
@@ -558,79 +432,45 @@ mod tests {
         let mut bytes = vec![0u8; HEADER_LEN + 10];
         bytes[0..5].copy_from_slice(&MAGIC);
         bytes[5] = VERSION.wrapping_add(1);
-        bytes[6] = FLAVOR_R1CS;
-        let res = R1csProofBundle::from_bytes(&bytes);
+        bytes[6] = FLAVOR_R1CS_LIGERITO;
+        let res = R1csProofBundleLigerito::from_bytes(&bytes);
         assert!(matches!(res, Err(DeserializeError::UnsupportedVersion(_))));
     }
 
     #[test]
     fn rejects_flavor_mismatch() {
-        // R1CS bundle bytes — try to read as Chain. Uses basefold path since
-        // R1csProofBundle is the BaseFold flavor.
-        let setup = Blake3Setup::new(8);
-        let (blocks, _, _) = honest_chain(8, 0xF00D);
-        let mut ch = FsChallenger::new(b"flock-proofio-test");
-        let (proof, commitment, _) = setup.prove_fast_basefold(&blocks, &mut ch);
-        let bytes = (R1csProofBundle { commitment, proof }).to_bytes();
-        let res = ChainProofBundle::from_bytes(&bytes);
+        // R1CS-flavored header — try to read as Chain. Header validation
+        // fails before any payload deserialization, so zero payload is fine.
+        let mut bytes = vec![0u8; HEADER_LEN + 10];
+        bytes[0..5].copy_from_slice(&MAGIC);
+        bytes[5] = VERSION;
+        bytes[6] = FLAVOR_R1CS_LIGERITO;
+        let res = ChainProofBundleLigerito::from_bytes(&bytes);
         assert!(matches!(
             res,
             Err(DeserializeError::FlavorMismatch {
-                expected: FLAVOR_CHAIN,
-                found: FLAVOR_R1CS
+                expected: FLAVOR_CHAIN_LIGERITO,
+                found: FLAVOR_R1CS_LIGERITO
             })
         ));
     }
 
     #[test]
-    fn rejects_truncated() {
-        let res = R1csProofBundle::from_bytes(&[0u8; 3]);
-        assert!(matches!(res, Err(DeserializeError::Truncated)));
-    }
-
-    /// Byte-flipping inside the payload should make verification reject. The
-    /// flip can either fail deserialization OR succeed-then-fail-at-verify;
-    /// either is acceptable evidence that the proof was actually consumed.
-    #[test]
-    fn payload_byte_flip_caught() {
-        let setup = Blake3Setup::new(8);
-        let (blocks, _, _) = honest_chain(8, 0x1234);
-        let mut ch = FsChallenger::new(b"flock-proofio-test");
-        let (proof, commitment, _) = setup.prove_fast_basefold(&blocks, &mut ch);
-        let bundle = R1csProofBundle { commitment, proof };
-        let bytes = bundle.to_bytes();
-
-        let flip_at = HEADER_LEN + (bytes.len() - HEADER_LEN) / 2;
-        let mut mutated = bytes.clone();
-        mutated[flip_at] ^= 0xFF;
-
-        let parsed: Result<R1csProofBundle, _> = R1csProofBundle::from_bytes(&mutated);
-        match parsed {
-            Err(_) => {}
-            Ok(bundle2) => {
-                let mut chv = FsChallenger::new(b"flock-proofio-test");
-                let res = setup.verify_basefold(&bundle2.commitment, &bundle2.proof, &mut chv);
-                assert!(res.is_err(), "verify must reject byte-mutated proof");
-            }
+    fn rejects_legacy_basefold_flavor() {
+        // Flavor bytes 0/1 were the legacy BaseFold bundles — now unknown.
+        for legacy in [0u8, 1u8] {
+            let mut bytes = vec![0u8; HEADER_LEN + 10];
+            bytes[0..5].copy_from_slice(&MAGIC);
+            bytes[5] = VERSION;
+            bytes[6] = legacy;
+            let res = R1csProofBundleLigerito::from_bytes(&bytes);
+            assert!(matches!(res, Err(DeserializeError::UnknownFlavor(f)) if f == legacy));
         }
     }
 
     #[test]
-    fn file_roundtrip() {
-        let setup = Blake3Setup::new(8);
-        let (blocks, _, _) = honest_chain(8, 0xAA);
-        let mut ch = FsChallenger::new(b"flock-proofio-test");
-        let (proof, commitment, _) = setup.prove_fast_basefold(&blocks, &mut ch);
-        let bundle = R1csProofBundle { commitment, proof };
-
-        let path = std::env::temp_dir().join("flock-proofio-roundtrip.bin");
-        write_r1cs_bundle_to_file(&path, &bundle).expect("write");
-        let bundle2 = read_r1cs_bundle_from_file(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
-
-        let mut chv = FsChallenger::new(b"flock-proofio-test");
-        setup
-            .verify_basefold(&bundle2.commitment, &bundle2.proof, &mut chv)
-            .expect("verify after file round-trip");
+    fn rejects_truncated() {
+        let res = R1csProofBundleLigerito::from_bytes(&[0u8; 3]);
+        assert!(matches!(res, Err(DeserializeError::Truncated)));
     }
 }

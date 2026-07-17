@@ -4,7 +4,8 @@
 //! over `[ab, c] ring-switched + [chain] packed-direct`) is hash-agnostic; only
 //! the *geometry* of where the input/output regions live in a witness block
 //! varies. This module captures that geometry in [`ChainLayout`] and provides
-//! the fully generic [`prove_chain_generic`] / [`verify_chain_generic`]. A
+//! the fully generic [`prove_chain_ligerito_generic`] /
+//! [`verify_chain_ligerito_generic`]. A
 //! per-hash module supplies its `ChainLayout`, a `State → physical-bits`
 //! converter for the public endpoints, and thin wrappers.
 //!
@@ -209,13 +210,13 @@ pub fn assemble_chain_claim(
 
 /// Verifier-side helper: build the chain-claim point identically to
 /// [`assemble_chain_claim`] but without constructing the sparse eq tensor (the
-/// verifier evaluates `eq_eval(point, basefold_challenges)` directly).
 /// Word-index claim point over `L = m − LOG_PACKING` coords, ordered by the
 /// witness layout's address decomposition of a word index:
 /// - RowMajor: `word = (inst << (k_log−7)) | in_block`
 ///   → `[τ_pos…, sel0, 0^high, instance…]`;
 /// - BatchMajor: `word = (in_block << n_log) | inst`
 ///   → `[instance…, τ_pos…, sel0, 0^high]`.
+/// verifier evaluates `eq_eval(point, residual_challenges)` directly).
 fn build_chain_claim_point(
     layout: &ChainLayout,
     wl: flock_core::r1cs::WitnessLayout,
@@ -240,17 +241,8 @@ fn build_chain_claim_point(
 
 /// Proof that `2^n` committed hash instances form a sequential chain
 /// `x_{i+1} = h(x_i)` with public endpoints. Composes the base R1CS sub-proofs,
-/// the shift-sumcheck sub-proof, and ONE PCS open over
+/// the shift-sumcheck sub-proof, and ONE Ligerito PCS open over
 /// `[ab, c] (ring-switched) + [chain] (packed-direct)`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChainProof {
-    pub zerocheck: flock_core::zerocheck::ZerocheckProof,
-    pub lincheck: flock_core::lincheck::LincheckProof,
-    pub shift: crate::chain::ChainShiftProof,
-    pub pcs_open: flock_core::pcs::BatchOpeningProof,
-}
-
-/// Ligerito-backend variant of [`ChainProof`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainProofLigerito {
     pub zerocheck: flock_core::zerocheck::ZerocheckProof,
@@ -270,125 +262,11 @@ pub enum ChainVerifyError {
     Pcs(flock_core::pcs::VerifyError),
 }
 
-/// Generic chain prover. The caller supplies the hash's already-generated packed
-/// witness buffers (`z`, `a`, `b`, lincheck stripe) and the layout; this runs
-/// core → packed-pos fold → shift sumcheck → one batched open over `[ab, c] +
-/// [chain]` where the chain claim is packed-direct.
-#[allow(clippy::too_many_arguments)]
-pub fn prove_chain_generic<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    pcs_params: &PcsParams,
-    layout: &ChainLayout,
-    z_packed: Vec<F128>,
-    a_packed: Vec<F128>,
-    b_packed: Vec<F128>,
-    z_lincheck: Vec<u8>,
-    lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
-    challenger: &mut Ch,
-) -> (ChainProof, Commitment) {
-    let trace = std::env::var("CHAIN_TRACE").is_ok();
-
-    // ---- Core: commit → zerocheck → lincheck → base claims (ab, c).
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let core = crate::prover::prove_fast_core(
-        r1cs,
-        pcs_params,
-        z_packed,
-        a_packed,
-        b_packed,
-        z_lincheck,
-        lincheck_circuit,
-        challenger,
-    );
-    if let Some(t) = t {
-        eprintln!(
-            "[chain] {:<18} {:>8.2} ms",
-            "base_r1cs (zc+lc)",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
-    // ---- Packed-pos fold: sample τ_pos, compute In/Out via τ_pos-MLE of each
-    //      instance's input/output region.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
-    let fold = ChainFold::new(layout, tau_pos);
-    let (in_vals, out_vals) = fold_in_out(layout, r1cs.layout, &core.z_packed, &fold);
-    if let Some(t) = t {
-        eprintln!(
-            "[chain] {:<18} {:>8.2} ms",
-            "fold_in_out",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
-    // ---- Shift sumcheck (samples τ, α internally) → proof + claim pieces.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let (shift, claims) = crate::chain::prove_chain_shift(&in_vals, &out_vals, challenger);
-    let chain_claim = assemble_chain_claim(layout, r1cs.layout, &fold, &claims);
-    if let Some(t) = t {
-        eprintln!(
-            "[chain] {:<18} {:>8.2} ms",
-            "shift_sumcheck",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
-    // ---- Single batched open over [ab, c] (ring-switched) + [chain] (packed-direct).
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let padding = r1cs.padding_spec();
-    let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
-    let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
-    let pre_ab: Option<&[flock_core::field::F128]> = core.s_hat_v_ab.as_deref();
-    let pre_c: Option<&[flock_core::field::F128]> = Some(core.s_hat_v_c.as_slice());
-    let pcs_open = flock_core::pcs::open_batch_mixed_with_precomputed_s_hat_v(
-        &core.z_packed,
-        &core.prover_data,
-        &core.commitment,
-        &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
-        &[pre_ab, pre_c],
-        std::slice::from_ref(&chain_claim),
-        &padding,
-        challenger,
-    );
-    if let Some(t) = t {
-        eprintln!(
-            "[chain] {:<18} {:>8.2} ms",
-            "open_batch",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
-    (
-        ChainProof {
-            zerocheck: core.zc_proof,
-            lincheck: core.lc_proof,
-            shift,
-            pcs_open,
-        },
-        core.commitment,
-    )
-}
-
-/// Ligerito-backend mirror of [`prove_chain_generic`]. Same protocol upstream;
-/// routes the final PCS open through Ligerito + builds the per-hash
-/// LigeritoConfig from the PCS params.
+/// Generic chain prover. The caller supplies the hash's already-generated
+/// packed witness buffers (`z`, `a`, `b`, lincheck stripe) and the layout;
+/// this runs core → packed-pos fold → shift sumcheck → one batched Ligerito
+/// open over `[ab, c] + [chain]` where the chain claim is packed-direct. The
+/// Ligerito config is built from the PCS params.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -467,7 +345,9 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     )
 }
 
-/// Ligerito-backend mirror of [`verify_chain_generic`].
+/// Generic chain verifier. `x0_phys` / `xlast_phys` are the public endpoints
+/// as `region_bits` bools in **physical** within-slot order; `n_log` is the
+/// instance-index arity (`m − k_log`).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_chain_ligerito_generic<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -526,97 +406,6 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
         challenger,
     )
     .map_err(ChainVerifyError::Pcs)?;
-
-    Ok(())
-}
-
-/// Generic chain verifier. `x0_phys` / `xlast_phys` are the public endpoints as
-/// `region_bits` bools in **physical** within-slot order; `n_log` is the
-/// instance-index arity (`m − k_log`).
-#[allow(clippy::too_many_arguments)]
-pub fn verify_chain_generic<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    layout: &ChainLayout,
-    commitment: &Commitment,
-    proof: &ChainProof,
-    n_log: usize,
-    x0_phys: &[bool],
-    xlast_phys: &[bool],
-    lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
-    challenger: &mut Ch,
-) -> Result<(), ChainVerifyError> {
-    let trace = std::env::var("VERIFY_TRACE").is_ok();
-    let fmt = |s: f64| -> String {
-        let ms = s * 1000.0;
-        if ms < 1.0 {
-            format!("{:>8.2} µs", s * 1e6)
-        } else {
-            format!("{:>8.2} ms", ms)
-        }
-    };
-
-    // ---- Replay base core → (ab, c).
-    let t = std::time::Instant::now();
-    let (ab, c) = flock_core::verifier::verify_core(
-        r1cs,
-        &proof.zerocheck,
-        &proof.lincheck,
-        commitment,
-        lincheck_circuit,
-        challenger,
-    )
-    .map_err(ChainVerifyError::R1cs)?;
-    if trace {
-        eprintln!(
-            "    [vch] verify_core (zerocheck+lincheck): {}",
-            fmt(t.elapsed().as_secs_f64())
-        );
-    }
-
-    // ---- Packed-pos fold parameters (matches prover transcript order).
-    let t = std::time::Instant::now();
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
-    let fold = ChainFold::new(layout, tau_pos);
-
-    // ---- Verify the shift sumcheck; fold public endpoints with same τ_pos.
-    let x0_r = fold.fold_public_phys(x0_phys);
-    let xlast_r = fold.fold_public_phys(xlast_phys);
-    let claims = crate::chain::verify_chain_shift(&proof.shift, x0_r, xlast_r, n_log, challenger)
-        .map_err(ChainVerifyError::Shift)?;
-    if trace {
-        eprintln!(
-            "    [vch] τ_pos fold + chain shift sumcheck: {}",
-            fmt(t.elapsed().as_secs_f64())
-        );
-    }
-
-    // ---- Build the packed-direct chain claim point + value, then verify the
-    //      mixed batched open. ab/c go through ring-switch; chain goes
-    //      packed-direct.
-    let t = std::time::Instant::now();
-    let chain_point = build_chain_claim_point(layout, r1cs.layout, &fold, &claims);
-    let ab_x_outer = crate::prover::quirky_x_outer_full(&ab.point);
-    let c_x_outer = crate::prover::quirky_x_outer_full(&c.point);
-    let pd_ref = PackedDirectClaimRef {
-        point: &chain_point,
-        value: claims.value,
-    };
-    flock_core::pcs::verify_opening_batch_mixed(
-        commitment,
-        &[ab.value, c.value],
-        &[ab.point.z_skip, c.point.z_skip],
-        &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
-        std::slice::from_ref(&pd_ref),
-        &proof.pcs_open,
-        challenger,
-    )
-    .map_err(ChainVerifyError::Pcs)?;
-    if trace {
-        eprintln!(
-            "    [vch] PCS verify_opening_batch_mixed (2 rs + 1 pd): {}",
-            fmt(t.elapsed().as_secs_f64())
-        );
-    }
 
     Ok(())
 }

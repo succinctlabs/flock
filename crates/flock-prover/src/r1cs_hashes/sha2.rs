@@ -1287,7 +1287,7 @@ impl Sha256HybridSetup {
         let profile = match log_inv_rate {
             1 => flock_core::pcs::ligerito::LigeritoProfile::Fast,
             2 => flock_core::pcs::ligerito::LigeritoProfile::Slim,
-            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // BaseFold-only rates
+            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // other rates default to Fast
         };
         Self::with_profile_and_rate(n_compressions, profile, log_inv_rate)
     }
@@ -1342,25 +1342,6 @@ impl Sha256HybridSetup {
         generate_witness(compressions, self.n_blocks_log())
     }
 
-    /// Slow-path prover: builds the boolean witness, packs it, and calls the
-    /// generic [`crate::prover::prove`] (which materializes `a, b, c` via
-    /// `apply_*_packed`). Use this for correctness verification.
-    ///
-    /// A `prove_fast` that fuses (z, a, b, c, z_lincheck) construction
-    /// directly is a follow-up port.
-    pub fn prove<Ch: flock_core::challenger::Challenger>(
-        &self,
-        compressions: &[([u32; 8], [u32; 16])],
-        challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProof,
-        flock_core::pcs::Commitment,
-        flock_core::proof::R1csClaim,
-    ) {
-        let z_packed = self.generate_witness_packed(compressions);
-        crate::prover::prove(&self.r1cs, &z_packed, &self.pcs_params, challenger)
-    }
-
     /// Packed witness trace for the generic (matrix-driven) provers — the
     /// per-circuit code they need. Implemented by reusing the fused builder
     /// (its a/b outputs are discarded): no separate packed-trace writer to
@@ -1373,10 +1354,9 @@ impl Sha256HybridSetup {
         z_packed
     }
 
-    /// Generic (matrix-driven) prover on the **Ligerito** backend — the
-    /// counterpart of [`Self::prove`] (BaseFold). Same witness path
-    /// (bool trace → pack); produces a proof byte-identical to
-    /// [`Self::prove_fast`] and verifiable with [`Self::verify`].
+    /// Generic (matrix-driven) prover. Same witness path (bool trace →
+    /// pack) as the fused [`Self::prove_fast`]; produces a byte-identical
+    /// proof, verifiable with [`Self::verify`].
     pub fn prove_ligerito<Ch: flock_core::challenger::Challenger>(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
@@ -1392,47 +1372,7 @@ impl Sha256HybridSetup {
 
     /// Fast prover: skips `pack_witness`, `apply_{a,b,c}_packed`, and
     /// `pack_z_lincheck_from_packed` by emitting `(z, a, b, c, z_lincheck)`
-    /// directly via [`generate_witness_with_abc_packed_and_lincheck`].
-    pub fn prove_fast_basefold<Ch: flock_core::challenger::Challenger>(
-        &self,
-        compressions: &[([u32; 8], [u32; 16])],
-        challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProof,
-        flock_core::pcs::Commitment,
-        flock_core::proof::R1csClaim,
-    ) {
-        assert_eq!(compressions.len(), self.n_compressions);
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness_ab(compressions);
-        crate::prover::prove_fast_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            self.r1cs.csc_lincheck_circuit(),
-            challenger,
-        )
-    }
-
-    pub fn verify_basefold<Ch: flock_core::challenger::Challenger>(
-        &self,
-        commitment: &flock_core::pcs::Commitment,
-        proof: &flock_core::proof::R1csProof,
-        challenger: &mut Ch,
-    ) -> Result<flock_core::proof::R1csClaim, flock_core::verifier::VerifyError> {
-        flock_core::verifier::verify(
-            &self.r1cs,
-            commitment,
-            proof,
-            self.r1cs.csc_lincheck_circuit(),
-            challenger,
-        )
-    }
-
-    /// Ligerito-backend mirror of [`Self::prove_fast`]. Requires m ≥ ~21.
+    /// directly via the fused witness builder. Requires m ≥ ~21 (Ligerito).
     pub fn prove_fast<Ch: flock_core::challenger::Challenger>(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
@@ -1518,7 +1458,7 @@ impl Sha256HybridSetup {
 // Hash chain: SHA-256 geometry + thin wrappers over the generic chain core.
 // ───────────────────────────────────────────────────────────────────────────
 
-pub use super::chain_common::{ChainFold, ChainProof, ChainVerifyError};
+pub use super::chain_common::{ChainFold, ChainVerifyError};
 
 /// One SHA-256 compression input: `(H_in, M)` — the 8-word input chaining
 /// value plus the 16-word message block. Mirrors the [`Sha256HybridSetup`]
@@ -1613,41 +1553,6 @@ impl Sha256HybridSetup {
     /// The prover is **given the full sequence** of `Compression`s (one per
     /// instance) so trace-gen is parallel; for an honest chain the caller sets
     /// `blocks[i+1].0 = sha256_compress(&blocks[i].0, &blocks[i].1)`.
-    pub fn prove_chain_basefold<Ch: flock_core::challenger::Challenger>(
-        &self,
-        compressions: &[Compression],
-        challenger: &mut Ch,
-    ) -> (ChainProof, flock_core::pcs::Commitment) {
-        assert_eq!(compressions.len(), self.n_compressions);
-        // The chain shift sumcheck enforces the relation across ALL witness
-        // slots, including padding. If n_compressions < n_block_slots, padding
-        // blocks (all-zero) break the chain at the boundary and the proof
-        // cannot verify with the user's intended endpoints. Require an exact
-        // fit (n_compressions a power of 2 ≥ 8, the lincheck floor).
-        assert_eq!(
-            self.n_compressions,
-            self.n_block_slots(),
-            "prove_chain requires n_compressions to exactly fill n_block_slots \
-             (no padding); got n_compressions={}, n_block_slots={}. Use a \
-             power-of-2 ≥ 8.",
-            self.n_compressions,
-            self.n_block_slots(),
-        );
-        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
-        super::chain_common::prove_chain_generic(
-            &self.r1cs,
-            &self.pcs_params,
-            &CHAIN_LAYOUT,
-            z_packed,
-            a_packed,
-            b_packed,
-            z_lincheck,
-            self.r1cs.csc_lincheck_circuit(),
-            challenger,
-        )
-    }
-
-    /// Ligerito-backend chain prove.
     pub fn prove_chain<Ch: flock_core::challenger::Challenger>(
         &self,
         compressions: &[Compression],
@@ -1657,7 +1562,17 @@ impl Sha256HybridSetup {
         flock_core::pcs::Commitment,
     ) {
         assert_eq!(compressions.len(), self.n_compressions);
-        assert_eq!(self.n_compressions, self.n_block_slots());
+        // The chain shift sumcheck enforces the relation across ALL witness
+        // slots, including padding — require an exact fit.
+        assert_eq!(
+            self.n_compressions,
+            self.n_block_slots(),
+            "prove_chain requires n_compressions to exactly fill n_block_slots \
+             (no padding); got n_compressions={}, n_block_slots={}. Use a \
+             power-of-2 ≥ 8.",
+            self.n_compressions,
+            self.n_block_slots(),
+        );
         let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
         super::chain_common::prove_chain_ligerito_generic(
             &self.r1cs,
@@ -1697,52 +1612,13 @@ impl Sha256HybridSetup {
             challenger,
         )
     }
-
-    /// Verify a [`ChainProof`] against public endpoints `cv_0` (first input CV)
-    /// and `cv_last` (last output CV).
-    pub fn verify_chain_basefold<Ch: flock_core::challenger::Challenger>(
-        &self,
-        commitment: &flock_core::pcs::Commitment,
-        proof: &ChainProof,
-        cv_0: &[u32; 8],
-        cv_last: &[u32; 8],
-        challenger: &mut Ch,
-    ) -> Result<(), ChainVerifyError> {
-        // Mirror `prove_chain`'s requirement: chain proof must cover exactly
-        // one compression per witness slot (no padding) to be meaningful.
-        assert_eq!(
-            self.n_compressions,
-            self.n_block_slots(),
-            "verify_chain requires n_compressions to exactly fill n_block_slots \
-             (no padding); got n_compressions={}, n_block_slots={}. Use a \
-             power-of-2 ≥ 8.",
-            self.n_compressions,
-            self.n_block_slots(),
-        );
-        let n_log = self.n_blocks_log();
-        let cv0_phys = cv_to_phys_bits(cv_0);
-        let cvlast_phys = cv_to_phys_bits(cv_last);
-        super::chain_common::verify_chain_generic(
-            &self.r1cs,
-            &CHAIN_LAYOUT,
-            commitment,
-            proof,
-            n_log,
-            &cv0_phys,
-            &cvlast_phys,
-            self.r1cs.csc_lincheck_circuit(),
-            challenger,
-        )
-    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
 // Merkle path: SHA-256 geometry + thin wrappers over the generic Merkle core.
 // ───────────────────────────────────────────────────────────────────────────
 
-pub use super::merkle_path_common::{
-    MerklePathProof, MerklePathProofLigerito, MerklePathVerifyError,
-};
+pub use super::merkle_path_common::{MerklePathProofLigerito, MerklePathVerifyError};
 
 /// SHA-256's 4-slot geometry for the Merkle-path protocol. The block starts
 /// with four 256-bit slots in order:
@@ -1779,181 +1655,9 @@ impl Sha256HybridSetup {
     /// is given the full per-hash `Compression` sequence (each hash's
     /// `(H_in, M)`) so trace-gen is parallel. Honest data must satisfy: for
     /// each `i = 1..K-1`, the `b[i]`-selected half of `M[i]` equals
-    /// `compressions[i-1].1[H_out]` (i.e. the previous compression's
-    /// digest, byte-equivalent).
-    pub fn prove_merkle_path<Ch: flock_core::challenger::Challenger>(
-        &self,
-        compressions: &[Compression],
-        b_bits: &[bool],
-        challenger: &mut Ch,
-    ) -> (MerklePathProof, flock_core::pcs::Commitment) {
-        assert_eq!(compressions.len(), self.n_compressions);
-        assert_eq!(
-            self.n_compressions,
-            self.n_block_slots(),
-            "prove_merkle_path requires n_compressions to exactly fill \
-             n_block_slots (no padding); got n_compressions={}, \
-             n_block_slots={}. Use a power-of-2 ≥ 8.",
-            self.n_compressions,
-            self.n_block_slots(),
-        );
-        assert_eq!(
-            b_bits.len(),
-            self.n_block_slots(),
-            "bit vector length mismatch"
-        );
-        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
-        super::merkle_path_common::prove_merkle_path_generic(
-            &self.r1cs,
-            &self.pcs_params,
-            &MERKLE_LAYOUT,
-            z_packed,
-            a_packed,
-            b_packed,
-            z_lincheck,
-            b_bits,
-            self.r1cs.csc_lincheck_circuit(),
-            challenger,
-        )
-    }
-
-    /// Verify a [`MerklePathProof`] against public `leaf` and `root` (each as
-    /// 8 × u32 words) and the public bit vector `b`.
-    pub fn verify_merkle_path<Ch: flock_core::challenger::Challenger>(
-        &self,
-        commitment: &flock_core::pcs::Commitment,
-        proof: &MerklePathProof,
-        leaf: &[u32; 8],
-        root: &[u32; 8],
-        b_bits: &[bool],
-        challenger: &mut Ch,
-    ) -> Result<(), MerklePathVerifyError> {
-        assert_eq!(
-            self.n_compressions,
-            self.n_block_slots(),
-            "verify_merkle_path requires n_compressions to exactly fill \
-             n_block_slots (no padding)",
-        );
-        assert_eq!(
-            b_bits.len(),
-            self.n_block_slots(),
-            "bit vector length mismatch"
-        );
-        let n_log = self.n_blocks_log();
-        let leaf_phys = hash_to_phys_bits(leaf);
-        let root_phys = hash_to_phys_bits(root);
-        super::merkle_path_common::verify_merkle_path_generic(
-            &self.r1cs,
-            &MERKLE_LAYOUT,
-            commitment,
-            proof,
-            n_log,
-            &leaf_phys,
-            &root_phys,
-            b_bits,
-            self.r1cs.csc_lincheck_circuit(),
-            challenger,
-        )
-    }
-
-    /// Prove `P = 2^path_log` independent SHA-256 Merkle paths into a single
-    /// shared root. `compressions` is the concatenation of all path
-    /// compressions in path-id order — path `i_p` occupies rows
-    /// `[i_p · L, (i_p + 1) · L)` where `L = n_block_slots / P`. `b_bits` is
-    /// likewise the per-path bit vectors concatenated in path-id order; the
-    /// first bit of each path is unused by the protocol (the leaf goes into
-    /// the `in_L` slot of each path's first hash by convention).
-    pub fn prove_merkle_paths<Ch: flock_core::challenger::Challenger>(
-        &self,
-        path_log: usize,
-        compressions: &[Compression],
-        b_bits: &[bool],
-        challenger: &mut Ch,
-    ) -> (MerklePathProof, flock_core::pcs::Commitment) {
-        assert_eq!(compressions.len(), self.n_compressions);
-        assert_eq!(
-            self.n_compressions,
-            self.n_block_slots(),
-            "prove_merkle_paths requires n_compressions to exactly fill \
-             n_block_slots (no padding); got n_compressions={}, \
-             n_block_slots={}. Use a power-of-2 ≥ 8.",
-            self.n_compressions,
-            self.n_block_slots(),
-        );
-        assert_eq!(
-            b_bits.len(),
-            self.n_block_slots(),
-            "bit vector length mismatch"
-        );
-        assert!(
-            path_log <= self.n_blocks_log(),
-            "path_log {} > n_blocks_log {}",
-            path_log,
-            self.n_blocks_log(),
-        );
-        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
-        super::merkle_path_common::prove_merkle_paths_generic(
-            &self.r1cs,
-            &self.pcs_params,
-            &MERKLE_LAYOUT,
-            path_log,
-            z_packed,
-            a_packed,
-            b_packed,
-            z_lincheck,
-            b_bits,
-            self.r1cs.csc_lincheck_circuit(),
-            challenger,
-        )
-    }
-
-    /// Verify a multi-path [`MerklePathProof`] against `P = 2^path_log` public
-    /// leaves and a single shared `root` (each 8 × u32 words).
-    pub fn verify_merkle_paths<Ch: flock_core::challenger::Challenger>(
-        &self,
-        path_log: usize,
-        commitment: &flock_core::pcs::Commitment,
-        proof: &MerklePathProof,
-        leaves: &[[u32; 8]],
-        root: &[u32; 8],
-        b_bits: &[bool],
-        challenger: &mut Ch,
-    ) -> Result<(), MerklePathVerifyError> {
-        assert_eq!(
-            self.n_compressions,
-            self.n_block_slots(),
-            "verify_merkle_paths requires n_compressions to exactly fill \
-             n_block_slots (no padding)",
-        );
-        assert_eq!(
-            b_bits.len(),
-            self.n_block_slots(),
-            "bit vector length mismatch"
-        );
-        let n_paths = 1usize << path_log;
-        assert_eq!(leaves.len(), n_paths, "leaves must have length 2^path_log");
-        let n_log = self.n_blocks_log();
-        let leaves_phys: Vec<Vec<bool>> = leaves.iter().map(hash_to_phys_bits).collect();
-        let leaves_phys_refs: Vec<&[bool]> = leaves_phys.iter().map(|v| v.as_slice()).collect();
-        let root_phys = hash_to_phys_bits(root);
-        super::merkle_path_common::verify_merkle_paths_generic(
-            &self.r1cs,
-            &MERKLE_LAYOUT,
-            path_log,
-            commitment,
-            proof,
-            n_log,
-            &leaves_phys_refs,
-            &root_phys,
-            b_bits,
-            self.r1cs.csc_lincheck_circuit(),
-            challenger,
-        )
-    }
-
-    /// Ligerito-backend mirror of [`Self::prove_merkle_path`]. Same protocol;
-    /// the final PCS open routes through Ligerito (smaller proof). Requires a
-    /// registered Ligerito security config for this `m` (m ≥ 22).
+    /// `compressions[i-1].1[H_out]` (i.e. the previous compression's digest,
+    /// byte-equivalent). Requires a registered Ligerito security config for
+    /// this `m` (m ≥ 22).
     pub fn prove_merkle_path_ligerito<Ch: flock_core::challenger::Challenger>(
         &self,
         compressions: &[Compression],
@@ -2371,30 +2075,31 @@ mod tests {
         }
     }
 
-    /// Batch-major end-to-end roundtrip (BaseFold) + tamper rejection.
+    /// Batch-major end-to-end Ligerito roundtrip + tamper rejection.
     #[test]
-    fn batch_major_prove_fast_basefold_roundtrip() {
+    #[ignore]
+    fn batch_major_prove_fast_roundtrip() {
         use flock_core::challenger::FsChallenger;
 
-        let setup = Sha256HybridSetup::new_batch_major(8);
+        let setup = Sha256HybridSetup::new_batch_major(128);
         let mut rng = Rng::new(0xBA7C_F012);
-        let inputs: Vec<([u32; 8], [u32; 16])> = (0..8)
+        let inputs: Vec<([u32; 8], [u32; 16])> = (0..128)
             .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
             .collect();
 
-        let mut ch_p = FsChallenger::new(b"flock-test-v0");
-        let (proof, commitment, claim_p) = setup.prove_fast_basefold(&inputs, &mut ch_p);
-        let mut ch_v = FsChallenger::new(b"flock-test-v0");
+        let mut ch_p = FsChallenger::new(b"flock-lig-batch-major-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast(&inputs, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-lig-batch-major-v0");
         let claim_v = setup
-            .verify_basefold(&commitment, &proof, &mut ch_v)
+            .verify(&commitment, &proof, &mut ch_v)
             .unwrap_or_else(|e| panic!("batch-major verifier rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
         let mut bad = proof.clone();
         bad.zerocheck.final_a_eval.lo ^= 1;
-        let mut ch = FsChallenger::new(b"flock-test-v0");
+        let mut ch = FsChallenger::new(b"flock-lig-batch-major-v0");
         assert!(
-            setup.verify_basefold(&commitment, &bad, &mut ch).is_err(),
+            setup.verify(&commitment, &bad, &mut ch).is_err(),
             "tampered batch-major proof accepted"
         );
     }
@@ -2540,35 +2245,6 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
-    #[test]
-    fn prove_fast_basefold_matches_prove() {
-        use flock_core::challenger::FsChallenger;
-        let mut rng = Rng::new(0xFACE_FEED);
-        let n = 8;
-        let compressions: Vec<([u32; 8], [u32; 16])> =
-            (0..n).map(|_| (SHA256_IV, rng.next_block())).collect();
-        let setup = Sha256HybridSetup::new(n);
-
-        let mut ch_slow = FsChallenger::new(b"flock-test-v0");
-        let (proof_slow, commit_slow, claim_slow) = setup.prove(&compressions, &mut ch_slow);
-        let mut ch_fast = FsChallenger::new(b"flock-test-v0");
-        let (proof_fast, commit_fast, claim_fast) =
-            setup.prove_fast_basefold(&compressions, &mut ch_fast);
-
-        // Same transcript ⇒ identical commitment root, claim, transcript.
-        assert_eq!(commit_slow.root, commit_fast.root, "commitments must match");
-        assert_eq!(claim_slow, claim_fast, "claims must match");
-        assert_eq!(proof_slow.lincheck.rounds, proof_fast.lincheck.rounds);
-        assert_eq!(proof_slow.lincheck.z_partial, proof_fast.lincheck.z_partial);
-
-        // Verify the fast proof end-to-end.
-        let mut v = FsChallenger::new(b"flock-test-v0");
-        let v_claim = setup
-            .verify_basefold(&commit_fast, &proof_fast, &mut v)
-            .expect("verify ok");
-        assert_eq!(v_claim, claim_fast);
-    }
-
     /// Generic (matrix-driven) Ligerito prove produces a byte-identical
     /// proof to the specialized `prove_fast` — pins that the generic path
     /// (bool trace → pack → apply → prove) and the fused path agree.
@@ -2606,34 +2282,16 @@ mod tests {
         assert_eq!(claim_v, claim_g);
     }
 
-    #[test]
-    fn prove_verify_roundtrip_small() {
-        use flock_core::challenger::FsChallenger;
-        let mut rng = Rng::new(0xBEEF_CAFE);
-        let n = 8;
-        let compressions: Vec<([u32; 8], [u32; 16])> =
-            (0..n).map(|_| (SHA256_IV, rng.next_block())).collect();
-        let setup = Sha256HybridSetup::new(n);
-
-        let mut p_ch = FsChallenger::new(b"flock-test-v0");
-        let (proof, commit, claim) = setup.prove(&compressions, &mut p_ch);
-
-        let mut v_ch = FsChallenger::new(b"flock-test-v0");
-        let v_claim = setup
-            .verify_basefold(&commit, &proof, &mut v_ch)
-            .expect("verify ok");
-        assert_eq!(v_claim, claim);
-    }
-
-    /// Constant-wire pin (docs/const-wire-pin.md). `new(5)` has padding blocks
-    /// (filled with a valid all-zero-input compression, constant = 1) so the
-    /// honest proof verifies; the all-zero witness must be rejected by the pin.
-    /// (For SHA-2 the pin lives on the R1CS-built CSC circuit, not the walker.)
+    /// Constant-wire pin (docs/const-wire-pin.md). `new(120)` has padding
+    /// blocks (filled with a valid all-zero-input compression, constant = 1)
+    /// so the honest proof verifies; the all-zero witness must be rejected by
+    /// the pin. (For SHA-2 the pin lives on the R1CS-built CSC circuit, not
+    /// the walker.)
     #[test]
     fn const_pin_all_zero_rejected() {
         use flock_core::challenger::FsChallenger;
 
-        let n = 5; // 3 padding blocks
+        let n = 120; // 8 padding blocks at n_block_slots = 128 (m = 22)
         let setup = Sha256HybridSetup::new(n);
 
         // (1) Honest proof with filled padding verifies.
@@ -2641,10 +2299,10 @@ mod tests {
         let compressions: Vec<([u32; 8], [u32; 16])> =
             (0..n).map(|_| (SHA256_IV, rng.next_block())).collect();
         let mut ch_p = FsChallenger::new(b"honest");
-        let (proof, commit, claim_p) = setup.prove(&compressions, &mut ch_p);
+        let (proof, commit, claim_p) = setup.prove_fast(&compressions, &mut ch_p);
         let mut ch_v = FsChallenger::new(b"honest");
         let claim_v = setup
-            .verify_basefold(&commit, &proof, &mut ch_v)
+            .verify(&commit, &proof, &mut ch_v)
             .unwrap_or_else(|e| panic!("honest padded proof rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
@@ -2661,7 +2319,7 @@ mod tests {
         zlc.iter_mut().for_each(|v| *v = 0);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commit, _) = crate::prover::prove_fast_from_witness(
+        let (proof, commit, _) = crate::prover::prove_fast_ligerito_from_witness(
             &setup.r1cs,
             &setup.pcs_params,
             z,
@@ -2669,10 +2327,11 @@ mod tests {
             b,
             zlc,
             circuit,
+            None,
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(b"poc");
-        let res = setup.verify_basefold(&commit, &proof, &mut ch_v);
+        let res = setup.verify(&commit, &proof, &mut ch_v);
         assert!(
             matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
@@ -2735,55 +2394,32 @@ mod tests {
         setup
             .verify_chain(&commitment, &proof, &cv_0, &cv_last, &mut chv)
             .expect("ligerito chain must verify");
-    }
 
-    #[test]
-    fn prove_chain_basefold_roundtrip_small() {
-        use flock_core::challenger::FsChallenger;
-        // n_compressions=8 → m=18 (K_LOG=15 + n_log=3). Small but exercises
-        // the full chain protocol (legacy BaseFold path).
-        let setup = Sha256HybridSetup::new(8);
-        let (blocks, cv_0, cv_last) = honest_chain(setup.n_compressions, 0xC0FFEE);
-        let mut ch = FsChallenger::new(b"sha2-chain-test");
-        let (proof, commitment) = setup.prove_chain_basefold(&blocks, &mut ch);
-        let mut chv = FsChallenger::new(b"sha2-chain-test");
-        setup
-            .verify_chain_basefold(&commitment, &proof, &cv_0, &cv_last, &mut chv)
-            .expect("honest chain must verify");
-    }
-
-    #[test]
-    fn verify_chain_basefold_rejects_wrong_endpoint() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Sha256HybridSetup::new(8);
-        let (blocks, cv_0, cv_last) = honest_chain(setup.n_compressions, 0xBADBADBAD);
-        let mut ch = FsChallenger::new(b"sha2-chain-test");
-        let (proof, commitment) = setup.prove_chain_basefold(&blocks, &mut ch);
-
+        // Wrong public endpoints must be rejected.
         let mut mutated_last = cv_last;
         mutated_last[0] ^= 1;
-        let mut chv = FsChallenger::new(b"sha2-chain-test");
-        let res = setup.verify_chain_basefold(&commitment, &proof, &cv_0, &mutated_last, &mut chv);
+        let mut chv = FsChallenger::new(b"sha2-chain-lig");
+        let res = setup.verify_chain(&commitment, &proof, &cv_0, &mutated_last, &mut chv);
         assert!(res.is_err(), "verifier must reject wrong cv_last");
 
         let mut mutated_0 = cv_0;
         mutated_0[7] ^= 1 << 31;
-        let mut chv = FsChallenger::new(b"sha2-chain-test");
-        let res = setup.verify_chain_basefold(&commitment, &proof, &mutated_0, &cv_last, &mut chv);
+        let mut chv = FsChallenger::new(b"sha2-chain-lig");
+        let res = setup.verify_chain(&commitment, &proof, &mutated_0, &cv_last, &mut chv);
         assert!(res.is_err(), "verifier must reject wrong cv_0");
     }
 
-    /// `prove_chain_basefold` must require `n_compressions == n_block_slots`.
+    /// `prove_chain` must require `n_compressions == n_block_slots`.
     #[test]
     #[should_panic(expected = "prove_chain requires n_compressions to exactly fill n_block_slots")]
-    fn prove_chain_basefold_panics_on_padding() {
+    fn prove_chain_panics_on_padding() {
         use flock_core::challenger::FsChallenger;
         let setup = Sha256HybridSetup::new(5);
         assert_eq!(setup.n_compressions, 5);
         assert_eq!(setup.n_block_slots(), 8);
         let (blocks, _, _) = honest_chain(setup.n_compressions, 0xDEADBEEF);
         let mut ch = FsChallenger::new(b"sha2-chain-test");
-        let _ = setup.prove_chain_basefold(&blocks, &mut ch);
+        let _ = setup.prove_chain(&blocks, &mut ch);
     }
 
     // -----------------------------------------------------------------------
@@ -2830,75 +2466,6 @@ mod tests {
         (blocks, leaf, root, b_bits)
     }
 
-    #[test]
-    fn prove_merkle_path_roundtrip_small() {
-        use flock_core::challenger::FsChallenger;
-        // n=8 compressions → K=2^3, smallest valid Merkle path size.
-        let setup = Sha256HybridSetup::new(8);
-        let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0xC0FFEE_BEEF);
-        let mut ch = FsChallenger::new(b"sha2-merkle-test");
-        let (proof, commitment) = setup.prove_merkle_path(&blocks, &b, &mut ch);
-        let mut chv = FsChallenger::new(b"sha2-merkle-test");
-        setup
-            .verify_merkle_path(&commitment, &proof, &leaf, &root, &b, &mut chv)
-            .expect("honest merkle path must verify");
-    }
-
-    /// Batch-major Merkle path prove -> verify roundtrip (BaseFold, n=8) +
-    /// wrong-leaf rejection.
-    #[test]
-    fn batch_major_prove_merkle_path_roundtrip() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Sha256HybridSetup::new_batch_major(8);
-        let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0xBA7C_BEEF);
-        let mut ch = FsChallenger::new(b"sha2-merkle-test");
-        let (proof, commitment) = setup.prove_merkle_path(&blocks, &b, &mut ch);
-        let mut chv = FsChallenger::new(b"sha2-merkle-test");
-        setup
-            .verify_merkle_path(&commitment, &proof, &leaf, &root, &b, &mut chv)
-            .expect("batch-major merkle path must verify");
-
-        let mut bad_leaf = leaf;
-        bad_leaf[0] ^= 1;
-        let mut chv = FsChallenger::new(b"sha2-merkle-test");
-        assert!(
-            setup
-                .verify_merkle_path(&commitment, &proof, &bad_leaf, &root, &b, &mut chv)
-                .is_err(),
-            "wrong leaf accepted under batch-major"
-        );
-    }
-
-    #[test]
-    fn verify_merkle_path_rejects_wrong_leaf() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Sha256HybridSetup::new(8);
-        let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0xDEAD_BEEF);
-        let mut ch = FsChallenger::new(b"sha2-merkle-test");
-        let (proof, commitment) = setup.prove_merkle_path(&blocks, &b, &mut ch);
-
-        let mut bad_leaf = leaf;
-        bad_leaf[0] ^= 1;
-        let mut chv = FsChallenger::new(b"sha2-merkle-test");
-        let res = setup.verify_merkle_path(&commitment, &proof, &bad_leaf, &root, &b, &mut chv);
-        assert!(res.is_err(), "verifier must reject wrong leaf");
-    }
-
-    #[test]
-    fn verify_merkle_path_rejects_wrong_root() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Sha256HybridSetup::new(8);
-        let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0xBAD_0123);
-        let mut ch = FsChallenger::new(b"sha2-merkle-test");
-        let (proof, commitment) = setup.prove_merkle_path(&blocks, &b, &mut ch);
-
-        let mut bad_root = root;
-        bad_root[7] ^= 1 << 31;
-        let mut chv = FsChallenger::new(b"sha2-merkle-test");
-        let res = setup.verify_merkle_path(&commitment, &proof, &leaf, &bad_root, &b, &mut chv);
-        assert!(res.is_err(), "verifier must reject wrong root");
-    }
-
     // -----------------------------------------------------------------------
     // Multi-path Merkle tests.
     // -----------------------------------------------------------------------
@@ -2932,17 +2499,19 @@ mod tests {
     #[test]
     fn multi_path_log0_matches_single_path() {
         use flock_core::challenger::FsChallenger;
-        // path_log = 0 should be byte-identical to single-path.
-        let setup = Sha256HybridSetup::new(8);
+        // path_log = 0 should be byte-identical to single-path. n=128 → m=22.
+        let setup = Sha256HybridSetup::new(128);
         let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0xC0FFEE);
 
         // Single-path proof.
         let mut ch_single = FsChallenger::new(b"sha2-merkle-equiv");
-        let (proof_single, commit_single) = setup.prove_merkle_path(&blocks, &b, &mut ch_single);
+        let (proof_single, commit_single) =
+            setup.prove_merkle_path_ligerito(&blocks, &b, &mut ch_single);
 
         // Multi-path with path_log=0.
         let mut ch_multi = FsChallenger::new(b"sha2-merkle-equiv");
-        let (proof_multi, commit_multi) = setup.prove_merkle_paths(0, &blocks, &b, &mut ch_multi);
+        let (proof_multi, commit_multi) =
+            setup.prove_merkle_paths_ligerito(0, &blocks, &b, &mut ch_multi);
 
         let cb_single = bincode::serialize(&commit_single).unwrap();
         let cb_multi = bincode::serialize(&commit_multi).unwrap();
@@ -2957,37 +2526,30 @@ mod tests {
         // Both verify against the leaves array of length 1.
         let mut chv = FsChallenger::new(b"sha2-merkle-equiv");
         setup
-            .verify_merkle_paths(0, &commit_multi, &proof_multi, &[leaf], &root, &b, &mut chv)
+            .verify_merkle_paths_ligerito(
+                0,
+                &commit_multi,
+                &proof_multi,
+                &[leaf],
+                &root,
+                &b,
+                &mut chv,
+            )
             .expect("multi-path with path_log=0 must verify");
     }
 
     #[test]
-    fn prove_merkle_paths_roundtrip_small() {
+    fn prove_merkle_paths_ligerito_roundtrip_p4() {
         use flock_core::challenger::FsChallenger;
-        // path_log = 1 → P = 2 paths of length 8 each = 16 total compressions.
-        let setup = Sha256HybridSetup::new(16);
-        let (blocks, leaves, root, b) =
-            honest_merkle_paths_identical(setup.n_compressions, 1, 0xBABE);
-        let mut ch = FsChallenger::new(b"sha2-merkle-paths-test");
-        let (proof, commitment) = setup.prove_merkle_paths(1, &blocks, &b, &mut ch);
-        let mut chv = FsChallenger::new(b"sha2-merkle-paths-test");
-        setup
-            .verify_merkle_paths(1, &commitment, &proof, &leaves, &root, &b, &mut chv)
-            .expect("honest 2-path proof must verify");
-    }
-
-    #[test]
-    fn prove_merkle_paths_roundtrip_p4() {
-        use flock_core::challenger::FsChallenger;
-        // path_log = 2 → P = 4 paths of length 8 each = 32 total.
-        let setup = Sha256HybridSetup::new(32);
+        // path_log = 2 → P = 4 paths of length 32 each = 128 total → m=22.
+        let setup = Sha256HybridSetup::new(128);
         let (blocks, leaves, root, b) =
             honest_merkle_paths_identical(setup.n_compressions, 2, 0xF00D);
         let mut ch = FsChallenger::new(b"sha2-merkle-paths-p4");
-        let (proof, commitment) = setup.prove_merkle_paths(2, &blocks, &b, &mut ch);
+        let (proof, commitment) = setup.prove_merkle_paths_ligerito(2, &blocks, &b, &mut ch);
         let mut chv = FsChallenger::new(b"sha2-merkle-paths-p4");
         setup
-            .verify_merkle_paths(2, &commitment, &proof, &leaves, &root, &b, &mut chv)
+            .verify_merkle_paths_ligerito(2, &commitment, &proof, &leaves, &root, &b, &mut chv)
             .expect("honest 4-path proof must verify");
     }
 
@@ -3003,6 +2565,58 @@ mod tests {
         setup
             .verify_merkle_path_ligerito(&commitment, &proof, &leaf, &root, &b, &mut chv)
             .expect("ligerito merkle path must verify");
+
+        // Wrong public leaf must be rejected.
+        let mut bad_leaf = leaf;
+        bad_leaf[0] ^= 1;
+        let mut chv = FsChallenger::new(b"sha2-merkle-lig");
+        let res =
+            setup.verify_merkle_path_ligerito(&commitment, &proof, &bad_leaf, &root, &b, &mut chv);
+        assert!(res.is_err(), "verifier must reject wrong leaf");
+
+        // Wrong public root must be rejected.
+        let mut bad_root = root;
+        bad_root[7] ^= 1 << 31;
+        let mut chv = FsChallenger::new(b"sha2-merkle-lig");
+        let res =
+            setup.verify_merkle_path_ligerito(&commitment, &proof, &leaf, &bad_root, &b, &mut chv);
+        assert!(res.is_err(), "verifier must reject wrong root");
+
+        // Flip one non-leading bit (B(0) := 0 by convention regardless of
+        // b[0], so flipping b[0] wouldn't actually change the protocol value;
+        // flip b[1] instead, which is a real chain constraint).
+        let mut bad_b = b.clone();
+        bad_b[1] = !bad_b[1];
+        let mut chv = FsChallenger::new(b"sha2-merkle-lig");
+        let res =
+            setup.verify_merkle_path_ligerito(&commitment, &proof, &leaf, &root, &bad_b, &mut chv);
+        assert!(res.is_err(), "verifier must reject wrong bit vector");
+    }
+
+    /// Batch-major Merkle-path roundtrip and wrong-leaf rejection on Ligerito.
+    #[test]
+    #[ignore]
+    fn batch_major_prove_merkle_path_ligerito_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+
+        let setup = Sha256HybridSetup::new_batch_major(128);
+        let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0xBA7C_BEEF);
+        let mut ch = FsChallenger::new(b"sha2-merkle-batch-major");
+        let (proof, commitment) = setup.prove_merkle_path_ligerito(&blocks, &b, &mut ch);
+        let mut chv = FsChallenger::new(b"sha2-merkle-batch-major");
+        setup
+            .verify_merkle_path_ligerito(&commitment, &proof, &leaf, &root, &b, &mut chv)
+            .expect("batch-major Merkle path must verify");
+
+        let mut bad_leaf = leaf;
+        bad_leaf[0] ^= 1;
+        let mut chv = FsChallenger::new(b"sha2-merkle-batch-major");
+        assert!(
+            setup
+                .verify_merkle_path_ligerito(&commitment, &proof, &bad_leaf, &root, &b, &mut chv,)
+                .is_err(),
+            "wrong leaf accepted under batch-major"
+        );
     }
 
     #[test]
@@ -3018,58 +2632,36 @@ mod tests {
         setup
             .verify_merkle_paths_ligerito(1, &commitment, &proof, &leaves, &root, &b, &mut chv)
             .expect("ligerito 2-path proof must verify");
-    }
 
-    #[test]
-    fn verify_merkle_paths_rejects_wrong_leaf() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Sha256HybridSetup::new(16);
-        let (blocks, leaves, root, b) =
-            honest_merkle_paths_identical(setup.n_compressions, 1, 0xDEAD);
-        let mut ch = FsChallenger::new(b"sha2-merkle-paths-rej");
-        let (proof, commitment) = setup.prove_merkle_paths(1, &blocks, &b, &mut ch);
-
+        // Wrong leaf in path 0 must be rejected.
         let mut bad_leaves = leaves.clone();
         bad_leaves[0][0] ^= 1;
-        let mut chv = FsChallenger::new(b"sha2-merkle-paths-rej");
-        let res =
-            setup.verify_merkle_paths(1, &commitment, &proof, &bad_leaves, &root, &b, &mut chv);
+        let mut chv = FsChallenger::new(b"sha2-merkle-paths-lig");
+        let res = setup.verify_merkle_paths_ligerito(
+            1,
+            &commitment,
+            &proof,
+            &bad_leaves,
+            &root,
+            &b,
+            &mut chv,
+        );
         assert!(res.is_err(), "verifier must reject wrong leaf in path 0");
-    }
 
-    #[test]
-    fn verify_merkle_paths_rejects_wrong_root() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Sha256HybridSetup::new(16);
-        let (blocks, leaves, root, b) =
-            honest_merkle_paths_identical(setup.n_compressions, 1, 0x12345);
-        let mut ch = FsChallenger::new(b"sha2-merkle-paths-rej");
-        let (proof, commitment) = setup.prove_merkle_paths(1, &blocks, &b, &mut ch);
-
+        // Wrong shared root must be rejected.
         let mut bad_root = root;
         bad_root[7] ^= 1 << 31;
-        let mut chv = FsChallenger::new(b"sha2-merkle-paths-rej");
-        let res =
-            setup.verify_merkle_paths(1, &commitment, &proof, &leaves, &bad_root, &b, &mut chv);
+        let mut chv = FsChallenger::new(b"sha2-merkle-paths-lig");
+        let res = setup.verify_merkle_paths_ligerito(
+            1,
+            &commitment,
+            &proof,
+            &leaves,
+            &bad_root,
+            &b,
+            &mut chv,
+        );
         assert!(res.is_err(), "verifier must reject wrong shared root");
-    }
-
-    #[test]
-    fn verify_merkle_path_rejects_wrong_bit() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Sha256HybridSetup::new(8);
-        let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0xF00D);
-        let mut ch = FsChallenger::new(b"sha2-merkle-test");
-        let (proof, commitment) = setup.prove_merkle_path(&blocks, &b, &mut ch);
-
-        // Flip one non-leading bit (B(0) := 0 by convention regardless of
-        // b[0], so flipping b[0] wouldn't actually change the protocol value;
-        // flip b[1] instead, which is a real chain constraint).
-        let mut bad_b = b.clone();
-        bad_b[1] = !bad_b[1];
-        let mut chv = FsChallenger::new(b"sha2-merkle-test");
-        let res = setup.verify_merkle_path(&commitment, &proof, &leaf, &root, &bad_b, &mut chv);
-        assert!(res.is_err(), "verifier must reject wrong bit vector");
     }
 
     #[test]

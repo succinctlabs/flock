@@ -5,7 +5,7 @@
 //! aux polynomial `v` (μ+1 vars) and its batched opening (5 points) at the
 //! sumcheck reduction point. The witness `f, g` is NOT committed (the prover
 //! only commits the PIOP's own oracle `v`). The opening backend is adaptive:
-//! Ligerito at μ≥7 (`v` has log_n = μ+1 ≥ 8), BaseFold below.
+//! Ligerito requires μ≥7 (`v` has log_n = μ+1 ≥ 8).
 //!
 //! Witness generation is hoisted outside the timed section. A warm-up run
 //! primes the OnceLock-cached NTT/convert tables.
@@ -124,12 +124,7 @@ fn main() {
             cs ^= claim.rho[0].lo;
         }
 
-        let backend = match &proof.v_open {
-            flock_prover::pcs::BatchOpening::Ligerito(_) => "Ligerito",
-            flock_prover::pcs::BatchOpening::BaseFold(_) => "BaseFold",
-        };
         let proof_bytes = bincode::serialize(&proof).expect("serialize").len();
-        println!("  {:<28} {}", "PCS backend (v open)", backend);
         println!("  {:<28} {:>10.3} ms", "prove", best_prove);
         println!("  {:<28} {:>10.3} ms", "verify", best_verify);
         println!(

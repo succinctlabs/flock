@@ -157,9 +157,9 @@ fn bench_pair(n_keccaks: usize, n_runs: usize) {
     // Warm-up both.
     {
         let mut ch = FsChallenger::new(b"flock-bench-v0");
-        black_box(&s1.prove_fast_basefold(&state_sets[0], &mut ch).0);
+        black_box(&s1.prove_fast(&state_sets[0], &mut ch).0);
         let mut ch = FsChallenger::new(b"flock-bench-v0");
-        black_box(&s3.prove_fast_basefold(&state_sets[0], &mut ch).0);
+        black_box(&s3.prove_fast(&state_sets[0], &mut ch).0);
     }
 
     let mut best1 = f64::INFINITY;
@@ -169,14 +169,14 @@ fn bench_pair(n_keccaks: usize, n_runs: usize) {
 
         let mut ch = FsChallenger::new(b"flock-bench-v0");
         let t0 = Instant::now();
-        let (p1, _, _) = s1.prove_fast_basefold(inputs, &mut ch);
+        let (p1, _, _) = s1.prove_fast(inputs, &mut ch);
         let e1 = t0.elapsed().as_secs_f64();
         best1 = best1.min(e1);
         black_box(&p1);
 
         let mut ch = FsChallenger::new(b"flock-bench-v0");
         let t0 = Instant::now();
-        let (p3, _, _) = s3.prove_fast_basefold(inputs, &mut ch);
+        let (p3, _, _) = s3.prove_fast(inputs, &mut ch);
         let e3 = t0.elapsed().as_secs_f64();
         best3 = best3.min(e3);
         black_box(&p3);

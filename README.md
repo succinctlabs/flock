@@ -2,7 +2,7 @@
 
 A Rust implementation of the **Flock** proving system: a prover and verifier for
 R1CS-over-GF(2) statements, built on a zerocheck + lincheck PIOP with a
-multilinear PCS (Ligerito / BaseFold) over the binary field F₂₁₂₈. Tuned for
+multilinear PCS (Ligerito) over the binary field F₂₁₂₈. Tuned for
 Apple silicon (M-series).
 
 It ships end-to-end provers for hash-chain and Merkle-path statements over

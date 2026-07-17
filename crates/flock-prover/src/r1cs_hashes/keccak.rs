@@ -62,12 +62,12 @@
 //! the slow `prove` path will report "everything satisfied vacuously" for
 //! this encoding — only use `prove_fast`/`prove_chain`.
 
-use crate::r1cs_hashes::chain_common::{ChainLayout, ChainProof, ChainVerifyError};
+use crate::r1cs_hashes::chain_common::{ChainLayout, ChainVerifyError};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::{Commitment, PcsParams};
-use flock_core::proof::{R1csClaim, R1csProof};
+use flock_core::proof::R1csClaim;
 use flock_core::r1cs::BlockR1cs;
 use flock_core::verifier;
 
@@ -876,7 +876,7 @@ impl KeccakSetup {
         let profile = match log_inv_rate {
             1 => flock_core::pcs::ligerito::LigeritoProfile::Fast,
             2 => flock_core::pcs::ligerito::LigeritoProfile::Slim,
-            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // BaseFold-only rates
+            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // other rates default to Fast
         };
         Self::with_profile_and_rate(n_keccaks, profile, log_inv_rate)
     }
@@ -916,7 +916,7 @@ impl KeccakSetup {
     /// [`Self::new`] with the **batch-major** witness layout (see
     /// [`flock_core::r1cs::WitnessLayout`]): fold-log_n-first variable
     /// order, contiguous padding suffix, direct-write witness producer.
-    /// Chain/Merkle wrappers still require the row-major layout.
+    /// Chain wrappers preserve the selected witness layout.
     pub fn new_batch_major(n_keccaks: usize) -> Self {
         let mut s = Self::new(n_keccaks);
         // Safe to set post-construction: the digest/csc caches are lazy and
@@ -950,47 +950,8 @@ impl KeccakSetup {
         1usize << self.n_keccaks_log()
     }
 
-    /// **Legacy BaseFold-backend** prove. Use `prove_fast` (Ligerito) for
-    /// production. Kept for m < ~21 and for backend timing comparisons.
-    pub fn prove_fast_basefold<Ch: Challenger>(
-        &self,
-        initial_states: &[State],
-        challenger: &mut Ch,
-    ) -> (R1csProof, Commitment, R1csClaim) {
-        assert_eq!(initial_states.len(), self.n_keccaks);
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness(initial_states);
-        crate::prover::prove_fast_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            &KeccakLincheckCircuit,
-            challenger,
-        )
-    }
-
-    /// **Legacy BaseFold-backend** verify. Pairs with `prove_fast_basefold`.
-    pub fn verify_basefold<Ch: Challenger>(
-        &self,
-        commitment: &Commitment,
-        proof: &R1csProof,
-        challenger: &mut Ch,
-    ) -> Result<R1csClaim, verifier::VerifyError> {
-        verifier::verify(
-            &self.r1cs,
-            commitment,
-            proof,
-            &KeccakLincheckCircuit,
-            challenger,
-        )
-    }
-
-    /// Build a base R1CS proof (without the chain shift sumcheck) using the
-    /// **Ligerito** backend. Smaller proof, slightly slower prover.
-    /// Requires `m ≥ ~21`; for tiny instances use `prove_fast_basefold`.
+    /// Build a base R1CS proof (without the chain shift sumcheck).
+    /// Requires `m ≥ ~21` (Ligerito recursion floor).
     pub fn prove_fast<Ch: Challenger>(
         &self,
         initial_states: &[State],
@@ -1027,36 +988,6 @@ impl KeccakSetup {
             proof,
             &KeccakLincheckCircuit,
             &self.pcs_params,
-            challenger,
-        )
-    }
-
-    /// Legacy BaseFold-backend chain prove.
-    pub fn prove_chain_basefold<Ch: Challenger>(
-        &self,
-        initial_states: &[State],
-        challenger: &mut Ch,
-    ) -> (ChainProof, Commitment) {
-        assert_eq!(initial_states.len(), self.n_keccaks);
-        assert_eq!(
-            self.n_keccaks,
-            self.n_keccak_slots(),
-            "prove_chain requires n_keccaks to exactly fill n_keccak_slots \
-             (no padding); got n_keccaks={}, n_keccak_slots={}. Use a \
-             power-of-2 ≥ 8.",
-            self.n_keccaks,
-            self.n_keccak_slots(),
-        );
-        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness(initial_states);
-        crate::r1cs_hashes::chain_common::prove_chain_generic(
-            &self.r1cs,
-            &self.pcs_params,
-            &CHAIN_LAYOUT,
-            z_packed,
-            a_packed,
-            b_packed,
-            z_lincheck,
-            &KeccakLincheckCircuit,
             challenger,
         )
     }
@@ -1112,40 +1043,6 @@ impl KeccakSetup {
             &xlast_phys,
             &KeccakLincheckCircuit,
             &self.pcs_params,
-            challenger,
-        )
-    }
-
-    /// Legacy BaseFold-backend chain verify.
-    pub fn verify_chain_basefold<Ch: Challenger>(
-        &self,
-        commitment: &Commitment,
-        proof: &ChainProof,
-        x_0: &State,
-        x_last: &State,
-        challenger: &mut Ch,
-    ) -> Result<(), ChainVerifyError> {
-        assert_eq!(
-            self.n_keccaks,
-            self.n_keccak_slots(),
-            "verify_chain requires n_keccaks to exactly fill n_keccak_slots \
-             (no padding); got n_keccaks={}, n_keccak_slots={}. Use a \
-             power-of-2 ≥ 8.",
-            self.n_keccaks,
-            self.n_keccak_slots(),
-        );
-        let n_log = self.n_keccaks_log();
-        let x0_phys = state_to_phys_bits(x_0);
-        let xlast_phys = state_to_phys_bits(x_last);
-        crate::r1cs_hashes::chain_common::verify_chain_generic(
-            &self.r1cs,
-            &CHAIN_LAYOUT,
-            commitment,
-            proof,
-            n_log,
-            &x0_phys,
-            &xlast_phys,
-            &KeccakLincheckCircuit,
             challenger,
         )
     }
@@ -1786,30 +1683,8 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
-    /// Legacy BaseFold `prove_fast_basefold` → `verify_basefold` roundtrip at K=8.
-    #[test]
-    fn prove_fast_basefold_roundtrip() {
-        use flock_core::challenger::FsChallenger;
-
-        let setup = KeccakSetup::new(8);
-        let mut rng = Rng::new(0xFAB1E_F011);
-        let inputs: Vec<State> = (0..8).map(|_| random_state(&mut rng)).collect();
-
-        let mut ch_p = FsChallenger::new(b"flock-test-v0");
-        let (proof, commitment, claim_p) = setup.prove_fast_basefold(&inputs, &mut ch_p);
-
-        let mut ch_v = FsChallenger::new(b"flock-test-v0");
-        let claim_v = setup
-            .verify_basefold(&commitment, &proof, &mut ch_v)
-            .unwrap_or_else(|e| panic!("prove_fast_basefold: verifier rejected: {e:?}"));
-        assert_eq!(claim_p, claim_v);
-    }
-
-    /// Batch-major witness equality: `generate_witness_batch_major`'s
-    /// `(z, a, b)` must be exactly the word-transpose of the row-major
-    /// driver's output (word (o, c) ↦ (c << n_log) + o), and the byte-stripe
-    /// must be identical. Exercises padding slots via a non-power-of-two
-    /// instance count.
+    /// The batch-major witness must be exactly the word-transpose of the
+    /// row-major witness, with an identical lincheck stripe.
     #[test]
     fn batch_major_witness_matches_row_major_transposed() {
         for (n_inputs, n_log) in [(8usize, 3usize), (13, 4)] {
@@ -1838,42 +1713,12 @@ mod tests {
         }
     }
 
-    /// Batch-major end-to-end roundtrip (BaseFold): prove on the
-    /// batch-major-committed witness, verify with the layout-aware verifier;
-    /// claims must agree and a tampered proof must be rejected.
-    #[test]
-    fn batch_major_prove_fast_basefold_roundtrip() {
-        use flock_core::challenger::FsChallenger;
-
-        let setup = KeccakSetup::new_batch_major(8);
-        let mut rng = Rng::new(0xBA7C_F011);
-        let inputs: Vec<State> = (0..8).map(|_| random_state(&mut rng)).collect();
-
-        let mut ch_p = FsChallenger::new(b"flock-test-v0");
-        let (proof, commitment, claim_p) = setup.prove_fast_basefold(&inputs, &mut ch_p);
-
-        let mut ch_v = FsChallenger::new(b"flock-test-v0");
-        let claim_v = setup
-            .verify_basefold(&commitment, &proof, &mut ch_v)
-            .unwrap_or_else(|e| panic!("batch-major verifier rejected: {e:?}"));
-        assert_eq!(claim_p, claim_v);
-
-        let mut bad = proof.clone();
-        bad.zerocheck.final_a_eval.lo ^= 1;
-        let mut ch = FsChallenger::new(b"flock-test-v0");
-        assert!(
-            setup.verify_basefold(&commitment, &bad, &mut ch).is_err(),
-            "tampered batch-major proof accepted"
-        );
-    }
-
-    /// Batch-major Ligerito roundtrip at K = 64 (m = 22, the smallest
-    /// embedded Ligerito config). Ignored by default like the row-major
-    /// Ligerito roundtrip above; run with `--ignored`.
+    /// Batch-major end-to-end Ligerito roundtrip at the smallest supported m.
     #[test]
     #[ignore]
     fn batch_major_prove_fast_roundtrip() {
         use flock_core::challenger::FsChallenger;
+
         let setup = KeccakSetup::new_batch_major(64);
         let mut rng = Rng::new(0xBA7C_2170);
         let inputs: Vec<State> = (0..64).map(|_| random_state(&mut rng)).collect();
@@ -1882,7 +1727,7 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"flock-lig-keccak-v0");
         let claim_v = setup
             .verify(&commitment, &proof, &mut ch_v)
-            .unwrap_or_else(|e| panic!("batch-major ligerito verifier rejected: {e:?}"));
+            .unwrap_or_else(|e| panic!("batch-major Ligerito verifier rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
     }
 
@@ -1891,20 +1736,21 @@ mod tests {
     /// still verifies; the all-zero witness — encoding the FALSE keccak_f(0) = 0 —
     /// must be rejected by the pin.
     #[test]
+    #[ignore] // Heavier — Ligerito needs m=22; run with `cargo test const_pin_all_zero_rejected -- --ignored`
     fn const_pin_all_zero_rejected() {
         use flock_core::challenger::FsChallenger;
 
-        let n = 5; // < 8 slots ⇒ 3 padding blocks, exercises padding fill
+        let n = 60; // < 64 slots ⇒ 4 padding blocks, exercises padding fill
         let setup = KeccakSetup::new(n);
 
         // (1) Honest proof with filled padding verifies.
         let mut rng = Rng::new(0x5EED_C0DE);
         let inputs: Vec<State> = (0..n).map(|_| random_state(&mut rng)).collect();
         let mut ch_p = FsChallenger::new(b"honest");
-        let (proof, commitment, claim_p) = setup.prove_fast_basefold(&inputs, &mut ch_p);
+        let (proof, commitment, claim_p) = setup.prove_fast(&inputs, &mut ch_p);
         let mut ch_v = FsChallenger::new(b"honest");
         let claim_v = setup
-            .verify_basefold(&commitment, &proof, &mut ch_v)
+            .verify(&commitment, &proof, &mut ch_v)
             .unwrap_or_else(|e| panic!("honest padded proof rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
@@ -1917,7 +1763,7 @@ mod tests {
         b.iter_mut().for_each(|v| *v = F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commitment, _) = crate::prover::prove_fast_from_witness(
+        let (proof, commitment, _) = crate::prover::prove_fast_ligerito_from_witness(
             &setup.r1cs,
             &setup.pcs_params,
             z,
@@ -1925,10 +1771,11 @@ mod tests {
             b,
             zlc,
             &KeccakLincheckCircuit,
+            None,
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(b"poc");
-        let res = setup.verify_basefold(&commitment, &proof, &mut ch_v);
+        let res = setup.verify(&commitment, &proof, &mut ch_v);
         assert!(
             matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
@@ -1969,41 +1816,6 @@ mod tests {
         );
         assert_eq!(in_b, in_r, "In fold diverged across layouts");
         assert_eq!(out_b, out_r, "Out fold diverged across layouts");
-    }
-
-    /// Batch-major chain prove -> verify roundtrip (BaseFold, K=8) + rejection
-    /// of a wrong public output endpoint.
-    #[test]
-    fn batch_major_prove_chain_basefold_roundtrip() {
-        use flock_core::challenger::FsChallenger;
-        let setup = KeccakSetup::new_batch_major(8);
-        let mut rng = Rng::new(0xBA7C_CA11);
-        let x0 = random_state(&mut rng);
-        let mut inputs = Vec::with_capacity(8);
-        let mut cur = x0;
-        for _ in 0..8 {
-            inputs.push(cur);
-            keccak_f(&mut cur);
-        }
-        let x_last = cur;
-
-        let mut chp = FsChallenger::new(b"flock-test-v0");
-        let (proof, comm) = setup.prove_chain_basefold(&inputs, &mut chp);
-        let mut chv = FsChallenger::new(b"flock-test-v0");
-        setup
-            .verify_chain_basefold(&comm, &proof, &x0, &x_last, &mut chv)
-            .expect("batch-major chain must verify");
-
-        // Wrong endpoint must be rejected.
-        let mut bad_last = x_last;
-        bad_last[0] = !bad_last[0];
-        let mut chv = FsChallenger::new(b"flock-test-v0");
-        assert!(
-            setup
-                .verify_chain_basefold(&comm, &proof, &x0, &bad_last, &mut chv)
-                .is_err(),
-            "wrong endpoint accepted under batch-major"
-        );
     }
 
     /// Batch-major chain roundtrip on the Ligerito backend (K=64, m=22) —
@@ -2053,74 +1865,5 @@ mod tests {
         setup
             .verify_chain(&comm, &proof, &x0, &x_last, &mut chv)
             .expect("chain must verify");
-    }
-
-    /// Comparison: proof size BaseFold vs Ligerito at m=22 (K=64 keccaks).
-    /// Run with `cargo test ligerito_vs_basefold_size -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn ligerito_vs_basefold_size() {
-        use flock_core::challenger::FsChallenger;
-        let setup = KeccakSetup::new(64);
-        let mut rng = Rng::new(0x517E_5717);
-        let inputs: Vec<State> = (0..64).map(|_| random_state(&mut rng)).collect();
-
-        let mut ch_p = FsChallenger::new(b"size-cmp");
-        let (bf_proof, bf_commitment, _) = setup.prove_fast_basefold(&inputs, &mut ch_p);
-        let bf_bundle = crate::proof_io::R1csProofBundle {
-            commitment: bf_commitment,
-            proof: bf_proof,
-        };
-        let bf_bytes = bf_bundle.to_bytes().len();
-
-        let mut ch_p2 = FsChallenger::new(b"size-cmp");
-        let (lig_proof, lig_commitment, _) = setup.prove_fast(&inputs, &mut ch_p2);
-        let lig_bundle = crate::proof_io::R1csProofBundleLigerito {
-            commitment: lig_commitment,
-            proof: lig_proof,
-        };
-        let lig_bytes = lig_bundle.to_bytes().len();
-
-        eprintln!("Keccak m=22 (K=64) proof size:");
-        eprintln!(
-            "  BaseFold:  {} bytes  ({:.1} KB)",
-            bf_bytes,
-            bf_bytes as f64 / 1024.0
-        );
-        eprintln!(
-            "  Ligerito:  {} bytes  ({:.1} KB)",
-            lig_bytes,
-            lig_bytes as f64 / 1024.0
-        );
-        eprintln!(
-            "  Ratio:     {:.2}× smaller",
-            bf_bytes as f64 / lig_bytes as f64
-        );
-    }
-
-    /// Legacy BaseFold chain roundtrip at K=8.
-    #[test]
-    fn prove_chain_basefold_roundtrip() {
-        use flock_core::challenger::RandomChallenger;
-
-        let setup = KeccakSetup::new(8);
-        let n_inst = setup.n_keccak_slots();
-        let mut rng = Rng::new(0xC0DE_C001);
-        let x0 = random_state(&mut rng);
-        let mut inputs = Vec::with_capacity(n_inst);
-        let mut cur = x0;
-        for _ in 0..n_inst {
-            inputs.push(cur);
-            keccak_f(&mut cur);
-        }
-        let x_last = cur;
-
-        let mut chp = RandomChallenger::new(7);
-        let (proof, comm) = setup.prove_chain_basefold(&inputs, &mut chp);
-
-        let mut chv = RandomChallenger::new(7);
-        setup
-            .verify_chain_basefold(&comm, &proof, &x0, &x_last, &mut chv)
-            .expect("honest chain must verify");
     }
 }

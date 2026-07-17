@@ -20,30 +20,6 @@ use crate::ntt::AdditiveNttF128;
 use crate::pcs::pack::LOG_PACKING;
 use serde::{Deserialize, Serialize};
 
-/// Log of the per-epoch FRI fold arity. `2^LOG_FRI_ARITY` codeword positions
-/// fold together between Merkle commits. Bigger = fewer Merkle trees (cheaper
-/// prover) but bigger query proofs.
-pub const LOG_FRI_ARITY: usize = 6;
-
-/// Decompose `log_dim` FRI rounds into a sequence of epoch arities, each at
-/// most [`LOG_FRI_ARITY`]. The last epoch may be smaller than [`LOG_FRI_ARITY`]
-/// if `log_dim` doesn't divide evenly.
-///
-/// Examples (`LOG_FRI_ARITY = 6`):
-/// - `log_dim = 17` → `[6, 6, 5]`
-/// - `log_dim = 8`  → `[6, 2]`
-/// - `log_dim = 3`  → `[3]`
-pub fn compute_fri_arities(log_dim: usize) -> Vec<usize> {
-    let mut arities = Vec::new();
-    let mut remaining = log_dim;
-    while remaining > 0 {
-        let a = remaining.min(LOG_FRI_ARITY);
-        arities.push(a);
-        remaining -= a;
-    }
-    arities
-}
-
 /// PCS configuration. Polynomial-basis subspace `{1, x, x², …}` for the NTT.
 ///
 /// Interleaved RS: the packed witness is split into `2^log_batch_size`
@@ -61,8 +37,7 @@ pub struct PcsParams {
     /// Ligerito parameter profile (fast/slim/secure). Selects which embedded
     /// security config (queries, OOD samples, grinding schedule) drives the
     /// PCS opening; must agree with `log_inv_rate`
-    /// (`profile.log_inv_rate() == log_inv_rate`). Ignored by the BaseFold
-    /// backend. Defaults to `Fast`.
+    /// (`profile.log_inv_rate() == log_inv_rate`). Defaults to `Fast`.
     #[serde(default)]
     pub profile: crate::pcs::ligerito::LigeritoProfile,
 }
@@ -92,20 +67,6 @@ impl PcsParams {
     /// (= `n_positions() * num_ntts()`).
     pub fn codeword_len_f128(&self) -> usize {
         self.n_positions() * self.num_ntts()
-    }
-    /// Per-epoch FRI arities (e.g. `[6, 6, 5]` for `log_dim = 17`). The first
-    /// entry, `fri_arities()[0]`, sizes the **post-row-batch** Merkle leaf
-    /// (built inside basefold::prove right after the row-batch sumcheck rounds).
-    /// The **initial** Merkle commitment uses small leaves of just
-    /// `2^log_batch_size = num_ntts` F_{2^128} values each — one codeword
-    /// position's row-batch lanes per leaf.
-    pub fn fri_arities(&self) -> Vec<usize> {
-        compute_fri_arities(self.log_dim())
-    }
-    /// Log of the first-epoch FRI arity (= `fri_arities()[0]` if any, else 0).
-    /// Drives the post-row-batch tree's leaf size, NOT the initial tree's.
-    pub fn log_first_fri_arity(&self) -> usize {
-        self.fri_arities().first().copied().unwrap_or(0)
     }
     /// `log_2` of the F_{2^128} count per **initial** Merkle leaf
     /// (= `log_batch_size`; just the row-batch lanes per position).
@@ -291,9 +252,8 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
         )
     };
     // Initial tree: one leaf per codeword position, each containing the
-    // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). The
-    // **post-row-batch** tree is built inside basefold::prove and provides
-    // the multi-arity batching for the first FRI epoch.
+    // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
+    // Ligerito's L0 commitment.
     let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves());
     let root = *merkle_tree.last().expect("merkle tree non-empty");
     if timing {

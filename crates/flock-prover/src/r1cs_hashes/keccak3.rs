@@ -43,7 +43,7 @@ use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::{Commitment, PcsParams};
-use flock_core::proof::{R1csClaim, R1csProof};
+use flock_core::proof::R1csClaim;
 use flock_core::r1cs::BlockR1cs;
 use flock_core::verifier;
 
@@ -504,7 +504,7 @@ impl KeccakSetup {
         let profile = match log_inv_rate {
             1 => flock_core::pcs::ligerito::LigeritoProfile::Fast,
             2 => flock_core::pcs::ligerito::LigeritoProfile::Slim,
-            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // BaseFold-only rates
+            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // other rates default to Fast
         };
         Self::with_profile_and_rate(n_keccaks, profile, log_inv_rate)
     }
@@ -548,41 +548,6 @@ impl KeccakSetup {
     }
     pub fn n_block_slots(&self) -> usize {
         1usize << self.n_blocks_log()
-    }
-
-    pub fn prove_fast_basefold<Ch: Challenger>(
-        &self,
-        initial_states: &[State],
-        challenger: &mut Ch,
-    ) -> (R1csProof, Commitment, R1csClaim) {
-        assert_eq!(initial_states.len(), self.n_keccaks);
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_blocks_log());
-        crate::prover::prove_fast_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            &KeccakLincheckCircuit,
-            challenger,
-        )
-    }
-
-    pub fn verify_basefold<Ch: Challenger>(
-        &self,
-        commitment: &Commitment,
-        proof: &R1csProof,
-        challenger: &mut Ch,
-    ) -> Result<R1csClaim, verifier::VerifyError> {
-        verifier::verify(
-            &self.r1cs,
-            commitment,
-            proof,
-            &KeccakLincheckCircuit,
-            challenger,
-        )
     }
 
     /// Ligerito-backend prove. Requires m ≥ ~21.

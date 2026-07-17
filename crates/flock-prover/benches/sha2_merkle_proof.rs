@@ -97,7 +97,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         black_box(&proof);
         black_box(&comm);
         let mut ch = FsChallenger::new(b"flock-merkle-bench-v0");
-        let (proof, comm) = setup.prove_merkle_path(&blocks, &b, &mut ch);
+        let (proof, comm) = setup.prove_merkle_path_ligerito(&blocks, &b, &mut ch);
         black_box(&proof);
         black_box(&comm);
     }
@@ -130,7 +130,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     for _ in 0..n_runs {
         let mut ch = FsChallenger::new(b"flock-merkle-bench-v0");
         let t = Instant::now();
-        let (proof, comm) = setup.prove_merkle_path(&blocks, &b, &mut ch);
+        let (proof, comm) = setup.prove_merkle_path_ligerito(&blocks, &b, &mut ch);
         best_merkle = best_merkle.min(t.elapsed().as_secs_f64());
         single_proof_opt = Some(proof);
         single_comm_opt = Some(comm);
@@ -144,7 +144,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         let mut chv = FsChallenger::new(b"flock-merkle-bench-v0");
         let t = Instant::now();
         setup
-            .verify_merkle_path(&single_comm, &single_proof, &leaf, &root, &b, &mut chv)
+            .verify_merkle_path_ligerito(&single_comm, &single_proof, &leaf, &root, &b, &mut chv)
             .expect("verify failed");
         best_verify_single = best_verify_single.min(t.elapsed().as_secs_f64());
     }
@@ -203,7 +203,8 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
             // Warm-up.
             {
                 let mut ch = FsChallenger::new(b"flock-merkle-bench-v0");
-                let (proof, comm) = setup.prove_merkle_paths(path_log, &blocks_p, &b_p, &mut ch);
+                let (proof, comm) =
+                    setup.prove_merkle_paths_ligerito(path_log, &blocks_p, &b_p, &mut ch);
                 black_box(&proof);
                 black_box(&comm);
             }
@@ -213,7 +214,8 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
             for _ in 0..n_runs {
                 let mut ch = FsChallenger::new(b"flock-merkle-bench-v0");
                 let t = Instant::now();
-                let (proof, comm) = setup.prove_merkle_paths(path_log, &blocks_p, &b_p, &mut ch);
+                let (proof, comm) =
+                    setup.prove_merkle_paths_ligerito(path_log, &blocks_p, &b_p, &mut ch);
                 best_mp = best_mp.min(t.elapsed().as_secs_f64());
                 last_proof = Some(proof);
                 last_comm = Some(comm);
@@ -227,7 +229,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
                 let mut chv = FsChallenger::new(b"flock-merkle-bench-v0");
                 let t = Instant::now();
                 setup
-                    .verify_merkle_paths(
+                    .verify_merkle_paths_ligerito(
                         path_log, &comm_p, &proof_p, &leaves_p, &_root, &b_p, &mut chv,
                     )
                     .expect("verify failed");

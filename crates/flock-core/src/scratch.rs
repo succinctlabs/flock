@@ -25,7 +25,7 @@ static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
 /// halves, ring-switch's per-claim rs_eq_ind vectors, b_combined, and
-/// basefold's 5 working buffers + per-epoch codewords. Pooling ALL of the
+/// the PCS open's working buffers. Pooling ALL of the
 /// open stage's transients matters beyond their own reuse: if they were
 /// left to malloc while the earlier phases' buffers sat in the pool, the
 /// open stage would fault fresh pages every prove (the pool denies malloc
@@ -102,8 +102,8 @@ pub fn give_f128(v: Vec<F128>) {
 /// machines; eliminated work doesn't.)
 ///
 /// The set (sizes in F128s): 2^(m-6)-class — L0 codeword, zerocheck round-2
-/// a/b, basefold codeword ping-pong ×2 → 5 buffers; 2^(m-7)-class — witness
-/// z/a/b, zerocheck tail ping-pong ×2, basefold a×2/b, rs_eq_ind ×2,
+/// a/b, open-stage codeword ping-pong ×2 → 5 buffers; 2^(m-7)-class — witness
+/// z/a/b, zerocheck tail ping-pong ×2, open-stage transients, rs_eq_ind ×2,
 /// b_combined → 11 buffers. ~1.1 GB resident at m = 29; release with
 /// [`clear`].
 pub fn prewarm_prover(m: usize) {

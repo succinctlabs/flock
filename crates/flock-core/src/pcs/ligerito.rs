@@ -241,7 +241,7 @@ pub fn default_config(
     }
 
     if recursive_ks.is_empty() {
-        return Err("log_n too small — no recursive levels needed (use BaseFold directly)");
+        return Err("log_n too small — no recursive levels for the Ligerito recursion");
     }
 
     let queries: Vec<usize> = log_inv_rates.iter().map(|&r| udr_queries(r)).collect();
@@ -318,7 +318,7 @@ fn derive_ladder_shape(
         rate_running = next_rate;
     }
     if shape.k_recursive.len() < 2 {
-        return Err("log_n too small — no recursive levels needed (use BaseFold directly)".into());
+        return Err("log_n too small — no recursive levels for the Ligerito recursion".into());
     }
     shape.yr_log_n = n_running;
     Ok(shape)
@@ -2944,7 +2944,7 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     )
 }
 
-/// Drop-in replacement for `basefold::prove`: takes a generic basis poly +
+/// Drop-in replacement for the legacy `basefold::prove`: takes a generic basis poly +
 /// target (typically the combined `Σ γ_k · eq(z_k, ·)` and target produced by
 /// `ring_switch::prove_batched` for batched claims), plus an externally-built
 /// L0 commitment (the existing `pcs::commit` output).

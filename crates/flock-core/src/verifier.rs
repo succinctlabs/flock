@@ -7,7 +7,7 @@ use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck;
 use crate::pcs::{self, Commitment};
-use crate::proof::{R1csClaim, R1csProof, R1csProofLigerito, ZClaim};
+use crate::proof::{R1csClaim, R1csProofLigerito, ZClaim};
 use crate::r1cs::BlockR1cs;
 use crate::zerocheck;
 
@@ -27,7 +27,7 @@ pub enum VerifyError {
 /// The verify path shares several `par_*` helpers with the (multi-threaded)
 /// prover — e.g. `lincheck::fold_alpha_batched`, `sumcheck_bind_top_in_place_par`,
 /// and the Ligerito residual eval — so rather than fork every shared helper, the
-/// reusable verify cores (`verify_core`, `verify_claims`, `verify_claims_ligerito`)
+/// reusable verify cores (`verify_core`, `verify_claims_ligerito`)
 /// run their body via `verifier_pool().install(..)`. Any `par_iter` reached from
 /// there uses this 1-thread pool and collapses onto a single worker, without
 /// touching the prover's use of the global pool.
@@ -48,37 +48,8 @@ fn verifier_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-pub fn verify<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    commitment: &Commitment,
-    proof: &R1csProof,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    challenger: &mut Ch,
-) -> Result<R1csClaim, VerifyError> {
-    // ---- Replay zerocheck + lincheck → the two base claims.
-    let (ab, c) = verify_core(
-        r1cs,
-        &proof.zerocheck,
-        &proof.lincheck,
-        commitment,
-        lincheck_circuit,
-        challenger,
-    )?;
-
-    // ---- Verify the batched PCS opening covering both z-claims.
-    verify_claims(
-        commitment,
-        &[ab.clone(), c.clone()],
-        &proof.pcs_open,
-        challenger,
-    )
-    .map_err(VerifyError::PcsAb)?;
-
-    Ok(R1csClaim { ab, c })
-}
-
-/// Ligerito-backend mirror of [`verify`]. Same FS protocol replay; only the
-/// final PCS verification step differs.
+/// Verify an R1CS proof: replay zerocheck + lincheck → the two base z-claims,
+/// then verify the batched Ligerito PCS opening covering both.
 pub fn verify_ligerito<Ch: Challenger>(
     r1cs: &BlockR1cs,
     commitment: &Commitment,
@@ -106,7 +77,10 @@ pub fn verify_ligerito<Ch: Challenger>(
     Ok(R1csClaim { ab, c })
 }
 
-/// Ligerito-backend mirror of [`verify_claims`].
+/// Verify a batched PCS opening over an arbitrary list of `ẑ`-claims — the
+/// mirror of `flock_prover::prover::open_claims_with_precomputed_ligerito`.
+/// Relation wrappers (e.g. the hash chain) reuse this with their own appended
+/// claims. Must run at the same transcript position as the prover's open.
 pub fn verify_claims_ligerito<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[ZClaim],
@@ -160,7 +134,7 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
 /// Replay bind → zerocheck → lincheck and reconstruct the two base z-claims
 /// (`ab`, `c`), stopping before the PCS open. Mirror of
 /// `flock_prover::prover::prove_fast_core`; relation wrappers reuse this then call
-/// [`verify_claims`] over `[ab, c, …]`.
+/// [`verify_claims_ligerito`] over `[ab, c, …]`.
 pub fn verify_core<Ch: Challenger>(
     r1cs: &BlockR1cs,
     zerocheck_proof: &zerocheck::ZerocheckProof,
@@ -259,40 +233,6 @@ fn verify_core_inner<Ch: Challenger>(
     };
 
     Ok((ab, c))
-}
-
-/// Verify a batched PCS opening over an arbitrary list of `ẑ`-claims — the
-/// mirror of `flock_prover::prover::open_claims`. Relation wrappers (e.g. the hash
-/// chain) reuse this with their own appended claims. Must run at the same
-/// transcript position as the prover's open.
-pub fn verify_claims<Ch: Challenger>(
-    commitment: &Commitment,
-    claims: &[ZClaim],
-    pcs_open: &pcs::BatchOpeningProof,
-    challenger: &mut Ch,
-) -> Result<(), pcs::VerifyError> {
-    // Verification is single-threaded; run the body on the dedicated 1-thread pool.
-    verifier_pool().install(move || verify_claims_inner(commitment, claims, pcs_open, challenger))
-}
-
-fn verify_claims_inner<Ch: Challenger>(
-    commitment: &Commitment,
-    claims: &[ZClaim],
-    pcs_open: &pcs::BatchOpeningProof,
-    challenger: &mut Ch,
-) -> Result<(), pcs::VerifyError> {
-    let z_skips: Vec<F128> = claims.iter().map(|c| c.point.z_skip).collect();
-    let values: Vec<F128> = claims.iter().map(|c| c.value).collect();
-    let x_fulls: Vec<Vec<F128>> = claims
-        .iter()
-        .map(|c| {
-            let mut v = c.point.x_inner_rest.clone();
-            v.extend_from_slice(&c.point.x_outer);
-            v
-        })
-        .collect();
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    pcs::verify_opening_batch(commitment, &values, &z_skips, &x_refs, pcs_open, challenger)
 }
 
 #[cfg(test)]

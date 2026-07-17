@@ -70,15 +70,7 @@ name = "zerocheck_phases"
 harness = false
 
 [[bench]]
-name = "pcs_open"
-harness = false
-
-[[bench]]
 name = "lincheck"
-harness = false
-
-[[bench]]
-name = "keccak_proof"
 harness = false
 
 [[bench]]
@@ -102,18 +94,6 @@ name = "blake3_proof"
 harness = false
 
 [[bench]]
-name = "blake3_lig_vs_bf"
-harness = false
-
-[[bench]]
-name = "blake3_chain_lig_vs_bf"
-harness = false
-
-[[bench]]
-name = "sha2_merkle_lig_vs_bf"
-harness = false
-
-[[bench]]
 name = "blake3_fast_vs_slim"
 harness = false
 
@@ -122,23 +102,7 @@ name = "grinding_sha256"
 harness = false
 
 [[bench]]
-name = "keccak3_lig_vs_bf"
-harness = false
-
-[[bench]]
-name = "sha2_lig_vs_bf"
-harness = false
-
-[[bench]]
-name = "blake3_chain_proof"
-harness = false
-
-[[bench]]
 name = "sha2_proof"
-harness = false
-
-[[bench]]
-name = "sha2_chain_proof"
 harness = false
 
 [[bench]]
@@ -155,10 +119,6 @@ harness = false
 
 [[bench]]
 name = "blake3_native_chain"
-harness = false
-
-[[bench]]
-name = "keccak_chain_proof"
 harness = false
 
 [[bench]]

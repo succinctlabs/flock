@@ -79,7 +79,7 @@ fn main() {
     // ---- Warm-up (1 run) — primes any lazy-init data (e.g. NTT tables) ----
     {
         let mut ch = FsChallenger::new(b"flock-profile-v0");
-        let (p, _, _) = setup.prove_fast_basefold(&block_sets[0], &mut ch);
+        let (p, _, _) = setup.prove_fast(&block_sets[0], &mut ch);
         black_box(&p);
     }
 
@@ -90,7 +90,7 @@ fn main() {
         let blocks = &block_sets[run + 1];
         let mut ch = FsChallenger::new(b"flock-profile-v0");
         let t = Instant::now();
-        let (p, _, _) = setup.prove_fast_basefold(blocks, &mut ch);
+        let (p, _, _) = setup.prove_fast(blocks, &mut ch);
         let elapsed = t.elapsed().as_secs_f64() * 1e3;
         times.push(elapsed);
         black_box(&p);

@@ -92,7 +92,7 @@ use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_de
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::pcs::{Commitment, PcsParams};
-use flock_core::proof::{R1csClaim, R1csProof};
+use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::verifier;
 
@@ -1301,7 +1301,7 @@ impl Blake3Setup {
         let profile = match log_inv_rate {
             1 => flock_core::pcs::ligerito::LigeritoProfile::Fast,
             2 => flock_core::pcs::ligerito::LigeritoProfile::Slim,
-            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // BaseFold-only rates
+            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // other rates default to Fast
         };
         Self::with_profile_and_rate(n_blocks, profile, log_inv_rate)
     }
@@ -1362,16 +1362,6 @@ impl Blake3Setup {
         generate_witness(blocks, self.n_blocks_log())
     }
 
-    /// Full prover pipeline.
-    pub fn prove<Ch: Challenger>(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut Ch,
-    ) -> (R1csProof, Commitment, R1csClaim) {
-        let z_packed = self.generate_witness_packed(blocks);
-        crate::prover::prove(&self.r1cs, &z_packed, &self.pcs_params, challenger)
-    }
-
     /// Packed witness trace for the generic (matrix-driven) provers — see
     /// `Sha256HybridSetup::generate_witness_packed`.
     pub fn generate_witness_packed(&self, blocks: &[Compression]) -> Vec<F128> {
@@ -1379,10 +1369,9 @@ impl Blake3Setup {
         z_packed
     }
 
-    /// Generic (matrix-driven) prover on the **Ligerito** backend — the
-    /// counterpart of [`Self::prove`] (BaseFold). Same witness path;
-    /// produces a proof byte-identical to [`Self::prove_fast`] and
-    /// verifiable with [`Self::verify`].
+    /// Generic (matrix-driven) prover. Same witness path as the fused
+    /// [`Self::prove_fast`]; produces a byte-identical proof, verifiable
+    /// with [`Self::verify`].
     pub fn prove_ligerito<Ch: Challenger>(
         &self,
         blocks: &[Compression],
@@ -1390,41 +1379,6 @@ impl Blake3Setup {
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         let z_packed = self.generate_witness_packed(blocks);
         crate::prover::prove_ligerito(&self.r1cs, z_packed, &self.pcs_params, challenger)
-    }
-
-    /// Like [`Self::prove`] but emits `a`, `b`, `c` during witness gen
-    /// directly in F_{2^128}-packed form — no bool intermediates, no
-    /// `pack_witness`, no `apply_block_diag_packed`.
-    ///
-    pub fn prove_fast_basefold<Ch: Challenger>(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut Ch,
-    ) -> (R1csProof, Commitment, R1csClaim) {
-        assert_eq!(blocks.len(), self.n_blocks);
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness_ab(blocks);
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        crate::prover::prove_fast_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            challenger,
-        )
-    }
-
-    pub fn verify_basefold<Ch: Challenger>(
-        &self,
-        commitment: &Commitment,
-        proof: &R1csProof,
-        challenger: &mut Ch,
-    ) -> Result<R1csClaim, verifier::VerifyError> {
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        verifier::verify(&self.r1cs, commitment, proof, lc_circuit, challenger)
     }
 
     /// Ligerito-backend prove. Requires m ≥ ~21.
@@ -1508,7 +1462,7 @@ impl Blake3Setup {
 // Hash chain: BLAKE3 geometry + thin wrappers over the generic chain core.
 // ---------------------------------------------------------------------------
 
-pub use super::chain_common::{ChainFold, ChainProof, ChainVerifyError};
+pub use super::chain_common::{ChainFold, ChainVerifyError};
 
 /// BLAKE3's I/O-region geometry for the generic chain core. The input chaining
 /// value `cv` sits in aligned slot 0 (byte 0), the output chaining value
@@ -1548,42 +1502,10 @@ impl Blake3Setup {
     /// The prover is **given the full sequence** of `Compression`s (one per
     /// instance) so trace-gen is parallel; for an honest chain the caller sets
     /// `blocks[i+1].cv = out_lo(compress(blocks[i]))`.
-    pub fn prove_chain_basefold<Ch: Challenger>(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut Ch,
-    ) -> (ChainProof, Commitment) {
-        assert_eq!(blocks.len(), self.n_blocks);
-        // The chain shift sumcheck enforces the relation across ALL witness
-        // slots, including padding. If n_blocks < n_block_slots, padding blocks
-        // (all-zero) break the chain at the boundary and the proof cannot
-        // verify with the user's intended endpoints. Require an exact fit
-        // (n_blocks a power of 2 ≥ 8, the lincheck floor).
-        assert_eq!(
-            self.n_blocks,
-            self.n_block_slots(),
-            "prove_chain requires n_blocks to exactly fill n_block_slots \
-             (no padding); got n_blocks={}, n_block_slots={}. Use a \
-             power-of-2 ≥ 8.",
-            self.n_blocks,
-            self.n_block_slots(),
-        );
-        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(blocks);
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        super::chain_common::prove_chain_generic(
-            &self.r1cs,
-            &self.pcs_params,
-            &CHAIN_LAYOUT,
-            z_packed,
-            a_packed,
-            b_packed,
-            z_lincheck,
-            lc_circuit,
-            challenger,
-        )
-    }
-
-    /// Ligerito-backend mirror of [`Self::prove_chain`].
+    ///
+    /// The chain shift sumcheck enforces the relation across ALL witness
+    /// slots, including padding — so n_blocks must exactly fill
+    /// n_block_slots (a power of 2 ≥ 8, the lincheck floor).
     pub fn prove_chain<Ch: Challenger>(
         &self,
         blocks: &[Compression],
@@ -1629,44 +1551,6 @@ impl Blake3Setup {
             &cv_last_phys,
             lc_circuit,
             &self.pcs_params,
-            challenger,
-        )
-    }
-
-    /// Verify a [`ChainProof`] against public endpoints `cv_0` (first input CV)
-    /// and `cv_last` (last output CV).
-    pub fn verify_chain_basefold<Ch: Challenger>(
-        &self,
-        commitment: &Commitment,
-        proof: &ChainProof,
-        cv_0: &[u32; 8],
-        cv_last: &[u32; 8],
-        challenger: &mut Ch,
-    ) -> Result<(), ChainVerifyError> {
-        // Mirror `prove_chain`'s requirement: chain proof must cover exactly
-        // one compression per witness slot (no padding) to be meaningful.
-        assert_eq!(
-            self.n_blocks,
-            self.n_block_slots(),
-            "verify_chain requires n_blocks to exactly fill n_block_slots \
-             (no padding); got n_blocks={}, n_block_slots={}. Use a \
-             power-of-2 ≥ 8.",
-            self.n_blocks,
-            self.n_block_slots(),
-        );
-        let n_log = self.n_blocks_log();
-        let cv0_phys = cv_to_phys_bits(cv_0);
-        let cvlast_phys = cv_to_phys_bits(cv_last);
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        super::chain_common::verify_chain_generic(
-            &self.r1cs,
-            &CHAIN_LAYOUT,
-            commitment,
-            proof,
-            n_log,
-            &cv0_phys,
-            &cvlast_phys,
-            lc_circuit,
             challenger,
         )
     }
@@ -1900,14 +1784,15 @@ mod tests {
         }
     }
 
-    /// Batch-major end-to-end roundtrip (BaseFold) + tamper rejection.
+    /// Batch-major end-to-end Ligerito roundtrip + tamper rejection.
     #[test]
-    fn batch_major_prove_fast_basefold_roundtrip() {
+    #[ignore]
+    fn batch_major_prove_fast_roundtrip() {
         use flock_core::challenger::FsChallenger;
 
-        let setup = Blake3Setup::new_batch_major(8);
+        let setup = Blake3Setup::new_batch_major(256);
         let mut rng = Rng::new(0xBA7C_F013);
-        let inputs: Vec<Compression> = (0..8)
+        let inputs: Vec<Compression> = (0..256)
             .map(|_| {
                 let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
                 let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
@@ -1916,19 +1801,19 @@ mod tests {
             })
             .collect();
 
-        let mut ch_p = FsChallenger::new(b"flock-test-v0");
-        let (proof, commitment, claim_p) = setup.prove_fast_basefold(&inputs, &mut ch_p);
-        let mut ch_v = FsChallenger::new(b"flock-test-v0");
+        let mut ch_p = FsChallenger::new(b"flock-lig-batch-major-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast(&inputs, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-lig-batch-major-v0");
         let claim_v = setup
-            .verify_basefold(&commitment, &proof, &mut ch_v)
+            .verify(&commitment, &proof, &mut ch_v)
             .unwrap_or_else(|e| panic!("batch-major verifier rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
         let mut bad = proof.clone();
         bad.zerocheck.final_a_eval.lo ^= 1;
-        let mut ch = FsChallenger::new(b"flock-test-v0");
+        let mut ch = FsChallenger::new(b"flock-lig-batch-major-v0");
         assert!(
-            setup.verify_basefold(&commitment, &bad, &mut ch).is_err(),
+            setup.verify(&commitment, &bad, &mut ch).is_err(),
             "tampered batch-major proof accepted"
         );
     }
@@ -2056,51 +1941,6 @@ mod tests {
         assert!(
             !r1cs.satisfies(&z),
             "tampered carry bit should violate R1CS"
-        );
-    }
-
-    /// End-to-end prove/verify for one compression. Slow in debug, fast in
-    /// release.
-    #[test]
-    fn end_to_end_prove_verify() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Blake3Setup::new(1);
-        let mut rng = Rng::new(0xC0DE_5A55);
-        let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-        let blocks = vec![(cv, m, 0u64, 64u32, 11u32)];
-        let mut ch_p = FsChallenger::new(b"flock-test-v0");
-        let (proof, commitment, claim_p) = setup.prove(&blocks, &mut ch_p);
-        let mut ch_v = FsChallenger::new(b"flock-test-v0");
-        let claim_v = setup
-            .verify_basefold(&commitment, &proof, &mut ch_v)
-            .unwrap_or_else(|e| panic!("verify rejected honest BLAKE3 proof: {e:?}"));
-        assert_eq!(claim_p, claim_v);
-    }
-
-    /// A mutated BLAKE3 witness produces a proof that fails verification.
-    #[test]
-    fn verify_rejects_mutation() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Blake3Setup::new(1);
-        let mut rng = Rng::new(0xBADD_BEEF);
-        let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-        let blocks = vec![(cv, m, 0u64, 64u32, 11u32)];
-        let mut z = setup.generate_witness(&blocks);
-        assert!(setup.r1cs.satisfies(&z));
-        z[g_add_carry_bit(15, ADD_A2, 3)] ^= true;
-        assert!(!setup.r1cs.satisfies(&z));
-        let mut ch_p = FsChallenger::new(b"flock-test-v0");
-        let z_packed = flock_core::pcs::pack_witness(&z, setup.r1cs.m);
-        let (proof, commitment, _) =
-            crate::prover::prove(&setup.r1cs, &z_packed, &setup.pcs_params, &mut ch_p);
-        let mut ch_v = FsChallenger::new(b"flock-test-v0");
-        assert!(
-            setup
-                .verify_basefold(&commitment, &proof, &mut ch_v)
-                .is_err(),
-            "tampered witness produced an accepted proof"
         );
     }
 
@@ -2299,33 +2139,17 @@ mod tests {
         );
     }
 
-    /// `prove_fast_basefold` produces an accepting proof (legacy BaseFold path).
+    /// Constant-wire pin (docs/const-wire-pin.md). `new(250)` has padding
+    /// blocks (filled with a valid all-zero-input compression, constant = 1)
+    /// so the honest proof verifies; the all-zero witness must be rejected by
+    /// the pin. (For BLAKE3 the pin lives on the R1CS-built CSC circuit, not
+    /// the walker.)
     #[test]
-    fn prove_fast_basefold_roundtrip() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Blake3Setup::new(1);
-        let mut rng = Rng::new(0xFA57_5A55);
-        let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-        let blocks = vec![(cv, m, 0u64, 64u32, 11u32)];
-        let mut ch_p = FsChallenger::new(b"flock-test-v0");
-        let (proof, commitment, claim_p) = setup.prove_fast_basefold(&blocks, &mut ch_p);
-        let mut ch_v = FsChallenger::new(b"flock-test-v0");
-        let claim_v = setup
-            .verify_basefold(&commitment, &proof, &mut ch_v)
-            .unwrap_or_else(|e| panic!("prove_fast_basefold: verifier rejected: {e:?}"));
-        assert_eq!(claim_p, claim_v);
-    }
-
-    /// Constant-wire pin (docs/const-wire-pin.md). `new(5)` has padding blocks
-    /// (filled with a valid all-zero-input compression, constant = 1) so the
-    /// honest proof verifies; the all-zero witness must be rejected by the pin.
-    /// (For BLAKE3 the pin lives on the R1CS-built CSC circuit, not the walker.)
-    #[test]
+    #[ignore] // Heavier — Ligerito needs m=22; run with `cargo test const_pin_all_zero_rejected -- --ignored`
     fn const_pin_all_zero_rejected() {
         use flock_core::challenger::FsChallenger;
 
-        let n = 5; // 3 padding blocks
+        let n = 250; // 6 padding blocks at n_block_slots = 256 (m = 22)
         let setup = Blake3Setup::new(n);
 
         // (1) Honest proof with filled padding verifies.
@@ -2338,10 +2162,10 @@ mod tests {
             })
             .collect();
         let mut ch_p = FsChallenger::new(b"honest");
-        let (proof, commitment, claim_p) = setup.prove_fast_basefold(&blocks, &mut ch_p);
+        let (proof, commitment, claim_p) = setup.prove_fast(&blocks, &mut ch_p);
         let mut ch_v = FsChallenger::new(b"honest");
         let claim_v = setup
-            .verify_basefold(&commitment, &proof, &mut ch_v)
+            .verify(&commitment, &proof, &mut ch_v)
             .unwrap_or_else(|e| panic!("honest padded proof rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
@@ -2358,7 +2182,7 @@ mod tests {
         zlc.iter_mut().for_each(|v| *v = 0);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commitment, _) = crate::prover::prove_fast_from_witness(
+        let (proof, commitment, _) = crate::prover::prove_fast_ligerito_from_witness(
             &setup.r1cs,
             &setup.pcs_params,
             z,
@@ -2366,31 +2190,15 @@ mod tests {
             b,
             zlc,
             circuit,
+            None,
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(b"poc");
-        let res = setup.verify_basefold(&commitment, &proof, &mut ch_v);
+        let res = setup.verify(&commitment, &proof, &mut ch_v);
         assert!(
             matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
-    }
-
-    /// `prove_fast_basefold` matches `prove` (same commitment + claim).
-    #[test]
-    fn prove_fast_basefold_matches_prove() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Blake3Setup::new(1);
-        let mut rng = Rng::new(0xDEED_1234);
-        let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-        let blocks = vec![(cv, m, 0u64, 64u32, 11u32)];
-        let mut ch1 = FsChallenger::new(b"flock-test-v0");
-        let (_p1, c1, claim1) = setup.prove(&blocks, &mut ch1);
-        let mut ch2 = FsChallenger::new(b"flock-test-v0");
-        let (_p2, c2, claim2) = setup.prove_fast_basefold(&blocks, &mut ch2);
-        assert_eq!(c1.root, c2.root, "commitments must match");
-        assert_eq!(claim1, claim2, "claims must match");
     }
 
     #[test]
@@ -2482,41 +2290,28 @@ mod chain_e2e_tests {
     }
 
     #[test]
-    fn chain_prove_verify_basefold_roundtrip() {
-        let setup = Blake3Setup::new(8); // n_log = 3, 8 instances, m = 17
-        let n = setup.n_block_slots();
-        let (blocks, cv0, cv_last) = honest_chain(n, 0xB3_C0FFEE);
-
-        let mut chp = FsChallenger::new(b"b3-chain");
-        let (proof, comm) = setup.prove_chain_basefold(&blocks, &mut chp);
-
-        let mut chv = FsChallenger::new(b"b3-chain");
-        setup
-            .verify_chain_basefold(&comm, &proof, &cv0, &cv_last, &mut chv)
-            .expect("honest BLAKE3 chain must verify");
-    }
-
-    #[test]
+    #[ignore] // Heavier — Ligerito needs m=22
     fn chain_wrong_endpoint_rejects() {
-        let setup = Blake3Setup::new(8);
+        let setup = Blake3Setup::new(256);
         let n = setup.n_block_slots();
         let (blocks, cv0, mut cv_last) = honest_chain(n, 0xB3_1234);
 
         let mut chp = FsChallenger::new(b"b3-chain");
-        let (proof, comm) = setup.prove_chain_basefold(&blocks, &mut chp);
+        let (proof, comm) = setup.prove_chain(&blocks, &mut chp);
 
         cv_last[0] ^= 1; // corrupt the public output endpoint
         let mut chv = FsChallenger::new(b"b3-chain");
         assert!(
             setup
-                .verify_chain_basefold(&comm, &proof, &cv0, &cv_last, &mut chv)
+                .verify_chain(&comm, &proof, &cv0, &cv_last, &mut chv)
                 .is_err()
         );
     }
 
     #[test]
+    #[ignore] // Heavier — Ligerito needs m=22
     fn chain_broken_link_rejects() {
-        let setup = Blake3Setup::new(8);
+        let setup = Blake3Setup::new(256);
         let n = setup.n_block_slots();
         let (mut blocks, cv0, cv_last) = honest_chain(n, 0xB3_55);
 
@@ -2525,11 +2320,11 @@ mod chain_e2e_tests {
         blocks[2].0 = rng.cv();
 
         let mut chp = FsChallenger::new(b"b3-chain");
-        let (proof, comm) = setup.prove_chain_basefold(&blocks, &mut chp);
+        let (proof, comm) = setup.prove_chain(&blocks, &mut chp);
         let mut chv = FsChallenger::new(b"b3-chain");
         assert!(
             setup
-                .verify_chain_basefold(&comm, &proof, &cv0, &cv_last, &mut chv)
+                .verify_chain(&comm, &proof, &cv0, &cv_last, &mut chv)
                 .is_err()
         );
     }

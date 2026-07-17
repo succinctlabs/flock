@@ -29,7 +29,7 @@ use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
-use flock_core::proof::{R1csClaim, R1csProof, R1csProofLigerito, ZClaim, bind_statement};
+use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
 
@@ -44,47 +44,17 @@ pub(crate) fn quirky_x_outer_full(point: &QuirkyPoint) -> Vec<F128> {
     v
 }
 
-/// Batched PCS open over an arbitrary list of `ẑ`-evaluation claims, in one
-/// shared BaseFold/FRI. This is the generic seam: the base R1CS proof opens
-/// `[ab, c]`; relation wrappers (e.g. the hash chain) append their own claims
-/// and open `[ab, c, …]`. The claims' `value`s aren't needed here (the opening
-/// is over the points); the verifier supplies them to [`open_claims`]'s mirror.
-///
-/// Must be called at the same transcript position as the verifier's
-/// [`flock_core::verifier::verify_claims`].
+/// Batched PCS open over an arbitrary list of `ẑ`-evaluation claims. This is
+/// the generic seam: the base R1CS proof opens `[ab, c]`; relation wrappers
+/// (e.g. the hash chain) append their own claims and open `[ab, c, …]`.
 /// Per-claim optional precomputed `s_hat_v` is passed through to ring-switch:
 /// when `Some(v)`, the claim skips `fold_1b_rows` and uses `v` directly.
 /// Caller responsibility: each `Some(v)` MUST equal what `fold_1b_rows` would
 /// produce on `z_packed` against the claim's suffix — see
 /// [`pcs::ring_switch::s_hat_v_from_z_vec`] for the AB-claim derivation.
-pub(crate) fn open_claims_with_precomputed<Ch: Challenger>(
-    z_packed: &[F128],
-    prover_data: &pcs::ProverData,
-    commitment: &Commitment,
-    claims: &[ZClaim],
-    precomputed_s_hat_v: &[Option<&[F128]>],
-    padding: &zerocheck::PaddingSpec,
-    challenger: &mut Ch,
-) -> pcs::BatchOpeningProof {
-    let x_fulls: Vec<Vec<F128>> = claims
-        .iter()
-        .map(|c| quirky_x_outer_full(&c.point))
-        .collect();
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    pcs::open_batch_padded_with_precomputed_s_hat_v(
-        z_packed,
-        prover_data,
-        commitment,
-        &x_refs,
-        precomputed_s_hat_v,
-        padding,
-        challenger,
-    )
-}
-
-/// Ligerito-backend counterpart to [`open_claims_with_precomputed`]. Same
-/// transcript shape from the caller's POV; just routes through Ligerito
-/// instead of BaseFold at the final PCS step.
+///
+/// Must be called at the same transcript position as the verifier's
+/// [`flock_core::verifier::verify_claims_ligerito`].
 pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
     z_packed: Vec<F128>,
     prover_data: &pcs::ProverData,
@@ -122,134 +92,6 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
 ///
 /// Returns the proof bundle, the witness commitment, and the two claims (which
 /// the verifier needs to know to check the openings).
-pub fn prove<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    z_packed: &[F128],
-    pcs_params: &PcsParams,
-    challenger: &mut Ch,
-) -> (R1csProof, Commitment, R1csClaim) {
-    assert_eq!(
-        r1cs.layout,
-        flock_core::r1cs::WitnessLayout::RowMajor,
-        "the generic matrix-driven provers assume the row-major layout \
-         (block-diagonal apply + lincheck stripe packing); batch-major \
-         setups must use the per-hash prove_fast paths"
-    );
-    assert_eq!(z_packed.len(), 1usize << (r1cs.m - 7));
-    assert_eq!(pcs_params.m, r1cs.m);
-
-    // ---- PCS commit to z (already packed). Pass by reference — commit copies
-    // the witness into the codeword buffer and doesn't retain it.
-    let (commitment, prover_data) = pcs::commit(z_packed, pcs_params);
-
-    // ---- Bind FS transcript to the statement (R1CS instance + commitment).
-    bind_statement(challenger, r1cs, &commitment);
-
-    // ---- Compute a = A·z, b = B·z in packed form. For the circuit-R1CS
-    // convention C = I (every production instance), c = C·z = z — alias it
-    // instead of running a third block-diagonal apply.
-    let a_packed_f128 = r1cs.apply_a_packed(z_packed);
-    let b_packed_f128 = r1cs.apply_b_packed(z_packed);
-    let c_packed_f128: Vec<F128> = if r1cs.c0_is_identity() {
-        Vec::new() // unused — c aliases z below
-    } else {
-        r1cs.apply_c_packed(z_packed)
-    };
-
-    // ---- View a/b/c as LSB-first bytes for zerocheck. `F128` is
-    // `repr(C, align(16))` with two little-endian u64s; that byte layout is
-    // identical to the bit packing the zerocheck consumes, so a raw cast
-    // suffices — no allocation, no copy.
-    let cast = |v: &[F128]| -> &[u8] {
-        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
-    };
-    let a_packed: &[u8] = cast(&a_packed_f128);
-    let b_packed: &[u8] = cast(&b_packed_f128);
-    let c_packed: &[u8] = if c_packed_f128.is_empty() {
-        cast(z_packed)
-    } else {
-        cast(&c_packed_f128)
-    };
-
-    // ---- Stripe-pack z from F_{2^128}-packed for lincheck.
-    let z_packed_lincheck = pack_z_lincheck_from_packed(z_packed, r1cs.m, r1cs.k_log);
-
-    // ---- Zerocheck.
-    let padding = r1cs.padding_spec();
-    let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
-        a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
-    );
-
-    // ---- Translate zerocheck output → lincheck input.
-    //
-    // Zerocheck's claim point for (â, b̂) is `(z, mlv_challenges)` where:
-    //   - `z = zc_claim.z` is the URM challenge (binds k_skip skip vars)
-    //   - `mlv_challenges[0..k_log-k_skip]` binds the inner-rest bits (between
-    //      the skip dim and the lincheck inner boundary).
-    //   - `mlv_challenges[k_log-k_skip..]` binds the outer bits.
-    let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-
-    // ---- Lincheck. Capture pre-sumcheck z_vec to skip fold_1b_rows for AB
-    // at PCS-open time.
-    let lc_circuit = r1cs.csc_lincheck_circuit();
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lc_circuit,
-        &x_ab,
-        challenger,
-    );
-
-    // ---- Build the two z-claims for the PCS.
-    let ab = ZClaim {
-        point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
-        value: lc_claim.w,
-    };
-    // c-claim: zerocheck gives `ĉ(point_c) = c_eval` where ĉ is the MLE of
-    // `C·z`. Since `C = I`, ĉ = ẑ and the c-claim is already a z-claim.
-    let c = ZClaim {
-        point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
-        value: zc_claim.c_eval,
-    };
-
-    // ---- Single batched PCS open covering both z-claims via one BaseFold.
-    // AB s_hat_v derived from lincheck's pre-sumcheck z_vec; skips
-    // fold_1b_rows for the AB claim. Skip when k_log < LOG_PACKING.
-    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else {
-        None
-    };
-    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
-    let pcs_open = open_claims_with_precomputed(
-        z_packed,
-        &prover_data,
-        &commitment,
-        &[ab.clone(), c.clone()],
-        &[pre_ab, pre_c],
-        &padding,
-        challenger,
-    );
-
-    let proof = R1csProof {
-        zerocheck: zc_proof,
-        lincheck: lc_proof,
-        pcs_open,
-    };
-    let claim = R1csClaim { ab, c };
-    (proof, commitment, claim)
-}
-
-/// Ligerito-backend mirror of [`prove`]. Drop-in replacement returning
-/// `R1csProofLigerito` instead of `R1csProof`. Same FS protocol upstream
-/// (commit, zerocheck, lincheck); only the final PCS step differs.
 pub fn prove_ligerito<Ch: Challenger>(
     r1cs: &BlockR1cs,
     z_packed: Vec<F128>,
@@ -269,12 +111,12 @@ pub fn prove_ligerito<Ch: Challenger>(
     let log_n = r1cs.m - pcs::LOG_PACKING;
     let lig_config =
         pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
-            .expect("Ligerito default config; bump m or use prove (BaseFold) for tiny instances");
+            .expect("Ligerito default config; bump m for tiny instances");
 
     let (commitment, prover_data) = pcs::commit(&z_packed, pcs_params);
     bind_statement(challenger, r1cs, &commitment);
 
-    // a = A·z, b = B·z; for the C = I convention c aliases z (see prove()).
+    // a = A·z, b = B·z; for the C = I convention c aliases z.
     let a_packed_f128 = r1cs.apply_a_packed(&z_packed);
     let b_packed_f128 = r1cs.apply_b_packed(&z_packed);
     let c_packed_f128: Vec<F128> = if r1cs.c0_is_identity() {
@@ -357,60 +199,7 @@ pub fn prove_ligerito<Ch: Challenger>(
 /// the four packed buffers produced by the per-hash
 /// `generate_witness_with_ab_packed_and_lincheck` and runs commit → zerocheck
 /// → lincheck → PCS-open. Uses the c-aliasing trick (`C = I` → `c == z`
-/// byte-for-byte).
-pub fn prove_fast_from_witness<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    pcs_params: &PcsParams,
-    z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
-    z_packed_lincheck: Vec<u8>,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    challenger: &mut Ch,
-) -> (R1csProof, Commitment, R1csClaim) {
-    let core = prove_fast_core(
-        r1cs,
-        pcs_params,
-        z_packed,
-        a_packed_f128,
-        b_packed_f128,
-        z_packed_lincheck,
-        lincheck_circuit,
-        challenger,
-    );
-
-    // ---- Single batched PCS open over the two base claims. AB-claim's
-    // s_hat_v is precomputed from lincheck's pre-sumcheck z_vec, skipping
-    // fold_1b_rows for that claim.
-    let padding = r1cs.padding_spec();
-    let pre_ab: Option<&[F128]> = core.s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(core.s_hat_v_c.as_slice());
-    let pcs_open = open_claims_with_precomputed(
-        &core.z_packed,
-        &core.prover_data,
-        &core.commitment,
-        &[core.ab.clone(), core.c.clone()],
-        &[pre_ab, pre_c],
-        &padding,
-        challenger,
-    );
-
-    let proof = R1csProof {
-        zerocheck: core.zc_proof,
-        lincheck: core.lc_proof,
-        pcs_open,
-    };
-    let claim = R1csClaim {
-        ab: core.ab,
-        c: core.c,
-    };
-    // Recycle the packed witness (the open was its last reader).
-    flock_core::scratch::give_f128(core.z_packed);
-    (proof, core.commitment, claim)
-}
-
-/// Ligerito-backend mirror of [`prove_fast_from_witness`]. Used by per-hash
-/// modules' `prove_fast_ligerito` methods.
+/// byte-for-byte). Used by per-hash modules' `prove_fast_ligerito` methods.
 pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
@@ -425,9 +214,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     let log_n = r1cs.m - pcs::LOG_PACKING;
     let lig_config =
         pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
-            .expect(
-                "Ligerito default config; bump m or use prove_fast (BaseFold) for tiny instances",
-            );
+            .expect("Ligerito default config; bump m for tiny instances");
 
     let ProveCore {
         zc_proof,
@@ -478,7 +265,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
 /// lincheck sub-proofs, the two base z-claims (`ab`, `c`), and the retained
 /// commitment / prover-data / packed witness needed to open more claims.
 ///
-/// The generic seam: `prove_fast_from_witness` = `prove_fast_core` +
+/// The generic seam: `prove_fast_ligerito_from_witness` = `prove_fast_core` +
 /// `open_claims([ab, c])`; a relation wrapper (e.g. the hash chain) runs the
 /// same core, derives extra z-claims, and calls `open_claims([ab, c, …])`.
 pub struct ProveCore {
@@ -656,7 +443,7 @@ pub struct ProvePhaseTimings {
 /// calls in the same order as `prove_fast_core_with_codeword` + the Ligerito
 /// open, wrapping each phase in an `Instant`, so the returned
 /// [`ProvePhaseTimings`] decompose the *real* Ligerito prover --- including its
-/// recursive opening --- not a BaseFold-style reconstruction. Kept in lockstep
+/// recursive opening. Kept in lockstep
 /// with `prove_fast_ligerito_from_witness`; benchmark-only.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_fast_ligerito_timed<Ch: Challenger>(
@@ -676,9 +463,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     let log_n = r1cs.m - pcs::LOG_PACKING;
     let lig_config =
         pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
-            .expect(
-                "Ligerito default config; bump m or use prove_fast (BaseFold) for tiny instances",
-            );
+            .expect("Ligerito default config; bump m for tiny instances");
 
     // --- PCS commit ---
     let t0 = Instant::now();

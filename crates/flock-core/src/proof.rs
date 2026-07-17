@@ -12,19 +12,8 @@ use crate::r1cs::BlockR1cs;
 use crate::zerocheck;
 use serde::{Deserialize, Serialize};
 
-/// Top-level R1CS proof: zerocheck + lincheck transcripts, plus two PCS
-/// opening proofs (one per ZClaim). BaseFold backend.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct R1csProof {
-    pub zerocheck: zerocheck::ZerocheckProof,
-    pub lincheck: lincheck::LincheckProof,
-    /// Batched PCS opening covering both the `ab` and `c` z-claims via one
-    /// shared BaseFold sumcheck + FRI.
-    pub pcs_open: pcs::BatchOpeningProof,
-}
-
-/// Top-level R1CS proof with the **Ligerito** PCS backend. Same zerocheck +
-/// lincheck transcripts; pcs_open uses Ligerito instead of BaseFold.
+/// Top-level R1CS proof: zerocheck + lincheck transcripts, plus one batched
+/// Ligerito PCS opening covering both the `ab` and `c` z-claims.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct R1csProofLigerito {
     pub zerocheck: zerocheck::ZerocheckProof,

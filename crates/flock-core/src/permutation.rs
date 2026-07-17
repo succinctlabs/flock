@@ -42,20 +42,16 @@
 //! points — `(ρ,0), (ρ,1), (1,ρ), (0,ρ)` and the product root `2N-2` — in one
 //! batched opening. The witness itself is not committed yet.
 //!
-//! ### Adaptive PCS backend
+//! ### PCS backend
 //!
-//! The opening uses **Ligerito** when `v` is large enough for Ligerito's
-//! recursion to be feasible (`ligerito::default_config` succeeds), and falls back
-//! to **BaseFold** otherwise. At `log_batch_size = log_inv_rate = 1` the floor is
-//! `log_n ≥ 8` (the L0 block must hold `udr_queries(1) = 243` distinct queries,
-//! so `2^log_n ≥ 243`); since `v` has `μ+1` vars, that means **Ligerito at
-//! `μ ≥ 7`**, BaseFold below. Below the floor Ligerito degenerates to "commit +
-//! check residual" with extra per-level overhead, so BaseFold is both simpler and
-//! smaller there. The choice is a deterministic function of `v`'s size, so prover
-//! and verifier agree without negotiation; the backend is recorded in the proof
-//! via [`pcs::BatchOpening`]. Committing a single poly (rather than `h` and `v`
-//! separately) also keeps it to one opening — Ligerito's succinct verifier is not
-//! transcript-balanced for chaining two opens on one challenger.
+//! The opening uses **Ligerito**, which requires `v` to be large enough for
+//! the recursion to be feasible (`ligerito::default_config` succeeds). At
+//! `log_batch_size = log_inv_rate = 1` the floor is `log_n ≥ 8` (the L0 block
+//! must hold `udr_queries(1) = 243` distinct queries, so `2^log_n ≥ 243`);
+//! since `v` has `μ+1` vars, that means **μ ≥ 7**. Committing a single poly
+//! (rather than `h` and `v` separately) also keeps it to one opening —
+//! Ligerito's succinct verifier is not transcript-balanced for chaining two
+//! opens on one challenger.
 //!
 //! Reuses `build_eq` (`zerocheck::univariate_skip`), the `F128` field arithmetic
 //! (incl. `inv`), the `Challenger` Fiat–Shamir trait, the PCS commit/open over
@@ -70,8 +66,8 @@ use crate::field::F128;
 use crate::merkle::Hash;
 use crate::pcs::ligerito::{ProverConfig, VerifierConfig};
 use crate::pcs::{
-    self, BatchOpening, Commitment, DirectEqInd, LOG_PACKING, PackedDirectClaim,
-    PackedDirectClaimRef, PcsParams, ProverData, commit,
+    self, Commitment, DirectEqInd, LOG_PACKING, PackedDirectClaim, PackedDirectClaimRef, PcsParams,
+    ProverData, commit,
 };
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq};
@@ -100,9 +96,9 @@ pub struct PermutationProof {
     pub v_x1: F128, // v(ρ, 1)
     pub v_1x: F128, // v(1, ρ)
     pub v_0x: F128, // v(0, ρ) — the leaf value ℓ(ρ), used in relation A
-    /// PCS opening of `v` at the five points `(ρ,0), (ρ,1), (1,ρ), (0,ρ)` and the
-    /// product root `2N-2`. Backend (Ligerito / BaseFold) chosen by `v`'s size.
-    pub v_open: BatchOpening,
+    /// Ligerito PCS opening of `v` at the five points `(ρ,0), (ρ,1), (1,ρ),
+    /// (0,ρ)` and the product root `2N-2`.
+    pub v_open: pcs::BatchOpeningProofLigerito,
 }
 
 /// Evaluation claims the verifier outputs. `f_eval, g_eval, s_sigma_eval` are
@@ -128,9 +124,6 @@ pub enum VerifyError {
     RootNotOne,
     /// The PCS opening of `v` failed to verify.
     PcsOpen(pcs::VerifyError),
-    /// An opening's backend (Ligerito / BaseFold) did not match the backend the
-    /// verifier deterministically expects for that poly's size — malformed proof.
-    BackendMismatch,
 }
 
 // ---------------------------------------------------------------------------
@@ -299,79 +292,59 @@ fn pcs_params(num_vars: usize) -> PcsParams {
     }
 }
 
-/// Ligerito prover config for an `F128` multilinear in `num_vars` variables, or
-/// `None` when the poly is too small for Ligerito's recursion (in which case the
-/// caller uses BaseFold). Deterministic in `num_vars`, so prover and verifier
-/// reach the same backend decision.
-fn ligerito_prover_config(num_vars: usize) -> Option<ProverConfig> {
-    pcs::ligerito::default_config(num_vars, PCS_LOG_BATCH_SIZE, PCS_LOG_INV_RATE).ok()
+/// Ligerito prover config for an `F128` multilinear in `num_vars` variables.
+/// Panics when the poly is too small for Ligerito's recursion (`num_vars < 8`,
+/// i.e. μ < 7 — see the module docs). Deterministic in `num_vars`, so prover
+/// and verifier build the same config.
+fn ligerito_prover_config(num_vars: usize) -> ProverConfig {
+    pcs::ligerito::default_config(num_vars, PCS_LOG_BATCH_SIZE, PCS_LOG_INV_RATE)
+        .expect("Ligerito config for the aux poly v; permutation check requires μ ≥ 7")
 }
 
-/// Verifier counterpart to [`ligerito_prover_config`]; `Some`/`None` agree with
-/// it (both gate on the same feasibility check).
-fn ligerito_verifier_config(num_vars: usize) -> Option<VerifierConfig> {
-    pcs::ligerito::default_verifier_config(num_vars, PCS_LOG_BATCH_SIZE, PCS_LOG_INV_RATE).ok()
+/// Verifier counterpart to [`ligerito_prover_config`]; agrees with it (both
+/// gate on the same feasibility check).
+fn ligerito_verifier_config(num_vars: usize) -> VerifierConfig {
+    pcs::ligerito::default_verifier_config(num_vars, PCS_LOG_BATCH_SIZE, PCS_LOG_INV_RATE)
+        .expect("Ligerito verifier config for the aux poly v; permutation check requires μ ≥ 7")
 }
 
 /// Open `poly` (length `2^num_vars`, already committed as `commitment`) at the
-/// packed-direct `claims`, using Ligerito when feasible for the size and
-/// BaseFold otherwise. `poly` is consumed (Ligerito's prover takes it by value).
-fn open_adaptive<C: Challenger>(
+/// packed-direct `claims` via Ligerito. `poly` is consumed (Ligerito's prover
+/// takes it by value).
+fn open_v<C: Challenger>(
     poly: Vec<F128>,
     prover_data: &ProverData,
     commitment: &Commitment,
     claims: &[PackedDirectClaim],
     ch: &mut C,
-) -> BatchOpening {
+) -> pcs::BatchOpeningProofLigerito {
     let num_vars = commitment.params.log_msg_len();
     let padding = PaddingSpec::dense(commitment.params.m);
-    match ligerito_prover_config(num_vars) {
-        Some(cfg) => {
-            BatchOpening::Ligerito(pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
-                poly,
-                prover_data,
-                commitment,
-                &[],
-                &[],
-                claims,
-                &padding,
-                &cfg,
-                ch,
-            ))
-        }
-        None => BatchOpening::BaseFold(pcs::open_batch_mixed(
-            &poly,
-            prover_data,
-            commitment,
-            &[],
-            claims,
-            &padding,
-            ch,
-        )),
-    }
+    let cfg = ligerito_prover_config(num_vars);
+    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+        poly,
+        prover_data,
+        commitment,
+        &[],
+        &[],
+        claims,
+        &padding,
+        &cfg,
+        ch,
+    )
 }
 
-/// Verify an [`open_adaptive`] opening: pick the same backend the prover must
-/// have used (deterministic in the poly size), require the proof's backend to
-/// match, and run the corresponding PCS verifier.
-fn verify_adaptive<C: Challenger>(
+/// Verify an [`open_v`] opening.
+fn verify_v<C: Challenger>(
     commitment: &Commitment,
     claims: &[PackedDirectClaimRef<'_>],
-    open: &BatchOpening,
+    open: &pcs::BatchOpeningProofLigerito,
     ch: &mut C,
 ) -> Result<(), VerifyError> {
     let num_vars = commitment.params.log_msg_len();
-    match (ligerito_verifier_config(num_vars), open) {
-        (Some(cfg), BatchOpening::Ligerito(p)) => {
-            pcs::verify_opening_batch_ligerito_mixed(commitment, &[], &[], &[], claims, p, &cfg, ch)
-                .map_err(VerifyError::PcsOpen)
-        }
-        (None, BatchOpening::BaseFold(p)) => {
-            pcs::verify_opening_batch_mixed(commitment, &[], &[], &[], claims, p, ch)
-                .map_err(VerifyError::PcsOpen)
-        }
-        _ => Err(VerifyError::BackendMismatch),
-    }
+    let cfg = ligerito_verifier_config(num_vars);
+    pcs::verify_opening_batch_ligerito_mixed(commitment, &[], &[], &[], claims, open, &cfg, ch)
+        .map_err(VerifyError::PcsOpen)
 }
 
 /// The five evaluation points of `v` (each length `μ+1`) that the PCS opens, in
@@ -637,7 +610,7 @@ pub fn prove<C: Challenger>(
             eq_ind: DirectEqInd::Dense(build_eq(point)),
         })
         .collect();
-    let v_open = open_adaptive(v, &pdata_v, &commitment_v, &v_claims, ch);
+    let v_open = open_v(v, &pdata_v, &commitment_v, &v_claims, ch);
     tp("open(v)");
 
     let proof = PermutationProof {
@@ -760,7 +733,7 @@ pub fn verify<C: Challenger>(
         .zip(v_values)
         .map(|(point, value)| PackedDirectClaimRef { point, value })
         .collect();
-    verify_adaptive(&commitment_v, &v_refs, &proof.v_open, ch)?;
+    verify_v(&commitment_v, &v_refs, &proof.v_open, ch)?;
 
     Ok(PermutationClaim {
         rho,
@@ -859,9 +832,8 @@ mod tests {
 
     #[test]
     fn honest_roundtrip_and_claim_match() {
-        // Spans both backend regimes for `v` (log_n = μ+1): BaseFold at μ≤6
-        // (log_n ≤ 7 < 8) and Ligerito at μ≥7 (log_n ≥ 8).
-        for mu in 1..=8 {
+        // μ ≥ 7 is the Ligerito floor for `v` (log_n = μ+1 ≥ 8).
+        for mu in 7..=8 {
             let (f, g, sigma) = honest_instance(mu, 0xC0FFEE ^ mu as u64);
             let (proof, claim_p) = run_prove(&f, &g, &sigma);
             assert_eq!(proof.claimed_product, F128::ONE, "μ={mu}: ∏ℓ ≠ 1");
@@ -872,7 +844,7 @@ mod tests {
 
     #[test]
     fn claim_matches_direct_mle() {
-        let mu = 6;
+        let mu = 7;
         let (f, g, sigma) = honest_instance(mu, 0xABCD);
         let (_proof, claim) = run_prove(&f, &g, &sigma);
 
@@ -917,7 +889,7 @@ mod tests {
 
     #[test]
     fn tampered_witness_rejected() {
-        let mu = 5;
+        let mu = 7;
         let (f, g, sigma) = honest_instance(mu, 0x1234);
         let (proof, _) = run_prove(&f, &g, &sigma);
 
@@ -935,7 +907,7 @@ mod tests {
     #[test]
     fn non_permutation_relation_rejected() {
         // f is NOT a permutation of g ⇒ honest prover's ∏h ≠ 1 ⇒ RootNotOne.
-        let mu = 4;
+        let mu = 7;
         let n = 1usize << mu;
         let mut rng = Rng::new(0x9999);
         let g: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
@@ -948,34 +920,16 @@ mod tests {
     }
 
     #[test]
-    fn tampered_basefold_opening_rejected() {
-        // μ=5 → v has log_n=6, below Ligerito's floor, so it opens with BaseFold.
-        // Corrupt its final value: the sumcheck and root checks still pass (evals
-        // + claimed_product are untouched), so the rejection comes purely from the
-        // PCS opening no longer matching the committed `v`.
-        let mu = 5;
+    fn tampered_pcs_opening_rejected() {
+        // Corrupt the opening's sumcheck transcript: the permutation sumcheck
+        // and root checks still pass (evals + claimed_product are untouched),
+        // so the rejection comes purely from the PCS opening no longer
+        // matching the committed `v`.
+        let mu = 7;
         let (f, g, sigma) = honest_instance(mu, 0x2468);
         let (mut proof, _) = run_prove(&f, &g, &sigma);
-        match &mut proof.v_open {
-            BatchOpening::BaseFold(bf) => bf.basefold.final_a.lo ^= 1,
-            BatchOpening::Ligerito(_) => panic!("μ={mu} should use BaseFold for v"),
-        }
+        proof.v_open.ligerito.sumcheck_transcript[0].u_0.lo ^= 1;
         let res = run_verify(mu, &f, &g, &sigma, &proof);
         assert!(matches!(res, Err(VerifyError::PcsOpen(_))), "got {res:?}");
-    }
-
-    #[test]
-    fn backend_is_adaptive_to_size() {
-        // μ=6: v has log_n=7 < 8 → BaseFold.
-        let (f, g, sigma) = honest_instance(6, 0x66);
-        let (p6, _) = run_prove(&f, &g, &sigma);
-        assert!(matches!(p6.v_open, BatchOpening::BaseFold(_)));
-        run_verify(6, &f, &g, &sigma, &p6).expect("μ=6 BaseFold verify");
-
-        // μ=7: v has log_n=8 ≥ 8 → Ligerito. Still verifies end-to-end.
-        let (f, g, sigma) = honest_instance(7, 0x77);
-        let (p7, _) = run_prove(&f, &g, &sigma);
-        assert!(matches!(p7.v_open, BatchOpening::Ligerito(_)));
-        run_verify(7, &f, &g, &sigma, &p7).expect("μ=7 Ligerito verify");
     }
 }

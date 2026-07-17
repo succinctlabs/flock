@@ -146,7 +146,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         n_blocks as f64 / best_fast
     );
 
-    // Peak memory + verify time + serialized proof size (single basefold prove).
+    // Peak memory + verify time + serialized proof size (single prove).
     {
         let blocks_v = &block_sets[0];
         reset_peak();

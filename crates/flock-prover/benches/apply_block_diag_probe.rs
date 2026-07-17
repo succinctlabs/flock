@@ -266,7 +266,7 @@ fn main() {
     {
         use flock_prover::challenger::FsChallenger;
         use flock_prover::r1cs_hashes::sha2::Sha256HybridSetup;
-        let n = 1usize << 10; // m = 25
+        let n = 1usize << 7; // m = 22 (smallest default-Ligerito size)
         let setup = Sha256HybridSetup::new(n);
         let mut rng = Rng(0xE2E);
         let comps: Vec<([u32; 8], [u32; 16])> = (0..n)
@@ -281,12 +281,12 @@ fn main() {
         for _ in 0..3 {
             let mut ch = FsChallenger::new(b"probe-e2e");
             let t = Instant::now();
-            let p = setup.prove(&comps, &mut ch);
+            let p = setup.prove_ligerito(&comps, &mut ch);
             best = best.min(t.elapsed().as_secs_f64());
             black_box(&p);
         }
         println!(
-            "\ne2e generic (non-fused) sha2 prove, m=25, 1024 compressions: {:.2} ms",
+            "\ne2e generic (non-fused) sha2 prove, m=22, 128 compressions: {:.2} ms",
             best * 1e3
         );
     }

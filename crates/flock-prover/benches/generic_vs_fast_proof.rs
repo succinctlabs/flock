@@ -1,6 +1,6 @@
-//! Generic (matrix-driven) prove vs the specialized `prove_fast` path, on
-//! the same BaseFold backend — quantifies what the hand-written fused
-//! witness generators buy now that the generic apply kernel is fast.
+//! Generic (matrix-driven) prove vs the specialized `prove_fast` path —
+//! quantifies what the hand-written fused witness generators buy now that
+//! the generic apply kernel is fast.
 //!
 //! Per hash/size, times the two pipelines end-to-end plus the phases that
 //! differ:
@@ -52,7 +52,7 @@ fn best_of<T, F: FnMut() -> T>(n: usize, mut f: F) -> (f64, T) {
     (best, out.unwrap())
 }
 
-fn bench_sha2(n: usize, ligerito: bool) {
+fn bench_sha2(n: usize) {
     use flock_prover::r1cs_hashes::sha2::{
         Compression, Sha256HybridSetup, generate_witness_with_ab_packed_and_lincheck,
     };
@@ -70,24 +70,13 @@ fn bench_sha2(n: usize, ligerito: bool) {
 
     println!("\n=== sha2, {n} compressions (m = {m}) ===");
 
-    // ---- specialized (fused) path, both backends ----
+    // ---- specialized (fused) path ----
     let (t_gen_fused, _) = best_of(2, || {
         generate_witness_with_ab_packed_and_lincheck(&comps, setup.n_blocks_log())
     });
-    let lig_times = ligerito.then(|| {
-        let (t_fast_lig, _) = best_of(2, || {
-            let mut ch = FsChallenger::new(b"bench-gvf");
-            black_box(setup.prove_fast(&comps, &mut ch))
-        });
-        let (t_generic_lig, _) = best_of(2, || {
-            let mut ch = FsChallenger::new(b"bench-gvf");
-            black_box(setup.prove_ligerito(&comps, &mut ch))
-        });
-        (t_fast_lig, t_generic_lig)
-    });
     let (t_fast, _) = best_of(2, || {
         let mut ch = FsChallenger::new(b"bench-gvf");
-        black_box(setup.prove_fast_basefold(&comps, &mut ch))
+        black_box(setup.prove_fast(&comps, &mut ch))
     });
 
     // ---- generic (matrix-driven) path: phases ----
@@ -97,23 +86,15 @@ fn bench_sha2(n: usize, ligerito: bool) {
     let (t_apply_b, _b) = best_of(2, || setup.r1cs.apply_b_packed(&z_packed));
     let (t_generic, _) = best_of(2, || {
         let mut ch = FsChallenger::new(b"bench-gvf");
-        black_box(setup.prove(&comps, &mut ch))
+        black_box(setup.prove_ligerito(&comps, &mut ch))
     });
-    if let Some((t_fast_lig, t_generic_lig)) = lig_times {
-        println!(
-            "  [ligerito] fast: {}  generic: {}  ratio {:>5.2}x   ({:.0} vs {:.0} H/s)",
-            fmt_ms(t_fast_lig),
-            fmt_ms(t_generic_lig),
-            t_generic_lig / t_fast_lig,
-            n as f64 / t_fast_lig,
-            n as f64 / t_generic_lig,
-        );
-    }
     println!(
-        "  [basefold] fast: {}  generic: {}  ratio {:>5.2}x",
+        "  fast: {}  generic: {}  ratio {:>5.2}x   ({:.0} vs {:.0} H/s)",
         fmt_ms(t_fast),
         fmt_ms(t_generic),
         t_generic / t_fast,
+        n as f64 / t_fast,
+        n as f64 / t_generic,
     );
     println!(
         "  generic phases:  trace {} | pack {} | A·z {} | B·z {}   (fused gen: {})",
@@ -125,7 +106,7 @@ fn bench_sha2(n: usize, ligerito: bool) {
     );
 }
 
-fn bench_blake3(n: usize, ligerito: bool) {
+fn bench_blake3(n: usize) {
     use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression};
     let setup = Blake3Setup::new(n);
     let mut rng = Rng(0xB1A ^ n as u64);
@@ -143,37 +124,18 @@ fn bench_blake3(n: usize, ligerito: bool) {
 
     println!("\n=== blake3, {n} compressions (m = {}) ===", setup.m());
 
-    let lig_times = ligerito.then(|| {
-        let (t_fast_lig, _) = best_of(2, || {
-            let mut ch = FsChallenger::new(b"bench-gvf");
-            black_box(setup.prove_fast(&blocks, &mut ch))
-        });
-        let (t_generic_lig, _) = best_of(2, || {
-            let mut ch = FsChallenger::new(b"bench-gvf");
-            black_box(setup.prove_ligerito(&blocks, &mut ch))
-        });
-        (t_fast_lig, t_generic_lig)
-    });
     let (t_fast, _) = best_of(2, || {
         let mut ch = FsChallenger::new(b"bench-gvf");
-        black_box(setup.prove_fast_basefold(&blocks, &mut ch))
+        black_box(setup.prove_fast(&blocks, &mut ch))
     });
     let (t_trace, z_packed) = best_of(2, || setup.generate_witness_packed(&blocks));
     let t_pack = 0.0f64;
     let (t_apply_a, _a) = best_of(2, || setup.r1cs.apply_a_packed(&z_packed));
     let (t_generic, _) = best_of(2, || {
         let mut ch = FsChallenger::new(b"bench-gvf");
-        black_box(setup.prove(&blocks, &mut ch))
+        black_box(setup.prove_ligerito(&blocks, &mut ch))
     });
 
-    if let Some((t_fast_lig, t_generic_lig)) = lig_times {
-        println!(
-            "  [ligerito] fast: {}  generic: {}  ratio {:>5.2}x",
-            fmt_ms(t_fast_lig),
-            fmt_ms(t_generic_lig),
-            t_generic_lig / t_fast_lig,
-        );
-    }
     println!("  specialized prove_fast: {}", fmt_ms(t_fast));
     println!(
         "  generic prove:          {}   (trace: {} | pack: {} | A·z: {})",
@@ -192,16 +154,12 @@ fn bench_blake3(n: usize, ligerito: bool) {
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
     println!(
-        "generic (matrix-driven) prove vs specialized prove_fast — BaseFold backend, \
-         {} threads",
+        "generic (matrix-driven) prove vs specialized prove_fast — {} threads",
         rayon::current_num_threads()
     );
 
-    // Ligerito comparisons only at sizes with registered default configs
-    // (m = 22, 28, 29); BaseFold runs at any size.
-    bench_sha2(128, true); // m = 22
-    bench_sha2(1024, false); // m = 25
-    bench_sha2(4096, false); // m = 27
-    bench_sha2(16384, true); // m = 29
-    bench_blake3(256, true); // m = 22
+    // Sizes with registered default Ligerito configs (m = 22, 29).
+    bench_sha2(128); // m = 22
+    bench_sha2(16384); // m = 29
+    bench_blake3(256); // m = 22
 }

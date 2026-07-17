@@ -68,17 +68,10 @@ fn report(label: &str, blake3_bytes: u64) {
     );
 }
 
-fn run(backend: &str, m: usize, rate: usize) {
+fn run(m: usize, rate: usize) {
     assert!(m > K_LOG, "m must exceed K_LOG={K_LOG}");
     let n_blocks = 1usize << (m - K_LOG);
-    println!(
-        "\n=== {} m={m} log_inv_rate={rate} (BLAKE3 R1CS, K={n_blocks}) ===",
-        if backend == "bf" {
-            "BaseFold"
-        } else {
-            "Ligerito"
-        }
-    );
+    println!("\n=== Ligerito m={m} log_inv_rate={rate} (BLAKE3 R1CS, K={n_blocks}) ===");
 
     let setup = Blake3Setup::with_log_inv_rate(n_blocks, rate);
     let mut rng = Rng::new(0xC0DE ^ (m as u64) << 8 ^ rate as u64);
@@ -87,50 +80,29 @@ fn run(backend: &str, m: usize, rate: usize) {
         .collect();
 
     let t0 = std::time::Instant::now();
-    match backend {
-        "bf" => {
-            let mut ch_p = FsChallenger::new(b"flock-hash-count");
-            let (proof, commitment, _) = setup.prove_fast_basefold(&blocks, &mut ch_p);
-            println!("  (prove: {:.1} s)", t0.elapsed().as_secs_f64());
+    let mut ch_p = FsChallenger::new(b"flock-hash-count");
+    let (proof, commitment, _) = setup.prove_fast(&blocks, &mut ch_p);
+    println!("  (prove: {:.1} s)", t0.elapsed().as_secs_f64());
 
-            reset_counters();
-            let mut ch_v = FsChallenger::new(b"flock-hash-count");
-            let t1 = std::time::Instant::now();
-            setup
-                .verify_basefold(&commitment, &proof, &mut ch_v)
-                .expect("bf verify");
-            let dt = t1.elapsed().as_secs_f64();
-            report("verify", ch_v.absorbed_bytes());
-            println!("    (verify time: {:.2} ms)", dt * 1e3);
-        }
-        "lig" => {
-            let mut ch_p = FsChallenger::new(b"flock-hash-count");
-            let (proof, commitment, _) = setup.prove_fast(&blocks, &mut ch_p);
-            println!("  (prove: {:.1} s)", t0.elapsed().as_secs_f64());
-
-            reset_counters();
-            let mut ch_v = FsChallenger::new(b"flock-hash-count");
-            let t1 = std::time::Instant::now();
-            setup
-                .verify(&commitment, &proof, &mut ch_v)
-                .expect("lig verify");
-            let dt = t1.elapsed().as_secs_f64();
-            report("verify", ch_v.absorbed_bytes());
-            println!("    (verify time: {:.2} ms)", dt * 1e3);
-        }
-        other => panic!("unknown backend {other:?} (use bf|lig)"),
-    }
+    reset_counters();
+    let mut ch_v = FsChallenger::new(b"flock-hash-count");
+    let t1 = std::time::Instant::now();
+    setup
+        .verify(&commitment, &proof, &mut ch_v)
+        .expect("lig verify");
+    let dt = t1.elapsed().as_secs_f64();
+    report("verify", ch_v.absorbed_bytes());
+    println!("    (verify time: {:.2} ms)", dt * 1e3);
 }
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
-    let runs = std::env::var("VHC_RUNS")
-        .unwrap_or_else(|_| "bf:22:1,lig:22:1,bf:30:1,lig:30:1,lig:30:2".to_string());
+    let runs = std::env::var("VHC_RUNS").unwrap_or_else(|_| "22:1,30:1,30:2".to_string());
     for entry in runs.split(',') {
         let parts: Vec<&str> = entry.trim().split(':').collect();
-        assert_eq!(parts.len(), 3, "bad VHC_RUNS entry {entry:?}");
-        let m: usize = parts[1].parse().expect("bad m");
-        let rate: usize = parts[2].parse().expect("bad rate");
-        run(parts[0], m, rate);
+        assert_eq!(parts.len(), 2, "bad VHC_RUNS entry {entry:?} (use m:rate)");
+        let m: usize = parts[0].parse().expect("bad m");
+        let rate: usize = parts[1].parse().expect("bad rate");
+        run(m, rate);
     }
 }
