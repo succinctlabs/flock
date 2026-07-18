@@ -1697,9 +1697,12 @@ pub(crate) fn fold_b128_from_table(eq_lo: &[F128], eq_hi: &[F128], tables: &[F12
 const SPARSE_ZERO_THRESHOLD: usize = 3;
 
 /// Sparse representation of `build_eq(coords)` when `coords` contains exact
-/// `F128::ZERO` entries: stores values at the compact (live) tensor positions
-/// and a `live_positions` table that maps compact bit `j` → original coord
-/// position. Avoids materializing the scattered `(full_idx, val)` pairs —
+/// `F128::ZERO` / `F128::ONE` entries: stores values at the compact (live)
+/// tensor positions and a `live_positions` table that maps compact bit `j` →
+/// original coord position. A zero coord pins its scattered-index bit to 0, a
+/// one coord pins it to 1 (`forced_ones_mask`) — in both cases the eq factor
+/// is 0 on one branch and 1 on the other, so skipping the dimension changes
+/// no value. Avoids materializing the scattered `(full_idx, val)` pairs —
 /// consumers compute the scattered idx on-the-fly via [`Self::scatter_idx`]
 /// (a bit-deposit / pdep operation) at the point of use.
 #[derive(Clone, Debug)]
@@ -1710,6 +1713,8 @@ pub struct SparseEqTensor {
     /// `j` of an enumeration index maps to bit `live_positions[j]` of the full
     /// scattered index.
     pub live_positions: Vec<usize>,
+    /// Scattered-index bits pinned to 1 by exact-`F128::ONE` coords.
+    pub forced_ones_mask: usize,
 }
 
 impl SparseEqTensor {
@@ -1724,7 +1729,7 @@ impl SparseEqTensor {
     /// the noise floor.)
     #[inline(always)]
     pub fn scatter_idx(&self, c: usize) -> usize {
-        let mut full = 0usize;
+        let mut full = self.forced_ones_mask;
         for (j, &pos) in self.live_positions.iter().enumerate() {
             full |= ((c >> j) & 1) << pos;
         }
@@ -1752,18 +1757,27 @@ impl SparseEqTensor {
     }
 }
 
-/// Build the sparse `build_eq(coords)` representation, skipping the zero-coord
-/// halvings. The output's `live_tensor` is the `build_eq` table over only the
-/// nonzero coords (length `2^live_count`); the scattered (full) index for
-/// compact entry `c` is reconstructed lazily via [`SparseEqTensor::scatter_idx`].
+/// Build the sparse `build_eq(coords)` representation, skipping the boolean-coord
+/// halvings (zero coords pin their bit to 0, one coords to 1). The output's
+/// `live_tensor` is the `build_eq` table over only the non-boolean coords
+/// (length `2^live_count`); the scattered (full) index for compact entry `c`
+/// is reconstructed lazily via [`SparseEqTensor::scatter_idx`].
 ///
 /// O(2^live_count) time and memory, vs the dense `build_eq`'s `O(2^coords.len())`.
+/// PD-claim points from block/slot geometry are fully boolean, so their tensors
+/// collapse to a single entry.
 pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
-    let live_positions: Vec<usize> = coords
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &c)| if c == F128::ZERO { None } else { Some(i) })
-        .collect();
+    let mut forced_ones_mask = 0usize;
+    let mut live_positions: Vec<usize> = Vec::new();
+    for (i, &c) in coords.iter().enumerate() {
+        if c == F128::ZERO {
+            // bit i pinned to 0 — dimension dropped entirely
+        } else if c == F128::ONE {
+            forced_ones_mask |= 1usize << i;
+        } else {
+            live_positions.push(i);
+        }
+    }
     let live_coords: Vec<F128> = live_positions.iter().map(|&i| coords[i]).collect();
     // Sequential build_eq. `build_eq_parallel` *does* save ~0.4 ms on the build
     // itself at 19 live coords, but the downstream `fold_1b_rows_sparse` /
@@ -1774,6 +1788,7 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
     SparseEqTensor {
         live_tensor,
         live_positions,
+        forced_ones_mask,
     }
 }
 
@@ -3533,15 +3548,68 @@ mod tests {
     /// Build a coord vector with `n_zeros` exact-zero entries at the requested
     /// positions and random F128s elsewhere.
     fn mk_coords(rng: &mut Rng, n: usize, zero_positions: &[usize]) -> Vec<F128> {
+        mk_coords_bool(rng, n, zero_positions, &[])
+    }
+
+    /// Coord vector with exact zeros at `zero_positions`, exact ones at
+    /// `one_positions`, random F128s elsewhere.
+    fn mk_coords_bool(
+        rng: &mut Rng,
+        n: usize,
+        zero_positions: &[usize],
+        one_positions: &[usize],
+    ) -> Vec<F128> {
         (0..n)
             .map(|i| {
                 if zero_positions.contains(&i) {
                     F128::ZERO
+                } else if one_positions.contains(&i) {
+                    F128::ONE
                 } else {
                     rng.f128()
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn build_eq_sparse_matches_dense_with_ones() {
+        let mut rng = Rng::new(0x0E1F1A6);
+        let cases: &[(usize, &[usize], &[usize])] = &[
+            (4, &[], &[1, 3]),                          // ones only
+            (6, &[0, 2], &[1, 5]),                      // zeros + ones + random
+            (8, &[2, 3], &[0, 1, 4, 5, 6, 7]),          // all boolean → one live entry
+            (10, &[], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), // all ones
+            (10, &[0, 5], &[9]),
+        ];
+        for &(n_coords, zeros, ones) in cases {
+            let coords = mk_coords_bool(&mut rng, n_coords, zeros, ones);
+            let dense = build_eq(&coords);
+            let sparse_eq = build_eq_sparse(&coords);
+            assert_eq!(
+                sparse_eq.live_positions.len(),
+                n_coords - zeros.len() - ones.len(),
+                "boolean coords must not be live (n={n_coords})"
+            );
+            let materialized = sparse_eq.materialize();
+            let mut covered = vec![false; dense.len()];
+            for &(idx, val) in &materialized {
+                assert_eq!(
+                    val, dense[idx],
+                    "value mismatch at idx={idx} (n={n_coords}, zeros={zeros:?}, ones={ones:?})"
+                );
+                covered[idx] = true;
+            }
+            for (i, &c) in covered.iter().enumerate() {
+                if !c {
+                    assert_eq!(
+                        dense[i],
+                        F128::ZERO,
+                        "dense[{i}] nonzero but absent from sparse (zeros={zeros:?}, ones={ones:?})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
