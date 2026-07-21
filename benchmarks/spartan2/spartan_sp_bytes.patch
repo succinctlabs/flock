@@ -1,0 +1,16 @@
+--- a/benches/sha256_spartan.rs
++++ b/benches/sha256_spartan.rs
+@@ -164,7 +164,12 @@
+ }
+ 
+ fn spartan_benches(c: &mut Criterion) {
+-  let sizes = [1024usize, 2048];
++  // Preimage byte-sizes (compressions ~= bytes/64). Override with SP_BYTES
++  // (comma-separated bytes), e.g. SP_BYTES="4096,8192,16384,32768" to sweep.
++  let sizes: Vec<usize> = match std::env::var("SP_BYTES") {
++    Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
++    Err(_) => vec![1024, 2048],
++  };
+   let thread_counts = thread_counts();
+ 
+   // Report proof sizes once (outside measurements)

@@ -39,6 +39,42 @@
 //! layer-by-layer DP over the 4 reachable states. Here `a = z_r` (row, `n`
 //! bits, zero-padded to `m`), `b = i` (dense index, `m` bits), and
 //! `c = t_{y-1}`, `d = t_y` are the (boolean, constant) cumulative heights.
+//!
+//! ## The jagged assist (paper §1.1.1 / §5)
+//!
+//! Direct `f̂_t` evaluation costs the verifier `2^k` branching-program DPs —
+//! `O(2^k·m)` multiplications with a large constant, and height-dependent
+//! control flow that is hostile to recursion. The *assist* delegates it to the
+//! prover: with `G(c,d) := ĝ(z_r, i*, c, d)` (row/index points pinned as
+//! constants) and the weight multilinear
+//!
+//! ```text
+//!   W(c,d) = Σ_y eq(z_c, y) · eq((t_{y-1}, t_y), (c,d)),
+//! ```
+//!
+//! `β = f̂_t(z_r, z_c, i*) = Σ_{(c,d) ∈ {0,1}^{2(m+1)}} W(c,d)·G(c,d)` — a
+//! product-of-two-multilinears sumcheck over only the `2(m+1)` cumulative-height
+//! variables. We prove the `eq(z_c,·)`-weighted sum directly (one claim, no
+//! per-column values, no batching randomness — the statement is a fixed scalar,
+//! so plain sumcheck soundness applies); SP1 Hypercube's `slop/jagged` makes
+//! the same choice. Because the `x_y = (t_{y-1}, t_y)` are boolean, each round
+//! message needs only one partially-bound `G` evaluation per column
+//! (Lemma 5.1's collapse), and columns with equal `(t_{y-1}, t_y)` — zero
+//! heights — are merged up front, so the prover pays per *distinct* pair.
+//!
+//! Variables bind in **layer-interleaved order** `c_0, d_0, c_1, d_1, …`
+//! (LSB-first, matching the branching program's read order), which lets the
+//! prover use Lemma 4.6 prefix/suffix streaming ([`prove_assist`]): per-column
+//! suffix vectors stored layer-major, sparse two-entry transition rows, and an
+//! advancing prefix row vector reduce each layer to a single 6-multiplication-
+//! per-column bucketing pass from which **both** round messages derive —
+//! `O(m·2^k)` total. The naive per-round DP prover is retained as a
+//! transcript-identical reference. The verifier finishes with one
+//! `Ĝ(ρ)` DP plus `W(ρ)` at `2(m+1)` multiplications per distinct column —
+//! `~35×` fewer multiplications than direct `f̂_t` at `m=25, k=10`, and no
+//! height-dependent branching. Round messages use the codebase's char-2-safe
+//! `(G(1), G(∞))` encoding (SP1's `{0, ½, 1}` interpolation needs `2⁻¹`, which
+//! does not exist in `F128`).
 
 use crate::challenger::Challenger;
 use crate::field::F128;
@@ -151,22 +187,24 @@ fn transition(row: bool, index: bool, curr: bool, next: bool, state: usize) -> O
 const STATE_INITIAL: usize = 0; // carry=0, comparison=0
 const STATE_SUCCESS: usize = 2; // carry=0, comparison=1
 
-/// Multilinear extension `ĝ(z_r, z_i, t_c, t_next)` of the branching program,
-/// with the heights `t_c, t_next` as boolean constants. Holmgren–Rothblum
-/// layer-by-layer DP over the 4 reachable states; `O(m)` field ops.
-fn g_hat_eval(z_row: &[F128], z_index: &[F128], t_c: u64, t_next: u64, m: usize) -> F128 {
+/// Multilinear extension `ĝ(z_r, z_i, c, d)` of the branching program, with
+/// the per-layer height coordinates supplied by `cd(layer)` as arbitrary field
+/// values. Holmgren–Rothblum layer-by-layer DP over the 4 reachable states;
+/// `O(m)` field ops.
+fn g_hat_eval_cd(
+    z_row: &[F128],
+    z_index: &[F128],
+    m: usize,
+    cd: impl Fn(usize) -> (F128, F128),
+) -> F128 {
     // dp[s] = weight, over already-processed (upper) layers, of reaching the
     // accepting sink from state `s`. Seed the accepting state, peel layers from
     // MSB down to LSB, and read off the initial state.
     let mut dp = [F128::ZERO; 4];
     dp[STATE_SUCCESS] = F128::ONE;
     for layer in (0..=m).rev() {
-        let eq16 = build_eq_table(&[
-            point_bit(z_row, layer),
-            point_bit(z_index, layer),
-            int_bit(t_c, layer),
-            int_bit(t_next, layer),
-        ]);
+        let (c, d) = cd(layer);
+        let eq16 = build_eq_table(&[point_bit(z_row, layer), point_bit(z_index, layer), c, d]);
         let mut new_dp = [F128::ZERO; 4];
         for (s, slot) in new_dp.iter_mut().enumerate() {
             let mut acc = F128::ZERO;
@@ -185,6 +223,13 @@ fn g_hat_eval(z_row: &[F128], z_index: &[F128], t_c: u64, t_next: u64, m: usize)
         dp = new_dp;
     }
     dp[STATE_INITIAL]
+}
+
+/// [`g_hat_eval_cd`] specialized to boolean cumulative heights `t_c, t_next`.
+fn g_hat_eval(z_row: &[F128], z_index: &[F128], t_c: u64, t_next: u64, m: usize) -> F128 {
+    g_hat_eval_cd(z_row, z_index, m, |layer| {
+        (int_bit(t_c, layer), int_bit(t_next, layer))
+    })
 }
 
 /// Evaluate `f̂_t(z_r, z_c, z_i)` at an arbitrary field point, via the
@@ -236,12 +281,16 @@ pub struct DenseClaim {
 /// (contiguous, jagged) columns filling `B` and accumulating its share of `v`.
 /// The column walk skips height-0 columns naturally and costs O(1) amortized per
 /// element, so there is no per-element binary search.
+/// Returns `(B, v, G(1), G(∞))`: the second sumcheck multilinear, the claim,
+/// **and the first round message**, all from one pass. Fusing the message in
+/// is free traffic-wise (the pass already streams `q` and `B` pair-by-pair)
+/// and removes the prover's separate `round_msg_par` pass over 2·2^m elements.
 fn generate_f_and_claim(
     params: &JaggedParams,
     q: &[F128],
     z_row: &[F128],
     z_col: &[F128],
-) -> (Vec<F128>, F128) {
+) -> (Vec<F128>, F128, F128, F128) {
     use rayon::prelude::*;
     let len = 1usize << params.m;
     let area = params.area() as usize;
@@ -250,9 +299,23 @@ fn generate_f_and_claim(
     let prefix = &params.col_prefix_sums;
     let mut b = crate::alloc_uninit_f128_vec(len);
 
-    // ~1 MB chunks: one binary search amortized over 64K elements.
+    if len == 1 {
+        // m = 0: single element, no sumcheck rounds (and no pairs).
+        let bi = if area == 0 {
+            F128::ZERO
+        } else {
+            let col = prefix.partition_point(|&t| t == 0).saturating_sub(1);
+            eq_row[0] * eq_col[col]
+        };
+        b[0] = bi;
+        return (b, q[0] * bi, F128::ZERO, F128::ZERO);
+    }
+
+    // ~1 MB chunks: one binary search amortized over 64K elements. CHUNK is
+    // even and len is a power of two ≥ 2, so message pairs never straddle
+    // chunks.
     const CHUNK: usize = 1 << 16;
-    let v = b
+    let (v, g_one, g_inf) = b
         .par_chunks_mut(CHUNK)
         .enumerate()
         .map(|(ci, b_chunk)| {
@@ -263,24 +326,41 @@ fn generate_f_and_claim(
                 .partition_point(|&t| t <= g0 as u64)
                 .saturating_sub(1);
             let mut acc = F128::ZERO;
-            for (local, slot) in b_chunk.iter_mut().enumerate() {
-                let i = g0 + local;
-                if i >= area {
-                    *slot = F128::ZERO;
-                    continue;
-                }
-                while (i as u64) >= prefix[col + 1] {
-                    col += 1;
-                }
-                let row = i - prefix[col] as usize;
-                let bi = eq_row[row] * eq_col[col];
-                *slot = bi;
-                acc += q_chunk[local] * bi;
+            let mut m_one = F128::ZERO;
+            let mut m_inf = F128::ZERO;
+            let mut i = g0;
+            for (bp, qp) in b_chunk.chunks_exact_mut(2).zip(q_chunk.chunks_exact(2)) {
+                let b0 = if i >= area {
+                    F128::ZERO
+                } else {
+                    while (i as u64) >= prefix[col + 1] {
+                        col += 1;
+                    }
+                    eq_row[i - prefix[col] as usize] * eq_col[col]
+                };
+                let b1 = if i + 1 >= area {
+                    F128::ZERO
+                } else {
+                    while ((i + 1) as u64) >= prefix[col + 1] {
+                        col += 1;
+                    }
+                    eq_row[i + 1 - prefix[col] as usize] * eq_col[col]
+                };
+                bp[0] = b0;
+                bp[1] = b1;
+                let t = qp[1] * b1;
+                acc += qp[0] * b0 + t;
+                m_one += t;
+                m_inf += (qp[0] + qp[1]) * (b0 + b1);
+                i += 2;
             }
-            acc
+            (acc, m_one, m_inf)
         })
-        .reduce(|| F128::ZERO, |x, y| x + y);
-    (b, v)
+        .reduce(
+            || (F128::ZERO, F128::ZERO, F128::ZERO),
+            |(a, b1, c), (d, e, f)| (a + d, b1 + e, c + f),
+        );
+    (b, v, g_one, g_inf)
 }
 
 /// Prover for the jagged reduction. Given the dense multilinear `q` (length
@@ -295,6 +375,20 @@ pub fn prove<C: Challenger>(
     z_col: &[F128],
     challenger: &mut C,
 ) -> (JaggedSumcheckProof, F128) {
+    let (proof, v, _point) = prove_main(params, q, z_row, z_col, challenger);
+    (proof, v)
+}
+
+/// [`prove`], additionally returning the bound point `i*` (the per-round
+/// challenges, low bit first) — needed to continue the transcript into the
+/// assist sub-protocol or the downstream dense opening.
+fn prove_main<C: Challenger>(
+    params: &JaggedParams,
+    q: &[F128],
+    z_row: &[F128],
+    z_col: &[F128],
+    challenger: &mut C,
+) -> (JaggedSumcheckProof, F128, Vec<F128>) {
     let m = params.m;
     let len = 1usize << m;
     assert_eq!(q.len(), len, "q must have 2^m entries");
@@ -303,33 +397,50 @@ pub fn prove<C: Challenger>(
     challenger.observe_label(b"flock-jagged-v0");
 
     // Second sumcheck multilinear B[i] = eq(row_t(i), z_row)·eq(col_t(i), z_col)
-    // over the boolean cube (= f̂_t(z_row, z_col, ·) on {0,1}^m), and the claim
-    // v = Σ_i q(i)·B(i) = p̂(z_row, z_col) — one fused parallel pass.
-    let (b, v) = generate_f_and_claim(params, q, z_row, z_col);
+    // over the boolean cube (= f̂_t(z_row, z_col, ·) on {0,1}^m), the claim
+    // v = Σ_i q(i)·B(i) = p̂(z_row, z_col), AND the first round message — one
+    // fused parallel pass, so `q` and `B` are not re-read for round 1's message.
+    let (b, v, mut g_one, mut g_inf) = generate_f_and_claim(params, q, z_row, z_col);
 
     // Product-of-two-multilinears sumcheck, binding the low index bit each
     // round — parallel and fused: each fold pass also computes the next round's
-    // message, halving passes over the (bandwidth-bound) witness. We ping-pong
-    // between `a/bb` and the scratch `sa/sb`. F128 addition is XOR, so the
-    // parallel tree reduction is bit-identical to a serial fold.
-    let mut a = q.to_vec();
-    let mut bb = b;
+    // message, halving passes over the (bandwidth-bound) witness. Round 1 folds
+    // straight out of the borrowed `q` and the owned `b` (q is never copied);
+    // rounds 2+ ping-pong `a/bb` (len/4 buffers) with the scratch `sa/sb`
+    // (len/2 buffers) — the write always fits the smaller of the pair. F128
+    // addition is XOR, so the parallel tree reduction is bit-identical to a
+    // serial fold.
     let mut sa = crate::alloc_uninit_f128_vec(len / 2);
     let mut sb = crate::alloc_uninit_f128_vec(len / 2);
+    let mut a = crate::alloc_uninit_f128_vec(len / 4);
+    let mut bb = crate::alloc_uninit_f128_vec(len / 4);
     let mut cur = len;
     let mut rounds = Vec::with_capacity(m);
-    let (mut g_one, mut g_inf) = round_msg_par(&a[..cur], &bb[..cur]);
-    for _ in 0..m {
+    let mut point = Vec::with_capacity(m);
+    for round in 0..m {
         let half = cur / 2;
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
         let r = challenger.sample_f128();
         rounds.push((g_one, g_inf));
+        point.push(r);
+        let (a_src, b_src): (&[F128], &[F128]) = if round == 0 { (q, &b) } else { (&a, &bb) };
         if cur > 2 {
-            (g_one, g_inf) =
-                fold_and_round_oop_par(&a[..cur], &bb[..cur], r, &mut sa[..half], &mut sb[..half]);
+            (g_one, g_inf) = fold_and_round_oop_par(
+                &a_src[..cur],
+                &b_src[..cur],
+                r,
+                &mut sa[..half],
+                &mut sb[..half],
+            );
         } else {
-            fold_oop_par(&a[..cur], &bb[..cur], r, &mut sa[..half], &mut sb[..half]);
+            fold_oop_par(
+                &a_src[..cur],
+                &b_src[..cur],
+                r,
+                &mut sa[..half],
+                &mut sb[..half],
+            );
         }
         std::mem::swap(&mut a, &mut sa);
         std::mem::swap(&mut bb, &mut sb);
@@ -337,11 +448,9 @@ pub fn prove<C: Challenger>(
     }
 
     debug_assert_eq!(cur, 1);
-    let proof = JaggedSumcheckProof {
-        rounds,
-        q_eval: a[0],
-    };
-    (proof, v)
+    let q_eval = if m == 0 { q[0] } else { a[0] };
+    let proof = JaggedSumcheckProof { rounds, q_eval };
+    (proof, v, point)
 }
 
 /// Verifier for the jagged reduction. Replays the sumcheck against the claimed
@@ -356,12 +465,32 @@ pub fn verify<C: Challenger>(
     proof: &JaggedSumcheckProof,
     challenger: &mut C,
 ) -> Option<DenseClaim> {
-    let m = params.m;
+    challenger.observe_label(b"flock-jagged-v0");
+    let (point, claim) = replay_rounds(claim_v, proof, params.m, challenger)?;
+
+    // Final sumcheck relation: claim == q̂(i*) · f̂_t(z_row, z_col, i*).
+    let beta = f_hat_t(params, z_row, z_col, &point);
+    if claim == proof.q_eval * beta {
+        Some(DenseClaim {
+            point,
+            alpha: proof.q_eval,
+        })
+    } else {
+        None
+    }
+}
+
+/// Replay the `m` sumcheck rounds against the claimed value, folding the claim
+/// and collecting the bound point `i*`. `None` on a length mismatch.
+fn replay_rounds<C: Challenger>(
+    claim_v: F128,
+    proof: &JaggedSumcheckProof,
+    m: usize,
+    challenger: &mut C,
+) -> Option<(Vec<F128>, F128)> {
     if proof.rounds.len() != m {
         return None;
     }
-    challenger.observe_label(b"flock-jagged-v0");
-
     let mut claim = claim_v;
     let mut point = Vec::with_capacity(m);
     for &(g_one, g_inf) in &proof.rounds {
@@ -371,9 +500,453 @@ pub fn verify<C: Challenger>(
         claim = fold_round_claim(claim, g_one, g_inf, r);
         point.push(r);
     }
+    Some((point, claim))
+}
 
-    // Final sumcheck relation: claim == q̂(i*) · f̂_t(z_row, z_col, i*).
-    let beta = f_hat_t(params, z_row, z_col, &point);
+// ───────────────────────────────────────────────────────────────────────────
+// The jagged assist (module docs above; paper §5)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Transcript of the assist sumcheck, proving `beta = f̂_t(z_row, z_col, i*)`
+/// so the verifier replaces `2^k` branching-program DPs with one. `beta` is
+/// the claimed value (observed into the transcript before the rounds); each of
+/// the `2(m+1)` rounds sends the degree-2 message `(G(1), G(∞))`.
+#[derive(Clone, Debug)]
+pub struct JaggedAssistProof {
+    pub beta: F128,
+    pub rounds: Vec<(F128, F128)>,
+}
+
+/// The assist's per-column terms `(w_y, t_{y-1}, t_y)`, with runs of columns
+/// sharing the same `(t_{y-1}, t_y)` pair — zero-height columns, including the
+/// zero-padded tail — collapsed into one term of summed weight `Σ eq(z_col, y)`.
+/// Pure regrouping of identical summands: transcript-invariant.
+fn assist_columns(params: &JaggedParams, z_col: &[F128]) -> Vec<(F128, u64, u64)> {
+    let eq_col = build_eq_table(z_col);
+    let mut out: Vec<(F128, u64, u64)> = Vec::with_capacity(eq_col.len());
+    for (y, &w) in eq_col.iter().enumerate() {
+        let (t_c, t_next) = (params.col_prefix_sums[y], params.col_prefix_sums[y + 1]);
+        match out.last_mut() {
+            Some((w_acc, c, d)) if *c == t_c && *d == t_next => *w_acc += w,
+            _ => out.push((w, t_c, t_next)),
+        }
+    }
+    out
+}
+
+/// The weight multilinear `W` at the assist's final point:
+/// `W(ρ) = Σ_y w_y · Π_ℓ eq(t_{y-1}[ℓ], ρ_{c,ℓ}) · eq(t_y[ℓ], ρ_{d,ℓ})`, with
+/// `ρ` in the interleaved order `(c_0, d_0, c_1, d_1, …)`. `eq(b, r)` at a
+/// boolean `b` is `r` or `1 + r` (char 2), so this is `2(m+1)` multiplications
+/// per distinct column — the verifier's only `2^k`-scale work.
+fn assist_w_at(cols: &[(F128, u64, u64)], rho: &[F128], m: usize) -> F128 {
+    debug_assert_eq!(rho.len(), 2 * (m + 1));
+    let mut acc = F128::ZERO;
+    for &(w, t_c, t_next) in cols {
+        let mut term = w;
+        for layer in 0..=m {
+            let rc = rho[2 * layer];
+            let rd = rho[2 * layer + 1];
+            term *= if (t_c >> layer) & 1 == 1 {
+                rc
+            } else {
+                F128::ONE + rc
+            };
+            term *= if (t_next >> layer) & 1 == 1 {
+                rd
+            } else {
+                F128::ONE + rd
+            };
+        }
+        acc += term;
+    }
+    acc
+}
+
+/// Column-chunk size for the assist's parallel passes: coarse enough to
+/// amortize rayon task overhead at typical column counts (2^k in the
+/// hundreds–thousands), fine enough to load-balance a P-core pool.
+const ASSIST_CHUNK: usize = 256;
+
+/// The two surviving transitions of each `(c + 2d, state)` row of a layer
+/// matrix: the addition check forces the index bit `b` once `a` is chosen, so
+/// each row has exactly two entries `(index into the layer's eq4 table, next
+/// state)` — and they are layer-independent (a layer only supplies its eq4
+/// table `eq((z_row[ℓ], z_index[ℓ]), ·)`).
+fn assist_sparse_transitions() -> [[[(usize, usize); 2]; 4]; 4] {
+    let mut table = [[[(0usize, 0usize); 2]; 4]; 4];
+    for (cd, rows) in table.iter_mut().enumerate() {
+        let (c, d) = (cd & 1 != 0, cd & 2 != 0);
+        for (s, row) in rows.iter_mut().enumerate() {
+            for (a, entry) in row.iter_mut().enumerate() {
+                let b = (a + (s & 1) + c as usize) & 1 == 1;
+                let out =
+                    transition(a == 1, b, c, d, s).expect("the forced index bit never rejects");
+                *entry = (a + 2 * (b as usize), out);
+            }
+        }
+    }
+    table
+}
+
+/// All columns' suffix vectors `S_y[ℓ] = M_ℓ(bits_y)···M_m(bits_y)·e_S`, laid
+/// out **layer-major** (`rows[ℓ·n_cols + y]`) so each sumcheck round streams
+/// one contiguous row. Built with one parallel pass per layer, `m → 0`; a
+/// column costs 8 multiplications per layer (two surviving transitions per
+/// state). Row 0's `INITIAL` entries are the columns' full `ĝ` values.
+fn assist_suffix_rows(
+    cols: &[(F128, u64, u64)],
+    eq4s: &[[F128; 4]],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+    m: usize,
+) -> Vec<[F128; 4]> {
+    use rayon::prelude::*;
+    let n_cols = cols.len();
+    let mut rows = vec![[F128::ZERO; 4]; (m + 2) * n_cols];
+    for seed in &mut rows[(m + 1) * n_cols..] {
+        seed[STATE_SUCCESS] = F128::ONE;
+    }
+    for layer in (0..=m).rev() {
+        let (head, tail) = rows.split_at_mut((layer + 1) * n_cols);
+        let dst = &mut head[layer * n_cols..];
+        let src = &tail[..n_cols];
+        let eq4 = &eq4s[layer];
+        dst.par_chunks_mut(ASSIST_CHUNK)
+            .zip(src.par_chunks(ASSIST_CHUNK))
+            .zip(cols.par_chunks(ASSIST_CHUNK))
+            .for_each(|((dc, sc), cc)| {
+                for ((dv, sv), &(_, t_c, t_next)) in dc.iter_mut().zip(sc).zip(cc) {
+                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+                    let rows_cd = &sparse[cd];
+                    for (s, slot) in dv.iter_mut().enumerate() {
+                        let (i0, o0) = rows_cd[s][0];
+                        let (i1, o1) = rows_cd[s][1];
+                        *slot = eq4[i0] * sv[o0] + eq4[i1] * sv[o1];
+                    }
+                }
+            });
+    }
+    rows
+}
+
+#[inline]
+fn dot4(u: &[F128; 4], v: &[F128; 4]) -> F128 {
+    u[0] * v[0] + u[1] * v[1] + u[2] * v[2] + u[3] * v[3]
+}
+
+#[inline]
+fn add4(a: &[F128; 4], b: &[F128; 4]) -> [F128; 4] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
+}
+
+/// `x·a + y·b`, component-wise.
+#[inline]
+fn comb4(x: F128, a: &[F128; 4], y: F128, b: &[F128; 4]) -> [F128; 4] {
+    [
+        x * a[0] + y * b[0],
+        x * a[1] + y * b[1],
+        x * a[2] + y * b[2],
+        x * a[3] + y * b[3],
+    ]
+}
+
+/// Prover for the assist sumcheck: proves `β = f̂_t(z_row, z_col, z_index)` =
+/// `Σ_{(c,d)} W(c,d)·ĝ(z_row, z_index, c, d)` over the `2(m+1)` height
+/// variables, bound in interleaved order `c_0, d_0, c_1, d_1, …` (LSB first).
+///
+/// Lemma 4.6 streaming ("assist with storage"), one parallel pass per
+/// **layer**: the pass folds the previous layer's two challenges into each
+/// column's running weight `we_y = w_y·E_y` and accumulates the four bucketed
+/// sums `B[cbit + 2·dbit] = Σ_y we_y·S_y[ℓ+1]` — 6 multiplications per column,
+/// streaming one contiguous suffix row ([`assist_suffix_rows`]). Both round
+/// messages then come from the buckets alone:
+///
+/// ```text
+///   Ĝ_y(x) = b_ℓᵀ · M_ℓ(mixed with x) · S_y[ℓ+1]
+///   c-round:  G(1) = u₁ᵀB₁ + u₃ᵀB₃,   G(∞) = (u₀+u₁)ᵀ(B₀+B₁) + (u₂+u₃)ᵀ(B₂+B₃)
+///   d-round:  M_ℓ(r_c, x) is a linear combination of the boolean matrices, so
+///             folding r_c into the u's and B's gives the message — no second
+///             column pass.
+/// ```
+///
+/// Here `u[cd]ᵀ = b_ℓᵀ·M_ℓ^{(c,d)}` are shared row vectors and the prefix
+/// `b_ℓᵀ = e_Iᵀ·M_0(ρ)···M_{ℓ-1}(ρ)` advances once per layer. `O(m·2^k)`
+/// multiplications total instead of the naive `O(m²·2^k)`
+/// ([`prove_assist_naive`], which produces a bit-identical transcript).
+pub fn prove_assist<C: Challenger>(
+    params: &JaggedParams,
+    z_row: &[F128],
+    z_col: &[F128],
+    z_index: &[F128],
+    challenger: &mut C,
+) -> JaggedAssistProof {
+    use rayon::prelude::*;
+    let m = params.m;
+    assert_eq!(z_row.len(), params.n);
+    assert_eq!(z_col.len(), params.k);
+    assert_eq!(z_index.len(), m);
+    let cols = assist_columns(params, z_col);
+    let n_cols = cols.len();
+
+    let eq4s: Vec<[F128; 4]> = (0..=m)
+        .map(|layer| {
+            let t = build_eq_table(&[point_bit(z_row, layer), point_bit(z_index, layer)]);
+            [t[0], t[1], t[2], t[3]]
+        })
+        .collect();
+    let sparse = assist_sparse_transitions();
+    let sfx = assist_suffix_rows(&cols, &eq4s, &sparse, m);
+
+    // β = Σ_y w_y·ĝ_y — the INITIAL entries of suffix row 0.
+    let beta = cols
+        .par_iter()
+        .zip(sfx[..n_cols].par_iter())
+        .map(|(&(w, _, _), s)| w * s[STATE_INITIAL])
+        .reduce(|| F128::ZERO, |x, y| x + y);
+
+    challenger.observe_label(b"flock-jagged-assist-v0");
+    challenger.observe_f128(beta);
+
+    let mut prefix_row = [F128::ZERO; 4];
+    prefix_row[STATE_INITIAL] = F128::ONE;
+    let mut we: Vec<F128> = cols.iter().map(|&(w, _, _)| w).collect();
+    let mut prev_ch: Option<(F128, F128)> = None;
+    let mut rounds = Vec::with_capacity(2 * (m + 1));
+    for layer in 0..=m {
+        let row = &sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
+
+        // The layer's only column pass.
+        let buckets = we
+            .par_chunks_mut(ASSIST_CHUNK)
+            .zip(cols.par_chunks(ASSIST_CHUNK))
+            .zip(row.par_chunks(ASSIST_CHUNK))
+            .map(|((wc, cc), sc)| {
+                let mut b = [[F128::ZERO; 4]; 4];
+                for ((w_e, &(_, t_c, t_next)), s) in wc.iter_mut().zip(cc).zip(sc) {
+                    if let Some((rc, rd)) = prev_ch {
+                        let pl = layer - 1;
+                        let ec = if (t_c >> pl) & 1 == 1 {
+                            rc
+                        } else {
+                            F128::ONE + rc
+                        };
+                        let ed = if (t_next >> pl) & 1 == 1 {
+                            rd
+                        } else {
+                            F128::ONE + rd
+                        };
+                        *w_e *= ec * ed;
+                    }
+                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+                    let v = *w_e;
+                    let bk = &mut b[cd];
+                    bk[0] += v * s[0];
+                    bk[1] += v * s[1];
+                    bk[2] += v * s[2];
+                    bk[3] += v * s[3];
+                }
+                b
+            })
+            .reduce(
+                || [[F128::ZERO; 4]; 4],
+                |mut x, y| {
+                    for (xv, yv) in x.iter_mut().zip(&y) {
+                        *xv = add4(xv, yv);
+                    }
+                    x
+                },
+            );
+
+        // u[c + 2d]ᵀ = b_ℓᵀ·M_ℓ^{(c,d)}, via the sparse transition rows.
+        let eq4 = &eq4s[layer];
+        let mut u = [[F128::ZERO; 4]; 4];
+        for (cd, uv) in u.iter_mut().enumerate() {
+            for (s, &bs) in prefix_row.iter().enumerate() {
+                let (i0, o0) = sparse[cd][s][0];
+                let (i1, o1) = sparse[cd][s][1];
+                uv[o0] += bs * eq4[i0];
+                uv[o1] += bs * eq4[i1];
+            }
+        }
+
+        // c-round.
+        let g_one = dot4(&u[1], &buckets[1]) + dot4(&u[3], &buckets[3]);
+        let g_inf = dot4(&add4(&u[0], &u[1]), &add4(&buckets[0], &buckets[1]))
+            + dot4(&add4(&u[2], &u[3]), &add4(&buckets[2], &buckets[3]));
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let rc = challenger.sample_f128();
+        rounds.push((g_one, g_inf));
+
+        // d-round from the same buckets: ud[x]ᵀ = b_ℓᵀ·M_ℓ(rc, x) and
+        // D[db] = Σ_{y: dbit=db} we·eq(cbit_y, rc)·S_y, both by folding rc.
+        let rc1 = F128::ONE + rc;
+        let ud0 = comb4(rc1, &u[0], rc, &u[1]);
+        let ud1 = comb4(rc1, &u[2], rc, &u[3]);
+        let d0 = comb4(rc1, &buckets[0], rc, &buckets[1]);
+        let d1 = comb4(rc1, &buckets[2], rc, &buckets[3]);
+        let g_one = dot4(&ud1, &d1);
+        let g_inf = dot4(&add4(&ud0, &ud1), &add4(&d0, &d1));
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let rd = challenger.sample_f128();
+        rounds.push((g_one, g_inf));
+
+        // Advance the prefix past the now fully-bound layer:
+        // b_{ℓ+1}ᵀ = b_ℓᵀ·M_ℓ(rc, rd) = (1+rd)·ud[0] + rd·ud[1].
+        prefix_row = comb4(F128::ONE + rd, &ud0, rd, &ud1);
+        prev_ch = Some((rc, rd));
+    }
+
+    JaggedAssistProof { beta, rounds }
+}
+
+/// Naive (SP1-style) reference for [`prove_assist`]: the eq side of each
+/// column is maintained incrementally (`prefix_eq`), while the `ĝ` side is
+/// re-evaluated per round with the full layer DP — `O(m²·2^k)` multiplications
+/// overall. Produces a transcript **bit-identical** to the streaming prover
+/// (same algebra over exact field ops); retained as the correctness reference
+/// (`assist_streamed_matches_naive`) and for the `runtime_assist_m25`
+/// comparison.
+#[allow(dead_code)]
+fn prove_assist_naive<C: Challenger>(
+    params: &JaggedParams,
+    z_row: &[F128],
+    z_col: &[F128],
+    z_index: &[F128],
+    challenger: &mut C,
+) -> JaggedAssistProof {
+    use rayon::prelude::*;
+    let m = params.m;
+    assert_eq!(z_row.len(), params.n);
+    assert_eq!(z_col.len(), params.k);
+    assert_eq!(z_index.len(), m);
+    let cols = assist_columns(params, z_col);
+
+    // The claimed value β, over the collapsed terms (same value as `f_hat_t`).
+    let beta = cols
+        .par_iter()
+        .map(|&(w, t_c, t_next)| w * g_hat_eval(z_row, z_index, t_c, t_next, m))
+        .reduce(|| F128::ZERO, |x, y| x + y);
+
+    challenger.observe_label(b"flock-jagged-assist-v0");
+    challenger.observe_f128(beta);
+
+    let total_rounds = 2 * (m + 1);
+    let mut rho: Vec<F128> = Vec::with_capacity(total_rounds);
+    let mut prefix_eq = vec![F128::ONE; cols.len()];
+    let mut rounds = Vec::with_capacity(total_rounds);
+    for j in 0..total_rounds {
+        let layer = j / 2;
+        let bind_c = j % 2 == 0;
+        // Round message: G(x) = Σ_y w·E_y·eq(bit_y, x)·Ĝ_y(x), where Ĝ_y(x) is
+        // ĝ at (prefix = ρ, current variable = x, suffix = the column's bits)
+        // and bit_y is the column's bit of the variable being bound. Both
+        // factors are linear in x with eq's x-coefficient 1 (char 2), so
+        // G(1) sums the bit_y = 1 columns and G(∞) sums Ĝ_y(0) + Ĝ_y(1).
+        let (g_one, g_inf) = cols
+            .par_iter()
+            .zip(prefix_eq.par_iter())
+            .map(|(&(w, t_c, t_next), &e)| {
+                let eval = |x: F128| {
+                    g_hat_eval_cd(z_row, z_index, m, |l| {
+                        use std::cmp::Ordering::*;
+                        match l.cmp(&layer) {
+                            Less => (rho[2 * l], rho[2 * l + 1]),
+                            Equal if bind_c => (x, int_bit(t_next, l)),
+                            Equal => (rho[2 * l], x),
+                            Greater => (int_bit(t_c, l), int_bit(t_next, l)),
+                        }
+                    })
+                };
+                let g0 = eval(F128::ZERO);
+                let g1 = eval(F128::ONE);
+                let we = w * e;
+                let bit = ((if bind_c { t_c } else { t_next }) >> layer) & 1 == 1;
+                let one_term = if bit { we * g1 } else { F128::ZERO };
+                (one_term, we * (g0 + g1))
+            })
+            .reduce(|| (F128::ZERO, F128::ZERO), |(a, b), (c, d)| (a + c, b + d));
+
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = challenger.sample_f128();
+        rounds.push((g_one, g_inf));
+        // Fold the bound bit into each column's running eq prefix:
+        // eq(bit, r) = r or 1 + r.
+        for (&(_, t_c, t_next), e) in cols.iter().zip(prefix_eq.iter_mut()) {
+            let bit = ((if bind_c { t_c } else { t_next }) >> layer) & 1 == 1;
+            *e *= if bit { r } else { F128::ONE + r };
+        }
+        rho.push(r);
+    }
+
+    JaggedAssistProof { beta, rounds }
+}
+
+/// Verifier for the assist sumcheck: replays the rounds against `proof.beta`
+/// and checks the final relation `claim == W(ρ)·ĝ(z_row, z_index, ρ)` — one
+/// branching-program DP plus the `assist_w_at` combination. On success returns
+/// the now-verified `β = f̂_t(z_row, z_col, z_index)`.
+pub fn verify_assist<C: Challenger>(
+    params: &JaggedParams,
+    z_row: &[F128],
+    z_col: &[F128],
+    z_index: &[F128],
+    proof: &JaggedAssistProof,
+    challenger: &mut C,
+) -> Option<F128> {
+    let m = params.m;
+    if proof.rounds.len() != 2 * (m + 1) {
+        return None;
+    }
+    challenger.observe_label(b"flock-jagged-assist-v0");
+    challenger.observe_f128(proof.beta);
+
+    let mut claim = proof.beta;
+    let mut rho = Vec::with_capacity(2 * (m + 1));
+    for &(g_one, g_inf) in &proof.rounds {
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = challenger.sample_f128();
+        claim = fold_round_claim(claim, g_one, g_inf, r);
+        rho.push(r);
+    }
+
+    let cols = assist_columns(params, z_col);
+    let w = assist_w_at(&cols, &rho, m);
+    let g = g_hat_eval_cd(z_row, z_index, m, |l| (rho[2 * l], rho[2 * l + 1]));
+    (claim == w * g).then_some(proof.beta)
+}
+
+/// [`prove`] followed by the assist sub-protocol at the sumcheck's final point.
+/// Companion of [`verify_with_assist`].
+pub fn prove_with_assist<C: Challenger>(
+    params: &JaggedParams,
+    q: &[F128],
+    z_row: &[F128],
+    z_col: &[F128],
+    challenger: &mut C,
+) -> (JaggedSumcheckProof, JaggedAssistProof, F128) {
+    let (proof, v, point) = prove_main(params, q, z_row, z_col, challenger);
+    let assist = prove_assist(params, z_row, z_col, &point, challenger);
+    (proof, assist, v)
+}
+
+/// [`verify`] with the `f̂_t` evaluation discharged by the assist proof instead
+/// of the `O(2^k)` direct computation.
+pub fn verify_with_assist<C: Challenger>(
+    params: &JaggedParams,
+    z_row: &[F128],
+    z_col: &[F128],
+    claim_v: F128,
+    proof: &JaggedSumcheckProof,
+    assist: &JaggedAssistProof,
+    challenger: &mut C,
+) -> Option<DenseClaim> {
+    challenger.observe_label(b"flock-jagged-v0");
+    let (point, claim) = replay_rounds(claim_v, proof, params.m, challenger)?;
+    let beta = verify_assist(params, z_row, z_col, &point, assist, challenger)?;
     if claim == proof.q_eval * beta {
         Some(DenseClaim {
             point,
@@ -395,9 +968,10 @@ fn fold_round_claim(claim: F128, g_one: F128, g_inf: F128, r: F128) -> F128 {
 }
 
 /// Degree-2 round message `(G(1), G(∞))` for `Σ_{x'} a(X,x')·b(X,x')`, low bit
-/// bound: `a(0,x') = a[2x']`, `a(1,x') = a[2x'+1]`. Serial reference (the
-/// production path uses [`round_msg_par`]); retained for the `runtime_m25`
-/// serial-vs-parallel benchmark.
+/// bound: `a(0,x') = a[2x']`, `a(1,x') = a[2x'+1]`. Serial reference; retained
+/// for the `runtime_m25` serial-vs-parallel benchmark. (The production path
+/// gets round 1's message fused into [`generate_f_and_claim`] and later
+/// messages from the fused fold kernels.)
 #[allow(dead_code)]
 #[inline]
 fn round_msg(a: &[F128], b: &[F128]) -> (F128, F128) {
@@ -460,7 +1034,9 @@ fn fold_and_round_fused(a: &mut Vec<F128>, b: &mut Vec<F128>, r: F128) -> (F128,
 /// Iterates contiguous slice chunks with `chunks_exact(2)` rather than indexing
 /// `a[2*x]`: eliminating the per-element bounds checks lifts the reduction from
 /// ~2.6× to ~6× parallel scaling (hits the memory-bandwidth ceiling). See
-/// `scaling_diag`.
+/// `scaling_diag`. No longer on the production path (round 1's message is
+/// fused into [`generate_f_and_claim`]); retained for the runtime benchmarks.
+#[allow(dead_code)]
 fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
     use rayon::prelude::*;
     const C: usize = 1 << 14;
@@ -685,6 +1261,157 @@ mod tests {
         );
     }
 
+    #[test]
+    fn assist_beta_matches_f_hat_t() {
+        // Standalone assist at an arbitrary z_index: honest roundtrip, and the
+        // proven β equals the direct f̂_t evaluation.
+        let mut ch = RandomChallenger::new(0xA551_57ED);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (2, 4, 6), (5, 1, 5)] {
+            for _ in 0..5 {
+                let (params, _q) = random_instance(&mut ch, n, k, m);
+                let z_row = sample_vec(&mut ch, n);
+                let z_col = sample_vec(&mut ch, k);
+                let z_idx = sample_vec(&mut ch, m);
+
+                let mut pch = FsChallenger::new(b"flock-jagged-assist-test");
+                let proof = prove_assist(&params, &z_row, &z_col, &z_idx, &mut pch);
+                assert_eq!(
+                    proof.beta,
+                    f_hat_t(&params, &z_row, &z_col, &z_idx),
+                    "β ≠ f̂_t for n={n} k={k} m={m}"
+                );
+
+                let mut vch = FsChallenger::new(b"flock-jagged-assist-test");
+                let beta = verify_assist(&params, &z_row, &z_col, &z_idx, &proof, &mut vch)
+                    .expect("honest assist must verify");
+                assert_eq!(beta, proof.beta);
+            }
+        }
+    }
+
+    #[test]
+    fn assist_streamed_matches_naive() {
+        // The Lemma 4.6 streaming prover and the naive per-round-DP prover
+        // compute the same polynomials with exact field ops — the transcripts
+        // must be bit-identical.
+        let mut ch = RandomChallenger::new(0x57EA_4E46);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (2, 4, 6), (5, 1, 5)] {
+            for _ in 0..5 {
+                let (params, _q) = random_instance(&mut ch, n, k, m);
+                let z_row = sample_vec(&mut ch, n);
+                let z_col = sample_vec(&mut ch, k);
+                let z_idx = sample_vec(&mut ch, m);
+
+                let mut ch_a = FsChallenger::new(b"flock-jagged-assist-test");
+                let streamed = prove_assist(&params, &z_row, &z_col, &z_idx, &mut ch_a);
+                let mut ch_b = FsChallenger::new(b"flock-jagged-assist-test");
+                let naive = prove_assist_naive(&params, &z_row, &z_col, &z_idx, &mut ch_b);
+
+                assert_eq!(streamed.beta, naive.beta, "β mismatch n={n} k={k} m={m}");
+                assert_eq!(
+                    streamed.rounds, naive.rounds,
+                    "rounds mismatch n={n} k={k} m={m}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assist_handles_degenerate_heights() {
+        // Zero-height runs (collapsed terms) and an all-zero instance.
+        let mut ch = RandomChallenger::new(0xDE6E_0000);
+        for heights in [vec![3u64, 0, 0, 2], vec![0, 0, 0, 0], vec![0, 4, 0, 4]] {
+            let params = JaggedParams::from_heights(&heights, 2, 3);
+            let z_row = sample_vec(&mut ch, 2);
+            let z_col = sample_vec(&mut ch, 2);
+            let z_idx = sample_vec(&mut ch, 3);
+
+            let mut pch = FsChallenger::new(b"flock-jagged-assist-test");
+            let proof = prove_assist(&params, &z_row, &z_col, &z_idx, &mut pch);
+            assert_eq!(proof.beta, f_hat_t(&params, &z_row, &z_col, &z_idx));
+
+            let mut vch = FsChallenger::new(b"flock-jagged-assist-test");
+            assert!(
+                verify_assist(&params, &z_row, &z_col, &z_idx, &proof, &mut vch).is_some(),
+                "assist must verify for heights {heights:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assist_roundtrip() {
+        let mut ch = RandomChallenger::new(0x0A55_1CC7);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (2, 4, 6)] {
+            for _ in 0..5 {
+                let (params, q) = random_instance(&mut ch, n, k, m);
+                let z_row = sample_vec(&mut ch, n);
+                let z_col = sample_vec(&mut ch, k);
+
+                let mut pch = FsChallenger::new(b"flock-jagged-test");
+                let (proof, assist, v) = prove_with_assist(&params, &q, &z_row, &z_col, &mut pch);
+
+                let mut vch = FsChallenger::new(b"flock-jagged-test");
+                let claim =
+                    verify_with_assist(&params, &z_row, &z_col, v, &proof, &assist, &mut vch)
+                        .expect("honest assisted proof must verify");
+                assert_eq!(claim.alpha, mle_eval(&q, &claim.point), "alpha ≠ q̂(i*)");
+
+                // Same reduced claim as the assist-free verifier.
+                let mut vch2 = FsChallenger::new(b"flock-jagged-test");
+                let direct = verify(&params, &z_row, &z_col, v, &proof, &mut vch2)
+                    .expect("direct verify of the same transcript");
+                assert_eq!(claim.point, direct.point);
+                assert_eq!(claim.alpha, direct.alpha);
+            }
+        }
+    }
+
+    #[test]
+    fn assist_rejects_tampered_proof() {
+        let mut ch = RandomChallenger::new(0xBAD_A5515);
+        let (params, q) = random_instance(&mut ch, 4, 3, 7);
+        let z_row = sample_vec(&mut ch, 4);
+        let z_col = sample_vec(&mut ch, 3);
+
+        let mut pch = FsChallenger::new(b"flock-jagged-test");
+        let (proof, assist, v) = prove_with_assist(&params, &q, &z_row, &z_col, &mut pch);
+
+        let check = |proof: &JaggedSumcheckProof, assist: &JaggedAssistProof| {
+            let mut vch = FsChallenger::new(b"flock-jagged-test");
+            verify_with_assist(&params, &z_row, &z_col, v, proof, assist, &mut vch)
+        };
+        assert!(check(&proof, &assist).is_some(), "sanity: honest verifies");
+
+        // Wrong β (breaks both the outer relation and the assist sumcheck).
+        let mut bad = assist.clone();
+        bad.beta += F128::ONE;
+        assert!(check(&proof, &bad).is_none(), "tampered β must be rejected");
+
+        // Tampered round message.
+        let mut bad = assist.clone();
+        bad.rounds[3].0 += F128::ONE;
+        assert!(
+            check(&proof, &bad).is_none(),
+            "tampered round must be rejected"
+        );
+
+        // Truncated assist.
+        let mut bad = assist.clone();
+        bad.rounds.pop();
+        assert!(
+            check(&proof, &bad).is_none(),
+            "truncated assist must be rejected"
+        );
+
+        // Tampered dense claim must break the outer relation against β.
+        let mut bad_proof = proof.clone();
+        bad_proof.q_eval += F128::ONE;
+        assert!(
+            check(&bad_proof, &assist).is_none(),
+            "tampered q_eval must be rejected"
+        );
+    }
+
     /// Runtime check at the realistic Option-B size: an m=32-bit trace packed
     /// into F128 (128 bits each) is a dense `q` of `2^25` field elements, so the
     /// jagged sumcheck runs over 25 variables. Mirrors `prove`, split into the
@@ -747,9 +1474,10 @@ mod tests {
             t_gen_ser = t_gen_ser.min(t0.elapsed());
             std::hint::black_box(&bs);
 
-            // Parallel fused helper (the production path).
+            // Parallel fused helper (the production path; also emits round 1's
+            // message, so it does slightly more work than the serial baseline).
             let t1 = Instant::now();
-            let (bp, vp) = generate_f_and_claim(&params, &q, &z_row, &z_col);
+            let (bp, vp, _g1, _gi) = generate_f_and_claim(&params, &q, &z_row, &z_col);
             t_gen_par = t_gen_par.min(t1.elapsed());
             assert_eq!(vs, vp, "parallel gen must match serial");
             b = bp;
@@ -886,6 +1614,274 @@ mod tests {
             "  best prover total (gen + best sumcheck): {:.1?} ({:.2} ns/elem)\n",
             t_gen_par + best,
             (t_gen_par + best).as_nanos() as f64 / len as f64
+        );
+    }
+
+    /// The full jagged reduction at the 2^30-bit packed-witness point: a
+    /// 2^30-bit trace packed into F128 (128 bits each) is a dense `q` of 2^23
+    /// field elements — `m = 23`, with 2^12 uniform columns (`n = 11`).
+    /// Best-of-3 for: main sumcheck prover, assist prover, both verifier
+    /// paths (direct `f̂_t` vs assist).
+    ///
+    /// `cargo test --release -p flock-core pcs::jagged::tests::runtime_bits30 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "heavy benchmark; run explicitly with --release --ignored --nocapture"]
+    fn runtime_bits30() {
+        use std::time::Instant;
+
+        let _ = crate::init_perf_thread_pool();
+        let (n, k, m) = (11usize, 12usize, 23usize); // 2^30 bits / 128 = 2^23 elems
+        let cols = 1usize << k;
+        let height = (1u64 << m) / cols as u64;
+        let params = JaggedParams::from_heights(&vec![height; cols], n, m);
+        assert_eq!(params.area(), 1u64 << m);
+
+        let len = 1usize << m;
+        let mut q = vec![F128::ZERO; len];
+        for (i, qi) in q.iter_mut().enumerate() {
+            *qi = F128 {
+                lo: i as u64,
+                hi: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            };
+        }
+        let mut rc = RandomChallenger::new(0x0B17_5300);
+        let z_row = sample_vec(&mut rc, n);
+        let z_col = sample_vec(&mut rc, k);
+
+        let best3 = |f: &mut dyn FnMut() -> std::time::Duration| (0..3).map(|_| f()).min().unwrap();
+
+        // Warm-up (thread pool + page faults).
+        let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+        let _ = prove(&params, &q, &z_row, &z_col, &mut ch);
+
+        // Main jagged sumcheck prover (B-generation + rounds).
+        let t_prove = best3(&mut || {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            let t = Instant::now();
+            std::hint::black_box(prove(&params, &q, &z_row, &z_col, &mut ch));
+            t.elapsed()
+        });
+
+        // Main + assist, and keep one transcript for the verifier runs.
+        let mut t_both = std::time::Duration::MAX;
+        let mut kept = None;
+        for _ in 0..3 {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            let t = Instant::now();
+            let out = prove_with_assist(&params, &q, &z_row, &z_col, &mut ch);
+            t_both = t_both.min(t.elapsed());
+            kept = Some(out);
+        }
+        let (proof, assist, v) = kept.unwrap();
+
+        // Verifier, direct f̂_t path.
+        let t_verify_direct = best3(&mut || {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            let t = Instant::now();
+            std::hint::black_box(
+                verify(&params, &z_row, &z_col, v, &proof, &mut ch).expect("verify"),
+            );
+            t.elapsed()
+        });
+
+        // Verifier, assist path.
+        let t_verify_assist = best3(&mut || {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            let t = Instant::now();
+            std::hint::black_box(
+                verify_with_assist(&params, &z_row, &z_col, v, &proof, &assist, &mut ch)
+                    .expect("verify_with_assist"),
+            );
+            t.elapsed()
+        });
+
+        let main_bytes = (2 * proof.rounds.len() + 1) * 16;
+        let assist_bytes = (2 * assist.rounds.len() + 1) * 16;
+        eprintln!("  threads: {}", rayon::current_num_threads());
+        eprintln!(
+            "  witness: 2^{m} F128 = {} MiB (2^30 bits packed)",
+            (len * 16) >> 20
+        );
+        eprintln!("  sumcheck prover ({m} rounds)          : {t_prove:>9.3?}");
+        eprintln!(
+            "  + assist prover ({} rounds)          : {:>9.3?}  (assist ≈ {:.3?}, {:.1}% of prover)",
+            assist.rounds.len(),
+            t_both,
+            t_both.saturating_sub(t_prove),
+            100.0 * t_both.saturating_sub(t_prove).as_secs_f64() / t_both.as_secs_f64()
+        );
+        eprintln!("  verifier, direct f̂_t (2^{k} BP evals): {t_verify_direct:>9.3?}");
+        eprintln!(
+            "  verifier, assist                      : {t_verify_assist:>9.3?}  ({:.1}x)",
+            t_verify_direct.as_secs_f64() / t_verify_assist.as_secs_f64()
+        );
+        eprintln!(
+            "  proof: main {main_bytes} B + assist {assist_bytes} B = {} B",
+            main_bytes + assist_bytes
+        );
+    }
+
+    /// Phase breakdown of the jagged sumcheck prover at the 2^30-bit point —
+    /// diagnostic companion to `runtime_bits30`. Mirrors `prove_main` with a
+    /// timer per phase and implied memory bandwidth (each phase's compulsory
+    /// traffic / time) to show how far each sits from the streaming floor.
+    ///
+    /// `cargo test --release -p flock-core pcs::jagged::tests::bits30_breakdown -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic; run with --release --ignored --nocapture"]
+    fn bits30_breakdown() {
+        use std::time::Instant;
+
+        let _ = crate::init_perf_thread_pool();
+        let (n, k, m) = (11usize, 12usize, 23usize);
+        let cols = 1usize << k;
+        let height = (1u64 << m) / cols as u64;
+        let params = JaggedParams::from_heights(&vec![height; cols], n, m);
+        let len = 1usize << m;
+        let mut q = vec![F128::ZERO; len];
+        for (i, qi) in q.iter_mut().enumerate() {
+            *qi = F128 {
+                lo: i as u64,
+                hi: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            };
+        }
+        let mut rc = RandomChallenger::new(0x0B17_5301);
+        let z_row = sample_vec(&mut rc, n);
+        let z_col = sample_vec(&mut rc, k);
+
+        // Warm-up.
+        {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            let _ = prove(&params, &q, &z_row, &z_col, &mut ch);
+        }
+
+        let mb = |bytes: usize, secs: f64| bytes as f64 / secs / 1e9;
+        for trial in 0..3 {
+            let mut ch = FsChallenger::new(b"flock-jagged-bits30");
+            ch.observe_label(b"flock-jagged-v0");
+
+            let t = Instant::now();
+            let (b, _v, mut g_one, mut g_inf) = generate_f_and_claim(&params, &q, &z_row, &z_col);
+            let t_gen = t.elapsed();
+
+            let t = Instant::now();
+            let mut sa = crate::alloc_uninit_f128_vec(len / 2);
+            let mut sb = crate::alloc_uninit_f128_vec(len / 2);
+            let mut a = crate::alloc_uninit_f128_vec(len / 4);
+            let mut bb = crate::alloc_uninit_f128_vec(len / 4);
+            let t_alloc = t.elapsed();
+
+            let mut cur = len;
+            let mut per_round = Vec::with_capacity(m);
+            for round in 0..m {
+                let half = cur / 2;
+                ch.observe_f128(g_one);
+                ch.observe_f128(g_inf);
+                let r = ch.sample_f128();
+                let t = Instant::now();
+                let (a_src, b_src): (&[F128], &[F128]) =
+                    if round == 0 { (&q, &b) } else { (&a, &bb) };
+                if cur > 2 {
+                    (g_one, g_inf) = fold_and_round_oop_par(
+                        &a_src[..cur],
+                        &b_src[..cur],
+                        r,
+                        &mut sa[..half],
+                        &mut sb[..half],
+                    );
+                } else {
+                    fold_oop_par(
+                        &a_src[..cur],
+                        &b_src[..cur],
+                        r,
+                        &mut sa[..half],
+                        &mut sb[..half],
+                    );
+                }
+                per_round.push(t.elapsed());
+                std::mem::swap(&mut a, &mut sa);
+                std::mem::swap(&mut bb, &mut sb);
+                cur = half;
+            }
+            let t_rounds: std::time::Duration = per_round.iter().sum();
+            let total = t_gen + t_alloc + t_rounds;
+
+            eprintln!("--- trial {trial}  (total {total:.3?})");
+            eprintln!(
+                "  gen B + claim + round-1 msg : {t_gen:>9.3?}  ({:>5.1} GB/s of 256 MB r+w)",
+                mb(2 * len * 16, t_gen.as_secs_f64())
+            );
+            eprintln!("  buffer alloc    : {t_alloc:>9.3?}");
+            // Fold round j reads 2·cur and writes cur elements (two arrays each).
+            let round_bytes = |j: usize| 3 * (len >> j) * 16;
+            let tail: std::time::Duration = per_round[4..].iter().sum();
+            for (j, d) in per_round.iter().take(4).enumerate() {
+                eprintln!(
+                    "  fold+msg round {:>2}: {d:>8.3?}  ({:>5.1} GB/s of {} MB)",
+                    j + 1,
+                    mb(round_bytes(j), d.as_secs_f64()),
+                    round_bytes(j) >> 20
+                );
+            }
+            eprintln!("  rounds 5..{m}     : {tail:>8.3?}");
+        }
+    }
+
+    /// Assist runtimes at the realistic size (matches `runtime_m25`: m=25,
+    /// 2^12 columns): direct verifier `f̂_t` vs assist prover / assist verifier.
+    ///
+    /// `cargo test --release -p flock-core pcs::jagged::tests::runtime_assist_m25 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "heavy benchmark; run explicitly with --release --ignored --nocapture"]
+    fn runtime_assist_m25() {
+        use std::time::Instant;
+
+        let _ = crate::init_perf_thread_pool();
+        let (n, k, m) = (13usize, 12usize, 25usize);
+        let cols = 1usize << k;
+        let height = (1u64 << m) / cols as u64;
+        let params = JaggedParams::from_heights(&vec![height; cols], n, m);
+
+        let mut rc = RandomChallenger::new(0xA551_0B25);
+        let z_row = sample_vec(&mut rc, n);
+        let z_col = sample_vec(&mut rc, k);
+        let z_idx = sample_vec(&mut rc, m);
+
+        let t0 = Instant::now();
+        let direct = f_hat_t(&params, &z_row, &z_col, &z_idx);
+        let t_direct = t0.elapsed();
+
+        let t1 = Instant::now();
+        let mut pch = FsChallenger::new(b"flock-jagged-assist-bench");
+        let proof = prove_assist(&params, &z_row, &z_col, &z_idx, &mut pch);
+        let t_prove = t1.elapsed();
+        assert_eq!(proof.beta, direct);
+
+        let t1n = Instant::now();
+        let mut nch = FsChallenger::new(b"flock-jagged-assist-bench");
+        let naive = prove_assist_naive(&params, &z_row, &z_col, &z_idx, &mut nch);
+        let t_prove_naive = t1n.elapsed();
+        assert_eq!(naive.rounds, proof.rounds, "provers must agree");
+
+        let t2 = Instant::now();
+        let mut vch = FsChallenger::new(b"flock-jagged-assist-bench");
+        let beta = verify_assist(&params, &z_row, &z_col, &z_idx, &proof, &mut vch)
+            .expect("honest assist must verify");
+        let t_verify = t2.elapsed();
+        assert_eq!(beta, direct);
+
+        eprintln!("  threads: {}", rayon::current_num_threads());
+        eprintln!("  verifier, direct f̂_t (2^{k} BP evals): {t_direct:>9.3?}");
+        eprintln!(
+            "  assist prover, streamed ({} rounds)   : {t_prove:>9.3?}  (naive: {t_prove_naive:.3?}, {:.1}x)",
+            proof.rounds.len(),
+            t_prove_naive.as_secs_f64() / t_prove.as_secs_f64()
+        );
+        eprintln!("  assist verifier (1 BP eval + W(ρ))    : {t_verify:>9.3?}");
+        eprintln!(
+            "  verifier speedup: {:.1}x   proof size: {} B",
+            t_direct.as_secs_f64() / t_verify.as_secs_f64(),
+            (1 + 2 * proof.rounds.len()) * 16
         );
     }
 
