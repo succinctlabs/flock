@@ -204,12 +204,7 @@ fn g_hat_eval_cd(
     dp[STATE_SUCCESS] = F128::ONE;
     for layer in (0..=m).rev() {
         let (c, d) = cd(layer);
-        let eq16 = build_eq_table(&[
-            point_bit(z_row, layer),
-            point_bit(z_index, layer),
-            c,
-            d,
-        ]);
+        let eq16 = build_eq_table(&[point_bit(z_row, layer), point_bit(z_index, layer), c, d]);
         let mut new_dp = [F128::ZERO; 4];
         for (s, slot) in new_dp.iter_mut().enumerate() {
             let mut acc = F128::ZERO;
@@ -334,10 +329,7 @@ fn generate_f_and_claim(
             let mut m_one = F128::ZERO;
             let mut m_inf = F128::ZERO;
             let mut i = g0;
-            for (bp, qp) in b_chunk
-                .chunks_exact_mut(2)
-                .zip(q_chunk.chunks_exact(2))
-            {
+            for (bp, qp) in b_chunk.chunks_exact_mut(2).zip(q_chunk.chunks_exact(2)) {
                 let b0 = if i >= area {
                     F128::ZERO
                 } else {
@@ -442,7 +434,13 @@ fn prove_main<C: Challenger>(
                 &mut sb[..half],
             );
         } else {
-            fold_oop_par(&a_src[..cur], &b_src[..cur], r, &mut sa[..half], &mut sb[..half]);
+            fold_oop_par(
+                &a_src[..cur],
+                &b_src[..cur],
+                r,
+                &mut sa[..half],
+                &mut sb[..half],
+            );
         }
         std::mem::swap(&mut a, &mut sa);
         std::mem::swap(&mut bb, &mut sb);
@@ -549,8 +547,16 @@ fn assist_w_at(cols: &[(F128, u64, u64)], rho: &[F128], m: usize) -> F128 {
         for layer in 0..=m {
             let rc = rho[2 * layer];
             let rd = rho[2 * layer + 1];
-            term *= if (t_c >> layer) & 1 == 1 { rc } else { F128::ONE + rc };
-            term *= if (t_next >> layer) & 1 == 1 { rd } else { F128::ONE + rd };
+            term *= if (t_c >> layer) & 1 == 1 {
+                rc
+            } else {
+                F128::ONE + rc
+            };
+            term *= if (t_next >> layer) & 1 == 1 {
+                rd
+            } else {
+                F128::ONE + rd
+            };
         }
         acc += term;
     }
@@ -719,8 +725,16 @@ pub fn prove_assist<C: Challenger>(
                 for ((w_e, &(_, t_c, t_next)), s) in wc.iter_mut().zip(cc).zip(sc) {
                     if let Some((rc, rd)) = prev_ch {
                         let pl = layer - 1;
-                        let ec = if (t_c >> pl) & 1 == 1 { rc } else { F128::ONE + rc };
-                        let ed = if (t_next >> pl) & 1 == 1 { rd } else { F128::ONE + rd };
+                        let ec = if (t_c >> pl) & 1 == 1 {
+                            rc
+                        } else {
+                            F128::ONE + rc
+                        };
+                        let ed = if (t_next >> pl) & 1 == 1 {
+                            rd
+                        } else {
+                            F128::ONE + rd
+                        };
                         *w_e *= ec * ed;
                     }
                     let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
@@ -852,10 +866,7 @@ fn prove_assist_naive<C: Challenger>(
                 let one_term = if bit { we * g1 } else { F128::ZERO };
                 (one_term, we * (g0 + g1))
             })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(a, b), (c, d)| (a + c, b + d),
-            );
+            .reduce(|| (F128::ZERO, F128::ZERO), |(a, b), (c, d)| (a + c, b + d));
 
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
@@ -1297,7 +1308,10 @@ mod tests {
                 let naive = prove_assist_naive(&params, &z_row, &z_col, &z_idx, &mut ch_b);
 
                 assert_eq!(streamed.beta, naive.beta, "β mismatch n={n} k={k} m={m}");
-                assert_eq!(streamed.rounds, naive.rounds, "rounds mismatch n={n} k={k} m={m}");
+                assert_eq!(
+                    streamed.rounds, naive.rounds,
+                    "rounds mismatch n={n} k={k} m={m}"
+                );
             }
         }
     }
@@ -1337,8 +1351,9 @@ mod tests {
                 let (proof, assist, v) = prove_with_assist(&params, &q, &z_row, &z_col, &mut pch);
 
                 let mut vch = FsChallenger::new(b"flock-jagged-test");
-                let claim = verify_with_assist(&params, &z_row, &z_col, v, &proof, &assist, &mut vch)
-                    .expect("honest assisted proof must verify");
+                let claim =
+                    verify_with_assist(&params, &z_row, &z_col, v, &proof, &assist, &mut vch)
+                        .expect("honest assisted proof must verify");
                 assert_eq!(claim.alpha, mle_eval(&q, &claim.point), "alpha ≠ q̂(i*)");
 
                 // Same reduced claim as the assist-free verifier.
@@ -1375,17 +1390,26 @@ mod tests {
         // Tampered round message.
         let mut bad = assist.clone();
         bad.rounds[3].0 += F128::ONE;
-        assert!(check(&proof, &bad).is_none(), "tampered round must be rejected");
+        assert!(
+            check(&proof, &bad).is_none(),
+            "tampered round must be rejected"
+        );
 
         // Truncated assist.
         let mut bad = assist.clone();
         bad.rounds.pop();
-        assert!(check(&proof, &bad).is_none(), "truncated assist must be rejected");
+        assert!(
+            check(&proof, &bad).is_none(),
+            "truncated assist must be rejected"
+        );
 
         // Tampered dense claim must break the outer relation against β.
         let mut bad_proof = proof.clone();
         bad_proof.q_eval += F128::ONE;
-        assert!(check(&bad_proof, &assist).is_none(), "tampered q_eval must be rejected");
+        assert!(
+            check(&bad_proof, &assist).is_none(),
+            "tampered q_eval must be rejected"
+        );
     }
 
     /// Runtime check at the realistic Option-B size: an m=32-bit trace packed
@@ -1624,9 +1648,7 @@ mod tests {
         let z_row = sample_vec(&mut rc, n);
         let z_col = sample_vec(&mut rc, k);
 
-        let best3 = |f: &mut dyn FnMut() -> std::time::Duration| {
-            (0..3).map(|_| f()).min().unwrap()
-        };
+        let best3 = |f: &mut dyn FnMut() -> std::time::Duration| (0..3).map(|_| f()).min().unwrap();
 
         // Warm-up (thread pool + page faults).
         let mut ch = FsChallenger::new(b"flock-jagged-bits30");
@@ -1676,7 +1698,10 @@ mod tests {
         let main_bytes = (2 * proof.rounds.len() + 1) * 16;
         let assist_bytes = (2 * assist.rounds.len() + 1) * 16;
         eprintln!("  threads: {}", rayon::current_num_threads());
-        eprintln!("  witness: 2^{m} F128 = {} MiB (2^30 bits packed)", (len * 16) >> 20);
+        eprintln!(
+            "  witness: 2^{m} F128 = {} MiB (2^30 bits packed)",
+            (len * 16) >> 20
+        );
         eprintln!("  sumcheck prover ({m} rounds)          : {t_prove:>9.3?}");
         eprintln!(
             "  + assist prover ({} rounds)          : {:>9.3?}  (assist ≈ {:.3?}, {:.1}% of prover)",
@@ -1765,7 +1790,13 @@ mod tests {
                         &mut sb[..half],
                     );
                 } else {
-                    fold_oop_par(&a_src[..cur], &b_src[..cur], r, &mut sa[..half], &mut sb[..half]);
+                    fold_oop_par(
+                        &a_src[..cur],
+                        &b_src[..cur],
+                        r,
+                        &mut sa[..half],
+                        &mut sb[..half],
+                    );
                 }
                 per_round.push(t.elapsed());
                 std::mem::swap(&mut a, &mut sa);
