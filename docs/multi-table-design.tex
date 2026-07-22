@@ -703,7 +703,12 @@ the \emph{existing} ring-switching stage exactly as today
 coordinates --- the skip coordinate included --- yielding per-slot
 multilinear claims on the \emph{packed} polynomial, whose variables are
 the batch and chunk coordinates. Ring-switching is per-claim local, so it
-needs no union-awareness. The jagged transport therefore operates purely
+needs no union-awareness. Its prover folds are, however, subject to the
+same declared-work discipline as everything else: the $\hat s_v$ capture
+for the zerocheck claim is fused into the zerocheck pass and inherits its
+run-lists (an explicit checkpoint when generalizing that pass), and the
+folds for the per-slot lincheck claims touch only their own slot's
+declared rows, $O(n_t k_t)$ each. The jagged transport therefore operates purely
 on packed data at ordinary multilinear points --- matching both the
 \code{jagged-assist} API (plain multilinear
 $(z_{\mathrm{row}}, z_{\mathrm{col}}, z_{\mathrm{index}})$ slices) and
@@ -811,6 +816,7 @@ Witness generation & per-type closures over declared rows; nothing for dummies \
 Commit & Ligerito on $N_{\mathrm{com}}$ (actual data, useful columns only) \\
 Zerocheck prover & $O(N_{\mathrm{decl}})$; static $M$ rounds; skip intact \\
 Lincheck prover & $O(N_{\mathrm{decl}})$ folds $+$ $K$-round multi-size SC \\
+Ring-switch folds & $O(N_{\mathrm{decl}})$ (fused into the zerocheck pass; per-slot for \LC claims) \\
 Jagged transport prover & $\tilde O(N_{\mathrm{com}})$ (one batched transport SC) \\
 Opening & one batched Ligerito open \\
 \midrule
@@ -882,11 +888,18 @@ proofs on the same witnesses.
         coordinate included (\S\ref{sec:commit}) --- the transport only
         ever sees ordinary multilinear points over packed-word variables,
         so \emph{no point-format adapter is needed}. What the composition
-        layer must add is claim \emph{batching}: many per-slot packed
-        claims, at different points, RLC-combined into one transport
-        sumcheck (combine the per-claim $\eq$-weight tables under random
-        coefficients). Bounded, known work --- design at the start of
-        Phase 1.
+        layer must add is claim \emph{batching} --- a cost matter, not a
+        soundness one. A mixed proof emits $\approx 2T$ claims at
+        distinct points ($T$ from decomposing the zerocheck's
+        $\hat c(r) = \hat z(r)$ claim by prefix weights, $T$ from the
+        per-slot lincheck outputs, plus glue on single-type statements),
+        and the transport's dense-domain sumcheck and assist are paid per
+        claim; RLC-combining the per-claim $\eq$-weight tables under
+        transcript coefficients collapses this to one transport sumcheck
+        --- the same multi-claim front-end \code{open\_batch\_mixed}
+        already provides at the Ligerito layer. A per-claim transport v0
+        is sound and an acceptable stepping stone inside Phase 1;
+        batching follows as the optimization.
   \item \textbf{Capacity sizing.} How many tiers, and how large? Each
         doubling of capacity costs one static sumcheck round and slightly
         larger bookkeeping tables; exceeding capacity forces a proof
@@ -903,9 +916,12 @@ proofs on the same witnesses.
         identity \eqref{eq:implicit-batch}, operationally). So ``prover
         pays declared work'' is delivered by architecture --- per-slot
         dense sub-folds plus an $O(T)$-per-round scalar tail --- with no
-        sparse iteration inside any hot loop. Residual work: the
-        round-polynomial accounting at slot-collapse boundaries, and an
-        adversarial benchmark at low utilization.
+        sparse iteration inside any hot loop. The same discipline covers
+        the ring-switching folds (\S\ref{sec:commit}): the fused
+        $\hat s_v$ capture and the per-slot claim folds must skip dummy
+        rows via the same run-lists. Residual work: the round-polynomial
+        accounting at slot-collapse boundaries, and an adversarial
+        benchmark at low utilization.
   \item \textbf{Many types.} Verifier matrix work is linear in registry
         size ($\sum_t \nnz$). If the registry grows past a handful of
         types, the clean fix is Spartan-style preprocessing: commit each
