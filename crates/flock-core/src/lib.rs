@@ -27,6 +27,7 @@ pub mod pcs;
 pub mod permutation;
 pub mod proof;
 pub mod r1cs;
+pub mod schedule;
 pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
