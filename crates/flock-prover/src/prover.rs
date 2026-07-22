@@ -29,7 +29,9 @@ use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
-use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
+use flock_core::proof::{
+    R1csClaim, R1csProofJaggedLigerito, R1csProofLigerito, ZClaim, bind_statement,
+};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
 
@@ -253,6 +255,124 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     );
 
     let proof = R1csProofLigerito {
+        zerocheck: zc_proof,
+        lincheck: lc_proof,
+        pcs_open,
+    };
+    let claim = R1csClaim { ab, c };
+    (proof, commitment, claim)
+}
+
+/// Jagged-path counterpart of [`open_claims_with_precomputed_ligerito`]:
+/// batched PCS open over `ẑ`-claims routed through the virtual-opening
+/// sumcheck + jagged transport (`pcs::open_batch_jagged_ligerito`).
+/// `heights` / `n_log` describe the committed jagged grid (see
+/// [`flock_core::r1cs::BlockR1cs::jagged_heights`]). Must be called at the
+/// same transcript position as the verifier's
+/// [`flock_core::verifier::verify_claims_jagged_ligerito`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_claims_with_precomputed_jagged_ligerito<Ch: Challenger>(
+    z_packed: Vec<F128>,
+    prover_data: &pcs::ProverData,
+    commitment: &Commitment,
+    claims: &[ZClaim],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    padding: &zerocheck::PaddingSpec,
+    heights: &[u64],
+    n_log: usize,
+    lig_config: &pcs::ligerito::ProverConfig,
+    challenger: &mut Ch,
+) -> pcs::BatchOpeningProofJaggedLigerito {
+    let x_fulls: Vec<Vec<F128>> = claims
+        .iter()
+        .map(|c| quirky_x_outer_full(&c.point))
+        .collect();
+    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    pcs::open_batch_jagged_ligerito(
+        z_packed,
+        prover_data,
+        commitment,
+        &x_refs,
+        precomputed_s_hat_v,
+        &[],
+        padding,
+        heights,
+        n_log,
+        lig_config,
+        challenger,
+    )
+}
+
+/// [`prove_fast_ligerito_from_witness`] with the opening routed through the
+/// **jagged transport** (Phase 1 of the multi-table design): identical
+/// commit → zerocheck → lincheck pipeline ([`prove_fast_core_with_codeword`],
+/// so the PIOP transcript prefix is byte-identical to the direct path on the
+/// same statement + witness), then `pcs::open_batch_jagged_ligerito` instead
+/// of the mixed Ligerito open. Requires the BatchMajor witness layout — the
+/// jagged grid's columns are the buffer's chunk-columns. Verify with
+/// [`flock_core::verifier::verify_ligerito_jagged`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_jagged_from_witness<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofJaggedLigerito, Commitment, R1csClaim) {
+    assert_eq!(
+        r1cs.layout,
+        flock_core::r1cs::WitnessLayout::BatchMajor,
+        "the jagged opening path requires the BatchMajor witness layout"
+    );
+    let log_n = r1cs.m - pcs::LOG_PACKING;
+    let lig_config =
+        pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
+            .expect("Ligerito default config; bump m for tiny instances");
+
+    let ProveCore {
+        zc_proof,
+        lc_proof,
+        ab,
+        c,
+        commitment,
+        prover_data,
+        z_packed,
+        s_hat_v_ab,
+        s_hat_v_c,
+    } = prove_fast_core_with_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    );
+
+    let padding = r1cs.padding_spec();
+    let heights = r1cs.jagged_heights();
+    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pcs_open = open_claims_with_precomputed_jagged_ligerito(
+        z_packed,
+        &prover_data,
+        &commitment,
+        &[ab.clone(), c.clone()],
+        &[pre_ab, pre_c],
+        &padding,
+        &heights,
+        r1cs.n_log(),
+        &lig_config,
+        challenger,
+    );
+
+    let proof = R1csProofJaggedLigerito {
         zerocheck: zc_proof,
         lincheck: lc_proof,
         pcs_open,

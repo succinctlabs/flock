@@ -21,6 +21,18 @@ pub struct R1csProofLigerito {
     pub pcs_open: pcs::BatchOpeningProofLigerito,
 }
 
+/// [`R1csProofLigerito`] with the opening routed through the **jagged
+/// transport** (`pcs::open_batch_jagged_ligerito`) instead of the direct
+/// mixed Ligerito open. The PIOP part (zerocheck + lincheck) is identical —
+/// on the same statement and witness the two proofs share a byte-identical
+/// transcript prefix up to the opening stage.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct R1csProofJaggedLigerito {
+    pub zerocheck: zerocheck::ZerocheckProof,
+    pub lincheck: lincheck::LincheckProof,
+    pub pcs_open: pcs::BatchOpeningProofJaggedLigerito,
+}
+
 /// A claim of the form `ẑ(point) = value` for the witness `z`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZClaim {

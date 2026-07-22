@@ -327,6 +327,33 @@ impl BlockR1cs {
         }
     }
 
+    /// Per-chunk-column heights (in packed words) of the committed witness's
+    /// jagged grid, for the jagged opening path
+    /// (`pcs::open_batch_jagged_ligerito`): `2^(k_log−7)` entries, the leading
+    /// `ceil(useful_bits/128)` equal to `2^n_log` (every declared row) and the
+    /// rest 0 (the padding chunk-columns, zero by the BatchMajor buffer
+    /// layout — see [`Self::padding_spec`]). Shared by the prover and verifier
+    /// wiring — any divergence is a transcript break, so both derive it here.
+    /// Requires the BatchMajor layout (`addr = [7 in-word | n_log batch |
+    /// k_log−7 chunk]`), whose packed-word suffix order `[batch | chunk]` is
+    /// what makes the chunk-columns the jagged grid's columns.
+    pub fn jagged_heights(&self) -> Vec<u64> {
+        assert_eq!(
+            self.layout,
+            WitnessLayout::BatchMajor,
+            "jagged_heights requires the BatchMajor witness layout"
+        );
+        assert!(self.k_log >= 7, "BatchMajor needs k_log >= 7");
+        let n_chunks = 1usize << (self.k_log - 7);
+        let useful_chunks = self.useful_bits.div_ceil(128);
+        debug_assert!(useful_chunks <= n_chunks);
+        let mut heights = vec![0u64; n_chunks];
+        for h in &mut heights[..useful_chunks] {
+            *h = 1u64 << self.n_log();
+        }
+        heights
+    }
+
     /// BLAKE3 hash of the R1CS instance (parameters + sparse matrices).
     /// Stable across runs; used to bind the Fiat-Shamir transcript to the
     /// statement being proved.

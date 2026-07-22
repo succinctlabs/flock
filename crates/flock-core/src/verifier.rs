@@ -7,7 +7,7 @@ use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck;
 use crate::pcs::{self, Commitment};
-use crate::proof::{R1csClaim, R1csProofLigerito, ZClaim};
+use crate::proof::{R1csClaim, R1csProofJaggedLigerito, R1csProofLigerito, ZClaim};
 use crate::r1cs::BlockR1cs;
 use crate::zerocheck;
 
@@ -17,6 +17,8 @@ pub enum VerifyError {
     Lincheck(lincheck::VerifyError),
     PcsAb(pcs::VerifyError),
     PcsC(pcs::VerifyError),
+    /// The jagged-path batched opening rejected (see [`verify_ligerito_jagged`]).
+    PcsJagged(pcs::VerifyErrorJagged),
 }
 
 /// Dedicated single-thread rayon pool that the verifier runs inside.
@@ -75,6 +77,91 @@ pub fn verify_ligerito<Ch: Challenger>(
     )
     .map_err(VerifyError::PcsAb)?;
     Ok(R1csClaim { ab, c })
+}
+
+/// Verify an R1CS proof whose opening went through the **jagged transport**:
+/// replay zerocheck + lincheck → the two base z-claims (identical to
+/// [`verify_ligerito`] — the PIOP is shared), then verify the jagged-path
+/// batched opening covering both. Mirror of
+/// `flock_prover::prover::prove_fast_ligerito_jagged_from_witness`.
+pub fn verify_ligerito_jagged<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    commitment: &Commitment,
+    proof: &R1csProofJaggedLigerito,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
+    let (ab, c) = verify_core(
+        r1cs,
+        &proof.zerocheck,
+        &proof.lincheck,
+        commitment,
+        lincheck_circuit,
+        challenger,
+    )?;
+    verify_claims_jagged_ligerito(
+        commitment,
+        &[ab.clone(), c.clone()],
+        &r1cs.jagged_heights(),
+        r1cs.n_log(),
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+    )
+    .map_err(VerifyError::PcsJagged)?;
+    Ok(R1csClaim { ab, c })
+}
+
+/// Verify a jagged-path batched PCS opening over an arbitrary list of
+/// `ẑ`-claims — the jagged counterpart of [`verify_claims_ligerito`], and the
+/// mirror of the prover's `pcs::open_batch_jagged_ligerito` call. `heights` /
+/// `n_log` describe the committed jagged grid (see
+/// [`BlockR1cs::jagged_heights`]); both sides derive them from the statement,
+/// never from the proof. Must run at the same transcript position as the
+/// prover's open.
+pub fn verify_claims_jagged_ligerito<Ch: Challenger>(
+    commitment: &Commitment,
+    claims: &[ZClaim],
+    heights: &[u64],
+    n_log: usize,
+    pcs_open: &pcs::BatchOpeningProofJaggedLigerito,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<(), pcs::VerifyErrorJagged> {
+    // Verification is single-threaded; run the body on the dedicated 1-thread pool.
+    verifier_pool().install(move || {
+        let z_skips: Vec<F128> = claims.iter().map(|c| c.point.z_skip).collect();
+        let values: Vec<F128> = claims.iter().map(|c| c.value).collect();
+        let x_fulls: Vec<Vec<F128>> = claims
+            .iter()
+            .map(|c| {
+                let mut v = c.point.x_inner_rest.clone();
+                v.extend_from_slice(&c.point.x_outer);
+                v
+            })
+            .collect();
+        let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+        let log_n = pcs_params.m - pcs::LOG_PACKING;
+        let lig_v_config = crate::pcs::ligerito::verifier_config_for(
+            log_n,
+            pcs_params.log_batch_size,
+            pcs_params.profile,
+        )
+        .expect("Ligerito default verifier config");
+        pcs::verify_opening_batch_jagged_ligerito(
+            commitment,
+            &values,
+            &z_skips,
+            &x_refs,
+            &[],
+            heights,
+            n_log,
+            pcs_open,
+            &lig_v_config,
+            challenger,
+        )
+    })
 }
 
 /// Verify a batched PCS opening over an arbitrary list of `ẑ`-claims — the
