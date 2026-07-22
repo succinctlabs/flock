@@ -101,15 +101,6 @@ protocol hash (the SHA-256 used for the Merkle commitment, Fiat--Shamir,
 and proof-of-work grinding is untouched by this design --- ``hash'' in this
 document always means the hash being \emph{proven}).
 
-\paragraph{One mode.} An earlier draft of this design carried two protocol
-modes: a \emph{fixed-shape} mode (counts predeclared, witness committed
-directly) and the dynamic mode. The fixed-shape mode is expressively the
-special case ``counts $=$ capacities'' of the dynamic mode, and carrying
-both meant two commitment layers, two transports, two wire formats, and a
-doubled audit surface. This draft specifies \textbf{the dynamic mode only}.
-The direct-commitment path survives as a development harness and fallback
-(Remark~\ref{rem:harness}), not as a protocol mode.
-
 % ===========================================================================
 \section{Preliminaries: the current single-table system}\label{sec:prelim}
 
