@@ -74,6 +74,11 @@ pub struct Registry {
     nu: usize,
     slots: Vec<Slot>,
     m_total: usize,
+    /// Lazily computed [`Self::digest`]. Unlike `BlockR1cs` (public fields,
+    /// manual `Clone` resetting the cache), every field here is private and
+    /// immutable after construction, so the cache can never go stale and the
+    /// derived `Clone` may carry it.
+    digest_cache: std::sync::OnceLock<[u8; 32]>,
 }
 
 impl Registry {
@@ -133,7 +138,54 @@ impl Registry {
             nu,
             slots,
             m_total,
+            digest_cache: std::sync::OnceLock::new(),
         }
+    }
+
+    /// BLAKE3 digest of the registry — the multi-table statement binding for
+    /// the Fiat-Shamir transcript (design doc, "Statement, transcript, wire
+    /// format"). Stable across runs; two registries agree iff they absorb
+    /// the same bytes below.
+    ///
+    /// Normative absorption order (format version 1):
+    /// 1. domain label `b"flock-registry-v1"` — intentionally
+    ///    domain-separated from the single-table `b"flock-r1cs-stmt-v1"` of
+    ///    [`crate::r1cs::BlockR1cs::statement_digest`], so a registry digest
+    ///    can never collide with a single-table statement digest;
+    /// 2. format-version byte `1u8`;
+    /// 3. `nu` as u32 LE;
+    /// 4. type count `T` as u32 LE;
+    /// 5. per type, IN SLOT ORDER (the registry's sorted order): `k_log`
+    ///    (u32 LE), `useful_bits` (u64 LE), `const_pin` as
+    ///    `(present: u8, value: u64 LE)` — `(0, 0)` for `None`, `(1, col)`
+    ///    for `Some(col)` — then the base matrices `a_0`, `b_0`, `c_0`, each
+    ///    absorbed by the same length-prefixed routine `statement_digest`
+    ///    uses (`crate::r1cs::absorb_matrix`).
+    ///
+    /// Lazily cached in `digest_cache`; first call materializes it,
+    /// subsequent calls are essentially free.
+    pub fn digest(&self) -> [u8; 32] {
+        *self.digest_cache.get_or_init(|| {
+            let mut h = blake3::Hasher::new();
+            h.update(b"flock-registry-v1");
+            h.update(&[1u8]);
+            h.update(&(self.nu as u32).to_le_bytes());
+            h.update(&(self.types.len() as u32).to_le_bytes());
+            for ty in &self.types {
+                h.update(&(ty.k_log as u32).to_le_bytes());
+                h.update(&(ty.useful_bits as u64).to_le_bytes());
+                let (present, value) = match ty.const_pin {
+                    Some(col) => (1u8, col as u64),
+                    None => (0u8, 0u64),
+                };
+                h.update(&[present]);
+                h.update(&value.to_le_bytes());
+                crate::r1cs::absorb_matrix(&mut h, &ty.a_0);
+                crate::r1cs::absorb_matrix(&mut h, &ty.b_0);
+                crate::r1cs::absorb_matrix(&mut h, &ty.c_0);
+            }
+            *h.finalize().as_bytes()
+        })
     }
 
     /// The types, in slot order (non-increasing capacity area).
@@ -483,5 +535,95 @@ mod tests {
     fn instance_rejects_count_over_capacity() {
         let reg = Registry::new(vec![ty(9, 300)], 3);
         let _ = Instance::new(&reg, vec![9]);
+    }
+
+    // The registry digest's `b"flock-registry-v1"` label intentionally
+    // domain-separates it from `BlockR1cs::statement_digest`'s
+    // `b"flock-r1cs-stmt-v1"`: a registry digest can never collide with a
+    // single-table statement digest, even for a one-type registry whose
+    // parameters and matrices match a `BlockR1cs` exactly.
+
+    /// Sparse matrix with the given rows (shape and contents are absorbed
+    /// as-is; the digest does not validate dimensions against `k_log`, same
+    /// as the walker-encoder stub convention).
+    fn matrix(rows: Vec<Vec<usize>>) -> SparseBinaryMatrix {
+        SparseBinaryMatrix {
+            num_rows: rows.len(),
+            num_cols: 512,
+            rows,
+        }
+    }
+
+    /// Digest is stable across calls (cache), across identically constructed
+    /// registries, and across clones.
+    #[test]
+    fn registry_digest_deterministic() {
+        let mk = || {
+            Registry::new(
+                vec![
+                    ty(10, 700),
+                    TableType {
+                        k_log: 9,
+                        useful_bits: 300,
+                        a_0: matrix(vec![vec![0, 3], vec![7]]),
+                        b_0: stub(),
+                        c_0: stub(),
+                        const_pin: Some(2),
+                    },
+                ],
+                3,
+            )
+        };
+        let a = mk();
+        let d = a.digest();
+        assert_eq!(d, a.digest(), "digest must be stable across calls");
+        assert_eq!(
+            d,
+            mk().digest(),
+            "identically constructed registries must agree"
+        );
+        assert_eq!(d, a.clone().digest(), "clone must carry the same digest");
+    }
+
+    /// Every absorbed component moves the digest: nu, a single matrix
+    /// entry, useful_bits, and const_pin (including Some(0) vs None — the
+    /// present byte). Type-order sensitivity is not testable at the
+    /// constructor boundary: `Registry::new` sorts, so two constructions
+    /// differing only in input order are the SAME registry and must (and
+    /// do, per `registry_digest_deterministic`) agree.
+    #[test]
+    fn registry_digest_sensitivity() {
+        let mk = |nu, useful_bits, a_rows: Vec<Vec<usize>>, const_pin| {
+            Registry::new(
+                vec![
+                    ty(10, 700),
+                    TableType {
+                        k_log: 9,
+                        useful_bits,
+                        a_0: matrix(a_rows),
+                        b_0: stub(),
+                        c_0: stub(),
+                        const_pin,
+                    },
+                ],
+                nu,
+            )
+        };
+        let d = mk(3, 300, vec![vec![0, 3], vec![7]], None).digest();
+        let cases = [
+            ("nu", mk(4, 300, vec![vec![0, 3], vec![7]], None)),
+            (
+                "single matrix entry",
+                mk(3, 300, vec![vec![0, 4], vec![7]], None),
+            ),
+            ("useful_bits", mk(3, 301, vec![vec![0, 3], vec![7]], None)),
+            (
+                "const_pin Some(0) vs None",
+                mk(3, 300, vec![vec![0, 3], vec![7]], Some(0)),
+            ),
+        ];
+        for (what, reg) in cases {
+            assert_ne!(d, reg.digest(), "digest insensitive to {what}");
+        }
     }
 }

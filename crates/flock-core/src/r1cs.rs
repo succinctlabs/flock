@@ -376,7 +376,10 @@ impl BlockR1cs {
 /// `(num_rows, num_cols, [(row_len, col_indices...) for each row])`, all
 /// little-endian u64, so two matrices with different shapes/contents always
 /// produce different states.
-fn absorb_matrix(h: &mut blake3::Hasher, m: &SparseBinaryMatrix) {
+///
+/// `pub(crate)` so [`crate::schedule::Registry::digest`] absorbs matrices
+/// with the exact same encoding rather than duplicating it.
+pub(crate) fn absorb_matrix(h: &mut blake3::Hasher, m: &SparseBinaryMatrix) {
     h.update(&(m.num_rows as u64).to_le_bytes());
     h.update(&(m.num_cols as u64).to_le_bytes());
     for row in &m.rows {
