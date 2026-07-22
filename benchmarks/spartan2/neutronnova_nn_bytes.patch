@@ -1,0 +1,38 @@
+--- a/benches/sha256_neutronnova.rs
++++ b/benches/sha256_neutronnova.rs
+@@ -34,8 +34,15 @@
+ 
+ type E = T256HyraxEngine;
+ 
+-/// Sizes in bytes to benchmark: 1 KB (16 steps) and 2 KB (32 steps).
+-const SIZES: &[usize] = &[1024, 2048];
++/// Sizes in bytes to benchmark (num_steps = size/64 compressions). Override with
++/// NN_BYTES (comma-separated bytes), e.g. NN_BYTES="32768" for 512 compressions.
++/// Default: 1 KB (16 steps) and 2 KB (32 steps).
++fn sizes() -> Vec<usize> {
++  match std::env::var("NN_BYTES") {
++    Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
++    Err(_) => vec![1024, 2048],
++  }
++}
+ 
+ /// SHA-256 block size in bytes.
+ const BLOCK_BYTES: usize = 64;
+@@ -226,7 +233,7 @@
+   let thread_counts = thread_counts();
+ 
+   // Report proof sizes once per size (outside measurements).
+-  for &size in SIZES {
++  for &size in &sizes() {
+     let num_steps = num_steps_for_size(size);
+     let step_proto = Sha256StepCircuit::<E>::new([0u8; BLOCK_BYTES]);
+     let core_proto = CoreCircuit::<E>::new();
+@@ -252,7 +259,7 @@
+   g.warm_up_time(Duration::from_millis(100));
+   g.measurement_time(Duration::from_secs(10));
+ 
+-  for &size in SIZES {
++  for &size in &sizes() {
+     let num_steps = num_steps_for_size(size);
+     g.throughput(Throughput::Bytes(size as u64));
+ 

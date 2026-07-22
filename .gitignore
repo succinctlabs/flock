@@ -27,6 +27,8 @@ benchmarks/bench-hash-in-snark/*
 !benchmarks/bench-hash-in-snark/setup.sh
 benchmarks/spartan2/*
 !benchmarks/spartan2/setup.sh
+!benchmarks/spartan2/neutronnova_nn_bytes.patch
+!benchmarks/spartan2/spartan_sp_bytes.patch
 
 # bench_keccak.sh / bench_sha256.sh / bench_blake3.sh result caches (machine-specific timings)
 benchmarks/bench-keccak-cache/
