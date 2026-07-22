@@ -79,6 +79,7 @@
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
+use serde::{Deserialize, Serialize};
 
 /// Configuration of a jagged function: the (zero-padded to `2^k`) column
 /// heights, summarized as the cumulative-height prefix sums.
@@ -258,7 +259,7 @@ pub fn f_hat_t(params: &JaggedParams, z_row: &[F128], z_col: &[F128], z_index: &
 /// Transcript of the jagged sumcheck. Each round sends the degree-2 round
 /// polynomial as `(G(1), G(∞))`; `G(0)` is reconstructed by the verifier from
 /// the running claim. `q_eval` is the final dense claim `α = q̂(i*)`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JaggedSumcheckProof {
     pub rounds: Vec<(F128, F128)>,
     pub q_eval: F128,
@@ -381,8 +382,10 @@ pub fn prove<C: Challenger>(
 
 /// [`prove`], additionally returning the bound point `i*` (the per-round
 /// challenges, low bit first) — needed to continue the transcript into the
-/// assist sub-protocol or the downstream dense opening.
-fn prove_main<C: Challenger>(
+/// assist sub-protocol or the downstream dense opening (see
+/// `pcs::open_batch_jagged_ligerito`, which pairs this with [`prove_assist`]
+/// exactly as [`prove_with_assist`] does and then opens `q` at `i*`).
+pub(crate) fn prove_main<C: Challenger>(
     params: &JaggedParams,
     q: &[F128],
     z_row: &[F128],
@@ -511,7 +514,7 @@ fn replay_rounds<C: Challenger>(
 /// so the verifier replaces `2^k` branching-program DPs with one. `beta` is
 /// the claimed value (observed into the transcript before the rounds); each of
 /// the `2(m+1)` rounds sends the degree-2 message `(G(1), G(∞))`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JaggedAssistProof {
     pub beta: F128,
     pub rounds: Vec<(F128, F128)>,
@@ -961,7 +964,7 @@ pub fn verify_with_assist<C: Challenger>(
 /// polynomial `G` is given by `G(1) = g_one`, leading coeff `G(∞) = g_inf`, and
 /// `G(0) = claim + G(1)` (since `claim = G(0) + G(1)`). Returns `G(r)`.
 #[inline]
-fn fold_round_claim(claim: F128, g_one: F128, g_inf: F128, r: F128) -> F128 {
+pub(crate) fn fold_round_claim(claim: F128, g_one: F128, g_inf: F128, r: F128) -> F128 {
     let g0 = claim + g_one; // char-2: G(0) = claim - G(1)
     // G(X) = g0 + (G(1) + g0 + g_inf)·X + g_inf·X²
     g0 + (g_one + g0 + g_inf) * r + g_inf * (r * r)
@@ -1061,7 +1064,7 @@ fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
 
 /// Parallel out-of-place fold (no message), `ao/bo` length `a.len()/2`. Used for
 /// the final round (size 2 → 1), where there is no successor message.
-fn fold_oop_par(a: &[F128], b: &[F128], r: F128, ao: &mut [F128], bo: &mut [F128]) {
+pub(crate) fn fold_oop_par(a: &[F128], b: &[F128], r: F128, ao: &mut [F128], bo: &mut [F128]) {
     use rayon::prelude::*;
     ao.par_iter_mut()
         .zip(bo.par_iter_mut())
@@ -1076,7 +1079,9 @@ fn fold_oop_par(a: &[F128], b: &[F128], r: F128, ao: &mut [F128], bo: &mut [F128
 /// in one pass. Requires `a.len() >= 4`. This is the production kernel — in the
 /// bandwidth-bound parallel regime the halved pass count is a ~1.4× win (the
 /// serial penalty from the fold→message dependency is hidden across cores).
-fn fold_and_round_oop_par(
+/// Shared with the virtual-opening sumcheck (`pcs::open_batch_jagged_ligerito`),
+/// which runs the same product-sumcheck round structure.
+pub(crate) fn fold_and_round_oop_par(
     a: &[F128],
     b: &[F128],
     r: F128,

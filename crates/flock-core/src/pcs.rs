@@ -53,6 +53,40 @@ pub enum VerifyError {
     Ligerito,
 }
 
+/// Batched opening proof for the **jagged transport** path (the
+/// three-polynomial pipeline of `docs/multi-table-design.tex` §"The
+/// commitment layer"): the ring-switching frontend exactly as
+/// [`BatchOpeningProofLigerito`], then the virtual-opening sumcheck
+/// converting the γ-combined inner-product claim into a single evaluation
+/// claim `f̂(ρ) = f_eval`, the jagged sumcheck + assist transporting it to a
+/// dense claim `q̂(i*) = α`, and the Ligerito opening of the dense stack at
+/// the `eq(i*, ·)` basis. Produced by [`open_batch_jagged_ligerito`], checked
+/// by [`verify_opening_batch_jagged_ligerito`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchOpeningProofJaggedLigerito {
+    pub ring_switches: Vec<RingSwitchProof>,
+    /// Virtual-opening sumcheck round messages `(G(1), G(∞))` — one per
+    /// packed-word variable (`m − 7` rounds, LSB bound first).
+    pub virtual_open_rounds: Vec<(F128, F128)>,
+    /// `f̂(ρ)` — the packed witness folded at the virtual-opening challenges.
+    pub f_eval: F128,
+    pub jagged_sumcheck: jagged::JaggedSumcheckProof,
+    pub jagged_assist: jagged::JaggedAssistProof,
+    pub ligerito: ligerito::LigeritoProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerifyErrorJagged {
+    RingSwitch(ring_switch::VerifyError),
+    /// The virtual-opening sumcheck rejected (wrong round count, or the final
+    /// round does not match `b̂_combined(ρ) · f_eval`).
+    VirtualOpen,
+    /// The jagged transport (sumcheck or assist) rejected.
+    Jagged,
+    /// The Ligerito recursive verifier rejected the dense opening.
+    Ligerito,
+}
+
 /// `eq_ind` representation for a packed-direct claim. The contributed value at
 /// scattered index `j` is the tensor entry — for the dense variant the index
 /// is the array offset; for the sparse variant it's reconstructed via
@@ -699,6 +733,379 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The jagged opening path (Phase 1 of docs/multi-table-design.tex §"The
+// commitment layer"): claim assembly exactly as the mixed path, then
+// virtual-opening sumcheck → jagged transport (with assist) → Ligerito on the
+// dense stack. Additive — the mixed path above is untouched.
+// ---------------------------------------------------------------------------
+
+/// Round-0 sumcheck prime `(u_0, u_2)` over `Σ_x f(x)·b(x)` with the LSB
+/// bound: `u_0 = Σ f_0·b_0`, `u_2 = Σ (f_0+f_1)(b_0+b_1)`. Feeds
+/// `ligerito::recursive_prover_with_basis_precomputed_round0` for the dense
+/// opening (mirrors what `compute_combined_basis_and_target` produces for the
+/// mixed path as a side effect of its combine pass).
+fn round0_prime_pair(f: &[F128], b: &[F128]) -> (F128, F128) {
+    use rayon::prelude::*;
+    debug_assert_eq!(f.len(), b.len());
+    const C: usize = 1 << 14;
+    f.par_chunks(C)
+        .zip(b.par_chunks(C))
+        .map(|(fc, bc)| {
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            for (fp, bp) in fc
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(bc.as_chunks::<2>().0.iter())
+            {
+                u0 += fp[0] * bp[0];
+                u2 += (fp[0] + fp[1]) * (bp[0] + bp[1]);
+            }
+            (u0, u2)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        )
+}
+
+/// Mixed-claim batched open through the **jagged transport**. Runs the exact
+/// claim assembly of [`open_batch_mixed_ligerito_with_precomputed_s_hat_v`]
+/// (ring-switch batched prove + γ-combination — transcript-identical up to and
+/// including the combined claim), then:
+///
+/// 1. **Virtual-opening sumcheck** (`flock-virtual-open-v0`): a product
+///    sumcheck over the `m − 7` packed-word variables proving
+///    `Σ_x f(x)·b_combined(x) = target_combined` (`f` = packed witness),
+///    with the char-2-safe `(G(1), G(∞))` round encoding of `pcs::jagged`.
+///    Converts the inner-product claim into the single evaluation claim
+///    `f̂(ρ) = f_eval` the transport consumes.
+/// 2. **Jagged transport with assist** (`flock-jagged-v0`): `q` = the packed
+///    witness (Phase 1 single table: the dense stack IS the padded buffer),
+///    `z_row = ρ[0..n_log]`, `z_col = ρ[n_log..]` (BatchMajor suffix order is
+///    `[batch | chunk]`). Reduces to the dense claim `q̂(i*) = α`.
+/// 3. **Ligerito** on the dense stack: opens `q` against the `eq(i*, ·)`
+///    basis with target `α`, reusing the commit-time codeword/Merkle tree as
+///    L0 exactly like the mixed path.
+///
+/// `heights` are the per-chunk-column word counts of the jagged grid
+/// (`2^(k_log−7)` entries; see `BlockR1cs::jagged_heights`), `n_log` the
+/// number of batch (row) variables. The witness must be zero past the jagged
+/// area (`Σ heights` packed words) — the BatchMajor buffer layout guarantees
+/// this.
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_jagged_ligerito<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    heights: &[u64],
+    n_log: usize,
+    lig_config: &ligerito::ProverConfig,
+    challenger: &mut Ch,
+) -> BatchOpeningProofJaggedLigerito {
+    let trace = std::env::var("PCS_TRACE").is_ok();
+    let t_total = std::time::Instant::now();
+
+    assert_eq!(
+        lig_config.initial_k, commitment.params.log_batch_size,
+        "ligerito initial_k ({}) must match PcsParams.log_batch_size ({}) for L0 reuse",
+        lig_config.initial_k, commitment.params.log_batch_size,
+    );
+    assert_eq!(
+        lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
+        "ligerito log_inv_rates[0] ({}) must match PcsParams.log_inv_rate ({}) for L0 reuse",
+        lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
+    );
+
+    // ---- Claim assembly: shared with (and transcript-identical to) the
+    // mixed path up to the γ-combined `(b_combined, target_combined)`.
+    let combined = compute_combined_basis_and_target(
+        &packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        packed_direct,
+        padding,
+        challenger,
+        trace,
+    );
+
+    let l = packed_witness.len();
+    let log_l = l.trailing_zeros() as usize;
+    assert_eq!(l, 1usize << log_l);
+    assert!(n_log <= log_l, "n_log exceeds packed-word variable count");
+
+    // ---- Virtual-opening sumcheck: Σ_x f(x)·b_combined(x) = target_combined,
+    // binding the low packed-word variable each round. Round 0's message falls
+    // out of the already-computed round-0 prime: `u_0 = G(0)` and
+    // `target = G(0) + G(1)` (char 2) give `G(1) = target + u_0`.
+    let t = std::time::Instant::now();
+    challenger.observe_label(b"flock-virtual-open-v0");
+    let b0 = combined.b_combined;
+    let (u0, u2) = combined.round0_prime;
+    let (mut g_one, mut g_inf) = (combined.target_combined + u0, u2);
+    let mut virtual_open_rounds = Vec::with_capacity(log_l);
+    let mut rho = Vec::with_capacity(log_l);
+    // Ping-pong fold buffers, exactly as jagged::prove_main: round 0 folds out
+    // of the borrowed (packed_witness, b0); rounds 1+ alternate (a, bb) with
+    // the scratch (sa, sb).
+    let mut sa = crate::scratch::take_f128(l / 2);
+    let mut sb = crate::scratch::take_f128(l / 2);
+    let mut a = crate::scratch::take_f128(l / 4);
+    let mut bb = crate::scratch::take_f128(l / 4);
+    let mut cur = l;
+    for round in 0..log_l {
+        let half = cur / 2;
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = challenger.sample_f128();
+        virtual_open_rounds.push((g_one, g_inf));
+        rho.push(r);
+        let (a_src, b_src): (&[F128], &[F128]) = if round == 0 {
+            (packed_witness.as_slice(), b0.as_slice())
+        } else {
+            (&a, &bb)
+        };
+        if cur > 2 {
+            (g_one, g_inf) = jagged::fold_and_round_oop_par(
+                &a_src[..cur],
+                &b_src[..cur],
+                r,
+                &mut sa[..half],
+                &mut sb[..half],
+            );
+        } else {
+            jagged::fold_oop_par(
+                &a_src[..cur],
+                &b_src[..cur],
+                r,
+                &mut sa[..half],
+                &mut sb[..half],
+            );
+        }
+        std::mem::swap(&mut a, &mut sa);
+        std::mem::swap(&mut bb, &mut sb);
+        cur = half;
+    }
+    let f_eval = if log_l == 0 { packed_witness[0] } else { a[0] };
+    challenger.observe_f128(f_eval);
+    crate::scratch::give_f128(b0);
+    crate::scratch::give_f128(sa);
+    crate::scratch::give_f128(sb);
+    crate::scratch::give_f128(a);
+    crate::scratch::give_f128(bb);
+    if trace {
+        eprintln!(
+            "  [open_jagged] virtual-opening sumcheck ({log_l} rounds): {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // ---- Jagged transport with assist: f̂(ρ) = f_eval → q̂(i*) = α.
+    let t = std::time::Instant::now();
+    let params = jagged::JaggedParams::from_heights(heights, n_log, log_l);
+    debug_assert!(
+        packed_witness[params.area() as usize..]
+            .iter()
+            .all(|&w| w == F128::ZERO),
+        "packed witness must be zero past the jagged area"
+    );
+    let (jagged_sumcheck, claim_v, i_star) = jagged::prove_main(
+        &params,
+        &packed_witness,
+        &rho[..n_log],
+        &rho[n_log..],
+        challenger,
+    );
+    debug_assert_eq!(
+        claim_v, f_eval,
+        "jagged claim must equal the virtual-opening output (witness zero past area)"
+    );
+    let jagged_assist =
+        jagged::prove_assist(&params, &rho[..n_log], &rho[n_log..], &i_star, challenger);
+    if trace {
+        eprintln!(
+            "  [open_jagged] jagged transport + assist: {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // ---- Ligerito on the dense stack: open q against eq(i*, ·) with target α.
+    let t = std::time::Instant::now();
+    let alpha = jagged_sumcheck.q_eval;
+    let b_eq = ring_switch::build_eq_parallel(&i_star);
+    let round0 = round0_prime_pair(&packed_witness, &b_eq);
+    let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0(
+        lig_config,
+        packed_witness,
+        b_eq,
+        alpha,
+        &prover_data.codeword,
+        &prover_data.merkle_tree,
+        round0,
+        challenger,
+    );
+    if trace {
+        eprintln!(
+            "  [open_jagged] ligerito::recursive_prover_with_basis: {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "  [open_jagged] TOTAL: {:6.2} ms",
+            t_total.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    BatchOpeningProofJaggedLigerito {
+        ring_switches: combined.ring_switches,
+        virtual_open_rounds,
+        f_eval,
+        jagged_sumcheck,
+        jagged_assist,
+        ligerito: ligerito_proof,
+    }
+}
+
+/// Verify a jagged-path batched opening (mirror of
+/// [`open_batch_jagged_ligerito`]). Runs the per-claim
+/// `ring_switch::verify_succinct` + target reconstruction exactly as
+/// [`verify_opening_batch_ligerito_mixed`], replays the virtual-opening
+/// sumcheck and checks its final round against `b̂_combined(ρ) · f_eval`
+/// (evaluating `b̂_combined` itself via the same residual machinery —
+/// `eval_rs_eq` per ring-switched claim, `eq_eval` per packed-direct claim —
+/// at the arbitrary field point `ρ`), then drives the jagged
+/// `verify_with_assist` and finally the succinct Ligerito verifier with the
+/// residual basis `eq(i*, ·)`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
+    commitment: &Commitment,
+    claims: &[F128],
+    z_skips: &[F128],
+    x_outers: &[&[F128]],
+    packed_direct: &[PackedDirectClaimRef<'_>],
+    heights: &[u64],
+    n_log: usize,
+    proof: &BatchOpeningProofJaggedLigerito,
+    lig_config: &ligerito::VerifierConfig,
+    challenger: &mut Ch,
+) -> Result<(), VerifyErrorJagged> {
+    let n_rs = claims.len();
+    let n_pd = packed_direct.len();
+    assert_eq!(z_skips.len(), n_rs);
+    assert_eq!(x_outers.len(), n_rs);
+    assert_eq!(proof.ring_switches.len(), n_rs);
+    assert!(n_rs + n_pd > 0);
+
+    challenger.observe_label(b"flock-pcs-open-batch-v0");
+
+    // 1.–3. Ring-switch succinct verify + γ-batching — identical to
+    // `verify_opening_batch_ligerito_mixed` steps 1–3.
+    let mut rs_outputs = Vec::with_capacity(n_rs);
+    for i in 0..n_rs {
+        let out = ring_switch::verify_succinct(
+            claims[i],
+            z_skips[i],
+            x_outers[i],
+            &proof.ring_switches[i],
+            challenger,
+        )
+        .map_err(VerifyErrorJagged::RingSwitch)?;
+        rs_outputs.push(out);
+    }
+    let gammas_rs: Vec<F128> = (0..n_rs).map(|_| challenger.sample_f128()).collect();
+
+    for pd in packed_direct {
+        challenger.observe_label(b"flock-pcs-packed-direct-v0");
+        challenger.observe_f128(pd.value);
+    }
+    let gammas_pd: Vec<F128> = (0..n_pd).map(|_| challenger.sample_f128()).collect();
+
+    let mut target_combined = F128::ZERO;
+    for (out, g) in rs_outputs.iter().zip(gammas_rs.iter()) {
+        target_combined += *g * out.sumcheck_claim;
+    }
+    for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
+        target_combined += *g * pd.value;
+    }
+
+    // 4. Virtual-opening sumcheck replay. The `(G(1), G(∞))` encoding folds
+    //    the per-round sum check into the running claim (`G(0)` is
+    //    reconstructed from it); the final round is checked against
+    //    `b̂_combined(ρ) · f_eval` below.
+    let log_l = commitment.params.m - LOG_PACKING;
+    challenger.observe_label(b"flock-virtual-open-v0");
+    if proof.virtual_open_rounds.len() != log_l {
+        return Err(VerifyErrorJagged::VirtualOpen);
+    }
+    let mut running = target_combined;
+    let mut rho = Vec::with_capacity(log_l);
+    for &(g_one, g_inf) in &proof.virtual_open_rounds {
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = challenger.sample_f128();
+        running = jagged::fold_round_claim(running, g_one, g_inf, r);
+        rho.push(r);
+    }
+    // b̂_combined(ρ): the same residual-evaluation machinery as the mixed
+    // path's `eval_b_residual`, at the (arbitrary-field) point ρ.
+    let mut b_at_rho = F128::ZERO;
+    for ((out, g), x_outer) in rs_outputs.iter().zip(gammas_rs.iter()).zip(x_outers.iter()) {
+        b_at_rho += *g * ring_switch::eval_rs_eq(&x_outer[1..], &rho, &out.eq_r_dprime);
+    }
+    for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
+        b_at_rho += *g * crate::zerocheck::multilinear::eq_eval(pd.point, &rho);
+    }
+    if running != b_at_rho * proof.f_eval {
+        return Err(VerifyErrorJagged::VirtualOpen);
+    }
+    challenger.observe_f128(proof.f_eval);
+
+    // 5. Jagged transport with assist: f̂(ρ) = f_eval → q̂(i*) = α.
+    assert!(n_log <= log_l, "n_log exceeds packed-word variable count");
+    let params = jagged::JaggedParams::from_heights(heights, n_log, log_l);
+    let dense = jagged::verify_with_assist(
+        &params,
+        &rho[..n_log],
+        &rho[n_log..],
+        proof.f_eval,
+        &proof.jagged_sumcheck,
+        &proof.jagged_assist,
+        challenger,
+    )
+    .ok_or(VerifyErrorJagged::Jagged)?;
+
+    // 6. Succinct Ligerito verify of the dense opening — the residual basis
+    //    is just eq(i*, ·), so eval_b_residual is a plain eq evaluation at
+    //    DenseClaim.point.
+    let eval_b_residual = |ris: &[F128], yr_log_n: usize| -> Vec<F128> {
+        use crate::zerocheck::multilinear::{eq_eval, eq_eval_binary_x};
+        debug_assert!(yr_log_n <= 32, "yr_log_n > 32 not supported by binary path");
+        let prefix = eq_eval(&dense.point[..ris.len()], ris);
+        let suffix = &dense.point[ris.len()..];
+        (0..1usize << yr_log_n)
+            .map(|y| prefix * eq_eval_binary_x(suffix, y as u32))
+            .collect()
+    };
+    let ok = ligerito::recursive_verifier_with_basis_succinct(
+        lig_config,
+        &proof.ligerito,
+        log_l,
+        dense.alpha,
+        &commitment.root,
+        eval_b_residual,
+        challenger,
+    );
+    if !ok {
+        return Err(VerifyErrorJagged::Ligerito);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,5 +1239,153 @@ mod tests {
             &mut ch_v,
         )
         .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
+    }
+
+    /// End-to-end roundtrip through the jagged opening path
+    /// (`open_batch_jagged_ligerito` / `verify_opening_batch_jagged_ligerito`)
+    /// on a synthetic single-table instance with dead chunk-columns, plus
+    /// tamper-rejection on every new proof component.
+    #[test]
+    #[ignore] // Heavier — run with `cargo test pcs_jagged_backend -- --ignored`
+    fn pcs_jagged_backend_roundtrip_and_tamper() {
+        let m = 22usize; // log_l = 15 packed-word variables
+        let n_log = 8usize; // 2^8 rows per chunk-column, 2^7 chunk-columns
+        let n_chunks = 1usize << (m - 7 - n_log);
+        let useful_chunks = 100usize; // 28 dead (zero) chunk-columns
+        let area_words = useful_chunks << n_log;
+
+        let mut rng = Rng::new(0x1A66_ED01);
+        let mut z = rng.bits(1 << m);
+        // BatchMajor stacking: the useful chunk-columns are the contiguous
+        // word prefix [0, area); zero everything past it.
+        for bit in z.iter_mut().skip(area_words * 128) {
+            *bit = false;
+        }
+        let z_skip = rng.f128();
+        let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let rs_claim = zhat_skip_reference(&z, m, z_skip, &x_outer);
+        let heights: Vec<u64> = (0..n_chunks)
+            .map(|c| if c < useful_chunks { 1u64 << n_log } else { 0 })
+            .collect();
+
+        let initial_k = 6;
+        let params = PcsParams {
+            m,
+            log_inv_rate: 1,
+            log_batch_size: initial_k,
+            profile: Default::default(),
+        };
+        let z_packed = pack_witness(&z, m);
+        let (commitment, prover_data) = commit(&z_packed, &params);
+
+        // Production embedded configs (the hand-rolled ad-hoc config of the
+        // test above predates the query-count derivation and is stale).
+        let lig_p_cfg =
+            crate::pcs::ligerito::prover_config_for(m - LOG_PACKING, initial_k, params.profile)
+                .expect("embedded Ligerito config for m=22");
+        let lig_v_cfg =
+            crate::pcs::ligerito::verifier_config_for(m - LOG_PACKING, initial_k, params.profile)
+                .expect("embedded Ligerito verifier config for m=22");
+
+        let mut ch_p = FsChallenger::new(b"flock-test-jagged-v0");
+        let proof = open_batch_jagged_ligerito(
+            z_packed.clone(),
+            &prover_data,
+            &commitment,
+            &[x_outer.as_slice()],
+            &[],
+            &[],
+            &PaddingSpec::dense(m),
+            &heights,
+            n_log,
+            &lig_p_cfg,
+            &mut ch_p,
+        );
+
+        let verify = |proof: &BatchOpeningProofJaggedLigerito,
+                      heights: &[u64]|
+         -> Result<(), VerifyErrorJagged> {
+            let mut ch_v = FsChallenger::new(b"flock-test-jagged-v0");
+            verify_opening_batch_jagged_ligerito(
+                &commitment,
+                &[rs_claim],
+                &[z_skip],
+                &[x_outer.as_slice()],
+                &[],
+                heights,
+                n_log,
+                proof,
+                &lig_v_cfg,
+                &mut ch_v,
+            )
+        };
+
+        verify(&proof, &heights)
+            .unwrap_or_else(|e| panic!("jagged verify rejected honest proof: {e:?}"));
+
+        // Tamper: corrupted f_eval → virtual-opening final check fails.
+        {
+            let mut bad = proof.clone();
+            bad.f_eval.lo ^= 1;
+            assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::VirtualOpen));
+        }
+        // Tamper: corrupted virtual-opening round.
+        {
+            let mut bad = proof.clone();
+            bad.virtual_open_rounds[3].0.lo ^= 1;
+            assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::VirtualOpen));
+        }
+        // Tamper: wrong virtual-opening round count.
+        {
+            let mut bad = proof.clone();
+            bad.virtual_open_rounds.pop();
+            assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::VirtualOpen));
+        }
+        // Tamper: corrupted jagged sumcheck round.
+        {
+            let mut bad = proof.clone();
+            bad.jagged_sumcheck.rounds[2].1.lo ^= 1;
+            assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::Jagged));
+        }
+        // Tamper: corrupted dense claim value α.
+        {
+            let mut bad = proof.clone();
+            bad.jagged_sumcheck.q_eval.lo ^= 1;
+            assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::Jagged));
+        }
+        // Tamper: corrupted assist claim β.
+        {
+            let mut bad = proof.clone();
+            bad.jagged_assist.beta.lo ^= 1;
+            assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::Jagged));
+        }
+        // Tamper: corrupted assist round.
+        {
+            let mut bad = proof.clone();
+            bad.jagged_assist.rounds[5].0.lo ^= 1;
+            assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::Jagged));
+        }
+        // Tamper: corrupted ring-switch message → claim check fails.
+        {
+            let mut bad = proof.clone();
+            bad.ring_switches[0].s_hat_v[0].lo ^= 1;
+            assert!(matches!(
+                verify(&bad, &heights),
+                Err(VerifyErrorJagged::RingSwitch(_))
+            ));
+        }
+        // Tamper: corrupted Ligerito final message.
+        {
+            let mut bad = proof.clone();
+            bad.ligerito.final_proof.yr[0].lo ^= 1;
+            assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::Ligerito));
+        }
+        // Wrong heights vector (one fewer useful column) → the jagged
+        // transport's f̂_t no longer matches the proof.
+        {
+            let mut bad_heights = heights.clone();
+            bad_heights[useful_chunks - 1] = 0;
+            assert_eq!(verify(&proof, &bad_heights), Err(VerifyErrorJagged::Jagged));
+        }
     }
 }

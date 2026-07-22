@@ -290,7 +290,7 @@ pub fn fold_1b_rows_multi_padded(
 /// independent and trivially parallelize. Earlier levels are tiny so
 /// rayon's per-task overhead dominates; we keep them sequential and only
 /// switch to parallel above a threshold.
-fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
+pub(crate) fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
     let n = r.len();
     // Uninit alloc — at iter `i`, the loop reads from t[..2^i] (always written
