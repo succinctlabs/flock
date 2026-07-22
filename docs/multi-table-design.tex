@@ -54,8 +54,7 @@ zerocheck over the composed instance is \emph{mathematically identical} to a
 batched per-table zerocheck with $\eq$-derived batching coefficients --- so
 batching comes for free, with plain single-instance soundness and almost no
 new zerocheck code. The genuinely new protocol work concentrates in the
-lincheck, which needs a small multi-size sumcheck over the per-table column
-dimensions. The commitment layer is the jagged (stacked-columns) scheme:
+lincheck, which becomes a single sumcheck over the union's column domain. The commitment layer is the jagged (stacked-columns) scheme:
 only the actual data is committed, with the static address space existing
 purely virtually. There is one protocol mode; fixed workloads are simply the
 full-utilization special case.
@@ -250,15 +249,21 @@ $s_t = 2^{m_t}$. The registry orders types by non-increasing capacity area
 $s_1 \ge s_2 \ge \cdots \ge s_T$.
 \end{definition}
 
-Capacities are per-type rather than global because the generality is free
-(slot areas differ across types anyway, since widths do) and workloads are
-asymmetric: the address-space size $\sum_t s_t$ --- which sets the static
-round count --- is dominated by the largest slots, so a type expected to
-appear rarely should not be granted the row capacity of the workhorse
-types. A uniform row capacity $\nu_t^{\max} \equiv \nu^{\max}$ is the
-obvious special case; another natural one is the \emph{area-balanced}
-registry, $\nu_t^{\max} + \kappa_t$ constant, where wider hashes get
-proportionally fewer maximum rows and every slot has equal area.
+Definition~\ref{def:registry} permits per-type capacities, but the
+\textbf{adopted convention is uniform row capacity}:
+$\nu_t^{\max} \equiv \nu$ for all $t$. Uniformity is load-bearing
+downstream: every slot then shares the same row coordinates (one shared
+row-fold table and a \emph{single} output claim in the lincheck,
+\S\ref{sec:lc}), and the packed union polynomial becomes literally the
+jagged grid polynomial, so union-level claims transport without per-slot
+decomposition (\S\ref{sec:commit}). The cost is only virtual: a
+rarely-used wide type is granted the same row capacity as the workhorse
+types, but undeclared capacity is address space, not work
+(\S\ref{sec:zc-sparse}), and the round count exceeds that of an
+area-balanced registry ($\nu_t^{\max} + \kappa_t$ constant) by at most
+$\kappa_{\max} - \kappa_{\min}$ ($\le 3$ today). Non-uniform capacities
+remain expressible if address-space pressure ever demands them, at the
+price of re-introducing per-slot claim decomposition.
 
 Two clarifications on Definition~\ref{def:registry}. First, capacities are
 powers of two \emph{by fiat}: slots must be subcubes of the global cube
@@ -270,8 +275,8 @@ lives in the counts $n_t$, which are unrestricted. Second, the registry
 ordering is by capacity \emph{area} $s_t$ (rows $\times$ width), not by row
 capacity alone --- a wider type with fewer maximum rows may sort first ---
 and the ordering is itself only a device: it is the canonical way to obtain
-the alignment property of Lemma~\ref{lem:align}, and in the area-balanced
-case it is immaterial.
+the alignment property of Lemma~\ref{lem:align}; under the
+uniform-capacity convention it is simply a sort by width.
 
 \begin{definition}[Instance]\label{def:instance}
 A proof \emph{instance} consists of public \emph{counts}
@@ -316,7 +321,10 @@ contiguous across invocations. The address split is therefore
 \]
 i.e.\ slot $t$'s \emph{row coordinates} are $R_t = [7,\, 7{+}\nu_t^{\max})$
 and its \emph{column coordinates} are the non-contiguous
-$C_t = [0,7) \cup [7{+}\nu_t^{\max},\, m_t)$. The interleaving is
+$C_t = [0,7) \cup [7{+}\nu_t^{\max},\, m_t)$. Under the uniform-capacity
+convention (\S\ref{sec:model}), $R_t = [7, 7{+}\nu) =: R$ is the
+\emph{same} coordinate set for every slot; we write $R$ where uniformity
+matters. The interleaving is
 harmless: all the math below depends only on the \emph{partition} of a
 slot's coordinates into (row, column, prefix) groups, never on their
 contiguity. The convention earns its keep three ways: the univariate skip
@@ -567,7 +575,7 @@ single-table case):
   \qquad
   \begin{aligned}
     w_t(r) &= \eq\bigl(r[m_t{:}M], p_t\bigr),\\
-    y_t(c') &= \hat z_t\bigl(r|_{R_t},\, c'\bigr),
+    y_t(c') &= \hat z_t\bigl(r|_{R},\, c'\bigr),
   \end{aligned}
 \end{equation}
 where
@@ -580,7 +588,8 @@ single-table code} (the code's ``semantic \code{QuirkyPoint}'' is
 layout-independent) --- and $\hat z_t(\cdot,\cdot)$ is the MLE of slot
 $t$'s (zero-padded) witness, rows-coordinates first. The prover
 materializes each $y_t$ by folding slot $t$'s \emph{declared rows} with
-the standard $\eq$ table of the row coordinates $r|_{R_t}$ ---
+the standard $\eq$ table of the \emph{shared} row coordinates $r|_{R}$
+--- one table serves every slot, by uniform capacity ---
 $O(\sum_t n_t k_t)$ in total, the declared area, analogous to today's
 single outer fold. The division of labor (quirky on the comb side,
 standard $\eq$ on the row-fold side) is \emph{identical} to today's
@@ -592,57 +601,52 @@ claim about a fixed weighted sum, so no batching randomness is needed
 \emph{across slots} (contrast \S\ref{sec:batchAB}, where combining the
 $A$- and $B$-claims genuinely does use a random $\alpha$).
 
-\subsection{The multi-size inner sumcheck}\label{sec:multisize}
+\subsection{One sumcheck over the union column domain}\label{sec:multisize}
 
-What remains is one sumcheck for \eqref{eq:lc-claim}: a sum of $T$
-sub-sums over domains of different sizes $2^{\kappa_t}$,
-$\kappa_t \in \{14, \dots, 17\}$. Two mechanisms, in order of preference:
-
-\paragraph{(a) $\eq$-embedded late join (recommended).}
-Let $K = \max_t \kappa_t$. Embed each sub-sum into $\{0,1\}^{K}$ using a
-shared auxiliary point $\sigma \in \F^{K}$:
-
-\begin{lemma}[$\eq$-embedding]\label{lem:embed}
-For any $f : \{0,1\}^{\kappa} \to \F$, any $K \ge \kappa$, and any
-$\sigma \in \F^{K}$:
+What remains is to prove \eqref{eq:lc-claim}: a sum of $T$ sub-sums over
+column domains of different sizes $2^{\kappa_t}$. Do not batch them ---
+\emph{address} them, exactly as the zerocheck did. Under the
+uniform-capacity convention all slots share the row coordinates $R$, so
+the per-slot folded vectors are restrictions of \emph{one} function
 \[
-  \sum_{c \in \{0,1\}^{K}}
-     \eq\bigl(\sigma[\kappa{:}K],\, c[\kappa{:}K]\bigr)\; f\bigl(c[0{:}\kappa]\bigr)
-  \;=\; \sum_{c' \in \{0,1\}^{\kappa}} f(c'),
+  g(c) \;:=\; \hat z\bigl(\text{rows} \leftarrow r|_R\bigr)(c),
+  \qquad c \in \{0,1\}^{M-\nu},
 \]
-by \eqref{eq:eqsum} applied to the top $K - \kappa$ coordinates.
-\end{lemma}
+the union with its row block partially evaluated, with $y_t = g$
+restricted to slot $t$'s column subcube (the slot's in-word and chunk
+coordinates, its column prefix fixed; areas $2^{\kappa_t}$, dyadic, and
+aligned by the argument of Lemma~\ref{lem:align} applied to the column
+space). Absorb the fixed weights into the public side by defining
+\[
+  \mathrm{Comb}(c) \;:=\; w_t(r)\cdot \mathrm{comb}^A_t(c')
+  \;\;\text{on slot } t\text{'s subcube}, \qquad 0 \;\text{on gaps}.
+\]
+Then \eqref{eq:lc-claim} reads
+\begin{equation}\label{eq:union-lc}
+  v_A \;=\; \sum_{c \in \{0,1\}^{M-\nu}} \mathrm{Comb}(c)\, g(c):
+\end{equation}
+\emph{one} ordinary product sumcheck over
+$M - \nu \approx \kappa_{\max} + \log T$ variables. Slots that have
+collapsed contribute $O(1)$ scalar work in the remaining rounds (the same
+implementation pattern as the zerocheck fold, \S\ref{sec:open}). At the
+end the verifier evaluates $\widehat{\mathrm{Comb}}(c^*)$ by the usual
+closed form --- per-type comb machinery at $O(\nnz)$ per type, times
+prefix-$\eq$ weights --- and is left with \textbf{a single witness claim}
+\[
+  \hat g(c^*) \;=\; \hat z\bigl(c^*\text{-columns},\; r|_R\text{-rows}\bigr),
+\]
+structurally identical to today's single-table lincheck output.
 
-\begin{remark}[Characteristic 2 forces this]\label{rem:char2}
-The textbook alternative --- replicate the small summand over the top
-coordinates and rescale by $2^{-(K-\kappa)}$ --- is unavailable: in
-$\F_{2^{128}}$, $2 = 0$. The $\eq$-weighting of Lemma~\ref{lem:embed} is the
-canonical char-2-safe embedding, and the same remark applies anywhere else in
-Flock where sums over different-sized cubes are ever combined.
+\begin{remark}[Why not batch per-slot sumchecks]\label{rem:char2}
+An earlier draft batched $T$ per-slot sumchecks of different sizes by a
+late-join mechanism, which in characteristic 2 requires an $\eq$-weighted
+embedding (the textbook $2^{-\Delta}$ rescaling divides by two, and
+$2 = 0$ in $\F_{2^{128}}$). The union-domain formulation supersedes all of
+it: same prover work, about $\log T$ more rounds, no auxiliary embedding
+point, and one output claim instead of $T$. The lesson generalizes:
+wherever this design meets sums over different-sized cubes, aligned
+addressing beats batching machinery.
 \end{remark}
-
-The sumcheck then has $K$ rounds, binding coordinates high to low. In a round
-where coordinate $j \ge \kappa_t$ is bound, type $t$'s term contributes
-$w_t \cdot \bigl(\prod_{i>j} \eq(\sigma_i, \rho_i)\bigr)\,\eq(\sigma_j, X)\,
- v_t$ --- a \emph{known scalar} times a linear polynomial, where
-$v_t = \sum_{c'} \mathrm{comb}^A_t(c')\,y_t(c')$ is the sub-claim value
-(which the prover sends alongside the round data; the verifier checks
-$\sum_t w_t v_t = v_A$). Once coordinate $\kappa_t - 1$ is reached, type $t$
-``joins'' and contributes its ordinary product-sumcheck rounds over
-$(\mathrm{comb}^A_t, y_t)$, scaled by its accumulated prefix. With
-$\kappa \in \{14..17\}$ all joins happen within the first
-$K - \min_t \kappa_t \le 3$ rounds. At the end, the verifier holds, per
-type, $\mathrm{comb}^A_t$ evaluated at the final point (computed itself via
-the comb machinery at $O(\nnz)$ per type) and an evaluation claim
-$y_t(c^*_t) = \hat z_t(r|_{R_t}, c^*_t)$ --- one witness claim
-per type.
-
-\paragraph{(b) Fallback: full-domain lincheck.} Alternatively run the
-lincheck over all $M$ column bits, with summand $\hat A(r,c)\hat z(c)$ via
-\eqref{eq:factor-union} --- zero new sumcheck machinery, at the cost of one
-extra pass to materialize $\hat A(r, \cdot)$ on the (declared part of the)
-cube. We spec (a) and keep (b) as the de-risking fallback; the delta between
-them is a benchmark, not an architecture question.
 
 \subsection{The \texorpdfstring{$B$}{B}-claim, and batching the two
 sumchecks}\label{sec:batchAB}
@@ -671,26 +675,26 @@ adds nothing there either.
 
 \subsection{Verifier cost summary}
 
-Rounds: $M$ (zerocheck) $+$ $K \le 17$ (lincheck) --- both
-registry-static, independent of $T$ and of the counts. Scalars: $3$
-zerocheck claims $+$ $T$ sub-claim values $+$ $T$ witness claims. Matrix
-work: $O(\sum_t \nnz(A_t, B_t))$, linear in the number of types --- the one
-term that grows if the registry grows large; see \S\ref{sec:open} for the
-delegation escape hatch. Prefix weights: $O(T \cdot M)$. Weight
-\emph{structure}, join schedule, comb structures, and the registry digest
-are all precomputable; the counts enter only through run lists and fold
-extents. One bookkeeping note: a union-level claim such as
-$\hat c(r) = \hat z(r)$ decomposes via the prefix weights into per-slot
-claims $\hat z_t(\cdot)$, which join the same transport batch as everything
-else.
+Rounds: $M$ (zerocheck) $+$ $M - \nu$ (lincheck) --- registry-static,
+independent of the counts, growing only logarithmically in $T$. Claims:
+$3$ zerocheck scalars and \emph{one} lincheck witness claim --- no
+per-slot sub-claims anywhere. Matrix work: $O(\sum_t \nnz(A_t, B_t))$,
+linear in the number of types --- the one term that grows if the registry
+grows large; see \S\ref{sec:open} for the delegation escape hatch. Prefix
+weights: $O(T \cdot M)$. Weight structure, comb structures, and the
+registry digest are all precomputable; the counts enter only through run
+lists and fold extents. Under the uniform-capacity convention the
+zerocheck's $\hat c(r) = \hat z(r)$ claim needs no per-slot decomposition
+either: it transports directly (\S\ref{sec:commit}).
 
 % ===========================================================================
 \section{The commitment layer: jagged transport}\label{sec:commit}
 
-The PIOP above emits evaluation claims on the per-slot virtual polynomials
-$\hat z_t$ (from the lincheck and from the decomposed union claims; a
-future lookup/bus layer will add its own, \S\ref{sec:open}). The
-commitment layer
+The PIOP above emits exactly two evaluation claims on the union
+polynomial --- the zerocheck's $\hat c(r) = \hat z(r)$ and the lincheck's
+$\hat g(c^*)$ --- plus, on single-type statements, the existing glue
+claims (a future lookup/bus layer will add its own, \S\ref{sec:open}).
+The commitment layer
 turns these into openings of \emph{one} committed polynomial while
 committing \textbf{only the actual data}: the capacity-sized address space
 of \S\ref{sec:union} exists purely virtually.
@@ -714,7 +718,17 @@ on packed data at ordinary multilinear points --- matching both the
 $(z_{\mathrm{row}}, z_{\mathrm{col}}, z_{\mathrm{index}})$ slices) and
 its flagship bench ($2^{30}$-bit \emph{packed} witness). At the packed
 level the jagged grid reads: columns $=$ chunk-columns, rows $=$
-invocations, heights $= n_t$ \emph{words}.
+invocations, heights $= n_t$ \emph{words}. Under the uniform-capacity
+convention this is exact, not analogical: a packed word's address is
+$[\,\nu \text{ batch bits} \mid \text{column bits}\,]$ uniformly across
+slots, the chunk-columns enumerate in address order, and the packed union
+polynomial \emph{is} the jagged grid polynomial ($n = \nu$,
+$k = M - 7 - \nu$, heights $n_t$ on used chunk-columns, $0$ elsewhere).
+Union-level claims therefore transport directly --- no per-slot
+decomposition. Better still, the two core claims share their row point
+($z_{\mathrm{row}} =$ the packed image of $r|_R$ for both), so the
+batched transport weight is one row-$\eq$ table times a two-term column
+table.
 
 \paragraph{The jagged scheme.} Stack only the \emph{useful} columns of the
 \emph{declared} rows of all tables contiguously (column-major per table ---
@@ -815,7 +829,7 @@ $N_{\mathrm{com}} = \sum_t n_t u_t$ (committed size), $T$ = types.
 Witness generation & per-type closures over declared rows; nothing for dummies \\
 Commit & Ligerito on $N_{\mathrm{com}}$ (actual data, useful columns only) \\
 Zerocheck prover & $O(N_{\mathrm{decl}})$; static $M$ rounds; skip intact \\
-Lincheck prover & $O(N_{\mathrm{decl}})$ folds $+$ $K$-round multi-size SC \\
+Lincheck prover & $O(N_{\mathrm{decl}})$ folds $+$ $(M{-}\nu)$-round union-column SC \\
 Ring-switch folds & $O(N_{\mathrm{decl}})$ (fused into the zerocheck pass; per-slot for \LC claims) \\
 Jagged transport prover & $\tilde O(N_{\mathrm{com}})$ (one batched transport SC) \\
 Opening & one batched Ligerito open \\
@@ -861,8 +875,8 @@ smallest possible context.
     within an agreed margin of the direct path; chunk-granular area
     saving realized.
   \item[Phase 2 --- the union PIOP and dynamic counts (mixed proofs ship).]
-    Union zerocheck (count-derived run lists); multi-size lincheck
-    (\S\ref{sec:multisize}(a), with (b) as fallback); per-slot witness
+    Union zerocheck (count-derived run lists); union-column lincheck
+    (\S\ref{sec:multisize}); per-slot witness
     closures in the existing drivers; counts in the
     transcript; wire format v5; CLI \code{--mix}. Internal milestone: the
     union PIOP differentially tested at full utilization against the
@@ -881,29 +895,23 @@ proofs on the same witnesses.
 \section{Open questions}\label{sec:open}
 
 \begin{enumerate}[nosep]
-  \item \textbf{Jagged claim batching (Phase 1).} The jagged kernel's
-        public API (branch \code{jagged-assist}) transports exactly one
-        sparse claim per invocation. Because ring-switching runs first
-        and eliminates the in-word coordinates --- univariate skip
-        coordinate included (\S\ref{sec:commit}) --- the transport only
-        ever sees ordinary multilinear points over packed-word variables,
-        so \emph{no point-format adapter is needed}. What the composition
-        layer must add is claim \emph{batching} --- a cost matter, not a
-        soundness one. A mixed proof emits $\approx 2T$ claims at
-        distinct points ($T$ from decomposing the zerocheck's
-        $\hat c(r) = \hat z(r)$ claim by prefix weights, $T$ from the
-        per-slot lincheck outputs, plus glue on single-type statements),
-        and the transport's dense-domain sumcheck and assist are paid per
-        claim; RLC-combining the per-claim $\eq$-weight tables under
-        transcript coefficients collapses this to one transport sumcheck
-        --- the same multi-claim front-end \code{open\_batch\_mixed}
-        already provides at the Ligerito layer. A per-claim transport v0
-        is sound and an acceptable stepping stone inside Phase 1;
-        batching follows as the optimization.
+  \item \textbf{Jagged claim batching (Phase 1) --- now small.} The
+        jagged kernel's public API (branch \code{jagged-assist})
+        transports exactly one sparse claim per invocation, and
+        ring-switching runs first, so the transport only ever sees
+        ordinary multilinear points over packed-word variables ---
+        \emph{no point-format adapter is needed}. The proof emits just
+        two core claims sharing their row point (\S\ref{sec:commit}),
+        plus glue on single-type statements, so the batched transport
+        weight is one row-$\eq$ table times a few column terms,
+        RLC-combined under transcript coefficients --- the same
+        multi-claim front-end \code{open\_batch\_mixed} already provides
+        at the Ligerito layer. A per-claim transport v0 is sound and an
+        acceptable stepping stone inside Phase 1.
   \item \textbf{Capacity sizing.} How many tiers, and how large? Each
         doubling of capacity costs one static sumcheck round and slightly
         larger bookkeeping tables; exceeding capacity forces a proof
-        split. Leaning: a single generous area-balanced tier
+        split. Leaning: a single generous uniform-capacity tier
         (\S\ref{sec:model}), adding tiers only on demonstrated demand;
         confirm against a workload model at Phase 2.
   \item \textbf{Folding over empty capacity --- an implementation
