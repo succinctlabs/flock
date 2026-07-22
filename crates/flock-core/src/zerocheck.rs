@@ -41,29 +41,127 @@ use univariate_skip_optimized::{
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
 
-/// Witness padding descriptor for URM work-skipping.
+/// One run of identically-shaped blocks inside a [`PaddingSpec`] run-list.
 ///
-/// The witness is a sequence of `2^(m - k_log)` blocks of `2^k_log` bits each;
-/// inside each block, bits `[0, useful_bits_per_block)` carry real data and
-/// bits `[useful_bits_per_block, 2^k_log)` are zero padding. URM contributions
-/// from a chunk of all-zero bits are themselves zero, so we can skip those
-/// chunks and produce byte-identical output.
-///
-/// Use [`PaddingSpec::dense`] when the witness has no padding holes.
-#[derive(Clone, Copy, Debug)]
-pub struct PaddingSpec {
+/// A run is `n_blocks` consecutive blocks of `2^k_log` bits each; inside each
+/// block, bits `[0, useful_bits_per_block)` carry real data and bits
+/// `[useful_bits_per_block, 2^k_log)` are zero padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaddingRun {
     pub k_log: usize,
     pub useful_bits_per_block: usize,
+    pub n_blocks: usize,
+}
+
+impl PaddingRun {
+    /// Address-space extent of the run in bits (= `n_blocks · 2^k_log`).
+    pub fn extent_bits(&self) -> usize {
+        self.n_blocks << self.k_log
+    }
+}
+
+/// Witness padding descriptor for URM / fold work-skipping.
+///
+/// The witness is described by an ordered **run-list**: the [`PaddingRun`]s
+/// are laid out back-to-back from address 0, and everything after the last
+/// run (up to the instance's `2^m` domain) is an implicit all-zero gap.
+/// URM/fold contributions from a chunk of all-zero bits are themselves zero,
+/// so kernels may skip any chunk the spec marks as padding or gap and produce
+/// byte-identical output — provided those bits are honestly zero.
+///
+/// All current callers build **single-run** specs (one run tiling the whole
+/// domain: [`PaddingSpec::dense`], [`PaddingSpec::uniform`], and
+/// `BlockR1cs::padding_spec`); the hot kernels detect that case via
+/// [`PaddingSpec::as_single_run`] and take exactly the pre-run-list code
+/// path. Multi-run specs — the count-derived slot schedules of the
+/// multi-table design (`docs/multi-table-design.tex` §5.2) — go through
+/// simpler general paths; they have no production callers yet.
+///
+/// Use [`PaddingSpec::dense`] when the witness has no padding holes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaddingSpec {
+    runs: Vec<PaddingRun>,
 }
 
 impl PaddingSpec {
     /// "No padding": every bit of the witness is treated as useful. Equivalent
     /// to the legacy URM path with no skipping.
     pub fn dense(m: usize) -> Self {
-        Self {
-            k_log: m,
-            useful_bits_per_block: 1usize << m,
+        Self::uniform(m, 1usize << m, 1)
+    }
+
+    /// Single-run spec: `n_blocks` blocks of `2^k_log` bits, each with a
+    /// `useful_bits_per_block` useful prefix. With `n_blocks = 2^(m − k_log)`
+    /// this is exactly the pre-run-list `PaddingSpec`.
+    pub fn uniform(k_log: usize, useful_bits_per_block: usize, n_blocks: usize) -> Self {
+        Self::from_runs(vec![PaddingRun {
+            k_log,
+            useful_bits_per_block,
+            n_blocks,
+        }])
+    }
+
+    /// General run-list constructor. Runs with `n_blocks = 0` cover no address
+    /// space and are dropped (canonical form, so `as_single_run` is reliable).
+    pub fn from_runs(runs: Vec<PaddingRun>) -> Self {
+        for run in &runs {
+            assert!(
+                run.useful_bits_per_block <= 1usize << run.k_log,
+                "useful_bits_per_block {} exceeds block size 2^{}",
+                run.useful_bits_per_block,
+                run.k_log
+            );
         }
+        Self {
+            runs: runs.into_iter().filter(|r| r.n_blocks > 0).collect(),
+        }
+    }
+
+    /// The runs, in address order.
+    pub fn runs(&self) -> &[PaddingRun] {
+        &self.runs
+    }
+
+    /// The single run when the list has exactly one — the hot kernels' fast
+    /// path. The fast path treats the run as tiling the entire domain
+    /// periodically (it ignores `n_blocks`), which matches the pre-run-list
+    /// kernels bit-for-bit; a single run with a trailing gap is still handled
+    /// correctly because the gap must be honestly zero, like all padding.
+    pub fn as_single_run(&self) -> Option<PaddingRun> {
+        match self.runs.as_slice() {
+            [run] => Some(*run),
+            _ => None,
+        }
+    }
+
+    /// Total extent covered by the runs, in bits. The instance domain `2^m`
+    /// may be larger; the difference is the implicit trailing zero gap.
+    pub fn covered_bits(&self) -> usize {
+        self.runs.iter().map(|r| r.extent_bits()).sum()
+    }
+
+    /// Sorted, merged list of useful bit intervals `[start, end)` — the
+    /// semantic content of the spec (everything outside is declared zero).
+    /// Consumed by the general (multi-run) kernel paths and by tests; cost is
+    /// O(total blocks), fine off the single-run hot path.
+    pub fn useful_intervals(&self) -> Vec<(usize, usize)> {
+        let mut intervals: Vec<(usize, usize)> = Vec::new();
+        let mut offset = 0usize;
+        for run in &self.runs {
+            let block_bits = 1usize << run.k_log;
+            if run.useful_bits_per_block > 0 {
+                for blk in 0..run.n_blocks {
+                    let start = offset + blk * block_bits;
+                    let end = start + run.useful_bits_per_block;
+                    match intervals.last_mut() {
+                        Some((_, prev_end)) if *prev_end == start => *prev_end = end,
+                        _ => intervals.push((start, end)),
+                    }
+                }
+            }
+            offset += run.extent_bits();
+        }
+        intervals
     }
 }
 
@@ -175,10 +273,10 @@ pub fn prove_packed<C: Challenger>(
     )
 }
 
-/// Same as [`prove_packed`] but lets the caller declare a per-block padding
-/// pattern so URM can skip work for chunks that fall entirely in the zero
-/// padding of every block. Output is byte-identical to the dense path when
-/// the padding bits are honestly zero.
+/// Same as [`prove_packed`] but lets the caller declare a run-list padding
+/// pattern so URM can skip work for chunks that fall entirely in zero
+/// padding (or in the trailing gap after the last run). Output is
+/// byte-identical to the dense path when the padding bits are honestly zero.
 pub fn prove_packed_padded<C: Challenger>(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -1045,6 +1143,187 @@ mod tests {
                 "msg_1 tamper round {idx} ACCEPTED"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Run-list PaddingSpec.
+    // -----------------------------------------------------------------------
+
+    /// Run-list construction/accessor sanity: canonical forms, extents,
+    /// single-run detection, and useful-interval merging.
+    #[test]
+    fn padding_spec_run_list_accessors() {
+        // dense(m) is a single run tiling the domain.
+        let dense = PaddingSpec::dense(5);
+        assert_eq!(
+            dense.as_single_run(),
+            Some(PaddingRun {
+                k_log: 5,
+                useful_bits_per_block: 32,
+                n_blocks: 1
+            })
+        );
+        assert_eq!(dense.covered_bits(), 32);
+        assert_eq!(dense.useful_intervals(), vec![(0, 32)]);
+
+        // uniform: one interval per block; partial useful prefixes don't merge.
+        let uni = PaddingSpec::uniform(4, 10, 3);
+        assert_eq!(uni.covered_bits(), 48);
+        assert_eq!(uni.useful_intervals(), vec![(0, 10), (16, 26), (32, 42)]);
+        assert!(uni.as_single_run().is_some());
+
+        // Fully-useful blocks merge into one interval, across run boundaries
+        // too when the next run starts where the previous one's data ends.
+        let multi = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 4,
+                useful_bits_per_block: 16,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 3,
+                useful_bits_per_block: 4,
+                n_blocks: 1,
+            },
+        ]);
+        assert!(multi.as_single_run().is_none());
+        assert_eq!(multi.covered_bits(), 40);
+        assert_eq!(multi.useful_intervals(), vec![(0, 36)]);
+
+        // Zero-block runs are dropped (canonical form), so a list that
+        // degenerates to one real run still takes the single-run fast path;
+        // zero-useful runs cover address space but contribute no intervals.
+        let canon = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 4,
+                useful_bits_per_block: 16,
+                n_blocks: 0,
+            },
+            PaddingRun {
+                k_log: 3,
+                useful_bits_per_block: 0,
+                n_blocks: 2,
+            },
+        ]);
+        assert_eq!(canon.runs().len(), 1);
+        assert!(canon.as_single_run().is_some());
+        assert_eq!(canon.covered_bits(), 16);
+        assert_eq!(canon.useful_intervals(), Vec::<(usize, usize)>::new());
+    }
+
+    /// A run whose useful prefix exceeds its block size is malformed.
+    #[test]
+    #[should_panic(expected = "exceeds block size")]
+    fn padding_spec_rejects_oversized_useful_prefix() {
+        let _ = PaddingSpec::uniform(4, 17, 1);
+    }
+
+    /// Zero every bit outside the spec's useful intervals (honest padding).
+    fn zero_outside_useful(spec: &PaddingSpec, bits: &mut [bool]) {
+        let mut useful = vec![false; bits.len()];
+        for (s, e) in spec.useful_intervals() {
+            useful[s..e].fill(true);
+        }
+        for (b, u) in bits.iter_mut().zip(&useful) {
+            if !*u {
+                *b = false;
+            }
+        }
+    }
+
+    /// **Single-run spec is byte-identical to the dense prover** (same proof,
+    /// same claim, same transcript position) on an honestly padded witness —
+    /// the run-list generalization must not perturb today's wire format.
+    /// Covers the BLAKE3 shape (k_log=14, useful=15409) over several blocks.
+    #[test]
+    fn prove_padded_single_run_matches_dense() {
+        let (m, k_log, useful_bits) = (17usize, 14usize, 15_409usize);
+        let padding = PaddingSpec::uniform(k_log, useful_bits, 1 << (m - k_log));
+
+        let mut rng = Rng::new(0x5111_C1E4);
+        let mut a = rng.bits(1 << m);
+        let mut b = rng.bits(1 << m);
+        zero_outside_useful(&padding, &mut a);
+        zero_outside_useful(&padding, &mut b);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+        let mut ch_dense = FsChallenger::new(b"flock-test-v0");
+        let (proof_dense, claim_dense) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_dense);
+
+        let mut ch_padded = FsChallenger::new(b"flock-test-v0");
+        let (proof_padded, claim_padded) =
+            prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch_padded);
+
+        assert_eq!(proof_dense, proof_padded, "proof mismatch");
+        assert_eq!(claim_dense, claim_padded, "claim mismatch");
+        // Transcript position: the next challenge either prover's caller
+        // would draw (lincheck's α slot) must agree.
+        assert_eq!(
+            ch_dense.sample_f128(),
+            ch_padded.sample_f128(),
+            "post-proof transcript state diverged"
+        );
+    }
+
+    /// **Multi-run spec is byte-identical to the dense prover** through the
+    /// general kernel paths (full-length b_med_counts table in round 1,
+    /// per-pair skip table in round 2), including the `capture_s_hat_v_c`
+    /// variant. The spec has two runs of different block shapes plus an
+    /// implicit trailing gap — the shape of a multi-table slot schedule.
+    #[test]
+    fn prove_padded_multi_run_matches_dense() {
+        let m = 15usize;
+        // Two runs (2×2^13 + 1×2^12 = 20480 bits) + a 12288-bit trailing gap.
+        let padding = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 5_000,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 12,
+                useful_bits_per_block: 3_000,
+                n_blocks: 1,
+            },
+        ]);
+        assert!(padding.as_single_run().is_none(), "must exercise multi-run");
+        assert!(padding.covered_bits() < 1 << m, "must exercise the gap");
+
+        let mut rng = Rng::new(0x0417_1157);
+        let mut a = rng.bits(1 << m);
+        let mut b = rng.bits(1 << m);
+        zero_outside_useful(&padding, &mut a);
+        zero_outside_useful(&padding, &mut b);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+        let mut ch_dense = FsChallenger::new(b"flock-test-v0");
+        let (proof_dense, claim_dense, s_hat_v_dense) = prove_packed_padded_capture_s_hat_v_c(
+            &a_p,
+            &b_p,
+            &c_p,
+            m,
+            &PaddingSpec::dense(m),
+            &mut ch_dense,
+        );
+
+        let mut ch_padded = FsChallenger::new(b"flock-test-v0");
+        let (proof_padded, claim_padded, s_hat_v_padded) =
+            prove_packed_padded_capture_s_hat_v_c(&a_p, &b_p, &c_p, m, &padding, &mut ch_padded);
+
+        assert_eq!(proof_dense, proof_padded, "proof mismatch");
+        assert_eq!(claim_dense, claim_padded, "claim mismatch");
+        assert_eq!(s_hat_v_dense, s_hat_v_padded, "s_hat_v_c mismatch");
+        assert_eq!(
+            ch_dense.sample_f128(),
+            ch_padded.sample_f128(),
+            "post-proof transcript state diverged"
+        );
+
+        // And the multi-run proof still verifies.
+        let mut ch_verify = FsChallenger::new(b"flock-test-v0");
+        verify(m, &proof_padded, &mut ch_verify).expect("multi-run proof must verify");
     }
 
     /// Determinism: same witness + same challenger seed → same proof.

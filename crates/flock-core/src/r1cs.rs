@@ -221,20 +221,23 @@ impl BlockR1cs {
     // -----------------------------------------------------------------------
 
     /// Witness padding descriptor for URM / PCS work-skipping under this
-    /// layout. RowMajor: per-block useful prefix (padding interleaved at
-    /// each block's tail). BatchMajor: the padding chunk-columns coalesce
-    /// into ONE contiguous buffer suffix, expressed as a single giant block
-    /// (`k_log = m`) with a useful prefix.
+    /// layout. Both are single-run [`crate::zerocheck::PaddingSpec`]s tiling
+    /// the whole domain (the kernels' fast path). RowMajor: per-block useful
+    /// prefix (padding interleaved at each block's tail). BatchMajor: the
+    /// padding chunk-columns coalesce into ONE contiguous buffer suffix,
+    /// expressed as a single giant block (`k_log = m`) with a useful prefix.
     pub fn padding_spec(&self) -> crate::zerocheck::PaddingSpec {
         match self.layout {
-            WitnessLayout::RowMajor => crate::zerocheck::PaddingSpec {
-                k_log: self.k_log,
-                useful_bits_per_block: self.useful_bits,
-            },
-            WitnessLayout::BatchMajor => crate::zerocheck::PaddingSpec {
-                k_log: self.m,
-                useful_bits_per_block: self.useful_bits.div_ceil(128) << (7 + self.n_log()),
-            },
+            WitnessLayout::RowMajor => crate::zerocheck::PaddingSpec::uniform(
+                self.k_log,
+                self.useful_bits,
+                1usize << self.n_log(),
+            ),
+            WitnessLayout::BatchMajor => crate::zerocheck::PaddingSpec::uniform(
+                self.m,
+                self.useful_bits.div_ceil(128) << (7 + self.n_log()),
+                1,
+            ),
         }
     }
 

@@ -87,17 +87,24 @@ impl ChunkPadding {
     /// descriptor if either (a) the spec covers the entire packed witness as
     /// one block, or (b) every chunk in a block is at least partially useful.
     fn new(padding: &PaddingSpec, chunk_width: usize) -> Self {
+        // Multi-run specs (the multi-table slot schedule) have no periodic
+        // per-block structure — fall back to "no skip", which is always sound
+        // (folding an honestly-zero chunk contributes zero). Generalizing the
+        // fold kernels to count-derived run lists is Phase 2 work.
+        let Some(run) = padding.as_single_run() else {
+            return Self::no_skip();
+        };
         // Block size in F128 elements = 2^(k_log - LOG_PACKING).
-        if padding.k_log <= LOG_PACKING {
+        if run.k_log <= LOG_PACKING {
             // Block smaller than one F128 — no per-block structure to exploit.
             return Self::no_skip();
         }
-        let block_size_f128 = 1usize << (padding.k_log - LOG_PACKING);
+        let block_size_f128 = 1usize << (run.k_log - LOG_PACKING);
         if block_size_f128 < chunk_width {
             return Self::no_skip();
         }
         let chunks_per_block = block_size_f128 / chunk_width;
-        let useful_f128 = padding.useful_bits_per_block.div_ceil(1 << LOG_PACKING);
+        let useful_f128 = run.useful_bits_per_block.div_ceil(1 << LOG_PACKING);
         let useful_chunks_per_block = useful_f128.div_ceil(chunk_width).min(chunks_per_block);
         if useful_chunks_per_block == chunks_per_block {
             return Self::no_skip();
@@ -3151,10 +3158,7 @@ mod tests {
             let len = packed.len();
             let t0: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
             let t1: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
-            let padding = PaddingSpec {
-                k_log,
-                useful_bits_per_block: useful_bits,
-            };
+            let padding = PaddingSpec::uniform(k_log, useful_bits, 1usize << (m - k_log));
 
             if packed.len().is_multiple_of(8) {
                 let dense = fold_1b_rows_2way_mfr_8wide(&packed, &t0, &t1);
@@ -3212,10 +3216,7 @@ mod tests {
             let w: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
             let r: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
             let full_eq = build_eq(&r);
-            let padding = PaddingSpec {
-                k_log,
-                useful_bits_per_block: useful_bits,
-            };
+            let padding = PaddingSpec::uniform(k_log, useful_bits, 1usize << (m - k_log));
 
             let reference = fold_1b_rows_1way_mfr_16wide_padded(&w, &full_eq, &padding);
             // Sweep n_lo across, below, and equal to the padding block width so
@@ -3249,10 +3250,7 @@ mod tests {
             let len = 1usize << l;
             let mut rng = Rng::new(0xBEEF_u64.wrapping_add((m * 131 + k_log) as u64));
             let w: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
-            let padding = PaddingSpec {
-                k_log,
-                useful_bits_per_block: useful_bits,
-            };
+            let padding = PaddingSpec::uniform(k_log, useful_bits, 1usize << (m - k_log));
             let n_lo = split_n_lo(l);
             let r0: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
             let r1: Vec<F128> = (0..l).map(|_| rng.f128()).collect();

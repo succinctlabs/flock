@@ -605,39 +605,72 @@ fn process_one_x_hi_with_s_hat_v(
 ///
 /// Returns `(within_outer_mask, b_med_counts)`:
 ///   - `within_outer_mask` masks `x_outer` to the bits identifying the
-///     within-block window.
+///     window (within-block bits on the single-run fast path; all outer bits
+///     on the general run-list path).
 ///   - `b_med_counts[w]` is how many of the 16 b_med 512-bit sub-windows of
 ///     window `w` we should process. Entries past the useful prefix are 0
 ///     (full skip) — kernels just `continue` past those x_outer_lo iterations.
-fn build_b_med_counts(padding: &PaddingSpec) -> (usize, Vec<u8>) {
+fn build_b_med_counts(padding: &PaddingSpec, m: usize) -> (usize, Vec<u8>) {
     const STRIDE: usize = 1 << (K_SKIP + N_INNER); // 8192 bits per within-window
     const B_MED_WINDOW: usize = 1 << (K_SKIP + 3); // 512 bits per b_med
     const N_B_MED_MAX: usize = 1 << N_MEDIUM;
 
-    // For k_log < K_SKIP + N_INNER (= 13) the within-window granularity is
-    // coarser than the block itself — skipping at this granularity would be
-    // incorrect, so we fall back to "no skip". All hash modules use
-    // k_log ∈ {14, 15, 16}.
-    if padding.k_log < K_SKIP + N_INNER {
-        return (0, vec![N_B_MED_MAX as u8]);
+    // Single-run fast path: the block structure is periodic, so one count per
+    // within-block window suffices (byte-identical to the pre-run-list code;
+    // the trailing gap, if any, is classified periodically — sound because
+    // gap bits are honestly zero, like all padding).
+    if let Some(run) = padding.as_single_run() {
+        // For k_log < K_SKIP + N_INNER (= 13) the within-window granularity is
+        // coarser than the block itself — skipping at this granularity would be
+        // incorrect, so we fall back to "no skip". All hash modules use
+        // k_log ∈ {14, 15, 16}.
+        if run.k_log < K_SKIP + N_INNER {
+            return (0, vec![N_B_MED_MAX as u8]);
+        }
+        let within_outer_bits = run.k_log - K_SKIP - N_INNER;
+        let within_outer_count = 1usize << within_outer_bits;
+        let within_outer_mask = within_outer_count - 1;
+        let useful = run.useful_bits_per_block;
+        let counts: Vec<u8> = (0..within_outer_count)
+            .map(|w| {
+                let block_start = w * STRIDE;
+                if block_start >= useful {
+                    0u8
+                } else {
+                    let bits_left = useful - block_start;
+                    let processed = bits_left.div_ceil(B_MED_WINDOW);
+                    processed.min(N_B_MED_MAX) as u8
+                }
+            })
+            .collect();
+        return (within_outer_mask, counts);
     }
-    let within_outer_bits = padding.k_log - K_SKIP - N_INNER;
-    let within_outer_count = 1usize << within_outer_bits;
-    let within_outer_mask = within_outer_count - 1;
-    let useful = padding.useful_bits_per_block;
-    let counts: Vec<u8> = (0..within_outer_count)
-        .map(|w| {
-            let block_start = w * STRIDE;
-            if block_start >= useful {
-                0u8
-            } else {
-                let bits_left = useful - block_start;
-                let processed = bits_left.div_ceil(B_MED_WINDOW);
-                processed.min(N_B_MED_MAX) as u8
-            }
-        })
-        .collect();
-    (within_outer_mask, counts)
+
+    // General run-list path (no production callers yet — the multi-table
+    // slot schedule): one count per window over the whole domain, computed
+    // from the useful intervals; the mask covers all outer bits. A window's
+    // count reaches up to its highest useful bit — all-padding sub-windows
+    // below that are processed anyway (contributing zero), which keeps the
+    // per-window prefix contract of `process_one_x_hi`.
+    assert!(
+        padding.covered_bits() <= 1usize << m,
+        "PaddingSpec covers {} bits but the domain has only 2^{m}",
+        padding.covered_bits()
+    );
+    let n_windows = 1usize << (m - K_SKIP - N_INNER);
+    let mut counts = vec![0u8; n_windows];
+    for (start, end) in padding.useful_intervals() {
+        for (w, count) in counts
+            .iter_mut()
+            .enumerate()
+            .take((end - 1) / STRIDE + 1)
+            .skip(start / STRIDE)
+        {
+            let covered = end.min((w + 1) * STRIDE) - w * STRIDE;
+            *count = (*count).max(covered.div_ceil(B_MED_WINDOW).min(N_B_MED_MAX) as u8);
+        }
+    }
+    (n_windows - 1, counts)
 }
 
 /// Packed-input variant of [`round1_shift_reduce_extract_c`]. **Parallel by
@@ -706,7 +739,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     let convert = convert_table();
     let eq_hi = &eq.hi;
 
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding, m);
 
     // Parallel fold: each worker accumulates a subset of x_hi values into its
     // own WorkerState. Reduce step combines the per-worker `local_res_*` by
@@ -798,7 +831,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     let convert = convert_table();
     let eq_hi = &eq.hi;
 
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding, m);
 
     let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
         .into_par_iter()
@@ -888,7 +921,7 @@ fn round1_shift_reduce_extract_c_packed_serial(
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
 
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(&PaddingSpec::dense(m));
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(&PaddingSpec::dense(m), m);
 
     let mut state = WorkerState::new();
     for x_hi in 0..hi_size {
@@ -1223,10 +1256,7 @@ mod tests {
 
             let (dense_ab, dense_c) =
                 round1_shift_reduce_extract_c_packed(&a_p, &b_p, &c_p, m, K_SKIP, &r, &table);
-            let padding = PaddingSpec {
-                k_log,
-                useful_bits_per_block: useful_bits,
-            };
+            let padding = PaddingSpec::uniform(k_log, useful_bits, n_blocks);
             let (padded_ab, padded_c) = round1_shift_reduce_extract_c_packed_padded(
                 &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
             );

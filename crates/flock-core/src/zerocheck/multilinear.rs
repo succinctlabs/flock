@@ -55,9 +55,11 @@ use kernels::aarch64::fold_one_row_neon_unchecked_8;
 use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecked_8};
 
 /// Returns `(pair_in_block_mask, useful_pairs_inclusive)` for the round-2
-/// fused-fold kernel. A pair (post-URM chunks `2k`, `2k+1`) is fully inside
-/// padding iff `(k & pair_in_block_mask) >= useful_pairs_inclusive` — those
-/// pairs contribute zero to both the message and the folded output (which is
+/// fused-fold kernel, from a **single-run** padding spec (the multi-run case
+/// takes [`uni_skip_fold_and_round_pair_runs`] instead). A pair (post-URM
+/// chunks `2k`, `2k+1`) is fully inside padding iff
+/// `(k & pair_in_block_mask) >= useful_pairs_inclusive` — those pairs
+/// contribute zero to both the message and the folded output (which is
 /// already zero-initialized), so the kernel can `continue` past them.
 ///
 /// `useful_pairs_inclusive` is the index AFTER the last pair that has any
@@ -65,13 +67,13 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 /// when `useful_bits` is odd in chunk units) is INSIDE the useful range and
 /// processed normally — its padding side has value 0 so the message
 /// contribution is naturally correct.
-fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
-    if padding.k_log <= k_skip + 1 {
+fn round2_pair_skip(run: &crate::zerocheck::PaddingRun, k_skip: usize) -> (usize, usize) {
+    if run.k_log <= k_skip + 1 {
         return (0, usize::MAX);
     }
-    let pairs_per_block = 1usize << (padding.k_log - k_skip - 1);
+    let pairs_per_block = 1usize << (run.k_log - k_skip - 1);
     let chunk_bits = 1usize << k_skip;
-    let useful_pairs = padding.useful_bits_per_block.div_ceil(2 * chunk_bits);
+    let useful_pairs = run.useful_bits_per_block.div_ceil(2 * chunk_bits);
     if useful_pairs >= pairs_per_block {
         return (0, usize::MAX);
     }
@@ -456,6 +458,21 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
     use rayon::prelude::*;
 
+    // Multi-run specs have no periodic per-block skip pattern; route them to
+    // the general run-list path (no production callers yet). The single-run
+    // fast path below is byte-identical to the pre-run-list kernel.
+    let Some(run) = padding.as_single_run() else {
+        return uni_skip_fold_and_round_pair_runs(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            table,
+            mlv_challenges,
+            padding,
+        );
+    };
+
     assert_eq!(
         k_skip, 6,
         "optimized fold-and-round_pair variant is k_skip=6 only"
@@ -482,7 +499,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     let chunk_size = 2 * lo_size;
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
-    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(&run, k_skip);
 
     // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
     // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
@@ -674,6 +691,111 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
             let pinf = pinf_acc.reduce();
             let eq_h = eq_hi[x_hi];
             (eq_h * p1, eq_h * pinf)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+        );
+
+    (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf)
+}
+
+/// General run-list path for
+/// [`uni_skip_fold_and_round_pair_optimized_packed_padded`]: handles
+/// multi-run [`PaddingSpec`]s (the multi-table slot schedule — no production
+/// callers yet). Same parallel-over-x_hi structure and output convention as
+/// the optimized kernel, but with the portable scalar per-row fold and a
+/// precomputed per-pair skip table instead of the periodic mask/threshold
+/// predicate. A pair (post-URM chunks `2k`, `2k+1`) covers witness bits
+/// `[k·2^(k_skip+1), (k+1)·2^(k_skip+1))`; pairs whose window contains no
+/// useful bits fold to zero and are skipped. Output is byte-identical to the
+/// dense path when the padding/gap bits are honestly zero.
+fn uni_skip_fold_and_round_pair_runs(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    use rayon::prelude::*;
+
+    assert_eq!(
+        k_skip, 6,
+        "optimized fold-and-round_pair variant is k_skip=6 only"
+    );
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+    assert!(
+        padding.covered_bits() <= 1usize << m,
+        "PaddingSpec covers {} bits but the domain has only 2^{m}",
+        padding.covered_bits()
+    );
+
+    // Per-pair skip table from the run-list's useful intervals.
+    let pair_bits = 1usize << (k_skip + 1);
+    let mut pair_useful = vec![false; n_out / 2];
+    for (start, end) in padding.useful_intervals() {
+        pair_useful[start / pair_bits..(end - 1) / pair_bits + 1].fill(true);
+    }
+
+    // See the optimized kernel for the uninit-alloc contract: every slot is
+    // either folded into or explicitly written F128::ZERO below.
+    let mut a_folded: Vec<F128> = crate::scratch::take_f128(n_out);
+    let mut b_folded: Vec<F128> = crate::scratch::take_f128(n_out);
+
+    let eq = SplitEqGhash::new(&mlv_challenges[1..]);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n_out);
+
+    let chunk_size = 2 * lo_size;
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+
+    let (sum1, sum_inf) = a_folded
+        .par_chunks_mut(chunk_size)
+        .zip(b_folded.par_chunks_mut(chunk_size))
+        .enumerate()
+        .map(|(x_hi, (a_chunk, b_chunk))| {
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            let pair_idx_base = x_hi * lo_size;
+            let base = x_hi * chunk_size;
+            for x_lo in 0..lo_size {
+                let x0l = 2 * x_lo;
+                let x1l = x0l + 1;
+                if !pair_useful[pair_idx_base + x_lo] {
+                    // Padding/gap hole: write zero (uninit alloc, see above).
+                    a_chunk[x0l] = F128::ZERO;
+                    a_chunk[x1l] = F128::ZERO;
+                    b_chunk[x0l] = F128::ZERO;
+                    b_chunk[x1l] = F128::ZERO;
+                    continue;
+                }
+                let x0g = base + 2 * x_lo;
+                let x1g = x0g + 1;
+                let a0 = table.fold_one_row(&a_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+                let b0 = table.fold_one_row(&b_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+                let a1 = table.fold_one_row(&a_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+                let b1 = table.fold_one_row(&b_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+                a_chunk[x0l] = a0;
+                a_chunk[x1l] = a1;
+                b_chunk[x0l] = b0;
+                b_chunk[x1l] = b1;
+                let eq_l = eq_lo[x_lo];
+                let g1 = a1 * b1;
+                p1_acc ^= eq_l.mul_unreduced(g1);
+                let g_inf = (a0 + a1) * (b0 + b1);
+                pinf_acc ^= eq_l.mul_unreduced(g_inf);
+            }
+            let eq_h = eq_hi[x_hi];
+            (eq_h * p1_acc.reduce(), eq_h * pinf_acc.reduce())
         })
         .reduce(
             || (F128::ZERO, F128::ZERO),
@@ -1522,10 +1644,7 @@ mod tests {
             let z = rng.f128();
             let mlv_challenges = rng.f128_vec(m - K_SKIP);
             let table = UniSkipFoldTable::new(K_SKIP, z);
-            let padding = PaddingSpec {
-                k_log,
-                useful_bits_per_block: useful_bits,
-            };
+            let padding = PaddingSpec::uniform(k_log, useful_bits, n_blocks);
 
             let dense = uni_skip_fold_and_round_pair_optimized_packed(
                 &a_packed,

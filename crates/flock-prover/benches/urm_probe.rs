@@ -90,10 +90,7 @@ fn main() {
     let padding = match padding_mode.as_str() {
         "dense" => PaddingSpec::dense(m),
         // BLAKE3 prove_fast shape: K_LOG=14, USEFUL_BITS=15,409.
-        "blake3" => PaddingSpec {
-            k_log: 14,
-            useful_bits_per_block: 15_409,
-        },
+        "blake3" => PaddingSpec::uniform(14, 15_409, 1usize << (m - 14)),
         other => panic!("padding arg must be 'dense' or 'blake3', got '{other}'"),
     };
 
