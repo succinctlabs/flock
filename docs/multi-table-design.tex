@@ -214,8 +214,9 @@ polynomial by a two-stage machinery: \emph{ring-switching}
 (\code{pcs/ring\_switch.rs}) eliminates the seven in-word packing
 coordinates --- including the univariate skip coordinate, which is why
 downstream layers never see quirky structure --- turning each bit-level
-claim into a multilinear claim on the \emph{packed} ($\F$-word)
-polynomial; the packed claims are then batched
+claim into an inner-product claim, against a transparent
+(verifier-evaluable) weight, over the \emph{packed} ($\F$-word)
+polynomial; the claims are then $\gamma$-batched
 (\code{pcs::open\_batch\_mixed\ldots}, label
 \code{flock-pcs-open-batch-v0}) into one Ligerito opening of the single
 committed witness polynomial.
@@ -696,40 +697,64 @@ claims (a future lookup/bus layer will add its own, \S\ref{sec:open}).
 The commitment layer
 turns these into openings of \emph{one} committed polynomial while
 committing \textbf{only the actual data}: the capacity-sized address space
-of \S\ref{sec:union} exists purely virtually.
+of \S\ref{sec:union} exists purely virtually. The pipeline is best
+understood as \textbf{three polynomials and two reductions}:
+\begin{enumerate}[nosep]
+  \item the \emph{sparse bit polynomial} $\hat z$ ($M$ variables): the
+        arithmetization's object --- bit-valued, zero on dummy rows,
+        useless columns, and gaps. The zerocheck and lincheck speak only
+        about this polynomial.
+  \item the \emph{sparse packed polynomial} $\hat f$ ($M-7$ variables):
+        each $128$ bits of $\hat z$ packed into one $\F$-word, still over
+        the virtual word-address space, still zero on dead words. Never
+        committed, never materialized beyond its support.
+  \item the \emph{dense packed polynomial} $\hat q$
+        ($M_{\mathrm{dense}}$ variables): the sparse packed polynomial
+        with the dead words deleted --- the only polynomial Ligerito
+        commits and opens.
+\end{enumerate}
+Ring-switching reduces claims about (1) to a claim about (2); the jagged
+transport reduces a claim about (2) to a claim about (3). Each reduction
+discharges exactly one mismatch --- bit-versus-word, then
+virtual-versus-dense. The two reductions use different \emph{claim
+types}, which dictates one additional, standard step between them.
 
-\paragraph{Pipeline position: ring-switch first, then jagged.} Claims
-emitted by the PIOP are bit-level and carry the univariate skip
-coordinate among their low (in-word) coordinates. They first pass through
-the \emph{existing} ring-switching stage exactly as today
-(\S\ref{sec:pioponetable}): ring-switching eliminates the seven in-word
-coordinates --- the skip coordinate included --- yielding per-slot
-multilinear claims on the \emph{packed} polynomial, whose variables are
-the batch and chunk coordinates. Ring-switching is per-claim local, so it
-needs no union-awareness. Its prover folds are, however, subject to the
-same declared-work discipline as everything else: the $\hat s_v$ capture
-for the zerocheck claim is fused into the zerocheck pass and inherits its
-run-lists (an explicit checkpoint when generalizing that pass), and the
-folds for the per-slot lincheck claims touch only their own slot's
-declared rows, $O(n_t k_t)$ each. The jagged transport therefore operates purely
-on packed data at ordinary multilinear points --- matching both the
-\code{jagged-assist} API (plain multilinear
-$(z_{\mathrm{row}}, z_{\mathrm{col}}, z_{\mathrm{index}})$ slices) and
-its flagship bench ($2^{30}$-bit \emph{packed} witness). At the packed
-level the jagged grid reads: columns $=$ chunk-columns, rows $=$
-invocations, heights $= n_t$ \emph{words}. Under the uniform-capacity
-convention this is exact, not analogical: a packed word's address is
-$[\,\nu \text{ batch bits} \mid \text{column bits}\,]$ uniformly across
-slots, the chunk-columns enumerate in address order, and the packed union
-polynomial \emph{is} the jagged grid polynomial ($n = \nu$,
-$k = M - 7 - \nu$, heights $n_t$ on used chunk-columns, $0$ elsewhere).
-Union-level claims therefore transport directly --- no per-slot
-decomposition. Better still, the two core claims share their row point
-($z_{\mathrm{row}} =$ the packed image of $r|_R$ for both), so the
-batched transport weight is one row-$\eq$ table times a two-term column
-table.
+\paragraph{Reduction 1: ring-switching (existing, unchanged).} A PIOP
+claim is bit-level and carries the univariate skip coordinate among its
+low (in-word) coordinates. Ring-switching sends the $128$-element
+slice-fold $\hat s_v$; the verifier checks the bit-level claim against it
+using the in-word weights --- this is where the skip coordinate is
+consumed, never to reappear downstream. Binding the prover-supplied
+$\hat s_v$ to the commitment then \emph{requires} fresh randomness (a
+single opening would pin down only one linear functional of a
+$128$-dimensional message), so the output claim about $\hat f$ is
+inherently an \textbf{inner product} $\langle f, W\rangle = t$ against a
+transparent, verifier-evaluable weight $W$ --- and $W$ does \emph{not}
+factor as the $\eq$ tensor of any point, because its per-entry bit
+surgery does not commute with field multiplication. Today's machinery
+already $\gamma$-batches \emph{all} claims (ab, c, glue) into one such
+statement $(b_{\mathrm{combined}}, \mathrm{target})$: claim batching
+lives entirely on this reduction, via code that already exists. The
+$\hat s_v$ folds are fused into the zerocheck and lincheck passes and
+inherit their run-lists (an explicit checkpoint when generalizing those
+passes), so the declared-work discipline extends here too.
 
-\paragraph{The jagged scheme.} Stack only the \emph{useful} columns of the
+\paragraph{The type converter: the virtual-opening sumcheck (new).} The
+jagged transport consumes an \emph{evaluation} claim
+$\hat f(\rho) = v$, not an inner product. Convert with the standard
+reduction: a product sumcheck over the $M-7$ word variables for
+$\sum_x f(x)\, b_{\mathrm{combined}}(x) = \mathrm{target}$. The prover's
+work is support-proportional (both factors are materialized on declared
+words only); at the final point $\rho$ the verifier evaluates
+$\hat b_{\mathrm{combined}}(\rho)$ \emph{itself}, using the same
+polylogarithmic machinery today's opening verifier uses at Ligerito's
+residual point, and is left with the single evaluation claim
+$\hat f(\rho) = v_\rho$. Everything non-factoring stays on the
+verifier-computable side; the committed side crosses as one point claim.
+Consequently \textbf{the jagged reduction always carries exactly one
+claim per proof}.
+
+\paragraph{Reduction 2: the jagged transport.} Stack only the \emph{useful} columns of the
 \emph{declared} rows of all tables contiguously (column-major per table ---
 the \code{BatchMajor} witness layout, added in anticipation of exactly
 this): the committed size is $\sum_t n_t \lceil u_t/128\rceil \cdot 128$ bits
@@ -740,18 +765,26 @@ non-power-of-two counts are native. Because the union's virtual layout is
 itself BatchMajor (\S\ref{sec:union}), the committed stack is simply the
 union buffer with dummy rows and useless chunks omitted --- commitment
 and address space share one orientation, with no transpose anywhere in
-the pipeline. Commit
-the dense stack with Ligerito, and transport each virtual claim
-$\hat z_t(\rho)$ to the dense polynomial via the jagged sumcheck
-(\code{pcs/jagged.rs}, branch \code{jagged-assist}):
-\code{col\_prefix\_sums} --- derived per proof from the public counts ---
-encodes the layout, and the branching-program evaluator $\hat f_t$, with
-the ``assist'' delegation, keeps the verifier cheap. The virtual table
+the pipeline. Under the uniform-capacity convention the identification is
+exact: a packed word's address is $[\,\nu \text{ batch bits} \mid
+\text{column bits}\,]$ uniformly across slots, chunk-columns enumerate in
+address order, and $\hat f$ \emph{is} the jagged grid polynomial
+($n = \nu$, $k = M - 7 - \nu$, heights $n_t$ words on used chunk-columns,
+$0$ elsewhere). Commit the dense stack with Ligerito, and transport the
+single claim $\hat f(\rho) = v_\rho$ via the jagged sumcheck with assist
+(\code{pcs/jagged.rs}): $z_{\mathrm{row}} = \rho[0{:}\nu]$,
+$z_{\mathrm{col}} = \rho[\nu{:}]$, with \code{col\_prefix\_sums} ---
+derived per proof from the public counts --- encoding the layout, and the
+branching-program evaluator $\hat f_t$, with the ``assist'' delegation,
+keeping the verifier cheap. The output is one dense claim
+$\hat q(\rho') = \alpha$, which Ligerito opens directly. The region
 beyond height $n_t$ is zero \emph{by definition} of this transport, which
 is what discharged the soundness obligation of Remark~\ref{rem:padding}.
-All transported claims are batched (random linear combination) into one
-jagged sumcheck and one Ligerito batch opening; the PIOP is oblivious to
-all of it.
+One sizing caveat: the committed length must be a power of two, and at
+single-table full utilization the dense stack rounds straight back to the
+padded length (BLAKE3 uses $121$ of $128$ chunk-columns, SHA-256 $246$ of
+$256$) --- area savings materialize only for mixed and partial-utilization
+instances, whose totals land between powers of two.
 
 One consequence to watch: with per-proof counts, the jagged verifier's
 branching-program data is per-proof rather than fully precomputed --- this
@@ -829,8 +862,9 @@ Witness generation & per-type closures over declared rows; nothing for dummies \
 Commit & Ligerito on $N_{\mathrm{com}}$ (actual data, useful columns only) \\
 Zerocheck prover & $O(N_{\mathrm{decl}})$; static $M$ rounds; skip intact \\
 Lincheck prover & $O(N_{\mathrm{decl}})$ folds $+$ $(M{-}\nu)$-round union-column SC \\
-Ring-switch folds & $O(N_{\mathrm{decl}})$ (fused into the zerocheck pass; per-slot for \LC claims) \\
-Jagged transport prover & $\tilde O(N_{\mathrm{com}})$ (one batched transport SC) \\
+Ring-switch folds & $O(N_{\mathrm{decl}})$ (fused into the zerocheck/lincheck passes) \\
+Virtual-opening SC prover & $O(\text{support})$, $(M{-}7)$-round product SC \\
+Jagged transport prover & $\tilde O(N_{\mathrm{com}})$ (single-claim transport SC $+$ assist) \\
 Opening & one batched Ligerito open \\
 \midrule
 Verifier rounds & $M + K$ $+$ transport --- registry-static, count-independent \\
@@ -863,16 +897,17 @@ smallest possible context.
     single-hash proofs byte-stable (modulo version field) and benchmarks
     flat.
   \item[Phase 1 --- jagged under the existing single-table system.]
-    Wire the \code{jagged-assist} transport beneath today's statements
-    (one-type registry, the existing BatchMajor prover paths): same
-    proofs, new commitment path, so every existing test and benchmark is
-    a correctness and throughput oracle. The zerocheck/lincheck kernels
-    need no changes (\S\ref{sec:skip}); the work is the composition
-    layer: slotting the jagged transport between the existing ring-switch
-    stage and the Ligerito opening, and multi-claim RLC batching into one
-    transport sumcheck (\S\ref{sec:open}). Gate: single-hash throughput
-    within an agreed margin of the direct path; chunk-granular area
-    saving realized.
+    Wire the three-polynomial pipeline (\S\ref{sec:commit}) beneath
+    today's statements (one-type registry, the existing BatchMajor prover
+    paths): keep ring-switching and $\gamma$-batching verbatim, add the
+    virtual-opening sumcheck and the single-claim jagged transport with
+    assist, and open the dense stack. Same statements, new commitment
+    path, so every existing test and benchmark is a correctness and
+    throughput oracle. Gate: single-hash throughput and proof size within
+    an agreed margin of the direct path. \emph{No area saving is expected
+    here} --- at single-table full utilization the power-of-two committed
+    length rounds the dense stack back to the padded size
+    (\S\ref{sec:commit}); the saving is a Phase 2 gate.
   \item[Phase 2 --- the union PIOP and dynamic counts (mixed proofs ship).]
     Union zerocheck (count-derived run lists); union-column lincheck
     (\S\ref{sec:multisize}); per-slot witness
@@ -883,7 +918,9 @@ smallest possible context.
     BLAKE3$+$SHA-256 proof verifies end-to-end; prover time tracks
     \emph{declared} work across utilization levels; verifier time flat
     across utilization levels; throughput within noise of the weighted
-    average of the single-hash provers on the same workload.
+    average of the single-hash provers on the same workload;
+    committed-area saving realized on mixed and partial-utilization
+    instances.
 \end{description}
 
 Independent invocations keep every phase per-table testable: any mixed
@@ -894,19 +931,18 @@ proofs on the same witnesses.
 \section{Open questions}\label{sec:open}
 
 \begin{enumerate}[nosep]
-  \item \textbf{Jagged claim batching (Phase 1) --- now small.} The
-        jagged kernel's public API (branch \code{jagged-assist})
-        transports exactly one sparse claim per invocation, and
-        ring-switching runs first, so the transport only ever sees
-        ordinary multilinear points over packed-word variables ---
-        \emph{no point-format adapter is needed}. The proof emits just
-        two core claims sharing their row point (\S\ref{sec:commit}),
-        plus glue on single-type statements, so the batched transport
-        weight is one row-$\eq$ table times a few column terms,
-        RLC-combined under transcript coefficients --- the same
-        multi-claim front-end \code{open\_batch\_mixed} already provides
-        at the Ligerito layer. A per-claim transport v0 is sound and an
-        acceptable stepping stone inside Phase 1.
+  \item \textbf{Phase 1 wiring constraints.} Claim batching is fully
+        resolved by architecture (\S\ref{sec:commit}: it lives on
+        reduction 1, in existing $\gamma$-machinery; the transport always
+        carries one claim). What remains is wiring: a Ligerito security
+        configuration must exist for each dense size the registry can
+        produce (enumerable at registry-definition time; at single-table
+        full utilization the dense size equals today's, so Phase 1 needs
+        no new configurations); the virtual-opening sumcheck needs its
+        domain label and transcript position pinned; and the ring-switch
+        \code{ChunkPadding} multi-run fallback (currently no-skip,
+        correct but unoptimized) is generalized alongside the folding
+        item above.
   \item \textbf{Capacity sizing.} How many tiers, and how large? Each
         doubling of capacity costs one static sumcheck round and slightly
         larger bookkeeping tables; exceeding capacity forces a proof
