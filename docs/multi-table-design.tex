@@ -453,8 +453,16 @@ identically zero (dummy rows, useless columns, the gap), the summand of
 round polynomial. The \code{PaddingSpec} generalizes from today's single
 $(\kappa, u)$ pair to a \textbf{run-list derived from the public counts}:
 per slot, columns $[u_t, k_t)$ and rows $[n_t, 2^{\nu_t^{\max}})$ are dead
-(this generalizes \code{useful\_bits} skipping from columns to rows). With
-run-list--driven iteration the prover's sumcheck work is proportional to
+(this generalizes \code{useful\_bits} skipping from columns to rows).
+Concretely, under BatchMajor the run-list's blocks are
+\emph{chunk-columns} ($k\_log = 7 + \nu$): slot $t$ contributes
+$\lceil u_t/128 \rceil$ used chunk-column blocks whose useful prefix is
+$128\, n_t$ bits (dummy rows are the dead suffix of every chunk-column),
+followed by an \emph{explicit} zero run for its useless chunks ---
+mid-list gaps must be explicit so later slots keep their offsets --- with
+only the region past the last slot left to the implicit trailing gap.
+With run-list--driven iteration the prover's sumcheck work is
+proportional to
 $\sum_t n_t k_t$ --- the \emph{declared} area --- while the round count
 stays the static $M$.
 
