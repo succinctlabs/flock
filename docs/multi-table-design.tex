@@ -160,9 +160,10 @@ $k_{\mathrm{skip}} = 6$). The witness index splits as
   x \;=\; (\underbrace{x[0{:}\kappa]}_{\text{column / ``inner''}},\;
            \underbrace{x[\kappa{:}m]}_{\text{row / ``outer''}}).
 \]
-This is today's \emph{row-major} convention (one invocation's trace is
-contiguous); the multi-table design deliberately transposes it
-(\S\ref{sec:union}).
+This is today's default \emph{row-major} convention (one invocation's
+trace is contiguous); the multi-table design adopts the code's other,
+chunk-column-major convention (\code{WitnessLayout::BatchMajor},
+\S\ref{sec:union}).
 
 \subsection{The PIOP, briefly}\label{sec:pioponetable}
 
@@ -295,18 +296,32 @@ areas --- the per-proof counts never move anything.
 
 \subsection{Static layout and alignment}
 
-\paragraph{Layout convention (BatchMajor).} Within a slot, indices are
-column-major: the low $\nu_t^{\max}$ bits are the row (invocation) index
-and the next $\kappa_t$ bits the column (trace-variable) index, so each
-trace variable's column is contiguous across invocations. This transposes
-the single-table recap's row-major convention (\S\ref{sec:single}), and
-the choice is deliberate: it is the stacking order the jagged commitment
-needs (\S\ref{sec:commit}); it makes sparse constraint application
-\emph{bit-sliced} --- each nonzero of $A_t$ becomes a contiguous
-column-XOR, vectorized across invocations --- and \S\ref{sec:skip} shows
-the univariate skip transfers intact. Witness generation, which naturally
-emits one invocation (row) at a time, writes this layout via cache-tiled
-bit-transposes, an existing kernel.
+\paragraph{Layout convention (BatchMajor).} Within a slot, addresses use
+the \emph{implemented} \code{WitnessLayout::BatchMajor} order
+(\code{r1cs.rs}): trace variables are grouped into chunks of $128$; one
+$128$-bit word holds one invocation's chunk; the words of a chunk are
+contiguous across invocations. The address split is therefore
+\emph{interleaved}:
+\[
+  \text{addr} = [\,\underbrace{7 \text{ in-word bits}}_{\text{column,
+  low}} \mid \underbrace{\nu_t^{\max} \text{ row bits}}_{\text{invocation}}
+  \mid \underbrace{\kappa_t - 7 \text{ chunk bits}}_{\text{column,
+  high}}\,],
+\]
+i.e.\ slot $t$'s \emph{row coordinates} are $R_t = [7,\, 7{+}\nu_t^{\max})$
+and its \emph{column coordinates} are the non-contiguous
+$C_t = [0,7) \cup [7{+}\nu_t^{\max},\, m_t)$. The interleaving is
+harmless: all the math below depends only on the \emph{partition} of a
+slot's coordinates into (row, column, prefix) groups, never on their
+contiguity. The convention earns its keep three ways: the univariate skip
+runs over the low six in-word (column) bits \emph{exactly as today} ---
+the existing skip kernels are byte-level layout-agnostic and run unchanged
+(\S\ref{sec:skip}); chunk-columns are contiguous across invocations, the
+stacking order the jagged commitment needs (\S\ref{sec:commit}), at
+$128$-variable-chunk granularity; and the witness drivers already emit
+this layout (with per-block padding coalesced), producing $z$, $Az$, and
+$Bz$ during generation --- no matrix application on the hot path. Requires
+$\kappa_t \ge 7$ (all current $\kappa_t \ge 14$).
 
 Let $M$ be minimal with $2^{M} \ge \sum_t s_t$ (choose capacities so that
 $\sum_t s_t = 2^{M}$ exactly if desired; a shortfall is harmless by
@@ -317,10 +332,13 @@ $[o_t, o_t + s_t)$ of $\{0,1\}^{M}$, where $o_t = \sum_{t' < t} s_{t'}$.
 With the descending-area ordering, $o_t$ is a multiple of $s_t = 2^{m_t}$.
 Consequently, for a global index $x$ in slot $t$:
 \[
-  x[0{:}\nu_t^{\max}] = \text{row index},\quad
-  x[\nu_t^{\max}{:}m_t] = \text{column index},\quad
-  x[m_t{:}M] = p_t \;(\text{a fixed bit pattern}, \; p_t = o_t / 2^{m_t}).
+  x|_{R_t} = \text{row index},\quad
+  x|_{C_t} = \text{column index},\quad
+  x[m_t{:}M] = p_t \;(\text{a fixed bit pattern}, \; p_t = o_t / 2^{m_t}),
 \]
+where $x|_S$ denotes the restriction of $x$ to the coordinate set $S$ and
+$(R_t, C_t)$ is the interleaved row/column partition of the BatchMajor
+convention above.
 \end{lemma}
 \begin{proof}
 $o_t$ is a sum of terms $2^{m_{t'}}$ with $m_{t'} \ge m_t$, each divisible by
@@ -435,27 +453,26 @@ run-list--driven iteration the prover's sumcheck work is proportional to
 $\sum_t n_t k_t$ --- the \emph{declared} area --- while the round count
 stays the static $M$.
 
-\subsection{The univariate skip survives globally --- over row
-bits}\label{sec:skip}
+\subsection{The univariate skip survives globally --- unchanged}
+\label{sec:skip}
 
 The skip merges the six low variables of the sumcheck into one univariate
 round; its prover win --- the six most expensive rounds computed directly
 on $\Ftwo$-valued data --- requires only that each merged group of $64$
-domain points be memory-contiguous. \emph{Which} six variables are merged
-is a free protocol choice. Under the BatchMajor convention, the global low
-six bits of any index are within-column \emph{row} bits for every slot
-(all $\nu_t^{\max} \ge 6$ in any real registry, and every slot offset is a
-multiple of $2^{m_t}$), so the single global skip round runs over the six
-low row bits: a skip group is the same trace variable across $64$
-consecutive invocations --- in packed representation, \textbf{exactly one
-64-bit machine word of a column}, the natural unit of the bit-sliced
-kernels. The zerocheck constraint is pointwise, so nothing else changes:
-one skip round, all slots at once, no per-table scheduling. The skip's
-univariate coordinate consequently sits among the \emph{row} coordinates
-of the zerocheck's output point; \S\ref{sec:lc} tracks where that lands
-(the witness folds inherit the quirky weight table, while the comb side
-becomes a standard $\eq$ fold), and the claim pipeline must accept such
-points --- a Phase 1 validation item (\S\ref{sec:open}).
+domain points be memory-contiguous. Under the BatchMajor convention the
+global low six bits of any index are in-word \emph{column} bits for every
+slot (all $\kappa_t \ge 7$, and every slot offset is a multiple of
+$2^{m_t}$), exactly as in today's row-major layout: a skip group is $64$
+adjacent trace variables of one invocation, one $u64$ of a $128$-bit
+word. The existing round-1/round-2 skip kernels are byte-level
+layout-agnostic and run \emph{unchanged} --- no new kernels, no
+re-orientation. The zerocheck constraint is pointwise, so mixing slots
+changes nothing else: one skip round, all slots at once, no per-table
+scheduling. The skip's univariate coordinate sits among the \emph{column}
+coordinates of the output point, precisely as today, so the lincheck's
+quirky-point handling (\S\ref{sec:lc}) and the existing claim-point
+conventions carry over; the one place the coordinate still needs an
+adapter is the jagged transport's point format (\S\ref{sec:open}).
 
 \subsection{What changes in code}
 
@@ -467,12 +484,11 @@ Only bookkeeping:
         over its slot's declared rows.
   \item \code{PaddingSpec} $(\kappa, u)$ becomes the count-derived run-list
         of \S\ref{sec:zc-sparse}.
-  \item The zerocheck sumcheck algorithm: \textbf{unchanged} (it is
-        pointwise and block-agnostic; the code map confirmed the uniform
-        \code{PaddingSpec} was its only single-table assumption). The
-        fold/skip kernels are re-targeted to the BatchMajor orientation
-        (skip groups become column words, \S\ref{sec:skip}) --- same
-        shape, new memory order.
+  \item The zerocheck sumcheck kernels: \textbf{unchanged, byte-identical}
+        (pointwise and layout-agnostic; the code map confirmed the uniform
+        \code{PaddingSpec} was the only single-table assumption, and the
+        BatchMajor prover paths for BLAKE3/SHA-256 already exercise these
+        kernels today).
 \end{itemize}
 
 \paragraph{Output.} A point $r \in \F^{M}$ and three claims
@@ -497,8 +513,8 @@ Combining the block-diagonal structure with
   \hat A(r, c) \;=\; \sum_{t=1}^{T}
      \eq\bigl(r[m_t{:}M], p_t\bigr)\,
      \eq\bigl(c[m_t{:}M], p_t\bigr)\,
-     \eq\bigl(r[0{:}\nu_t^{\max}],\, c[0{:}\nu_t^{\max}]\bigr)\,
-     \hat A_t\bigl(r[\nu_t^{\max}{:}m_t],\, c[\nu_t^{\max}{:}m_t]\bigr).
+     \eq\bigl(r|_{R_t},\, c|_{R_t}\bigr)\,
+     \hat A_t\bigl(r|_{C_t},\, c|_{C_t}\bigr),
 \end{equation}
 \paragraph{Derivation of \eqref{eq:factor-union}.} By definition
 $\hat A(r,c) = \sum_{x,y \in \{0,1\}^M} \eq(r,x)\,\eq(c,y)\,A[x,y]$, and
@@ -506,22 +522,22 @@ the MLE is linear in the matrix, so split $A$ by slot; cross-slot entries
 vanish, and slot $t$'s part is supported on pairs with both prefixes frozen
 at $p_t$. Since $\eq$ is a product over coordinates, it factors over any
 partition of them: for $x$ in slot $t$,
-$\eq(r,x) = \eq(r[m_t{:}M], p_t)\cdot\eq(r[\nu_t^{\max}{:}m_t],
-x_{\mathrm{col}})\cdot\eq(r[0{:}\nu_t^{\max}], x_{\mathrm{row}})$, and the
-prefix factor ---
+$\eq(r,x) = \eq(r[m_t{:}M], p_t)\cdot\eq(r|_{R_t}, x|_{R_t})
+\cdot\eq(r|_{C_t}, x|_{C_t})$ --- $\eq$ factors over \emph{any} partition
+of the coordinates, contiguous or not --- and the prefix factor ---
 constant over the slot --- pulls out of the sum (likewise for $c$): these
 are the first two factors of \eqref{eq:factor-union}, the multilinear
 indicators ``$r$ addresses slot $t$'' and ``$c$ addresses slot $t$''. What
 remains is the MLE of $I \otimes A_t$ in the within-slot coordinates, and
 the MLE of a Kronecker product is the product of the factors' MLEs: the
-identity contributes $\eq(r[0{:}\nu_t^{\max}], c[0{:}\nu_t^{\max}])$
+identity contributes $\eq(r|_{R_t}, c|_{R_t})$
 (``same invocation'') via
 \begin{equation*}
   \sum_{w \in \{0,1\}^{\nu}} \eq(a, w)\,\eq(b, w) \;=\; \eq(a, b),
 \end{equation*}
-and the base block contributes $\hat A_t$. Note each term splits the
-\emph{same} shared coordinates at its own boundaries $\nu_t^{\max}, m_t$
---- legal, since every term is simply a function of all $M$ coordinates.
+and the base block contributes $\hat A_t$. Note each term partitions the
+\emph{same} shared coordinates by its own $(R_t, C_t, \text{prefix})$ ---
+legal, since every term is simply a function of all $M$ coordinates.
 Sanity check: at a Boolean pair $(x, y)$, every term except the one for
 the slot actually containing $x$ dies at its prefix factor, and the
 surviving term reproduces the matrix entry.
@@ -535,34 +551,33 @@ machinery --- still never touching any expanded matrix.
 
 Substituting \eqref{eq:factor-union} into
 $v_A = \sum_{c \in \{0,1\}^M} \hat A(r, c)\, \hat z(c)$ and
-collapsing, per slot, the sum over the row coordinates
-$c[0{:}\nu_t^{\max}]$ into a partial evaluation of that slot's witness MLE
-(exactly as in the single-table case):
+collapsing, per slot, the sum over the row coordinates $c|_{R_t}$ into a
+partial evaluation of that slot's witness MLE (exactly as in the
+single-table case):
 \begin{equation}\label{eq:lc-claim}
   v_A \;=\; \sum_{t=1}^{T} w_t(r) \sum_{c' \in \{0,1\}^{\kappa_t}}
       \mathrm{comb}^A_t(c')\; y_t(c'),
   \qquad
   \begin{aligned}
     w_t(r) &= \eq\bigl(r[m_t{:}M], p_t\bigr),\\
-    y_t(c') &= \hat z_t\bigl(r[0{:}\nu_t^{\max}],\, c'\bigr),
+    y_t(c') &= \hat z_t\bigl(r|_{R_t},\, c'\bigr),
   \end{aligned}
 \end{equation}
 where
-$\mathrm{comb}^A_t(c') = \sum_{x'} \eq(r[\nu_t^{\max}{:}m_t], x')\,
-A_t[x', c']$
-is the base block folded by the \emph{standard} $\eq$ table of the
-within-block constraint coordinates of $r$ (computed through the type's
-\code{LincheckCircuit}), and $\hat z_t(\cdot,\cdot)$ is the MLE of slot
-$t$'s (zero-padded) witness, rows first. The prover materializes each
-$y_t$ by folding slot $t$'s \emph{declared rows} with the weight table of
-the row coordinates $r[0{:}\nu_t^{\max}]$ --- the \emph{quirky} table,
-since these coordinates contain the univariate skip coordinate
-(\S\ref{sec:skip}): Lagrange-at-$z$ weights for the low six bits times
-$\eq$ for the rest, at the same fold cost as a standard table ---
+$\mathrm{comb}^A_t(c') = \sum_{x'} \eq(r|_{C_t}, x')\, A_t[x', c']$
+is the base block folded by the weight table of the within-block
+constraint coordinates of $r$ --- the \emph{quirky} table, since $C_t$
+contains the univariate skip coordinate (\S\ref{sec:skip}), computed
+through the type's \code{LincheckCircuit} \emph{exactly as in today's
+single-table code} (the code's ``semantic \code{QuirkyPoint}'' is
+layout-independent) --- and $\hat z_t(\cdot,\cdot)$ is the MLE of slot
+$t$'s (zero-padded) witness, rows-coordinates first. The prover
+materializes each $y_t$ by folding slot $t$'s \emph{declared rows} with
+the standard $\eq$ table of the row coordinates $r|_{R_t}$ ---
 $O(\sum_t n_t k_t)$ in total, the declared area, analogous to today's
-single outer fold. (Note the division of labor relative to today's code:
-the skip structure has migrated from the comb side, now a plain $\eq$
-fold, to the witness-fold side.)
+single outer fold. The division of labor (quirky on the comb side,
+standard $\eq$ on the row-fold side) is \emph{identical} to today's
+single-table lincheck.
 
 Note the weights $w_t(r)$ are \emph{fixed known scalars} (determined by $r$
 and the registry), not fresh randomness: \eqref{eq:lc-claim} is a single
@@ -612,7 +627,7 @@ $\kappa \in \{14..17\}$ all joins happen within the first
 $K - \min_t \kappa_t \le 3$ rounds. At the end, the verifier holds, per
 type, $\mathrm{comb}^A_t$ evaluated at the final point (computed itself via
 the comb machinery at $O(\nnz)$ per type) and an evaluation claim
-$y_t(c^*_t) = \hat z_t(r[0{:}\nu_t^{\max}], c^*_t)$ --- one witness claim
+$y_t(c^*_t) = \hat z_t(r|_{R_t}, c^*_t)$ --- one witness claim
 per type.
 
 \paragraph{(b) Fallback: full-domain lincheck.} Alternatively run the
@@ -676,12 +691,15 @@ of \S\ref{sec:union} exists purely virtually.
 \paragraph{The jagged scheme.} Stack only the \emph{useful} columns of the
 \emph{declared} rows of all tables contiguously (column-major per table ---
 the \code{BatchMajor} witness layout, added in anticipation of exactly
-this): the committed size is $\sum_t n_t u_t$, with all columns of slot $t$
-having height exactly $n_t$ --- non-power-of-two counts are native.
-Because the union's virtual layout is itself BatchMajor
-(\S\ref{sec:union}), the committed stack is simply the union buffer with
-dummy rows and useless columns omitted --- commitment and address space
-share one orientation, with no transpose anywhere in the pipeline. Commit
+this): the committed size is $\sum_t n_t \lceil u_t/128\rceil \cdot 128$ bits
+(stacking granularity is the $128$-variable chunk-column, so useless
+columns are dropped per chunk; the sub-chunk remainder is negligible),
+with all chunk-columns of slot $t$ having height exactly $n_t$ ---
+non-power-of-two counts are native. Because the union's virtual layout is
+itself BatchMajor (\S\ref{sec:union}), the committed stack is simply the
+union buffer with dummy rows and useless chunks omitted --- commitment
+and address space share one orientation, with no transpose anywhere in
+the pipeline. Commit
 the dense stack with Ligerito, and transport each virtual claim
 $\hat z_t(\rho)$ to the dense polynomial via the jagged sumcheck
 (\code{pcs/jagged.rs}, branch \code{jagged-assist}):
@@ -804,15 +822,14 @@ smallest possible context.
     flat.
   \item[Phase 1 --- jagged under the existing single-table system.]
     Wire the \code{jagged-assist} transport beneath today's statements
-    (one-type registry): same proofs, new commitment path, so every
-    existing test and benchmark is a correctness and throughput oracle.
-    Validate the BatchMajor-native design here, by measurement: the
-    row-bit skip kernels (skip group $=$ one packed \code{u64} of a
-    column, \S\ref{sec:skip}), the bit-sliced constraint application, and
-    the claim pipeline's handling of univariate-coordinate-in-row points
-    --- the design's one throughput-critical unknown, moved to the front.
-    Gate: single-hash throughput within an agreed margin of the direct
-    path; useful-column area saving realized.
+    (one-type registry, the existing BatchMajor prover paths): same
+    proofs, new commitment path, so every existing test and benchmark is
+    a correctness and throughput oracle. The zerocheck/lincheck kernels
+    need no changes (\S\ref{sec:skip}); the work is the composition
+    layer: multi-claim RLC batching into one jagged transport, and the
+    point-format adapter for the univariate skip coordinate
+    (\S\ref{sec:open}). Gate: single-hash throughput within an agreed
+    margin of the direct path; chunk-granular area saving realized.
   \item[Phase 2 --- the union PIOP and dynamic counts (mixed proofs ship).]
     Union zerocheck (count-derived run lists); multi-size lincheck
     (\S\ref{sec:multisize}(a), with (b) as fallback); per-slot witness
@@ -834,18 +851,19 @@ proofs on the same witnesses.
 \section{Open questions}\label{sec:open}
 
 \begin{enumerate}[nosep]
-  \item \textbf{BatchMajor-native skip (Phase 1).} The design adopts the
-        BatchMajor layout with the univariate skip over the six low
-        \emph{row} bits (\S\ref{sec:skip}) --- single buffer from witness
-        generation through commit through PIOP. Hypotheses to validate by
-        measurement: (a) vertical-group skip kernels (one packed
-        \code{u64} per group) match or beat today's horizontal-group
-        kernels; (b) the packed-direct / ring-switch claim pipeline
-        accommodates evaluation points whose univariate coordinate sits
-        among the row coordinates. Fallback if either fails: dual buffers
-        --- a row-major working copy for the PIOP, BatchMajor for commit
-        --- via the existing tiled bit-transpose, at one extra pass and
-        $2\times$ witness memory.
+  \item \textbf{Jagged composition adapters (Phase 1).} The jagged
+        kernel's public API (branch \code{jagged-assist}) transports
+        exactly one sparse claim and takes its evaluation point as plain
+        multilinear $(z_{\mathrm{row}}, z_{\mathrm{col}},
+        z_{\mathrm{index}})$ slices. The composition layer must add:
+        (a) RLC batching of many per-slot claims into one transport
+        sumcheck; (b) an adapter for the univariate skip coordinate,
+        which sits among the coordinates jagged treats as ordinary
+        multilinear --- either extend the transport's weight tables to
+        accept the quirky (Lagrange-at-$z$) weights for those six bits,
+        or pre-reduce the quirky claim to a multilinear claim with a
+        six-round mini-sumcheck. Both are bounded, known work items ---
+        design them at the start of Phase 1.
   \item \textbf{Capacity sizing.} How many tiers, and how large? Each
         doubling of capacity costs one static sumcheck round and slightly
         larger bookkeeping tables; exceeding capacity forces a proof
