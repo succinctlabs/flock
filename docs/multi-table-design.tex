@@ -219,8 +219,14 @@ that trait, not with matrices directly.)
 \ZC ($\hat c(r)$), from \LC, and from the statement-binding arguments (e.g.\
 today's chain argument, which constrains input/output \emph{regions} of the
 committed witness via an auxiliary shift-sumcheck; note it is claim-level
-``glue'', \emph{not} extra R1CS rows) --- are batched by the existing
-machinery (\code{pcs::open\_batch\_mixed\ldots}, label
+``glue'', \emph{not} extra R1CS rows) --- are carried to the committed
+polynomial by a two-stage machinery: \emph{ring-switching}
+(\code{pcs/ring\_switch.rs}) eliminates the seven in-word packing
+coordinates --- including the univariate skip coordinate, which is why
+downstream layers never see quirky structure --- turning each bit-level
+claim into a multilinear claim on the \emph{packed} ($\F$-word)
+polynomial; the packed claims are then batched
+(\code{pcs::open\_batch\_mixed\ldots}, label
 \code{flock-pcs-open-batch-v0}) into one Ligerito opening of the single
 committed witness polynomial.
 
@@ -471,8 +477,9 @@ changes nothing else: one skip round, all slots at once, no per-table
 scheduling. The skip's univariate coordinate sits among the \emph{column}
 coordinates of the output point, precisely as today, so the lincheck's
 quirky-point handling (\S\ref{sec:lc}) and the existing claim-point
-conventions carry over; the one place the coordinate still needs an
-adapter is the jagged transport's point format (\S\ref{sec:open}).
+conventions carry over; the coordinate is then eliminated by the existing
+ring-switching stage before the jagged transport ever sees a point
+(\S\ref{sec:commit}).
 
 \subsection{What changes in code}
 
@@ -688,6 +695,22 @@ turns these into openings of \emph{one} committed polynomial while
 committing \textbf{only the actual data}: the capacity-sized address space
 of \S\ref{sec:union} exists purely virtually.
 
+\paragraph{Pipeline position: ring-switch first, then jagged.} Claims
+emitted by the PIOP are bit-level and carry the univariate skip
+coordinate among their low (in-word) coordinates. They first pass through
+the \emph{existing} ring-switching stage exactly as today
+(\S\ref{sec:pioponetable}): ring-switching eliminates the seven in-word
+coordinates --- the skip coordinate included --- yielding per-slot
+multilinear claims on the \emph{packed} polynomial, whose variables are
+the batch and chunk coordinates. Ring-switching is per-claim local, so it
+needs no union-awareness. The jagged transport therefore operates purely
+on packed data at ordinary multilinear points --- matching both the
+\code{jagged-assist} API (plain multilinear
+$(z_{\mathrm{row}}, z_{\mathrm{col}}, z_{\mathrm{index}})$ slices) and
+its flagship bench ($2^{30}$-bit \emph{packed} witness). At the packed
+level the jagged grid reads: columns $=$ chunk-columns, rows $=$
+invocations, heights $= n_t$ \emph{words}.
+
 \paragraph{The jagged scheme.} Stack only the \emph{useful} columns of the
 \emph{declared} rows of all tables contiguously (column-major per table ---
 the \code{BatchMajor} witness layout, added in anticipation of exactly
@@ -826,10 +849,11 @@ smallest possible context.
     proofs, new commitment path, so every existing test and benchmark is
     a correctness and throughput oracle. The zerocheck/lincheck kernels
     need no changes (\S\ref{sec:skip}); the work is the composition
-    layer: multi-claim RLC batching into one jagged transport, and the
-    point-format adapter for the univariate skip coordinate
-    (\S\ref{sec:open}). Gate: single-hash throughput within an agreed
-    margin of the direct path; chunk-granular area saving realized.
+    layer: slotting the jagged transport between the existing ring-switch
+    stage and the Ligerito opening, and multi-claim RLC batching into one
+    transport sumcheck (\S\ref{sec:open}). Gate: single-hash throughput
+    within an agreed margin of the direct path; chunk-granular area
+    saving realized.
   \item[Phase 2 --- the union PIOP and dynamic counts (mixed proofs ship).]
     Union zerocheck (count-derived run lists); multi-size lincheck
     (\S\ref{sec:multisize}(a), with (b) as fallback); per-slot witness
@@ -851,19 +875,18 @@ proofs on the same witnesses.
 \section{Open questions}\label{sec:open}
 
 \begin{enumerate}[nosep]
-  \item \textbf{Jagged composition adapters (Phase 1).} The jagged
-        kernel's public API (branch \code{jagged-assist}) transports
-        exactly one sparse claim and takes its evaluation point as plain
-        multilinear $(z_{\mathrm{row}}, z_{\mathrm{col}},
-        z_{\mathrm{index}})$ slices. The composition layer must add:
-        (a) RLC batching of many per-slot claims into one transport
-        sumcheck; (b) an adapter for the univariate skip coordinate,
-        which sits among the coordinates jagged treats as ordinary
-        multilinear --- either extend the transport's weight tables to
-        accept the quirky (Lagrange-at-$z$) weights for those six bits,
-        or pre-reduce the quirky claim to a multilinear claim with a
-        six-round mini-sumcheck. Both are bounded, known work items ---
-        design them at the start of Phase 1.
+  \item \textbf{Jagged claim batching (Phase 1).} The jagged kernel's
+        public API (branch \code{jagged-assist}) transports exactly one
+        sparse claim per invocation. Because ring-switching runs first
+        and eliminates the in-word coordinates --- univariate skip
+        coordinate included (\S\ref{sec:commit}) --- the transport only
+        ever sees ordinary multilinear points over packed-word variables,
+        so \emph{no point-format adapter is needed}. What the composition
+        layer must add is claim \emph{batching}: many per-slot packed
+        claims, at different points, RLC-combined into one transport
+        sumcheck (combine the per-claim $\eq$-weight tables under random
+        coefficients). Bounded, known work --- design at the start of
+        Phase 1.
   \item \textbf{Capacity sizing.} How many tiers, and how large? Each
         doubling of capacity costs one static sumcheck round and slightly
         larger bookkeeping tables; exceeding capacity forces a proof
