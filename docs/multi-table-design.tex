@@ -1,0 +1,920 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xspace}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+% ---------------------------------------------------------------------------
+% Macros
+% ---------------------------------------------------------------------------
+\newcommand{\F}{\mathbb{F}}                       % the extension field F_{2^128}
+\newcommand{\Ftwo}{\F_2}
+\newcommand{\eq}{\mathsf{eq}}
+\newcommand{\nnz}{\mathsf{nnz}}
+\newcommand{\ip}[2]{\langle #1, #2 \rangle}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\ZC}{\textsf{Zerocheck}\xspace}
+\newcommand{\LC}{\textsf{Lincheck}\xspace}
+\newcommand{\pre}{\mathrm{pre}}
+\newcommand{\out}{\mathrm{out}}
+\newcommand{\inn}{\mathrm{in}}
+
+\newtheorem{lemma}{Lemma}
+\newtheorem{remark}{Remark}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+
+\title{Multi-Table Proving in Flock:\\ One Proof for Heterogeneous Hash Batches\\[0.6ex]
+\large Design document --- working draft v0.2}
+\author{Flock}
+\date{July 22, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Flock currently produces one proof per hash function: a proof attests to $n$
+invocations of \emph{one} of BLAKE3, SHA-256, or Keccak-f[1600]. This document
+designs the generalization to a \emph{single} proof attesting to a
+heterogeneous batch --- e.g.\ $1000$ BLAKE3 compressions \emph{and} $4096$
+SHA-256 compressions, independently invoked, with the counts chosen at prove
+time --- in one proof with one commitment and one opening. The design views
+the statement as a collection of \emph{tables} (one per hash type; rows =
+invocations, columns = the trace of one invocation) composed into one
+\emph{block-diagonal R1CS} over a \textbf{static, capacity-sized address
+space}: each type owns a fixed slot sized to a maximum invocation count, the
+per-proof counts are public inputs, and undeclared rows are zero --- they
+satisfy the constraints identically and cost the prover essentially nothing.
+The central observation is that running Flock's existing single-instance
+zerocheck over the composed instance is \emph{mathematically identical} to a
+batched per-table zerocheck with $\eq$-derived batching coefficients --- so
+batching comes for free, with plain single-instance soundness and almost no
+new zerocheck code. The genuinely new protocol work concentrates in the
+lincheck, which needs a small multi-size sumcheck over the per-table column
+dimensions. The commitment layer is the jagged (stacked-columns) scheme:
+only the actual data is committed, with the static address space existing
+purely virtually. There is one protocol mode; fixed workloads are simply the
+full-utilization special case.
+\end{abstract}
+
+\tableofcontents
+
+% ===========================================================================
+\section{Goals and non-goals}\label{sec:goals}
+
+\paragraph{Goal.} One proof system execution that proves a batch containing
+invocations of \emph{several different} hash functions, with the number of
+invocations of each chosen at prove time. The invocations are
+\textbf{independent}: no hash output feeds another hash input across (or
+within) types; each row is a self-contained invocation. The multi-table
+core deliberately binds \emph{no} per-invocation input/output --- all
+dataflow, between tables and to the public statement, is deferred to a
+planned lookup/bus layer (\S\ref{sec:statement}, \S\ref{sec:open}).
+
+\paragraph{Design priorities} (decided up front, in order):
+\begin{enumerate}[nosep]
+  \item \textbf{Prover throughput.} Hashes proven per second is the headline
+        metric. Per-hash witness-generation kernels and the NEON/AVX hot
+        paths must not be perturbed, and the prover must pay for
+        \emph{declared} work, never for capacity.
+  \item \textbf{Gradual landing.} Small reviewable steps; the existing
+        single-hash path stays green throughout; each phase is independently
+        shippable and benchmarkable.
+  \item \textbf{Static structure.} The set of hash types, their encoders,
+        their widths, and their capacities come from a small predeclared
+        \emph{registry}. Everything structural about the verifier --- round
+        counts, control flow, precomputed digests --- depends only on the
+        registry, never on the per-proof counts, which enter as scalars
+        only. (This is what keeps the door open to fixed-circuit recursion
+        or aggregation later.)
+\end{enumerate}
+
+\paragraph{Non-goals (for now).}
+Cross-table dataflow and per-invocation public IO --- both deliberately
+excluded from the multi-table core and slated for a subsequent lookup/bus
+layer (\S\ref{sec:open}); a dynamic \emph{type} registry (adding a new
+hash type remains a registry/code change); changing the \emph{internal}
+protocol hash (the SHA-256 used for the Merkle commitment, Fiat--Shamir,
+and proof-of-work grinding is untouched by this design --- ``hash'' in this
+document always means the hash being \emph{proven}).
+
+\paragraph{One mode.} An earlier draft of this design carried two protocol
+modes: a \emph{fixed-shape} mode (counts predeclared, witness committed
+directly) and the dynamic mode. The fixed-shape mode is expressively the
+special case ``counts $=$ capacities'' of the dynamic mode, and carrying
+both meant two commitment layers, two transports, two wire formats, and a
+doubled audit surface. This draft specifies \textbf{the dynamic mode only}.
+The direct-commitment path survives as a development harness and fallback
+(Remark~\ref{rem:harness}), not as a protocol mode.
+
+% ===========================================================================
+\section{Preliminaries: the current single-table system}\label{sec:prelim}
+
+\subsection{Notation}
+
+$\F = \F_{2^{128}}$ is the extension field; witnesses are $\Ftwo$-valued
+(bits). For $\tau, x \in \F^m$,
+\[
+  \eq(\tau, x) \;=\; \prod_{i=1}^{m} \bigl(\tau_i x_i + (1-\tau_i)(1-x_i)\bigr),
+\]
+the multilinear extension of the Kronecker delta on the Boolean cube. We use
+throughout the identity
+\begin{equation}\label{eq:eqsum}
+  \sum_{x \in \{0,1\}^m} \eq(\tau, x) \;=\; 1
+  \qquad\text{for every } \tau \in \F^m,
+\end{equation}
+which holds because each factor sums to $\tau_i + (1-\tau_i) = 1$ over
+$x_i \in \{0,1\}$. For a vector $v \in \F^{2^m}$, $\hat v$ denotes its
+multilinear extension (MLE); index bits are little-endian (bit $0$ is the
+least significant). For a point $r \in \F^m$ and a bit range $[a,b)$ we write
+$r[a{:}b]$ for the corresponding subvector of coordinates.
+
+\subsection{The single-table instance}\label{sec:single}
+
+A Flock statement today is a \emph{block R1CS}
+(\code{flock-core/src/r1cs.rs}, \code{struct BlockR1cs}): one \emph{base
+block} of sparse $\Ftwo$-matrices $(A_0, B_0, C_0)$, each $k \times k$ with
+$k = 2^{\kappa}$, with $C_0 = I$ (``circuit form'': the $C$-side just reads
+the witness), replicated $n = 2^{\nu}$ times. The full constraint matrix is
+implicitly
+\[
+  A \;=\; I_{n} \otimes A_0, \qquad B \;=\; I_{n} \otimes B_0,
+  \qquad C \;=\; I_{n} \otimes C_0 = I,
+\]
+and the witness $z \in \Ftwo^{2^{m}}$, $m = \nu + \kappa$, satisfies
+$(Az) \circ (Bz) = Cz$ (Hadamard product), i.e.\ each block independently
+satisfies the base relation. Only the first $u \le k$ columns of a block are
+``useful''; columns $[u, k)$ are zero padding, recorded by a single scalar
+\code{useful\_bits}.
+
+\paragraph{The table view.} This is exactly a \emph{table}: $n$ rows (one per
+hash invocation), $k$ columns (the trace of one invocation --- for the current
+encoders, $\kappa = 14$ for BLAKE3, $15$ for SHA-256, $16$ for Keccak, $17$
+for the 3-wide Keccak variant; all share the zerocheck skip parameter
+$k_{\mathrm{skip}} = 6$). The witness index splits as
+\[
+  x \;=\; (\underbrace{x[0{:}\kappa]}_{\text{column / ``inner''}},\;
+           \underbrace{x[\kappa{:}m]}_{\text{row / ``outer''}}).
+\]
+This is today's \emph{row-major} convention (one invocation's trace is
+contiguous); the multi-table design deliberately transposes it
+(\S\ref{sec:union}).
+
+\subsection{The PIOP, briefly}\label{sec:pioponetable}
+
+Let $a = Az$, $b = Bz$, $c = Cz = z$ over the $2^m$-point domain. The proof
+runs:
+
+\paragraph{\ZC (\code{zerocheck.rs}).} Proves $\hat a(x)\hat b(x) = \hat c(x)$
+for all Boolean $x$: the verifier samples $\tau \in \F^{m}$, the prover runs a
+sumcheck for
+\begin{equation}\label{eq:zc-single}
+  \sum_{x \in \{0,1\}^{m}} \eq(\tau, x)\,
+     \bigl(\hat a(x)\hat b(x) - \hat c(x)\bigr) \;=\; 0 .
+\end{equation}
+The low $k_{\mathrm{skip}} = 6$ variables are bound in a single
+\emph{univariate-skip} round (one univariate over a $2^{6}$-point domain),
+which is where most of the prover's win from $\Ftwo$-valued data lives; the
+remaining $m - 6$ rounds are ordinary. The output is a random point
+$r \in \F^{m}$ and claims $\hat a(r), \hat b(r), \hat c(r)$. Since $C = I$,
+$\hat c(r) = \hat z(r)$ is already a witness evaluation claim. A
+\code{PaddingSpec} $= (\kappa, u)$ lets the prover skip work on the uniform
+zero-padding columns.
+
+\paragraph{\LC (\code{lincheck.rs}).} Reduces $\hat a(r)$ and $\hat b(r)$
+(batched by a fresh $\alpha$: the claim is $\alpha\hat a(r) + \hat b(r)$) to a
+witness evaluation. The load-bearing structure is the factorization of the
+replicated matrix's MLE:
+\begin{equation}\label{eq:factor-single}
+  \hat A\bigl((r_{\out}, r_{\inn}), (c_{\out}, c_{\inn})\bigr)
+  \;=\; \eq(r_{\out}, c_{\out}) \cdot \hat A_0(r_{\inn}, c_{\inn}),
+\end{equation}
+so that
+\[
+  \hat a(r) = \sum_{c} \hat A(r, c)\,\hat z(c)
+  = \sum_{c_{\inn} \in \{0,1\}^{\kappa}}
+      \hat A_0(r_{\inn}, c_{\inn})\;
+      \underbrace{\hat z(c_{\inn}, r_{\out})}_{\text{partial eval.\ of } \hat z},
+\]
+where the sum over $c_{\out}$ \emph{collapsed} into a partial evaluation of
+the witness MLE at the row point $r_{\out}$. The prover materializes
+$y(c_{\inn}) := \hat z(c_{\inn}, r_{\out})$ (one $O(2^m)$ fold of the witness)
+and the \emph{comb} vector
+$\mathrm{comb}(c_{\inn}) = \alpha\,(\eq_{r_{\inn}}^{\top} A_0)(c_{\inn})
+ + (\eq_{r_{\inn}}^{\top} B_0)(c_{\inn})$,
+then runs a $\kappa$-bit sumcheck for
+$\sum_{c_{\inn}} \mathrm{comb}(c_{\inn})\, y(c_{\inn})$. The verifier's matrix
+work is $O(\nnz(A_0) + \nnz(B_0))$, \textbf{independent of the row count} ---
+it never touches the expanded matrix. (In code the comb evaluation goes
+through \code{trait LincheckCircuit}; Keccak implements it with a custom
+walker rather than literal sparse matrices. Everything below interacts with
+that trait, not with matrices directly.)
+
+\paragraph{Claims, glue, opening.} All evaluation claims on $\hat z$ --- from
+\ZC ($\hat c(r)$), from \LC, and from the statement-binding arguments (e.g.\
+today's chain argument, which constrains input/output \emph{regions} of the
+committed witness via an auxiliary shift-sumcheck; note it is claim-level
+``glue'', \emph{not} extra R1CS rows) --- are batched by the existing
+machinery (\code{pcs::open\_batch\_mixed\ldots}, label
+\code{flock-pcs-open-batch-v0}) into one Ligerito opening of the single
+committed witness polynomial.
+
+The design below preserves every element of this pipeline and generalizes the
+instance it runs on.
+
+% ===========================================================================
+\section{The multi-table model}\label{sec:model}
+
+\begin{definition}[Type registry]\label{def:registry}
+The \emph{registry} fixes, once, an ordered list of \emph{table types}
+$t = 1, \dots, T$. Type $t$ consists of: a base block
+$(A_t, B_t, C_t{=}I)$ of width $k_t = 2^{\kappa_t}$ with $u_t \le k_t$
+useful columns, and a \emph{row capacity} $2^{\nu_t^{\max}}$ --- the padded
+maximum: the largest number of invocations of type $t$ a single proof may
+declare, sizing the type's (virtual) slot once and for all. The number of
+rows \emph{actually used} is a per-proof quantity, the count $n_t$ of
+Definition~\ref{def:instance}; the prover pays only for those. Write
+$m_t = \nu_t^{\max} + \kappa_t$; the type's \emph{capacity area} is
+$s_t = 2^{m_t}$. The registry orders types by non-increasing capacity area
+$s_1 \ge s_2 \ge \cdots \ge s_T$.
+\end{definition}
+
+Capacities are per-type rather than global because the generality is free
+(slot areas differ across types anyway, since widths do) and workloads are
+asymmetric: the address-space size $\sum_t s_t$ --- which sets the static
+round count --- is dominated by the largest slots, so a type expected to
+appear rarely should not be granted the row capacity of the workhorse
+types. A uniform row capacity $\nu_t^{\max} \equiv \nu^{\max}$ is the
+obvious special case; another natural one is the \emph{area-balanced}
+registry, $\nu_t^{\max} + \kappa_t$ constant, where wider hashes get
+proportionally fewer maximum rows and every slot has equal area.
+
+Two clarifications on Definition~\ref{def:registry}. First, capacities are
+powers of two \emph{by fiat}: slots must be subcubes of the global cube
+(Lemma~\ref{lem:align} and everything built on it), and subcubes have
+power-of-two size. This costs nothing --- capacity is virtual, so a true
+maximum of, say, $3 \cdot 2^{10}$ is simply rounded up to $2^{12}$; the
+never-used rows are skipped by the prover, and all genuine arbitrariness
+lives in the counts $n_t$, which are unrestricted. Second, the registry
+ordering is by capacity \emph{area} $s_t$ (rows $\times$ width), not by row
+capacity alone --- a wider type with fewer maximum rows may sort first ---
+and the ordering is itself only a device: it is the canonical way to obtain
+the alignment property of Lemma~\ref{lem:align}, and in the area-balanced
+case it is immaterial.
+
+\begin{definition}[Instance]\label{def:instance}
+A proof \emph{instance} consists of public \emph{counts}
+$(n_t)_{t=1..T}$ with $0 \le n_t \le 2^{\nu_t^{\max}}$ --- arbitrary
+integers, \emph{not} necessarily powers of two --- together with, per type
+$t$, the witness table $Z_t \in \Ftwo^{n_t \times k_t}$: row $r < n_t$ holds
+the full trace of invocation $r$ and independently satisfies
+$(A_t z) \circ (B_t z) = z$. Rows $[n_t, 2^{\nu_t^{\max}})$ are \emph{dummy
+rows}, identically zero.
+\end{definition}
+
+Independence of invocations means there are no constraints connecting
+different rows, neither within a table nor across tables. The multi-table
+layer attaches no statement to individual rows --- no input/output binding
+(\S\ref{sec:statement}); in particular, dummy rows are referenced by
+nothing at all.
+
+If a workload exceeds a capacity, the proof is split (or a larger registry
+tier is used, \S\ref{sec:statement}); capacities are a registry-design
+question, not a protocol limit (\S\ref{sec:open}).
+
+% ===========================================================================
+\section{The union instance}\label{sec:union}
+
+We compose the tables into one index space and one R1CS. The layout is
+computed \textbf{once, at registry-definition time}, from the capacity
+areas --- the per-proof counts never move anything.
+
+\subsection{Static layout and alignment}
+
+\paragraph{Layout convention (BatchMajor).} Within a slot, indices are
+column-major: the low $\nu_t^{\max}$ bits are the row (invocation) index
+and the next $\kappa_t$ bits the column (trace-variable) index, so each
+trace variable's column is contiguous across invocations. This transposes
+the single-table recap's row-major convention (\S\ref{sec:single}), and
+the choice is deliberate: it is the stacking order the jagged commitment
+needs (\S\ref{sec:commit}); it makes sparse constraint application
+\emph{bit-sliced} --- each nonzero of $A_t$ becomes a contiguous
+column-XOR, vectorized across invocations --- and \S\ref{sec:skip} shows
+the univariate skip transfers intact. Witness generation, which naturally
+emits one invocation (row) at a time, writes this layout via cache-tiled
+bit-transposes, an existing kernel.
+
+Let $M$ be minimal with $2^{M} \ge \sum_t s_t$ (choose capacities so that
+$\sum_t s_t = 2^{M}$ exactly if desired; a shortfall is harmless by
+Remark~\ref{rem:padding}). Assign type $t$ the \emph{slot}
+$[o_t, o_t + s_t)$ of $\{0,1\}^{M}$, where $o_t = \sum_{t' < t} s_{t'}$.
+
+\begin{lemma}[Alignment]\label{lem:align}
+With the descending-area ordering, $o_t$ is a multiple of $s_t = 2^{m_t}$.
+Consequently, for a global index $x$ in slot $t$:
+\[
+  x[0{:}\nu_t^{\max}] = \text{row index},\quad
+  x[\nu_t^{\max}{:}m_t] = \text{column index},\quad
+  x[m_t{:}M] = p_t \;(\text{a fixed bit pattern}, \; p_t = o_t / 2^{m_t}).
+\]
+\end{lemma}
+\begin{proof}
+$o_t$ is a sum of terms $2^{m_{t'}}$ with $m_{t'} \ge m_t$, each divisible by
+$2^{m_t}$.
+\end{proof}
+
+We call $p_t$ the \emph{slot prefix}: the Boolean string of length
+$M - m_t$ that the top bits of \emph{every} address in slot $t$ are frozen
+to (numerically $o_t / 2^{m_t}$, an exact division by the lemma). Note its
+length varies per slot --- larger slots have shorter prefixes --- so
+expressions like $\eq(\tau[m_t{:}M], p_t)$ always pair it with a
+coordinate range of matching length. Example ($M = 6$, slot sizes
+$32, 16, 16$): slots $[0,32)$, $[32,48)$, $[48,64)$ have prefixes
+$p_1 = \mathtt{0}$, $p_2 = \mathtt{10}$, $p_3 = \mathtt{11}$.
+
+So each slot is a subcube of $\{0,1\}^M$, selected by fixing the top
+$M - m_t$ bits to the static prefix $p_t$, and \emph{within} the
+subcube the index has the same (column, row) split as a single-table
+instance. Distinct slots are disjoint subcubes. (The alignment property is
+what all the math below needs; sorting is merely how the registry obtains
+it once and for all.)
+
+\subsection{The block-diagonal R1CS}
+
+The union instance has constraint matrices
+\[
+  A = \mathrm{diag}\bigl(I_{2^{\nu_1^{\max}}} \otimes A_1,\; \dots,\;
+                         I_{2^{\nu_T^{\max}}} \otimes A_T\bigr),
+  \qquad B \text{ likewise}, \qquad C = I_{2^M},
+\]
+and witness $z \in \Ftwo^{2^M}$ = the concatenation of the per-type
+witnesses in slot order (each table internally BatchMajor, per the
+convention of \S\ref{sec:union}), with dummy rows zero. The satisfied relation is, as before, pointwise:
+$(Az) \circ (Bz) = z$ over all of $\{0,1\}^M$.
+
+\begin{remark}[Dummy rows are complete; padding is self-enforcing]
+\label{rem:padding}
+The R1CS is homogeneous --- constants enter only through the constant-pin
+column --- so the all-zero row satisfies
+$(A_t \cdot 0)\circ(B_t \cdot 0) = 0 = C_t \cdot 0$, with the constant pin
+at $0$ marking the row as dummy; no witness-generation work is performed
+for dummy rows. Soundness needs nothing from them either: nothing in the
+system references dummy rows (the core binds no per-row IO at all,
+\S\ref{sec:statement}), and under the jagged commitment
+(\S\ref{sec:commit}) the region beyond height $n_t$ is zero \emph{by
+construction} of the transport --- the prover has no freedom there to begin
+with. In any gap region beyond the last slot, $A$ and $B$ have zero rows
+and $C = I$, so the constraint reads $0 \cdot 0 = z(x)$, \emph{forcing}
+zero. Padding therefore needs no soundness caveats; its only cost is
+prover work, which \S\ref{sec:zc}--\ref{sec:lc} reduce to zero.
+\end{remark}
+
+There are \textbf{no selector polynomials} anywhere: disjointness of the
+slots is the selection mechanism. The ``selector'' will surface only as
+scalar $\eq$-prefix weights in the verifier's algebra, essentially for free.
+
+% ===========================================================================
+\section{Zerocheck over the union}\label{sec:zc}
+
+Run \emph{exactly the existing zerocheck} (\S\ref{sec:pioponetable}) on the
+union instance: sample $\tau \in \F^{M}$, prove
+\begin{equation}\label{eq:zc-union}
+  \sum_{x \in \{0,1\}^{M}} \eq(\tau, x)
+     \bigl(\hat a(x)\hat b(x) - \hat c(x)\bigr) = 0 ,
+\end{equation}
+by an $M$-round sumcheck ($1$ univariate-skip round $+$ $M - 6$ ordinary
+rounds), where now $a = Az$ etc.\ for the block-diagonal $A$. Note $M$ is
+registry-determined, hence \emph{static}: a few more rounds than a
+perfectly-sized instance, in exchange for a count-independent verifier.
+
+\subsection{Why this is implicit batching}
+
+Split the sum in \eqref{eq:zc-union} by slot. For $x$ in slot $t$,
+$\eq(\tau, x)$ factors across the bit split of Lemma~\ref{lem:align}:
+\[
+  \eq(\tau, x) \;=\;
+  \underbrace{\eq\bigl(\tau[m_t{:}M],\, p_t\bigr)}_{=: \, w_t \;\in\; \F}
+  \;\cdot\;
+  \eq\bigl(\tau[0{:}m_t],\, x[0{:}m_t]\bigr),
+\]
+and the constraint polynomial restricted to slot $t$ is exactly type
+$t$'s own $\hat a_t \hat b_t - \hat c_t$. Hence
+\begin{equation}\label{eq:implicit-batch}
+  \eqref{eq:zc-union}
+  \iff
+  \sum_{t=1}^{T} w_t \cdot
+  \underbrace{\sum_{x' \in \{0,1\}^{m_t}}
+     \eq\bigl(\tau[0{:}m_t], x'\bigr)
+     \bigl(\hat a_t \hat b_t - \hat c_t\bigr)(x')}_{\text{type } t\text{'s
+     single-table zerocheck sum}} \;=\; 0 .
+\end{equation}
+That is: the union zerocheck \emph{is} a batched per-table zerocheck, with
+batching coefficients $w_t = \eq(\tau[m_t{:}M], p_t)$ derived from the shared
+randomness $\tau$ instead of independently sampled. There is no separate
+batching protocol, no batching soundness lemma (soundness is the ordinary
+single-instance zerocheck argument over $\{0,1\}^M$: if any invocation of any
+table is wrong, the constraint polynomial is nonzero somewhere on the cube,
+and \eqref{eq:zc-union} fails except with probability
+$O(M/|\F|)$ over $\tau$ plus the sumcheck error), and no scheduling
+machinery. Different tables simply live at different (static) addresses.
+
+\subsection{The prover pays for declared work only}\label{sec:zc-sparse}
+
+On every region where the witness --- hence $a$, $b$, and $c$ --- is
+identically zero (dummy rows, useless columns, the gap), the summand of
+\eqref{eq:zc-union} vanishes identically and contributes nothing to any
+round polynomial. The \code{PaddingSpec} generalizes from today's single
+$(\kappa, u)$ pair to a \textbf{run-list derived from the public counts}:
+per slot, columns $[u_t, k_t)$ and rows $[n_t, 2^{\nu_t^{\max}})$ are dead
+(this generalizes \code{useful\_bits} skipping from columns to rows). With
+run-list--driven iteration the prover's sumcheck work is proportional to
+$\sum_t n_t k_t$ --- the \emph{declared} area --- while the round count
+stays the static $M$.
+
+\subsection{The univariate skip survives globally --- over row
+bits}\label{sec:skip}
+
+The skip merges the six low variables of the sumcheck into one univariate
+round; its prover win --- the six most expensive rounds computed directly
+on $\Ftwo$-valued data --- requires only that each merged group of $64$
+domain points be memory-contiguous. \emph{Which} six variables are merged
+is a free protocol choice. Under the BatchMajor convention, the global low
+six bits of any index are within-column \emph{row} bits for every slot
+(all $\nu_t^{\max} \ge 6$ in any real registry, and every slot offset is a
+multiple of $2^{m_t}$), so the single global skip round runs over the six
+low row bits: a skip group is the same trace variable across $64$
+consecutive invocations --- in packed representation, \textbf{exactly one
+64-bit machine word of a column}, the natural unit of the bit-sliced
+kernels. The zerocheck constraint is pointwise, so nothing else changes:
+one skip round, all slots at once, no per-table scheduling. The skip's
+univariate coordinate consequently sits among the \emph{row} coordinates
+of the zerocheck's output point; \S\ref{sec:lc} tracks where that lands
+(the witness folds inherit the quirky weight table, while the comb side
+becomes a standard $\eq$ fold), and the claim pipeline must accept such
+points --- a Phase 1 validation item (\S\ref{sec:open}).
+
+\subsection{What changes in code}
+
+Only bookkeeping:
+\begin{itemize}[nosep]
+  \item \code{BlockR1cs} generalizes to the registry schedule of slots
+        $\{(\text{base block}, \kappa_t, u_t, \nu_t^{\max})\}$ (one entry
+        $\equiv$ today's struct); \code{apply\_a} applies each base block
+        over its slot's declared rows.
+  \item \code{PaddingSpec} $(\kappa, u)$ becomes the count-derived run-list
+        of \S\ref{sec:zc-sparse}.
+  \item The zerocheck sumcheck algorithm: \textbf{unchanged} (it is
+        pointwise and block-agnostic; the code map confirmed the uniform
+        \code{PaddingSpec} was its only single-table assumption). The
+        fold/skip kernels are re-targeted to the BatchMajor orientation
+        (skip groups become column words, \S\ref{sec:skip}) --- same
+        shape, new memory order.
+\end{itemize}
+
+\paragraph{Output.} A point $r \in \F^{M}$ and three claims
+$\hat a(r), \hat b(r), \hat c(r)$, with $\hat c(r) = \hat z(r)$ a direct
+witness claim.
+
+% ===========================================================================
+\section{Lincheck over the union}\label{sec:lc}
+
+This is where the real (and modest) protocol work lives. The zerocheck left
+two matrix claims, $\hat a(r)$ and $\hat b(r)$. For clarity we develop the
+lincheck for the $A$-claim alone, $v_A := \hat a(r)$;
+\S\ref{sec:batchAB} then observes that the $B$-claim is word-for-word
+identical and that the two sumchecks merge into one at the cost of a single
+random scalar.
+
+\subsection{Closed form of the union matrix MLE}
+
+Combining the block-diagonal structure with
+\eqref{eq:factor-single} per slot and Lemma~\ref{lem:align}:
+\begin{equation}\label{eq:factor-union}
+  \hat A(r, c) \;=\; \sum_{t=1}^{T}
+     \eq\bigl(r[m_t{:}M], p_t\bigr)\,
+     \eq\bigl(c[m_t{:}M], p_t\bigr)\,
+     \eq\bigl(r[0{:}\nu_t^{\max}],\, c[0{:}\nu_t^{\max}]\bigr)\,
+     \hat A_t\bigl(r[\nu_t^{\max}{:}m_t],\, c[\nu_t^{\max}{:}m_t]\bigr).
+\end{equation}
+\paragraph{Derivation of \eqref{eq:factor-union}.} By definition
+$\hat A(r,c) = \sum_{x,y \in \{0,1\}^M} \eq(r,x)\,\eq(c,y)\,A[x,y]$, and
+the MLE is linear in the matrix, so split $A$ by slot; cross-slot entries
+vanish, and slot $t$'s part is supported on pairs with both prefixes frozen
+at $p_t$. Since $\eq$ is a product over coordinates, it factors over any
+partition of them: for $x$ in slot $t$,
+$\eq(r,x) = \eq(r[m_t{:}M], p_t)\cdot\eq(r[\nu_t^{\max}{:}m_t],
+x_{\mathrm{col}})\cdot\eq(r[0{:}\nu_t^{\max}], x_{\mathrm{row}})$, and the
+prefix factor ---
+constant over the slot --- pulls out of the sum (likewise for $c$): these
+are the first two factors of \eqref{eq:factor-union}, the multilinear
+indicators ``$r$ addresses slot $t$'' and ``$c$ addresses slot $t$''. What
+remains is the MLE of $I \otimes A_t$ in the within-slot coordinates, and
+the MLE of a Kronecker product is the product of the factors' MLEs: the
+identity contributes $\eq(r[0{:}\nu_t^{\max}], c[0{:}\nu_t^{\max}])$
+(``same invocation'') via
+\begin{equation*}
+  \sum_{w \in \{0,1\}^{\nu}} \eq(a, w)\,\eq(b, w) \;=\; \eq(a, b),
+\end{equation*}
+and the base block contributes $\hat A_t$. Note each term splits the
+\emph{same} shared coordinates at its own boundaries $\nu_t^{\max}, m_t$
+--- legal, since every term is simply a function of all $M$ coordinates.
+Sanity check: at a Boolean pair $(x, y)$, every term except the one for
+the slot actually containing $x$ dies at its prefix factor, and the
+surviving term reproduces the matrix entry.
+
+The verifier can evaluate the scalar prefix weights in $O(T \cdot M)$
+additions and multiplications; the per-type base-block evaluations cost
+$O(\sum_t \nnz(A_t, B_t))$ via the existing \code{LincheckCircuit} comb
+machinery --- still never touching any expanded matrix.
+
+\subsection{Per-slot collapse}
+
+Substituting \eqref{eq:factor-union} into
+$v_A = \sum_{c \in \{0,1\}^M} \hat A(r, c)\, \hat z(c)$ and
+collapsing, per slot, the sum over the row coordinates
+$c[0{:}\nu_t^{\max}]$ into a partial evaluation of that slot's witness MLE
+(exactly as in the single-table case):
+\begin{equation}\label{eq:lc-claim}
+  v_A \;=\; \sum_{t=1}^{T} w_t(r) \sum_{c' \in \{0,1\}^{\kappa_t}}
+      \mathrm{comb}^A_t(c')\; y_t(c'),
+  \qquad
+  \begin{aligned}
+    w_t(r) &= \eq\bigl(r[m_t{:}M], p_t\bigr),\\
+    y_t(c') &= \hat z_t\bigl(r[0{:}\nu_t^{\max}],\, c'\bigr),
+  \end{aligned}
+\end{equation}
+where
+$\mathrm{comb}^A_t(c') = \sum_{x'} \eq(r[\nu_t^{\max}{:}m_t], x')\,
+A_t[x', c']$
+is the base block folded by the \emph{standard} $\eq$ table of the
+within-block constraint coordinates of $r$ (computed through the type's
+\code{LincheckCircuit}), and $\hat z_t(\cdot,\cdot)$ is the MLE of slot
+$t$'s (zero-padded) witness, rows first. The prover materializes each
+$y_t$ by folding slot $t$'s \emph{declared rows} with the weight table of
+the row coordinates $r[0{:}\nu_t^{\max}]$ --- the \emph{quirky} table,
+since these coordinates contain the univariate skip coordinate
+(\S\ref{sec:skip}): Lagrange-at-$z$ weights for the low six bits times
+$\eq$ for the rest, at the same fold cost as a standard table ---
+$O(\sum_t n_t k_t)$ in total, the declared area, analogous to today's
+single outer fold. (Note the division of labor relative to today's code:
+the skip structure has migrated from the comb side, now a plain $\eq$
+fold, to the witness-fold side.)
+
+Note the weights $w_t(r)$ are \emph{fixed known scalars} (determined by $r$
+and the registry), not fresh randomness: \eqref{eq:lc-claim} is a single
+claim about a fixed weighted sum, so no batching randomness is needed
+\emph{across slots} (contrast \S\ref{sec:batchAB}, where combining the
+$A$- and $B$-claims genuinely does use a random $\alpha$).
+
+\subsection{The multi-size inner sumcheck}\label{sec:multisize}
+
+What remains is one sumcheck for \eqref{eq:lc-claim}: a sum of $T$
+sub-sums over domains of different sizes $2^{\kappa_t}$,
+$\kappa_t \in \{14, \dots, 17\}$. Two mechanisms, in order of preference:
+
+\paragraph{(a) $\eq$-embedded late join (recommended).}
+Let $K = \max_t \kappa_t$. Embed each sub-sum into $\{0,1\}^{K}$ using a
+shared auxiliary point $\sigma \in \F^{K}$:
+
+\begin{lemma}[$\eq$-embedding]\label{lem:embed}
+For any $f : \{0,1\}^{\kappa} \to \F$, any $K \ge \kappa$, and any
+$\sigma \in \F^{K}$:
+\[
+  \sum_{c \in \{0,1\}^{K}}
+     \eq\bigl(\sigma[\kappa{:}K],\, c[\kappa{:}K]\bigr)\; f\bigl(c[0{:}\kappa]\bigr)
+  \;=\; \sum_{c' \in \{0,1\}^{\kappa}} f(c'),
+\]
+by \eqref{eq:eqsum} applied to the top $K - \kappa$ coordinates.
+\end{lemma}
+
+\begin{remark}[Characteristic 2 forces this]\label{rem:char2}
+The textbook alternative --- replicate the small summand over the top
+coordinates and rescale by $2^{-(K-\kappa)}$ --- is unavailable: in
+$\F_{2^{128}}$, $2 = 0$. The $\eq$-weighting of Lemma~\ref{lem:embed} is the
+canonical char-2-safe embedding, and the same remark applies anywhere else in
+Flock where sums over different-sized cubes are ever combined.
+\end{remark}
+
+The sumcheck then has $K$ rounds, binding coordinates high to low. In a round
+where coordinate $j \ge \kappa_t$ is bound, type $t$'s term contributes
+$w_t \cdot \bigl(\prod_{i>j} \eq(\sigma_i, \rho_i)\bigr)\,\eq(\sigma_j, X)\,
+ v_t$ --- a \emph{known scalar} times a linear polynomial, where
+$v_t = \sum_{c'} \mathrm{comb}^A_t(c')\,y_t(c')$ is the sub-claim value
+(which the prover sends alongside the round data; the verifier checks
+$\sum_t w_t v_t = v_A$). Once coordinate $\kappa_t - 1$ is reached, type $t$
+``joins'' and contributes its ordinary product-sumcheck rounds over
+$(\mathrm{comb}^A_t, y_t)$, scaled by its accumulated prefix. With
+$\kappa \in \{14..17\}$ all joins happen within the first
+$K - \min_t \kappa_t \le 3$ rounds. At the end, the verifier holds, per
+type, $\mathrm{comb}^A_t$ evaluated at the final point (computed itself via
+the comb machinery at $O(\nnz)$ per type) and an evaluation claim
+$y_t(c^*_t) = \hat z_t(r[0{:}\nu_t^{\max}], c^*_t)$ --- one witness claim
+per type.
+
+\paragraph{(b) Fallback: full-domain lincheck.} Alternatively run the
+lincheck over all $M$ column bits, with summand $\hat A(r,c)\hat z(c)$ via
+\eqref{eq:factor-union} --- zero new sumcheck machinery, at the cost of one
+extra pass to materialize $\hat A(r, \cdot)$ on the (declared part of the)
+cube. We spec (a) and keep (b) as the de-risking fallback; the delta between
+them is a benchmark, not an architecture question.
+
+\subsection{The \texorpdfstring{$B$}{B}-claim, and batching the two
+sumchecks}\label{sec:batchAB}
+
+Everything above applies verbatim to the $B$-claim $v_B := \hat b(r)$, with
+$\mathrm{comb}^B_t$ folding $B_t$ instead of $A_t$. Crucially, the folded
+witness vectors $y_t$ \emph{do not change} --- they depend only on $r$ and
+the witness, never on the matrix. The two multi-size sumchecks therefore
+range over identical domains against identical $y_t$'s and differ only in
+the comb factor, so they merge into one: squeeze a fresh $\alpha$ from the
+transcript (after both claims are bound) and run the sumcheck of
+\S\ref{sec:multisize} once for the combined claim
+\[
+  \alpha\, v_A + v_B \;=\; \sum_{t=1}^{T} w_t(r) \sum_{c'}
+    \bigl(\alpha\,\mathrm{comb}^A_t + \mathrm{comb}^B_t\bigr)(c')\;
+    y_t(c') .
+\]
+This is standard random-linear-combination batching of two claims (error
+$1/|\F|$), costs one scalar and zero extra rounds, and the combined comb
+$\alpha\,\mathrm{comb}^A_t + \mathrm{comb}^B_t$ is exactly what the
+existing \code{fold\_alpha\_batched} computes --- the code's
+$\alpha$-comb is this batching, seen from the single-table special case.
+The end-of-sumcheck outputs --- per-type comb evaluations and the witness
+claims $y_t(c^*_t)$ --- are shared between the two claims, so batching
+adds nothing there either.
+
+\subsection{Verifier cost summary}
+
+Rounds: $M$ (zerocheck) $+$ $K \le 17$ (lincheck) --- both
+registry-static, independent of $T$ and of the counts. Scalars: $3$
+zerocheck claims $+$ $T$ sub-claim values $+$ $T$ witness claims. Matrix
+work: $O(\sum_t \nnz(A_t, B_t))$, linear in the number of types --- the one
+term that grows if the registry grows large; see \S\ref{sec:open} for the
+delegation escape hatch. Prefix weights: $O(T \cdot M)$. Weight
+\emph{structure}, join schedule, comb structures, and the registry digest
+are all precomputable; the counts enter only through run lists and fold
+extents. One bookkeeping note: a union-level claim such as
+$\hat c(r) = \hat z(r)$ decomposes via the prefix weights into per-slot
+claims $\hat z_t(\cdot)$, which join the same transport batch as everything
+else.
+
+% ===========================================================================
+\section{The commitment layer: jagged transport}\label{sec:commit}
+
+The PIOP above emits evaluation claims on the per-slot virtual polynomials
+$\hat z_t$ (from the lincheck and from the decomposed union claims; a
+future lookup/bus layer will add its own, \S\ref{sec:open}). The
+commitment layer
+turns these into openings of \emph{one} committed polynomial while
+committing \textbf{only the actual data}: the capacity-sized address space
+of \S\ref{sec:union} exists purely virtually.
+
+\paragraph{The jagged scheme.} Stack only the \emph{useful} columns of the
+\emph{declared} rows of all tables contiguously (column-major per table ---
+the \code{BatchMajor} witness layout, added in anticipation of exactly
+this): the committed size is $\sum_t n_t u_t$, with all columns of slot $t$
+having height exactly $n_t$ --- non-power-of-two counts are native.
+Because the union's virtual layout is itself BatchMajor
+(\S\ref{sec:union}), the committed stack is simply the union buffer with
+dummy rows and useless columns omitted --- commitment and address space
+share one orientation, with no transpose anywhere in the pipeline. Commit
+the dense stack with Ligerito, and transport each virtual claim
+$\hat z_t(\rho)$ to the dense polynomial via the jagged sumcheck
+(\code{pcs/jagged.rs}, branch \code{jagged-assist}):
+\code{col\_prefix\_sums} --- derived per proof from the public counts ---
+encodes the layout, and the branching-program evaluator $\hat f_t$, with
+the ``assist'' delegation, keeps the verifier cheap. The virtual table
+beyond height $n_t$ is zero \emph{by definition} of this transport, which
+is what discharged the soundness obligation of Remark~\ref{rem:padding}.
+All transported claims are batched (random linear combination) into one
+jagged sumcheck and one Ligerito batch opening; the PIOP is oblivious to
+all of it.
+
+One consequence to watch: with per-proof counts, the jagged verifier's
+branching-program data is per-proof rather than fully precomputed --- this
+is precisely where the assist delegation earns its keep; the
+registry-determined part of the structure remains precomputable.
+
+\begin{remark}[The direct-commitment harness]\label{rem:harness}
+At full utilization ($n_t = 2^{\nu_t^{\max}}$ for all $t$) the union buffer
+is itself a dense power-of-two array, and it can be committed directly with
+today's \code{pcs::commit}; per-slot claims then transport \emph{trivially}:
+for $\rho \in \F^{m_t}$, let $x^\star \in \F^{M}$ be $\rho$ in coordinates
+$[0, m_t)$ and the bits of $p_t$ in coordinates $[m_t, M)$; then
+$\hat z(x^\star) = \hat z_t(\rho)$. (Proof: decompose $\hat z$ by slot; slot
+$t$'s prefix factor is $\eq(p_t, p_t) = 1$; for $t' \ne t$ with
+$m_{t'} \le m_t$ the factor is $\eq$ of two distinct Boolean strings $= 0$;
+for $m_{t'} > m_t$, if the top $M - m_{t'}$ bits of $p_t$ equaled $p_{t'}$,
+slot $t$'s address range would lie inside slot $t'$'s, contradicting
+disjointness.) This path is \textbf{not a protocol mode} and does not
+appear in the wire format. It exists as (i) the differential-testing
+harness for the union PIOP before and after the jagged layer lands, and
+(ii) a cheaply resurrectable fallback should the jagged composition stall
+--- the PIOP is identical under both transports.
+\end{remark}
+
+% ===========================================================================
+\section{Statement, transcript, wire format}\label{sec:statement}
+
+\paragraph{Statement digest and transcript.} The \emph{registry digest} ---
+format version, the ordered type list $(\text{type}_t, \kappa_t, u_t,
+\nu_t^{\max})$, and each base block's existing digest --- is one precomputed
+32-byte value. Per proof, the transcript absorbs, before any challenge is
+squeezed: the registry digest, the counts vector $(n_t)_t$, and the
+commitment root. New domain-separation labels (\code{flock-mixed-v1}, plus
+labels for the multi-size lincheck and the jagged transport) join the
+existing family. Counts affect only scalar bookkeeping --- run lists, fold
+extents, \code{col\_prefix\_sums} --- never the verifier's control flow.
+
+\paragraph{What a multi-table proof attests.} Exactly this: \emph{the
+commitment opens to tables with the declared counts, every declared row of
+which satisfies its type's hash relation.} The core deliberately carries
+no statement about the hashed values themselves --- no per-invocation
+input/output binding. All dataflow --- between tables, and between tables
+and the public statement --- is the job of a planned \emph{lookup/bus}
+layer built on top of this core (\S\ref{sec:open}): the core's only
+obligations toward it, both already met, are fixed column offsets per type
+(the \code{ChainLayout} region data) and cheap per-slot claims into the
+transport batch. Until the bus lands, mixed proofs are infrastructure and
+benchmarks, not application statements; today's single-type statements
+(hash chains, Merkle paths) are untouched and keep their existing
+claim-level glue.
+
+\paragraph{Capacity tiers.} If workloads vary wildly, the registry may
+offer a few \emph{capacity tiers} (small/medium/large instantiations of the
+same type list); selecting a tier selects a registry digest. Each doubling
+of capacity costs one static sumcheck round; see \S\ref{sec:open}.
+
+\paragraph{Wire format.} \code{proof\_io}: bump \code{VERSION} to 5; replace
+the single \code{hash\_kind} in the bundle with the registry (tier) id and
+the counts vector. CLI: \code{flock\_chain} gains
+a mix argument (e.g.\ \code{--mix blake3=1000,sha2=4096}); the existing
+single-hash flags become single-type mixes internally.
+
+% ===========================================================================
+\section{Cost accounting}\label{sec:costs}
+
+Let $N_{\mathrm{decl}} = \sum_t n_t k_t$ (declared area),
+$N_{\mathrm{com}} = \sum_t n_t u_t$ (committed size), $T$ = types.
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+ & \textbf{cost} \\
+\midrule
+Witness generation & per-type closures over declared rows; nothing for dummies \\
+Commit & Ligerito on $N_{\mathrm{com}}$ (actual data, useful columns only) \\
+Zerocheck prover & $O(N_{\mathrm{decl}})$; static $M$ rounds; skip intact \\
+Lincheck prover & $O(N_{\mathrm{decl}})$ folds $+$ $K$-round multi-size SC \\
+Jagged transport prover & $\tilde O(N_{\mathrm{com}})$ (one batched transport SC) \\
+Opening & one batched Ligerito open \\
+\midrule
+Verifier rounds & $M + K$ $+$ transport --- registry-static, count-independent \\
+Verifier matrix work & $O(\sum_t \nnz(A_t,B_t))$ \\
+Verifier bookkeeping & $O(T \cdot M)$ weights $+$ per-proof jagged data (assisted) \\
+Proof size & $+\,O(T)$ scalars over a single-table proof of equal area \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The headline: \textbf{the prover pays for declared work only} --- every
+per-invocation cost (witness gen, zerocheck folding, commit) matches the
+single-table system on the same workload; capacity costs only
+$M - \log_2 N_{\mathrm{decl}}$ extra sumcheck rounds, and mixing costs
+$O(T)$ scalars plus the (new, but size-independent-per-invocation) jagged
+transport. Relative to today's proofs, the committed area actually
+\emph{shrinks} by the useful-column ratio ($\approx 4$--$6\%$).
+
+% ===========================================================================
+\section{Roadmap}\label{sec:roadmap}
+
+Jagged is on the critical path for everything, so it lands first, in the
+smallest possible context.
+
+\begin{description}[leftmargin=1.6em, style=nextline]
+  \item[Phase 0 --- enablers (no behavior change).]
+    Registry/schedule types; \code{BlockR1cs} $\to$ slot schedule
+    (single-table $=$ one slot; all existing tests must pass unchanged);
+    run-list \code{PaddingSpec}; registry digest. Gate: existing
+    single-hash proofs byte-stable (modulo version field) and benchmarks
+    flat.
+  \item[Phase 1 --- jagged under the existing single-table system.]
+    Wire the \code{jagged-assist} transport beneath today's statements
+    (one-type registry): same proofs, new commitment path, so every
+    existing test and benchmark is a correctness and throughput oracle.
+    Validate the BatchMajor-native design here, by measurement: the
+    row-bit skip kernels (skip group $=$ one packed \code{u64} of a
+    column, \S\ref{sec:skip}), the bit-sliced constraint application, and
+    the claim pipeline's handling of univariate-coordinate-in-row points
+    --- the design's one throughput-critical unknown, moved to the front.
+    Gate: single-hash throughput within an agreed margin of the direct
+    path; useful-column area saving realized.
+  \item[Phase 2 --- the union PIOP and dynamic counts (mixed proofs ship).]
+    Union zerocheck (count-derived run lists); multi-size lincheck
+    (\S\ref{sec:multisize}(a), with (b) as fallback); per-slot witness
+    closures in the existing drivers; counts in the
+    transcript; wire format v5; CLI \code{--mix}. Internal milestone: the
+    union PIOP differentially tested at full utilization against the
+    direct-commitment harness (Remark~\ref{rem:harness}). Gates: mixed
+    BLAKE3$+$SHA-256 proof verifies end-to-end; prover time tracks
+    \emph{declared} work across utilization levels; verifier time flat
+    across utilization levels; throughput within noise of the weighted
+    average of the single-hash provers on the same workload.
+\end{description}
+
+Independent invocations keep every phase per-table testable: any mixed
+proof can be differentially tested against the corresponding single-table
+proofs on the same witnesses.
+
+% ===========================================================================
+\section{Open questions}\label{sec:open}
+
+\begin{enumerate}[nosep]
+  \item \textbf{BatchMajor-native skip (Phase 1).} The design adopts the
+        BatchMajor layout with the univariate skip over the six low
+        \emph{row} bits (\S\ref{sec:skip}) --- single buffer from witness
+        generation through commit through PIOP. Hypotheses to validate by
+        measurement: (a) vertical-group skip kernels (one packed
+        \code{u64} per group) match or beat today's horizontal-group
+        kernels; (b) the packed-direct / ring-switch claim pipeline
+        accommodates evaluation points whose univariate coordinate sits
+        among the row coordinates. Fallback if either fails: dual buffers
+        --- a row-major working copy for the PIOP, BatchMajor for commit
+        --- via the existing tiled bit-transpose, at one extra pass and
+        $2\times$ witness memory.
+  \item \textbf{Capacity sizing.} How many tiers, and how large? Each
+        doubling of capacity costs one static sumcheck round and slightly
+        larger bookkeeping tables; exceeding capacity forces a proof
+        split. Leaning: a single generous area-balanced tier
+        (\S\ref{sec:model}), adding tiers only on demonstrated demand;
+        confirm against a workload model at Phase 2.
+  \item \textbf{Folding over empty capacity --- an implementation
+        pattern, not a hot loop.} The union fold factorizes per slot:
+        binding variables low to high, slot $t$ folds its own dense,
+        declared data for its first $m_t$ rounds (today's kernels,
+        verbatim) and then collapses to a single scalar; in every later
+        round it contributes $O(1)$ scalar work (the accumulated value
+        times the appropriate $\eq$ factors --- the implicit-batching
+        identity \eqref{eq:implicit-batch}, operationally). So ``prover
+        pays declared work'' is delivered by architecture --- per-slot
+        dense sub-folds plus an $O(T)$-per-round scalar tail --- with no
+        sparse iteration inside any hot loop. Residual work: the
+        round-polynomial accounting at slot-collapse boundaries, and an
+        adversarial benchmark at low utilization.
+  \item \textbf{Many types.} Verifier matrix work is linear in registry
+        size ($\sum_t \nnz$). If the registry grows past a handful of
+        types, the clean fix is Spartan-style preprocessing: commit each
+        base block's MLE once at registry-definition time and replace the
+        verifier's comb evaluation with one PCS opening per type;
+        assist-style delegation is the lighter-weight alternative. Not
+        needed initially.
+  \item \textbf{The lookup/bus layer (the designated follow-on).} All
+        dataflow --- table-to-table communication \emph{and} binding
+        hashed values to the public statement --- is to be provided by a
+        lookup/bus argument over the committed columns: rows emit and
+        consume tuples (e.g.\ (type, input, output)); a multiset-balance
+        argument (grand-product or log-derivative/LogUp style, realized as
+        additional sumchecks over committed columns) enforces that every
+        consumed tuple was emitted; public values enter as statement-side
+        injections into the bus. This integrates at claim level --- the
+        bus sumchecks emit evaluation claims into the same transport batch
+        --- so the multi-table core needs nothing from it beyond what
+        already holds (fixed column offsets per type, cheap per-slot
+        claims). It changes no decision in this document and deserves its
+        own design document.
+  \item \textbf{Internal-hash generality.} Orthogonal axis (Merkle/FS hash
+        is hard-coded SHA-256); out of scope here, noted for completeness.
+\end{enumerate}
+
+% ===========================================================================
+\appendix
+\section{Code touchpoint map}\label{app:code}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Area} & \textbf{Location (today)} & \textbf{Change} \\
+\midrule
+Instance & \code{flock-core/src/r1cs.rs} (\code{BlockR1cs}) & slot schedule; \code{apply\_a} per slot \\
+Zerocheck & \code{flock-core/src/zerocheck.rs} (\code{PaddingSpec}) & count-derived run lists; kernel unchanged \\
+Lincheck & \code{flock-core/src/lincheck.rs} & multi-size inner SC; prefix weights; \\
+ & (\code{LincheckCircuit}, \code{fold\_alpha\_batched}) & per-type comb reuse \\
+Commitment & \code{flock-core/src/pcs/jagged.rs} $+$ branch & wire in as the claim-transport layer \\
+Claim batching & \code{flock-core/src/pcs.rs} (\code{open\_batch\ldots}) & feeds the jagged transport batch \\
+Test harness & \code{flock-core/src/pcs/commit.rs} & direct commit at full utilization \\
+ & & (Remark~\ref{rem:harness}; tests only) \\
+Statement & \code{flock-core/src/r1cs.rs} (\code{statement\_digest}) & registry digest $+$ counts \\
+Witness gen & \code{flock-prover/src/r1cs\_hashes/common.rs} & drivers over per-slot closures \\
+Statement glue & \code{flock-prover/src/r1cs\_hashes/chain\_common.rs} & unchanged (single-type statements); \\
+ & & superseded later by the bus layer \\
+Wire/CLI & \code{flock-prover/src/proof\_io.rs}, \code{bin/flock\_chain.rs} & v5; registry id $+$ counts; \code{--mix} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

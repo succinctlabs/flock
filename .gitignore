@@ -55,3 +55,6 @@ autoresearch/
 
 # Local working notes (review docs, scratch write-ups) — not part of the project
 docs/local/
+
+# Built design-doc PDFs (source .tex files are tracked; PDFs are build output)
+docs/*.pdf
