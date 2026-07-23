@@ -781,16 +781,30 @@ exact: a packed word's address is $[\,\nu \text{ batch bits} \mid
 \text{column bits}\,]$ uniformly across slots, chunk-columns enumerate in
 address order, and $\hat f$ \emph{is} the jagged grid polynomial
 ($n = \nu$, $k = M - 7 - \nu$, heights $n_t$ words on used chunk-columns,
-$0$ elsewhere). Commit the dense stack with Ligerito, and transport the
-single claim $\hat f(\rho) = v_\rho$ via the jagged sumcheck with assist
-(\code{pcs/jagged.rs}): $z_{\mathrm{row}} = \rho[0{:}\nu]$,
-$z_{\mathrm{col}} = \rho[\nu{:}]$, with \code{col\_prefix\_sums} ---
-derived per proof from the public counts --- encoding the layout, and the
-branching-program evaluator $\hat f_t$, with the ``assist'' delegation,
-keeping the verifier cheap. The output is one dense claim
-$\hat q(\rho') = \alpha$, which Ligerito opens directly. The region
-beyond height $n_t$ is zero \emph{by definition} of this transport, which
-is what discharged the soundness obligation of Remark~\ref{rem:padding}.
+$0$ elsewhere). Commit the dense stack with Ligerito. The transport itself is
+\emph{fused into the opening}: since $\hat f(\rho) = \sum_e q[e]\,
+W_\rho(e)$ with $W_\rho(e) = \eq(\rho[0{:}\nu], \mathrm{row}(e))\cdot
+\eq(\rho[\nu{:}], \mathrm{col}(e))$ --- the region beyond height $n_t$
+is zero \emph{by definition}, which is what discharged the soundness
+obligation of Remark~\ref{rem:padding} --- Ligerito, itself an
+inner-product argument, proves $\langle q, W_\rho\rangle = v_\rho$
+directly with $W_\rho$ as its basis; no separate jagged sumcheck runs.
+The verifier's one remaining obligation is the basis MLE at Ligerito's
+final points: the recursion ends not at a point but at a prover vector
+$yr$ of length $2^{yr\_log\_n}$, requiring
+$\hat W_\rho(\mathrm{ris}\,\|\,\mathrm{bits}(y))$ for every $y$. These
+are supplied and bound by a \emph{send-and-spot-check} reduction: the
+prover sends the vector
+$\tilde b[y] = \hat W_\rho(\mathrm{ris}\,\|\,\mathrm{bits}(y))$; the
+verifier uses it in the final check, squeezes a fresh
+$r_{\mathrm{extra}}$, locally evaluates the MLE of the received
+$\tilde b$ at $r_{\mathrm{extra}}$, and requires equality with a
+single, unmodified assist evaluation
+$\hat f_t(\rho[0{:}\nu], \rho[\nu{:}], \mathrm{ris}\,\|\,r_{\mathrm{extra}})$
+--- by Schwartz--Zippel, a wrong $\tilde b$ survives with probability
+$yr\_log\_n/|\F|$. \code{col\_prefix\_sums}, derived per proof from the
+public counts, encodes the layout inside the branching-program evaluator
+$\hat f_t$.
 One sizing caveat: the committed length must be a power of two, and at
 single-table full utilization the dense stack rounds straight back to the
 padded length (BLAKE3 uses $121$ of $128$ chunk-columns, SHA-256 $246$ of
@@ -875,7 +889,7 @@ Zerocheck prover & $O(N_{\mathrm{decl}})$; static $M$ rounds; skip intact \\
 Lincheck prover & $O(N_{\mathrm{decl}})$ folds $+$ $(M{-}\nu)$-round union-column SC \\
 Ring-switch folds & $O(N_{\mathrm{decl}})$ (fused into the zerocheck/lincheck passes) \\
 Virtual-opening SC prover & $O(\text{support})$, $(M{-}7)$-round product SC \\
-Jagged transport prover & $\tilde O(N_{\mathrm{com}})$ (single-claim transport SC $+$ assist) \\
+Jagged transport (fused into Ligerito) & $\tilde O(N_{\mathrm{com}})$ ($W_\rho$ basis $+$ $\tilde b$/assist) \\
 Opening & one batched Ligerito open \\
 \midrule
 Verifier rounds & $M + K$ $+$ transport --- registry-static, count-independent \\
