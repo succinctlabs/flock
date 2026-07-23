@@ -29,7 +29,7 @@
 \newtheorem{definition}{Definition}
 
 \title{Multi-Table Proving in Flock:\\ One Proof for Heterogeneous Hash Batches\\[0.6ex]
-\large Design document --- working draft v0.3}
+\large Design document --- working draft v0.4}
 \author{Flock}
 \date{July 23, 2026}
 
@@ -55,8 +55,8 @@ batched per-table zerocheck with $\eq$-derived batching coefficients --- so
 batching comes for free, with plain single-instance soundness and almost no
 new zerocheck code. The genuinely new protocol work concentrates in the
 lincheck, which becomes a single sumcheck over the union's column domain. The commitment layer is the jagged (stacked-columns) scheme:
-only the used columns are committed, with the rest of the static address
-space existing purely virtually. There is one protocol mode; fixed
+only the declared rows of the used columns are committed, with the rest of
+the static address space existing purely virtually. There is one protocol mode; fixed
 workloads are simply the full-utilization special case.
 \end{abstract}
 
@@ -251,8 +251,8 @@ jagged grid polynomial, so union-level claims transport without per-slot
 decomposition (\S\ref{sec:commit}). The cost is only virtual: a
 rarely-used wide type is granted the same row capacity as the workhorse
 types, but undeclared capacity is address space, not sumcheck work
-(\S\ref{sec:zc-sparse}; the commit does pay capacity height on used
-columns until height-$n_t$ stacking lands, \S\ref{sec:commit}), and the
+(\S\ref{sec:zc-sparse}) --- nor commit work: under height-$n_t$ stacking
+the committed size is count-proportional (\S\ref{sec:commit}) --- and the
 round count exceeds that of an
 area-balanced registry ($\nu_t^{\max} + \kappa_t$ constant) by at most
 $\kappa_{\max} - \kappa_{\min}$ ($\le 3$ today). Non-uniform capacities
@@ -391,12 +391,13 @@ at $0$ marking the row as dummy; no witness-generation work is performed
 for dummy rows. Soundness needs nothing from them either: nothing in the
 system references dummy rows (the core binds no per-row IO at all,
 \S\ref{sec:statement}). Under the jagged commitment (\S\ref{sec:commit})
-the \emph{dropped} regions --- useless chunks and inter-slot gaps --- are
-zero \emph{by construction} of the transport, the prover having no freedom
-there to begin with; dummy rows, which under the implemented
-capacity-height stacking remain inside the committed columns, are
-constrained like every other row by the zerocheck and marked dummy by the
-lincheck's count-derived pin target (Remark~\ref{rem:pinbind}). In any gap
+dummy rows are \emph{dropped} from the committed stack, along with the
+useless chunks and the inter-slot gaps (height-$n_t$ stacking); every
+dropped word of the padded virtual buffer is zero --- the partial witness
+drivers zero dummy rows (pin included) and never write useless columns or
+gaps, an invariant the transport debug-asserts --- and the declared rows
+are marked by the lincheck's count-derived pin target
+(Remark~\ref{rem:pinbind}). In any gap
 region beyond the last slot, $A$ and $B$ have zero rows
 and $C = I$, so the constraint reads $0 \cdot 0 = z(x)$, \emph{forcing}
 zero. Padding therefore needs no soundness caveats; its only cost is
@@ -720,10 +721,10 @@ $\hat g(c^*)$ --- plus, on single-type statements, the existing glue
 claims (a future lookup/bus layer will add its own, \S\ref{sec:open}).
 The commitment layer
 turns these into openings of \emph{one} committed polynomial while
-committing \textbf{only the used chunk-columns}: the dead part of the
-capacity-sized address space of \S\ref{sec:union} exists purely virtually
-(dummy rows, for now, ride along as zeros inside the used columns ---
-Reduction 2 below). The pipeline is best
+committing \textbf{only the declared rows of the used chunk-columns}: the
+dead part of the capacity-sized address space of \S\ref{sec:union} ---
+dummy rows included --- exists purely virtually (Reduction 2 below). The
+pipeline is best
 understood as \textbf{three polynomials and two reductions}:
 \begin{enumerate}[nosep]
   \item the \emph{sparse bit polynomial} $\hat z$ ($M$ variables): the
@@ -791,41 +792,47 @@ the support), while the verifier's costs --- the static round count and
 one polylog $\hat b(\rho)$ evaluation --- are oblivious to the sparsity
 pattern.
 
-\paragraph{Reduction 2: the jagged transport.} Stack only the \emph{used}
-chunk-columns of all tables contiguously (column-major per table --- the
-\code{BatchMajor} witness layout, added in anticipation of exactly this),
-dropping the useless chunks and the inter-slot gaps but keeping every used
-column at its full \textbf{capacity height}: slot $t$ contributes
-$\lceil u_t/128\rceil$ chunk-columns of $2^{\nu}$ words each, dummy rows
-riding along as zeros, so the committed size is
-$\bigl(\sum_t 2^{\nu}\,\lceil u_t/128\rceil \cdot 128\bigr)$ bits, padded
-up to a power of two (stacking granularity is the $128$-variable
-chunk-column; the sub-chunk remainder is negligible). The jagged heights
-are therefore \textbf{registry-static} --- capacity on used columns, $0$
-elsewhere --- and the counts do not affect the commitment layout at all:
-they bind through the transcript (\S\ref{sec:statement}) and through the
-lincheck's count-derived pin target (Remark~\ref{rem:pinbind}).
-\emph{Height-$n_t$ stacking} --- dropping the dummy rows too, making the
-committed size the count-proportional
-$\sum_t n_t \lceil u_t/128\rceil \cdot 128$ bits, with non-power-of-two
-counts native --- is the deferred future optimization; capacity-height
-columns keep the identification with the padded buffer immediate, every
-\emph{dropped} word being zero by construction. Because the union's
-virtual layout is itself BatchMajor (\S\ref{sec:union}), the committed
-stack is simply the union buffer with useless chunks and gaps omitted ---
+\paragraph{Reduction 2: the jagged transport.} Stack only the
+\emph{declared} rows of the \emph{used} chunk-columns of all tables
+contiguously (column-major per table --- the \code{BatchMajor} witness
+layout, added in anticipation of exactly this), dropping the dummy rows,
+the useless chunks, and the inter-slot gaps. This is \emph{height-$n_t$
+stacking}, as implemented: slot $t$ contributes $\lceil u_t/128\rceil$
+chunk-columns of $n_t$ words each --- the declared count, an arbitrary
+integer in $[0, 2^{\nu}]$; non-power-of-two counts are native --- so the
+un-padded dense size is the count-proportional
+$\sum_t n_t\,\lceil u_t/128\rceil$ packed words (stacking granularity is
+the $128$-variable chunk-column; the sub-chunk remainder is negligible).
+The committed size is this rounded up to a power of two,
+\textbf{floored} at the smallest embedded Ligerito security
+configuration ($m22$: $2^{15}$ packed words --- configurations are
+derived and embedded per committed size) and capped at the union's own
+padded size, so the dense domain never exceeds the virtual one. The
+jagged heights are therefore \textbf{per-proof} --- $n_t$ on slot $t$'s
+used columns, $0$ elsewhere --- derived by prover and verifier alike
+from the \emph{public} counts, never from the bundle; a wrong declared
+count thus diverges in the commitment layout itself, in addition to the
+transcript binding (\S\ref{sec:statement}) and the lincheck's
+count-derived pin target (Remark~\ref{rem:pinbind}). Because the
+union's virtual layout is itself BatchMajor (\S\ref{sec:union}), the
+committed stack is simply the union buffer with dummy rows, useless
+chunks, and gaps omitted ---
 commitment and address space share one orientation, with no transpose
 anywhere in the pipeline. Under the uniform-capacity convention the
 identification is exact: a packed word's address is $[\,\nu \text{ batch
 bits} \mid \text{column bits}\,]$ uniformly across slots, chunk-columns
 enumerate in address order, and $\hat f$ \emph{is} the jagged grid
-polynomial ($n = \nu$, $k = M - 7 - \nu$, registry-static heights $2^\nu$
-words on used chunk-columns, $0$ elsewhere). Commit the dense stack with
-Ligerito. The transport itself is
+polynomial ($n = \nu$, $k = M - 7 - \nu$, per-proof heights $n_t$ words
+on slot $t$'s used chunk-columns, $0$ elsewhere). Commit the dense stack
+with Ligerito. The transport itself is
 \emph{fused into the opening}: since $\hat f(\rho) = \sum_e q[e]\,
 W_\rho(e)$ with $W_\rho(e) = \eq(\rho[0{:}\nu], \mathrm{row}(e))\cdot
-\eq(\rho[\nu{:}], \mathrm{col}(e))$ --- the dropped region is zero
-\emph{by definition}, which is what discharged the soundness obligation
-of Remark~\ref{rem:padding} for it --- Ligerito, itself an
+\eq(\rho[\nu{:}], \mathrm{col}(e))$ --- every dropped word of the padded
+buffer is zero, dummy rows by the partial-driver contract of
+Remark~\ref{rem:padding} (debug-asserted by the transport's compaction)
+and useless columns and gaps by construction, which is what keeps the
+fused-opening identity $\ip{q}{W_\rho} = \hat f(\rho)$ intact (the
+deleted terms of $\hat f(\rho)$ were all zero) --- Ligerito, itself an
 inner-product argument, proves $\langle q, W_\rho\rangle = v_\rho$
 directly with $W_\rho$ as its basis; no separate jagged sumcheck runs.
 The verifier's one remaining obligation is the basis MLE at Ligerito's
@@ -841,25 +848,24 @@ $\tilde b$ at $r_{\mathrm{extra}}$, and requires equality with a
 single, unmodified assist evaluation
 $\hat f_t(\rho[0{:}\nu], \rho[\nu{:}], \mathrm{ris}\,\|\,r_{\mathrm{extra}})$
 --- by Schwartz--Zippel, a wrong $\tilde b$ survives with probability
-$yr\_log\_n/|\F|$. \code{col\_prefix\_sums}, derived once from the
-registry's used-column map (registry-static under capacity-height
-stacking), encodes the layout inside the branching-program evaluator
-$\hat f_t$.
-One sizing caveat, sharpened by implementation: the committed length must
-be a power of two, and under capacity-height stacking a registry of
-\emph{column-dense} types can never save committed area. BLAKE3 uses
-$121$ of its $128$ chunk-columns and SHA-256 $246$ of $256$, so each
-contributes more than half of its padded slot and \emph{any}
-BLAKE3$+$SHA-256 mix rounds straight back to the padded power of two
-($367$ of $512$ columns for the two-type registry). Area savings under
-this stacking require a \emph{column-sparse} type --- Keccak's walker
-layout uses roughly $333$ of $512$ --- and \emph{count-proportional}
-savings require height-$n_t$ stacking.
+$yr\_log\_n/|\F|$. \code{col\_prefix\_sums}, derived \emph{per proof}
+from the public counts (the jagged heights are count-dependent under
+height-$n_t$ stacking), encodes the layout inside the branching-program
+evaluator $\hat f_t$.
+The sizing fact, sharpened by implementation: above the $m22$ config
+floor the committed size is \textbf{count-proportional} --- the
+power-of-two rounding costs at most $2\times$, and the floor binds only
+when the dense area falls below $2^{15}$ packed words. (The
+capacity-height column-dense rounding effect of the previous draft ---
+column-dense registries like BLAKE3$+$SHA-256, at $121$ of $128$ and
+$246$ of $256$ chunk-columns, rounding straight back to the padded power
+of two --- survives only at full utilization, where the dense area is
+the used-column capacity area.)
 
-One consequence worth recording: under capacity-height stacking the
-jagged verifier's branching-program layout data is registry-static and
-fully precomputable; it becomes per-proof only under height-$n_t$
-stacking --- where the assist delegation, already in place, earns its
+One consequence worth recording: under height-$n_t$ stacking the jagged
+verifier's branching-program layout data (heights,
+\code{col\_prefix\_sums}) is per-proof, derived from the public counts
+--- which is where the assist delegation, already in place, earns its
 keep a second time.
 
 \begin{remark}[The direct-commitment harness]\label{rem:harness}
@@ -894,10 +900,13 @@ $(n_t)_t$, and the commitment root. New domain-separation labels
 \code{flock-virtual-open-v0} for the virtual-opening sumcheck) join the
 existing family; the union lincheck keeps \code{flock-lincheck-v0},
 differing from the single-table transcript only through its inputs.
-Counts affect only scalar bookkeeping --- run lists, fold extents, the
-lincheck's count-derived pin target (Remark~\ref{rem:pinbind}) --- never
-the verifier's control flow, and (under capacity-height stacking,
-\S\ref{sec:commit}) not the commitment layout either.
+Counts affect scalar bookkeeping --- run lists, fold extents, the
+lincheck's count-derived pin target (Remark~\ref{rem:pinbind}) --- and,
+under height-$n_t$ stacking (\S\ref{sec:commit}), the committed size:
+both sides derive the dense length, hence the Ligerito configuration
+(selected per proof from the embedded per-size table), from the public
+counts, never from the bundle. The PIOP's round structure and the
+verifier's control flow otherwise stay registry-static.
 
 \paragraph{What a multi-table proof attests.} Exactly this: \emph{the
 commitment opens to tables with the declared counts, every declared row of
@@ -936,9 +945,10 @@ single-hash chain statements keep their own flavor and path, untouched.
 \section{Cost accounting}\label{sec:costs}
 
 Let $N_{\mathrm{decl}} = \sum_t n_t k_t$ (declared area),
-$N_{\mathrm{com}} = \sum_t 2^{\nu} \lceil u_t/128\rceil \cdot 128$
-(committed size under capacity-height stacking, \S\ref{sec:commit};
-$\sum_t n_t u_t$ once height-$n_t$ stacking lands), $T$ = types.
+$N_{\mathrm{com}} = \sum_t n_t \lceil u_t/128\rceil$ packed words (the
+count-proportional dense size under height-$n_t$ stacking, committed
+after rounding up to a power of two and flooring at the $m22$ config,
+\S\ref{sec:commit}), $T$ = types.
 
 \begin{center}
 \begin{tabular}{@{}ll@{}}
@@ -946,7 +956,7 @@ $\sum_t n_t u_t$ once height-$n_t$ stacking lands), $T$ = types.
  & \textbf{cost} \\
 \midrule
 Witness generation & per-type closures over declared rows; nothing for dummies \\
-Commit & Ligerito on $N_{\mathrm{com}}$ (used chunk-columns, capacity height) \\
+Commit & Ligerito on $N_{\mathrm{com}}$ (declared rows of used chunk-columns --- count-proportional) \\
 Zerocheck prover & $O(N_{\mathrm{decl}})$; static $M$ rounds; skip intact \\
 Lincheck prover & $O(N_{\mathrm{decl}})$ folds $+$ $(M{-}\nu)$-round union-column SC \\
 Ring-switch folds & $O(N_{\mathrm{decl}})$ (fused into the zerocheck/lincheck passes) \\
@@ -954,9 +964,9 @@ Virtual-opening SC prover & $O(\text{support})$, $(M{-}7)$-round product SC \\
 Jagged transport (fused into Ligerito) & $\tilde O(N_{\mathrm{com}})$ ($W_\rho$ basis $+$ $\tilde b$/assist) \\
 Opening & one batched Ligerito open \\
 \midrule
-Verifier rounds & $M + K$ $+$ transport --- registry-static, count-independent \\
+Verifier rounds & $M + K$ registry-static; transport rounds sized by the per-proof $N_{\mathrm{com}}$ \\
 Verifier matrix work & $O(\sum_t \nnz(A_t,B_t))$ \\
-Verifier bookkeeping & $O(T \cdot M)$ weights $+$ registry-static jagged layout data (assisted) \\
+Verifier bookkeeping & $O(T \cdot M)$ weights $+$ per-proof jagged layout data from the counts (assisted) \\
 Proof size & $+\,O(T)$ scalars over a single-table proof of equal area \\
 \bottomrule
 \end{tabular}
@@ -967,10 +977,11 @@ witness generation and zerocheck folding match the single-table system on
 the same workload; capacity costs only $M - \log_2 N_{\mathrm{decl}}$
 extra sumcheck rounds, and mixing costs $O(T)$ scalars plus the (new, but
 size-independent-per-invocation) jagged transport. The commit pays for
-used columns at capacity height, becoming count-proportional only with
-height-$n_t$ stacking (\S\ref{sec:commit}); the useful-column ratio
-($\approx 4$--$6\%$) is recovered before padding but returned by the
-power-of-two rounding on column-dense registries.
+the declared rows of the used columns --- count-proportional above the
+$m22$ config floor under height-$n_t$ stacking (\S\ref{sec:commit}),
+with the power-of-two rounding costing at most $2\times$; the
+column-dense rounding effect (the useful-column ratio returned by the
+rounding) survives only at full utilization.
 
 % ===========================================================================
 \section{Roadmap}\label{sec:roadmap}
@@ -1008,9 +1019,12 @@ smallest possible context.
     \emph{declared} work across utilization levels; verifier time flat
     across utilization levels; throughput within noise of the weighted
     average of the single-hash provers on the same workload;
-    committed-area saving demonstrated for column-sparse shapes
-    (count-proportional saving deferred to height-$n_t$ stacking,
-    \S\ref{sec:commit}).
+    count-proportional committed-area saving delivered by height-$n_t$
+    stacking (\S\ref{sec:commit}) --- the measured gate: BLAKE3$+$SHA-256
+    at $\nu = 7$, counts $(32, 32)$, commits $2^{15}$ words (the $m22$
+    config floor) against capacity-height stacking's $2^{16}$; at
+    $\nu = 10$ low utilization the saving reaches $16\times$ ($2^{15}$
+    vs $2^{19}$ committed words).
 \end{description}
 
 Independent invocations keep every phase per-table testable: any mixed
@@ -1024,7 +1038,12 @@ the roadmap prescribes: every step landed behind a single-slot
 byte-identity differential against the direct path (the whole proof
 bundle asserted byte-identical, not merely accepted), with brute-force
 MLE cross-checks for the $T = 2$ lincheck; the direct-commitment harness
-(Remark~\ref{rem:harness}) remains a live regression anchor.
+(Remark~\ref{rem:harness}) remains a live regression anchor. Height-$n_t$
+stacking (M5) has since landed, making the committed size
+count-proportional (\S\ref{sec:commit}) with the area numbers of the
+Phase 2 gate above: BLAKE3$+$SHA-256 at $\nu = 7$, counts $(32, 32)$,
+commits $2^{15}$ words against capacity-height's $2^{16}$, and $16\times$
+fewer at $\nu = 10$ low utilization.
 
 Measured at $m = 30$ BLAKE3 on Apple silicon: the direct path proves at
 roughly $600$--$620$k compressions/s; the jagged/union pipeline runs at
@@ -1033,11 +1052,10 @@ cost (virtual-opening sumcheck $\approx 3.9$, $W_\rho$ basis
 $\approx 2.0$, $\tilde b$ $+$ assist $\approx 2.7$) --- with verification
 at parity ($\approx 10.5$\,ms) and proof size $+0.7\%$. Mixed proofs cost
 $\approx 1.02\times$ the sum of the corresponding single-type proofs; the
-CLI's mixed proof of \code{blake3=100,sha2=37} is $\approx 285$\,KB,
+CLI's mixed proof of \code{blake3=100,sha2=37} is $\approx 274$\,KB,
 proving and verifying in $\approx 0.3$\,s each.
 
-Open follow-ups, in the order they are likely to matter: height-$n_t$
-stacking (count-proportional committed size, \S\ref{sec:commit});
+Open follow-ups, in the order they are likely to matter:
 support-proportional lincheck/ring-switch folds plus the ring-switch
 \code{ChunkPadding} multi-run (\S\ref{sec:open}); a Keccak batch-major
 driver (the registry machinery accepts the type; only the driver is
@@ -1051,11 +1069,12 @@ missing); and the lookup/bus layer (\S\ref{sec:open}).
         batching is fully resolved by architecture (\S\ref{sec:commit}:
         it lives on reduction 1, in existing $\gamma$-machinery; the
         transport always carries one claim). The Ligerito-configuration
-        question dissolved under capacity-height stacking: the dense size
-        is registry-static --- one per tier, count-independent
-        (\code{dense\_m}) --- so each tier names exactly one security
-        configuration at registry-definition time; height-$n_t$ stacking
-        would revive the per-size enumeration. The virtual-opening
+        question is settled by per-size enumeration: under height-$n_t$
+        stacking the dense size (\code{dense\_m}) is count-dependent, so
+        security configurations are derived and embedded per committed
+        size and the configuration is selected \emph{per proof} from the
+        public counts, floored at the smallest embedded configuration
+        ($m22$, \S\ref{sec:commit}). The virtual-opening
         sumcheck's domain label (\code{flock-virtual-open-v0}) and
         transcript position are pinned. Still open: the ring-switch
         \code{ChunkPadding} multi-run fallback (currently no-skip,
