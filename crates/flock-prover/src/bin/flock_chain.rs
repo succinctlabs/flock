@@ -339,6 +339,15 @@ fn cmd_prove_mix(mix: MixSpec, args: Args) -> Result<(), String> {
     let t = Instant::now();
     let (proof, commitment, _claim) = setup.prove(&sha2_inputs, &blake3_inputs, mode, &mut ch);
     eprintln!("  prove_mixed: {:.2}s", t.elapsed().as_secs_f64());
+    // Height-n_t stacking: the committed dense stack is count-proportional
+    // (floored at the m22 Ligerito config); capacity-height stacking would
+    // have committed the full 2^(M-7) padded words.
+    eprintln!(
+        "  committed: 2^{} words (m = {}; capacity-height would be 2^{})",
+        commitment.params.m - 7,
+        commitment.params.m,
+        id.nu() + 16 - 7,
+    );
 
     let bundle = MixedProofBundleLigerito {
         registry_id: id,

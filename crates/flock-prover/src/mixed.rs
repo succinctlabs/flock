@@ -154,11 +154,16 @@ impl MixedSetup {
         UnionInstance::new(&self.registry, vec![counts.sha2, counts.blake3])
     }
 
-    /// PCS params of the tier's dense-stack commit for a profile: the
-    /// committed size is `dense_m` (registry-static), rate from the
-    /// profile, `log_batch_size = 6` as the single-type setups.
-    pub fn pcs_params(&self, profile: LigeritoProfile) -> PcsParams {
-        let union = self.union(MixedCounts { sha2: 0, blake3: 0 });
+    /// PCS params of the dense-stack commit for the declared counts and a
+    /// profile: the committed size is the per-proof `dense_m` —
+    /// count-dependent under height-`n_t` stacking, floored at the m22
+    /// Ligerito config (`UnionInstance::committed_words`) — rate from the
+    /// profile, `log_batch_size = 6` as the single-type setups. Both sides
+    /// derive it from the public counts: the prover from its inputs, the
+    /// verifier from the declared counts, so a tampered bundle
+    /// `PcsParams.m` cannot redirect verification.
+    pub fn pcs_params(&self, counts: MixedCounts, profile: LigeritoProfile) -> PcsParams {
+        let union = self.union(counts);
         PcsParams {
             m: union.dense_m(),
             log_inv_rate: profile.log_inv_rate(),
@@ -184,7 +189,7 @@ impl MixedSetup {
             blake3: blake3_inputs.len(),
         };
         let union = self.union(counts);
-        let pcs_params = self.pcs_params(profile);
+        let pcs_params = self.pcs_params(counts, profile);
         let slots = vec![
             UnionSlotProverInput::new(
                 sha2::generate_witness_batch_major_partial(sha2_inputs, nu),
@@ -201,8 +206,8 @@ impl MixedSetup {
     /// Verify a mixed proof against the declared counts. The Ligerito
     /// profile is recovered from the commitment's `PcsParams` (as the
     /// single-type CLI does); the remaining params are re-derived from the
-    /// tier, so a tampered `PcsParams.m`/rate/batch in the bundle cannot
-    /// redirect verification.
+    /// tier and the declared counts, so a tampered `PcsParams.m`/rate/batch
+    /// in the bundle cannot redirect verification.
     pub fn verify<Ch: Challenger>(
         &self,
         counts: MixedCounts,
@@ -211,7 +216,7 @@ impl MixedSetup {
         challenger: &mut Ch,
     ) -> Result<R1csClaim, VerifyError> {
         let union = self.union(counts);
-        let pcs_params = self.pcs_params(commitment.params.profile);
+        let pcs_params = self.pcs_params(counts, commitment.params.profile);
         let circuits: [&dyn LincheckCircuit; 2] = [
             self.sha2_r1cs.csc_lincheck_circuit(),
             self.blake3_r1cs.csc_lincheck_circuit(),
@@ -268,25 +273,39 @@ mod tests {
         assert!(bincode::deserialize::<MixedRegistryId>(&[0u8]).is_err());
     }
 
-    /// The tier registry reproduces the geometry the M3/M4 mixed tests pin:
-    /// slot order SHA-256 then BLAKE3, M = nu + 16, and the dense-stack
-    /// sizes (367 of 512 used chunk-columns — committed words equal padded
-    /// at this ratio, compaction non-identity).
+    /// The tier registry reproduces the geometry the M3/M4/M5 mixed tests
+    /// pin: slot order SHA-256 then BLAKE3, M = nu + 16, and the
+    /// height-`n_t` dense-stack sizes — count-proportional (367 used
+    /// chunk-columns: 246 SHA-256 + 121 BLAKE3), floored at the m22
+    /// Ligerito config, reaching M4's capacity-height size only at full
+    /// utilization.
     #[test]
     fn tier_geometry() {
         let setup = MixedSetup::new(MixedRegistryId::Blake3Sha2Nu7);
         assert_eq!(setup.registry.m_total(), 23);
-        let union = setup.union(MixedCounts {
+        // The CLI's flagship mix: counts (100, 37) — dense
+        // 100·246 + 37·121 = 29 077 words → committed 2^15 (m = 22), HALF
+        // of M4's capacity-height 2^16 (m = 23).
+        let counts = MixedCounts {
             sha2: 100,
             blake3: 37,
-        });
-        assert_eq!(union.dense_words(), (246 + 121) << 7);
-        assert_eq!(union.dense_m(), 23);
+        };
+        let union = setup.union(counts);
+        assert_eq!(union.dense_words(), 100 * 246 + 37 * 121);
+        assert_eq!(union.dense_m(), 22);
         assert!(!union.compaction_is_identity());
         assert_eq!(
-            setup.pcs_params(LigeritoProfile::Fast).m,
-            23,
-            "nu7 tier commits at m = 23"
+            setup.pcs_params(counts, LigeritoProfile::Fast).m,
+            22,
+            "nu7 tier at counts (100, 37) commits at m = 22"
         );
+        // Full utilization recovers M4's capacity-height size.
+        let full = MixedCounts {
+            sha2: 128,
+            blake3: 128,
+        };
+        assert_eq!(setup.union(full).dense_words(), (246 + 121) << 7);
+        assert_eq!(setup.union(full).dense_m(), 23);
+        assert_eq!(setup.pcs_params(full, LigeritoProfile::Fast).m, 23);
     }
 }

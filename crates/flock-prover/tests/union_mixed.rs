@@ -98,10 +98,12 @@ fn mixed_registry(nu: usize) -> (Registry, BlockR1cs, BlockR1cs) {
     (registry, sha2_r1cs, blake3_r1cs)
 }
 
-/// PCS params over the committed DENSE stack (M4): `m = dense_m` — the
-/// compacted stack's variable count, not the union's `M` (for the
-/// BLAKE3+SHA-256 registry the two coincide numerically: 367 of 512 used
-/// columns round back to the padded power of two). Rate, batch size, and
+/// PCS params over the committed DENSE stack: `m = dense_m` — the
+/// compacted stack's variable count, not the union's `M`. Count-dependent
+/// under height-`n_t` stacking (M5), floored at the m22 Ligerito config;
+/// at ν = 6 the padded size 2^15 IS the floor, so every count vector in
+/// these tests commits `m = 22` (the count-proportional shrink needs
+/// ν ≥ 7 — see `mixed_area_saving_roundtrip`). Rate, batch size, and
 /// profile match the single-type setups.
 fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
     PcsParams {
@@ -128,10 +130,11 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     );
     let union = UnionInstance::new(&registry, vec![n_per_type, n_per_type]);
     let pcs_params = union_pcs_params(&union);
-    // The M4 dense-stack shape on this registry: 367 of 512 chunk-columns
-    // used (SHA-256 246/256, BLAKE3 121/128; the top quarter is the gap), a
-    // genuinely non-identity compaction (BLAKE3's columns stack at 246, not
-    // 256), rounding back to the padded word count at this ratio.
+    // The dense-stack shape on this registry at FULL utilization (heights =
+    // capacity, M4's grid exactly): 367 of 512 chunk-columns used (SHA-256
+    // 246/256, BLAKE3 121/128; the top quarter is the gap), a genuinely
+    // non-identity compaction (BLAKE3's columns stack at 246, not 256),
+    // rounding back to the padded word count at this ratio.
     assert!(!union.compaction_is_identity());
     assert_eq!(union.dense_words(), (246 + 121) << nu);
     assert_eq!(union.committed_words(), 1 << (union.m_total() - 7));
@@ -208,9 +211,10 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
 
     // ---- Tamper: wrong counts vector. The binding absorbs the counts
     // before any challenge, so a verifier declaring different counts walks
-    // a diverged transcript from the first squeeze (the lincheck's
-    // count-derived const-pin target would also mismatch downstream; the
-    // jagged heights are count-independent since M4) — reject.
+    // a diverged transcript from the first squeeze (downstream, the
+    // lincheck's count-derived const-pin target would also mismatch, and —
+    // since M5's height-n_t stacking — so would the count-derived jagged
+    // heights/col_prefix_sums of the opening) — reject.
     {
         let union_bad = UnionInstance::new(&registry, vec![n_per_type, n_per_type - 1]);
         assert!(
@@ -272,13 +276,17 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     }
 }
 
-/// M4 — partial utilization (dynamic counts): mixed roundtrips at several
-/// count vectors, including non-powers-of-two and a zero count for one
-/// type, through the partial batch-major drivers (dummy rows identically
-/// zero — pin included). Verifies acceptance at every utilization, rejects
-/// wrong-count tampering against the partial proof, and prints verify wall
-/// times across utilizations (informational — the verifier's control flow
-/// is registry-static, so times should be flat).
+/// M4/M5 — partial utilization (dynamic counts): mixed roundtrips at
+/// several count vectors, including non-powers-of-two and a zero count for
+/// one type, through the partial batch-major drivers (dummy rows
+/// identically zero — pin included). Under height-`n_t` stacking every
+/// partial vector here exercises genuinely truncated jagged columns
+/// (heights 50/37/0 < 64) and per-proof col_prefix_sums; the committed
+/// LENGTH stays 2^15 words throughout only because ν = 6's padded size
+/// equals the m22 config floor. Verifies acceptance at every utilization,
+/// rejects wrong-count tampering against the partial proof, and prints
+/// verify wall times across utilizations (informational — the verifier's
+/// control flow is registry-static, so times should be flat).
 #[test]
 #[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
 fn mixed_partial_counts_roundtrip_and_tamper() {
@@ -301,6 +309,10 @@ fn mixed_partial_counts_roundtrip_and_tamper() {
         assert!(n_sha2 <= capacity && n_blake3 <= capacity);
         let union = UnionInstance::new(&registry, counts.to_vec());
         let pcs_params = union_pcs_params(&union);
+        // ν = 6: the padded size 2^15 IS the m22 config floor, so every
+        // count vector commits m = 22 — but with genuinely truncated
+        // count-height columns inside the stack.
+        assert_eq!(pcs_params.m, 22);
         let blake3_inputs = random_blake3_inputs(&mut rng, n_blake3);
         let sha2_inputs = random_sha2_inputs(&mut rng, n_sha2);
 
@@ -356,6 +368,83 @@ fn mixed_partial_counts_roundtrip_and_tamper() {
     for (counts, ms) in &verify_ms {
         println!("  counts (sha2, blake3) = {counts:?}: {ms:.1} ms");
     }
+}
+
+/// M5 — THE area gate, end to end: at ν = 7 (M = 23, padded 2^16 words) a
+/// partial-utilization mix at counts (32, 32) commits the height-`n_t`
+/// dense stack of 32·(246 + 121) = 11 744 words → 2^15 committed words
+/// (the m22 config floor) — HALF of M4's capacity-height 2^16 — and the
+/// proof roundtrips through the smaller commitment. Wrong-count tampering
+/// still rejects (transcript binding first; the count-derived
+/// heights/col_prefix_sums would diverge downstream too). The committed
+/// size is asserted from the returned commitment, not just the sizing
+/// arithmetic.
+#[test]
+#[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
+fn mixed_area_saving_roundtrip() {
+    let nu = 7usize; // capacity 128 per type; padded 2^16 words
+    let counts = [32usize, 32usize]; // (sha2, blake3), quarter utilization
+    let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
+    assert_eq!(registry.m_total(), 23);
+    let union = UnionInstance::new(&registry, counts.to_vec());
+    // The halving: dense 11 744 words → committed 2^15 (config floor;
+    // next_pow2 alone would give 2^14) vs M4's capacity-height 2^16.
+    assert_eq!(union.dense_words(), 11_744);
+    assert_eq!(union.committed_words(), 1 << 15);
+    assert_eq!(union.dense_m(), 22);
+    assert_eq!(
+        2 * union.committed_words(),
+        1 << (union.m_total() - 7),
+        "counts (32, 32) must commit HALF of the capacity-height size"
+    );
+    let pcs_params = union_pcs_params(&union);
+
+    let mut rng = Rng::new(0x05_31_2B_B3);
+    let sha2_inputs = random_sha2_inputs(&mut rng, counts[0]);
+    let blake3_inputs = random_blake3_inputs(&mut rng, counts[1]);
+    let sha2_circuit = sha2_r1cs.csc_lincheck_circuit();
+    let blake3_circuit = blake3_r1cs.csc_lincheck_circuit();
+
+    let slots = vec![
+        UnionSlotProverInput::new(
+            sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+            sha2_circuit,
+        ),
+        UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+            blake3_circuit,
+        ),
+    ];
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (proof, commitment, claim) =
+        prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch_p);
+    assert_eq!(
+        commitment.params.m, 22,
+        "the produced commitment must be to the 2^15-word dense stack"
+    );
+
+    let circuits: [&dyn LincheckCircuit; 2] = [sha2_circuit, blake3_circuit];
+    let verify = |union: &UnionInstance<'_>| {
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged_union(
+            union,
+            &circuits,
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch_v,
+        )
+    };
+    let claim_v = verify(&union)
+        .unwrap_or_else(|e| panic!("area-saving verifier rejected honest proof: {e:?}"));
+    assert_eq!(claim_v, claim);
+
+    // Wrong declared counts against the smaller commitment: reject.
+    let union_bad = UnionInstance::new(&registry, vec![counts[0] + 1, counts[1]]);
+    assert!(
+        verify(&union_bad).is_err(),
+        "wrong counts must reject against the count-sized commitment"
+    );
 }
 
 /// Mis-ordered per-slot inputs (BLAKE3 before SHA-256) can never produce a
@@ -540,4 +629,84 @@ fn mixed_throughput_smoke() {
         "  singles sum {singles:.0} ms; mixed / sum = {:.2}",
         mixed_ms / singles
     );
+}
+
+/// Informational M5 low-utilization prove-time smoke: counts (8, 8) at
+/// ν = 10 against full utilization (1024, 1024). Under height-`n_t`
+/// stacking the low-count instance commits 2^15 words (config floor; dense
+/// 2 936) versus 2^19 at full — a 16x smaller commit (Merkle/encoding)
+/// phase, which should show up markedly in the prove wall time. The PIOP
+/// sumcheck folds are still dense over the 2^26-point padded space
+/// (support-proportional folds are a separate follow-up), so the saving is
+/// bounded by the commit/opening share. No timing assertions. Run with
+/// `cargo test --release -p flock-prover --test union_mixed -- --ignored
+/// --nocapture mixed_low_utilization_smoke`.
+#[test]
+#[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
+fn mixed_low_utilization_smoke() {
+    use std::time::Instant;
+
+    let nu = 10usize;
+    let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
+    let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
+    let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
+    let mut rng = Rng::new(0x05_31_77_77);
+    flock_core::scratch::prewarm_prover(registry.m_total());
+
+    let mut results = Vec::new();
+    for counts in [[8usize, 8usize], [1024, 1024]] {
+        let [n_sha2, n_blake3] = counts;
+        let union = UnionInstance::new(&registry, counts.to_vec());
+        let pcs_params = union_pcs_params(&union);
+        let sha2_inputs = random_sha2_inputs(&mut rng, n_sha2);
+        let blake3_inputs = random_blake3_inputs(&mut rng, n_blake3);
+        // One untimed warm-up (hot scratch pool), then one timed run.
+        let mut prove_ms = 0.0;
+        for timed in [false, true] {
+            let slots = vec![
+                UnionSlotProverInput::new(
+                    sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                    s2_circuit,
+                ),
+                UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                    b3_circuit,
+                ),
+            ];
+            let mut ch = FsChallenger::new(DOMAIN);
+            let t = Instant::now();
+            let (proof, commitment, claim) =
+                prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
+            if timed {
+                prove_ms = t.elapsed().as_secs_f64() * 1e3;
+                // Roundtrip while we're here.
+                let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
+                let mut ch_v = FsChallenger::new(DOMAIN);
+                let claim_v = verifier::verify_ligerito_jagged_union(
+                    &union,
+                    &circuits,
+                    &commitment,
+                    &proof,
+                    &pcs_params,
+                    &mut ch_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("low-utilization verifier rejected honest proof {counts:?}: {e:?}")
+                });
+                assert_eq!(claim_v, claim);
+            }
+        }
+        results.push((counts, union.committed_words(), prove_ms));
+    }
+
+    println!(
+        "low-utilization smoke @ nu = {nu} (M = {}), prove incl. witgen:",
+        registry.m_total()
+    );
+    for (counts, committed, ms) in &results {
+        println!(
+            "  counts (sha2, blake3) = {counts:?}: committed 2^{} words, {ms:.0} ms",
+            committed.trailing_zeros()
+        );
+    }
 }

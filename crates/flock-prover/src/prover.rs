@@ -460,10 +460,12 @@ enum UnionProveBinding<'a> {
 /// Witness contract: rows `[n_t, 2^nu)` of each slot must be identically
 /// zero — the run-list padding lets the kernels skip them (only sound, and
 /// only byte-identical to the dense computation, for honest zeros), the
-/// dense-stack transport commits them at capacity height, and the union
-/// lincheck's count-derived const-pin target requires the pin at 0 on every
-/// dummy row. Use the per-hash `generate_witness_batch_major_partial`
-/// drivers (M4), which honor any `n_t ≤ 2^nu` and zero the remainder; the
+/// height-`n_t` dense-stack transport DROPS them from the committed stack
+/// (sound only because the padded buffer is zero there — asserted in debug
+/// by `UnionInstance::compact_witness`), and the union lincheck's
+/// count-derived const-pin target requires the pin at 0 on every dummy
+/// row. Use the per-hash `generate_witness_batch_major_partial` drivers
+/// (M4), which honor any `n_t ≤ 2^nu` and zero the remainder; the
 /// full-utilization `generate_witness_batch_major` drivers instead fill
 /// padding rows with real dummy invocations (pin = 1) and are only valid
 /// here at `n_t = 2^nu`.
@@ -550,11 +552,12 @@ fn prove_union_with_binding<Ch: Challenger>(
     }
     let (z_packed, a_packed_f128, b_packed_f128) = union.assemble_witness(witnesses);
 
-    // True dense-stack commit: commit the compacted stack q (used
-    // chunk-columns at capacity height, useless columns and gaps dropped,
-    // padded to a power of two). When the compaction map is the identity
-    // (single-slot registries — the byte-identity anchors), q IS the padded
-    // buffer and no copy is made.
+    // True dense-stack commit (height-n_t stacking): commit the compacted
+    // stack q — the declared n_t-row prefix of every used chunk-column;
+    // dummy rows, useless columns and gaps dropped; padded to a power of
+    // two with the m22 config floor. When the compaction map is the
+    // identity (single-slot registries at full utilization — the
+    // byte-identity anchors), q IS the padded buffer and no copy is made.
     let dense_q: Option<Vec<F128>> = if union.compaction_is_identity() {
         None
     } else {
