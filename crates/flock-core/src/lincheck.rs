@@ -124,6 +124,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 
 mod kernels;
+mod union;
+
+pub use union::{
+    UnionLincheckSlot, eq_prefix_sum, eq_prefix_weight, prove_union_capture_z_vec,
+    union_comb_partial, verify_union,
+};
 
 #[cfg(target_arch = "x86_64")]
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;
@@ -1273,7 +1279,7 @@ fn prove_padded_inner<Ch: Challenger>(
         None
     };
     let eq_x_outer = build_eq_table(&x_ab.x_outer);
-    let mut z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+    let z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -1289,6 +1295,31 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         None
     };
+
+    // 5.–9. The column-domain sumcheck core, shared with the union-column
+    //       lincheck (`prove_union_capture_z_vec`).
+    let (proof, claim) = column_sumcheck_prove(comb_vec, z_vec, k_skip, trace, challenger);
+    (proof, claim, captured_z_vec)
+}
+
+/// Shared sumcheck core of the single-table and union-column linchecks
+/// (steps 5–9 of `prove_padded_inner`, verbatim): run the multilinear
+/// product-sumcheck over the top `log2(len) − k_skip` variables of the
+/// `(comb, z)` pair, send the length-`2^k_skip` collapse `z_partial`, sample
+/// the fresh univariate-skip challenge, and assemble the proof + claim.
+/// Consumes both vectors. The union prover reuses this loop over the longer
+/// union column domain — same code on the same vectors is what makes the
+/// single-slot union lincheck byte-identical to today's.
+fn column_sumcheck_prove<Ch: Challenger>(
+    mut comb_vec: Vec<F128>,
+    mut z_vec: Vec<F128>,
+    k_skip: usize,
+    trace: bool,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim) {
+    debug_assert_eq!(comb_vec.len(), z_vec.len());
+    debug_assert!(comb_vec.len().is_power_of_two());
+    let inner_rest_len = comb_vec.len().trailing_zeros() as usize - k_skip;
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -1361,7 +1392,7 @@ fn prove_padded_inner<Ch: Challenger>(
         r_inner_rest,
         w,
     };
-    (proof, claim, captured_z_vec)
+    (proof, claim)
 }
 
 /// Verify a lincheck proof. Walks the challenger in lockstep with `prove`,

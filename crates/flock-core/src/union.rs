@@ -24,9 +24,10 @@
 //! byte-identical to `prove_fast_ligerito_jagged_from_witness`. The pieces
 //! here that are already slot-general (heights, padding, witness assembly)
 //! are unit-tested on synthetic multi-type registries; the union zerocheck
-//! run-lists are consumed by the existing kernels' general paths, while the
-//! union-column lincheck and the registry-digest transcript binding land in
-//! later milestones.
+//! run-lists are consumed by the existing kernels' general paths, and the
+//! union-column lincheck (M2, [`crate::lincheck::verify_union`]) is
+//! slot-general — the registry-digest transcript binding lands in a later
+//! milestone.
 
 use crate::challenger::Challenger;
 use crate::field::F128;
@@ -207,8 +208,8 @@ impl<'r> UnionInstance<'r> {
         assert_eq!(
             registry.num_types(),
             1,
-            "M1 union plumbing is single-type only; the union lincheck and \
-             the registry-digest binding land in later milestones"
+            "M1 union plumbing is single-type only; the registry-digest \
+             binding lands in a later milestone"
         );
         let ty = &registry.types()[0];
         assert_eq!(
