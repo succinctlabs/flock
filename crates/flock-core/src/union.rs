@@ -1,11 +1,13 @@
-//! The union instance — multi-table Phase 2, milestone M1.
+//! The union instance — multi-table Phase 2 (M1 plumbing, M3 binding).
 //!
 //! [`UnionInstance`] wraps a [`Registry`] + counts pair (the static slot
 //! layout of `schedule.rs` plus the per-proof declared counts) and derives
 //! everything the prove/verify paths need from the union address space,
 //! replacing what [`BlockR1cs`] provides for a single table today: the
 //! count-derived run-list [`PaddingSpec`], the union jagged-grid heights,
-//! the layout-aware claim points, and the union witness assembly.
+//! the layout-aware claim points, the union witness assembly, and — since
+//! M3 — the multi-table statement binding ([`Self::bind_statement`], label
+//! `flock-mixed-v1`).
 //!
 //! Under the uniform-capacity convention the union's BatchMajor address
 //! split is `[7 in-word | nu batch | M−7−nu chunk]` — structurally a single
@@ -18,16 +20,14 @@
 //! the `BlockR1cs` versions coordinate for coordinate — the union of one
 //! slot *is* today's instance.
 //!
-//! M1 scope (`flock_prover::prover::prove_fast_ligerito_jagged_union`):
-//! prove SINGLE-TYPE registry instances through the existing jagged path,
-//! transcript-preserving — on the same statement + witness the proof is
-//! byte-identical to `prove_fast_ligerito_jagged_from_witness`. The pieces
-//! here that are already slot-general (heights, padding, witness assembly)
-//! are unit-tested on synthetic multi-type registries; the union zerocheck
-//! run-lists are consumed by the existing kernels' general paths, and the
-//! union-column lincheck (M2, [`crate::lincheck::verify_union`]) is
-//! slot-general — the registry-digest transcript binding lands in a later
-//! milestone.
+//! The prove/verify entries (`flock_prover::prover::
+//! prove_fast_ligerito_jagged_union` / [`crate::verifier::
+//! verify_ligerito_jagged_union`]) accept any registry under the
+//! `flock-mixed-v1` binding. The M1/M2 single-type harness binding
+//! ([`Self::bind_statement_single_type`], transcript-identical to the
+//! direct jagged path) is retained for the byte-identity differential
+//! tests — the regression anchor for the plumbing — behind the dedicated
+//! `*_harness` entries; it is not a protocol mode.
 
 use crate::challenger::Challenger;
 use crate::field::F128;
@@ -102,29 +102,50 @@ impl<'r> UnionInstance<'r> {
     /// for the jagged opening path (`pcs::open_batch_jagged_ligerito`):
     /// `2^col_log` entries in union column order. Slot `t` occupies columns
     /// `[o_t >> (7+nu), o_t >> (7+nu) + 2^{k_log_t−7})` (alignment makes the
-    /// offset exact); its leading `ceil(useful_bits_t/128)` columns carry the
-    /// declared `n_t` words each, its remaining columns are 0 (useless
-    /// chunk-columns, zero by the BatchMajor buffer layout), and columns past
-    /// the last slot are 0 (the gap). The generalization of
-    /// [`BlockR1cs::jagged_heights`]: one slot at full utilization
-    /// (`n_t = 2^nu`) reproduces it exactly. Shared by the prover and
-    /// verifier wiring — any divergence is a transcript break, so both
-    /// derive it here.
+    /// offset exact); its leading `ceil(useful_bits_t/128)` columns carry
+    /// the declared `n_t` words each. Shared by the prover and verifier
+    /// wiring — any divergence is a transcript break, so both derive it
+    /// here.
+    ///
+    /// The jagged transport addresses the committed buffer through
+    /// `col_prefix_sums` — column `c`'s words at STACKED dense indices
+    /// `[Σ_{c'<c} h_{c'}, …)` — while today's pipeline commits the full
+    /// padded union buffer (the Phase 1/2 dense commit; the true
+    /// dense-stack commit is M4, alongside partial counts). The two
+    /// indexings must coincide on every word that carries data, so a
+    /// non-final slot's useless chunk-columns — dead address space BETWEEN
+    /// data-bearing columns — are declared at the full capacity height
+    /// `2^nu` (address-space filler keeping every later slot's stacked
+    /// offset equal to its padded offset). This costs nothing in soundness:
+    /// the zerocheck's `C = I` relation forces `z = 0` on all dead address
+    /// space (design doc, Remark "dummy rows are complete; padding is
+    /// self-enforcing"), so the transport never needs to. The LAST slot's
+    /// useless columns and the trailing gap stay 0 — stacked and padded
+    /// indexing agree past the final data column regardless, and a one-slot
+    /// registry at full utilization thereby reproduces
+    /// [`BlockR1cs::jagged_heights`] exactly (the M1 byte-identity anchor).
     pub fn jagged_heights(&self) -> Vec<u64> {
         let nu = self.n_log();
         let mut heights = vec![0u64; 1usize << self.col_log()];
         let registry = self.registry();
-        for ((ty, slot), &n_t) in registry
+        for (t, ((ty, slot), &n_t)) in registry
             .types()
             .iter()
             .zip(registry.slots())
             .zip(self.counts())
+            .enumerate()
         {
             let n_cols = 1usize << (ty.k_log - 7);
             let useful_cols = ty.useful_bits.div_ceil(128).min(n_cols);
             let col_offset = slot.offset >> (7 + nu);
             for h in &mut heights[col_offset..col_offset + useful_cols] {
                 *h = n_t as u64;
+            }
+            // Address-space filler for non-final slots (see above).
+            if t + 1 < registry.num_types() {
+                for h in &mut heights[col_offset + useful_cols..col_offset + n_cols] {
+                    *h = 1u64 << nu;
+                }
             }
         }
         heights
@@ -193,23 +214,53 @@ impl<'r> UnionInstance<'r> {
     }
 
     // -----------------------------------------------------------------------
-    // M1 statement binding + single-type guard.
+    // Statement binding: the flock-mixed-v1 protocol binding, plus the M1/M2
+    // single-type harness binding (differential tests only).
     // -----------------------------------------------------------------------
 
-    /// M1 guard: the registry has exactly one type and `slot_r1cs` is that
-    /// type's single-table [`BlockR1cs`] view (same variable count, width,
-    /// useful bits, const pin, BatchMajor layout, `k_skip = 6`). Returns the
-    /// type. Both the union prove and verify entries call this before doing
-    /// anything transcript-visible. (The base matrices are not compared —
-    /// they are bound by [`Self::bind_statement_single_type`] through the
-    /// `BlockR1cs` statement digest.)
+    /// The multi-table statement binding (design doc §"Statement digest and
+    /// transcript"): absorb, before any challenge is squeezed and in this
+    /// order, the `flock-mixed-v1` domain label, the registry digest
+    /// ([`Registry::digest`]), the counts vector (one u64 LE per type, in
+    /// slot order, as a single byte string — its length is additionally
+    /// bound through the digest's type count), and the commitment root. The
+    /// counts are the only per-proof statement data; everything else is
+    /// registry-static.
+    ///
+    /// Domain-separated from the single-table binding
+    /// ([`crate::proof::bind_statement`]: `flock-r1cs-v0` + the `BlockR1cs`
+    /// statement digest), so a mixed proof can never be replayed as a
+    /// single-table proof or vice versa. This is also why a SINGLE-TYPE
+    /// instance proved under this binding is deliberately **not**
+    /// byte-identical to the direct jagged path — that byte-identity is the
+    /// harness binding's job ([`Self::bind_statement_single_type`]).
+    pub fn bind_statement<Ch: Challenger>(&self, challenger: &mut Ch, commitment: &Commitment) {
+        challenger.observe_label(b"flock-mixed-v1");
+        challenger.observe_bytes(&self.registry().digest());
+        let mut counts_le = Vec::with_capacity(8 * self.counts().len());
+        for &n_t in self.counts() {
+            counts_le.extend_from_slice(&(n_t as u64).to_le_bytes());
+        }
+        challenger.observe_bytes(&counts_le);
+        challenger.observe_bytes(&commitment.root);
+    }
+
+    /// M1/M2 **harness** guard (differential tests only): the registry has
+    /// exactly one type and `slot_r1cs` is that type's single-table
+    /// [`BlockR1cs`] view (same variable count, width, useful bits, const
+    /// pin, BatchMajor layout, `k_skip = 6`). Returns the type. The
+    /// `*_harness` prove/verify entries call this before doing anything
+    /// transcript-visible; the protocol entries (`flock-mixed-v1` binding)
+    /// do not. (The base matrices are not compared — they are bound by
+    /// [`Self::bind_statement_single_type`] through the `BlockR1cs`
+    /// statement digest.)
     pub fn expect_single_type_slot(&self, slot_r1cs: &BlockR1cs) -> &'r TableType {
         let registry = self.registry();
         assert_eq!(
             registry.num_types(),
             1,
-            "M1 union plumbing is single-type only; the registry-digest \
-             binding lands in a later milestone"
+            "the single-type harness binding is single-type only; \
+             multi-type registries go through the flock-mixed-v1 binding"
         );
         let ty = &registry.types()[0];
         assert_eq!(
@@ -231,17 +282,18 @@ impl<'r> UnionInstance<'r> {
         ty
     }
 
-    /// M1 transcript binding: bind exactly today's single-table statement —
-    /// [`crate::proof::bind_statement`] over the slot's [`BlockR1cs`]
-    /// statement digest + the commitment root — keeping the transcript
-    /// byte-identical to the existing jagged path. Single-type registries
-    /// only.
+    /// M1/M2 **harness** transcript binding (differential tests only): bind
+    /// exactly today's single-table statement — [`crate::proof::
+    /// bind_statement`] over the slot's [`BlockR1cs`] statement digest + the
+    /// commitment root — keeping the transcript byte-identical to the
+    /// existing jagged path. Single-type registries only.
     ///
-    /// The multi-table binding — [`Registry::digest`] + the counts vector +
-    /// the commitment root under a `flock-mixed-v1` domain label (design doc
-    /// §"Statement, transcript, wire format") — replaces this in the
-    /// milestone that changes the transcript; the registry digest is already
-    /// implemented and waiting.
+    /// Since M3 the protocol binding is [`Self::bind_statement`]
+    /// (`flock-mixed-v1`); this one is kept solely so the M1/M2
+    /// byte-identity differential tests (`flock-prover`'s
+    /// `tests/union_roundtrip.rs`) remain a live regression anchor for the
+    /// union plumbing. It is not a protocol mode and does not appear in any
+    /// wire format.
     pub fn bind_statement_single_type<Ch: Challenger>(
         &self,
         challenger: &mut Ch,
@@ -251,8 +303,8 @@ impl<'r> UnionInstance<'r> {
         assert_eq!(
             self.registry().num_types(),
             1,
-            "M1 binding is the single-table statement digest; multi-type \
-             registries need the registry-digest + counts binding"
+            "the harness binding is the single-table statement digest; \
+             multi-type registries go through the flock-mixed-v1 binding"
         );
         crate::proof::bind_statement(challenger, slot_r1cs, commitment);
     }
@@ -469,31 +521,49 @@ mod tests {
     }
 
     /// Multi-slot heights against hand-computed values: two synthetic types
-    /// (κ = 10/9, ν = 3 → M = 14, 16 union columns), mid-range counts.
-    /// Checks used columns, unused (useless-chunk) columns, the aligned slot
-    /// column offset, and the gap columns.
+    /// (κ = 10/9, ν = 3 → M = 14, 16 union columns). Checks used columns,
+    /// the full-capacity address-space filler on a non-final slot's useless
+    /// columns, the zero tail on the final slot's useless columns, the
+    /// aligned slot column offset, and the gap columns.
     #[test]
     fn multi_slot_heights_hand_computed() {
         // Type A: 8 chunk-columns, ceil(700/128) = 6 used; type B: 4
         // chunk-columns at column offset 8192 >> (7+3) = 8, ceil(300/128) = 3
-        // used. Columns 12..16 are the gap past the last slot.
+        // used. Columns 12..16 are the gap past the last slot. Slot A's 2
+        // useless columns carry the full capacity height 2^3 = 8 (address-
+        // space filler: slot B's stacked offset must equal its padded
+        // offset); slot B's useless column and the gap stay 0.
         let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
         let union = UnionInstance::new(&reg, vec![5, 3]);
         assert_eq!(union.m_total(), 14);
         assert_eq!(union.col_log(), 4);
         #[rustfmt::skip]
         let expected: Vec<u64> = vec![
-            5, 5, 5, 5, 5, 5, 0, 0, // slot A: 6 used at n_A = 5, 2 useless
+            5, 5, 5, 5, 5, 5, 8, 8, // slot A: 6 used at n_A = 5, 2 filler
             3, 3, 3, 0,             // slot B: 3 used at n_B = 3, 1 useless
             0, 0, 0, 0,             // gap
         ];
         assert_eq!(union.jagged_heights(), expected);
 
-        // Count edge cases: empty and full slots.
+        // At full utilization the stacked (col_prefix_sums) indexing must
+        // reproduce the padded buffer's aligned layout: every column below
+        // slot B's used-column end at full height, so prefix sums are
+        // exactly `col · 2^nu` there.
+        let union = UnionInstance::new(&reg, vec![8, 8]);
+        #[rustfmt::skip]
+        let expected: Vec<u64> = vec![
+            8, 8, 8, 8, 8, 8, 8, 8,
+            8, 8, 8, 0,
+            0, 0, 0, 0,
+        ];
+        assert_eq!(union.jagged_heights(), expected);
+
+        // Count edge cases: empty first slot (its filler still holds later
+        // slots' offsets in place) and full second slot.
         let union = UnionInstance::new(&reg, vec![0, 8]);
         #[rustfmt::skip]
         let expected: Vec<u64> = vec![
-            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 8, 8,
             8, 8, 8, 0,
             0, 0, 0, 0,
         ];
@@ -566,8 +636,8 @@ mod tests {
         }
     }
 
-    /// The M1 guard rejects multi-type registries — the union lincheck and
-    /// the registry-digest binding are later milestones.
+    /// The harness guard rejects multi-type registries — multi-type
+    /// instances go through the flock-mixed-v1 binding, never the harness.
     #[test]
     #[should_panic(expected = "single-type only")]
     fn expect_single_type_slot_rejects_multi_type() {
@@ -575,5 +645,62 @@ mod tests {
         let union = UnionInstance::new(&reg, vec![5, 3]);
         let r1cs = block_r1cs(10, 700, 3);
         let _ = union.expect_single_type_slot(&r1cs);
+    }
+
+    /// The `flock-mixed-v1` binding is deterministic and sensitive to every
+    /// bound component — registry digest, counts (value AND slot order), and
+    /// commitment root: divergence anywhere yields a different first
+    /// challenge, which is what makes the statement non-substitutable.
+    #[test]
+    fn bind_statement_sensitivity() {
+        use crate::challenger::FsChallenger;
+        use crate::pcs::PcsParams;
+
+        let commitment = |root_byte: u8| Commitment {
+            root: [root_byte; 32],
+            params: PcsParams {
+                m: 14,
+                log_inv_rate: 1,
+                log_batch_size: 6,
+                profile: Default::default(),
+            },
+        };
+        let sample = |union: &UnionInstance<'_>, root: u8| {
+            let mut ch = FsChallenger::new(b"flock-test-v0");
+            union.bind_statement(&mut ch, &commitment(root));
+            ch.sample_f128()
+        };
+
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
+        let base = sample(&UnionInstance::new(&reg, vec![5, 3]), 0xAA);
+        assert_eq!(
+            base,
+            sample(&UnionInstance::new(&reg, vec![5, 3]), 0xAA),
+            "binding must be deterministic"
+        );
+        assert_ne!(
+            base,
+            sample(&UnionInstance::new(&reg, vec![3, 5]), 0xAA),
+            "count order must bind"
+        );
+        assert_ne!(
+            base,
+            sample(&UnionInstance::new(&reg, vec![5, 4]), 0xAA),
+            "count value must bind"
+        );
+        assert_ne!(
+            base,
+            sample(&UnionInstance::new(&reg, vec![5, 3]), 0xAB),
+            "commitment root must bind"
+        );
+        // A registry tamper invisible to every other verifier-side quantity
+        // (useful_bits +1 within the same chunk-column) still moves the
+        // digest, hence the binding.
+        let reg2 = Registry::new(vec![ty(10, 701), ty(9, 300)], 3);
+        assert_ne!(
+            base,
+            sample(&UnionInstance::new(&reg2, vec![5, 3]), 0xAA),
+            "registry digest must bind"
+        );
     }
 }

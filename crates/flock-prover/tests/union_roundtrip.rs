@@ -1,16 +1,23 @@
 //! M1/M2 differential oracle for the union-instance plumbing: a SINGLE-TYPE
-//! registry instance proved through `prove_fast_ligerito_jagged_union` must
-//! produce a proof **byte-identical** (bincode equality of the whole bundle,
-//! with the lincheck sub-proof asserted separately — since M2 the union
-//! entry runs the union-column lincheck, whose one-slot degeneration must BE
-//! today's lincheck) to the existing
-//! `prove_fast_ligerito_jagged_from_witness` on the same statement + witness
-//! at full utilization — the union of one slot at offset 0 is today's
-//! instance verbatim, and M1/M2 change no transcript. Plus a prove → verify
-//! roundtrip through the union entry pair alone, including count-binding
-//! rejection (a verifier declaring a different count computes a different
-//! lincheck const-pin target — and different jagged heights — and must
-//! reject).
+//! registry instance proved through
+//! `prove_fast_ligerito_jagged_union_harness` must produce a proof
+//! **byte-identical** (bincode equality of the whole bundle, with the
+//! lincheck sub-proof asserted separately — since M2 the union entry runs
+//! the union-column lincheck, whose one-slot degeneration must BE today's
+//! lincheck) to the existing `prove_fast_ligerito_jagged_from_witness` on
+//! the same statement + witness at full utilization — the union of one slot
+//! at offset 0 is today's instance verbatim, and the harness binding
+//! changes no transcript. Plus a prove → verify roundtrip through the
+//! harness entry pair alone, including count-binding rejection (a verifier
+//! declaring a different count computes a different lincheck const-pin
+//! target — and different jagged heights — and must reject).
+//!
+//! Since M3 the PROTOCOL union entries bind the statement as
+//! `flock-mixed-v1` (registry digest + counts + root) and are exercised in
+//! `tests/union_mixed.rs`; these tests pin the M1/M2 harness binding
+//! (`bind_statement_single_type`) as the regression anchor for the
+//! plumbing. Proofs under the protocol binding are (correctly) NOT
+//! byte-identical to the direct path — the bindings are domain-separated.
 
 use flock_prover::challenger::FsChallenger;
 use flock_prover::prover::{self, UnionSlotProverInput};
@@ -90,7 +97,7 @@ fn blake3_union_matches_jagged_byte_identical() {
         lc_circuit,
     );
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof_union, comm_union, claim_union) = prover::prove_fast_ligerito_jagged_union(
+    let (proof_union, comm_union, claim_union) = prover::prove_fast_ligerito_jagged_union_harness(
         &union,
         &setup.r1cs,
         &setup.pcs_params,
@@ -132,7 +139,7 @@ fn blake3_union_matches_jagged_byte_identical() {
     assert_eq!(claim_vj, claim_jagged);
 
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim_vu = verifier::verify_ligerito_jagged_union(
+    let claim_vu = verifier::verify_ligerito_jagged_union_harness(
         &union,
         &setup.r1cs,
         &comm_union,
@@ -183,7 +190,7 @@ fn sha256_union_matches_jagged_byte_identical() {
         lc_circuit,
     );
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof_union, comm_union, claim_union) = prover::prove_fast_ligerito_jagged_union(
+    let (proof_union, comm_union, claim_union) = prover::prove_fast_ligerito_jagged_union_harness(
         &union,
         &setup.r1cs,
         &setup.pcs_params,
@@ -219,7 +226,7 @@ fn sha256_union_matches_jagged_byte_identical() {
     .unwrap_or_else(|e| panic!("jagged verifier rejected honest proof: {e:?}"));
 
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim_vu = verifier::verify_ligerito_jagged_union(
+    let claim_vu = verifier::verify_ligerito_jagged_union_harness(
         &union,
         &setup.r1cs,
         &comm_union,
@@ -255,7 +262,7 @@ fn blake3_union_roundtrip_and_count_rejection() {
         lc_circuit,
     );
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof, commitment, claim) = prover::prove_fast_ligerito_jagged_union(
+    let (proof, commitment, claim) = prover::prove_fast_ligerito_jagged_union_harness(
         &union,
         &setup.r1cs,
         &setup.pcs_params,
@@ -264,7 +271,7 @@ fn blake3_union_roundtrip_and_count_rejection() {
     );
 
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim_v = verifier::verify_ligerito_jagged_union(
+    let claim_v = verifier::verify_ligerito_jagged_union_harness(
         &union,
         &setup.r1cs,
         &commitment,
@@ -283,7 +290,7 @@ fn blake3_union_roundtrip_and_count_rejection() {
     use flock_core::verifier::VerifyError;
     let union_bad = UnionInstance::new(&registry, vec![setup.n_block_slots() - 1]);
     let mut ch_v = FsChallenger::new(DOMAIN);
-    match verifier::verify_ligerito_jagged_union(
+    match verifier::verify_ligerito_jagged_union_harness(
         &union_bad,
         &setup.r1cs,
         &commitment,

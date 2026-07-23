@@ -414,22 +414,42 @@ impl<'a> UnionSlotProverInput<'a> {
     }
 }
 
+/// Statement-binding selector for the union prove path. Private: the two
+/// public entries below fix the variant.
+enum UnionProveBinding<'a> {
+    /// The protocol binding: `flock-mixed-v1` over the registry digest, the
+    /// counts vector, and the commitment root
+    /// ([`flock_core::union::UnionInstance::bind_statement`]).
+    Mixed,
+    /// The M1/M2 differential-harness binding: the slot's single-table
+    /// `BlockR1cs` statement digest, transcript-identical to the direct
+    /// jagged path. Single-type registries only; not a protocol mode.
+    SingleTypeHarness(&'a BlockR1cs),
+}
+
 /// Prove a registry instance through the **union address space** — Phase 2
-/// milestone M1 of the multi-table design: assemble the per-slot witnesses
-/// into the union buffers and drive the EXISTING jagged path with the
+/// of the multi-table design, since M3 under the real multi-table statement
+/// binding: assemble the per-slot witnesses into the union buffers, bind
+/// the statement as `flock-mixed-v1` (registry digest + counts vector +
+/// commitment root, [`flock_core::union::UnionInstance::bind_statement`]),
+/// and drive the EXISTING jagged path with the
 /// [`flock_core::union::UnionInstance`]-derived quantities (count-derived
 /// run-list padding, union jagged heights, `n_log = nu`, union claim
-/// points).
-///
-/// M1/M2 is single-type and transcript-preserving: the statement binding is
-/// still the slot's single-table `BlockR1cs` digest
-/// ([`flock_core::union::UnionInstance::bind_statement_single_type`]), the
-/// lincheck is the union-column lincheck (M2) — byte-identical to the
-/// slot's own on a one-slot registry — and on the same statement + witness
-/// at full utilization the proof is **byte-identical** to
-/// [`prove_fast_ligerito_jagged_from_witness`]
-/// (the differential oracle in `tests/union_roundtrip.rs`). Verify with
+/// points) and the union-column lincheck. Verify with
 /// [`flock_core::verifier::verify_ligerito_jagged_union`].
+///
+/// `slots` are one per registry type, **in slot order** — the registry's
+/// order, i.e. sorted by capacity area descending (under uniform capacity:
+/// by `k_log` descending; e.g. SHA-256 (κ = 15) before BLAKE3 (κ = 14)).
+/// Mis-ordered inputs cannot produce a proof: the witness-assembly and
+/// lincheck layers assert each slot's buffer sizes and circuit shape
+/// against the registry type.
+///
+/// A single-type instance proved here roundtrips with the union verifier
+/// but is deliberately **not** byte-identical to
+/// [`prove_fast_ligerito_jagged_from_witness`] — the statement bindings are
+/// domain-separated. The byte-identity regression anchor is
+/// [`prove_fast_ligerito_jagged_union_harness`].
 ///
 /// Witness contract: rows `[n_t, 2^nu)` of each slot must be identically
 /// zero — the run-list padding lets the kernels skip them, which is only
@@ -437,16 +457,60 @@ impl<'a> UnionSlotProverInput<'a> {
 /// zeros. The current batch-major drivers fill every row (padding rows run
 /// a dummy invocation), so with them the declared counts must be the full
 /// capacity; per-slot witness closures that honor partial counts are a
-/// later Phase 2 item.
+/// later Phase 2 item (M4).
 pub fn prove_fast_ligerito_jagged_union<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    challenger: &mut Ch,
+) -> (R1csProofJaggedLigerito, Commitment, R1csClaim) {
+    prove_union_with_binding(
+        union,
+        UnionProveBinding::Mixed,
+        pcs_params,
+        slots,
+        challenger,
+    )
+}
+
+/// [`prove_fast_ligerito_jagged_union`] under the M1/M2 **harness** binding
+/// (the slot's single-table `BlockR1cs` statement digest): on a single-type
+/// registry at full utilization, the proof is **byte-identical** to
+/// [`prove_fast_ligerito_jagged_from_witness`] on the same statement +
+/// witness — the differential oracle in `tests/union_roundtrip.rs`, kept as
+/// the regression anchor for the union plumbing. Verify with
+/// [`flock_core::verifier::verify_ligerito_jagged_union_harness`].
+/// Test/differential harness only — not a protocol mode.
+pub fn prove_fast_ligerito_jagged_union_harness<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
     slot_r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
     slots: Vec<UnionSlotProverInput<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofJaggedLigerito, Commitment, R1csClaim) {
-    // M1 guard + slot statement consistency (also asserts one type).
-    let ty = union.expect_single_type_slot(slot_r1cs);
+    prove_union_with_binding(
+        union,
+        UnionProveBinding::SingleTypeHarness(slot_r1cs),
+        pcs_params,
+        slots,
+        challenger,
+    )
+}
+
+/// Shared body of the two union prove entries; `binding` selects the
+/// statement binding, everything else is identical.
+fn prove_union_with_binding<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    binding: UnionProveBinding<'_>,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    challenger: &mut Ch,
+) -> (R1csProofJaggedLigerito, Commitment, R1csClaim) {
+    // Harness guard + slot statement consistency (also asserts one type) —
+    // before doing anything heavy.
+    if let UnionProveBinding::SingleTypeHarness(slot_r1cs) = binding {
+        union.expect_single_type_slot(slot_r1cs);
+    }
     let m = union.m_total();
     assert_eq!(pcs_params.m, m, "PcsParams.m must equal the union's M");
     assert_eq!(
@@ -471,7 +535,12 @@ pub fn prove_fast_ligerito_jagged_union<Ch: Challenger>(
     let (z_packed, a_packed_f128, b_packed_f128) = union.assemble_witness(witnesses);
 
     let (commitment, prover_data) = pcs::commit(&z_packed, pcs_params);
-    union.bind_statement_single_type(challenger, slot_r1cs, &commitment);
+    match binding {
+        UnionProveBinding::Mixed => union.bind_statement(challenger, &commitment),
+        UnionProveBinding::SingleTypeHarness(slot_r1cs) => {
+            union.bind_statement_single_type(challenger, slot_r1cs, &commitment)
+        }
+    }
 
     // Zerocheck over the union address space, driven by the count-derived
     // run-list (the existing kernels' general multi-run paths — value-
@@ -532,7 +601,12 @@ pub fn prove_fast_ligerito_jagged_union<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    let s_hat_v_ab = if ty.k_log >= pcs::LOG_PACKING {
+    // `s_hat_v_from_z_vec` needs `z_vec.len() = 2^LOG_PACKING · 2^tail`;
+    // the union fold has `len = 2^(M−ν)` and `tail = M−ν−LOG_PACKING`, so
+    // the condition is `M−ν ≥ LOG_PACKING` — for a single-type registry
+    // exactly the old `k_log ≥ LOG_PACKING`, and always true for real
+    // registries (every `k_log ≥ 7`).
+    let s_hat_v_ab = if m - union.n_log() >= pcs::LOG_PACKING {
         Some(pcs::ring_switch::s_hat_v_from_z_vec(
             &z_vec_pre,
             &lc_claim.r_inner_rest[1..],

@@ -113,20 +113,60 @@ pub fn verify_ligerito_jagged<Ch: Challenger>(
     Ok(R1csClaim { ab, c })
 }
 
+/// Statement-binding selector for the union verify path. Private: the two
+/// public entries below fix the variant (mirror of the prove-side enum in
+/// `flock_prover::prover`).
+enum UnionVerifyBinding<'a> {
+    /// The protocol binding: `flock-mixed-v1` over the registry digest, the
+    /// counts vector, and the commitment root
+    /// ([`crate::union::UnionInstance::bind_statement`]).
+    Mixed,
+    /// The M1/M2 differential-harness binding: the slot's single-table
+    /// `BlockR1cs` statement digest. Single-type registries only; not a
+    /// protocol mode.
+    SingleTypeHarness(&'a BlockR1cs),
+}
+
 /// Verify a proof produced by the **union prove entry**
-/// (`flock_prover::prover::prove_fast_ligerito_jagged_union`): replay
-/// zerocheck + the union-column lincheck over the union address space with
-/// the claim points derived from the [`crate::union::UnionInstance`], then
-/// verify the jagged-path batched opening against the union's heights. The
-/// counts enter through the heights, the lincheck's const-pin target term,
-/// and (on the prover side) the run-list padding — the M1 transcript
-/// binding is still the slot's single-table statement
-/// ([`crate::union::UnionInstance::bind_statement_single_type`]).
+/// (`flock_prover::prover::prove_fast_ligerito_jagged_union`): bind the
+/// statement as `flock-mixed-v1` (registry digest + counts vector +
+/// commitment root, [`crate::union::UnionInstance::bind_statement`]),
+/// replay zerocheck + the union-column lincheck over the union address
+/// space with the claim points derived from the
+/// [`crate::union::UnionInstance`], then verify the jagged-path batched
+/// opening against the union's heights. The counts bind in the transcript
+/// (before any challenge) and additionally enter through the heights and
+/// the lincheck's const-pin target terms.
 ///
-/// M1/M2: single-type registries only (the guard). On those, acceptance is
-/// equivalent to [`verify_ligerito_jagged`] with the slot's `BlockR1cs` at
-/// full utilization — the transcript walk is byte-identical.
+/// `circuits` are the per-type lincheck circuits, one per registry type,
+/// **in slot order** (the registry's order — capacity area descending).
 pub fn verify_ligerito_jagged_union<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &R1csProofJaggedLigerito,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
+    verify_union_with_binding(
+        union,
+        UnionVerifyBinding::Mixed,
+        circuits,
+        commitment,
+        proof,
+        pcs_params,
+        challenger,
+    )
+}
+
+/// [`verify_ligerito_jagged_union`] under the M1/M2 **harness** binding
+/// (the slot's single-table `BlockR1cs` statement digest) — the mirror of
+/// `flock_prover::prover::prove_fast_ligerito_jagged_union_harness`.
+/// Single-type registries only; on those, acceptance is equivalent to
+/// [`verify_ligerito_jagged`] with the slot's `BlockR1cs` at full
+/// utilization — the transcript walk is byte-identical.
+/// Test/differential harness only — not a protocol mode.
+pub fn verify_ligerito_jagged_union_harness<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     slot_r1cs: &BlockR1cs,
     commitment: &Commitment,
@@ -135,21 +175,48 @@ pub fn verify_ligerito_jagged_union<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
+    verify_union_with_binding(
+        union,
+        UnionVerifyBinding::SingleTypeHarness(slot_r1cs),
+        &[lincheck_circuit],
+        commitment,
+        proof,
+        pcs_params,
+        challenger,
+    )
+}
+
+/// Shared body of the two union verify entries; `binding` selects the
+/// statement binding, everything else is identical.
+fn verify_union_with_binding<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    binding: UnionVerifyBinding<'_>,
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &R1csProofJaggedLigerito,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
     // Verification is single-threaded; run the PIOP replay on the dedicated
     // 1-thread pool (verify_claims_jagged_ligerito installs it itself).
     let (ab, c) = verifier_pool().install(|| -> Result<(ZClaim, ZClaim), VerifyError> {
-        union.expect_single_type_slot(slot_r1cs);
-        union.bind_statement_single_type(challenger, slot_r1cs, commitment);
+        match binding {
+            UnionVerifyBinding::Mixed => union.bind_statement(challenger, commitment),
+            UnionVerifyBinding::SingleTypeHarness(slot_r1cs) => {
+                union.expect_single_type_slot(slot_r1cs);
+                union.bind_statement_single_type(challenger, slot_r1cs, commitment);
+            }
+        }
 
         let zc_claim = zerocheck::verify(union.m_total(), &proof.zerocheck, challenger)
             .map_err(VerifyError::Zerocheck)?;
         let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-        // M2: the union-column lincheck. On the M1 single-type registries it
-        // is byte-identical to the slot's own lincheck; the declared counts
-        // additionally bind through any const-pin target term.
+        // The union-column lincheck (one circuit per slot, in slot order);
+        // the declared counts additionally bind through the per-type
+        // const-pin target terms.
         let lc_claim = lincheck::verify_union(
             union,
-            &[lincheck_circuit],
+            circuits,
             &x_ab,
             zc_claim.a_eval,
             zc_claim.b_eval,
