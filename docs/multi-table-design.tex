@@ -752,7 +752,18 @@ residual point, and is left with the single evaluation claim
 $\hat f(\rho) = v_\rho$. Everything non-factoring stays on the
 verifier-computable side; the committed side crosses as one point claim.
 Consequently \textbf{the jagged reduction always carries exactly one
-claim per proof}.
+claim per proof}. Historically this step is not new machinery at all: it
+is \emph{ring-switching's own sumcheck}, which the direct path had fused
+into Ligerito (itself an inner-product argument, able to absorb
+$\langle f, b\rangle$ without an explicit sumcheck) and which the jagged
+path un-fuses, because Ligerito now lives on the far side of the
+dense/virtual index translation and only eq-shaped claims cross that
+translation cheaply. The prover's sumcheck folds are support-proportional
+under the declared-work discipline (a Phase 2 item --- the Phase 1
+implementation folds dense buffers, which at full utilization \emph{is}
+the support), while the verifier's costs --- the static round count and
+one polylog $\hat b(\rho)$ evaluation --- are oblivious to the sparsity
+pattern.
 
 \paragraph{Reduction 2: the jagged transport.} Stack only the \emph{useful} columns of the
 \emph{declared} rows of all tables contiguously (column-major per table ---
