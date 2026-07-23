@@ -115,17 +115,17 @@ pub fn verify_ligerito_jagged<Ch: Challenger>(
 
 /// Verify a proof produced by the **union prove entry**
 /// (`flock_prover::prover::prove_fast_ligerito_jagged_union`): replay
-/// zerocheck + lincheck over the union address space with the claim points
-/// derived from the [`crate::union::UnionInstance`], then verify the
-/// jagged-path batched opening against the union's heights. The counts
-/// enter through the heights (and, on the prover side, the run-list
-/// padding) only — the M1 transcript binding is still the slot's
-/// single-table statement
+/// zerocheck + the union-column lincheck over the union address space with
+/// the claim points derived from the [`crate::union::UnionInstance`], then
+/// verify the jagged-path batched opening against the union's heights. The
+/// counts enter through the heights, the lincheck's const-pin target term,
+/// and (on the prover side) the run-list padding — the M1 transcript
+/// binding is still the slot's single-table statement
 /// ([`crate::union::UnionInstance::bind_statement_single_type`]).
 ///
-/// M1: single-type registries only. On those, acceptance is equivalent to
-/// [`verify_ligerito_jagged`] with the slot's `BlockR1cs` at full
-/// utilization — the transcript walk is byte-identical.
+/// M1/M2: single-type registries only (the guard). On those, acceptance is
+/// equivalent to [`verify_ligerito_jagged`] with the slot's `BlockR1cs` at
+/// full utilization — the transcript walk is byte-identical.
 pub fn verify_ligerito_jagged_union<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     slot_r1cs: &BlockR1cs,
@@ -138,19 +138,18 @@ pub fn verify_ligerito_jagged_union<Ch: Challenger>(
     // Verification is single-threaded; run the PIOP replay on the dedicated
     // 1-thread pool (verify_claims_jagged_ligerito installs it itself).
     let (ab, c) = verifier_pool().install(|| -> Result<(ZClaim, ZClaim), VerifyError> {
-        let ty = union.expect_single_type_slot(slot_r1cs);
+        union.expect_single_type_slot(slot_r1cs);
         union.bind_statement_single_type(challenger, slot_r1cs, commitment);
 
         let zc_claim = zerocheck::verify(union.m_total(), &proof.zerocheck, challenger)
             .map_err(VerifyError::Zerocheck)?;
         let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-        // M1: the lincheck is the slot's own, exactly as today (the union of
-        // one slot has m = M). The union-column lincheck is a later milestone.
-        let lc_claim = lincheck::verify(
-            union.m_total(),
-            ty.k_log,
-            zerocheck::K_SKIP,
-            lincheck_circuit,
+        // M2: the union-column lincheck. On the M1 single-type registries it
+        // is byte-identical to the slot's own lincheck; the declared counts
+        // additionally bind through any const-pin target term.
+        let lc_claim = lincheck::verify_union(
+            union,
+            &[lincheck_circuit],
             &x_ab,
             zc_claim.a_eval,
             zc_claim.b_eval,

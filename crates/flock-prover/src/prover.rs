@@ -421,11 +421,13 @@ impl<'a> UnionSlotProverInput<'a> {
 /// run-list padding, union jagged heights, `n_log = nu`, union claim
 /// points).
 ///
-/// M1 is single-type and transcript-preserving: the statement binding is
+/// M1/M2 is single-type and transcript-preserving: the statement binding is
 /// still the slot's single-table `BlockR1cs` digest
-/// ([`flock_core::union::UnionInstance::bind_statement_single_type`]), the lincheck is the
-/// slot's own, and on the same statement + witness at full utilization the
-/// proof is **byte-identical** to [`prove_fast_ligerito_jagged_from_witness`]
+/// ([`flock_core::union::UnionInstance::bind_statement_single_type`]), the
+/// lincheck is the union-column lincheck (M2) — byte-identical to the
+/// slot's own on a one-slot registry — and on the same statement + witness
+/// at full utilization the proof is **byte-identical** to
+/// [`prove_fast_ligerito_jagged_from_witness`]
 /// (the differential oracle in `tests/union_roundtrip.rs`). Verify with
 /// [`flock_core::verifier::verify_ligerito_jagged_union`].
 ///
@@ -467,8 +469,6 @@ pub fn prove_fast_ligerito_jagged_union<Ch: Challenger>(
         linchecks.push((slot.z_lincheck, slot.lincheck_circuit));
     }
     let (z_packed, a_packed_f128, b_packed_f128) = union.assemble_witness(witnesses);
-    let (z_packed_lincheck, lincheck_circuit) =
-        linchecks.pop().expect("single slot per the M1 guard");
 
     let (commitment, prover_data) = pcs::commit(&z_packed, pcs_params);
     union.bind_statement_single_type(challenger, slot_r1cs, &commitment);
@@ -507,19 +507,21 @@ pub fn prove_fast_ligerito_jagged_union<Ch: Challenger>(
 
     let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
-    // M1: the lincheck is the slot's own, invoked exactly as today (the
-    // union of one slot has m = M). Union-column lincheck: later milestone.
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        m,
-        ty.k_log,
-        zerocheck::K_SKIP,
-        ty.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
-    drop(z_packed_lincheck);
+    // M2: the union-column lincheck — one sumcheck over the union column
+    // domain against the per-slot stripes and circuits. On the M1
+    // single-type registries it is byte-identical to invoking the slot's
+    // own lincheck (the union of one slot has m = M).
+    let (lc_proof, lc_claim, z_vec_pre) = {
+        let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
+            .iter()
+            .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
+                z_lincheck: stripe,
+                circuit: *circuit,
+            })
+            .collect();
+        lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
+    };
+    drop(linchecks);
 
     let ab = ZClaim {
         point: union.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),

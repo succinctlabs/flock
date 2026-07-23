@@ -1,12 +1,16 @@
-//! M1 differential oracle for the union-instance plumbing: a SINGLE-TYPE
+//! M1/M2 differential oracle for the union-instance plumbing: a SINGLE-TYPE
 //! registry instance proved through `prove_fast_ligerito_jagged_union` must
-//! produce a proof **byte-identical** (bincode equality of the whole bundle)
-//! to the existing `prove_fast_ligerito_jagged_from_witness` on the same
-//! statement + witness at full utilization — the union of one slot at offset
-//! 0 is today's instance verbatim, and M1 changes no transcript. Plus a
-//! prove → verify roundtrip through the union entry pair alone, including
-//! count-binding rejection (a verifier declaring a different count derives
-//! different jagged heights and must reject).
+//! produce a proof **byte-identical** (bincode equality of the whole bundle,
+//! with the lincheck sub-proof asserted separately — since M2 the union
+//! entry runs the union-column lincheck, whose one-slot degeneration must BE
+//! today's lincheck) to the existing
+//! `prove_fast_ligerito_jagged_from_witness` on the same statement + witness
+//! at full utilization — the union of one slot at offset 0 is today's
+//! instance verbatim, and M1/M2 change no transcript. Plus a prove → verify
+//! roundtrip through the union entry pair alone, including count-binding
+//! rejection (a verifier declaring a different count computes a different
+//! lincheck const-pin target — and different jagged heights — and must
+//! reject).
 
 use flock_prover::challenger::FsChallenger;
 use flock_prover::prover::{self, UnionSlotProverInput};
@@ -94,12 +98,20 @@ fn blake3_union_matches_jagged_byte_identical() {
         &mut ch_p,
     );
 
-    // ---- THE differential: the ENTIRE proofs are byte-identical.
+    // ---- THE differential: the ENTIRE proofs are byte-identical. The
+    // lincheck sub-proof is asserted first on its own — it is the piece M2
+    // replaced with the union-column lincheck, whose single-slot
+    // degeneration must be byte-for-byte today's lincheck.
     assert_eq!(
         comm_jagged.root, comm_union.root,
         "commitment root diverged"
     );
     assert_eq!(claim_jagged, claim_union, "accepted claims diverged");
+    assert_eq!(
+        bincode::serialize(&proof_jagged.lincheck).unwrap(),
+        bincode::serialize(&proof_union.lincheck).unwrap(),
+        "union-column lincheck must be byte-identical to today's lincheck on one slot"
+    );
     assert_eq!(
         bincode::serialize(&proof_jagged).unwrap(),
         bincode::serialize(&proof_union).unwrap(),
@@ -185,6 +197,11 @@ fn sha256_union_matches_jagged_byte_identical() {
     );
     assert_eq!(claim_jagged, claim_union, "accepted claims diverged");
     assert_eq!(
+        bincode::serialize(&proof_jagged.lincheck).unwrap(),
+        bincode::serialize(&proof_union.lincheck).unwrap(),
+        "union-column lincheck must be byte-identical to today's lincheck on one slot"
+    );
+    assert_eq!(
         bincode::serialize(&proof_jagged).unwrap(),
         bincode::serialize(&proof_union).unwrap(),
         "union proof must be byte-identical to the jagged path at full utilization"
@@ -217,7 +234,11 @@ fn sha256_union_matches_jagged_byte_identical() {
 
 /// BLAKE3 prove → verify roundtrip through the union entry pair alone, plus
 /// count binding: a verifier whose instance declares one invocation fewer
-/// derives different jagged heights and must reject.
+/// must reject. Since M2 the count binds already inside the union-column
+/// lincheck — BLAKE3 pins a constant wire, and the verifier's pin target
+/// carries the count-derived factor Σ_{row<n} eq(x_outer, row) — so the
+/// rejection surfaces at the lincheck's final consistency check, before the
+/// jagged-heights mismatch would have rejected the opening.
 #[test]
 #[ignore] // Heavier — run with `cargo test -p flock-prover --test union_roundtrip -- --ignored`
 fn blake3_union_roundtrip_and_count_rejection() {
@@ -255,9 +276,10 @@ fn blake3_union_roundtrip_and_count_rejection() {
     .unwrap_or_else(|e| panic!("union verifier rejected honest proof: {e:?}"));
     assert_eq!(claim_v, claim);
 
-    // Wrong declared count: the heights (hence the jagged weight table) no
-    // longer match the committed data — the opening must reject.
-    use flock_core::pcs::VerifyErrorJagged;
+    // Wrong declared count: the lincheck's const-pin target no longer
+    // matches the committed pin column's fold (and the jagged heights would
+    // mismatch downstream too) — the lincheck consistency check rejects
+    // first.
     use flock_core::verifier::VerifyError;
     let union_bad = UnionInstance::new(&registry, vec![setup.n_block_slots() - 1]);
     let mut ch_v = FsChallenger::new(DOMAIN);
@@ -270,7 +292,9 @@ fn blake3_union_roundtrip_and_count_rejection() {
         &setup.pcs_params,
         &mut ch_v,
     ) {
-        Err(VerifyError::PcsJagged(VerifyErrorJagged::Jagged)) => {}
-        other => panic!("wrong count: expected PcsJagged(Jagged), got {other:?}"),
+        Err(VerifyError::Lincheck(flock_core::lincheck::VerifyError::ConsistencyFailed {
+            ..
+        })) => {}
+        other => panic!("wrong count: expected Lincheck(ConsistencyFailed), got {other:?}"),
     }
 }
