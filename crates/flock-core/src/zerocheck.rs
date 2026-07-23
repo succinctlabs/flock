@@ -442,7 +442,35 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (mut a_mlv, mut b_mlv, msg_1, msg_inf) =
+    // Support-proportional prover (M6): under a multi-run count-derived spec
+    // the post-URM tables are zero outside the declared support (the live
+    // interval list). While that support is sparse (live·16 ≤ n), round 2
+    // skips its dead-pair zero writes and the tail rounds fold/evaluate over
+    // the live intervals only — every skipped term carries an `a·b` factor
+    // of zero, so all messages and folded values are byte-identical to the
+    // dense path. Once the live fraction crosses the threshold, the dead
+    // regions are zeroed once and the dense kernels resume.
+    let mut live: Option<Vec<(usize, usize)>> = if padding.as_single_run().is_none() {
+        Some(padding.useful_block_intervals(k_skip))
+    } else {
+        None
+    };
+    let sparse_from_round2 = live.as_ref().is_some_and(|list| {
+        let live_elems: usize = list.iter().map(|&(s, e)| e - s).sum();
+        let n_out = 1usize << n_mlv;
+        n_out >= 8 && live_elems * 16 <= n_out
+    });
+    let (mut a_mlv, mut b_mlv, msg_1, msg_inf) = if sparse_from_round2 {
+        multilinear::uni_skip_fold_and_round_pair_runs_sparse(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        )
+    } else {
         uni_skip_fold_and_round_pair_optimized_packed_padded(
             a_packed,
             b_packed,
@@ -451,7 +479,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             &fold_table,
             &mlv_arg,
             padding,
-        );
+        )
+    };
 
     if zc_timing {
         eprintln!(
@@ -490,20 +519,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
-    // Support-proportional tail (M6): under a multi-run count-derived spec
-    // the folded tables are zero outside the declared support. While that
-    // support stays sparse (live·16 ≤ n), each round folds and evaluates the
-    // message over the live intervals only — the skipped terms all carry an
-    // `a·b` factor of zero, so every message and folded value is
-    // byte-identical to the dense path. Once the live fraction grows past
-    // the threshold (or the tables get small), the buffers' dead regions are
-    // zeroed once and the dense kernels resume.
-    let mut live: Option<Vec<(usize, usize)>> = if padding.as_single_run().is_none() {
-        Some(padding.useful_block_intervals(k_skip))
-    } else {
-        None
-    };
-    let mut sparse_dirty = false; // sparse folds leave dead scratch untouched
+    // See the round-2 comment: `live` drives the tail's sparse rounds;
+    // `sparse_dirty` tracks whether the current buffers' dead regions hold
+    // unwritten scratch (true from the start when round 2 skipped its
+    // dead-pair zero writes).
+    let mut sparse_dirty = sparse_from_round2;
 
     for i in 0..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];

@@ -1148,6 +1148,172 @@ pub(crate) fn fold_and_round_oop_par(
         .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (s, t)| (p + s, q + t))
 }
 
+/// Batched `b_tilde` evaluation (M6): `out[y] = f̂_t(z_row, z_col, ris ‖
+/// bits(y))` for all `y ∈ {0,1}^yr_log_n` — the basis evaluations the fused
+/// Ligerito opening sends ([`crate::pcs::BatchOpeningProofJaggedLigerito::
+/// b_tilde`]). Value-identical to calling [`f_hat_t`] per `y` (all field ops
+/// exact; the reassociations below cannot change a single output byte), but
+/// ~3–4× cheaper:
+///
+/// - columns with equal `(t_c, t_next)` — the height-0 runs: dropped
+///   columns, gaps — share one ĝ evaluation, weighted by their summed
+///   `eq_col` factor ([`assist_columns`], distributivity);
+/// - the branching-program DP runs FORWARD (initial state at layer 0), so
+///   the `ris`-only layers — shared by every `y` — are walked once per
+///   column, and only the `yr_log_n + 1` suffix layers are per-`y`
+///   (associativity of the layer-matrix product);
+/// - each layer step uses the sparse two-transitions-per-state rows
+///   ([`assist_sparse_transitions`], 8 muls) instead of the dense 16-entry
+///   eq table of [`g_hat_eval_cd`].
+pub(crate) fn f_hat_t_batch_y(
+    params: &JaggedParams,
+    z_row: &[F128],
+    z_col: &[F128],
+    ris: &[F128],
+    yr_log_n: usize,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    let m = params.m;
+    let shared_len = ris.len();
+    debug_assert_eq!(shared_len + yr_log_n, m);
+    let cols = assist_columns(params, z_col);
+    let sparse = assist_sparse_transitions();
+
+    // Per-layer eq4 tables over `(z_row bit, z_index bit)`. Layers below
+    // `shared_len` read `ris`; layers `shared_len..m` read a boolean `y` bit
+    // (one table per bit value); layer `m` is past `z_index`, so its
+    // coordinate is pinned to zero (`point_bit`).
+    let eq4_at = |layer: usize, index_coord: F128| -> [F128; 4] {
+        let t = build_eq_table(&[point_bit(z_row, layer), index_coord]);
+        [t[0], t[1], t[2], t[3]]
+    };
+    let eq4_shared: Vec<[F128; 4]> = (0..shared_len).map(|l| eq4_at(l, ris[l])).collect();
+    let eq4_y: Vec<[[F128; 4]; 2]> = (shared_len..=m)
+        .map(|l| {
+            let bit1 = if l < m { F128::ONE } else { F128::ZERO };
+            [eq4_at(l, F128::ZERO), eq4_at(l, bit1)]
+        })
+        .collect();
+
+    let step = |v: &[F128; 4], eq4: &[F128; 4], cd: usize| -> [F128; 4] {
+        let mut out = [F128::ZERO; 4];
+        for (s, &bs) in v.iter().enumerate() {
+            let (i0, o0) = sparse[cd][s][0];
+            let (i1, o1) = sparse[cd][s][1];
+            out[o0] += bs * eq4[i0];
+            out[o1] += bs * eq4[i1];
+        }
+        out
+    };
+    let cd_at = |t_c: u64, t_next: u64, layer: usize| -> usize {
+        ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize
+    };
+
+    // Forward shared-prefix pass, once per (merged) column.
+    let prefixes: Vec<[F128; 4]> = cols
+        .par_iter()
+        .map(|&(_, t_c, t_next)| {
+            let mut v = [F128::ZERO; 4];
+            v[STATE_INITIAL] = F128::ONE;
+            for (layer, eq4) in eq4_shared.iter().enumerate() {
+                v = step(&v, eq4, cd_at(t_c, t_next, layer));
+            }
+            v
+        })
+        .collect();
+
+    // Per-y suffix layers + eq_col-weighted assembly.
+    (0..1usize << yr_log_n)
+        .into_par_iter()
+        .map(|y| {
+            let mut acc = F128::ZERO;
+            for (&(w, t_c, t_next), prefix) in cols.iter().zip(&prefixes) {
+                let mut v = *prefix;
+                for (j, eq4s) in eq4_y.iter().enumerate() {
+                    let layer = shared_len + j;
+                    let bit = if layer < m { (y >> j) & 1 } else { 0 };
+                    v = step(&v, &eq4s[bit], cd_at(t_c, t_next, layer));
+                }
+                acc += w * v[STATE_SUCCESS];
+            }
+            acc
+        })
+        .collect()
+}
+
+/// Support-proportional variant of [`fold_and_round_oop_par`] (M6). The
+/// b-side (the γ-combined basis) folds densely — it has no zero structure,
+/// and no product structure survives ring-switching's φ byte-table — but the
+/// witness side is zero outside `live_in` (canonical interval list, packed
+/// words) on an honest padded buffer, so its fold and the round message are
+/// evaluated only over the live pair cover, with zero-substituted reads so
+/// dead scratch is never touched. Message values equal the dense kernel's
+/// exactly: every skipped term carries a zero witness factor, and field ops
+/// are exact. Returns the message and the folded live list; positions of
+/// `ao` outside the returned list's pair cover are left unwritten (callers
+/// switching back to the dense kernels must zero them first).
+pub(crate) fn fold_and_round_sparse(
+    a: &[F128],
+    b: &[F128],
+    r: F128,
+    ao: &mut [F128],
+    bo: &mut [F128],
+    live_in: &[(usize, usize)],
+) -> (F128, F128, Vec<(usize, usize)>) {
+    use crate::zerocheck::multilinear::shrink_intervals;
+    use rayon::prelude::*;
+    debug_assert_eq!(a.len(), 2 * ao.len());
+    debug_assert!(a.len() >= 4);
+    debug_assert!(live_in.last().is_none_or(|&(_, e)| e <= a.len()));
+
+    // Dense b-side fold (chunked, like fold_and_round_oop_par — per-element
+    // rayon dispatch would dominate at these sizes).
+    const CO: usize = 1 << 13;
+    bo.par_chunks_mut(CO)
+        .zip(b.par_chunks(2 * CO))
+        .for_each(|(ob, bin)| {
+            for (op, bq) in ob.iter_mut().zip(bin.as_chunks::<2>().0.iter()) {
+                *op = bq[0] + r * (bq[1] + bq[0]);
+            }
+        });
+
+    let live_out = shrink_intervals(live_in);
+    let pair_cover = shrink_intervals(&live_out);
+
+    // Zero-substituting witness reads; `cur` walks `live_in` monotonically as
+    // the read position `y` ascends.
+    let mut cur = 0usize;
+    let read = |cur: &mut usize, y: usize| -> F128 {
+        while *cur < live_in.len() && live_in[*cur].1 <= y {
+            *cur += 1;
+        }
+        if *cur < live_in.len() && live_in[*cur].0 <= y {
+            a[y]
+        } else {
+            F128::ZERO
+        }
+    };
+
+    let mut g1 = F128::ZERO;
+    let mut gi = F128::ZERO;
+    for &(ps, pe) in &pair_cover {
+        for t in ps..pe {
+            let y = 4 * t;
+            let a00 = read(&mut cur, y);
+            let a01 = read(&mut cur, y + 1);
+            let a10 = read(&mut cur, y + 2);
+            let a11 = read(&mut cur, y + 3);
+            let na0 = a00 + r * (a01 + a00);
+            let na1 = a10 + r * (a11 + a10);
+            ao[2 * t] = na0;
+            ao[2 * t + 1] = na1;
+            g1 += na1 * bo[2 * t + 1];
+            gi += (na0 + na1) * (bo[2 * t] + bo[2 * t + 1]);
+        }
+    }
+    (g1, gi, live_out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,6 +1392,34 @@ mod tests {
                 let got = f_hat_t(&params, &z_row, &z_col, &z_idx);
                 let want = f_hat_t_bruteforce(&params, &z_row, &z_col, &z_idx);
                 assert_eq!(got, want, "f̂_t mismatch for n={n} k={k} m={m}");
+            }
+        }
+    }
+
+    /// The batched shared-prefix `b_tilde` evaluator is VALUE-IDENTICAL to
+    /// per-`y` `f_hat_t` calls at `z_index = ris ‖ bits(y)` — the M6
+    /// byte-identity contract for the fused opening's basis message. Random
+    /// heights include zero-height runs (merged-column sharing) and shapes
+    /// whose cumulative sums reach `2^m` (bit `m` of `t` set), across several
+    /// `ris`-length splits including the degenerate `yr = 0` and `yr = m`.
+    #[test]
+    fn f_hat_t_batch_y_matches_per_y() {
+        let mut ch = RandomChallenger::new(0xB71D_E001);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (2, 4, 6)] {
+            for _ in 0..4 {
+                let (params, _q) = random_instance(&mut ch, n, k, m);
+                let z_row = sample_vec(&mut ch, n);
+                let z_col = sample_vec(&mut ch, k);
+                for yr in 0..=m.min(4) {
+                    let ris = sample_vec(&mut ch, m - yr);
+                    let got = f_hat_t_batch_y(&params, &z_row, &z_col, &ris, yr);
+                    for (y, &g) in got.iter().enumerate() {
+                        let mut z_index = ris.clone();
+                        z_index.extend((0..yr).map(|j| int_bit(y as u64, j)));
+                        let want = f_hat_t(&params, &z_row, &z_col, &z_index);
+                        assert_eq!(g, want, "b_tilde mismatch n={n} k={k} m={m} yr={yr} y={y}");
+                    }
+                }
             }
         }
     }

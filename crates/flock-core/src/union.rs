@@ -492,23 +492,69 @@ impl<'r> UnionInstance<'r> {
 
     /// General placement path: zero-initialized union buffers with each
     /// slot's data copied at its word offset.
+    ///
+    /// Support-proportional copies (M6): a slot at partial utilization only
+    /// copies the declared `n_t`-word prefix of each used chunk-column — the
+    /// witness contract (see `prove_fast_ligerito_jagged_union`) makes the
+    /// slot buffers zero everywhere else (dummy rows, useless columns), so
+    /// the zero-initialized union buffers already hold those words'
+    /// values and the result is byte-identical to the full-slot copy.
+    /// Full-utilization slots keep the one-memcpy path.
     fn scatter_witnesses(
         &self,
         slot_witnesses: Vec<SlotWitness>,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+        let nu = self.n_log();
         let len = self.packed_len();
         let mut z = vec![F128::ZERO; len];
         let mut a = vec![F128::ZERO; len];
         let mut b = vec![F128::ZERO; len];
-        for (slot, w) in self.registry().slots().iter().zip(slot_witnesses) {
+        for (((ty, slot), w), &n_t) in self
+            .registry()
+            .types()
+            .iter()
+            .zip(self.registry().slots())
+            .zip(&slot_witnesses)
+            .zip(self.counts())
+        {
             let start = slot.offset >> 7;
             let words = 1usize << (slot.m_slot - 7);
-            z[start..start + words].copy_from_slice(&w.z_packed);
-            a[start..start + words].copy_from_slice(&w.a_packed);
-            b[start..start + words].copy_from_slice(&w.b_packed);
+            if n_t == 1usize << nu {
+                z[start..start + words].copy_from_slice(&w.z_packed);
+                a[start..start + words].copy_from_slice(&w.a_packed);
+                b[start..start + words].copy_from_slice(&w.b_packed);
+            } else {
+                debug_assert!(
+                    slot_buffer_zero_off_support(w, self.used_cols(ty), nu, n_t),
+                    "slot buffers must be zero on dummy rows and useless columns \
+                     (the union witness contract)"
+                );
+                for c in 0..self.used_cols(ty) {
+                    let col = c << nu;
+                    z[start + col..start + col + n_t].copy_from_slice(&w.z_packed[col..col + n_t]);
+                    a[start + col..start + col + n_t].copy_from_slice(&w.a_packed[col..col + n_t]);
+                    b[start + col..start + col + n_t].copy_from_slice(&w.b_packed[col..col + n_t]);
+                }
+            }
         }
         (z, a, b)
     }
+}
+
+/// Whether a slot's `(z, a, b)` buffers are zero outside the declared
+/// `n_t`-row prefixes of the used chunk-columns — the union witness
+/// contract [`UnionInstance::scatter_witnesses`] debug-asserts before its
+/// support-proportional copies.
+fn slot_buffer_zero_off_support(w: &SlotWitness, used_cols: usize, nu: usize, n_t: usize) -> bool {
+    let mut kept = vec![false; w.z_packed.len()];
+    for c in 0..used_cols {
+        kept[(c << nu)..(c << nu) + n_t].fill(true);
+    }
+    [&w.z_packed, &w.a_packed, &w.b_packed].iter().all(|buf| {
+        buf.iter()
+            .zip(&kept)
+            .all(|(word, &k)| k || *word == F128::ZERO)
+    })
 }
 
 /// One slot's packed witness buffers, exactly as the existing batch-major
@@ -922,11 +968,12 @@ mod tests {
     }
 
     /// Multi-slot witness assembly places each slot's words at its aligned
-    /// word offset `o_t >> 7`, leaving the gap zero.
+    /// word offset `o_t >> 7`, leaving the gap zero — at FULL utilization
+    /// (the one-memcpy path), with marks everywhere in the slot buffers.
     #[test]
     fn multi_slot_assembly_places_slots_at_offsets() {
         let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
-        let union = UnionInstance::new(&reg, vec![5, 3]);
+        let union = UnionInstance::new(&reg, vec![8, 8]);
         // Slot A: 2^(13-7) = 64 words at word offset 0; slot B: 32 words at
         // word offset 8192 >> 7 = 64; union: 2^(14-7) = 128 words.
         assert_eq!(union.packed_len(), 128);
@@ -957,6 +1004,55 @@ mod tests {
                 buf[96..].iter().all(|x| *x == F128::ZERO),
                 "gap must stay zero"
             );
+        }
+    }
+
+    /// Partial-count assembly (the M6 support-proportional copy path): slot
+    /// buffers honoring the witness contract — nonzero only on the declared
+    /// `n_t`-row prefixes of the used chunk-columns — are placed
+    /// byte-identically to a full-slot copy: support words land at their
+    /// aligned offsets, and dummy rows, useless columns, and the gap are
+    /// zero.
+    #[test]
+    fn multi_slot_assembly_partial_counts_places_support() {
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
+        let union = UnionInstance::new(&reg, vec![5, 3]);
+        assert_eq!(union.packed_len(), 128);
+        // Used columns: A = ceil(700/128) = 6 of 8; B = ceil(300/128) = 3 of
+        // 4. Support-marked slot buffer: word i of used column c gets a
+        // (tag, c, i) mark for rows i < n_t, zero elsewhere.
+        let mark = |tag: u64, c: usize, i: usize| F128 {
+            lo: ((c as u64) << 32) | i as u64,
+            hi: tag,
+        };
+        let support_buf = |tag: u64, words: usize, used_cols: usize, n_t: usize| -> Vec<F128> {
+            let mut v = vec![F128::ZERO; words];
+            for c in 0..used_cols {
+                for i in 0..n_t {
+                    v[(c << 3) + i] = mark(tag, c, i);
+                }
+            }
+            v
+        };
+        let slot_a = SlotWitness {
+            z_packed: support_buf(0xA0, 64, 6, 5),
+            a_packed: support_buf(0xA1, 64, 6, 5),
+            b_packed: support_buf(0xA2, 64, 6, 5),
+        };
+        let slot_b = SlotWitness {
+            z_packed: support_buf(0xB0, 32, 3, 3),
+            a_packed: support_buf(0xB1, 32, 3, 3),
+            b_packed: support_buf(0xB2, 32, 3, 3),
+        };
+        let expected = |tag_a: u64, tag_b: u64| -> Vec<F128> {
+            let mut v = vec![F128::ZERO; 128];
+            v[..64].copy_from_slice(&support_buf(tag_a, 64, 6, 5));
+            v[64..96].copy_from_slice(&support_buf(tag_b, 32, 3, 3));
+            v
+        };
+        let (z, a, b) = union.assemble_witness(vec![slot_a, slot_b]);
+        for (buf, tag_a, tag_b) in [(&z, 0xA0, 0xB0), (&a, 0xA1, 0xB1), (&b, 0xA2, 0xB2)] {
+            assert_eq!(buf[..], expected(tag_a, tag_b)[..], "tag {tag_a:#x}");
         }
     }
 

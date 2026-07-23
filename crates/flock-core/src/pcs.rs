@@ -180,6 +180,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         precomputed_s_hat_v,
         packed_direct,
         padding,
+        None,
         challenger,
         trace,
     );
@@ -227,6 +228,14 @@ struct CombinedClaim {
 /// combination of all `rs_eq_ind`s and `eq_ind`s) and `target_combined`.
 /// Also computes the round-0 prime as a side effect (cheap since it shares
 /// the b_combined pass).
+///
+/// `live_pairs` (M6, support-proportional): when `Some`, the canonical
+/// interval list of witness-word PAIRS whose words are not all declared
+/// zero — the round-0 prime is then summed over those pairs only (the
+/// skipped pairs have `a0 = a1 = 0`, so their terms are exactly zero).
+/// `b_combined` itself is still fully materialized: the virtual-opening /
+/// Ligerito b-side folds are dense by nature. Pass `None` for dense
+/// witnesses (identical to the pre-M6 behavior).
 #[allow(clippy::too_many_arguments)]
 fn compute_combined_basis_and_target<Ch: Challenger>(
     packed_witness: &[F128],
@@ -234,6 +243,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     precomputed_s_hat_v: &[Option<&[F128]>],
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
+    live_pairs: Option<&[(usize, usize)]>,
     challenger: &mut Ch,
     trace: bool,
 ) -> CombinedClaim {
@@ -379,17 +389,40 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                         }
                     }
                 }
-                // Round-0 prime over this block's pairs (b is even, base is even).
+                // Round-0 prime over this block's pairs (b is even, base is
+                // even). With `live_pairs`, only the pairs whose witness
+                // words can be nonzero contribute — the rest have
+                // `a0 = a1 = 0`, so their terms are exactly zero.
                 let base = hi * b;
                 let mut u0 = F128::ZERO;
                 let mut u2 = F128::ZERO;
-                for t in 0..(b / 2) {
+                let mut prime_pair = |t: usize| {
                     let s0 = out_block[2 * t];
                     let s1 = out_block[2 * t + 1];
                     let a0 = packed_witness[base + 2 * t];
                     let a1 = packed_witness[base + 2 * t + 1];
                     u0 += a0 * s0;
                     u2 += (a0 + a1) * (s0 + s1);
+                };
+                match live_pairs {
+                    Some(pairs) => {
+                        let p_lo = hi * (b / 2);
+                        let p_hi = p_lo + b / 2;
+                        let start = pairs.partition_point(|&(_, e)| e <= p_lo);
+                        for &(s, e) in &pairs[start..] {
+                            if s >= p_hi {
+                                break;
+                            }
+                            for t in s.max(p_lo)..e.min(p_hi) {
+                                prime_pair(t - p_lo);
+                            }
+                        }
+                    }
+                    None => {
+                        for t in 0..(b / 2) {
+                            prime_pair(t);
+                        }
+                    }
                 }
                 (u0, u2)
             })
@@ -830,6 +863,23 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
     );
 
+    // ---- M6 support-proportional witness side: the live packed-word
+    // intervals of the padded buffer under a multi-run count-derived spec —
+    // outside them the honest witness is identically zero, so the round-0
+    // prime and the virtual-opening f-side folds/messages can skip the dead
+    // words without changing a single value. `None` on single-run specs
+    // (the single-table paths) or when the support is too dense to pay.
+    let live_words: Option<Vec<(usize, usize)>> = if padding.as_single_run().is_none() {
+        let lv = padding.useful_block_intervals(LOG_PACKING);
+        let words: usize = lv.iter().map(|&(s, e)| e - s).sum();
+        (!lv.is_empty() && words * 8 <= packed_witness.len()).then_some(lv)
+    } else {
+        None
+    };
+    let live_pairs = live_words
+        .as_deref()
+        .map(crate::zerocheck::multilinear::shrink_intervals);
+
     // ---- Claim assembly: shared with (and transcript-identical to) the
     // mixed path up to the γ-combined `(b_combined, target_combined)`.
     let combined = compute_combined_basis_and_target(
@@ -838,6 +888,7 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         precomputed_s_hat_v,
         packed_direct,
         padding,
+        live_pairs.as_deref(),
         challenger,
         trace,
     );
@@ -866,6 +917,13 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     let mut a = crate::scratch::take_f128(l / 4);
     let mut bb = crate::scratch::take_f128(l / 4);
     let mut cur = l;
+    // M6: while the witness support stays sparse, the f-side of each round
+    // (fold + message terms) touches only the live intervals; the b-side
+    // folds stay dense. Once the live fraction crosses the threshold, the
+    // a-side scratch's dead regions (untouched by the sparse rounds) are
+    // zeroed once and the dense fused kernel resumes.
+    let mut live = live_words;
+    let mut sparse_dirty = false;
     for round in 0..log_l {
         let half = cur / 2;
         challenger.observe_f128(g_one);
@@ -873,12 +931,37 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         let r = challenger.sample_f128();
         virtual_open_rounds.push((g_one, g_inf));
         rho.push(r);
+        let use_sparse = live.as_ref().is_some_and(|lv| {
+            let words: usize = lv.iter().map(|&(s, e)| e - s).sum();
+            cur > 2 && words * 8 <= cur
+        });
+        if !use_sparse
+            && let Some(lv) = live.take()
+            && sparse_dirty
+        {
+            // Only rounds ≥ 1 read the scratch `a`; round 0 reads the padded
+            // witness, which is genuinely zero off-support.
+            crate::zerocheck::multilinear::zero_dead_regions(&mut a, cur, &lv);
+            sparse_dirty = false;
+        }
         let (a_src, b_src): (&[F128], &[F128]) = if round == 0 {
             (packed_witness.as_slice(), b0.as_slice())
         } else {
             (&a, &bb)
         };
-        if cur > 2 {
+        if use_sparse {
+            let (g1, gi, live_out) = jagged::fold_and_round_sparse(
+                &a_src[..cur],
+                &b_src[..cur],
+                r,
+                &mut sa[..half],
+                &mut sb[..half],
+                live.as_ref().expect("use_sparse implies live"),
+            );
+            (g_one, g_inf) = (g1, gi);
+            live = Some(live_out);
+            sparse_dirty = true;
+        } else if cur > 2 {
             (g_one, g_inf) = jagged::fold_and_round_oop_par(
                 &a_src[..cur],
                 &b_src[..cur],
@@ -987,27 +1070,20 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     // and run the existing, unmodified assist at z_index = ris ‖ r_extra.
     let t = std::time::Instant::now();
     let yr_log_n = dense_log - ris.len();
-    let b_tilde: Vec<F128> = {
-        use rayon::prelude::*;
-        (0..1usize << yr_log_n)
-            .into_par_iter()
-            .map(|y| {
-                let mut z_index = Vec::with_capacity(dense_log);
-                z_index.extend_from_slice(&ris);
-                for j in 0..yr_log_n {
-                    z_index.push(if (y >> j) & 1 == 1 {
-                        F128::ONE
-                    } else {
-                        F128::ZERO
-                    });
-                }
-                jagged::f_hat_t(&params, &rho[..n_log], &rho[n_log..], &z_index)
-            })
-            .collect()
-    };
+    // Batched shared-prefix evaluation — value-identical to per-y `f_hat_t`
+    // calls (see `f_hat_t_batch_y`), ~3–4× cheaper.
+    let b_tilde: Vec<F128> =
+        jagged::f_hat_t_batch_y(&params, &rho[..n_log], &rho[n_log..], &ris, yr_log_n);
     for &v in &b_tilde {
         challenger.observe_f128(v);
     }
+    if trace {
+        eprintln!(
+            "  [open_jagged] b_tilde (2^{yr_log_n}): {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let t = std::time::Instant::now();
     let r_extra = challenger.sample_f128_vec(yr_log_n);
     let mut z_index = ris;
     z_index.extend_from_slice(&r_extra);
@@ -1015,7 +1091,7 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         jagged::prove_assist(&params, &rho[..n_log], &rho[n_log..], &z_index, challenger);
     if trace {
         eprintln!(
-            "  [open_jagged] b_tilde (2^{yr_log_n}) + assist: {:6.2} ms",
+            "  [open_jagged] assist: {:6.2} ms",
             t.elapsed().as_secs_f64() * 1e3
         );
         eprintln!(

@@ -459,8 +459,8 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     use rayon::prelude::*;
 
     // Multi-run specs have no periodic per-block skip pattern; route them to
-    // the general run-list path (no production callers yet). The single-run
-    // fast path below is byte-identical to the pre-run-list kernel.
+    // the general run-list path. The single-run fast path below is
+    // byte-identical to the pre-run-list kernel.
     let Some(run) = padding.as_single_run() else {
         return uni_skip_fold_and_round_pair_runs(
             a_packed,
@@ -470,6 +470,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
             table,
             mlv_challenges,
             padding,
+            true,
         );
     };
 
@@ -702,14 +703,21 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 
 /// General run-list path for
 /// [`uni_skip_fold_and_round_pair_optimized_packed_padded`]: handles
-/// multi-run [`PaddingSpec`]s (the multi-table slot schedule — no production
-/// callers yet). Same parallel-over-x_hi structure and output convention as
+/// multi-run [`PaddingSpec`]s (the multi-table slot schedule). Same
+/// parallel-over-x_hi structure and output convention as
 /// the optimized kernel, but with the portable scalar per-row fold and a
 /// precomputed per-pair skip table instead of the periodic mask/threshold
 /// predicate. A pair (post-URM chunks `2k`, `2k+1`) covers witness bits
 /// `[k·2^(k_skip+1), (k+1)·2^(k_skip+1))`; pairs whose window contains no
 /// useful bits fold to zero and are skipped. Output is byte-identical to the
 /// dense path when the padding/gap bits are honestly zero.
+///
+/// `write_dead`: when true (the public wrapper's contract), dead pairs are
+/// written `F128::ZERO` so the whole output is valid; when false (the M6
+/// sparse-tail prover, [`uni_skip_fold_and_round_pair_runs_sparse`]), dead
+/// pairs are left untouched — the caller promises to only read the useful
+/// intervals (zero-substituting the rest), which is what the sparse tail
+/// does.
 fn uni_skip_fold_and_round_pair_runs(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -718,6 +726,7 @@ fn uni_skip_fold_and_round_pair_runs(
     table: &UniSkipFoldTable,
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
+    write_dead: bool,
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
     use rayon::prelude::*;
 
@@ -771,11 +780,14 @@ fn uni_skip_fold_and_round_pair_runs(
                 let x0l = 2 * x_lo;
                 let x1l = x0l + 1;
                 if !pair_useful[pair_idx_base + x_lo] {
-                    // Padding/gap hole: write zero (uninit alloc, see above).
-                    a_chunk[x0l] = F128::ZERO;
-                    a_chunk[x1l] = F128::ZERO;
-                    b_chunk[x0l] = F128::ZERO;
-                    b_chunk[x1l] = F128::ZERO;
+                    // Padding/gap hole: write zero (uninit alloc, see above),
+                    // unless the caller reads only the useful intervals.
+                    if write_dead {
+                        a_chunk[x0l] = F128::ZERO;
+                        a_chunk[x1l] = F128::ZERO;
+                        b_chunk[x0l] = F128::ZERO;
+                        b_chunk[x1l] = F128::ZERO;
+                    }
                     continue;
                 }
                 let x0g = base + 2 * x_lo;
@@ -803,6 +815,39 @@ fn uni_skip_fold_and_round_pair_runs(
         );
 
     (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf)
+}
+
+/// [`uni_skip_fold_and_round_pair_optimized_packed_padded`]'s multi-run path
+/// WITHOUT the dead-pair zero writes (M6): for sparse-support instances whose
+/// tail runs the support-proportional folds from the first round, the dead
+/// regions of the output are never read (the sparse tail zero-substitutes
+/// them, and zeroes them explicitly on any switch back to the dense
+/// kernels), so the `2·2^(m−k_skip)`-word zero fill can be skipped. Message
+/// and useful-interval values are byte-identical to the public wrapper.
+/// Multi-run specs only.
+pub fn uni_skip_fold_and_round_pair_runs_sparse(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    assert!(
+        padding.as_single_run().is_none(),
+        "the sparse round-2 variant is for multi-run specs only"
+    );
+    uni_skip_fold_and_round_pair_runs(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+        false,
+    )
 }
 
 // ---------------------------------------------------------------------------
