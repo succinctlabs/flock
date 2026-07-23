@@ -381,6 +381,189 @@ pub fn prove_fast_ligerito_jagged_from_witness<Ch: Challenger>(
     (proof, commitment, claim)
 }
 
+/// One slot's prover inputs for the union prove entry: the packed witness
+/// bundle plus the slot's lincheck stripe and circuit. One per registry
+/// type, in slot order.
+pub struct UnionSlotProverInput<'a> {
+    /// The slot's `(z, a, b)` packed buffers (see
+    /// [`flock_core::union::SlotWitness`]).
+    pub witness: flock_core::union::SlotWitness,
+    /// The slot's lincheck stripe copy of `z` (the drivers' fourth output).
+    pub z_lincheck: Vec<u8>,
+    /// The slot's lincheck circuit (e.g. `BlockR1cs::csc_lincheck_circuit`).
+    pub lincheck_circuit: &'a dyn lincheck::LincheckCircuit,
+}
+
+impl<'a> UnionSlotProverInput<'a> {
+    /// Wrap one slot's driver output — the `(z, a, b, stripe)` tuple of the
+    /// existing batch-major witness generators (e.g.
+    /// `blake3::generate_witness_batch_major`) — plus its lincheck circuit.
+    pub fn new(
+        (z_packed, a_packed, b_packed, z_lincheck): (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>),
+        lincheck_circuit: &'a dyn lincheck::LincheckCircuit,
+    ) -> Self {
+        Self {
+            witness: flock_core::union::SlotWitness {
+                z_packed,
+                a_packed,
+                b_packed,
+            },
+            z_lincheck,
+            lincheck_circuit,
+        }
+    }
+}
+
+/// Prove a registry instance through the **union address space** — Phase 2
+/// milestone M1 of the multi-table design: assemble the per-slot witnesses
+/// into the union buffers and drive the EXISTING jagged path with the
+/// [`flock_core::union::UnionInstance`]-derived quantities (count-derived
+/// run-list padding, union jagged heights, `n_log = nu`, union claim
+/// points).
+///
+/// M1 is single-type and transcript-preserving: the statement binding is
+/// still the slot's single-table `BlockR1cs` digest
+/// ([`flock_core::union::UnionInstance::bind_statement_single_type`]), the lincheck is the
+/// slot's own, and on the same statement + witness at full utilization the
+/// proof is **byte-identical** to [`prove_fast_ligerito_jagged_from_witness`]
+/// (the differential oracle in `tests/union_roundtrip.rs`). Verify with
+/// [`flock_core::verifier::verify_ligerito_jagged_union`].
+///
+/// Witness contract: rows `[n_t, 2^nu)` of each slot must be identically
+/// zero — the run-list padding lets the kernels skip them, which is only
+/// sound (and only byte-identical to the dense computation) for honest
+/// zeros. The current batch-major drivers fill every row (padding rows run
+/// a dummy invocation), so with them the declared counts must be the full
+/// capacity; per-slot witness closures that honor partial counts are a
+/// later Phase 2 item.
+pub fn prove_fast_ligerito_jagged_union<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    slot_r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    challenger: &mut Ch,
+) -> (R1csProofJaggedLigerito, Commitment, R1csClaim) {
+    // M1 guard + slot statement consistency (also asserts one type).
+    let ty = union.expect_single_type_slot(slot_r1cs);
+    let m = union.m_total();
+    assert_eq!(pcs_params.m, m, "PcsParams.m must equal the union's M");
+    assert_eq!(
+        slots.len(),
+        union.registry().num_types(),
+        "need one prover input per registry type"
+    );
+
+    let log_n = m - pcs::LOG_PACKING;
+    let lig_config =
+        pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
+            .expect("Ligerito default config; bump m for tiny instances");
+
+    // Union witness assembly (single slot: zero-copy passthrough), keeping
+    // the per-slot lincheck inputs aside.
+    let mut witnesses = Vec::with_capacity(slots.len());
+    let mut linchecks = Vec::with_capacity(slots.len());
+    for slot in slots {
+        witnesses.push(slot.witness);
+        linchecks.push((slot.z_lincheck, slot.lincheck_circuit));
+    }
+    let (z_packed, a_packed_f128, b_packed_f128) = union.assemble_witness(witnesses);
+    let (z_packed_lincheck, lincheck_circuit) =
+        linchecks.pop().expect("single slot per the M1 guard");
+
+    let (commitment, prover_data) = pcs::commit(&z_packed, pcs_params);
+    union.bind_statement_single_type(challenger, slot_r1cs, &commitment);
+
+    // Zerocheck over the union address space, driven by the count-derived
+    // run-list (the existing kernels' general multi-run paths — value-
+    // identical to the single-run spec on honestly-zero padding).
+    let padding = union.padding_spec();
+    let (zc_proof, zc_claim, s_hat_v_c) = {
+        // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
+        let a_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                a_packed_f128.as_ptr() as *const u8,
+                a_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let b_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                b_packed_f128.as_ptr() as *const u8,
+                b_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let c_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr() as *const u8,
+                z_packed.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        zerocheck::prove_packed_padded_capture_s_hat_v_c(
+            a_packed, b_packed, c_packed, m, &padding, challenger,
+        )
+    };
+    // a/b are consumed; recycle the buffers as in `prove_fast_core`.
+    flock_core::scratch::give_f128(a_packed_f128);
+    flock_core::scratch::give_f128(b_packed_f128);
+
+    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+
+    // M1: the lincheck is the slot's own, invoked exactly as today (the
+    // union of one slot has m = M). Union-column lincheck: later milestone.
+    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+        &z_packed_lincheck,
+        m,
+        ty.k_log,
+        zerocheck::K_SKIP,
+        ty.useful_bits,
+        lincheck_circuit,
+        &x_ab,
+        challenger,
+    );
+    drop(z_packed_lincheck);
+
+    let ab = ZClaim {
+        point: union.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
+        value: lc_claim.w,
+    };
+    let c = ZClaim {
+        point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+        value: zc_claim.c_eval,
+    };
+
+    let s_hat_v_ab = if ty.k_log >= pcs::LOG_PACKING {
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else {
+        None
+    };
+
+    let heights = union.jagged_heights();
+    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pcs_open = open_claims_with_precomputed_jagged_ligerito(
+        z_packed,
+        &prover_data,
+        &commitment,
+        &[ab.clone(), c.clone()],
+        &[pre_ab, pre_c],
+        &padding,
+        &heights,
+        union.n_log(),
+        &lig_config,
+        challenger,
+    );
+
+    let proof = R1csProofJaggedLigerito {
+        zerocheck: zc_proof,
+        lincheck: lc_proof,
+        pcs_open,
+    };
+    let claim = R1csClaim { ab, c };
+    (proof, commitment, claim)
+}
+
 /// Everything the prover produces *before* the PCS open: the zerocheck +
 /// lincheck sub-proofs, the two base z-claims (`ab`, `c`), and the retained
 /// commitment / prover-data / packed witness needed to open more claims.
