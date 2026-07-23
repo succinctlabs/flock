@@ -1,4 +1,5 @@
-//! `flock_chain` — CLI for proving and verifying hash-chain proofs.
+//! `flock_chain` — CLI for proving and verifying hash-chain proofs, and
+//! (since wire v5) multi-table MIXED proofs.
 //!
 //! ```text
 //! Usage:
@@ -8,6 +9,7 @@
 //!                       [--initial-cv HEX]              (64 hex for blake3/sha2, 400 hex for keccak;
 //!                                                        default: hash's IV / all-zero state)
 //!                       --out FILE
+//!   flock_chain prove   --mix blake3=N,sha2=M [--seed HEX] --out FILE
 //!   flock_chain verify  --in FILE
 //!   flock_chain help
 //! ```
@@ -21,10 +23,11 @@ use std::time::Instant;
 
 use flock_prover::challenger::FsChallenger;
 use flock_prover::field::F128;
+use flock_prover::mixed::{MixedCounts, MixedRegistryId, MixedSetup};
 use flock_prover::pcs::Commitment;
 use flock_prover::proof_io::{
-    BundleReadError, ChainProofBundleLigerito, HashKind, read_chain_bundle_ligerito_from_file,
-    write_chain_bundle_ligerito_to_file,
+    BundleFlavor, ChainProofBundleLigerito, HashKind, MixedProofBundleLigerito, peek_flavor,
+    read_bytes_from_file, write_chain_bundle_ligerito_to_file, write_mixed_bundle_ligerito_to_file,
 };
 use flock_prover::r1cs_hashes::blake3::{
     self as blake3_chain, BLAKE3_IV, Blake3Setup, blake3_compress, cv_to_phys_bits as bl_cv_phys,
@@ -57,6 +60,43 @@ struct Args {
     out: Option<String>,
     input: Option<String>,
     mode: Option<Mode>,
+    mix: Option<MixSpec>,
+}
+
+/// Parsed `--mix` argument: per-type invocation counts.
+#[derive(Clone, Copy, Debug, Default)]
+struct MixSpec {
+    blake3: usize,
+    sha2: usize,
+}
+
+impl MixSpec {
+    /// Parse `blake3=N,sha2=M` (either key may be omitted — count 0; at
+    /// least one must be positive; keys accept the `HashKind` spellings).
+    fn parse(s: &str) -> Result<Self, String> {
+        let mut spec = MixSpec::default();
+        for part in s.split(',') {
+            let (key, val) = part
+                .split_once('=')
+                .ok_or_else(|| format!("--mix: expected key=COUNT, got '{part}'"))?;
+            let count: usize = val
+                .parse()
+                .map_err(|e| format!("--mix: invalid count '{val}' for '{key}': {e}"))?;
+            match HashKind::parse(key) {
+                Some(HashKind::Blake3) => spec.blake3 = count,
+                Some(HashKind::Sha2) => spec.sha2 = count,
+                _ => {
+                    return Err(format!(
+                        "--mix: unknown type '{key}' (mixed registries cover blake3, sha2)"
+                    ));
+                }
+            }
+        }
+        if spec.blake3 == 0 && spec.sha2 == 0 {
+            return Err("--mix: at least one count must be positive".into());
+        }
+        Ok(spec)
+    }
 }
 
 fn parse_args(it: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -91,6 +131,10 @@ fn parse_args(it: impl Iterator<Item = String>) -> Result<Args, String> {
                 );
             }
             "--initial-cv" => args.initial_cv_hex = Some(val!()),
+            "--mix" => {
+                let v: String = val!();
+                args.mix = Some(MixSpec::parse(&v)?);
+            }
             "--out" => args.out = Some(val!()),
             "--in" => args.input = Some(val!()),
             "--mode" => {
@@ -107,11 +151,13 @@ fn parse_args(it: impl Iterator<Item = String>) -> Result<Args, String> {
 }
 
 const USAGE: &str = "\
-flock_chain — prove/verify hash-chain proofs
+flock_chain — prove/verify hash-chain proofs and mixed multi-table proofs
 
 Usage:
   flock_chain prove  --hash <blake3|sha2|keccak> [--steps N] [--seed HEX]
                      [--initial-cv HEX] [--mode <fast|slim|secure>] --out FILE
+  flock_chain prove  --mix blake3=N,sha2=M [--seed HEX]
+                     [--mode <fast|slim|secure>] --out FILE
   flock_chain verify --in FILE
   flock_chain help
 
@@ -119,8 +165,13 @@ Notes:
   --steps N: must be a power of 2 and ≥ 8 (chain protocol requirement). Default 8.
              The Ligerito PCS needs m ≥ ~21, i.e. steps ≥ 256 (blake3),
              ≥ 128 (sha2), or ≥ 64 (keccak).
-  --seed HEX: 16 hex chars (u64). Drives message generation for blake3/sha2.
-              Default 0. Ignored for keccak (no message).
+  --mix blake3=N,sha2=M: ONE mixed proof of N independent BLAKE3 and M
+              independent SHA-256 compressions (any counts, chosen at prove
+              time; either may be omitted for 0). Statement is
+              well-formedness only — no per-invocation I/O binding. Picks
+              the smallest built-in registry tier whose capacity fits.
+  --seed HEX: 16 hex chars (u64). Drives message generation for blake3/sha2
+              (chain and mix). Default 0. Ignored for keccak (no message).
   --initial-cv HEX: hash-specific length:
               blake3, sha2: 64 hex chars = 8 × 32-bit words, big-endian per word
               keccak:       400 hex chars = 1600 bits, LSB-first per byte
@@ -129,7 +180,7 @@ Notes:
               fast = rate 1/2 (smaller log_inv_rate, faster prover, larger proof).
               slim = rate 1/4 (larger log_inv_rate, smaller proof, slower prover).
   --out FILE: write proof bundle here.
-  --in FILE:  read proof bundle here.
+  --in FILE:  read proof bundle here (flavor auto-detected: chain or mixed).
 ";
 
 // ---------------------------------------------------------------------------
@@ -197,6 +248,12 @@ impl Rng {
 // ---------------------------------------------------------------------------
 
 fn cmd_prove(args: Args) -> Result<(), String> {
+    if let Some(mix) = args.mix {
+        if args.hash.is_some() || args.steps.is_some() || args.initial_cv_hex.is_some() {
+            return Err("prove: --mix is exclusive with --hash/--steps/--initial-cv".into());
+        }
+        return cmd_prove_mix(mix, args);
+    }
     let hash = args.hash.ok_or("prove: --hash is required")?;
     let steps = args.steps.unwrap_or(8);
     let seed = args.seed.unwrap_or(0);
@@ -232,6 +289,73 @@ fn cmd_prove(args: Args) -> Result<(), String> {
     let bytes_len = bundle.to_bytes().len();
     write_chain_bundle_ligerito_to_file(&out, &bundle).map_err(|e| format!("write {out}: {e}"))?;
     eprintln!("  wrote {out} ({bytes_len} bytes)");
+    Ok(())
+}
+
+/// `prove --mix blake3=N,sha2=M`: ONE mixed multi-table proof of N BLAKE3 +
+/// M SHA-256 independent compressions (inputs generated from `--seed`),
+/// through the union prove entry on the smallest fitting registry tier.
+/// Statement = well-formedness only (no per-invocation I/O binding).
+fn cmd_prove_mix(mix: MixSpec, args: Args) -> Result<(), String> {
+    let seed = args.seed.unwrap_or(0);
+    let mode = args.mode.unwrap_or_default();
+    let out = args.out.ok_or("prove: --out is required")?;
+
+    let max_count = mix.blake3.max(mix.sha2);
+    let id = MixedRegistryId::smallest_fitting(max_count).ok_or_else(|| {
+        format!(
+            "--mix: count {max_count} exceeds every built-in registry tier \
+             (largest capacity: {}); split the workload",
+            1usize << MixedRegistryId::ALL.last().unwrap().nu()
+        )
+    })?;
+    eprintln!(
+        "flock_chain prove: mix blake3={} sha2={} seed=0x{seed:016x} mode={} tier={}",
+        mix.blake3,
+        mix.sha2,
+        mode.as_str(),
+        id.as_str(),
+    );
+
+    // Deterministic independent inputs from the seed (no chaining — the
+    // invocations are independent by design).
+    let mut rng = Rng::new(seed);
+    let blake3_inputs: Vec<blake3_chain::Compression> = (0..mix.blake3)
+        .map(|_| {
+            let cv: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
+            let m = rng.next_block();
+            (cv, m, 0u64, 64u32, 0u32)
+        })
+        .collect();
+    let sha2_inputs: Vec<sha2_chain::Compression> = (0..mix.sha2)
+        .map(|_| (std::array::from_fn(|_| rng.nx() as u32), rng.next_block()))
+        .collect();
+
+    let t = Instant::now();
+    let setup = MixedSetup::new(id);
+    eprintln!("  registry setup: {:.2}s", t.elapsed().as_secs_f64());
+
+    let mut ch = FsChallenger::new(b"flock_chain-cli-mixed");
+    let t = Instant::now();
+    let (proof, commitment, _claim) = setup.prove(&sha2_inputs, &blake3_inputs, mode, &mut ch);
+    eprintln!("  prove_mixed: {:.2}s", t.elapsed().as_secs_f64());
+
+    let bundle = MixedProofBundleLigerito {
+        registry_id: id,
+        counts: vec![mix.sha2 as u64, mix.blake3 as u64],
+        commitment,
+        proof,
+    };
+    let bytes_len = bundle.to_bytes().len();
+    write_mixed_bundle_ligerito_to_file(&out, &bundle).map_err(|e| format!("write {out}: {e}"))?;
+    eprintln!("  wrote {out} ({bytes_len} bytes)");
+    println!(
+        "Proved (well-formedness only): {} blake3 and {} sha2 independent \
+         compressions in one proof (tier {}, no per-invocation I/O binding).",
+        mix.blake3,
+        mix.sha2,
+        id.as_str()
+    );
     Ok(())
 }
 
@@ -373,10 +497,21 @@ fn prove_keccak(
 fn cmd_verify(args: Args) -> Result<(), String> {
     let input = args.input.ok_or("verify: --in is required")?;
 
-    let bundle = read_chain_bundle_ligerito_from_file(&input).map_err(|e| match e {
-        BundleReadError::Io(e) => format!("read {input}: {e}"),
-        BundleReadError::Deserialize(e) => format!("deserialize {input}: {e}"),
-    })?;
+    // Flavor auto-detect: chain and mixed bundles share the header.
+    let bytes = read_bytes_from_file(&input).map_err(|e| format!("read {input}: {e}"))?;
+    match peek_flavor(&bytes).map_err(|e| format!("deserialize {input}: {e}"))? {
+        BundleFlavor::Chain => {}
+        BundleFlavor::Mixed => return cmd_verify_mix(&input, &bytes),
+        BundleFlavor::R1cs => {
+            return Err(format!(
+                "{input}: bare R1cs bundles carry no statement for this CLI \
+                 (expected a chain or mixed bundle)"
+            ));
+        }
+    }
+
+    let bundle = ChainProofBundleLigerito::from_bytes(&bytes)
+        .map_err(|e| format!("deserialize {input}: {e}"))?;
 
     let m = bundle.commitment.params.m;
     let hash = bundle.hash_kind;
@@ -443,6 +578,65 @@ fn cmd_verify(args: Args) -> Result<(), String> {
             println!(
                 "OK: {} chain of {steps} compressions verified.",
                 hash.as_str()
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("verification rejected: {e:?}")),
+    }
+}
+
+/// Verify a mixed bundle: rebuild the registry from the bundle's id (which
+/// pins the full registry, capacity included), take the counts from the
+/// bundle, and run the union verifier under the `flock-mixed-v1` binding.
+fn cmd_verify_mix(input: &str, bytes: &[u8]) -> Result<(), String> {
+    let bundle = MixedProofBundleLigerito::from_bytes(bytes)
+        .map_err(|e| format!("deserialize {input}: {e}"))?;
+    let id = bundle.registry_id;
+    if bundle.counts.len() != 2 {
+        return Err(format!(
+            "{input}: tier {} declares 2 types, bundle carries {} counts",
+            id.as_str(),
+            bundle.counts.len()
+        ));
+    }
+    let capacity = 1u64 << id.nu();
+    for (t, &n) in bundle.counts.iter().enumerate() {
+        if n > capacity {
+            return Err(format!(
+                "{input}: count n_{t} = {n} exceeds tier capacity {capacity}"
+            ));
+        }
+    }
+    // Counts are in slot order: SHA-256 (wider) first, then BLAKE3.
+    let counts = MixedCounts {
+        sha2: bundle.counts[0] as usize,
+        blake3: bundle.counts[1] as usize,
+    };
+    eprintln!(
+        "flock_chain verify: mixed tier={} sha2={} blake3={} (M={})",
+        id.as_str(),
+        counts.sha2,
+        counts.blake3,
+        id.nu() + 16,
+    );
+
+    let t = Instant::now();
+    let setup = MixedSetup::new(id);
+    eprintln!("  registry setup: {:.2}s", t.elapsed().as_secs_f64());
+    let mut ch = FsChallenger::new(b"flock_chain-cli-mixed");
+    let t = Instant::now();
+    let result = setup.verify(counts, &bundle.commitment, &bundle.proof, &mut ch);
+    eprintln!("  verify_mixed: {:.2}s", t.elapsed().as_secs_f64());
+
+    match result {
+        Ok(_claim) => {
+            println!(
+                "OK: mixed proof verified — {} sha2 and {} blake3 independent \
+                 compressions are well-formed under tier {} (statement is \
+                 well-formedness only; no per-invocation I/O binding).",
+                counts.sha2,
+                counts.blake3,
+                id.as_str()
             );
             Ok(())
         }

@@ -1,15 +1,18 @@
 //! Serialize / deserialize proofs to bytes (and files).
 //!
-//! Two bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof and
-//! [`ChainProofBundleLigerito`] for the hash-chain proof. Both pair a proof
-//! with its commitment (which the verifier needs); the chain bundle
-//! additionally carries the public endpoint bits.
+//! Three bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof,
+//! [`ChainProofBundleLigerito`] for the hash-chain proof, and
+//! [`MixedProofBundleLigerito`] for the multi-table mixed proof. All pair a
+//! proof with its commitment (which the verifier needs); the chain bundle
+//! additionally carries the public endpoint bits, the mixed bundle its
+//! registry id + counts vector.
 //!
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 1)
-//!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain (0/1 reserved: legacy BaseFold)
+//!   byte  5       VERSION                  (currently 5)
+//!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain, 4 = Mixed
+//!                 (0/1 reserved: legacy BaseFold)
 //!   bytes 7..     bincode-serialized payload
 //! ```
 //!
@@ -41,12 +44,16 @@ use flock_core::pcs::Commitment;
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Format version. Bumped on incompatible serialization changes.
-/// v4 (current) adds `ood_values` + `fold_grinding_nonces` to
-/// `LigeritoProof` and `profile` to `PcsParams` (Johnson+OOD profiles).
-/// v3 restructures `BaseFoldProof`: per-query Merkle paths are replaced by
-/// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
-/// to [`ChainProofBundle`].
-pub const VERSION: u8 = 4;
+/// v5 (current) adds the Mixed flavor ([`MixedProofBundleLigerito`]:
+/// registry id + counts vector + jagged-transport proof); the existing
+/// R1cs/Chain flavors' payloads are unchanged, but versioning is strict so
+/// v4 files are rejected.
+/// v4 added `ood_values` + `fold_grinding_nonces` to `LigeritoProof` and
+/// `profile` to `PcsParams` (Johnson+OOD profiles). v3 restructured
+/// `BaseFoldProof`: per-query Merkle paths were replaced by shared octopus
+/// multi-proofs (one per Merkle tree). v2 added `HashKind` to
+/// [`ChainProofBundle`].
+pub const VERSION: u8 = 5;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right
@@ -80,10 +87,41 @@ impl HashKind {
 }
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
-/// bundle a file holds without parsing the payload first. Values 0/1 are
-/// reserved: they were the legacy BaseFold R1cs/Chain flavors.
+/// bundle a file holds without parsing the payload first (see
+/// [`peek_flavor`]). Values 0/1 are reserved: they were the legacy BaseFold
+/// R1cs/Chain flavors.
 const FLAVOR_R1CS_LIGERITO: u8 = 2;
 const FLAVOR_CHAIN_LIGERITO: u8 = 3;
+const FLAVOR_MIXED_LIGERITO: u8 = 4;
+
+/// What kind of bundle a byte buffer holds. Returned by [`peek_flavor`] so
+/// generic readers (the CLI) can dispatch before parsing the payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BundleFlavor {
+    R1cs,
+    Chain,
+    Mixed,
+}
+
+/// Validate the header (magic + version) and return the bundle flavor,
+/// without touching the payload.
+pub fn peek_flavor(bytes: &[u8]) -> Result<BundleFlavor, DeserializeError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(DeserializeError::Truncated);
+    }
+    if bytes[0..5] != MAGIC {
+        return Err(DeserializeError::BadMagic);
+    }
+    if bytes[5] != VERSION {
+        return Err(DeserializeError::UnsupportedVersion(bytes[5]));
+    }
+    match bytes[6] {
+        FLAVOR_R1CS_LIGERITO => Ok(BundleFlavor::R1cs),
+        FLAVOR_CHAIN_LIGERITO => Ok(BundleFlavor::Chain),
+        FLAVOR_MIXED_LIGERITO => Ok(BundleFlavor::Mixed),
+        other => Err(DeserializeError::UnknownFlavor(other)),
+    }
+}
 
 /// Header size = 5-byte magic + 1-byte version + 1-byte flavor.
 const HEADER_LEN: usize = 7;
@@ -96,7 +134,8 @@ pub enum DeserializeError {
     /// The version byte didn't match this build's `VERSION`. The number is
     /// the version found in the file.
     UnsupportedVersion(u8),
-    /// The flavor byte was neither `2` (R1cs Ligerito) nor `3` (Chain Ligerito).
+    /// The flavor byte was none of `2` (R1cs Ligerito), `3` (Chain
+    /// Ligerito), `4` (Mixed Ligerito).
     UnknownFlavor(u8),
     /// `from_bytes` was called with a slice shorter than `HEADER_LEN`.
     Truncated,
@@ -183,6 +222,55 @@ impl ChainProofBundleLigerito {
     }
 }
 
+/// Bundles a multi-table MIXED proof (wire format v5): the built-in
+/// registry id — which pins the FULL registry, type list and uniform
+/// capacity `nu` included (see [`crate::mixed::MixedRegistryId`]) — the
+/// declared counts vector (one `u64` per type, **in slot order**), the
+/// commitment to the dense stack, and the jagged-transport union proof.
+/// The statement is well-formedness only (design doc §"Statement,
+/// transcript, wire format"): the commitment opens to tables with the
+/// declared counts, every declared row satisfying its type's hash relation
+/// — no per-invocation I/O binding.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MixedProofBundleLigerito {
+    pub registry_id: crate::mixed::MixedRegistryId,
+    /// Declared invocation counts, in slot order (for the current tiers:
+    /// SHA-256, then BLAKE3).
+    pub counts: Vec<u64>,
+    pub commitment: Commitment,
+    pub proof: flock_core::proof::R1csProofJaggedLigerito,
+}
+
+impl MixedProofBundleLigerito {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        write_header(&mut out, FLAVOR_MIXED_LIGERITO);
+        bincode::serialize_into(&mut out, self)
+            .expect("bincode serialize MixedProofBundleLigerito");
+        out
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
+        let payload = parse_header(bytes, FLAVOR_MIXED_LIGERITO)?;
+        Ok(bincode::deserialize(payload)?)
+    }
+}
+
+/// Write a mixed bundle to `path`.
+pub fn write_mixed_bundle_ligerito_to_file<P: AsRef<Path>>(
+    path: P,
+    bundle: &MixedProofBundleLigerito,
+) -> io::Result<()> {
+    write_bytes_to_file(path, &bundle.to_bytes())
+}
+
+/// Read a mixed bundle from `path`.
+pub fn read_mixed_bundle_ligerito_from_file<P: AsRef<Path>>(
+    path: P,
+) -> Result<MixedProofBundleLigerito, BundleReadError> {
+    let bytes = read_bytes_from_file(path).map_err(BundleReadError::Io)?;
+    MixedProofBundleLigerito::from_bytes(&bytes).map_err(BundleReadError::Deserialize)
+}
+
 // ---------------------------------------------------------------------------
 // Encoding helpers
 // ---------------------------------------------------------------------------
@@ -205,7 +293,10 @@ fn parse_header(bytes: &[u8], expected_flavor: u8) -> Result<&[u8], DeserializeE
         return Err(DeserializeError::UnsupportedVersion(v));
     }
     let flavor = bytes[6];
-    if flavor != FLAVOR_R1CS_LIGERITO && flavor != FLAVOR_CHAIN_LIGERITO {
+    if flavor != FLAVOR_R1CS_LIGERITO
+        && flavor != FLAVOR_CHAIN_LIGERITO
+        && flavor != FLAVOR_MIXED_LIGERITO
+    {
         return Err(DeserializeError::UnknownFlavor(flavor));
     }
     if flavor != expected_flavor {
@@ -415,6 +506,157 @@ mod tests {
                 &mut chv,
             )
             .expect("verify round-tripped chain proof");
+    }
+
+    /// Mixed bundle (wire v5) end-to-end: prove a small partial-count mixed
+    /// instance on the nu7 tier, serialize, roundtrip, verify from the
+    /// deserialized bundle (registry rebuilt from the id, counts from the
+    /// bundle), and reject count tampering.
+    #[test]
+    #[ignore] // Heavier — run with `cargo test mixed_bundle_roundtrip -- --ignored`
+    fn mixed_bundle_roundtrip_and_verify() {
+        use crate::mixed::{MixedCounts, MixedRegistryId, MixedSetup};
+        use flock_prover_test_inputs::{random_blake3_inputs, random_sha2_inputs};
+
+        let setup = MixedSetup::new(MixedRegistryId::Blake3Sha2Nu7);
+        let mut rng = Rng::new(0x0511_31ED);
+        let sha2_inputs = random_sha2_inputs(&mut rng, 100);
+        let blake3_inputs = random_blake3_inputs(&mut rng, 37);
+
+        let mut ch = FsChallenger::new(b"flock-proofio-mixed");
+        let (proof, commitment, _claim) =
+            setup.prove(&sha2_inputs, &blake3_inputs, Default::default(), &mut ch);
+
+        let bundle = MixedProofBundleLigerito {
+            registry_id: setup.id,
+            counts: vec![100, 37],
+            commitment,
+            proof,
+        };
+        let bytes = bundle.to_bytes();
+        assert_eq!(&bytes[0..5], &MAGIC);
+        assert_eq!(bytes[5], VERSION);
+        assert_eq!(bytes[6], FLAVOR_MIXED_LIGERITO);
+        assert!(matches!(peek_flavor(&bytes), Ok(BundleFlavor::Mixed)));
+
+        let bundle2 = MixedProofBundleLigerito::from_bytes(&bytes).expect("must round-trip");
+        assert_eq!(bundle2.registry_id, bundle.registry_id);
+        assert_eq!(bundle2.counts, bundle.counts);
+        assert_eq!(bundle2.commitment.root, bundle.commitment.root);
+
+        // Verify from the deserialized bundle alone (+ the rebuilt tier).
+        let setup2 = MixedSetup::new(bundle2.registry_id);
+        let counts = MixedCounts {
+            sha2: bundle2.counts[0] as usize,
+            blake3: bundle2.counts[1] as usize,
+        };
+        let mut chv = FsChallenger::new(b"flock-proofio-mixed");
+        setup2
+            .verify(counts, &bundle2.commitment, &bundle2.proof, &mut chv)
+            .expect("verify round-tripped mixed proof");
+
+        // Tampered counts must reject (they bind before any challenge).
+        let mut chv = FsChallenger::new(b"flock-proofio-mixed");
+        assert!(
+            setup2
+                .verify(
+                    MixedCounts {
+                        sha2: 101,
+                        blake3: 37
+                    },
+                    &bundle2.commitment,
+                    &bundle2.proof,
+                    &mut chv,
+                )
+                .is_err(),
+            "tampered counts must reject"
+        );
+
+        // File roundtrip.
+        let path = std::env::temp_dir().join("flock-proofio-mixed-roundtrip.bin");
+        write_mixed_bundle_ligerito_to_file(&path, &bundle).expect("write");
+        let bundle3 = read_mixed_bundle_ligerito_from_file(&path).expect("file round-trip");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bundle3.counts, bundle.counts);
+
+        eprintln!(
+            "Mixed proof bundle ({}, counts sha2=100 blake3=37): {} bytes ({:.1} KB)",
+            bundle.registry_id.as_str(),
+            bytes.len(),
+            bytes.len() as f64 / 1024.0
+        );
+    }
+
+    /// Deterministic input generators shared with the mixed bundle test.
+    mod flock_prover_test_inputs {
+        use super::Rng;
+
+        pub fn random_blake3_inputs(
+            rng: &mut Rng,
+            n: usize,
+        ) -> Vec<crate::r1cs_hashes::blake3::Compression> {
+            (0..n)
+                .map(|_| {
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.nx() as u32);
+                    (cv, m, rng.nx(), 64u32, 11u32)
+                })
+                .collect()
+        }
+
+        pub fn random_sha2_inputs(
+            rng: &mut Rng,
+            n: usize,
+        ) -> Vec<crate::r1cs_hashes::sha2::Compression> {
+            (0..n)
+                .map(|_| {
+                    (
+                        std::array::from_fn(|_| rng.nx() as u32),
+                        std::array::from_fn(|_| rng.nx() as u32),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// Mixed flavor header mechanics (cheap): peek_flavor on all three
+    /// flavors, mixed-vs-chain flavor mismatch, and version strictness for
+    /// the mixed reader.
+    #[test]
+    fn mixed_flavor_header_checks() {
+        let mut bytes = vec![0u8; HEADER_LEN + 10];
+        bytes[0..5].copy_from_slice(&MAGIC);
+        bytes[5] = VERSION;
+        for (flavor, expect) in [
+            (FLAVOR_R1CS_LIGERITO, BundleFlavor::R1cs),
+            (FLAVOR_CHAIN_LIGERITO, BundleFlavor::Chain),
+            (FLAVOR_MIXED_LIGERITO, BundleFlavor::Mixed),
+        ] {
+            bytes[6] = flavor;
+            assert!(matches!(peek_flavor(&bytes), Ok(f) if f == expect));
+        }
+
+        // Chain-flavored header read as Mixed: flavor mismatch.
+        bytes[6] = FLAVOR_CHAIN_LIGERITO;
+        assert!(matches!(
+            MixedProofBundleLigerito::from_bytes(&bytes),
+            Err(DeserializeError::FlavorMismatch {
+                expected: FLAVOR_MIXED_LIGERITO,
+                found: FLAVOR_CHAIN_LIGERITO
+            })
+        ));
+
+        // Old version (v4) rejected — strict versioning.
+        bytes[5] = VERSION - 1;
+        bytes[6] = FLAVOR_MIXED_LIGERITO;
+        assert!(matches!(
+            MixedProofBundleLigerito::from_bytes(&bytes),
+            Err(DeserializeError::UnsupportedVersion(v)) if v == VERSION - 1
+        ));
+        assert!(matches!(
+            peek_flavor(&bytes),
+            Err(DeserializeError::UnsupportedVersion(v)) if v == VERSION - 1
+        ));
     }
 
     #[test]

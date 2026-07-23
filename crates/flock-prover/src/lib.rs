@@ -16,6 +16,7 @@ pub use flock_core::*;
 
 pub mod chain;
 pub mod merkle_path;
+pub mod mixed;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
