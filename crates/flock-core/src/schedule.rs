@@ -9,8 +9,8 @@
 //! [`Instance`] adds the per-proof declared counts `n_t` and derives the
 //! run-list [`PaddingSpec`] the zerocheck kernels consume.
 //!
-//! Nothing here is wired into the prover/verifier paths yet: Phase 0 lands
-//! the types and their arithmetic; Phase 2 makes the union PIOP consume them.
+//! Phase 0 landed the types and their arithmetic; the union-instance layer
+//! that wires them into the prove/verify paths lives in [`crate::union`].
 
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::{PaddingRun, PaddingSpec};
@@ -35,6 +35,24 @@ pub struct TableType {
     /// Column of a constant-one wire to pin to 1 across all blocks, or
     /// `None` (see `BlockR1cs::const_pin`).
     pub const_pin: Option<usize>,
+}
+
+impl TableType {
+    /// One-type view of an existing single-table [`crate::r1cs::BlockR1cs`]:
+    /// the base block, width, useful bits, and const pin — everything except
+    /// the replication count, which becomes the registry's uniform capacity
+    /// `nu` (pass the r1cs's `n_log()` to [`Registry::new`] to reproduce
+    /// today's geometry exactly).
+    pub fn from_block_r1cs(r1cs: &crate::r1cs::BlockR1cs) -> Self {
+        Self {
+            k_log: r1cs.k_log,
+            useful_bits: r1cs.useful_bits,
+            a_0: r1cs.a_0.clone(),
+            b_0: r1cs.b_0.clone(),
+            c_0: r1cs.c_0.clone(),
+            const_pin: r1cs.const_pin,
+        }
+    }
 }
 
 /// Static layout of one type's slot in the union address space. Computed

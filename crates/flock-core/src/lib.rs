@@ -29,6 +29,7 @@ pub mod proof;
 pub mod r1cs;
 pub mod schedule;
 pub mod scratch;
+pub mod union;
 pub mod verifier;
 pub mod zerocheck;
 

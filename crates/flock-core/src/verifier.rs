@@ -113,6 +113,79 @@ pub fn verify_ligerito_jagged<Ch: Challenger>(
     Ok(R1csClaim { ab, c })
 }
 
+/// Verify a proof produced by the **union prove entry**
+/// (`flock_prover::prover::prove_fast_ligerito_jagged_union`): replay
+/// zerocheck + lincheck over the union address space with the claim points
+/// derived from the [`crate::union::UnionInstance`], then verify the
+/// jagged-path batched opening against the union's heights. The counts
+/// enter through the heights (and, on the prover side, the run-list
+/// padding) only — the M1 transcript binding is still the slot's
+/// single-table statement
+/// ([`crate::union::UnionInstance::bind_statement_single_type`]).
+///
+/// M1: single-type registries only. On those, acceptance is equivalent to
+/// [`verify_ligerito_jagged`] with the slot's `BlockR1cs` at full
+/// utilization — the transcript walk is byte-identical.
+pub fn verify_ligerito_jagged_union<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    slot_r1cs: &BlockR1cs,
+    commitment: &Commitment,
+    proof: &R1csProofJaggedLigerito,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
+    // Verification is single-threaded; run the PIOP replay on the dedicated
+    // 1-thread pool (verify_claims_jagged_ligerito installs it itself).
+    let (ab, c) = verifier_pool().install(|| -> Result<(ZClaim, ZClaim), VerifyError> {
+        let ty = union.expect_single_type_slot(slot_r1cs);
+        union.bind_statement_single_type(challenger, slot_r1cs, commitment);
+
+        let zc_claim = zerocheck::verify(union.m_total(), &proof.zerocheck, challenger)
+            .map_err(VerifyError::Zerocheck)?;
+        let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+        // M1: the lincheck is the slot's own, exactly as today (the union of
+        // one slot has m = M). The union-column lincheck is a later milestone.
+        let lc_claim = lincheck::verify(
+            union.m_total(),
+            ty.k_log,
+            zerocheck::K_SKIP,
+            lincheck_circuit,
+            &x_ab,
+            zc_claim.a_eval,
+            zc_claim.b_eval,
+            &proof.lincheck,
+            challenger,
+        )
+        .map_err(VerifyError::Lincheck)?;
+
+        let ab = ZClaim {
+            point: union.ab_claim_point(
+                lc_claim.r_inner_skip,
+                &lc_claim.r_inner_rest,
+                &x_ab.x_outer,
+            ),
+            value: lc_claim.w,
+        };
+        let c = ZClaim {
+            point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+            value: zc_claim.c_eval,
+        };
+        Ok((ab, c))
+    })?;
+    verify_claims_jagged_ligerito(
+        commitment,
+        &[ab.clone(), c.clone()],
+        &union.jagged_heights(),
+        union.n_log(),
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+    )
+    .map_err(VerifyError::PcsJagged)?;
+    Ok(R1csClaim { ab, c })
+}
+
 /// Verify a jagged-path batched PCS opening over an arbitrary list of
 /// `ẑ`-claims — the jagged counterpart of [`verify_claims_ligerito`], and the
 /// mirror of the prover's `pcs::open_batch_jagged_ligerito` call. `heights` /
