@@ -578,3 +578,111 @@ where
 
     (z, a, b, stripe)
 }
+
+/// Partial-count variant of [`drive_witness_batch_major`] for the union's
+/// dynamic invocation counts (M4): the declared rows are `inputs`
+/// (`inputs.len() = n_t ≤ 2^n_blocks_log`, any value — not necessarily a
+/// power of two), and every row in `[n_t, 2^n_blocks_log)` is left
+/// **identically zero** in `z`, `a`, `b`, and the lincheck stripe — the
+/// design doc's dummy-row semantics, which the union's count-derived
+/// run-lists and the lincheck's count-derived const-pin target require
+/// (dummy rows carry the pin at 0; a real padding invocation would carry it
+/// at 1 and break the count binding).
+///
+/// Interleaved-group mechanics: groups fully below `n_t` build exactly as
+/// the full driver; a partial final group builds all `BM_V` lanes (dead
+/// lanes fed the group's first real input as a placeholder) and then zeroes
+/// the dead lanes in the row buffers before the NT flush + stripe
+/// transpose; groups fully past `n_t` skip the builder and flush the
+/// pre-zeroed rows (the destination buffers come from the dirty scratch
+/// pool, so the dummy region must be written — it is committed at capacity
+/// height by the dense-stack transport and read by the kernels' dense
+/// paths).
+pub(crate) fn drive_witness_batch_major_partial<S: Sync, F>(
+    inputs: &[S],
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    per_group: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
+{
+    use rayon::prelude::*;
+
+    let n_total = 1usize << n_blocks_log;
+    let n_declared = inputs.len();
+    assert!(n_declared <= n_total);
+    assert!(n_total >= BM_V);
+    let u64_per_block = (1usize << k_log) / 64;
+    let useful_chunks = useful_bits.div_ceil(128);
+    let useful_words = useful_bits.div_ceil(64);
+    let total_f128 = n_total * (u64_per_block / 2);
+
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let stripe = vec![0u8; n_total * u64_per_block * 8];
+    // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
+    // the loop below fully writes the useful prefix — declared rows from the
+    // builders, dummy rows as zero flushes.
+    let tail = useful_chunks << n_blocks_log;
+    for buf in [&mut z, &mut a, &mut b] {
+        buf[tail..]
+            .par_chunks_mut(1 << 16)
+            .for_each(|c| c.fill(F128::ZERO));
+    }
+
+    let (zp, ap, bp) = (
+        SendPtr(z.as_mut_ptr() as *mut u64),
+        SendPtr(a.as_mut_ptr() as *mut u64),
+        SendPtr(b.as_mut_ptr() as *mut u64),
+    );
+    let sp = SendPtr(stripe.as_ptr() as *mut u64);
+    let inputs_ref = inputs;
+
+    (0..n_total / BM_V).into_par_iter().for_each_init(
+        || {
+            (
+                vec![[0u64; BM_V]; u64_per_block],
+                vec![[0u64; BM_V]; u64_per_block],
+                vec![[0u64; BM_V]; u64_per_block],
+            )
+        },
+        move |(rz, ra, rb), g| {
+            rz[..useful_words].fill([0u64; BM_V]);
+            ra[..useful_words].fill([0u64; BM_V]);
+            rb[..useful_words].fill([0u64; BM_V]);
+            let o0 = g * BM_V;
+            let live = n_declared.saturating_sub(o0).min(BM_V);
+            if live > 0 {
+                // Dead lanes get the group's first real input as a
+                // placeholder — their rows are zeroed below, so the
+                // placeholder's data never reaches the buffers.
+                let group: [&S; BM_V] =
+                    std::array::from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(&inputs_ref[o0]));
+                per_group(group, rz, ra, rb);
+                if live < BM_V {
+                    for rows in [&mut *rz, &mut *ra, &mut *rb] {
+                        for row in rows[..useful_words].iter_mut() {
+                            for lane in row[live..].iter_mut() {
+                                *lane = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            // Fully-dummy groups (live == 0) flush the pre-zeroed rows:
+            // the dummy region must be written, not skipped — see above.
+            // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
+            unsafe {
+                flush_rows_nt(rz, zp.get(), o0, n_blocks_log, useful_chunks);
+                flush_rows_nt(ra, ap.get(), o0, n_blocks_log, useful_chunks);
+                flush_rows_nt(rb, bp.get(), o0, n_blocks_log, useful_chunks);
+                stripe_from_rows(rz, sp.get() as *mut u8, o0, u64_per_block, useful_words);
+            }
+        },
+    );
+
+    (z, a, b, stripe)
+}

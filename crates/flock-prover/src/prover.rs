@@ -458,12 +458,15 @@ enum UnionProveBinding<'a> {
 /// [`prove_fast_ligerito_jagged_union_harness`].
 ///
 /// Witness contract: rows `[n_t, 2^nu)` of each slot must be identically
-/// zero — the run-list padding lets the kernels skip them, which is only
-/// sound (and only byte-identical to the dense computation) for honest
-/// zeros. The current batch-major drivers fill every row (padding rows run
-/// a dummy invocation), so with them the declared counts must be the full
-/// capacity; per-slot witness closures that honor partial counts are a
-/// later Phase 2 item (M4).
+/// zero — the run-list padding lets the kernels skip them (only sound, and
+/// only byte-identical to the dense computation, for honest zeros), the
+/// dense-stack transport commits them at capacity height, and the union
+/// lincheck's count-derived const-pin target requires the pin at 0 on every
+/// dummy row. Use the per-hash `generate_witness_batch_major_partial`
+/// drivers (M4), which honor any `n_t ≤ 2^nu` and zero the remainder; the
+/// full-utilization `generate_witness_batch_major` drivers instead fill
+/// padding rows with real dummy invocations (pin = 1) and are only valid
+/// here at `n_t = 2^nu`.
 pub fn prove_fast_ligerito_jagged_union<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
     pcs_params: &PcsParams,

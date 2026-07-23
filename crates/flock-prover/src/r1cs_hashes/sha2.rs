@@ -2021,6 +2021,30 @@ pub fn generate_witness_batch_major(
     )
 }
 
+/// Partial-count batch-major witness for the union's dynamic invocation
+/// counts (M4): rows `[compressions.len(), 2^n_blocks_log)` are left
+/// **identically zero** (z, a, b, and stripe — constant wire included; the
+/// union lincheck's count-derived const-pin target requires zero dummies,
+/// not padding compressions). `compressions.len()` may be any value up to
+/// the capacity, not necessarily a power of two.
+pub fn generate_witness_batch_major_partial(
+    compressions: &[([u32; 8], [u32; 16])],
+    n_blocks_log: usize,
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<u8>,
+) {
+    super::common::drive_witness_batch_major_partial(
+        compressions,
+        n_blocks_log,
+        K_LOG,
+        USEFUL_BITS,
+        build_group_batch_major,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2072,6 +2096,64 @@ mod tests {
             assert_eq!(z_b, transpose(&z_r), "z diverged (n_log={n_log})");
             assert_eq!(a_b, transpose(&a_r), "a diverged (n_log={n_log})");
             assert_eq!(b_b, transpose(&b_r), "b diverged (n_log={n_log})");
+        }
+    }
+
+    /// The partial-count driver (M4 dynamic counts): declared rows match the
+    /// full driver word for word, dummy rows `[n, 2^n_log)` are identically
+    /// zero in z/a/b, and the stripe equals the canonical `pack_z_lincheck`
+    /// of the (zero-dummy) witness. Covers a partial final 8-group, an exact
+    /// group boundary, fully-dummy trailing groups, and the empty count.
+    #[test]
+    fn batch_major_partial_zeroes_dummy_rows() {
+        use flock_core::field::F128;
+        use flock_core::lincheck::pack_z_lincheck_from_packed;
+
+        let n_log = 4usize;
+        let n_total = 1usize << n_log;
+        let m = K_LOG + n_log;
+        let mut rng = Rng::new(0xBA7C_5427);
+        let inputs: Vec<([u32; 8], [u32; 16])> = (0..n_total)
+            .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+            .collect();
+        let (z_f, a_f, b_f, _) = generate_witness_batch_major(&inputs, n_log);
+
+        let chunks_per_block = K / 128;
+        for n in [11usize, 8, 16, 0] {
+            let (z_p, a_p, b_p, stripe_p) =
+                generate_witness_batch_major_partial(&inputs[..n], n_log);
+            for ((pb, fb), what) in [(&z_p, &z_f), (&a_p, &a_f), (&b_p, &b_f)]
+                .into_iter()
+                .zip(["z", "a", "b"])
+            {
+                for c in 0..chunks_per_block {
+                    for o in 0..n_total {
+                        let w = (c << n_log) + o;
+                        if o < n {
+                            assert_eq!(pb[w], fb[w], "{what} declared word (n={n}, c={c}, o={o})");
+                        } else {
+                            assert_eq!(
+                                pb[w],
+                                F128::ZERO,
+                                "{what} dummy word must be zero (n={n}, c={c}, o={o})"
+                            );
+                        }
+                    }
+                }
+            }
+            // Stripe: canonical pack_z_lincheck of the zero-dummy witness
+            // (batch-major → row-major word transpose first).
+            let mut z_row = vec![F128::ZERO; z_p.len()];
+            for o in 0..n_total {
+                for c in 0..chunks_per_block {
+                    z_row[o * chunks_per_block + c] = z_p[(c << n_log) + o];
+                }
+            }
+            assert_eq!(
+                stripe_p,
+                pack_z_lincheck_from_packed(&z_row, m, K_LOG),
+                "stripe diverged (n={n})"
+            );
         }
     }
 

@@ -272,6 +272,92 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     }
 }
 
+/// M4 — partial utilization (dynamic counts): mixed roundtrips at several
+/// count vectors, including non-powers-of-two and a zero count for one
+/// type, through the partial batch-major drivers (dummy rows identically
+/// zero — pin included). Verifies acceptance at every utilization, rejects
+/// wrong-count tampering against the partial proof, and prints verify wall
+/// times across utilizations (informational — the verifier's control flow
+/// is registry-static, so times should be flat).
+#[test]
+#[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
+fn mixed_partial_counts_roundtrip_and_tamper() {
+    use std::time::Instant;
+
+    let nu = 6usize; // capacity 64 per type; M = 22 (m22 Ligerito config)
+    let capacity = 1usize << nu;
+    let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
+    let sha2_circuit = sha2_r1cs.csc_lincheck_circuit();
+    let blake3_circuit = blake3_r1cs.csc_lincheck_circuit();
+    let circuits: [&dyn LincheckCircuit; 2] = [sha2_circuit, blake3_circuit];
+    let mut rng = Rng::new(0x04_31_2B_B3);
+
+    // Counts in slot order (SHA-256, BLAKE3): full, non-power-of-two
+    // partials, and a zero count for one type.
+    let count_vectors: [[usize; 2]; 4] = [[64, 64], [50, 37], [0, 64], [37, 0]];
+    let mut verify_ms = Vec::new();
+    for counts in count_vectors {
+        let [n_sha2, n_blake3] = counts;
+        assert!(n_sha2 <= capacity && n_blake3 <= capacity);
+        let union = UnionInstance::new(&registry, counts.to_vec());
+        let pcs_params = union_pcs_params(&union);
+        let blake3_inputs = random_blake3_inputs(&mut rng, n_blake3);
+        let sha2_inputs = random_sha2_inputs(&mut rng, n_sha2);
+
+        let slots = vec![
+            UnionSlotProverInput::new(
+                sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                sha2_circuit,
+            ),
+            UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                blake3_circuit,
+            ),
+        ];
+        let mut ch_p = FsChallenger::new(DOMAIN);
+        let (proof, commitment, claim) =
+            prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch_p);
+
+        let verify = |union: &UnionInstance<'_>| {
+            let mut ch_v = FsChallenger::new(DOMAIN);
+            verifier::verify_ligerito_jagged_union(
+                union,
+                &circuits,
+                &commitment,
+                &proof,
+                &pcs_params,
+                &mut ch_v,
+            )
+        };
+        let t = Instant::now();
+        let claim_v = verify(&union).unwrap_or_else(|e| {
+            panic!("partial-count verifier rejected honest proof (counts {counts:?}): {e:?}")
+        });
+        verify_ms.push((counts, t.elapsed().as_secs_f64() * 1e3));
+        assert_eq!(claim_v, claim);
+
+        // Wrong-count tampering: a verifier declaring one more (or one
+        // fewer at zero) invocation walks a diverged transcript from the
+        // first squeeze (counts bind before any challenge) and, downstream,
+        // a wrong const-pin target — reject.
+        let bad_counts = if n_sha2 < capacity {
+            vec![n_sha2 + 1, n_blake3]
+        } else {
+            vec![n_sha2 - 1, n_blake3]
+        };
+        let union_bad = UnionInstance::new(&registry, bad_counts.clone());
+        assert!(
+            verify(&union_bad).is_err(),
+            "wrong counts {bad_counts:?} vs {counts:?} must reject"
+        );
+    }
+
+    println!("mixed partial-count verify times (registry-static control flow):");
+    for (counts, ms) in &verify_ms {
+        println!("  counts (sha2, blake3) = {counts:?}: {ms:.1} ms");
+    }
+}
+
 /// Mis-ordered per-slot inputs (BLAKE3 before SHA-256) can never produce a
 /// proof: slots must arrive in registry order — capacity area descending —
 /// and the witness assembly asserts every slot buffer's length against its
