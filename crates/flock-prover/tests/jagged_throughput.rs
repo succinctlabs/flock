@@ -51,21 +51,20 @@ fn blake3_m30_direct_vs_jagged_throughput() {
         ITERS
     );
 
-    // Witness generation, timed once (identical for both paths).
-    let t = Instant::now();
+    // Warm-up witness generation (pages in the buffers; not part of a timed run).
     let (z, a, b, stripe) = blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
-    let witgen_ms = t.elapsed().as_secs_f64() * 1e3;
-    println!("witness gen: {witgen_ms:.0} ms");
     drop((z, a, b, stripe));
 
+    // Timed region per iteration = witness generation + prove, matching the
+    // canonical benches' accounting (e.g. blake3_proof's prove_fast).
     let mut best_direct = f64::INFINITY;
     let mut best_jagged = f64::INFINITY;
     let mut direct_out = None;
     let mut jagged_out = None;
     for _ in 0..ITERS {
-        let (z, a, b, stripe) = blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
         let mut ch = FsChallenger::new(DOMAIN);
         let t = Instant::now();
+        let (z, a, b, stripe) = blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
         let out = prover::prove_fast_ligerito_from_witness(
             &setup.r1cs,
             &setup.pcs_params,
@@ -80,9 +79,9 @@ fn blake3_m30_direct_vs_jagged_throughput() {
         best_direct = best_direct.min(t.elapsed().as_secs_f64() * 1e3);
         direct_out = Some(out);
 
-        let (z, a, b, stripe) = blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
         let mut ch = FsChallenger::new(DOMAIN);
         let t = Instant::now();
+        let (z, a, b, stripe) = blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
         let out = prover::prove_fast_ligerito_jagged_from_witness(
             &setup.r1cs,
             &setup.pcs_params,
@@ -101,19 +100,18 @@ fn blake3_m30_direct_vs_jagged_throughput() {
     let (proof_j, comm_j, _) = jagged_out.unwrap();
     assert_eq!(comm_d.root, comm_j.root, "commitment root diverged");
 
-    let hps = |prove_ms: f64| n_blocks as f64 / ((witgen_ms + prove_ms) / 1e3);
+    let hps = |prove_ms: f64| n_blocks as f64 / (prove_ms / 1e3);
     println!(
-        "prove direct: {best_direct:.0} ms  ({:.0} hashes/s e2e)",
+        "prove direct (incl. witgen): {best_direct:.0} ms  ({:.0} hashes/s)",
         hps(best_direct)
     );
     println!(
-        "prove jagged: {best_jagged:.0} ms  ({:.0} hashes/s e2e)",
+        "prove jagged (incl. witgen): {best_jagged:.0} ms  ({:.0} hashes/s)",
         hps(best_jagged)
     );
     println!(
-        "jagged prove overhead: {:+.1}% (prove-only), {:+.1}% (e2e incl. witness gen)",
-        (best_jagged / best_direct - 1.0) * 100.0,
-        ((witgen_ms + best_jagged) / (witgen_ms + best_direct) - 1.0) * 100.0
+        "jagged prove overhead: {:+.1}%",
+        (best_jagged / best_direct - 1.0) * 100.0
     );
 
     let t = Instant::now();
