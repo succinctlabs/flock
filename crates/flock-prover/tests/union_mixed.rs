@@ -631,14 +631,16 @@ fn mixed_throughput_smoke() {
     );
 }
 
-/// Informational M5 low-utilization prove-time smoke: counts (8, 8) at
-/// ν = 10 against full utilization (1024, 1024). Under height-`n_t`
-/// stacking the low-count instance commits 2^15 words (config floor; dense
-/// 2 936) versus 2^19 at full — a 16x smaller commit (Merkle/encoding)
-/// phase, which should show up markedly in the prove wall time. The PIOP
-/// sumcheck folds are still dense over the 2^26-point padded space
-/// (support-proportional folds are a separate follow-up), so the saving is
-/// bounded by the commit/opening share. No timing assertions. Run with
+/// Low-utilization prove-time smoke: counts (8, 8) at ν = 10 against full
+/// utilization (1024, 1024). Under height-`n_t` stacking the low-count
+/// instance commits 2^15 words (config floor; dense 2 936) versus 2^19 at
+/// full — a 16x smaller commit — and since M6 the PIOP/opening passes are
+/// support-proportional too (zerocheck tail, lincheck row folds,
+/// virtual-open f-side, round-0 prime, witness scatter), so the low-count
+/// prove is dominated by the count-independent floor: the per-type comb
+/// builds (O(nnz), registry-static) and the m22-config-floor opening
+/// machinery. One LOOSE timing assertion (partial must beat full by a
+/// noise-proof margin); precise numbers are printed, not asserted. Run with
 /// `cargo test --release -p flock-prover --test union_mixed -- --ignored
 /// --nocapture mixed_low_utilization_smoke`.
 #[test]
@@ -709,4 +711,18 @@ fn mixed_low_utilization_smoke() {
             committed.trailing_zeros()
         );
     }
+
+    // The M6 gate, asserted LOOSELY (wall times of single runs are noisy;
+    // the precise ratios live in the printed output and the milestone
+    // notes): a 128x-fewer-invocations instance must prove well under the
+    // full-utilization time. Pre-M6 the ratio hovered around 0.7 (only
+    // commit/opening scaled); post-M6 it sits around 0.5.
+    let (_, _, low_ms) = results[0];
+    let (_, _, full_ms) = results[1];
+    assert!(
+        low_ms < 0.8 * full_ms,
+        "low-utilization prove ({low_ms:.0} ms) must beat full utilization \
+         ({full_ms:.0} ms) by a clear margin — support-proportional passes \
+         may have regressed"
+    );
 }

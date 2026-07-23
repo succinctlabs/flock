@@ -69,13 +69,15 @@ impl PaddingRun {
 /// so kernels may skip any chunk the spec marks as padding or gap and produce
 /// byte-identical output — provided those bits are honestly zero.
 ///
-/// All current callers build **single-run** specs (one run tiling the whole
+/// Single-table callers build **single-run** specs (one run tiling the whole
 /// domain: [`PaddingSpec::dense`], [`PaddingSpec::uniform`], and
 /// `BlockR1cs::padding_spec`); the hot kernels detect that case via
 /// [`PaddingSpec::as_single_run`] and take exactly the pre-run-list code
 /// path. Multi-run specs — the count-derived slot schedules of the
-/// multi-table design (`docs/multi-table-design.tex` §5.2) — go through
-/// simpler general paths; they have no production callers yet.
+/// multi-table design (`docs/multi-table-design.tex` §5.2, the union prove
+/// path) — go through general run-list paths that, since M6, skip dead
+/// regions with cost proportional to the declared support
+/// ([`Self::useful_block_intervals`] drives the interval-based kernels).
 ///
 /// Use [`PaddingSpec::dense`] when the witness has no padding holes.
 #[derive(Clone, Debug, PartialEq, Eq)]
