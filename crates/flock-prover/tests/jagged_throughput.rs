@@ -51,9 +51,24 @@ fn blake3_m30_direct_vs_jagged_throughput() {
         ITERS
     );
 
-    // Warm-up witness generation (pages in the buffers; not part of a timed run).
-    let (z, a, b, stripe) = blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
-    drop((z, a, b, stripe));
+    // Warm-up: one full untimed prove, so the scratch pool holds hot buffers
+    // and the timed iterations run under the same conditions as the canonical
+    // benches' best-of-N runs.
+    {
+        let (z, a, b, stripe) = blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
+        let mut ch = FsChallenger::new(DOMAIN);
+        let _ = prover::prove_fast_ligerito_from_witness(
+            &setup.r1cs,
+            &setup.pcs_params,
+            z,
+            a,
+            b,
+            stripe,
+            lc_circuit,
+            None,
+            &mut ch,
+        );
+    }
 
     // Timed region per iteration = witness generation + prove, matching the
     // canonical benches' accounting (e.g. blake3_proof's prove_fast).
