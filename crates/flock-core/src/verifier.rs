@@ -198,9 +198,11 @@ fn verify_union_with_binding<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
-    // The commitment is to the DENSE stack q (M4): PcsParams.m is the
-    // dense variable count, while the PIOP and the virtual-opening
-    // sumcheck run over the M-variable padded address space.
+    // The commitment is to the DENSE stack q (M4/M5): PcsParams.m is the
+    // dense variable count — count-dependent under height-n_t stacking,
+    // derived from the declared counts — while the PIOP and the
+    // virtual-opening sumcheck run over the M-variable padded address
+    // space.
     assert_eq!(
         pcs_params.m,
         union.dense_m(),
@@ -266,12 +268,14 @@ fn verify_union_with_binding<Ch: Challenger>(
 /// `ẑ`-claims — the jagged counterpart of [`verify_claims_ligerito`], and the
 /// mirror of the prover's `pcs::open_batch_jagged_ligerito` call. `heights` /
 /// `n_log` describe the committed jagged grid (see
-/// [`BlockR1cs::jagged_heights`]); `virtual_m` is the bit-variable count of
-/// the VIRTUAL (padded) polynomial the PIOP ran over (`= pcs_params.m` on
-/// the single-table paths; `= UnionInstance::m_total` under the M4
-/// dense-stack commit, where `pcs_params.m` is the smaller dense size).
-/// Both sides derive all three from the statement, never from the proof.
-/// Must run at the same transcript position as the prover's open.
+/// [`BlockR1cs::jagged_heights`]; the union heights — and hence the dense
+/// size — are count-dependent under height-`n_t` stacking); `virtual_m` is
+/// the bit-variable count of the VIRTUAL (padded) polynomial the PIOP ran
+/// over (`= pcs_params.m` on the single-table paths;
+/// `= UnionInstance::m_total` under the dense-stack commit, where
+/// `pcs_params.m` is the smaller dense size). Both sides derive all three
+/// from the statement, never from the proof. Must run at the same
+/// transcript position as the prover's open.
 pub fn verify_claims_jagged_ligerito<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[ZClaim],

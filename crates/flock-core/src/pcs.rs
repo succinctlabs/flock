@@ -782,22 +782,25 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
 ///    the received `b_tilde` at `r_extra` (Schwartz–Zippel binding).
 ///
 /// `heights` are the per-chunk-column word counts of the jagged grid
-/// (`2^(k_log−7)` entries; see `BlockR1cs::jagged_heights`), `n_log` the
-/// number of batch (row) variables. The witness must be zero past the jagged
-/// area (`Σ heights` packed words) — the BatchMajor buffer layout guarantees
-/// this.
+/// (`2^(k_log−7)` entries; see `BlockR1cs::jagged_heights` and the
+/// count-dependent `UnionInstance::jagged_heights`), `n_log` the number of
+/// batch (row) variables. The committed stack must be zero past the jagged
+/// area (`Σ heights` packed words) — guaranteed by the BatchMajor buffer
+/// layout on the identity paths and by construction of the compacted stack.
 ///
-/// **True dense-stack commit (M4):** `dense_witness` is the committed stack
-/// `q` — the padded `packed_witness` with the height-0 (dropped) columns
-/// deleted and the total zero-padded to a power of two (see
-/// `UnionInstance::compact_witness`; `col_prefix_sums` of `heights` IS the
-/// compaction map). When `Some(q)`: the commitment, `lig_config`, and the
-/// jagged `W_ρ`/`b_tilde`/assist all live on `q`'s (possibly smaller)
-/// `2^dense_log` domain, while the claim assembly and the virtual-opening
-/// sumcheck keep running over the padded `packed_witness` — the identity
-/// `⟨q, W_ρ⟩ = f̂(ρ)` holds because the padded buffer is zero on every
-/// dropped column. When `None`, `q` is `packed_witness` itself (the
-/// single-table paths, whose compaction map is the identity).
+/// **True dense-stack commit (M4/M5):** `dense_witness` is the committed
+/// stack `q` — the padded `packed_witness` with every dropped word deleted
+/// (height-0 columns, and — under height-`n_t` stacking — each used
+/// column's rows past its declared height) and the total zero-padded to a
+/// power of two (see `UnionInstance::compact_witness`; `col_prefix_sums`
+/// of `heights` IS the compaction map). When `Some(q)`: the commitment,
+/// `lig_config`, and the jagged `W_ρ`/`b_tilde`/assist all live on `q`'s
+/// (possibly smaller) `2^dense_log` domain, while the claim assembly and
+/// the virtual-opening sumcheck keep running over the padded
+/// `packed_witness` — the identity `⟨q, W_ρ⟩ = f̂(ρ)` holds because the
+/// padded buffer is zero on every dropped word. When `None`, `q` is
+/// `packed_witness` itself (the single-table paths and full-utilization
+/// single-slot unions, whose compaction map is the identity).
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     packed_witness: Vec<F128>,
@@ -1052,7 +1055,9 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
 /// count. The committed dense stack's variable count is
 /// `commitment.params.m − 7 ≤ virtual_vars`; the two coincide on the
 /// single-table paths (identity compaction) and split under the true
-/// dense-stack commit (M4).
+/// dense-stack commit (M4/M5 — under height-`n_t` stacking the dense size,
+/// like the `heights`, is count-dependent, derived per proof from the
+/// public counts).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
     commitment: &Commitment,

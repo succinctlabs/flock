@@ -4,7 +4,9 @@
 //! layout of `schedule.rs` plus the per-proof declared counts) and derives
 //! everything the prove/verify paths need from the union address space,
 //! replacing what [`BlockR1cs`] provides for a single table today: the
-//! count-derived run-list [`PaddingSpec`], the union jagged-grid heights,
+//! count-derived run-list [`PaddingSpec`], the union jagged-grid heights
+//! (count-dependent height-`n_t` stacking since M5 — the committed size is
+//! count-proportional, floored at the smallest embedded Ligerito config),
 //! the layout-aware claim points, the union witness assembly, and — since
 //! M3 — the multi-table statement binding ([`Self::bind_statement`], label
 //! `flock-mixed-v1`).
@@ -36,6 +38,12 @@ use crate::pcs::Commitment;
 use crate::r1cs::{BlockR1cs, WitnessLayout};
 use crate::schedule::{Instance, Registry, TableType};
 use crate::zerocheck::{K_SKIP, PaddingSpec};
+
+/// Floor of the committed dense-stack size, as a bit-variable count: the
+/// smallest embedded Ligerito security config is `m22` (`2^15` packed
+/// words), so [`UnionInstance::committed_words`] never shrinks below it —
+/// see the config-floor note there.
+pub const MIN_DENSE_M: usize = 22;
 
 /// A registry instance viewed as ONE union address space of `2^M` points —
 /// the object the union prove/verify paths consume. Thin layer over
@@ -105,29 +113,39 @@ impl<'r> UnionInstance<'r> {
     /// offset exact). Shared by the prover and verifier wiring — any
     /// divergence is a transcript break, so both derive it here.
     ///
-    /// **True dense-stack semantics (M4):** every USED chunk-column — the
-    /// leading `ceil(useful_bits_t/128)` columns of each slot — is committed
-    /// at the FULL capacity height `2^nu` (dummy rows `[n_t, 2^nu)` are
-    /// honest zeros inside the committed column; the counts bind through the
-    /// transcript and the lincheck's count-derived const-pin target, not
-    /// through the heights). USELESS chunk-columns and the trailing gap are
-    /// height 0 — dropped from the committed stack entirely. The
-    /// `col_prefix_sums` derived from these heights ARE the compaction map:
-    /// `unrank ≡` [`Self::compact_witness`]. Height-`n_t` stacking (dropping
-    /// dummy rows too) is a later optimization; capacity-height columns keep
-    /// the virtual-open/`W_ρ` identity `⟨q, W_ρ⟩ = f̂(ρ)` immediate, since
-    /// the dropped region of the padded buffer is identically zero.
+    /// **Height-`n_t` stacking (M5):** every USED chunk-column — the
+    /// leading `ceil(useful_bits_t/128)` columns of slot `t` — has height
+    /// `n_t`, the DECLARED count (an arbitrary integer in `[0, 2^nu]`), so
+    /// the committed area is count-proportional. Dummy rows `[n_t, 2^nu)`
+    /// are dropped from the committed stack along with the useless
+    /// chunk-columns and the inter-slot/trailing gaps (all height 0). Every
+    /// dropped word of the padded virtual buffer is identically zero — the
+    /// partial witness drivers zero dummy rows, useless columns and gaps
+    /// are zero by construction ([`Self::compact_witness`] debug-asserts
+    /// this) — which is what keeps the fused-opening identity
+    /// `⟨q, W_ρ⟩ = f̂(ρ)` intact. The `col_prefix_sums` derived from these
+    /// heights ARE the compaction map: `unrank ≡` [`Self::compact_witness`].
     ///
-    /// Registry-static (count-independent). A one-slot registry reproduces
+    /// COUNT-DEPENDENT (per proof, unlike M4's registry-static capacity
+    /// heights): both sides derive the heights and their `col_prefix_sums`
+    /// from the public counts, so a wrong declared count diverges here (and
+    /// in the jagged assist's layout evaluator) in addition to the
+    /// transcript binding and the lincheck's const-pin target. A one-slot
+    /// registry at FULL utilization (`n_t = 2^nu`) reproduces
     /// [`BlockR1cs::jagged_heights`] exactly (the M1 byte-identity anchor).
     pub fn jagged_heights(&self) -> Vec<u64> {
         let nu = self.n_log();
         let mut heights = vec![0u64; 1usize << self.col_log()];
         let registry = self.registry();
-        for (ty, slot) in registry.types().iter().zip(registry.slots()) {
+        for ((ty, slot), &n_t) in registry
+            .types()
+            .iter()
+            .zip(registry.slots())
+            .zip(self.counts())
+        {
             let col_offset = slot.offset >> (7 + nu);
             for h in &mut heights[col_offset..col_offset + self.used_cols(ty)] {
-                *h = 1u64 << nu;
+                *h = n_t as u64;
             }
         }
         heights
@@ -140,26 +158,43 @@ impl<'r> UnionInstance<'r> {
     }
 
     // -----------------------------------------------------------------------
-    // The dense-stack commit (M4): only the used chunk-columns are committed,
-    // stacked contiguously at capacity height. All registry-static.
+    // The dense-stack commit (M4/M5): only the declared rows of the used
+    // chunk-columns are committed, stacked contiguously — count-dependent.
     // -----------------------------------------------------------------------
 
-    /// Words of the un-padded dense stack: `Σ_t used_cols_t · 2^nu` — the
-    /// jagged area (= `Σ` [`Self::jagged_heights`]).
+    /// Words of the un-padded dense stack: `Σ_t n_t · used_cols_t` — the
+    /// jagged area (= `Σ` [`Self::jagged_heights`]), count-proportional
+    /// under height-`n_t` stacking.
     pub fn dense_words(&self) -> usize {
-        let per_col = 1usize << self.n_log();
         self.registry()
             .types()
             .iter()
-            .map(|ty| self.used_cols(ty) * per_col)
+            .zip(self.counts())
+            .map(|(ty, &n_t)| self.used_cols(ty) * n_t)
             .sum()
     }
 
     /// Committed length of the dense stack `q` in packed words:
     /// [`Self::dense_words`] rounded up to a power of two (Ligerito commits
-    /// power-of-two messages; the pad tail is zero).
+    /// power-of-two messages; the pad tail is zero), then clamped to
+    /// `[2^(MIN_DENSE_M − 7), packed_len]`.
+    ///
+    /// **The config floor:** Ligerito security configs are derived and
+    /// embedded per committed size, and the smallest shipped config is
+    /// `m22` (`2^15` packed words) — see
+    /// [`crate::pcs::ligerito::embedded_security_config`]. Low-count
+    /// instances therefore never commit below `2^15` words; the sub-floor
+    /// tail is zero padding. The floor is additionally capped at the
+    /// union's own padded size so the committed (dense) domain never
+    /// exceeds the virtual domain — reachable only for sub-floor address
+    /// spaces (`M < MIN_DENSE_M`, test-scale registries), where the
+    /// committed length is simply the padded length.
     pub fn committed_words(&self) -> usize {
-        self.dense_words().next_power_of_two()
+        let floor = 1usize << (MIN_DENSE_M - 7);
+        self.dense_words()
+            .next_power_of_two()
+            .max(floor)
+            .min(self.packed_len())
     }
 
     /// Bit-variable count of the committed polynomial:
@@ -171,17 +206,25 @@ impl<'r> UnionInstance<'r> {
         self.committed_words().trailing_zeros() as usize + 7
     }
 
-    /// Whether the compaction map is the identity: every used chunk-column's
-    /// stacked offset equals its padded offset (no dropped column precedes
-    /// any used column) and the committed length equals the padded length.
-    /// True for every single-slot registry whose used columns exceed half
-    /// the padded space (BLAKE3: 121 of 128; SHA-256: 246 of 256) — the
-    /// byte-identity anchors — where `q` IS the padded buffer.
+    /// Whether the compaction map is the identity: every slot is at FULL
+    /// utilization (`n_t = 2^nu`, so no dummy row is truncated away), every
+    /// used chunk-column's stacked offset equals its padded offset (no
+    /// dropped column precedes any used column), and the committed length
+    /// equals the padded length. True for the M1/M2 byte-identity anchors —
+    /// single-slot registries at full utilization whose used columns exceed
+    /// half the padded space (BLAKE3: 121 of 128; SHA-256: 246 of 256) —
+    /// where `q` IS the padded buffer.
     pub fn compaction_is_identity(&self) -> bool {
         let nu = self.n_log();
         let mut cursor = 0usize; // stacked word offset
-        for (ty, slot) in self.registry().types().iter().zip(self.registry().slots()) {
-            if cursor != slot.offset >> 7 {
+        for ((ty, slot), &n_t) in self
+            .registry()
+            .types()
+            .iter()
+            .zip(self.registry().slots())
+            .zip(self.counts())
+        {
+            if cursor != slot.offset >> 7 || n_t != 1usize << nu {
                 return false;
             }
             cursor += self.used_cols(ty) << nu;
@@ -190,25 +233,70 @@ impl<'r> UnionInstance<'r> {
     }
 
     /// Assemble the committed dense stack `q` from the padded union buffer:
-    /// per slot in order, its used chunk-columns' full capacity-height word
-    /// runs — contiguous in the padded buffer, so one copy per slot —
-    /// stacked contiguously, zero-padded to [`Self::committed_words`].
-    /// Useless chunk-columns and the inter-slot/trailing gaps are dropped.
-    /// This is exactly the map `col_prefix_sums`/`unrank` of
+    /// per slot in order, the DECLARED `n_t`-row prefix of each of its used
+    /// chunk-columns, stacked contiguously, zero-padded to
+    /// [`Self::committed_words`]. Dummy rows `[n_t, 2^nu)`, useless
+    /// chunk-columns, and the inter-slot/trailing gaps are dropped. This is
+    /// exactly the map the `col_prefix_sums`/`unrank` of
     /// [`Self::jagged_heights`] induces.
+    ///
+    /// Debug builds assert the soundness invariant of the height-`n_t`
+    /// transport: every DROPPED word of the padded buffer is zero, so the
+    /// fused-opening identity `⟨q, W_ρ⟩ = f̂(ρ)` holds (the deleted terms of
+    /// `f̂(ρ)` were all zero). Honest witnesses satisfy this by
+    /// construction — the partial batch-major drivers zero dummy rows (pin
+    /// included), and useless columns/gaps are never written.
     pub fn compact_witness(&self, z_padded: &[F128]) -> Vec<F128> {
         assert_eq!(z_padded.len(), self.packed_len(), "padded buffer length");
+        debug_assert!(
+            self.dropped_words_are_zero(z_padded),
+            "padded buffer must be zero on every dropped word \
+             (dummy rows, useless columns, gaps)"
+        );
         let nu = self.n_log();
         let mut q = vec![F128::ZERO; self.committed_words()];
         let mut cursor = 0usize;
-        for (ty, slot) in self.registry().types().iter().zip(self.registry().slots()) {
+        for ((ty, slot), &n_t) in self
+            .registry()
+            .types()
+            .iter()
+            .zip(self.registry().slots())
+            .zip(self.counts())
+        {
             let start = slot.offset >> 7;
-            let len = self.used_cols(ty) << nu;
-            q[cursor..cursor + len].copy_from_slice(&z_padded[start..start + len]);
-            cursor += len;
+            for c in 0..self.used_cols(ty) {
+                let col = start + (c << nu);
+                q[cursor..cursor + n_t].copy_from_slice(&z_padded[col..col + n_t]);
+                cursor += n_t;
+            }
         }
         debug_assert_eq!(cursor, self.dense_words());
         q
+    }
+
+    /// Whether every word of the padded buffer that [`Self::compact_witness`]
+    /// drops is zero — the height-`n_t` transport's soundness invariant
+    /// (debug-asserted there).
+    fn dropped_words_are_zero(&self, z_padded: &[F128]) -> bool {
+        let nu = self.n_log();
+        let mut kept = vec![false; z_padded.len()];
+        for ((ty, slot), &n_t) in self
+            .registry()
+            .types()
+            .iter()
+            .zip(self.registry().slots())
+            .zip(self.counts())
+        {
+            let start = slot.offset >> 7;
+            for c in 0..self.used_cols(ty) {
+                let col = start + (c << nu);
+                kept[col..col + n_t].iter_mut().for_each(|k| *k = true);
+            }
+        }
+        z_padded
+            .iter()
+            .zip(&kept)
+            .all(|(w, &k)| k || *w == F128::ZERO)
     }
 
     // -----------------------------------------------------------------------
@@ -581,9 +669,10 @@ mod tests {
     }
 
     /// Multi-slot heights against hand-computed values: two synthetic types
-    /// (κ = 10/9, ν = 3 → M = 14, 16 union columns). True dense-stack (M4)
-    /// semantics: used columns at the full capacity height `2^nu`, useless
-    /// columns and the gap dropped (height 0), independent of the counts.
+    /// (κ = 10/9, ν = 3 → M = 14, 16 union columns). Height-`n_t` stacking
+    /// (M5) semantics: used columns at the DECLARED count `n_t` (arbitrary
+    /// integer), useless columns and the gap dropped (height 0) — the
+    /// heights are count-dependent, per proof.
     #[test]
     fn multi_slot_heights_hand_computed() {
         // Type A: 8 chunk-columns, ceil(700/128) = 6 used; type B: 4
@@ -591,64 +680,93 @@ mod tests {
         // used. Columns 12..16 are the gap past the last slot.
         let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
         #[rustfmt::skip]
-        let expected: Vec<u64> = vec![
-            8, 8, 8, 8, 8, 8, 0, 0, // slot A: 6 used at capacity, 2 dropped
-            8, 8, 8, 0,             // slot B: 3 used at capacity, 1 dropped
-            0, 0, 0, 0,             // gap: dropped
+        let cases: [(Vec<usize>, Vec<u64>); 3] = [
+            // Partial, non-power-of-two counts.
+            (vec![5, 3], vec![
+                5, 5, 5, 5, 5, 5, 0, 0, // slot A: 6 used at n_A = 5, 2 dropped
+                3, 3, 3, 0,             // slot B: 3 used at n_B = 3, 1 dropped
+                0, 0, 0, 0,             // gap: dropped
+            ]),
+            // Full utilization: capacity heights — M4's grid, exactly.
+            (vec![8, 8], vec![
+                8, 8, 8, 8, 8, 8, 0, 0,
+                8, 8, 8, 0,
+                0, 0, 0, 0,
+            ]),
+            // A zero count drops the slot's columns entirely.
+            (vec![0, 8], vec![
+                0, 0, 0, 0, 0, 0, 0, 0,
+                8, 8, 8, 0,
+                0, 0, 0, 0,
+            ]),
         ];
-        // Registry-static: partial, full, and zero counts all commit the
-        // same grid — the counts bind through the transcript and the
-        // lincheck const-pin target, never through the heights.
-        for counts in [vec![5, 3], vec![8, 8], vec![0, 8]] {
+        for (counts, expected) in cases {
             let union = UnionInstance::new(&reg, counts.clone());
             assert_eq!(union.m_total(), 14);
             assert_eq!(union.col_log(), 4);
             assert_eq!(union.jagged_heights(), expected, "counts {counts:?}");
+            // The heights' area IS dense_words (unrank ≡ compaction map).
+            assert_eq!(
+                union.jagged_heights().iter().sum::<u64>(),
+                union.dense_words() as u64,
+                "counts {counts:?}"
+            );
         }
     }
 
-    /// Dense-stack size arithmetic + THE M4 area-saving assertion on a
-    /// two-slot instance: committed words < padded words (2x fewer Merkle
-    /// leaves here). Also pins the sizes where the saving does NOT
-    /// materialize: real ≥94%-column-dense types (BLAKE3 121/128, SHA-256
-    /// 246/256) round the dense stack straight back to the padded power of
-    /// two, both single-slot (the byte-identity anchors) and mixed.
+    /// Dense-stack size arithmetic under height-`n_t` stacking (M5): the
+    /// count-proportional dense area, the config floor's clamp on sub-floor
+    /// address spaces, and the shapes where nothing changes — single-slot
+    /// full utilization (the M1/M2 byte-identity anchors) and full-
+    /// utilization mixes of ≥94%-column-dense types (BLAKE3 121/128,
+    /// SHA-256 246/256), which round straight back to the padded size.
     #[test]
     fn dense_stack_sizes_and_area_saving() {
         // Synthetic column-sparse pair: A uses 4 of 8 columns, B 3 of 4.
-        // Dense 7·8 = 56 words → committed 64 < padded 128.
+        // Dense 7·8 = 56 words at full utilization; the padded space (128
+        // words) sits far below the m22 config floor, so the committed
+        // length clamps to the padded length.
         let reg = Registry::new(vec![ty(10, 512), ty(9, 300)], 3);
         let union = UnionInstance::new(&reg, vec![8, 8]);
         assert_eq!(union.dense_words(), 56);
-        assert_eq!(union.committed_words(), 64);
         assert_eq!(union.packed_len(), 128);
-        assert!(
-            union.committed_words() < union.packed_len(),
-            "two-slot dense stack must commit fewer words than the padded buffer"
+        assert_eq!(
+            union.committed_words(),
+            union.packed_len(),
+            "sub-floor address spaces commit the padded length"
         );
-        assert_eq!(union.dense_m(), 13);
+        assert_eq!(union.dense_m(), union.m_total());
         assert!(!union.compaction_is_identity());
+        // Count-proportional dense area, monotone in the counts.
+        let dense = |counts: Vec<usize>| UnionInstance::new(&reg, counts).dense_words();
+        assert_eq!(dense(vec![5, 3]), 4 * 5 + 3 * 3);
+        assert_eq!(dense(vec![0, 8]), 3 * 8);
+        assert!(dense(vec![5, 3]) < dense(vec![8, 8]));
         // The heights' area IS dense_words (unrank ≡ compaction map).
         assert_eq!(
             union.jagged_heights().iter().sum::<u64>(),
             union.dense_words() as u64
         );
 
-        // Single-slot BLAKE3/SHA-256 shapes: dense rounds back to padded
-        // (used columns > half), and the compaction map is the identity —
-        // the M1/M2 byte-identity precondition.
+        // Single-slot BLAKE3/SHA-256 shapes at full utilization: dense
+        // rounds back to padded (used columns > half), and the compaction
+        // map is the identity — the M1/M2 byte-identity precondition.
+        // Partial counts break the identity (dummy rows get dropped).
         for &(k_log, useful_bits, nu) in &[(14usize, 15_409usize, 3usize), (15, 31_401, 2)] {
             let reg = Registry::new(vec![ty(k_log, useful_bits)], nu);
             let union = UnionInstance::new(&reg, vec![1 << nu]);
             assert_eq!(union.committed_words(), union.packed_len());
             assert_eq!(union.dense_m(), union.m_total());
             assert!(union.compaction_is_identity());
+            let partial = UnionInstance::new(&reg, vec![(1 << nu) - 1]);
+            assert!(!partial.compaction_is_identity());
         }
 
-        // Mixed BLAKE3+SHA-256 (the M3/M4 registry shape, scaled): 367 of
-        // 512 columns used → committed == padded in words, but the
-        // compaction is NOT the identity (SHA-256 drops 10 columns before
-        // BLAKE3's slot, which stacks at column 246 instead of 256).
+        // Mixed BLAKE3+SHA-256 (the M3/M4 registry shape, scaled) at FULL
+        // utilization: 367 of 512 columns used → committed == padded in
+        // words, but the compaction is NOT the identity (SHA-256 drops 10
+        // columns before BLAKE3's slot, which stacks at column 246 instead
+        // of 256).
         let reg = Registry::new(vec![ty(14, 15_409), ty(15, 31_401)], 3);
         let union = UnionInstance::new(&reg, vec![8, 8]);
         assert_eq!(union.dense_words(), (246 + 121) << 3);
@@ -656,41 +774,98 @@ mod tests {
         assert!(!union.compaction_is_identity());
     }
 
-    /// `compact_witness` against a hand-built map: marked words land at
-    /// their stacked offsets, dropped columns and gaps vanish, the pad tail
-    /// is zero, and a single-slot identity registry round-trips the buffer
-    /// unchanged.
+    /// THE M5 area gate at the sizing level, on the real BLAKE3+SHA-256
+    /// column shapes at ν = 7 (the `blake3+sha2@nu7` tier geometry, M = 23):
+    /// committed words scale with the counts — halving at counts (32, 32)
+    /// against M4's capacity-height 2^16 — bottoming out at the m22 config
+    /// floor, and monotone (componentwise higher counts commit ≥ words).
+    #[test]
+    fn committed_words_scale_with_counts_and_floor() {
+        // Registry sorts κ descending: slot 0 is the SHA-256 shape
+        // (246/256 used columns), slot 1 the BLAKE3 shape (121/128).
+        let reg = Registry::new(vec![ty(14, 15_409), ty(15, 31_401)], 7);
+        let u = |counts: [usize; 2]| UnionInstance::new(&reg, counts.to_vec());
+        assert_eq!(u([0, 0]).m_total(), 23);
+        assert_eq!(u([0, 0]).packed_len(), 1 << 16);
+
+        // The gate: counts (32, 32) → dense 32·(246+121) = 11 744 words →
+        // committed 2^15 (the config floor; next_pow2 alone would say 2^14)
+        // — HALF of M4's capacity-height 2^16.
+        let partial = u([32, 32]);
+        assert_eq!(partial.dense_words(), 11_744);
+        assert_eq!(partial.committed_words(), 1 << (MIN_DENSE_M - 7));
+        assert_eq!(partial.dense_m(), MIN_DENSE_M);
+        assert_eq!(
+            partial.committed_words() * 2,
+            partial.packed_len(),
+            "counts (32, 32) must commit half of M4's capacity-height size"
+        );
+
+        // Monotone across count vectors (incl. non-powers-of-two), from the
+        // floor up to the full-utilization padded size.
+        let ladder: [[usize; 2]; 4] = [[8, 8], [32, 32], [50, 37], [128, 128]];
+        let mut prev = (0usize, 0usize);
+        for counts in ladder {
+            let union = u(counts);
+            let cur = (union.dense_words(), union.committed_words());
+            assert!(
+                cur.0 >= prev.0 && cur.1 >= prev.1,
+                "committed area must be monotone in the counts ({counts:?})"
+            );
+            prev = cur;
+        }
+        assert_eq!(u([8, 8]).committed_words(), 1 << 15, "floor binds");
+        assert_eq!(u([50, 37]).dense_words(), 50 * 246 + 37 * 121);
+        assert_eq!(u([50, 37]).committed_words(), 1 << 15);
+        assert_eq!(u([128, 128]).committed_words(), 1 << 16, "full = M4 size");
+    }
+
+    /// `compact_witness` against a hand-built map: the declared `n_t`-row
+    /// prefix of each used column lands at its stacked offset, dummy rows,
+    /// dropped columns and gaps vanish, the pad tail is zero, and a
+    /// single-slot full-utilization identity registry round-trips the
+    /// buffer unchanged.
     #[test]
     fn compact_witness_matches_map() {
         let reg = Registry::new(vec![ty(10, 512), ty(9, 300)], 3);
         let union = UnionInstance::new(&reg, vec![5, 3]);
-        // Padded buffer: word i of column c holds (c, i) tags.
+        // Padded buffer: declared word i of used column c holds (c, i)
+        // tags; dropped words (dummy rows, useless columns, the gap) stay
+        // zero — the honest-witness invariant compact_witness asserts.
         let mut z = vec![F128::ZERO; union.packed_len()];
-        for c in 0..(1usize << union.col_log()) {
-            for i in 0..8 {
-                z[(c << 3) + i] = F128 {
-                    lo: i as u64,
-                    hi: c as u64,
-                };
+        for (cols, n_t) in [(0..4usize, 5usize), (8..11, 3)] {
+            for c in cols {
+                for i in 0..n_t {
+                    z[(c << 3) + i] = F128 {
+                        lo: i as u64,
+                        hi: c as u64,
+                    };
+                }
             }
         }
         let q = union.compact_witness(&z);
-        assert_eq!(q.len(), 64);
-        // Slot A used columns 0..4 stack at 0..32; slot B used columns
-        // 8..11 (padded) stack at 32..56; tail 56..64 zero.
-        for (stacked, padded_col) in (0..4).map(|c| (c, c)).chain((0..3).map(|c| (4 + c, 8 + c))) {
-            for i in 0..8 {
+        // Sub-floor address space: committed clamps to the padded length.
+        assert_eq!(q.len(), 128);
+        assert_eq!(union.dense_words(), 4 * 5 + 3 * 3);
+        // Slot A used columns 0..4 stack their 5-word prefixes at 0..20;
+        // slot B used columns 8..11 (padded) their 3-word prefixes at
+        // 20..29; tail 29..128 zero.
+        let mut cursor = 0usize;
+        for (padded_col, n_t) in (0..4).map(|c| (c, 5)).chain((8..11).map(|c| (c, 3))) {
+            for i in 0..n_t {
                 assert_eq!(
-                    q[(stacked << 3) + i],
+                    q[cursor],
                     F128 {
                         lo: i as u64,
                         hi: padded_col as u64
                     },
-                    "stacked column {stacked} word {i}"
+                    "padded column {padded_col} word {i}"
                 );
+                cursor += 1;
             }
         }
-        assert!(q[56..].iter().all(|w| *w == F128::ZERO), "pad tail");
+        assert_eq!(cursor, union.dense_words());
+        assert!(q[cursor..].iter().all(|w| *w == F128::ZERO), "pad tail");
         // unrank ≡ compaction: every dense index maps back to the padded
         // word it was copied from.
         let params = crate::pcs::jagged::JaggedParams::from_heights(
@@ -703,7 +878,8 @@ mod tests {
             assert_eq!(q[e as usize], z[(col << 3) + row], "unrank at {e}");
         }
 
-        // Identity registry: q is byte-identical to the padded buffer.
+        // Identity registry (full utilization): q is byte-identical to the
+        // padded buffer.
         let reg1 = Registry::new(vec![ty(10, 700)], 3);
         let union1 = UnionInstance::new(&reg1, vec![8]);
         assert!(union1.compaction_is_identity());
