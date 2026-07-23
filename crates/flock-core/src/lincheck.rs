@@ -662,6 +662,66 @@ pub fn partial_fold_packed_z_fast_padded(
         )
 }
 
+/// Row-prefix variant of [`partial_fold_packed_z_fast_padded`] (M6,
+/// support-proportional): fold only the outer rows `[0, n_rows)`. On an
+/// honest partial-count witness the rows `[n_rows, 2^n_log)` are identically
+/// zero, so their fold terms are zero and the output is byte-identical to
+/// the dense fold — at cost proportional to the DECLARED rows. Stripe
+/// granularity is 8 rows; a partial last stripe is handled by the byte
+/// itself (its dead-row bits are zero, so the sum-table lookup already
+/// contributes only the live rows).
+pub fn partial_fold_packed_z_rows_padded(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+    n_rows: usize,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_packed.len(), (1usize << m) / 8);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(n_log >= 3, "need n_outer ≥ 8 for byte stripes");
+    assert!(useful_bits <= k);
+    assert!(n_rows <= n_outer);
+    let n_stripes = n_rows.div_ceil(8);
+
+    let stripes_per_chunk = (n_stripes / 256).max(1);
+    let bytes_per_chunk = stripes_per_chunk * k;
+
+    z_packed[..n_stripes * k]
+        .par_chunks(bytes_per_chunk)
+        .enumerate()
+        .fold(
+            || vec![F128::ZERO; k],
+            |mut acc, (chunk_idx, chunk_bytes)| {
+                let stripe_start = chunk_idx * stripes_per_chunk;
+                let mut table = vec![F128::ZERO; 256];
+                for (rel_stripe, stripe) in chunk_bytes.chunks(k).enumerate() {
+                    let byte_idx = stripe_start + rel_stripe;
+                    build_sum_table(&eq_outer[8 * byte_idx..8 * byte_idx + 8], &mut table);
+                    for (i_inner, &z_byte) in stripe[..useful_bits].iter().enumerate() {
+                        acc[i_inner] += table[z_byte as usize];
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![F128::ZERO; k],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+                a
+            },
+        )
+}
+
 /// Stripes swept per accumulator touch in the NEON tiled partial fold.
 /// Larger ⇒ the length-`k` accumulator is re-streamed fewer times
 /// (`n_stripes / NEON_TILE_T`), but the per-tile sum tables grow
@@ -713,6 +773,29 @@ fn partial_fold_packed_z_best(
         }
     } else {
         partial_fold_packed_z_fast_padded(z_packed, m, k_log, useful_bits, eq_outer)
+    }
+}
+
+/// Row-aware dispatch over the declared count (M6, support-proportional):
+/// when the declared rows fill at most half the outer capacity, fold only
+/// their stripe prefix ([`partial_fold_packed_z_rows_padded`] — cost
+/// proportional to the count); otherwise the dense best-kernel dispatch (the
+/// possible saving is under 2× there, and the dense NEON kernels win per
+/// byte). Byte-identical either way on honest witnesses whose dummy rows
+/// are zero.
+fn partial_fold_packed_z_rows_best(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+    n_rows: usize,
+) -> Vec<F128> {
+    let n_outer = 1usize << (m - k_log);
+    if n_rows.div_ceil(8) * 8 * 2 <= n_outer {
+        partial_fold_packed_z_rows_padded(z_packed, m, k_log, useful_bits, eq_outer, n_rows)
+    } else {
+        partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, eq_outer)
     }
 }
 

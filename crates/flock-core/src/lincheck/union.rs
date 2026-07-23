@@ -68,7 +68,7 @@ use crate::zerocheck::multilinear::lagrange_weights_naive;
 
 use super::{
     LincheckCircuit, LincheckClaim, LincheckProof, QuirkyPoint, VerifyError, build_eq_table,
-    build_quirky_eq_table, column_sumcheck_prove, inner_product, partial_fold_packed_z_best,
+    build_quirky_eq_table, column_sumcheck_prove, inner_product, partial_fold_packed_z_rows_best,
 };
 
 /// One slot's lincheck inputs, in slot order — the union counterpart of the
@@ -229,6 +229,11 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     //    Dense union-column placement (see module docs); a single slot is
     //    today's comb vector, moved.
     let single = registry.num_types() == 1;
+    let t_comb = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let mut comb_vec: Vec<F128> = if single {
         Vec::new()
     } else {
@@ -260,26 +265,45 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
             comb_vec[off + col] += beta;
         }
     }
+    if let Some(t) = t_comb {
+        eprintln!(
+            "[lc] {:<26} {:>7.2} ms",
+            "union comb build",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     // 3. Per-slot row folds against the SHARED standard eq table of the row
     //    block r|_R (uniform capacity: one table, all slots), placed at the
     //    slots' aligned column offsets — the union generalization of today's
-    //    single partial fold. Dummy rows are honest zeros, so the
-    //    full-capacity fold equals the declared-rows fold; skipping them is
-    //    part of the same later factorized-iteration performance item.
+    //    single partial fold. Dummy rows are honest zeros, so folding only
+    //    the DECLARED rows equals the full-capacity fold byte for byte —
+    //    the row-aware dispatch makes the fold count-proportional (M6).
+    let t_fold = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let eq_x_outer = build_eq_table(&x_ab.x_outer);
     let mut z_vec: Vec<F128> = if single {
         Vec::new()
     } else {
         vec![F128::ZERO; 1usize << col_vars]
     };
-    for ((ty, slot), slot_in) in registry.types().iter().zip(registry.slots()).zip(slots) {
-        let y_t = partial_fold_packed_z_best(
+    for (((ty, slot), slot_in), &n_t) in registry
+        .types()
+        .iter()
+        .zip(registry.slots())
+        .zip(slots)
+        .zip(union.counts())
+    {
+        let y_t = partial_fold_packed_z_rows_best(
             slot_in.z_lincheck,
             nu + ty.k_log,
             ty.k_log,
             ty.useful_bits,
             &eq_x_outer,
+            n_t,
         );
         if single {
             z_vec = y_t;
@@ -287,6 +311,14 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
             let off = slot.prefix << ty.k_log;
             z_vec[off..off + y_t.len()].copy_from_slice(&y_t);
         }
+    }
+
+    if let Some(t) = t_fold {
+        eprintln!(
+            "[lc] {:<26} {:>7.2} ms",
+            "union partial folds",
+            t.elapsed().as_secs_f64() * 1e3
+        );
     }
 
     // 3b. Capture the pre-sumcheck union fold g for downstream reuse

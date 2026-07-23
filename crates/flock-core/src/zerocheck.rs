@@ -27,9 +27,9 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_optimized_packed_padded,
+    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_and_round_pair_sparse_into,
+    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    uni_skip_fold_and_round_pair_optimized_packed_padded, zero_dead_regions,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -138,6 +138,24 @@ impl PaddingSpec {
     /// may be larger; the difference is the implicit trailing zero gap.
     pub fn covered_bits(&self) -> usize {
         self.runs.iter().map(|r| r.extent_bits()).sum()
+    }
+
+    /// [`Self::useful_intervals`] coarsened to `2^log2_block`-bit blocks and
+    /// merged: block `x` is listed iff bits `[x·2^log2_block,
+    /// (x+1)·2^log2_block)` intersect a useful interval. This is the live set
+    /// of a table whose entries each aggregate one block of witness bits
+    /// (e.g. the post-URM tables at `log2_block = k_skip`, or packed words at
+    /// `log2_block = 7`): outside it the honest table is identically zero.
+    pub fn useful_block_intervals(&self, log2_block: usize) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in self.useful_intervals() {
+            let (s2, e2) = (s >> log2_block, e.div_ceil(1usize << log2_block));
+            match out.last_mut() {
+                Some((_, prev_e)) if *prev_e >= s2 => *prev_e = (*prev_e).max(e2),
+                _ => out.push((s2, e2)),
+            }
+        }
+        out
     }
 
     /// Sorted, merged list of useful bit intervals `[start, end)` — the
@@ -472,6 +490,21 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
+    // Support-proportional tail (M6): under a multi-run count-derived spec
+    // the folded tables are zero outside the declared support. While that
+    // support stays sparse (live·16 ≤ n), each round folds and evaluates the
+    // message over the live intervals only — the skipped terms all carry an
+    // `a·b` factor of zero, so every message and folded value is
+    // byte-identical to the dense path. Once the live fraction grows past
+    // the threshold (or the tables get small), the buffers' dead regions are
+    // zeroed once and the dense kernels resume.
+    let mut live: Option<Vec<(usize, usize)>> = if padding.as_single_run().is_none() {
+        Some(padding.useful_block_intervals(k_skip))
+    } else {
+        None
+    };
+    let mut sparse_dirty = false; // sparse folds leave dead scratch untouched
+
     for i in 0..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
@@ -482,7 +515,45 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut r_next = vec![F128::ONE; log_n_before - 1];
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
-        let (m1, mi) = if log_n_before >= 10 {
+        let use_sparse = live.as_ref().is_some_and(|list| {
+            let live_elems: usize = list.iter().map(|&(s, e)| e - s).sum();
+            a_mlv.len() >= 8 && live_elems * 16 <= a_mlv.len()
+        });
+        if !use_sparse
+            && let Some(list) = live.take()
+            && sparse_dirty
+        {
+            let len = a_mlv.len();
+            zero_dead_regions(&mut a_mlv, len, &list);
+            zero_dead_regions(&mut b_mlv, len, &list);
+            sparse_dirty = false;
+        }
+
+        let (m1, mi) = if use_sparse {
+            let half = a_mlv.len() / 2;
+            if a_nxt.len() < half {
+                crate::scratch::give_f128(a_nxt);
+                crate::scratch::give_f128(b_nxt);
+                a_nxt = crate::scratch::take_f128(half);
+                b_nxt = crate::scratch::take_f128(half);
+            }
+            let (m1, mi, live_out) = fold_and_round_pair_sparse_into(
+                &a_mlv,
+                &b_mlv,
+                &mut a_nxt[..half],
+                &mut b_nxt[..half],
+                rho_prev,
+                &r_next,
+                live.as_ref().expect("use_sparse implies live"),
+            );
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(half);
+            b_mlv.truncate(half);
+            live = Some(live_out);
+            sparse_dirty = true;
+            (m1, mi)
+        } else if log_n_before >= 10 {
             let half = a_mlv.len() / 2;
             let (m1, mi) = fold_and_compute_round_pair_into(
                 &a_mlv,
@@ -1324,6 +1395,79 @@ mod tests {
         // And the multi-run proof still verifies.
         let mut ch_verify = FsChallenger::new(b"flock-test-v0");
         verify(m, &proof_padded, &mut ch_verify).expect("multi-run proof must verify");
+    }
+
+    /// **Sparse multi-run spec is byte-identical to the dense prover** through
+    /// the M6 support-proportional tail (`fold_and_round_pair_sparse_into`):
+    /// the support here is ~1% of the domain, so the tail's sparse rounds
+    /// genuinely run (unlike `prove_padded_multi_run_matches_dense`, whose
+    /// support is too dense to trigger them), including the mid-tail
+    /// switch-back to the dense kernels (zeroing dead scratch) once the live
+    /// fraction crosses the threshold.
+    #[test]
+    fn prove_padded_sparse_multi_run_matches_dense() {
+        let m = 16usize;
+        // Two count-derived-shaped runs: blocks of 2^13 bits with a 256-bit
+        // declared prefix (n_t = 2 rows of 128), then a gap-shaped zero run,
+        // then a smaller block shape — plus the implicit trailing gap.
+        let padding = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 256,
+                n_blocks: 3,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 0,
+                n_blocks: 1,
+            },
+            PaddingRun {
+                k_log: 12,
+                useful_bits_per_block: 128,
+                n_blocks: 2,
+            },
+        ]);
+        assert!(padding.as_single_run().is_none(), "must exercise multi-run");
+        let live = padding.useful_block_intervals(K_SKIP);
+        let live_elems: usize = live.iter().map(|&(s, e)| e - s).sum();
+        assert!(
+            live_elems * 16 <= 1usize << (m - K_SKIP),
+            "spec must be sparse enough to drive the sparse tail"
+        );
+
+        let mut rng = Rng::new(0x0616_5A9D);
+        let mut a = rng.bits(1 << m);
+        let mut b = rng.bits(1 << m);
+        zero_outside_useful(&padding, &mut a);
+        zero_outside_useful(&padding, &mut b);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+        let mut ch_dense = FsChallenger::new(b"flock-test-v0");
+        let (proof_dense, claim_dense, s_hat_v_dense) = prove_packed_padded_capture_s_hat_v_c(
+            &a_p,
+            &b_p,
+            &c_p,
+            m,
+            &PaddingSpec::dense(m),
+            &mut ch_dense,
+        );
+
+        let mut ch_padded = FsChallenger::new(b"flock-test-v0");
+        let (proof_padded, claim_padded, s_hat_v_padded) =
+            prove_packed_padded_capture_s_hat_v_c(&a_p, &b_p, &c_p, m, &padding, &mut ch_padded);
+
+        assert_eq!(proof_dense, proof_padded, "proof mismatch");
+        assert_eq!(claim_dense, claim_padded, "claim mismatch");
+        assert_eq!(s_hat_v_dense, s_hat_v_padded, "s_hat_v_c mismatch");
+        assert_eq!(
+            ch_dense.sample_f128(),
+            ch_padded.sample_f128(),
+            "post-proof transcript state diverged"
+        );
+
+        let mut ch_verify = FsChallenger::new(b"flock-test-v0");
+        verify(m, &proof_padded, &mut ch_verify).expect("sparse multi-run proof must verify");
     }
 
     /// Determinism: same witness + same challenger seed → same proof.

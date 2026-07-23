@@ -1115,6 +1115,124 @@ pub fn fold_and_compute_round_pair_into(
     (r_next[0] * sum1, sum_inf)
 }
 
+/// Halve a sorted, disjoint interval list under one binding round: index `x`
+/// of the folded (half-size) domain is live iff `{2x, 2x+1}` intersects a
+/// live input interval — `[s, e)` maps to `[s/2, (e+1)/2)` — with touching
+/// output intervals merged so the list stays canonical.
+pub fn shrink_intervals(live: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(live.len());
+    for &(s, e) in live {
+        let (s2, e2) = (s >> 1, e.div_ceil(2));
+        match out.last_mut() {
+            Some((_, prev_e)) if *prev_e >= s2 => *prev_e = (*prev_e).max(e2),
+            _ => out.push((s2, e2)),
+        }
+    }
+    out
+}
+
+/// Support-proportional variant of [`fold_and_compute_round_pair_into`] for
+/// sparse-support instances (the multi-table count-derived run lists): bind
+/// one variable at `r_fold` and compute the next round's message, touching
+/// only the pairs that cover `live_in` — the canonical (sorted, disjoint,
+/// merged) interval list outside of which the input tables are **zero** on an
+/// honest witness. Cost `O(live + intervals)` instead of `O(n)`.
+///
+/// Contract differences from the dense kernel:
+/// - Input positions outside `live_in` are never read (they may hold scratch
+///   garbage); their honest value — zero — is substituted, which is what
+///   makes the output byte-identical to the dense fold.
+/// - Only the pair-cover of the folded live set is written; everything else
+///   in `a_out`/`b_out` is left untouched. Callers switching back to a dense
+///   kernel must zero the dead regions first (`zero_dead_regions`).
+///
+/// Returns `(r_next[0] · G(1), G(∞), live_out)` where `live_out` is the
+/// folded domain's live list — exactly [`shrink_intervals`] of `live_in`.
+/// The message equals the dense kernel's value exactly: the skipped terms
+/// each carry an `a·b` factor of zero, and field ops are exact, so dropping
+/// them cannot change the sum.
+pub fn fold_and_round_pair_sparse_into(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    live_in: &[(usize, usize)],
+) -> (F128, F128, Vec<(usize, usize)>) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 8);
+    let half = n / 2;
+    assert!(a_out.len() >= half && b_out.len() >= half);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n - 1);
+    debug_assert!(
+        live_in.windows(2).all(|w| w[0].1 < w[1].0),
+        "canonical list"
+    );
+    debug_assert!(live_in.last().is_none_or(|&(_, e)| e <= n));
+
+    // eq split over the message's pair domain (size half/2), exactly as the
+    // dense kernel: eq(k) = lo[k & mask] · hi[k >> n_lo].
+    let eq = SplitEqGhash::new(&r_next[1..]);
+    let lo_mask = (1usize << eq.n_lo) - 1;
+
+    let live_out = shrink_intervals(live_in);
+    let pair_cover = shrink_intervals(&live_out);
+
+    // Zero-substituting source reads: `cur` walks `live_in` monotonically as
+    // the read position `y` ascends (all reads below are in ascending order).
+    let mut cur = 0usize;
+    let read2 = |cur: &mut usize, y: usize| -> (F128, F128) {
+        while *cur < live_in.len() && live_in[*cur].1 <= y {
+            *cur += 1;
+        }
+        if *cur < live_in.len() && live_in[*cur].0 <= y {
+            (a[y], b[y])
+        } else {
+            (F128::ZERO, F128::ZERO)
+        }
+    };
+
+    let mut sum1 = F128::ZERO;
+    let mut sum_inf = F128::ZERO;
+    for &(ps, pe) in &pair_cover {
+        for t in ps..pe {
+            let y = 4 * t;
+            let (a00, b00) = read2(&mut cur, y);
+            let (a01, b01) = read2(&mut cur, y + 1);
+            let (a10, b10) = read2(&mut cur, y + 2);
+            let (a11, b11) = read2(&mut cur, y + 3);
+            let a0 = a00 + r_fold * (a01 + a00);
+            let a1 = a10 + r_fold * (a11 + a10);
+            let b0 = b00 + r_fold * (b01 + b00);
+            let b1 = b10 + r_fold * (b11 + b10);
+            a_out[2 * t] = a0;
+            a_out[2 * t + 1] = a1;
+            b_out[2 * t] = b0;
+            b_out[2 * t + 1] = b1;
+            let eq_k = eq.lo[t & lo_mask] * eq.hi[t >> eq.n_lo];
+            sum1 += eq_k * (a1 * b1);
+            sum_inf += eq_k * ((a0 + a1) * (b0 + b1));
+        }
+    }
+    (r_next[0] * sum1, sum_inf, live_out)
+}
+
+/// Zero every position of `v[..len]` outside the canonical live interval
+/// list — restores the dense kernels' "dead positions are zero" invariant
+/// after a sequence of sparse-support folds (which leave dead scratch
+/// untouched).
+pub fn zero_dead_regions(v: &mut [F128], len: usize, live: &[(usize, usize)]) {
+    let mut pos = 0usize;
+    for &(s, e) in live {
+        v[pos..s.min(len)].fill(F128::ZERO);
+        pos = e.min(len);
+    }
+    v[pos..len].fill(F128::ZERO);
+}
+
 /// Serial reference — identical I/O contract to
 /// [`uni_skip_fold_and_round_pair_optimized_packed`], no rayon. Kept under
 /// `#[cfg(test)]` as the cross-check oracle for the parallel version.
