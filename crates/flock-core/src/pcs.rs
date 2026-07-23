@@ -58,10 +58,16 @@ pub enum VerifyError {
 /// commitment layer"): the ring-switching frontend exactly as
 /// [`BatchOpeningProofLigerito`], then the virtual-opening sumcheck
 /// converting the γ-combined inner-product claim into a single evaluation
-/// claim `f̂(ρ) = f_eval`, the jagged sumcheck + assist transporting it to a
-/// dense claim `q̂(i*) = α`, and the Ligerito opening of the dense stack at
-/// the `eq(i*, ·)` basis. Produced by [`open_batch_jagged_ligerito`], checked
-/// by [`verify_opening_batch_jagged_ligerito`].
+/// claim `f̂(ρ) = f_eval`, and the **fused** Ligerito opening discharging
+/// `⟨q, W_ρ⟩ = f_eval` directly against the jagged weight table
+/// `W_ρ = f̂_t(ρ_row, ρ_col, ·)` as the basis (no jagged main sumcheck). The
+/// weight-table evaluations Ligerito's final check needs at `ris ‖ bits(y)`
+/// are prover-supplied (`b_tilde`) and bound to the true `Ŵ_ρ` by a
+/// send-and-spot-check reduction: a fresh challenge `r_extra` is squeezed
+/// after `b_tilde`, and the (unmodified) jagged assist proves
+/// `Ŵ_ρ(ris ‖ r_extra)`, which must equal the MLE of the received `b_tilde`
+/// at `r_extra` (Schwartz–Zippel). Produced by [`open_batch_jagged_ligerito`],
+/// checked by [`verify_opening_batch_jagged_ligerito`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchOpeningProofJaggedLigerito {
     pub ring_switches: Vec<RingSwitchProof>,
@@ -70,9 +76,12 @@ pub struct BatchOpeningProofJaggedLigerito {
     pub virtual_open_rounds: Vec<(F128, F128)>,
     /// `f̂(ρ)` — the packed witness folded at the virtual-opening challenges.
     pub f_eval: F128,
-    pub jagged_sumcheck: jagged::JaggedSumcheckProof,
-    pub jagged_assist: jagged::JaggedAssistProof,
     pub ligerito: ligerito::LigeritoProof,
+    /// `b_tilde[y] = Ŵ_ρ(ris ‖ bits(y))` for all `y ∈ {0,1}^yr_log_n`, where
+    /// `ris` are Ligerito's fold challenges — the basis evaluations its final
+    /// check consumes, sent by the prover and spot-checked via the assist.
+    pub b_tilde: Vec<F128>,
+    pub jagged_assist: jagged::JaggedAssistProof,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,9 +90,13 @@ pub enum VerifyErrorJagged {
     /// The virtual-opening sumcheck rejected (wrong round count, or the final
     /// round does not match `b̂_combined(ρ) · f_eval`).
     VirtualOpen,
-    /// The jagged transport (sumcheck or assist) rejected.
+    /// The jagged transport rejected: the assist replay failed, or the
+    /// assist-verified `β = Ŵ_ρ(ris ‖ r_extra)` does not match the MLE of the
+    /// proof's `b_tilde` at `r_extra` (the spot-check binding `b_tilde` to the
+    /// true weight table).
     Jagged,
-    /// The Ligerito recursive verifier rejected the dense opening.
+    /// The Ligerito recursive verifier rejected the fused opening (including
+    /// its final check, which consumes the proof's `b_tilde`).
     Ligerito,
 }
 
@@ -736,40 +749,10 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
 // ---------------------------------------------------------------------------
 // The jagged opening path (Phase 1 of docs/multi-table-design.tex §"The
 // commitment layer"): claim assembly exactly as the mixed path, then
-// virtual-opening sumcheck → jagged transport (with assist) → Ligerito on the
-// dense stack. Additive — the mixed path above is untouched.
+// virtual-opening sumcheck → fused Ligerito opening against the jagged weight
+// table W_ρ → b_tilde send-and-spot-check (with the unmodified assist).
+// Additive — the mixed path above is untouched.
 // ---------------------------------------------------------------------------
-
-/// Round-0 sumcheck prime `(u_0, u_2)` over `Σ_x f(x)·b(x)` with the LSB
-/// bound: `u_0 = Σ f_0·b_0`, `u_2 = Σ (f_0+f_1)(b_0+b_1)`. Feeds
-/// `ligerito::recursive_prover_with_basis_precomputed_round0` for the dense
-/// opening (mirrors what `compute_combined_basis_and_target` produces for the
-/// mixed path as a side effect of its combine pass).
-fn round0_prime_pair(f: &[F128], b: &[F128]) -> (F128, F128) {
-    use rayon::prelude::*;
-    debug_assert_eq!(f.len(), b.len());
-    const C: usize = 1 << 14;
-    f.par_chunks(C)
-        .zip(b.par_chunks(C))
-        .map(|(fc, bc)| {
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            for (fp, bp) in fc
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(bc.as_chunks::<2>().0.iter())
-            {
-                u0 += fp[0] * bp[0];
-                u2 += (fp[0] + fp[1]) * (bp[0] + bp[1]);
-            }
-            (u0, u2)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-        )
-}
 
 /// Mixed-claim batched open through the **jagged transport**. Runs the exact
 /// claim assembly of [`open_batch_mixed_ligerito_with_precomputed_s_hat_v`]
@@ -781,14 +764,22 @@ fn round0_prime_pair(f: &[F128], b: &[F128]) -> (F128, F128) {
 ///    `Σ_x f(x)·b_combined(x) = target_combined` (`f` = packed witness),
 ///    with the char-2-safe `(G(1), G(∞))` round encoding of `pcs::jagged`.
 ///    Converts the inner-product claim into the single evaluation claim
-///    `f̂(ρ) = f_eval` the transport consumes.
-/// 2. **Jagged transport with assist** (`flock-jagged-v0`): `q` = the packed
-///    witness (Phase 1 single table: the dense stack IS the padded buffer),
-///    `z_row = ρ[0..n_log]`, `z_col = ρ[n_log..]` (BatchMajor suffix order is
-///    `[batch | chunk]`). Reduces to the dense claim `q̂(i*) = α`.
-/// 3. **Ligerito** on the dense stack: opens `q` against the `eq(i*, ·)`
-///    basis with target `α`, reusing the commit-time codeword/Merkle tree as
-///    L0 exactly like the mixed path.
+///    `f̂(ρ) = f_eval`.
+/// 2. **Fused Ligerito opening**: materializes the jagged weight table
+///    `W_ρ[e] = eq(ρ_row, row(e))·eq(ρ_col, col(e))` over the dense domain
+///    (`z_row = ρ[0..n_log]`, `z_col = ρ[n_log..]` — BatchMajor suffix order
+///    is `[batch | chunk]`; zero past the jagged area, so
+///    `Σ_e q[e]·W_ρ[e] = f_eval`) and opens `q` = the packed witness against
+///    `W_ρ` as the basis with target `f_eval`, reusing the commit-time
+///    codeword/Merkle tree as L0 exactly like the mixed path. There is no
+///    jagged main sumcheck on this path.
+/// 3. **Send-and-spot-check** (`b_tilde` + assist): the verifier cannot
+///    evaluate `Ŵ_ρ` succinctly at Ligerito's residual points
+///    `ris ‖ bits(y)`, so the prover sends `b_tilde[y] = Ŵ_ρ(ris ‖ bits(y))`
+///    for all `y`, the transcript squeezes `yr_log_n` fresh challenges
+///    `r_extra`, and the existing, unmodified [`jagged::prove_assist`] proves
+///    `Ŵ_ρ(ris ‖ r_extra)` — which the verifier compares against the MLE of
+///    the received `b_tilde` at `r_extra` (Schwartz–Zippel binding).
 ///
 /// `heights` are the per-chunk-column word counts of the jagged grid
 /// (`2^(k_log−7)` entries; see `BlockR1cs::jagged_heights`), `n_log` the
@@ -906,7 +897,10 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         );
     }
 
-    // ---- Jagged transport with assist: f̂(ρ) = f_eval → q̂(i*) = α.
+    // ---- Jagged weight table W_ρ over the dense domain + round-0 prime.
+    // W_ρ[e] = eq(ρ_row, row(e))·eq(ρ_col, col(e)) (zero past the jagged
+    // area), so ⟨q, W_ρ⟩ = f̂(ρ) = f_eval — the fused Ligerito opening below
+    // discharges this inner product directly.
     let t = std::time::Instant::now();
     let params = jagged::JaggedParams::from_heights(heights, n_log, log_l);
     debug_assert!(
@@ -915,36 +909,33 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
             .all(|&w| w == F128::ZERO),
         "packed witness must be zero past the jagged area"
     );
-    let (jagged_sumcheck, claim_v, i_star) = jagged::prove_main(
+    let (w_rho, claim_v, round0) = jagged::weight_table_claim_and_round0(
         &params,
         &packed_witness,
         &rho[..n_log],
         &rho[n_log..],
-        challenger,
     );
     debug_assert_eq!(
         claim_v, f_eval,
-        "jagged claim must equal the virtual-opening output (witness zero past area)"
+        "⟨q, W_ρ⟩ must equal the virtual-opening output (witness zero past area)"
     );
-    let jagged_assist =
-        jagged::prove_assist(&params, &rho[..n_log], &rho[n_log..], &i_star, challenger);
     if trace {
         eprintln!(
-            "  [open_jagged] jagged transport + assist: {:6.2} ms",
+            "  [open_jagged] W_rho weight table + round0: {:6.2} ms",
             t.elapsed().as_secs_f64() * 1e3
         );
     }
 
-    // ---- Ligerito on the dense stack: open q against eq(i*, ·) with target α.
+    // ---- Fused Ligerito: open q against W_ρ with target f_eval, reusing the
+    // commit-time codeword/tree as L0. The fused entry also returns the fold
+    // challenges `ris` and mirrors the succinct verifier's trailing samples so
+    // the transcript can continue below.
     let t = std::time::Instant::now();
-    let alpha = jagged_sumcheck.q_eval;
-    let b_eq = ring_switch::build_eq_parallel(&i_star);
-    let round0 = round0_prime_pair(&packed_witness, &b_eq);
-    let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0(
+    let (ligerito_proof, ris) = ligerito::recursive_prover_with_basis_precomputed_round0_fused(
         lig_config,
         packed_witness,
-        b_eq,
-        alpha,
+        w_rho,
+        f_eval,
         &prover_data.codeword,
         &prover_data.merkle_tree,
         round0,
@@ -952,7 +943,47 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     );
     if trace {
         eprintln!(
-            "  [open_jagged] ligerito::recursive_prover_with_basis: {:6.2} ms",
+            "  [open_jagged] ligerito::recursive_prover_with_basis (fused): {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // ---- Send-and-spot-check: b_tilde[y] = Ŵ_ρ(ris ‖ bits(y)) for all y in
+    // {0,1}^yr_log_n (Ŵ_ρ = f̂_t(ρ_row, ρ_col, ·), so 2^yr_log_n branching-
+    // program evaluations — O(2^yr_log_n · 2^k · log_l) muls, no pass over the
+    // 2^log_l table), observed in index order; then squeeze r_extra and run
+    // the existing, unmodified assist at z_index = ris ‖ r_extra.
+    let t = std::time::Instant::now();
+    let yr_log_n = log_l - ris.len();
+    let b_tilde: Vec<F128> = {
+        use rayon::prelude::*;
+        (0..1usize << yr_log_n)
+            .into_par_iter()
+            .map(|y| {
+                let mut z_index = Vec::with_capacity(log_l);
+                z_index.extend_from_slice(&ris);
+                for j in 0..yr_log_n {
+                    z_index.push(if (y >> j) & 1 == 1 {
+                        F128::ONE
+                    } else {
+                        F128::ZERO
+                    });
+                }
+                jagged::f_hat_t(&params, &rho[..n_log], &rho[n_log..], &z_index)
+            })
+            .collect()
+    };
+    for &v in &b_tilde {
+        challenger.observe_f128(v);
+    }
+    let r_extra = challenger.sample_f128_vec(yr_log_n);
+    let mut z_index = ris;
+    z_index.extend_from_slice(&r_extra);
+    let jagged_assist =
+        jagged::prove_assist(&params, &rho[..n_log], &rho[n_log..], &z_index, challenger);
+    if trace {
+        eprintln!(
+            "  [open_jagged] b_tilde (2^{yr_log_n}) + assist: {:6.2} ms",
             t.elapsed().as_secs_f64() * 1e3
         );
         eprintln!(
@@ -965,9 +996,9 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         ring_switches: combined.ring_switches,
         virtual_open_rounds,
         f_eval,
-        jagged_sumcheck,
-        jagged_assist,
         ligerito: ligerito_proof,
+        b_tilde,
+        jagged_assist,
     }
 }
 
@@ -978,9 +1009,14 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
 /// sumcheck and checks its final round against `b̂_combined(ρ) · f_eval`
 /// (evaluating `b̂_combined` itself via the same residual machinery —
 /// `eval_rs_eq` per ring-switched claim, `eq_eval` per packed-direct claim —
-/// at the arbitrary field point `ρ`), then drives the jagged
-/// `verify_with_assist` and finally the succinct Ligerito verifier with the
-/// residual basis `eq(i*, ·)`.
+/// at the arbitrary field point `ρ`), then drives the succinct Ligerito
+/// verifier on the fused opening `⟨q, W_ρ⟩ = f_eval` with the residual basis
+/// values at `ris ‖ bits(y)` **taken from the proof's `b_tilde`** (the
+/// induced/OOD terms are computed as usual), and finally binds `b_tilde` to
+/// the true weight table: observe `b_tilde`, squeeze `r_extra`, run the
+/// unmodified [`jagged::verify_assist`] at `z_index = ris ‖ r_extra`, and
+/// require the verified `β = Ŵ_ρ(ris ‖ r_extra)` to equal the MLE of the
+/// received `b_tilde` at `r_extra` (Schwartz–Zippel spot-check).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
     commitment: &Commitment,
@@ -1065,43 +1101,61 @@ pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
     }
     challenger.observe_f128(proof.f_eval);
 
-    // 5. Jagged transport with assist: f̂(ρ) = f_eval → q̂(i*) = α.
+    // 5. Succinct Ligerito verify of the fused opening ⟨q, W_ρ⟩ = f_eval.
+    //    The residual basis values at ris ‖ bits(y) are TAKEN FROM the
+    //    proof's b_tilde (the closure returns them verbatim; the induced/OOD
+    //    terms are computed as usual, and the final check consumes b_tilde).
+    //    The closure also captures Ligerito's fold challenges `ris` for the
+    //    spot-check below — it runs exactly once, at the residual.
     assert!(n_log <= log_l, "n_log exceeds packed-word variable count");
     let params = jagged::JaggedParams::from_heights(heights, n_log, log_l);
-    let dense = jagged::verify_with_assist(
-        &params,
-        &rho[..n_log],
-        &rho[n_log..],
-        proof.f_eval,
-        &proof.jagged_sumcheck,
-        &proof.jagged_assist,
-        challenger,
-    )
-    .ok_or(VerifyErrorJagged::Jagged)?;
-
-    // 6. Succinct Ligerito verify of the dense opening — the residual basis
-    //    is just eq(i*, ·), so eval_b_residual is a plain eq evaluation at
-    //    DenseClaim.point.
-    let eval_b_residual = |ris: &[F128], yr_log_n: usize| -> Vec<F128> {
-        use crate::zerocheck::multilinear::{eq_eval, eq_eval_binary_x};
-        debug_assert!(yr_log_n <= 32, "yr_log_n > 32 not supported by binary path");
-        let prefix = eq_eval(&dense.point[..ris.len()], ris);
-        let suffix = &dense.point[ris.len()..];
-        (0..1usize << yr_log_n)
-            .map(|y| prefix * eq_eval_binary_x(suffix, y as u32))
-            .collect()
+    let ris_cell: std::cell::RefCell<Vec<F128>> = std::cell::RefCell::new(Vec::new());
+    let eval_b_residual = |ris: &[F128], _yr_log_n: usize| -> Vec<F128> {
+        ris_cell.borrow_mut().extend_from_slice(ris);
+        proof.b_tilde.clone()
     };
     let ok = ligerito::recursive_verifier_with_basis_succinct(
         lig_config,
         &proof.ligerito,
         log_l,
-        dense.alpha,
+        proof.f_eval,
         &commitment.root,
         eval_b_residual,
         challenger,
     );
     if !ok {
         return Err(VerifyErrorJagged::Ligerito);
+    }
+    let ris = ris_cell.into_inner();
+    let yr_log_n = log_l - ris.len();
+    // The succinct verifier accepted, so it reached the residual (populating
+    // `ris`) and checked the closure's output length against 2^yr_log_n.
+    debug_assert_eq!(proof.b_tilde.len(), 1usize << yr_log_n);
+
+    // 6. Send-and-spot-check binding of b_tilde to the true Ŵ_ρ. Transcript
+    //    mirror of the prover: observe b_tilde (index order), squeeze
+    //    r_extra, then the unmodified assist at z_index = ris ‖ r_extra. The
+    //    assist-verified β = Ŵ_ρ(ris ‖ r_extra) must equal the MLE of the
+    //    received b_tilde at r_extra — otherwise b_tilde differs from the
+    //    true basis vector and the proof is rejected (Schwartz–Zippel).
+    for &v in &proof.b_tilde {
+        challenger.observe_f128(v);
+    }
+    let r_extra = challenger.sample_f128_vec(yr_log_n);
+    let b_tilde_at_r_extra = ligerito::partial_eval_lsb(&proof.b_tilde, &r_extra)[0];
+    let mut z_index = ris;
+    z_index.extend_from_slice(&r_extra);
+    let beta = jagged::verify_assist(
+        &params,
+        &rho[..n_log],
+        &rho[n_log..],
+        &z_index,
+        &proof.jagged_assist,
+        challenger,
+    )
+    .ok_or(VerifyErrorJagged::Jagged)?;
+    if beta != b_tilde_at_r_extra {
+        return Err(VerifyErrorJagged::Jagged);
     }
     Ok(())
 }
@@ -1341,16 +1395,31 @@ mod tests {
             bad.virtual_open_rounds.pop();
             assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::VirtualOpen));
         }
-        // Tamper: corrupted jagged sumcheck round.
+        // Tamper: single b_tilde element → Ligerito's final check consumes
+        // b_tilde and fails (its yr-weighted sum shifts by yr[0]·δ ≠ 0).
         {
             let mut bad = proof.clone();
-            bad.jagged_sumcheck.rounds[2].1.lo ^= 1;
-            assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::Jagged));
+            bad.b_tilde[0].lo ^= 1;
+            assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::Ligerito));
         }
-        // Tamper: corrupted dense claim value α.
+        // Tamper: a b_tilde PAIR crafted to keep Ligerito's final check
+        // satisfied — δ_0 = yr[1]·c, δ_1 = yr[0]·c makes the yr-weighted
+        // shift yr[0]·yr[1]·c + yr[1]·yr[0]·c = 0 (char 2) — so it must be
+        // caught downstream by the spot-check/assist comparison: the changed
+        // b_tilde re-randomizes r_extra, and the assist replay and/or the
+        // β = MLE_{b_tilde}(r_extra) check rejects.
         {
             let mut bad = proof.clone();
-            bad.jagged_sumcheck.q_eval.lo ^= 1;
+            let c = F128 {
+                lo: 0xD1CE,
+                hi: 0x5EED,
+            };
+            let yr0 = proof.ligerito.final_proof.yr[0];
+            let yr1 = proof.ligerito.final_proof.yr[1];
+            let (d0, d1) = (yr1 * c, yr0 * c);
+            assert!(d0 != F128::ZERO && d1 != F128::ZERO, "degenerate yr");
+            bad.b_tilde[0] += d0;
+            bad.b_tilde[1] += d1;
             assert_eq!(verify(&bad, &heights), Err(VerifyErrorJagged::Jagged));
         }
         // Tamper: corrupted assist claim β.

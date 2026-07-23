@@ -364,6 +364,27 @@ fn generate_f_and_claim(
     (b, v, g_one, g_inf)
 }
 
+/// The jagged **weight table** `W[e] = eq(row_t(e), z_row)·eq(col_t(e), z_col)`
+/// over the dense domain (zero past `area`) — i.e. `f̂_t(z_row, z_col, ·)` on
+/// the boolean cube — together with the inner-product claim `v = Σ_e q(e)·W(e)`
+/// and the round-0 sumcheck prime `(u_0, u_2)` of `Σ_e q(e)·W(e)` with the LSB
+/// bound (`u_0 = Σ q_0·W_0`, `u_2 = Σ (q_0+q_1)(W_0+W_1)`), all from
+/// [`generate_f_and_claim`]'s single fused pass. `generate_f_and_claim` emits
+/// the round message as `(G(1), G(∞))`; the prime pair is `u_0 = G(0) = v +
+/// G(1)` (char 2) and `u_2 = G(∞)` — an exact field identity, so the values
+/// are bit-identical to a separate `Σ q_0·W_0` pass. Feeds the fused
+/// jagged→Ligerito opening (`pcs::open_batch_jagged_ligerito`), which
+/// discharges `⟨q, W⟩ = v` directly in Ligerito with `W` as the basis.
+pub(crate) fn weight_table_claim_and_round0(
+    params: &JaggedParams,
+    q: &[F128],
+    z_row: &[F128],
+    z_col: &[F128],
+) -> (Vec<F128>, F128, (F128, F128)) {
+    let (w, v, g_one, g_inf) = generate_f_and_claim(params, q, z_row, z_col);
+    (w, v, (v + g_one, g_inf))
+}
+
 /// Prover for the jagged reduction. Given the dense multilinear `q` (length
 /// `2^m`, column-major flattening of the jagged function, zero-padded past
 /// `area`) and the sparse evaluation point `(z_row, z_col)`, runs the sumcheck
@@ -382,9 +403,10 @@ pub fn prove<C: Challenger>(
 
 /// [`prove`], additionally returning the bound point `i*` (the per-round
 /// challenges, low bit first) — needed to continue the transcript into the
-/// assist sub-protocol or the downstream dense opening (see
-/// `pcs::open_batch_jagged_ligerito`, which pairs this with [`prove_assist`]
-/// exactly as [`prove_with_assist`] does and then opens `q` at `i*`).
+/// assist sub-protocol ([`prove_with_assist`] pairs the two). Not on the
+/// fused opening path (`pcs::open_batch_jagged_ligerito` discharges the
+/// weight-table inner product directly in Ligerito, with no jagged main
+/// sumcheck).
 pub(crate) fn prove_main<C: Challenger>(
     params: &JaggedParams,
     q: &[F128],

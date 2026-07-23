@@ -63,8 +63,7 @@ fn blake3_m30_direct_vs_jagged_throughput() {
     let mut direct_out = None;
     let mut jagged_out = None;
     for _ in 0..ITERS {
-        let (z, a, b, stripe) =
-            blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
+        let (z, a, b, stripe) = blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
         let mut ch = FsChallenger::new(DOMAIN);
         let t = Instant::now();
         let out = prover::prove_fast_ligerito_from_witness(
@@ -81,8 +80,7 @@ fn blake3_m30_direct_vs_jagged_throughput() {
         best_direct = best_direct.min(t.elapsed().as_secs_f64() * 1e3);
         direct_out = Some(out);
 
-        let (z, a, b, stripe) =
-            blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
+        let (z, a, b, stripe) = blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log());
         let mut ch = FsChallenger::new(DOMAIN);
         let t = Instant::now();
         let out = prover::prove_fast_ligerito_jagged_from_witness(
@@ -147,5 +145,8 @@ fn blake3_m30_direct_vs_jagged_throughput() {
 
     let db = bincode::serialize(&proof_d).unwrap().len();
     let jb = bincode::serialize(&proof_j).unwrap().len();
-    println!("proof size: direct {db} B, jagged {jb} B ({:+} B)", jb as i64 - db as i64);
+    println!(
+        "proof size: direct {db} B, jagged {jb} B ({:+} B)",
+        jb as i64 - db as i64
+    );
 }

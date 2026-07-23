@@ -2973,6 +2973,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         challenger,
     )
+    .0
 }
 
 /// Variant of [`recursive_prover_with_basis`] that accepts the round-0 sumcheck
@@ -3004,8 +3005,64 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         }),
         challenger,
     )
+    .0
 }
 
+/// Fusion entry for the jagged opening path
+/// (`pcs::open_batch_jagged_ligerito`). Produces a proof and transcript
+/// **byte-identical** to [`recursive_prover_with_basis_precomputed_round0`],
+/// then additionally:
+///
+/// 1. returns the fold challenges `ris` (all `log_n − yr_log_n` of them, in
+///    binding order: the `initial_k` L0 lane folds, then every recursive
+///    level's folds) alongside the proof — the caller needs them to evaluate
+///    the basis MLE at `ris ‖ ·` after the opening; and
+/// 2. mirrors the trailing challenger samples of
+///    [`recursive_verifier_with_basis_succinct`] (`alpha_last`, `beta_last` —
+///    drawn by the verifier after the final queries to bind `yr` to the last
+///    commitment) so a caller that continues the transcript past the Ligerito
+///    opening stays in lockstep with the verifier. The legacy entries end the
+///    transcript at the opening, so they never need this mirror.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recursive_prover_with_basis_precomputed_round0_fused<Ch: Challenger>(
+    config: &ProverConfig,
+    packed_witness: Vec<F128>,
+    b_initial: Vec<F128>,
+    target: F128,
+    l0_codeword: &[F128],
+    l0_tree: &[Hash],
+    round0_uv: (F128, F128),
+    challenger: &mut Ch,
+) -> (LigeritoProof, Vec<F128>) {
+    let (proof, ris) = recursive_prover_with_basis_impl(
+        config,
+        packed_witness,
+        b_initial,
+        target,
+        l0_codeword,
+        l0_tree,
+        Some(SumcheckMessage {
+            u_0: round0_uv.0,
+            u_2: round0_uv.1,
+        }),
+        challenger,
+    );
+    // Verifier mirror: the succinct verifier samples the last level's
+    // basis-induction challenge `alpha_last` (after the final queries) and the
+    // batching challenge `beta_last` for the yr-binding proximity tie. The
+    // values only feed the verifier's local final check — the prover's proof
+    // is already fully determined — but the samples advance the Fiat–Shamir
+    // state, so both sides must draw them before the transcript continues.
+    let num_queries_last = config.queries[config.recursive_steps];
+    let _alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
+    let _beta_last = challenger.sample_f128();
+    (proof, ris)
+}
+
+/// Shared body of the `recursive_prover_with_basis*` entries. Returns the
+/// proof together with all fold challenges (`initial_k` L0 lane folds followed
+/// by every level's folds, in binding order) — the public entries drop them;
+/// the fused jagged entry forwards them to its caller.
 #[allow(clippy::too_many_arguments)]
 fn recursive_prover_with_basis_impl<Ch: Challenger>(
     config: &ProverConfig,
@@ -3016,7 +3073,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_tree: &[Hash],
     first_msg: Option<SumcheckMessage>,
     challenger: &mut Ch,
-) -> LigeritoProof {
+) -> (LigeritoProof, Vec<F128>) {
     let log_n = packed_witness.len().trailing_zeros() as usize;
     let r = config.recursive_steps;
     let initial_k = config.initial_k;
@@ -3210,6 +3267,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut wtns_prev = wtns_1;
     let mut recursive_roots: Vec<Hash> = vec![wtns_prev.root()];
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
+    // All fold challenges in binding order (returned to the caller).
+    let mut ris_all: Vec<F128> = r_lane_fold.clone();
 
     for i in 0..r {
         let k_i = config.recursive_ks[i];
@@ -3228,6 +3287,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             challenger.observe_f128(msg.u_0);
             challenger.observe_f128(msg.u_2);
             level_rs.push(ri);
+            ris_all.push(ri);
         }
         if trace {
             t_sumcheck_folds += _t.elapsed();
@@ -3289,21 +3349,24 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     );
                 }
             }
-            return LigeritoProof {
-                initial_root,
-                initial_proof,
-                recursive_roots,
-                recursive_proofs,
-                final_proof: FinalProof {
-                    yr,
-                    opened_rows: opened_rows_last,
-                    merkle_proof: merkle_proof_last,
+            return (
+                LigeritoProof {
+                    initial_root,
+                    initial_proof,
+                    recursive_roots,
+                    recursive_proofs,
+                    final_proof: FinalProof {
+                        yr,
+                        opened_rows: opened_rows_last,
+                        merkle_proof: merkle_proof_last,
+                    },
+                    sumcheck_transcript: sc_prover.transcript().to_vec(),
+                    grinding_nonces,
+                    ood_values,
+                    fold_grinding_nonces,
                 },
-                sumcheck_transcript: sc_prover.transcript().to_vec(),
-                grinding_nonces,
-                ood_values,
-                fold_grinding_nonces,
-            };
+                ris_all,
+            );
         }
 
         let n_next = sc_prover.f().len().trailing_zeros() as usize;

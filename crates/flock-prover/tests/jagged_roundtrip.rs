@@ -162,15 +162,34 @@ fn blake3_jagged_roundtrip_differential_and_tamper() {
         bad.pcs_open.virtual_open_rounds[2].1.lo ^= 1;
         expect_pcs(&bad, VerifyErrorJagged::VirtualOpen, "virtual-open round");
     }
+    // Single b_tilde element: caught by Ligerito's final check (which
+    // consumes b_tilde).
     {
         let mut bad = proof_jagged.clone();
-        bad.pcs_open.jagged_sumcheck.rounds[1].0.lo ^= 1;
-        expect_pcs(&bad, VerifyErrorJagged::Jagged, "jagged sumcheck round");
+        bad.pcs_open.b_tilde[0].lo ^= 1;
+        expect_pcs(&bad, VerifyErrorJagged::Ligerito, "b_tilde element");
     }
+    // b_tilde pair crafted to keep Ligerito's final check satisfied
+    // (δ_0 = yr[1]·c, δ_1 = yr[0]·c cancels in the yr-weighted sum, char 2):
+    // must be caught by the spot-check/assist comparison.
     {
+        use flock_core::field::F128;
         let mut bad = proof_jagged.clone();
-        bad.pcs_open.jagged_sumcheck.q_eval.lo ^= 1;
-        expect_pcs(&bad, VerifyErrorJagged::Jagged, "dense claim α");
+        let c = F128 {
+            lo: 0xD1CE,
+            hi: 0x5EED,
+        };
+        let yr0 = proof_jagged.pcs_open.ligerito.final_proof.yr[0];
+        let yr1 = proof_jagged.pcs_open.ligerito.final_proof.yr[1];
+        let (d0, d1) = (yr1 * c, yr0 * c);
+        assert!(d0 != F128::ZERO && d1 != F128::ZERO, "degenerate yr");
+        bad.pcs_open.b_tilde[0] += d0;
+        bad.pcs_open.b_tilde[1] += d1;
+        expect_pcs(
+            &bad,
+            VerifyErrorJagged::Jagged,
+            "yr-consistent b_tilde pair",
+        );
     }
     {
         let mut bad = proof_jagged.clone();
