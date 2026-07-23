@@ -786,9 +786,22 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
 /// number of batch (row) variables. The witness must be zero past the jagged
 /// area (`Σ heights` packed words) — the BatchMajor buffer layout guarantees
 /// this.
+///
+/// **True dense-stack commit (M4):** `dense_witness` is the committed stack
+/// `q` — the padded `packed_witness` with the height-0 (dropped) columns
+/// deleted and the total zero-padded to a power of two (see
+/// `UnionInstance::compact_witness`; `col_prefix_sums` of `heights` IS the
+/// compaction map). When `Some(q)`: the commitment, `lig_config`, and the
+/// jagged `W_ρ`/`b_tilde`/assist all live on `q`'s (possibly smaller)
+/// `2^dense_log` domain, while the claim assembly and the virtual-opening
+/// sumcheck keep running over the padded `packed_witness` — the identity
+/// `⟨q, W_ρ⟩ = f̂(ρ)` holds because the padded buffer is zero on every
+/// dropped column. When `None`, `q` is `packed_witness` itself (the
+/// single-table paths, whose compaction map is the identity).
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     packed_witness: Vec<F128>,
+    dense_witness: Option<Vec<F128>>,
     prover_data: &ProverData,
     commitment: &Commitment,
     x_outers: &[&[F128]],
@@ -897,24 +910,40 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         );
     }
 
+    // ---- Switch from the padded buffer to the committed dense stack q
+    // (identical when no dense_witness is given). Everything from here on —
+    // W_ρ, the fused Ligerito opening, b_tilde, the assist — lives on q's
+    // 2^dense_log domain; the padded buffer is dead and recycled.
+    let q: Vec<F128> = match dense_witness {
+        Some(q) => {
+            crate::scratch::give_f128(packed_witness);
+            q
+        }
+        None => packed_witness,
+    };
+    let dense_log = q.len().trailing_zeros() as usize;
+    assert_eq!(q.len(), 1usize << dense_log, "q must be a power of two");
+    assert_eq!(
+        dense_log,
+        commitment.params.m - LOG_PACKING,
+        "dense witness length must match the commitment's PcsParams.m"
+    );
+    assert!(dense_log <= log_l, "dense domain exceeds the padded domain");
+
     // ---- Jagged weight table W_ρ over the dense domain + round-0 prime.
     // W_ρ[e] = eq(ρ_row, row(e))·eq(ρ_col, col(e)) (zero past the jagged
     // area), so ⟨q, W_ρ⟩ = f̂(ρ) = f_eval — the fused Ligerito opening below
-    // discharges this inner product directly.
+    // discharges this inner product directly. (With a compacted q the
+    // identity holds because the padded buffer is zero on every dropped
+    // column, so the deleted terms of f̂(ρ) were all zero.)
     let t = std::time::Instant::now();
-    let params = jagged::JaggedParams::from_heights(heights, n_log, log_l);
+    let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
     debug_assert!(
-        packed_witness[params.area() as usize..]
-            .iter()
-            .all(|&w| w == F128::ZERO),
-        "packed witness must be zero past the jagged area"
+        q[params.area() as usize..].iter().all(|&w| w == F128::ZERO),
+        "committed stack must be zero past the jagged area"
     );
-    let (w_rho, claim_v, round0) = jagged::weight_table_claim_and_round0(
-        &params,
-        &packed_witness,
-        &rho[..n_log],
-        &rho[n_log..],
-    );
+    let (w_rho, claim_v, round0) =
+        jagged::weight_table_claim_and_round0(&params, &q, &rho[..n_log], &rho[n_log..]);
     debug_assert_eq!(
         claim_v, f_eval,
         "⟨q, W_ρ⟩ must equal the virtual-opening output (witness zero past area)"
@@ -933,7 +962,7 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     let t = std::time::Instant::now();
     let (ligerito_proof, ris) = ligerito::recursive_prover_with_basis_precomputed_round0_fused(
         lig_config,
-        packed_witness,
+        q,
         w_rho,
         f_eval,
         &prover_data.codeword,
@@ -950,17 +979,17 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
 
     // ---- Send-and-spot-check: b_tilde[y] = Ŵ_ρ(ris ‖ bits(y)) for all y in
     // {0,1}^yr_log_n (Ŵ_ρ = f̂_t(ρ_row, ρ_col, ·), so 2^yr_log_n branching-
-    // program evaluations — O(2^yr_log_n · 2^k · log_l) muls, no pass over the
-    // 2^log_l table), observed in index order; then squeeze r_extra and run
-    // the existing, unmodified assist at z_index = ris ‖ r_extra.
+    // program evaluations — O(2^yr_log_n · 2^k · dense_log) muls, no pass over
+    // the 2^dense_log table), observed in index order; then squeeze r_extra
+    // and run the existing, unmodified assist at z_index = ris ‖ r_extra.
     let t = std::time::Instant::now();
-    let yr_log_n = log_l - ris.len();
+    let yr_log_n = dense_log - ris.len();
     let b_tilde: Vec<F128> = {
         use rayon::prelude::*;
         (0..1usize << yr_log_n)
             .into_par_iter()
             .map(|y| {
-                let mut z_index = Vec::with_capacity(log_l);
+                let mut z_index = Vec::with_capacity(dense_log);
                 z_index.extend_from_slice(&ris);
                 for j in 0..yr_log_n {
                     z_index.push(if (y >> j) & 1 == 1 {
@@ -1017,6 +1046,13 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
 /// unmodified [`jagged::verify_assist`] at `z_index = ris ‖ r_extra`, and
 /// require the verified `β = Ŵ_ρ(ris ‖ r_extra)` to equal the MLE of the
 /// received `b_tilde` at `r_extra` (Schwartz–Zippel spot-check).
+///
+/// `virtual_vars` is the packed-word variable count of the VIRTUAL (padded)
+/// polynomial the PIOP ran over — the virtual-opening sumcheck's round
+/// count. The committed dense stack's variable count is
+/// `commitment.params.m − 7 ≤ virtual_vars`; the two coincide on the
+/// single-table paths (identity compaction) and split under the true
+/// dense-stack commit (M4).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
     commitment: &Commitment,
@@ -1026,6 +1062,7 @@ pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
     packed_direct: &[PackedDirectClaimRef<'_>],
     heights: &[u64],
     n_log: usize,
+    virtual_vars: usize,
     proof: &BatchOpeningProofJaggedLigerito,
     lig_config: &ligerito::VerifierConfig,
     challenger: &mut Ch,
@@ -1069,11 +1106,17 @@ pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
         target_combined += *g * pd.value;
     }
 
-    // 4. Virtual-opening sumcheck replay. The `(G(1), G(∞))` encoding folds
-    //    the per-round sum check into the running claim (`G(0)` is
+    // 4. Virtual-opening sumcheck replay over the PADDED word domain
+    //    (`virtual_vars` rounds). The `(G(1), G(∞))` encoding folds the
+    //    per-round sum check into the running claim (`G(0)` is
     //    reconstructed from it); the final round is checked against
     //    `b̂_combined(ρ) · f_eval` below.
-    let log_l = commitment.params.m - LOG_PACKING;
+    let log_l = virtual_vars;
+    let dense_log = commitment.params.m - LOG_PACKING;
+    assert!(
+        dense_log <= log_l,
+        "committed dense domain exceeds the virtual domain"
+    );
     challenger.observe_label(b"flock-virtual-open-v0");
     if proof.virtual_open_rounds.len() != log_l {
         return Err(VerifyErrorJagged::VirtualOpen);
@@ -1101,14 +1144,16 @@ pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
     }
     challenger.observe_f128(proof.f_eval);
 
-    // 5. Succinct Ligerito verify of the fused opening ⟨q, W_ρ⟩ = f_eval.
-    //    The residual basis values at ris ‖ bits(y) are TAKEN FROM the
+    // 5. Succinct Ligerito verify of the fused opening ⟨q, W_ρ⟩ = f_eval,
+    //    over the committed DENSE domain (`dense_log` variables; the
+    //    jagged params' `col_prefix_sums` are the compaction map). The
+    //    residual basis values at ris ‖ bits(y) are TAKEN FROM the
     //    proof's b_tilde (the closure returns them verbatim; the induced/OOD
     //    terms are computed as usual, and the final check consumes b_tilde).
     //    The closure also captures Ligerito's fold challenges `ris` for the
     //    spot-check below — it runs exactly once, at the residual.
     assert!(n_log <= log_l, "n_log exceeds packed-word variable count");
-    let params = jagged::JaggedParams::from_heights(heights, n_log, log_l);
+    let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
     let ris_cell: std::cell::RefCell<Vec<F128>> = std::cell::RefCell::new(Vec::new());
     let eval_b_residual = |ris: &[F128], _yr_log_n: usize| -> Vec<F128> {
         ris_cell.borrow_mut().extend_from_slice(ris);
@@ -1117,7 +1162,7 @@ pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
     let ok = ligerito::recursive_verifier_with_basis_succinct(
         lig_config,
         &proof.ligerito,
-        log_l,
+        dense_log,
         proof.f_eval,
         &commitment.root,
         eval_b_residual,
@@ -1127,7 +1172,7 @@ pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
         return Err(VerifyErrorJagged::Ligerito);
     }
     let ris = ris_cell.into_inner();
-    let yr_log_n = log_l - ris.len();
+    let yr_log_n = dense_log - ris.len();
     // The succinct verifier accepted, so it reached the residual (populating
     // `ris`) and checked the closure's output length against 2^yr_log_n.
     debug_assert_eq!(proof.b_tilde.len(), 1usize << yr_log_n);
@@ -1344,6 +1389,7 @@ mod tests {
         let mut ch_p = FsChallenger::new(b"flock-test-jagged-v0");
         let proof = open_batch_jagged_ligerito(
             z_packed.clone(),
+            None,
             &prover_data,
             &commitment,
             &[x_outer.as_slice()],
@@ -1368,6 +1414,7 @@ mod tests {
                 &[],
                 heights,
                 n_log,
+                m - LOG_PACKING,
                 proof,
                 &lig_v_cfg,
                 &mut ch_v,
@@ -1455,6 +1502,120 @@ mod tests {
             let mut bad_heights = heights.clone();
             bad_heights[useful_chunks - 1] = 0;
             assert_eq!(verify(&proof, &bad_heights), Err(VerifyErrorJagged::Jagged));
+        }
+    }
+
+    /// True dense-stack commit (M4) at the PCS level: the committed stack
+    /// `q` is strictly SMALLER than the padded buffer (2^15 vs 2^16 words —
+    /// 2x fewer Merkle leaves), the virtual-opening sumcheck runs over the
+    /// padded domain while Ligerito/W_ρ/b_tilde run over `q`, and the
+    /// roundtrip verifies. Synthetic single-table shape whose used columns
+    /// are the word prefix, so the compaction map is a pure truncation.
+    #[test]
+    #[ignore] // Heavier — run with `cargo test pcs_jagged_dense -- --ignored`
+    fn pcs_jagged_dense_stack_smaller_commit_roundtrip() {
+        let m_virtual = 23usize; // padded: 2^16 packed words
+        let n_log = 8usize; // 2^8 rows per chunk-column, 2^8 chunk-columns
+        let n_chunks = 1usize << (m_virtual - 7 - n_log);
+        let useful_chunks = 100usize; // area 100·2^8 = 25 600 words → q = 2^15
+        let area_words = useful_chunks << n_log;
+        let committed_words = area_words.next_power_of_two();
+        let m_dense = committed_words.trailing_zeros() as usize + LOG_PACKING;
+        assert_eq!(m_dense, 22, "test shape must land on the m22 config");
+
+        let mut rng = Rng::new(0xDE_5E_57AC);
+        let mut z = rng.bits(1 << m_virtual);
+        for bit in z.iter_mut().skip(area_words * 128) {
+            *bit = false;
+        }
+        let z_skip = rng.f128();
+        let x_outer: Vec<F128> = (0..(m_virtual - 6)).map(|_| rng.f128()).collect();
+        let rs_claim = zhat_skip_reference(&z, m_virtual, z_skip, &x_outer);
+        let heights: Vec<u64> = (0..n_chunks)
+            .map(|c| if c < useful_chunks { 1u64 << n_log } else { 0 })
+            .collect();
+
+        let initial_k = 6;
+        let params = PcsParams {
+            m: m_dense,
+            log_inv_rate: 1,
+            log_batch_size: initial_k,
+            profile: Default::default(),
+        };
+        let z_packed = pack_witness(&z, m_virtual);
+        // The dense stack: used columns are the contiguous word prefix, so
+        // compaction = truncation to the committed power of two.
+        let q: Vec<F128> = z_packed[..committed_words].to_vec();
+        assert!(
+            q.len() < z_packed.len(),
+            "committed words must be fewer than padded words"
+        );
+        let (commitment, prover_data) = commit(&q, &params);
+
+        let lig_p_cfg = crate::pcs::ligerito::prover_config_for(
+            m_dense - LOG_PACKING,
+            initial_k,
+            params.profile,
+        )
+        .expect("embedded Ligerito config for m=22");
+        let lig_v_cfg = crate::pcs::ligerito::verifier_config_for(
+            m_dense - LOG_PACKING,
+            initial_k,
+            params.profile,
+        )
+        .expect("embedded Ligerito verifier config for m=22");
+
+        let mut ch_p = FsChallenger::new(b"flock-test-jagged-dense-v0");
+        let proof = open_batch_jagged_ligerito(
+            z_packed.clone(),
+            Some(q),
+            &prover_data,
+            &commitment,
+            &[x_outer.as_slice()],
+            &[],
+            &[],
+            &PaddingSpec::dense(m_virtual),
+            &heights,
+            n_log,
+            &lig_p_cfg,
+            &mut ch_p,
+        );
+        assert_eq!(
+            proof.virtual_open_rounds.len(),
+            m_virtual - LOG_PACKING,
+            "virtual-opening sumcheck must span the padded domain"
+        );
+
+        let verify = |proof: &BatchOpeningProofJaggedLigerito| -> Result<(), VerifyErrorJagged> {
+            let mut ch_v = FsChallenger::new(b"flock-test-jagged-dense-v0");
+            verify_opening_batch_jagged_ligerito(
+                &commitment,
+                &[rs_claim],
+                &[z_skip],
+                &[x_outer.as_slice()],
+                &[],
+                &heights,
+                n_log,
+                m_virtual - LOG_PACKING,
+                proof,
+                &lig_v_cfg,
+                &mut ch_v,
+            )
+        };
+        verify(&proof)
+            .unwrap_or_else(|e| panic!("dense-stack jagged verify rejected honest proof: {e:?}"));
+
+        // Tamper smoke on the new split: f_eval (virtual-open final check)
+        // and a Ligerito final message (dense-domain opening).
+        {
+            let mut bad = proof.clone();
+            bad.f_eval.lo ^= 1;
+            assert_eq!(verify(&bad), Err(VerifyErrorJagged::VirtualOpen));
+        }
+        {
+            let mut bad = proof.clone();
+            bad.ligerito.final_proof.yr[0].lo ^= 1;
+            assert_eq!(verify(&bad), Err(VerifyErrorJagged::Ligerito));
         }
     }
 }

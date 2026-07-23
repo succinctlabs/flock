@@ -98,12 +98,14 @@ fn mixed_registry(nu: usize) -> (Registry, BlockR1cs, BlockR1cs) {
     (registry, sha2_r1cs, blake3_r1cs)
 }
 
-/// PCS params over the union address space: the committed buffer is the
-/// full 2^{M−7}-word union buffer (the Phase 1/2 dense commit), so
-/// `m = M`; rate, batch size, and profile match the single-type setups.
-fn union_pcs_params(registry: &Registry) -> PcsParams {
+/// PCS params over the committed DENSE stack (M4): `m = dense_m` — the
+/// compacted stack's variable count, not the union's `M` (for the
+/// BLAKE3+SHA-256 registry the two coincide numerically: 367 of 512 used
+/// columns round back to the padded power of two). Rate, batch size, and
+/// profile match the single-type setups.
+fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
     PcsParams {
-        m: registry.m_total(),
+        m: union.dense_m(),
         log_inv_rate: 1,
         log_batch_size: 6,
         profile: LigeritoProfile::Fast,
@@ -125,7 +127,14 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
         "ν = 6 must land on the m = 22 embedded Ligerito config"
     );
     let union = UnionInstance::new(&registry, vec![n_per_type, n_per_type]);
-    let pcs_params = union_pcs_params(&registry);
+    let pcs_params = union_pcs_params(&union);
+    // The M4 dense-stack shape on this registry: 367 of 512 chunk-columns
+    // used (SHA-256 246/256, BLAKE3 121/128; the top quarter is the gap), a
+    // genuinely non-identity compaction (BLAKE3's columns stack at 246, not
+    // 256), rounding back to the padded word count at this ratio.
+    assert!(!union.compaction_is_identity());
+    assert_eq!(union.dense_words(), (246 + 121) << nu);
+    assert_eq!(union.committed_words(), 1 << (union.m_total() - 7));
 
     let mut rng = Rng::new(0x03_31_2B_B3);
     let blake3_inputs = random_blake3_inputs(&mut rng, n_per_type);
@@ -148,9 +157,11 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     let (proof, commitment, claim) =
         prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch_p);
 
-    // ---- The commitment is a commitment to the assembled union buffer:
-    // regenerate the witnesses, assemble them independently, commit
-    // directly, and compare roots.
+    // ---- The commitment is a commitment to the COMPACTED union buffer
+    // (the M4 dense stack): regenerate the witnesses, assemble them
+    // independently, compact, commit directly, and compare roots. Also pin
+    // that the compaction genuinely moved data: q differs from the padded
+    // buffer's prefix (BLAKE3's slot stacks 10 columns lower).
     let (z_s, a_s, b_s, _) = sha2::generate_witness_batch_major(&sha2_inputs, nu);
     let (z_b, a_b, b_b, _) = blake3::generate_witness_batch_major(&blake3_inputs, nu);
     let (z_union, _, _) = union.assemble_witness(vec![
@@ -165,10 +176,17 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
             b_packed: b_b,
         },
     ]);
-    let (comm_direct, _prover_data) = flock_core::pcs::commit(&z_union, &pcs_params);
+    let q = union.compact_witness(&z_union);
+    assert_eq!(q.len(), union.committed_words());
+    assert_ne!(
+        q[..],
+        z_union[..q.len()],
+        "compaction must move the second slot's columns"
+    );
+    let (comm_direct, _prover_data) = flock_core::pcs::commit(&q, &pcs_params);
     assert_eq!(
         commitment.root, comm_direct.root,
-        "commitment root must equal a direct commit of the assembled union buffer"
+        "commitment root must equal a direct commit of the compacted union stack"
     );
 
     // ---- Verify (circuits in slot order).
@@ -190,8 +208,9 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
 
     // ---- Tamper: wrong counts vector. The binding absorbs the counts
     // before any challenge, so a verifier declaring different counts walks
-    // a diverged transcript from the first squeeze (the jagged heights and
-    // const-pin targets would also mismatch downstream) — reject.
+    // a diverged transcript from the first squeeze (the lincheck's
+    // count-derived const-pin target would also mismatch downstream; the
+    // jagged heights are count-independent since M4) — reject.
     {
         let union_bad = UnionInstance::new(&registry, vec![n_per_type, n_per_type - 1]);
         assert!(
@@ -264,7 +283,7 @@ fn mixed_prove_rejects_swapped_slot_order() {
     let n_per_type = 1usize << nu;
     let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
     let union = UnionInstance::new(&registry, vec![n_per_type, n_per_type]);
-    let pcs_params = union_pcs_params(&registry);
+    let pcs_params = union_pcs_params(&union);
     let mut rng = Rng::new(0x03_31_5A_9D);
     let blake3_inputs = random_blake3_inputs(&mut rng, n_per_type);
     let sha2_inputs = random_sha2_inputs(&mut rng, n_per_type);
@@ -399,7 +418,7 @@ fn mixed_throughput_smoke() {
     // The mixed instance at the same per-type sizes.
     let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
     let union = UnionInstance::new(&registry, vec![n_per_type, n_per_type]);
-    let pcs_params = union_pcs_params(&registry);
+    let pcs_params = union_pcs_params(&union);
     flock_core::scratch::prewarm_prover(registry.m_total());
     let s2_mix_circuit = sha2_r1cs.csc_lincheck_circuit();
     let b3_mix_circuit = blake3_r1cs.csc_lincheck_circuit();

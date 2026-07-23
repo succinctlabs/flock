@@ -267,12 +267,16 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
 /// batched PCS open over `ẑ`-claims routed through the virtual-opening
 /// sumcheck + jagged transport (`pcs::open_batch_jagged_ligerito`).
 /// `heights` / `n_log` describe the committed jagged grid (see
-/// [`flock_core::r1cs::BlockR1cs::jagged_heights`]). Must be called at the
-/// same transcript position as the verifier's
+/// [`flock_core::r1cs::BlockR1cs::jagged_heights`]); `dense_witness` is the
+/// committed dense stack `q` when it differs from the padded buffer (the M4
+/// dense-stack commit — `UnionInstance::compact_witness`), `None` when the
+/// compaction map is the identity. Must be called at the same transcript
+/// position as the verifier's
 /// [`flock_core::verifier::verify_claims_jagged_ligerito`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_claims_with_precomputed_jagged_ligerito<Ch: Challenger>(
     z_packed: Vec<F128>,
+    dense_witness: Option<Vec<F128>>,
     prover_data: &pcs::ProverData,
     commitment: &Commitment,
     claims: &[ZClaim],
@@ -290,6 +294,7 @@ pub(crate) fn open_claims_with_precomputed_jagged_ligerito<Ch: Challenger>(
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     pcs::open_batch_jagged_ligerito(
         z_packed,
+        dense_witness,
         prover_data,
         commitment,
         &x_refs,
@@ -361,6 +366,7 @@ pub fn prove_fast_ligerito_jagged_from_witness<Ch: Challenger>(
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let pcs_open = open_claims_with_precomputed_jagged_ligerito(
         z_packed,
+        None,
         &prover_data,
         &commitment,
         &[ab.clone(), c.clone()],
@@ -512,14 +518,21 @@ fn prove_union_with_binding<Ch: Challenger>(
         union.expect_single_type_slot(slot_r1cs);
     }
     let m = union.m_total();
-    assert_eq!(pcs_params.m, m, "PcsParams.m must equal the union's M");
+    // The commitment is to the DENSE stack q (M4): PcsParams.m is the dense
+    // variable count; the PIOP and the virtual-opening sumcheck keep the
+    // M-variable padded address space.
+    assert_eq!(
+        pcs_params.m,
+        union.dense_m(),
+        "PcsParams.m must equal the union's dense_m (committed stack size)"
+    );
     assert_eq!(
         slots.len(),
         union.registry().num_types(),
         "need one prover input per registry type"
     );
 
-    let log_n = m - pcs::LOG_PACKING;
+    let log_n = union.dense_m() - pcs::LOG_PACKING;
     let lig_config =
         pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
             .expect("Ligerito default config; bump m for tiny instances");
@@ -534,7 +547,20 @@ fn prove_union_with_binding<Ch: Challenger>(
     }
     let (z_packed, a_packed_f128, b_packed_f128) = union.assemble_witness(witnesses);
 
-    let (commitment, prover_data) = pcs::commit(&z_packed, pcs_params);
+    // True dense-stack commit: commit the compacted stack q (used
+    // chunk-columns at capacity height, useless columns and gaps dropped,
+    // padded to a power of two). When the compaction map is the identity
+    // (single-slot registries — the byte-identity anchors), q IS the padded
+    // buffer and no copy is made.
+    let dense_q: Option<Vec<F128>> = if union.compaction_is_identity() {
+        None
+    } else {
+        Some(union.compact_witness(&z_packed))
+    };
+    let (commitment, prover_data) = match &dense_q {
+        Some(q) => pcs::commit(q, pcs_params),
+        None => pcs::commit(&z_packed, pcs_params),
+    };
     match binding {
         UnionProveBinding::Mixed => union.bind_statement(challenger, &commitment),
         UnionProveBinding::SingleTypeHarness(slot_r1cs) => {
@@ -620,6 +646,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let pcs_open = open_claims_with_precomputed_jagged_ligerito(
         z_packed,
+        dense_q,
         &prover_data,
         &commitment,
         &[ab.clone(), c.clone()],

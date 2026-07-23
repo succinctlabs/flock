@@ -105,6 +105,7 @@ pub fn verify_ligerito_jagged<Ch: Challenger>(
         &[ab.clone(), c.clone()],
         &r1cs.jagged_heights(),
         r1cs.n_log(),
+        r1cs.m,
         &proof.pcs_open,
         pcs_params,
         challenger,
@@ -197,6 +198,14 @@ fn verify_union_with_binding<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
+    // The commitment is to the DENSE stack q (M4): PcsParams.m is the
+    // dense variable count, while the PIOP and the virtual-opening
+    // sumcheck run over the M-variable padded address space.
+    assert_eq!(
+        pcs_params.m,
+        union.dense_m(),
+        "PcsParams.m must equal the union's dense_m (committed stack size)"
+    );
     // Verification is single-threaded; run the PIOP replay on the dedicated
     // 1-thread pool (verify_claims_jagged_ligerito installs it itself).
     let (ab, c) = verifier_pool().install(|| -> Result<(ZClaim, ZClaim), VerifyError> {
@@ -244,6 +253,7 @@ fn verify_union_with_binding<Ch: Challenger>(
         &[ab.clone(), c.clone()],
         &union.jagged_heights(),
         union.n_log(),
+        union.m_total(),
         &proof.pcs_open,
         pcs_params,
         challenger,
@@ -256,14 +266,18 @@ fn verify_union_with_binding<Ch: Challenger>(
 /// `ẑ`-claims — the jagged counterpart of [`verify_claims_ligerito`], and the
 /// mirror of the prover's `pcs::open_batch_jagged_ligerito` call. `heights` /
 /// `n_log` describe the committed jagged grid (see
-/// [`BlockR1cs::jagged_heights`]); both sides derive them from the statement,
-/// never from the proof. Must run at the same transcript position as the
-/// prover's open.
+/// [`BlockR1cs::jagged_heights`]); `virtual_m` is the bit-variable count of
+/// the VIRTUAL (padded) polynomial the PIOP ran over (`= pcs_params.m` on
+/// the single-table paths; `= UnionInstance::m_total` under the M4
+/// dense-stack commit, where `pcs_params.m` is the smaller dense size).
+/// Both sides derive all three from the statement, never from the proof.
+/// Must run at the same transcript position as the prover's open.
 pub fn verify_claims_jagged_ligerito<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[ZClaim],
     heights: &[u64],
     n_log: usize,
+    virtual_m: usize,
     pcs_open: &pcs::BatchOpeningProofJaggedLigerito,
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
@@ -296,6 +310,7 @@ pub fn verify_claims_jagged_ligerito<Ch: Challenger>(
             &[],
             heights,
             n_log,
+            virtual_m - pcs::LOG_PACKING,
             pcs_open,
             &lig_v_config,
             challenger,
