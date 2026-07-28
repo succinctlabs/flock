@@ -1319,6 +1319,7 @@ impl Sha256HybridSetup {
             log_inv_rate,
             log_batch_size: 6,
             profile,
+            merkle_hash: Default::default(),
         };
         Self {
             n_compressions,

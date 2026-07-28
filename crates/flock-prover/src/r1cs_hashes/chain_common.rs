@@ -279,13 +279,9 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> (ChainProofLigerito, Commitment) {
-    let log_n = r1cs.m - flock_core::pcs::LOG_PACKING;
-    let lig_config = flock_core::pcs::ligerito::prover_config_for(
-        log_n,
-        pcs_params.log_batch_size,
-        pcs_params.profile,
-    )
-    .expect("Ligerito default config for chain prove; bump m for tiny instances");
+    let lig_config = pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito default config for chain prove; bump m for tiny instances");
 
     let core = crate::prover::prove_fast_core(
         r1cs,
@@ -387,13 +383,9 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
         value: claims.value,
     };
 
-    let log_n = r1cs.m - flock_core::pcs::LOG_PACKING;
-    let lig_v_config = flock_core::pcs::ligerito::verifier_config_for(
-        log_n,
-        pcs_params.log_batch_size,
-        pcs_params.profile,
-    )
-    .expect("Ligerito default verifier config for chain verify");
+    let lig_v_config = pcs_params
+        .ligerito_verifier_config()
+        .expect("Ligerito default verifier config for chain verify");
 
     flock_core::pcs::verify_opening_batch_ligerito_mixed(
         commitment,

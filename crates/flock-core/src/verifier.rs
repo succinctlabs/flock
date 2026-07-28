@@ -112,13 +112,9 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
         })
         .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    let log_n = pcs_params.m - pcs::LOG_PACKING;
-    let lig_v_config = crate::pcs::ligerito::verifier_config_for(
-        log_n,
-        pcs_params.log_batch_size,
-        pcs_params.profile,
-    )
-    .expect("Ligerito default verifier config");
+    let lig_v_config = pcs_params
+        .ligerito_verifier_config()
+        .expect("Ligerito default verifier config");
     pcs::verify_opening_batch_ligerito_mixed(
         commitment,
         &values,

@@ -7,9 +7,10 @@ authors.workspace = true
 description = "Protocol library and verifier for the Flock R1CS-over-GF(2) PIOP."
 
 [features]
-# Count hash invocations (SHA-256 Merkle leaf/pair compressions, FS BLAKE3
-# absorption, PoW SHA-256) via global relaxed atomics. Off by default; used
-# by flock-prover's benches/verifier_hash_count.rs.
+# Count hash invocations (Merkle leaf/pair compressions, FS transcript
+# absorption and squeezes, PoW evaluations) via global relaxed atomics. Counts
+# whichever hash each component is configured with — see `hash::HashKind`. Off
+# by default; used by flock-prover's benches/verifier_hash_count.rs.
 hash-count = []
 
 # Compile the insecure `RandomChallenger` (no Fiat-Shamir binding) into a

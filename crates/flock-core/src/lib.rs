@@ -20,6 +20,7 @@
 pub mod bits;
 pub mod challenger;
 pub mod field;
+pub mod hash;
 pub mod lincheck;
 pub mod merkle;
 pub mod ntt;

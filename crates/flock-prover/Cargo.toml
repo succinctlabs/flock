@@ -208,3 +208,11 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "blake3_node_probe"
+harness = false
+
+[[bench]]
+name = "fs_challenger"
+harness = false

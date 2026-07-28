@@ -108,10 +108,9 @@ pub fn prove_ligerito<Ch: Challenger>(
     assert_eq!(z_packed.len(), 1usize << (r1cs.m - 7));
     assert_eq!(pcs_params.m, r1cs.m);
 
-    let log_n = r1cs.m - pcs::LOG_PACKING;
-    let lig_config =
-        pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
-            .expect("Ligerito default config; bump m for tiny instances");
+    let lig_config = pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito default config; bump m for tiny instances");
 
     let (commitment, prover_data) = pcs::commit(&z_packed, pcs_params);
     bind_statement(challenger, r1cs, &commitment);
@@ -211,10 +210,9 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    let log_n = r1cs.m - pcs::LOG_PACKING;
-    let lig_config =
-        pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
-            .expect("Ligerito default config; bump m for tiny instances");
+    let lig_config = pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito default config; bump m for tiny instances");
 
     let ProveCore {
         zc_proof,
@@ -460,10 +458,9 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     use std::time::Instant;
     let mut t = ProvePhaseTimings::default();
 
-    let log_n = r1cs.m - pcs::LOG_PACKING;
-    let lig_config =
-        pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
-            .expect("Ligerito default config; bump m for tiny instances");
+    let lig_config = pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito default config; bump m for tiny instances");
 
     // --- PCS commit ---
     let t0 = Instant::now();

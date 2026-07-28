@@ -289,6 +289,7 @@ fn pcs_params(num_vars: usize) -> PcsParams {
         log_inv_rate: PCS_LOG_INV_RATE,
         log_batch_size: PCS_LOG_BATCH_SIZE,
         profile: Default::default(),
+        merkle_hash: Default::default(),
     }
 }
 

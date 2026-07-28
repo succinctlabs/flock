@@ -32,7 +32,7 @@
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
-use crate::merkle::{self, Hash};
+use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +130,10 @@ pub struct ProverConfig {
     /// L0 is bound by the opening's own (post-commit, random-point)
     /// evaluation claim. Length = recursive_steps + 1.
     pub ood_samples: Vec<usize>,
+    /// Hash backing every Merkle commitment this prover makes (L0 and each
+    /// recursive level). Comes from the `hash` field of the security config;
+    /// [`Default`] is SHA-256.
+    pub merkle_hash: HashKind,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +154,10 @@ pub struct VerifierConfig {
     pub fold_grinding_bits: Vec<usize>,
     /// Per-commit-level OOD samples. Length = recursive_steps + 1.
     pub ood_samples: Vec<usize>,
+    /// Hash the prover's Merkle commitments were built under. Must match the
+    /// prover's — a mismatch makes every opening fail to verify, which is the
+    /// correct outcome: the root commits to the hash as much as to the data.
+    pub merkle_hash: HashKind,
 }
 
 /// Proximity loss `ε*` for the UDR (unique-decoding regime) analysis. It
@@ -260,6 +268,7 @@ pub fn default_config(
         grinding_bits,
         fold_grinding_bits: vec![0usize; n_levels],
         ood_samples: vec![0usize; n_levels],
+        merkle_hash: HashKind::default(),
     })
 }
 
@@ -440,6 +449,7 @@ pub fn default_verifier_config(
         grinding_bits: p.grinding_bits,
         fold_grinding_bits: p.fold_grinding_bits,
         ood_samples: p.ood_samples,
+        merkle_hash: p.merkle_hash,
     })
 }
 
@@ -603,7 +613,19 @@ pub struct LigeritoSecurityConfig {
     pub analysis_version: String,
     /// Field of the protocol. Example: `"f128"`.
     pub field: String,
-    /// Hash function used by Merkle + FS challenger. Example: `"sha256"`.
+    /// Hash function used by the Merkle commitments: `"sha256"` or
+    /// `"blake3"`. Read via [`LigeritoSecurityConfig::merkle_hash`] and
+    /// carried into the prover/verifier configs; [`validate`] rejects any
+    /// other value.
+    ///
+    /// This selects the **Merkle** hash only. The Fiat-Shamir transcript hash
+    /// is a separate, independent choice made where the challenger is built
+    /// ([`crate::challenger::FsChallenger::with_hash`]) — the challenger is
+    /// constructed by the caller, upstream of any PCS config, so there is
+    /// deliberately no field for it here rather than one that cannot drive
+    /// anything.
+    ///
+    /// [`validate`]: LigeritoSecurityConfig::validate
     pub hash: String,
     /// Where in the per-level FS transcript grinding is placed.
     pub grinding_step: GrindingStep,
@@ -881,6 +903,10 @@ impl LigeritoSecurityConfig {
                 self.log_n, self.m
             ));
         }
+
+        // Reject a `hash` we do not implement here, so a bad spelling is caught
+        // at config-load time rather than silently committing under SHA-256.
+        self.merkle_hash()?;
 
         // Recursion shape: initial_k + Σ k_recursive (L1+) + yr_log_n = log_n.
         let levels_recursive_sum: usize = self.levels.iter().skip(1).map(|lv| lv.k_recursive).sum();
@@ -1382,6 +1408,7 @@ impl LigeritoSecurityConfig {
     /// works unchanged.
     pub fn to_prover_verifier_configs(&self) -> Result<(ProverConfig, VerifierConfig), String> {
         self.validate()?;
+        let merkle_hash = self.merkle_hash()?;
         let log_inv_rates: Vec<usize> = self.levels.iter().map(|lv| lv.log_inv_rate).collect();
         let recursive_ks: Vec<usize> = self
             .levels
@@ -1412,6 +1439,7 @@ impl LigeritoSecurityConfig {
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: fold_grinding_bits.clone(),
             ood_samples: ood_samples.clone(),
+            merkle_hash,
         };
         let verifier = VerifierConfig {
             log_inv_rates: log_inv_rates.clone(),
@@ -1425,8 +1453,19 @@ impl LigeritoSecurityConfig {
             grinding_bits,
             fold_grinding_bits,
             ood_samples,
+            merkle_hash,
         };
         Ok((prover, verifier))
+    }
+
+    /// The Merkle hash this config selects, parsed from its `hash` field.
+    ///
+    /// Errors on any spelling we do not implement rather than defaulting —
+    /// a config asking for a hash that is not wired up must fail loudly, not
+    /// silently produce SHA-256 proofs under a `hash = "…"` that says
+    /// otherwise.
+    pub fn merkle_hash(&self) -> Result<HashKind, String> {
+        HashKind::parse(&self.hash).map_err(|e| format!("security config `hash`: {e}"))
     }
 }
 
@@ -2308,6 +2347,7 @@ pub(crate) fn ligero_commit(
     log_num_interleaved: usize,
     log_inv_rate: usize,
     ntt: &AdditiveNttF128,
+    kind: HashKind,
 ) -> LigeroWitness {
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
@@ -2337,7 +2377,7 @@ pub(crate) fn ligero_commit(
         )
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let tree = merkle::merkle_tree(data_bytes, block_len);
+    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
 
     LigeroWitness {
         mat,
@@ -2842,7 +2882,14 @@ pub fn recursive_prover<Ch: Challenger>(
     let log_msg_cols_0 = log_n - initial_k;
     let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate_0);
     let t = std::time::Instant::now();
-    let wtns_0 = ligero_commit(poly, log_msg_cols_0, initial_k, log_inv_rate_0, &ntt_0);
+    let wtns_0 = ligero_commit(
+        poly,
+        log_msg_cols_0,
+        initial_k,
+        log_inv_rate_0,
+        &ntt_0,
+        config.merkle_hash,
+    );
     let t_l0 = t.elapsed();
     t_commits += t_l0;
     tlog!("  [ligerito]   L0 commit: {:.2?}", t_l0);
@@ -3122,6 +3169,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         log_num_interleaved_1,
         log_inv_rate_1,
         &ntt_1,
+        config.merkle_hash,
     );
     if trace {
         t_commits += _t.elapsed();
@@ -3320,6 +3368,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             log_num_interleaved_next,
             log_inv_rate_next,
             &ntt_next,
+            config.merkle_hash,
         );
         if trace {
             t_commits += _t.elapsed();
@@ -3571,6 +3620,7 @@ where
         &proof.initial_proof.opened_rows,
         num_interleaved_0,
         &proof.initial_proof.merkle_proof,
+        config.merkle_hash,
     ) {
         return false;
     }
@@ -3714,6 +3764,7 @@ where
                 &proof.final_proof.opened_rows,
                 prev_num_interleaved,
                 &proof.final_proof.merkle_proof,
+                config.merkle_hash,
             ) {
                 return false;
             }
@@ -3922,6 +3973,7 @@ where
             &rp.opened_rows,
             prev_num_interleaved,
             &rp.merkle_proof,
+            config.merkle_hash,
         ) {
             return false;
         }
@@ -4108,6 +4160,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         &proof.initial_proof.opened_rows,
         num_interleaved_0,
         &proof.initial_proof.merkle_proof,
+        config.merkle_hash,
     ) {
         return false;
     }
@@ -4232,6 +4285,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
                 &proof.final_proof.opened_rows,
                 prev_num_interleaved,
                 &proof.final_proof.merkle_proof,
+                config.merkle_hash,
             ) {
                 return false;
             }
@@ -4351,6 +4405,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             &rp.opened_rows,
             prev_num_interleaved,
             &rp.merkle_proof,
+            config.merkle_hash,
         ) {
             return false;
         }
@@ -4444,6 +4499,7 @@ fn recursive_prover_inner<Ch: Challenger>(
         log_num_interleaved_1,
         log_inv_rate_1,
         &ntt_1,
+        config.merkle_hash,
     );
     let t_l1 = t.elapsed();
     t_commits += t_l1;
@@ -4571,6 +4627,7 @@ fn recursive_prover_inner<Ch: Challenger>(
             log_num_interleaved_next,
             log_inv_rate_next,
             &ntt_next,
+            config.merkle_hash,
         );
         let t_li = t.elapsed();
         t_commits += t_li;
@@ -4629,6 +4686,7 @@ fn verify_level_opens(
     opened_rows: &[Vec<F128>],
     expected_num_interleaved: usize,
     multi_proof: &[Hash],
+    kind: HashKind,
 ) -> bool {
     if queries.len() != opened_rows.len() {
         return false;
@@ -4644,9 +4702,9 @@ fn verify_level_opens(
                 row.len() * core::mem::size_of::<F128>(),
             )
         };
-        leaf_hashes.push(merkle::hash_leaf(bytes));
+        leaf_hashes.push(merkle::hash_leaf(bytes, kind));
     }
-    merkle::verify_merkle_multi_proof(root, block_len, queries, &leaf_hashes, multi_proof)
+    merkle::verify_merkle_multi_proof(root, block_len, queries, &leaf_hashes, multi_proof, kind)
 }
 
 /// Verifier counterpart to [`recursive_prover`]. Supports arbitrary `R ≥ 1`.
@@ -4699,6 +4757,7 @@ pub fn recursive_verifier<Ch: Challenger>(
         &proof.initial_proof.opened_rows,
         num_interleaved_0,
         &proof.initial_proof.merkle_proof,
+        config.merkle_hash,
     ) {
         return false;
     }
@@ -4810,6 +4869,7 @@ pub fn recursive_verifier<Ch: Challenger>(
                 &proof.final_proof.opened_rows,
                 prev_num_interleaved,
                 &proof.final_proof.merkle_proof,
+                config.merkle_hash,
             ) {
                 return false;
             }
@@ -4886,6 +4946,7 @@ pub fn recursive_verifier<Ch: Challenger>(
             &rp.opened_rows,
             prev_num_interleaved,
             &rp.merkle_proof,
+            config.merkle_hash,
         ) {
             return false;
         }
@@ -5128,6 +5189,54 @@ mod tests {
             .unwrap_or_else(|e| panic!("validate failed: {e}"));
     }
 
+    /// The config's `hash` field selects the Merkle hash and reaches both
+    /// derived configs — this is the knob the option is exposed through.
+    #[test]
+    fn ligerito_security_config_hash_field_selects_merkle_hash() {
+        let mut cfg = blake3_m29_udr_example();
+        assert_eq!(cfg.hash, "sha256", "example config baseline");
+        let (p, v) = cfg.to_prover_verifier_configs().expect("sha256 configs");
+        assert_eq!(p.merkle_hash, HashKind::Sha256);
+        assert_eq!(v.merkle_hash, HashKind::Sha256);
+
+        cfg.hash = "blake3".into();
+        let (p, v) = cfg.to_prover_verifier_configs().expect("blake3 configs");
+        assert_eq!(p.merkle_hash, HashKind::Blake3);
+        assert_eq!(v.merkle_hash, HashKind::Blake3);
+
+        // Survives a TOML round-trip, so the option is settable from a file.
+        cfg.validate().expect("blake3 config validates");
+        let back = LigeritoSecurityConfig::from_toml_str(&cfg.to_toml_string().unwrap())
+            .expect("toml roundtrip");
+        assert_eq!(back.merkle_hash().unwrap(), HashKind::Blake3);
+    }
+
+    /// A `hash` we do not implement must fail at validation rather than
+    /// silently committing under SHA-256.
+    #[test]
+    fn ligerito_security_config_rejects_unknown_hash() {
+        let mut cfg = blake3_m29_udr_example();
+        cfg.hash = "keccak256".into();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("hash") && err.contains("keccak256"),
+            "err = {err}"
+        );
+        assert!(cfg.to_prover_verifier_configs().is_err());
+    }
+
+    /// Every embedded config must name a hash we actually implement — a typo
+    /// in a checked-in TOML should fail here, not at proving time.
+    #[test]
+    fn embedded_configs_all_declare_a_supported_hash() {
+        for &((m, profile), toml) in EMBEDDED_CONFIGS {
+            let cfg = LigeritoSecurityConfig::from_toml_str(toml)
+                .unwrap_or_else(|e| panic!("m{m} {profile:?}: {e}"));
+            cfg.merkle_hash()
+                .unwrap_or_else(|e| panic!("m{m} {profile:?}: {e}"));
+        }
+    }
+
     /// Lowering a level's expected_eps_query_bits below the required
     /// (target − grinding) is caught by validation.
     #[test]
@@ -5261,11 +5370,19 @@ mod tests {
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
 
         let log_msg_cols_0 = log_n - initial_k;
         let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate);
-        let wtns_0 = ligero_commit(&poly, log_msg_cols_0, initial_k, log_inv_rate, &ntt_0);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            log_inv_rate,
+            &ntt_0,
+            HashKind::Sha256,
+        );
         let initial_root = wtns_0.root();
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"pow-test");
@@ -5292,6 +5409,7 @@ mod tests {
             grinding_bits,
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
         let mut v_ch = crate::challenger::FsChallenger::new(b"pow-test");
         let ok =
@@ -5719,7 +5837,14 @@ mod tests {
 
         // Encode via ligero_commit (so we use the same matrix layout).
         let ntt = AdditiveNttF128::standard(log_msg + log_inv_rate);
-        let w = ligero_commit(&poly, log_msg, log_interleaved, log_inv_rate, &ntt);
+        let w = ligero_commit(
+            &poly,
+            log_msg,
+            log_interleaved,
+            log_inv_rate,
+            &ntt,
+            HashKind::Sha256,
+        );
         assert_eq!(w.block_len, block_len);
 
         let num_queries = 5;
@@ -5793,6 +5918,7 @@ mod tests {
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
         let verifier_cfg = VerifierConfig {
             log_inv_rates: log_inv_rates.clone(),
@@ -5806,6 +5932,7 @@ mod tests {
             grinding_bits,
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
         let _ = num_queries; // queries derived per-level from log_inv_rates now
 
@@ -5872,6 +5999,7 @@ mod tests {
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: vec![0; r + 1],
             ood_samples: vec![0; r + 1],
+            merkle_hash: Default::default(),
         };
         let v_cfg = VerifierConfig {
             log_inv_rates: log_inv_rates.clone(),
@@ -5885,6 +6013,7 @@ mod tests {
             grinding_bits,
             fold_grinding_bits: vec![0; r + 1],
             ood_samples: vec![0; r + 1],
+            merkle_hash: Default::default(),
         };
 
         // Time the prover, best of 3.
@@ -6237,6 +6366,7 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 3],
             ood_samples: vec![0; 3],
+            merkle_hash: Default::default(),
         };
         let v_cfg = VerifierConfig {
             log_inv_rates: log_inv_rates.clone(),
@@ -6250,6 +6380,7 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 3],
             ood_samples: vec![0; 3],
+            merkle_hash: Default::default(),
         };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"test-r2");
@@ -6293,6 +6424,7 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
         let mut p_ch = crate::challenger::FsChallenger::new(b"serde");
         let proof = recursive_prover(&cfg, &poly, &z, v, &mut p_ch);
@@ -6338,11 +6470,19 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
 
         let log_msg_cols_0 = log_n - initial_k;
         let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate);
-        let wtns_0 = ligero_commit(&poly, log_msg_cols_0, initial_k, log_inv_rate, &ntt_0);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            log_inv_rate,
+            &ntt_0,
+            HashKind::Sha256,
+        );
         let initial_root = wtns_0.root();
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"basis-test");
@@ -6368,6 +6508,7 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
         let mut v_ch = crate::challenger::FsChallenger::new(b"basis-test");
         let ok =
@@ -6469,7 +6610,7 @@ mod tests {
         // num_interleaved = 1 ⇒ no lane fold (level_rs empty) ⇒ yr == the message.
         let yr: Vec<F128> = (0..msg_cols).map(|_| rng.sample_f128()).collect();
         let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
-        let wtns = ligero_commit(&yr, log_msg_cols, 0, log_inv_rate, &ntt);
+        let wtns = ligero_commit(&yr, log_msg_cols, 0, log_inv_rate, &ntt, HashKind::Sha256);
 
         // Distinct query positions (the protocol always samples distinct ones).
         let mut queries: Vec<usize> = Vec::new();
@@ -6561,11 +6702,19 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
 
         let log_msg_cols_0 = log_n - initial_k;
         let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate);
-        let wtns_0 = ligero_commit(&poly, log_msg_cols_0, initial_k, log_inv_rate, &ntt_0);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            log_inv_rate,
+            &ntt_0,
+            HashKind::Sha256,
+        );
         let initial_root = wtns_0.root();
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"succ-cmp");
@@ -6591,6 +6740,7 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
 
         // Dense verifier
@@ -6663,6 +6813,7 @@ mod tests {
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: fold_grinding_bits.clone(),
             ood_samples: ood_samples.clone(),
+            merkle_hash: Default::default(),
         };
         let v = VerifierConfig {
             log_inv_rates,
@@ -6676,6 +6827,7 @@ mod tests {
             grinding_bits,
             fold_grinding_bits,
             ood_samples,
+            merkle_hash: Default::default(),
         };
         (p, v)
     }
@@ -6706,7 +6858,14 @@ mod tests {
 
         let log_msg_cols_0 = log_n - initial_k;
         let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + 1);
-        let wtns_0 = ligero_commit(&poly, log_msg_cols_0, initial_k, 1, &ntt_0);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            1,
+            &ntt_0,
+            HashKind::Sha256,
+        );
         let initial_root = wtns_0.root();
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"ood-test");
@@ -6815,7 +6974,14 @@ mod tests {
 
         let log_msg_cols_0 = log_n - initial_k;
         let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + 1);
-        let wtns_0 = ligero_commit(&poly, log_msg_cols_0, initial_k, 1, &ntt_0);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            1,
+            &ntt_0,
+            HashKind::Sha256,
+        );
         let initial_root = wtns_0.root();
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"m22-fast");
@@ -6834,6 +7000,164 @@ mod tests {
             recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch),
             "m22 fast profile proof must verify"
         );
+    }
+
+    /// End-to-end under BLAKE3: the same recursion, every Merkle commitment
+    /// (L0 and each recursive level) built and checked with the other hash.
+    /// Also pins the failure mode of a hash mismatch — a verifier configured
+    /// for the wrong hash must reject, since the roots commit to the hash.
+    #[test]
+    fn ligerito_m22_roundtrip_under_blake3() {
+        use crate::challenger::Challenger;
+        let m = 22usize;
+        let log_n = m - crate::pcs::LOG_PACKING;
+        let initial_k = 6;
+        let mut p_cfg = prover_config_for(log_n, initial_k, LigeritoProfile::Fast)
+            .expect("m22 fast prover config");
+        let mut v_cfg = verifier_config_for(log_n, initial_k, LigeritoProfile::Fast)
+            .expect("m22 fast verifier config");
+        // The embedded configs all declare sha256; override to exercise the
+        // other arm of the option end to end.
+        assert_eq!(p_cfg.merkle_hash, HashKind::Sha256);
+        p_cfg.merkle_hash = HashKind::Blake3;
+        v_cfg.merkle_hash = HashKind::Blake3;
+
+        let mut rng = crate::challenger::RandomChallenger::new(0xB1A5_E300);
+        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let b = build_eq_table(&z);
+        let target: F128 = poly
+            .iter()
+            .zip(b.iter())
+            .map(|(&a, &c)| a * c)
+            .fold(F128::ZERO, |a, x| a + x);
+
+        let log_msg_cols_0 = log_n - initial_k;
+        let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + 1);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            1,
+            &ntt_0,
+            HashKind::Blake3,
+        );
+        let initial_root = wtns_0.root();
+
+        let mut p_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
+        let proof = recursive_prover_with_basis(
+            &p_cfg,
+            poly,
+            b.clone(),
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            &mut p_ch,
+        );
+
+        let mut v_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
+        assert!(
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch),
+            "blake3 Merkle proof must verify"
+        );
+
+        // Same proof, verifier configured for SHA-256 → every opening's
+        // recomputed root disagrees, so it must reject.
+        let mut wrong_cfg = v_cfg.clone();
+        wrong_cfg.merkle_hash = HashKind::Sha256;
+        let mut w_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
+        assert!(
+            !recursive_verifier_with_basis(
+                &wrong_cfg,
+                &proof,
+                &b,
+                target,
+                &initial_root,
+                &mut w_ch
+            ),
+            "a sha256-configured verifier must reject a blake3 proof"
+        );
+    }
+
+    /// The Merkle hash and the Fiat-Shamir transcript hash are independent
+    /// options: all four combinations must prove and verify. Also pins the
+    /// failure mode of a transcript-hash mismatch, the FS analogue of the
+    /// Merkle mismatch checked above.
+    #[test]
+    fn ligerito_m22_roundtrip_over_hash_matrix() {
+        use crate::challenger::Challenger;
+        const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
+        let log_n = 22usize - crate::pcs::LOG_PACKING;
+        let initial_k = 6;
+
+        for merkle_hash in KINDS {
+            for fs_hash in KINDS {
+                let mut p_cfg = prover_config_for(log_n, initial_k, LigeritoProfile::Fast).unwrap();
+                let mut v_cfg =
+                    verifier_config_for(log_n, initial_k, LigeritoProfile::Fast).unwrap();
+                p_cfg.merkle_hash = merkle_hash;
+                v_cfg.merkle_hash = merkle_hash;
+
+                let mut rng = crate::challenger::RandomChallenger::new(0x4A11_0000);
+                let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+                let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+                let b = build_eq_table(&z);
+                let target: F128 = poly
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(&a, &c)| a * c)
+                    .fold(F128::ZERO, |a, x| a + x);
+
+                let log_msg_cols_0 = log_n - initial_k;
+                let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + 1);
+                let wtns_0 =
+                    ligero_commit(&poly, log_msg_cols_0, initial_k, 1, &ntt_0, merkle_hash);
+                let initial_root = wtns_0.root();
+
+                let mut p_ch = crate::challenger::FsChallenger::with_hash(b"m22-matrix", fs_hash);
+                let proof = recursive_prover_with_basis(
+                    &p_cfg,
+                    poly,
+                    b.clone(),
+                    target,
+                    &wtns_0.mat,
+                    &wtns_0.tree,
+                    &mut p_ch,
+                );
+
+                let mut v_ch = crate::challenger::FsChallenger::with_hash(b"m22-matrix", fs_hash);
+                assert!(
+                    recursive_verifier_with_basis(
+                        &v_cfg,
+                        &proof,
+                        &b,
+                        target,
+                        &initial_root,
+                        &mut v_ch
+                    ),
+                    "merkle={merkle_hash} fs={fs_hash} must verify"
+                );
+
+                // Verifier on the other transcript hash: challenges diverge
+                // from the first sample, so it must reject.
+                let other_fs = match fs_hash {
+                    HashKind::Sha256 => HashKind::Blake3,
+                    HashKind::Blake3 => HashKind::Sha256,
+                };
+                let mut w_ch = crate::challenger::FsChallenger::with_hash(b"m22-matrix", other_fs);
+                assert!(
+                    !recursive_verifier_with_basis(
+                        &v_cfg,
+                        &proof,
+                        &b,
+                        target,
+                        &initial_root,
+                        &mut w_ch
+                    ),
+                    "merkle={merkle_hash}: an {other_fs} transcript must reject an {fs_hash} proof"
+                );
+            }
+        }
     }
 
     /// Multi-claim batched basis: `b = γ_1·eq(z_1, ·) + γ_2·eq(z_2, ·)`,
@@ -6885,11 +7209,19 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
 
         let log_msg_cols_0 = log_n - initial_k;
         let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate);
-        let wtns_0 = ligero_commit(&poly, log_msg_cols_0, initial_k, log_inv_rate, &ntt_0);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            log_inv_rate,
+            &ntt_0,
+            HashKind::Sha256,
+        );
         let initial_root = wtns_0.root();
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"batched");
@@ -6915,6 +7247,7 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
         let mut v_ch = crate::challenger::FsChallenger::new(b"batched");
         let ok =
@@ -6956,6 +7289,7 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
 
         // Path 1: built-in L0 commit.
@@ -6965,8 +7299,14 @@ mod tests {
         // Path 2: build L0 externally via ligero_commit, then call _with_l0.
         let log_msg_cols_0 = log_n - initial_k;
         let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate);
-        let mut wtns_0_external =
-            ligero_commit(&poly, log_msg_cols_0, initial_k, log_inv_rate, &ntt_0);
+        let mut wtns_0_external = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            log_inv_rate,
+            &ntt_0,
+            HashKind::Sha256,
+        );
         let mut p_ch_b = crate::challenger::FsChallenger::new(b"l0-test");
         let proof_b = recursive_prover_with_l0(
             &cfg,
@@ -7007,6 +7347,7 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
         let mut v_ch = crate::challenger::FsChallenger::new(b"l0-test");
         assert!(recursive_verifier(&v_cfg, &proof_b, &z, v, &mut v_ch));
@@ -7046,6 +7387,7 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
         let verifier_cfg = VerifierConfig {
             log_inv_rates: log_inv_rates.clone(),
@@ -7059,6 +7401,7 @@ mod tests {
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
         };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"test-mut");
@@ -7092,7 +7435,14 @@ mod tests {
             .collect();
 
         let ntt = AdditiveNttF128::standard(log_msg + log_inv_rate);
-        let w = ligero_commit(&poly, log_msg, log_interleaved, log_inv_rate, &ntt);
+        let w = ligero_commit(
+            &poly,
+            log_msg,
+            log_interleaved,
+            log_inv_rate,
+            &ntt,
+            HashKind::Sha256,
+        );
         assert_eq!(w.block_len, block_len);
         assert_eq!(w.num_interleaved, num_interleaved);
         assert_eq!(w.mat.len(), block_len * num_interleaved);
@@ -7122,7 +7472,14 @@ mod tests {
 
         // Merkle root is deterministic: re-running the same commit yields the
         // same root.
-        let w2 = ligero_commit(&poly, log_msg, log_interleaved, log_inv_rate, &ntt);
+        let w2 = ligero_commit(
+            &poly,
+            log_msg,
+            log_interleaved,
+            log_inv_rate,
+            &ntt,
+            HashKind::Sha256,
+        );
         assert_eq!(w.root(), w2.root());
     }
 }

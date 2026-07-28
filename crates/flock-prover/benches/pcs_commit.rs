@@ -81,6 +81,7 @@ fn bench_commit_breakdown(m: usize) {
         log_inv_rate: 1,
         log_batch_size: 6,
         profile: Default::default(),
+        merkle_hash: Default::default(),
     };
     let n_bits = 1usize << m;
     let n_packed = 1usize << params.log_msg_len();
@@ -131,7 +132,8 @@ fn bench_commit_breakdown(m: usize) {
 
     // ---- 5. Merkle tree (leaves of num_ntts × 16 bytes).
     let t0 = Instant::now();
-    let merkle_tree = merkle::merkle_tree(&codeword_bytes, params.n_positions());
+    let merkle_tree =
+        merkle::merkle_tree(&codeword_bytes, params.n_positions(), params.merkle_hash);
     let secs_merkle = t0.elapsed().as_secs_f64();
     let _root = merkle_tree.last().unwrap();
     let leaf_bytes = params.leaf_size_bytes();
@@ -215,6 +217,7 @@ fn bench_commit_packed_only(m: usize) {
         log_inv_rate: 1,
         log_batch_size: 6,
         profile: Default::default(),
+        merkle_hash: Default::default(),
     };
     let n_packed = 1usize << params.log_msg_len();
     let n_code = params.codeword_len_f128();
@@ -268,6 +271,7 @@ fn bench_commit_packed_breakdown(m: usize) {
         log_inv_rate: 1,
         log_batch_size: 6,
         profile: Default::default(),
+        merkle_hash: Default::default(),
     };
     let n_packed = 1usize << params.log_msg_len();
     let n_code = params.codeword_len_f128();
@@ -314,7 +318,7 @@ fn bench_commit_packed_breakdown(m: usize) {
 
     // ---- 4. Merkle tree.
     let t0 = Instant::now();
-    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_positions());
+    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_positions(), params.merkle_hash);
     let secs_merkle = t0.elapsed().as_secs_f64();
     let _root = merkle_tree.last().unwrap();
 

@@ -4,14 +4,15 @@
 //!
 //! Usage:
 //!   cargo bench --bench merkle_probe --no-run
-//!   RAYON_NUM_THREADS=1 samply record -- ./target/release/deps/merkle_probe-<hash> [n_runs] [m]
+//!   RAYON_NUM_THREADS=1 samply record -- ./target/release/deps/merkle_probe-<hash> [n_runs] [m] [hash]
 //!
-//! Default: 50 runs at m=29 (~3 sec ST).
+//! Default: 50 runs at m=29 (~3 sec ST) under sha256. Pass `blake3` as the
+//! third argument to profile the other Merkle hash.
 
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::merkle;
+use flock_prover::merkle::{self, HashKind};
 
 struct Rng(u64);
 impl Rng {
@@ -37,6 +38,10 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(29);
+    let kind = match std::env::args().nth(3) {
+        Some(s) => HashKind::parse(&s).expect("third arg must be sha256 or blake3"),
+        None => HashKind::Sha256,
+    };
     // Same shape as pcs::commit at this m: 128 MB codeword bytes, 262144 leaves of 1 KB each.
     let log_msg_len = m - 7;
     let log_batch_size = 6usize;
@@ -48,7 +53,7 @@ fn main() {
     let n_leaves = 1usize << k_code;
 
     println!(
-        "Merkle probe: m={m}, codeword {} MB ({} F128), leaves {}",
+        "Merkle probe: m={m}, hash={kind}, codeword {} MB ({} F128), leaves {}",
         codeword_bytes / (1024 * 1024),
         codeword_f128,
         n_leaves
@@ -62,13 +67,13 @@ fn main() {
     }
 
     // Warm-up.
-    let _ = merkle::merkle_tree(&data, n_leaves);
+    let _ = merkle::merkle_tree(&data, n_leaves, kind);
 
     let t0 = Instant::now();
     let mut times = Vec::with_capacity(n_runs);
     for _ in 0..n_runs {
         let t = Instant::now();
-        let tree = merkle::merkle_tree(&data, n_leaves);
+        let tree = merkle::merkle_tree(&data, n_leaves, kind);
         times.push(t.elapsed().as_secs_f64() * 1e3);
         black_box(&tree);
     }

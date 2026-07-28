@@ -1,21 +1,31 @@
-//! SHA-256 + Merkle-tree throughput sanity check.
+//! Hash + Merkle-tree throughput sanity check, run for **both** Merkle hashes
+//! so the `merkle_hash` config option can be chosen on measurements rather
+//! than on folklore.
 //!
-//! Three measurements:
-//! 1. **Raw streaming SHA-256**: one `Sha256` finalize over a large contiguous
-//!    buffer. Reports the per-byte cost of the hash itself — should hit
+//! Three measurements, each repeated per hash:
+//! 1. **Raw streaming hash**: one finalize over a large contiguous buffer.
+//!    Reports the per-byte cost of the hash itself — SHA-256 should hit
 //!    ~2.6 GB/s on M4 Max with HW acceleration, ~0.5 GB/s on the software
 //!    fallback (footgun: needs `features = ["asm"]` in Cargo.toml).
-//! 2. **Per-leaf SHA-256**: digest one 16-byte leaf at a time, summed over
-//!    many leaves (= what `merkle_tree`'s leaf level does sequentially).
+//! 2. **Per-leaf hash**: digest one leaf at a time, summed over many leaves
+//!    (= what `merkle_tree`'s leaf level does sequentially).
 //! 3. **Merkle tree (parallel)**: full tree build over a buffer matching the
 //!    PCS commit @ m=29 leaf count.
+//!
+//! The two hashes are not expected to win uniformly: SHA-256 has the four-way
+//! hardware path and BLAKE3 does not, but BLAKE3 costs one compression per
+//! 64-byte internal node against SHA-256's two, and SIMD-parallelizes within
+//! leaves past 1 KiB. Leaf size is what decides it, so the tree bench sweeps
+//! 16 B (one F128) through 512 B (the default `log_batch_size = 5` geometry).
 //!
 //! Run: `cargo bench --bench merkle`
 
 use std::time::Instant;
 
-use flock_prover::merkle::{hash_leaf, merkle_tree};
+use flock_prover::merkle::{HashKind, hash_leaf, merkle_tree};
 use sha2::{Digest, Sha256};
+
+const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
 
 fn fmt_secs(s: f64) -> String {
     if s < 1e-3 {
@@ -74,18 +84,24 @@ fn alloc_pattern(bytes: usize, seed: u64) -> Vec<u8> {
     buf
 }
 
-/// Raw SHA-256: one `digest` over the whole buffer.
-fn bench_streaming_sha256(bytes: usize) {
+/// Raw one-shot hash over the whole buffer.
+fn bench_streaming(bytes: usize, kind: HashKind) {
     let data = alloc_pattern(bytes, 0xCAFE);
+    let once = |d: &[u8]| -> [u8; 32] {
+        match kind {
+            HashKind::Sha256 => Sha256::digest(d).into(),
+            HashKind::Blake3 => *blake3::hash(d).as_bytes(),
+        }
+    };
     // Warm-up.
-    let _ = Sha256::digest(&data);
+    let _ = once(&data);
 
     let t0 = Instant::now();
-    let digest = Sha256::digest(&data);
+    let digest = once(&data);
     let secs = t0.elapsed().as_secs_f64();
     let cs: u64 = u64::from_le_bytes(digest[..8].try_into().unwrap());
     report(
-        &format!("streaming Sha256::digest ({})", fmt_bytes(bytes as u64)),
+        &format!("streaming {kind} ({})", fmt_bytes(bytes as u64)),
         secs,
         bytes as u64,
         1,
@@ -94,26 +110,26 @@ fn bench_streaming_sha256(bytes: usize) {
     eprintln!("  (digest cs: {:016x})", cs);
 }
 
-/// Per-leaf SHA-256: call `hash_leaf` once per 16-byte leaf, sequentially.
-/// This is what the Merkle leaf level does (modulo parallelism).
-fn bench_per_leaf_sha256(num_leaves: usize, leaf_size: usize) {
+/// Per-leaf hash: call `hash_leaf` once per leaf, sequentially. This is what
+/// the Merkle leaf level does (modulo parallelism).
+fn bench_per_leaf(num_leaves: usize, leaf_size: usize, kind: HashKind) {
     let total = num_leaves * leaf_size;
     let data = alloc_pattern(total, 0xBEEF);
     // Warm-up: hash a few leaves.
     for chunk in data.chunks(leaf_size).take(8) {
-        let _ = hash_leaf(chunk);
+        let _ = hash_leaf(chunk, kind);
     }
 
     let mut cs: u64 = 0;
     let t0 = Instant::now();
     for chunk in data.chunks(leaf_size) {
-        let h = hash_leaf(chunk);
+        let h = hash_leaf(chunk, kind);
         cs ^= u64::from_le_bytes(h[..8].try_into().unwrap());
     }
     let secs = t0.elapsed().as_secs_f64();
     report(
         &format!(
-            "per-leaf hash_leaf (sequential, {} × {})",
+            "per-leaf hash_leaf {kind} (sequential, {} × {})",
             num_leaves,
             fmt_bytes(leaf_size as u64)
         ),
@@ -124,34 +140,45 @@ fn bench_per_leaf_sha256(num_leaves: usize, leaf_size: usize) {
     eprintln!("  (leaves cs: {:016x})", cs);
 }
 
+/// How many timed tree builds to run per configuration. A single shot is far
+/// too noisy to compare hashes with — run-to-run spread on an otherwise idle
+/// M4 Max is ~10-15% — so take the best of several, which is the run least
+/// perturbed by other work on the machine.
+const TREE_RUNS: usize = 7;
+
 /// Parallel Merkle tree (matches what `pcs::commit` calls at m=29).
-fn bench_merkle_tree(num_leaves: usize, leaf_size: usize) {
+/// Returns the *minimum* elapsed seconds over [`TREE_RUNS`] builds, so `main`
+/// can print a head-to-head ratio that is not dominated by scheduling noise.
+fn bench_merkle_tree(num_leaves: usize, leaf_size: usize, kind: HashKind) -> f64 {
     let total = num_leaves * leaf_size;
     let data = alloc_pattern(total, 0xDEAD);
-    // Warm-up: small tree.
-    {
-        let small = &data[..1024.min(total)];
-        let _ = merkle_tree(small, 16);
-    }
+    // Warm-up: one full build, so page faults and thread-pool spin-up are not
+    // charged to the first measurement.
+    let warm = merkle_tree(&data, num_leaves, kind);
+    let cs: u64 = u64::from_le_bytes(warm.last().unwrap()[..8].try_into().unwrap());
+    drop(warm);
 
-    let t0 = Instant::now();
-    let tree = merkle_tree(&data, num_leaves);
-    let secs = t0.elapsed().as_secs_f64();
-    let root = *tree.last().unwrap();
-    let cs: u64 = u64::from_le_bytes(root[..8].try_into().unwrap());
+    let mut best = f64::INFINITY;
+    for _ in 0..TREE_RUNS {
+        let t0 = Instant::now();
+        let tree = merkle_tree(&data, num_leaves, kind);
+        best = best.min(t0.elapsed().as_secs_f64());
+        std::hint::black_box(&tree);
+    }
     // Tree work = leaves + internal nodes; internal = num_leaves - 1 hashes.
     let total_hashes = (2 * num_leaves - 1) as u64;
     report(
         &format!(
-            "merkle_tree (rayon, {} leaves × {})",
+            "merkle_tree {kind} (rayon, {} leaves × {})",
             num_leaves,
             fmt_bytes(leaf_size as u64)
         ),
-        secs,
+        best,
         total as u64,
         total_hashes,
     );
     eprintln!("  (root cs: {:016x})", cs);
+    best
 }
 
 fn main() {
@@ -166,15 +193,43 @@ fn main() {
     )))]
     println!("(target: software fallback path — HW SHA-256 NOT active)");
 
-    header("Streaming SHA-256 (single digest over a large buffer)");
-    bench_streaming_sha256(64 * 1024); // 64 KB — fits in L1
-    bench_streaming_sha256(8 * 1024 * 1024); // 8 MB — DRAM-ish
-    bench_streaming_sha256(128 * 1024 * 1024); // 128 MB — matches PCS m=29 codeword
+    header("Streaming hash (single digest over a large buffer)");
+    for kind in KINDS {
+        bench_streaming(64 * 1024, kind); // 64 KB — fits in L1
+        bench_streaming(8 * 1024 * 1024, kind); // 8 MB — DRAM-ish
+        bench_streaming(128 * 1024 * 1024, kind); // 128 MB — PCS m=29 codeword
+    }
 
-    header("Per-leaf SHA-256 (one call per 16-B leaf — leaf level cost)");
-    bench_per_leaf_sha256(8 * 1024 * 1024, 16); // 8M leaves × 16 B = 128 MB
+    header("Per-leaf hash (one call per 16-B leaf — leaf level cost)");
+    for kind in KINDS {
+        bench_per_leaf(8 * 1024 * 1024, 16, kind); // 8M leaves × 16 B = 128 MB
+    }
 
     header("Merkle tree (parallel, matches PCS commit @ m=29 geometry)");
-    // m=29: codeword = 2^23 F128 = 128 MB. Leaves are 1 F128 = 16 B each, 2^23 leaves.
-    bench_merkle_tree(1 << 23, 16);
+    // m=29: codeword = 2^23 F128 = 128 MB. Sweep leaf size, since that is what
+    // decides which hash wins: 16 B = one F128 per leaf, 512 B / 1 KB = the
+    // log_batch_size = 5 / 6 geometries `pcs::commit` actually uses, 4 KB =
+    // past BLAKE3's 1 KiB chunk boundary, where its leaves stop batching.
+    for (num_leaves, leaf_size) in [
+        (1usize << 23, 16usize),
+        (1 << 18, 512),
+        (1 << 17, 1024),
+        (1 << 15, 4096),
+    ] {
+        let mut secs = [0.0f64; KINDS.len()];
+        for (i, kind) in KINDS.into_iter().enumerate() {
+            secs[i] = bench_merkle_tree(num_leaves, leaf_size, kind);
+        }
+        let (sha, blake) = (secs[0], secs[1]);
+        let (faster, ratio) = if blake < sha {
+            ("blake3", sha / blake)
+        } else {
+            ("sha256", blake / sha)
+        };
+        println!(
+            "  → {} leaves × {}: {faster} faster by {ratio:.2}×",
+            num_leaves,
+            fmt_bytes(leaf_size as u64)
+        );
+    }
 }

@@ -905,6 +905,7 @@ impl KeccakSetup {
             log_inv_rate,
             log_batch_size: 6,
             profile,
+            merkle_hash: Default::default(),
         };
         Self {
             n_keccaks,

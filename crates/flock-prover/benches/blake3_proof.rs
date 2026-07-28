@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use flock_prover::challenger::FsChallenger;
+use flock_prover::merkle::HashKind;
 use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log};
 
 // Peak-heap tracker (wraps System), as in keccak_proof/sha2_proof — lets the
@@ -95,11 +96,31 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     );
 
     // BLAKE3_BATCH_MAJOR=1 switches the witness layout (WitnessLayout::BatchMajor).
-    let setup = if std::env::var_os("BLAKE3_BATCH_MAJOR").is_some() {
+    let mut setup = if std::env::var_os("BLAKE3_BATCH_MAJOR").is_some() {
         Blake3Setup::new_batch_major(n_blocks)
     } else {
         Blake3Setup::new(n_blocks)
     };
+    // FLOCK_MERKLE_HASH=sha256|blake3 selects the PCS Merkle hash (default
+    // sha256). Setting it on `pcs_params` is enough: the Ligerito prover and
+    // verifier configs are derived from those params, so the L0 commitment and
+    // every recursive level follow.
+    if let Ok(h) = std::env::var("FLOCK_MERKLE_HASH") {
+        setup.pcs_params.merkle_hash =
+            HashKind::parse(&h).expect("FLOCK_MERKLE_HASH must be sha256 or blake3");
+    }
+    let setup = setup;
+    // FLOCK_FS_HASH=sha256|blake3 selects the Fiat-Shamir transcript hash
+    // (default sha256), independently of the Merkle hash above.
+    let fs_hash = match std::env::var("FLOCK_FS_HASH") {
+        Ok(h) => HashKind::parse(&h).expect("FLOCK_FS_HASH must be sha256 or blake3"),
+        Err(_) => HashKind::default(),
+    };
+    let fs = || FsChallenger::with_hash(b"flock-bench-v0", fs_hash);
+    println!(
+        "  merkle hash: {}   fs hash: {}",
+        setup.pcs_params.merkle_hash, fs_hash
+    );
     // Generate n_runs + 2 distinct block vectors so each run hits a fresh
     // witness (and therefore a fresh Fiat-Shamir transcript). The first is
     // used for warm-up; the rest for measurements + one spare.
@@ -115,7 +136,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
 
     // Warm-up.
     {
-        let mut ch_p = FsChallenger::new(b"flock-bench-v0");
+        let mut ch_p = fs();
         let (p, _, _) = setup.prove_fast(&block_sets[0], &mut ch_p);
         black_box(&p);
     }
@@ -125,7 +146,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     let mut best_fast = f64::INFINITY;
     for run in 0..n_runs {
         let blocks = &block_sets[run + 1];
-        let mut ch_p = FsChallenger::new(b"flock-bench-v0");
+        let mut ch_p = fs();
         let t0 = Instant::now();
         let (p, _, _) = setup.prove_fast(blocks, &mut ch_p);
         let elapsed = t0.elapsed().as_secs_f64();
@@ -150,11 +171,11 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     {
         let blocks_v = &block_sets[0];
         reset_peak();
-        let mut ch_p = FsChallenger::new(b"flock-bench-v0");
+        let mut ch_p = fs();
         let (proof, commitment, _) = setup.prove_fast(blocks_v, &mut ch_p);
         println!("  peak memory: {:>8.2} MB", peak_mb());
 
-        let mut ch_v = FsChallenger::new(b"flock-bench-v0");
+        let mut ch_v = fs();
         let t = Instant::now();
         let _ = setup
             .verify(&commitment, &proof, &mut ch_v)
@@ -175,7 +196,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     // zerocheck + lincheck + recursive PCS open) via prove_fast_timed, so the
     // phases decompose exactly the prover the headline number runs.
     println!("  [prove_fast breakdown]");
-    let mut ch = FsChallenger::new(b"flock-bench-v0");
+    let mut ch = fs();
     let (proof, _commitment, _claim, tm) = setup.prove_fast_timed(blocks, &mut ch);
     println!(
         "    {:32} {}",
