@@ -1,4 +1,6 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
+use core::arch::aarch64::uint8x16_t;
+use core::arch::aarch64::uint16x8_t;
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -112,19 +114,18 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
     use core::arch::aarch64::*;
 
     unsafe {
-        let in_ptr = input.as_ptr();
-        let v0 = vld1q_u8(in_ptr);
-        let v1 = vld1q_u8(in_ptr.add(16));
-        let v2 = vld1q_u8(in_ptr.add(32));
-        let v3 = vld1q_u8(in_ptr.add(48));
-        let table = uint8x16x4_t(v0, v1, v2, v3);
-
         // vqtbl4q indexes that bring bytes belonging to byte-chunk b ∈ 0..8
         // into contiguous 8-byte runs, packed two-chunks-per-Q-reg.
         const IDX0: [u8; 16] = [0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57];
         const IDX1: [u8; 16] = [2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59];
         const IDX2: [u8; 16] = [4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61];
         const IDX3: [u8; 16] = [6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
+        let in_ptr = input.as_ptr();
+        let v0 = vld1q_u8(in_ptr);
+        let v1 = vld1q_u8(in_ptr.add(16));
+        let v2 = vld1q_u8(in_ptr.add(32));
+        let v3 = vld1q_u8(in_ptr.add(48));
+        let table = uint8x16x4_t(v0, v1, v2, v3);
 
         let mut y0 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX0.as_ptr())));
         let mut y1 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX1.as_ptr())));
@@ -275,14 +276,14 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
     table_base: *const u8,
     a_byte: u8,
     b_byte: u8,
-    da0: &mut core::arch::aarch64::uint8x16_t,
-    da1: &mut core::arch::aarch64::uint8x16_t,
-    da2: &mut core::arch::aarch64::uint8x16_t,
-    da3: &mut core::arch::aarch64::uint8x16_t,
-    db0: &mut core::arch::aarch64::uint8x16_t,
-    db1: &mut core::arch::aarch64::uint8x16_t,
-    db2: &mut core::arch::aarch64::uint8x16_t,
-    db3: &mut core::arch::aarch64::uint8x16_t,
+    da0: &mut uint8x16_t,
+    da1: &mut uint8x16_t,
+    da2: &mut uint8x16_t,
+    da3: &mut uint8x16_t,
+    db0: &mut uint8x16_t,
+    db1: &mut uint8x16_t,
+    db2: &mut uint8x16_t,
+    db3: &mut uint8x16_t,
 ) {
     use core::arch::aarch64::*;
     unsafe {
@@ -329,14 +330,14 @@ unsafe fn fused_apply_one_k<const K: i32>(
     table_base: *const u8,
     a_row: *const u8,
     b_row: *const u8,
-    acc0_lo: &mut core::arch::aarch64::uint16x8_t,
-    acc0_hi: &mut core::arch::aarch64::uint16x8_t,
-    acc1_lo: &mut core::arch::aarch64::uint16x8_t,
-    acc1_hi: &mut core::arch::aarch64::uint16x8_t,
-    acc2_lo: &mut core::arch::aarch64::uint16x8_t,
-    acc2_hi: &mut core::arch::aarch64::uint16x8_t,
-    acc3_lo: &mut core::arch::aarch64::uint16x8_t,
-    acc3_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc0_lo: &mut uint16x8_t,
+    acc0_hi: &mut uint16x8_t,
+    acc1_lo: &mut uint16x8_t,
+    acc1_hi: &mut uint16x8_t,
+    acc2_lo: &mut uint16x8_t,
+    acc2_hi: &mut uint16x8_t,
+    acc3_lo: &mut uint16x8_t,
+    acc3_hi: &mut uint16x8_t,
 ) {
     use crate::field::gf2_8::neon::gf8_mul_vec16;
     use core::arch::aarch64::*;

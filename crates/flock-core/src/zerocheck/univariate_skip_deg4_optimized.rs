@@ -46,6 +46,7 @@
 //! All of these are direct ports of the degree-2 versions and are pure
 //! perf-engineering — the math is settled by the tests in this file.
 
+use core::arch::aarch64::uint8x16_t;
 use std::sync::OnceLock;
 
 use crate::field::gf2_8::gf8_reduce;
@@ -277,10 +278,10 @@ unsafe fn xor_apply_byte_into_4_regs_deg4<
 >(
     table_base: *const u8,
     byte: u8,
-    d0: &mut core::arch::aarch64::uint8x16_t,
-    d1: &mut core::arch::aarch64::uint8x16_t,
-    d2: &mut core::arch::aarch64::uint8x16_t,
-    d3: &mut core::arch::aarch64::uint8x16_t,
+    d0: &mut uint8x16_t,
+    d1: &mut uint8x16_t,
+    d2: &mut uint8x16_t,
+    d3: &mut uint8x16_t,
 ) {
     use core::arch::aarch64::*;
     unsafe {
@@ -315,12 +316,7 @@ unsafe fn xor_apply_byte_into_4_regs_deg4<
 unsafe fn build_factor_row_4chunks_deg4<const TILE_BASE: usize>(
     table_base: *const u8,
     factor_row: *const u8,
-) -> (
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-) {
+) -> (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t) {
     use core::arch::aarch64::*;
     unsafe {
         let row0 = table_base.add(*factor_row as usize * V8_SIZE);

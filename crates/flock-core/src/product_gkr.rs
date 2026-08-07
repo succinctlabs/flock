@@ -69,8 +69,18 @@
 //! (A sibling `logup_gkr` — a fractional **sum** GKR with an `a/b ⊕ c/d` gate —
 //! exists on the `recursive-verifier` branch of `flock-dev`, not ported here.)
 
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::array::from_fn;
+use std::env::var;
+#[cfg(test)]
+use std::hint::black_box;
+use std::mem::replace;
+use std::mem::swap;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::challenger::Challenger;
 use crate::field::F128;
@@ -207,9 +217,9 @@ fn build_s_id_vec(mu: usize, basis: &[F128]) -> Vec<F128> {
 const PAR_THRESHOLD_DEFAULT: usize = 1 << 16;
 
 fn par_threshold() -> usize {
-    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static GATE: OnceLock<usize> = OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("FLOCK_GKR_GATE")
+        var("FLOCK_GKR_GATE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(PAR_THRESHOLD_DEFAULT)
@@ -219,19 +229,19 @@ fn par_threshold() -> usize {
 /// Phase tracing, enabled by `GKR_TRACE=1` (mirrors `PERM_TRACE` in
 /// [`crate::permutation`]). Read once.
 fn trace_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GKR_TRACE").is_ok())
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| var("GKR_TRACE").is_ok())
 }
 
 /// Print `label` with the elapsed time since `t`, then reset `t`. No-op unless
 /// [`trace_on`].
-fn tp(t: &mut std::time::Instant, label: &str) {
+fn tp(t: &mut Instant, label: &str) {
     if trace_on() {
         eprintln!(
             "  [prod-gkr] {label:<16} {:8.3} ms",
             t.elapsed().as_secs_f64() * 1e3
         );
-        *t = std::time::Instant::now();
+        *t = Instant::now();
     }
 }
 
@@ -241,15 +251,15 @@ fn fold_in_place(u: &mut Vec<F128>, rho: F128) {
     let one_minus = F128::ONE + rho;
     match crate::fold_min_len(half) {
         Some(min_len) => {
-            let mut out = crate::scratch::take_f128(half);
+            let mut out = take_f128(half);
             out.par_iter_mut()
                 .enumerate()
                 .with_min_len(min_len)
                 .for_each(|(x, o)| {
                     *o = u[2 * x] * one_minus + u[2 * x + 1] * rho;
                 });
-            let old = std::mem::replace(u, out);
-            crate::scratch::give_f128(old);
+            let old = replace(u, out);
+            give_f128(old);
         }
         None => {
             for x in 0..half {
@@ -270,7 +280,7 @@ fn fold_borrowed(src: &[F128], rho: F128) -> Vec<F128> {
     // Callers hand these back via `scratch::give_f128` once a layer is done.
     // This is resource hygiene, not a speed win — measured neutral at μ=20,
     // since the fold is bound by memory traffic rather than by the allocator.
-    let mut out = crate::scratch::take_f128(half);
+    let mut out = take_f128(half);
     match crate::fold_min_len(half) {
         Some(min_len) => {
             out.par_iter_mut()
@@ -508,7 +518,7 @@ fn prove_product<C: Challenger>(v_in: &[F128], ch: &mut C) -> (F128, Vec<LayerPr
     let mu = v_in.len().trailing_zeros() as usize;
 
     // Build all layers, v_layers[k] has 2^k entries; v_layers[mu] = v_in.
-    let mut tt = std::time::Instant::now();
+    let mut tt = Instant::now();
     let mut v_layers: Vec<Vec<F128>> = vec![Vec::new(); mu + 1];
     v_layers[mu] = v_in.to_vec();
     for k in (0..mu).rev() {
@@ -634,7 +644,7 @@ pub fn prove<C: Challenger>(
     assert!(n.is_power_of_two() && n >= 2, "need N = 2^μ ≥ 2");
     let mu = n.trailing_zeros() as usize;
 
-    let mut t = std::time::Instant::now();
+    let mut t = Instant::now();
     ch.observe_label(DOMAIN);
     let alpha = ch.sample_f128();
     let beta = ch.sample_f128();
@@ -850,7 +860,7 @@ pub fn prove_batched<C: Challenger>(
     assert!(n.is_power_of_two() && n >= 2, "need N = 2^μ ≥ 2");
     let mu = n.trailing_zeros() as usize;
 
-    let mut t = std::time::Instant::now();
+    let mut t = Instant::now();
     ch.observe_label(DOMAIN_BATCHED);
     let alpha = ch.sample_f128();
     let beta = ch.sample_f128();
@@ -918,8 +928,8 @@ pub fn prove_batched<C: Challenger>(
     // round. Pages are faulted at most once per prove — and across proves the
     // scratch pool hands the same resident buffers straight back.
     let cap = 1usize << mu.saturating_sub(2);
-    let mut cur: [Vec<F128>; 4] = std::array::from_fn(|_| crate::scratch::take_f128(cap));
-    let mut nxt: [Vec<F128>; 4] = std::array::from_fn(|_| crate::scratch::take_f128(cap));
+    let mut cur: [Vec<F128>; 4] = from_fn(|_| take_f128(cap));
+    let mut nxt: [Vec<F128>; 4] = from_fn(|_| take_f128(cap));
     for k in 0..mu {
         let lambda = ch.sample_f128();
         let h = 1usize << k;
@@ -931,7 +941,7 @@ pub fn prove_batched<C: Challenger>(
         // been folded yet, so it comes straight off the layer. Every later
         // round's message is produced by the preceding fold.
         let mut pending = if k > 0 {
-            let tr = std::time::Instant::now();
+            let tr = Instant::now();
             let (l0s, l1s) = l_layers[k + 1].split_at(h);
             let (r0s, r1s) = r_layers[k + 1].split_at(h);
             let eq = SplitEqGhash::new(&r_pt[1..k]);
@@ -952,13 +962,13 @@ pub fn prove_batched<C: Challenger>(
             rounds.push((g1, g_inf));
             r_prime.push(rho);
 
-            let mut tr = std::time::Instant::now();
+            let mut tr = Instant::now();
             // eq for round i+1; `None` on the last round, where the fold has no
             // successor message to emit.
             let eq_next = (i + 1 < k).then(|| SplitEqGhash::new(&r_pt[i + 2..k]));
             if trace_on() {
                 eq_ns += tr.elapsed().as_nanos();
-                tr = std::time::Instant::now();
+                tr = Instant::now();
             }
             if i == 0 {
                 let (l0s, l1s) = l_layers[k + 1].split_at(h);
@@ -988,7 +998,7 @@ pub fn prove_batched<C: Challenger>(
                     eq_next.as_ref(),
                 );
                 len /= 2;
-                std::mem::swap(&mut cur, &mut nxt);
+                swap(&mut cur, &mut nxt);
             }
             if trace_on() {
                 fold_ns += tr.elapsed().as_nanos();
@@ -1048,7 +1058,7 @@ pub fn prove_batched<C: Challenger>(
     observe_evals(ch, &[f_eval, g_eval, s_sigma_eval]);
     // Hand the ping-pong buffers back so the next prove reuses resident pages.
     for u in cur.into_iter().chain(nxt) {
-        crate::scratch::give_f128(u);
+        give_f128(u);
     }
     tp(&mut t, "evals");
 
@@ -1323,11 +1333,11 @@ mod tests {
             // message, whose eq spans the folded width's pairs.
             let eq_pt: Vec<F128> = (0..log_n.saturating_sub(2)).map(|_| rng.f128()).collect();
             let eq = SplitEqGhash::new(&eq_pt);
-            let mut dst: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; half]);
+            let mut dst: [Vec<F128>; 4] = from_fn(|_| vec![F128::ZERO; half]);
 
             let time = |iters: usize, mut run: Box<dyn FnMut()>| -> f64 {
                 run();
-                let t0 = std::time::Instant::now();
+                let t0 = Instant::now();
                 for _ in 0..iters {
                     run();
                 }
@@ -1337,10 +1347,7 @@ mod tests {
             let plain = {
                 let mut d = vec![F128::ZERO; half];
                 let s = &src;
-                time(
-                    20,
-                    Box::new(move || fold_into(std::hint::black_box(s), rho, &mut d)),
-                )
+                time(20, Box::new(move || fold_into(black_box(s), rho, &mut d)))
             };
             let fused = {
                 let s = &src;

@@ -17,6 +17,8 @@
 //! Isolated on purpose — `prove_wiring` is timed on its own rather than
 //! inside a full prove, so nothing else moves.
 
+use flock_core::circuit::prove_wiring;
+use std::hint::black_box;
 use std::time::Instant;
 
 use flock_core::circuit::builder::{GateType, ShapeBuilder, SlotWitness};
@@ -106,18 +108,13 @@ fn wiring_cost_across_mu() {
         // Warm once — the first call pays pooled-buffer faults.
         {
             let mut ch = FsChallenger::new(b"wiring-scaling");
-            std::hint::black_box(flock_core::circuit::prove_wiring(
-                &shape.circuit,
-                &packed,
-                &public,
-                &mut ch,
-            ));
+            black_box(prove_wiring(&shape.circuit, &packed, &public, &mut ch));
         }
         let mut ch = FsChallenger::new(b"wiring-scaling");
         let t = Instant::now();
-        let out = flock_core::circuit::prove_wiring(&shape.circuit, &packed, &public, &mut ch);
+        let out = prove_wiring(&shape.circuit, &packed, &public, &mut ch);
         let ms = t.elapsed().as_secs_f64() * 1e3;
-        std::hint::black_box(out);
+        black_box(out);
 
         let factor = match prev {
             Some((pmu, pms)) if mu == pmu + 1 => format!("{:.2}", ms / pms),

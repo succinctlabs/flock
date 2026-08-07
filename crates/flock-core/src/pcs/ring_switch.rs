@@ -59,11 +59,19 @@
 
 use crate::bits::transpose_8x8_bits;
 use crate::challenger::Challenger;
+#[cfg(any(test, feature = "unsound-challenger"))]
+use crate::challenger::RandomChallenger;
 use crate::field::F128;
+use crate::pcs::tensor_algebra::TensorAlgebra;
+use crate::scratch::take_f128;
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use crate::zerocheck::univariate_skip::build_eq;
 use serde::{Deserialize, Serialize};
+use std::env::var;
+#[cfg(test)]
+use std::hint::black_box;
+use std::time::Instant;
 
 use super::pack::LOG_PACKING;
 
@@ -299,6 +307,8 @@ pub(crate) fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
 /// merged transport's inner open to materialize `γ·eq(ρ, ·)` directly as
 /// `b_combined`.
 pub(crate) fn build_eq_scaled_parallel(r: &[F128], seed: F128) -> Vec<F128> {
+    // Threshold below which rayon dispatch overhead beats the parallel work.
+    const PAR_THRESHOLD: usize = 1 << 12;
     use rayon::prelude::*;
     let n = r.len();
     // Uninit alloc — at iter `i`, the loop reads from t[..2^i] (always written
@@ -307,8 +317,7 @@ pub(crate) fn build_eq_scaled_parallel(r: &[F128], seed: F128) -> Vec<F128> {
     // read; uninit is safe.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = seed;
-    // Threshold below which rayon dispatch overhead beats the parallel work.
-    const PAR_THRESHOLD: usize = 1 << 12;
+
     for i in 0..n {
         let r_i = r[i];
         let one_minus_r = F128::ONE + r_i;
@@ -1488,10 +1497,11 @@ pub fn fold_b128_elems_naive(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Ve
 /// Tables: 16 × 256 × 16 B = 64 KB (fits in L1+L2). Target speedup ~3× vs the
 /// `trailing_zeros` loop in `fold_b128_elems_naive`.
 pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128> {
+    const N_BYTES: usize = 16;
+    // bytes per F128
+    const TABLE_SIZE: usize = 256;
     use rayon::prelude::*;
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
-    const N_BYTES: usize = 16; // bytes per F128
-    const TABLE_SIZE: usize = 256;
 
     // Build the 16 byte-tables. `tables[byte_idx * 256 + value]` = the F128
     // sum of `eq_r_dprime[byte_idx*8 + bit]` over set bits in `value`.
@@ -1777,7 +1787,7 @@ pub(crate) fn fold_b128_from_table(eq_lo: &[F128], eq_hi: &[F128], tables: &[F12
     use rayon::prelude::*;
     let b = eq_lo.len();
     // Each slot is written exactly once (`*slot = acc`) before any read.
-    let mut out = crate::scratch::take_f128(b * eq_hi.len());
+    let mut out = take_f128(b * eq_hi.len());
     out.par_chunks_mut(b)
         .zip(eq_hi.par_iter())
         .for_each(|(out_block, &e_hi)| {
@@ -1884,18 +1894,6 @@ impl SparseEqTensor {
 ///
 /// O(2^live_count) time and memory, vs the dense `build_eq`'s `O(2^coords.len())`.
 pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
-    let mut live_positions: Vec<usize> = Vec::with_capacity(coords.len());
-    let mut base = 0usize;
-    for (i, &c) in coords.iter().enumerate() {
-        if c == F128::ZERO {
-            // eq factor pins index bit `i` to 0 — drop it.
-        } else if c == F128::ONE {
-            base |= 1 << i; // pins index bit `i` to 1
-        } else {
-            live_positions.push(i);
-        }
-    }
-    let live_coords: Vec<F128> = live_positions.iter().map(|&i| coords[i]).collect();
     // Builder choice is size-gated, byte-identical either way (`build_eq_parallel`
     // is documented byte-identical to `build_eq`):
     //
@@ -1913,6 +1911,19 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
     //   that consume them — the same reasoning as the standalone element
     //   path's dense `build_eq_parallel` build (`element_r1cs.rs`).
     const PAR_LIVE_COORDS: usize = 20;
+    let mut live_positions: Vec<usize> = Vec::with_capacity(coords.len());
+    let mut base = 0usize;
+    for (i, &c) in coords.iter().enumerate() {
+        if c == F128::ZERO {
+            // eq factor pins index bit `i` to 0 — drop it.
+        } else if c == F128::ONE {
+            base |= 1 << i; // pins index bit `i` to 1
+        } else {
+            live_positions.push(i);
+        }
+    }
+    let live_coords: Vec<F128> = live_positions.iter().map(|&i| coords[i]).collect();
+
     let live_tensor = if live_coords.len() >= PAR_LIVE_COORDS {
         build_eq_parallel(&live_coords)
     } else {
@@ -2367,13 +2378,13 @@ pub fn prove<Ch: Challenger>(
     // So packed_witness.len() = 2^(x_outer.len() - 1). Enforce that.
     assert_eq!(l, 1 << (x_outer.len() - 1));
 
-    let trace = std::env::var("PCS_TRACE").is_ok();
+    let trace = var("PCS_TRACE").is_ok();
 
     challenger.observe_label(b"flock-ring-switch-v0");
 
     // Suffix is x_outer[1..] (length m-7); first coord becomes the 7th-bit factor.
     let suffix = &x_outer[1..];
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let suffix_tensor = build_eq_parallel(suffix);
     if trace {
         eprintln!(
@@ -2385,7 +2396,7 @@ pub fn prove<Ch: Challenger>(
     debug_assert_eq!(suffix_tensor.len(), l);
 
     // Compute and send s_hat_v.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let s_hat_v = fold_1b_rows_naive(packed_witness, &suffix_tensor);
     if trace {
         eprintln!(
@@ -2404,7 +2415,7 @@ pub fn prove<Ch: Challenger>(
     let sumcheck_claim = inner_product(&s_hat_u, &eq_r_dprime);
 
     // Compute transparent multilinear rs_eq_ind.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let rs_eq_ind = fold_b128_elems(&suffix_tensor, &eq_r_dprime);
     if trace {
         eprintln!(
@@ -2476,8 +2487,24 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
+    // 1. Classify each claim. Claims whose suffix `x_outer[1..]` has at least
+    //    `SPARSE_ZERO_THRESHOLD` exactly-zero coords (e.g. the hash-chain
+    //    ẑ-claim) skip the dense kernels entirely; the rest fuse through the
+    //    existing MFR/8-wide multi-fold. Pulling sparse claims out also
+    //    restores k==2 (the MFR fast-path threshold in `fold_1b_rows_multi`)
+    //    when there are exactly two dense claims — the common case.
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Dense(usize),
+        Sparse(usize),
+    }
+    struct ClaimWork {
+        s_hat_v: Vec<F128>,
+        sumcheck_claim: F128,
+        eq_r_dprime: Vec<F128>,
+    }
     assert!(!x_outers.is_empty());
-    let trace = std::env::var("PCS_TRACE").is_ok();
+    let trace = var("PCS_TRACE").is_ok();
     let n = x_outers.len();
     let l = packed_witness.len();
     for x in x_outers {
@@ -2503,17 +2530,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     let has_precomputed =
         |orig: usize| -> bool { precomputed_s_hat_v.get(orig).copied().flatten().is_some() };
 
-    // 1. Classify each claim. Claims whose suffix `x_outer[1..]` has at least
-    //    `SPARSE_ZERO_THRESHOLD` exactly-zero coords (e.g. the hash-chain
-    //    ẑ-claim) skip the dense kernels entirely; the rest fuse through the
-    //    existing MFR/8-wide multi-fold. Pulling sparse claims out also
-    //    restores k==2 (the MFR fast-path threshold in `fold_1b_rows_multi`)
-    //    when there are exactly two dense claims — the common case.
-    #[derive(Clone, Copy)]
-    enum Kind {
-        Dense(usize),
-        Sparse(usize),
-    }
     let mut kinds: Vec<Kind> = Vec::with_capacity(n);
     let mut dense_suffixes: Vec<&[F128]> = Vec::new();
     let mut sparse_suffixes: Vec<&[F128]> = Vec::new();
@@ -2545,7 +2561,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     // Gates the s_hat_v fold KERNEL only (the MFR split kernels need 16-wide
     // lo blocks). The rs_eq_ind below defers regardless — see the else arm.
     let use_split = l.is_multiple_of(16);
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
@@ -2588,7 +2604,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
         .filter(|&s| !has_precomputed(sparse_to_orig[s]))
         .collect();
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
     // Fill precomputed slots first.
@@ -2656,13 +2672,8 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    (b) Sample γ_rs after all observations (Schwartz-Zippel-sound).
     //    (c) Per claim: bake γ_k into eq_r_dprime, fold. Output rs_eq_ind
     //        already has γ_k baked in — pcs combine just adds.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
 
-    struct ClaimWork {
-        s_hat_v: Vec<F128>,
-        sumcheck_claim: F128,
-        eq_r_dprime: Vec<F128>,
-    }
     let mut work: Vec<ClaimWork> = Vec::with_capacity(n);
     for i in 0..n {
         challenger.observe_label(b"flock-ring-switch-v0");
@@ -2717,7 +2728,11 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                         // Gate-rich circuit unions hit this. Byte-identical
                         // to the Dense fold on every consumer.
                         let sfx = &dense_suffixes[d];
-                        let n_lo = if sfx.len() >= 4 { split_n_lo(sfx.len()) } else { sfx.len() };
+                        let n_lo = if sfx.len() >= 4 {
+                            split_n_lo(sfx.len())
+                        } else {
+                            sfx.len()
+                        };
                         let (eq_lo, eq_hi) = build_eq_split(sfx, n_lo);
                         RsEqInd::DeferredDense {
                             eq_lo,
@@ -2736,7 +2751,11 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                 // element region grows.
                 Kind::Sparse(sp) => {
                     let sfx = sparse_suffixes[sp];
-                    let n_lo = if sfx.len() >= 4 { split_n_lo(sfx.len()) } else { sfx.len() };
+                    let n_lo = if sfx.len() >= 4 {
+                        split_n_lo(sfx.len())
+                    } else {
+                        sfx.len()
+                    };
                     let (eq_lo, eq_hi) = build_eq_split(sfx, n_lo);
                     RsEqInd::DeferredDense {
                         eq_lo,
@@ -2918,10 +2937,7 @@ pub fn eval_rs_eq(z_vals: &[F128], query: &[F128], eq_r_dprime: &[F128]) -> F128
 /// (z_vals, query) pairs and returns the partially-evolved `TensorAlgebra`.
 /// Pair with [`eval_rs_eq_finish_from_prefix`] to share the prefix across
 /// many query points (e.g. residual `y_bits` positions).
-pub fn eval_rs_eq_prefix(
-    z_vals: &[F128],
-    query_prefix: &[F128],
-) -> crate::pcs::tensor_algebra::TensorAlgebra {
+pub fn eval_rs_eq_prefix(z_vals: &[F128], query_prefix: &[F128]) -> TensorAlgebra {
     use crate::pcs::tensor_algebra::TensorAlgebra;
     assert!(query_prefix.len() <= z_vals.len());
     let mut eval = TensorAlgebra::from_vertical(F128::ONE);
@@ -2938,7 +2954,7 @@ pub fn eval_rs_eq_prefix(
 /// (z, query) suffix. `z_vals_suffix` and `query_suffix` are the parts of
 /// the original `z_vals`/`query` past the prefix length.
 pub fn eval_rs_eq_finish_from_prefix(
-    prefix: &crate::pcs::tensor_algebra::TensorAlgebra,
+    prefix: &TensorAlgebra,
     z_vals_suffix: &[F128],
     query_suffix: &[F128],
     eq_r_dprime: &[F128],
@@ -2971,7 +2987,7 @@ pub fn eval_rs_eq_finish_from_prefix(
 ///
 /// `y_bits` encodes the suffix as a bitmask: bit `j` is the j-th suffix coord.
 pub fn eval_rs_eq_finish_from_prefix_binary_q(
-    prefix: &crate::pcs::tensor_algebra::TensorAlgebra,
+    prefix: &TensorAlgebra,
     z_vals_suffix: &[F128],
     y_bits: u32,
     eq_r_dprime: &[F128],
@@ -3005,7 +3021,7 @@ mod tests {
     #[test]
     fn eval_rs_eq_finish_binary_q_matches_general() {
         use crate::challenger::Challenger;
-        let mut rng = crate::challenger::RandomChallenger::new(0x_B17_0BBE);
+        let mut rng = RandomChallenger::new(0x_B17_0BBE);
         let log_n = 20usize;
         let prefix_len = 15usize;
         let suffix_len = log_n - prefix_len; // 5
@@ -3381,7 +3397,7 @@ mod tests {
     /// with the real subset-sum structure.
     #[test]
     fn linearized_coefficients_reconstruct_fold() {
-        let mut ch = crate::challenger::RandomChallenger::new(0x11EA_A12E);
+        let mut ch = RandomChallenger::new(0x11EA_A12E);
         for _ in 0..3 {
             let eq_r: Vec<F128> = (0..1 << LOG_PACKING).map(|_| ch.sample_f128()).collect();
             let tables = build_fold_byte_table(&eq_r);
@@ -3644,23 +3660,23 @@ mod tests {
 
         let iters = 20;
         let bench = |f: &dyn Fn()| {
-            let t = std::time::Instant::now();
+            let t = Instant::now();
             for _ in 0..iters {
                 f();
             }
             t.elapsed().as_secs_f64() * 1e3 / iters as f64
         };
         let t_k4 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_1way_mfr(&pw, &t0));
+            black_box(fold_1b_rows_1way_mfr(&pw, &t0));
         });
         let t_8 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_1way_mfr_8wide_k4(&pw, &t0));
+            black_box(fold_1b_rows_1way_mfr_8wide_k4(&pw, &t0));
         });
         let t_2k4 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_2way_mfr(&pw, &t0, &t1));
+            black_box(fold_1b_rows_2way_mfr(&pw, &t0, &t1));
         });
         let t_28 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_2way_mfr_8wide(&pw, &t0, &t1));
+            black_box(fold_1b_rows_2way_mfr_8wide(&pw, &t0, &t1));
         });
         eprintln!(
             "\n  [fold_1b @ m=29] 1-way: {t_k4:5.2}→{t_8:5.2} ms ({:.2}x) | 2-way: {t_2k4:5.2}→{t_28:5.2} ms ({:.2}x)\n",

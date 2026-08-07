@@ -13,7 +13,9 @@
 //! For single-threaded numbers, run with `RAYON_NUM_THREADS=1` — the perf
 //! pool honors it.
 
+use flock_prover::proof_io::R1csProofBundleLigerito;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::env::var;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -236,7 +238,7 @@ fn bench_3wide_report(n_keccaks: usize, n_runs: usize) {
             .expect("verify failed");
         println!("  verify: {}", fmt_ms(t.elapsed().as_secs_f64()));
 
-        let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
+        let bundle = R1csProofBundleLigerito { commitment, proof };
         let proof_size = bundle.to_bytes().len();
         println!(
             "  proof size: {} bytes ({:.2} KiB)",
@@ -280,7 +282,7 @@ fn main() {
     // parseable prove_fast/peak/verify/proof-size fields consumed by
     // bench_keccak.sh. Best for counts of the form 3·2^j. Unset → the default
     // single-vs-3-wide comparison sweep below.
-    if let Ok(s) = std::env::var("KECCAK3_KS") {
+    if let Ok(s) = var("KECCAK3_KS") {
         println!("3-wide Keccak-f[1600] prove_fast (flock3) ({threads} thread(s)).");
         let counts: Vec<usize> = s
             .split([',', ' '])

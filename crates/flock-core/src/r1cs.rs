@@ -10,6 +10,15 @@
 //! materialized `c_0` matrix for utilities like `satisfies`).
 
 /// Sparse boolean matrix. `rows[i]` lists the column indices where the entry is 1.
+use crate::field::F128;
+use crate::lincheck::CscCircuit;
+use crate::lincheck::QuirkyPoint;
+use crate::lincheck::SparseMatrixCircuit;
+use crate::zerocheck::PaddingSpec;
+use std::array::from_fn;
+use std::slice::from_raw_parts;
+use std::slice::from_raw_parts_mut;
+use std::sync::OnceLock;
 #[derive(Clone, Debug)]
 pub struct SparseBinaryMatrix {
     pub num_rows: usize,
@@ -81,15 +90,15 @@ pub struct BlockR1cs {
     /// (the matrices are public fields, so callers that mutate them after the
     /// cache is populated will see a stale digest — don't do that).
     #[doc(hidden)]
-    pub digest_cache: std::sync::OnceLock<[u8; 32]>,
+    pub digest_cache: OnceLock<[u8; 32]>,
     /// Lazily-cached CSC transpose of `(a_0, b_0)` for lincheck's
     /// `fold_alpha_batched` — see [`Self::csc_lincheck_circuit`]. Same
     /// stale-cache caveat as [`Self::digest_cache`].
     #[doc(hidden)]
-    pub csc_cache: std::sync::OnceLock<crate::lincheck::CscCircuit>,
+    pub csc_cache: OnceLock<CscCircuit>,
 }
 
-// Manual Clone — std::sync::OnceLock doesn't derive Clone, and a fresh cache
+// Manual Clone — OnceLock doesn't derive Clone, and a fresh cache
 // after cloning is the right behavior (recomputes lazily on first use).
 impl Clone for BlockR1cs {
     fn clone(&self) -> Self {
@@ -103,8 +112,8 @@ impl Clone for BlockR1cs {
             c_0: self.c_0.clone(),
             layout: self.layout,
             const_pin: self.const_pin,
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
 }
@@ -143,7 +152,7 @@ impl BlockR1cs {
 
     /// Default `LincheckCircuit` wrapping this R1CS's sparse matrices.
     /// Per-hash setups that supply a custom circuit walker bypass this.
-    pub fn sparse_lincheck_circuit(&self) -> crate::lincheck::SparseMatrixCircuit<'_> {
+    pub fn sparse_lincheck_circuit(&self) -> SparseMatrixCircuit<'_> {
         crate::lincheck::SparseMatrixCircuit::new(&self.a_0, &self.b_0)
             .with_const_pin(self.const_pin)
     }
@@ -155,10 +164,9 @@ impl BlockR1cs {
     /// over the nonzeros) out of the prove path. NOT meaningful for setups
     /// whose `BlockR1cs` carries empty matrix stubs (e.g. Keccak) — those
     /// must keep their circuit walkers.
-    pub fn csc_lincheck_circuit(&self) -> &crate::lincheck::CscCircuit {
+    pub fn csc_lincheck_circuit(&self) -> &CscCircuit {
         self.csc_cache.get_or_init(|| {
-            crate::lincheck::CscCircuit::from_matrices(&self.a_0, &self.b_0)
-                .with_const_pin(self.const_pin)
+            CscCircuit::from_matrices(&self.a_0, &self.b_0).with_const_pin(self.const_pin)
         })
     }
 
@@ -197,17 +205,17 @@ impl BlockR1cs {
     // -----------------------------------------------------------------------
 
     /// Packed `a = A · z` ∈ GF(2)^N. Output is F_{2^128}-packed (length 2^(m-7)).
-    pub fn apply_a_packed(&self, z_packed: &[crate::field::F128]) -> Vec<crate::field::F128> {
+    pub fn apply_a_packed(&self, z_packed: &[F128]) -> Vec<F128> {
         apply_block_diag_packed(&self.a_0, z_packed, self.m, self.k_log)
     }
 
     /// Packed `b = B · z`.
-    pub fn apply_b_packed(&self, z_packed: &[crate::field::F128]) -> Vec<crate::field::F128> {
+    pub fn apply_b_packed(&self, z_packed: &[F128]) -> Vec<F128> {
         apply_block_diag_packed(&self.b_0, z_packed, self.m, self.k_log)
     }
 
     /// Packed `c = C · z`.
-    pub fn apply_c_packed(&self, z_packed: &[crate::field::F128]) -> Vec<crate::field::F128> {
+    pub fn apply_c_packed(&self, z_packed: &[F128]) -> Vec<F128> {
         apply_block_diag_packed(&self.c_0, z_packed, self.m, self.k_log)
     }
 
@@ -226,14 +234,12 @@ impl BlockR1cs {
     /// prefix (padding interleaved at each block's tail). BatchMajor: the
     /// padding chunk-columns coalesce into ONE contiguous buffer suffix,
     /// expressed as a single giant block (`k_log = m`) with a useful prefix.
-    pub fn padding_spec(&self) -> crate::zerocheck::PaddingSpec {
+    pub fn padding_spec(&self) -> PaddingSpec {
         match self.layout {
-            WitnessLayout::RowMajor => crate::zerocheck::PaddingSpec::uniform(
-                self.k_log,
-                self.useful_bits,
-                1usize << self.n_log(),
-            ),
-            WitnessLayout::BatchMajor => crate::zerocheck::PaddingSpec::uniform(
+            WitnessLayout::RowMajor => {
+                PaddingSpec::uniform(self.k_log, self.useful_bits, 1usize << self.n_log())
+            }
+            WitnessLayout::BatchMajor => PaddingSpec::uniform(
                 self.m,
                 self.useful_bits.div_ceil(128) << (7 + self.n_log()),
                 1,
@@ -246,15 +252,11 @@ impl BlockR1cs {
     /// coordinates. RowMajor address order is `[inner-rest | batch]`;
     /// BatchMajor is `[dim6 | batch | chunk]` with the inner-rest coords
     /// being `[dim6, chunk…]`.
-    pub fn x_ab_from_mlv(
-        &self,
-        z_skip: crate::field::F128,
-        mlv: &[crate::field::F128],
-    ) -> crate::lincheck::QuirkyPoint {
+    pub fn x_ab_from_mlv(&self, z_skip: F128, mlv: &[F128]) -> QuirkyPoint {
         let inner_rest_len = self.k_log - self.k_skip;
         assert_eq!(mlv.len(), self.m - self.k_skip);
         match self.layout {
-            WitnessLayout::RowMajor => crate::lincheck::QuirkyPoint {
+            WitnessLayout::RowMajor => QuirkyPoint {
                 z_skip,
                 x_inner_rest: mlv[..inner_rest_len].to_vec(),
                 x_outer: mlv[inner_rest_len..].to_vec(),
@@ -268,7 +270,7 @@ impl BlockR1cs {
                 let mut x_inner_rest = Vec::with_capacity(inner_rest_len);
                 x_inner_rest.push(mlv[0]);
                 x_inner_rest.extend_from_slice(&mlv[1 + n_log..]);
-                crate::lincheck::QuirkyPoint {
+                QuirkyPoint {
                     z_skip,
                     x_inner_rest,
                     x_outer: mlv[1..1 + n_log].to_vec(),
@@ -282,12 +284,12 @@ impl BlockR1cs {
     /// See [`WitnessLayout`] for the BatchMajor point convention.
     pub fn ab_claim_point(
         &self,
-        r_inner_skip: crate::field::F128,
-        r_inner_rest: &[crate::field::F128],
-        x_outer: &[crate::field::F128],
-    ) -> crate::lincheck::QuirkyPoint {
+        r_inner_skip: F128,
+        r_inner_rest: &[F128],
+        x_outer: &[F128],
+    ) -> QuirkyPoint {
         match self.layout {
-            WitnessLayout::RowMajor => crate::lincheck::QuirkyPoint {
+            WitnessLayout::RowMajor => QuirkyPoint {
                 z_skip: r_inner_skip,
                 x_inner_rest: r_inner_rest.to_vec(),
                 x_outer: x_outer.to_vec(),
@@ -296,7 +298,7 @@ impl BlockR1cs {
                 let mut suffix = Vec::with_capacity(x_outer.len() + r_inner_rest.len() - 1);
                 suffix.extend_from_slice(x_outer);
                 suffix.extend_from_slice(&r_inner_rest[1..]);
-                crate::lincheck::QuirkyPoint {
+                QuirkyPoint {
                     z_skip: r_inner_skip,
                     x_inner_rest: vec![r_inner_rest[0]],
                     x_outer: suffix,
@@ -307,19 +309,15 @@ impl BlockR1cs {
 
     /// Address-ordered `ZClaim` point for the C claim from the zerocheck's
     /// `r_rest` (which is address-ordered in both layouts).
-    pub fn c_claim_point(
-        &self,
-        z_skip: crate::field::F128,
-        r_rest: &[crate::field::F128],
-    ) -> crate::lincheck::QuirkyPoint {
+    pub fn c_claim_point(&self, z_skip: F128, r_rest: &[F128]) -> QuirkyPoint {
         let inner_rest_len = self.k_log - self.k_skip;
         match self.layout {
-            WitnessLayout::RowMajor => crate::lincheck::QuirkyPoint {
+            WitnessLayout::RowMajor => QuirkyPoint {
                 z_skip,
                 x_inner_rest: r_rest[..inner_rest_len].to_vec(),
                 x_outer: r_rest[inner_rest_len..].to_vec(),
             },
-            WitnessLayout::BatchMajor => crate::lincheck::QuirkyPoint {
+            WitnessLayout::BatchMajor => QuirkyPoint {
                 z_skip,
                 x_inner_rest: vec![r_rest[0]],
                 x_outer: r_rest[1..].to_vec(),
@@ -383,7 +381,7 @@ impl BlockR1cs {
 
     /// Check the R1CS constraint `(A·z) ⊙ (B·z) = C·z` over GF(2) on a packed
     /// witness. Per-element check is `a & b == c` bitwise.
-    pub fn satisfies_packed(&self, z_packed: &[crate::field::F128]) -> bool {
+    pub fn satisfies_packed(&self, z_packed: &[F128]) -> bool {
         use crate::field::F128;
         assert_eq!(z_packed.len(), 1usize << (self.m - 7));
         let a = self.apply_a_packed(z_packed);
@@ -447,10 +445,10 @@ fn apply_block_diag(m_0: &SparseBinaryMatrix, z: &[bool], k_log: usize) -> Vec<b
 /// = `n_outer · k · s` bit ops.
 pub fn apply_block_diag_packed(
     m_0: &SparseBinaryMatrix,
-    z_packed: &[crate::field::F128],
+    z_packed: &[F128],
     m: usize,
     k_log: usize,
-) -> Vec<crate::field::F128> {
+) -> Vec<F128> {
     use crate::field::F128;
     use rayon::prelude::*;
 
@@ -549,10 +547,10 @@ fn flatten_csr(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
 /// View a block of F128s as u128 words (F128 is repr(C, align(16)) with two
 /// little-endian u64s — bit `b` of the u128 is logical bit `b` of the block).
 #[inline]
-fn as_u128s(block: &[crate::field::F128]) -> &[u128] {
+fn as_u128s(block: &[F128]) -> &[u128] {
     // SAFETY: F128 has u128's size and alignment on all supported targets;
     // the lo/hi little-endian layout matches the u128 bit order.
-    unsafe { std::slice::from_raw_parts(block.as_ptr() as *const u128, block.len()) }
+    unsafe { from_raw_parts(block.as_ptr() as *const u128, block.len()) }
 }
 
 /// Apply `M_0` (CSR form) to APPLY_STRIP = 8 consecutive blocks at once.
@@ -570,8 +568,8 @@ fn as_u128s(block: &[crate::field::F128]) -> &[u128] {
 fn apply_strip_csr(
     row_ptr: &[u32],
     cols: &[u32],
-    z_strip: &[crate::field::F128],
-    out_strip: &mut [crate::field::F128],
+    z_strip: &[F128],
+    out_strip: &mut [F128],
     f128_per_block: usize,
 ) {
     use crate::bits::transpose_8_u64s_to_64_bytes;
@@ -583,12 +581,12 @@ fn apply_strip_csr(
     // SAFETY: F128 is repr(C, align(16)) = two little-endian u64s; viewing the
     // strip as u64 words preserves bit order within each block.
     let z_u64: &[u64] =
-        unsafe { std::slice::from_raw_parts(z_strip.as_ptr() as *const u64, z_strip.len() * 2) };
+        unsafe { from_raw_parts(z_strip.as_ptr() as *const u64, z_strip.len() * 2) };
 
     // Phase 1: bit-transpose the 8 blocks to column-major bytes.
     let mut colbits = vec![0u8; k];
     for w in 0..u64_per_block {
-        let lanes: [u64; 8] = std::array::from_fn(|s| z_u64[s * u64_per_block + w]);
+        let lanes: [u64; 8] = from_fn(|s| z_u64[s * u64_per_block + w]);
         transpose_8_u64s_to_64_bytes(&lanes, &mut colbits[w * 64..w * 64 + 64]);
     }
 
@@ -650,8 +648,8 @@ fn transpose_64x64(a: &mut [u64; 64]) {
 fn apply_strip64_csr(
     row_ptr: &[u32],
     cols: &[u32],
-    z_strip: &[crate::field::F128],
-    out_strip: &mut [crate::field::F128],
+    z_strip: &[F128],
+    out_strip: &mut [F128],
     f128_per_block: usize,
 ) {
     const S: usize = 64;
@@ -661,10 +659,9 @@ fn apply_strip64_csr(
     // SAFETY: F128 is repr(C, align(16)) = two little-endian u64s; u64 views
     // preserve bit order within each block.
     let z_u64: &[u64] =
-        unsafe { std::slice::from_raw_parts(z_strip.as_ptr() as *const u64, z_strip.len() * 2) };
-    let out_u64: &mut [u64] = unsafe {
-        std::slice::from_raw_parts_mut(out_strip.as_mut_ptr() as *mut u64, out_strip.len() * 2)
-    };
+        unsafe { from_raw_parts(z_strip.as_ptr() as *const u64, z_strip.len() * 2) };
+    let out_u64: &mut [u64] =
+        unsafe { from_raw_parts_mut(out_strip.as_mut_ptr() as *mut u64, out_strip.len() * 2) };
 
     // Transpose in: colbits[j] = column j's bit across the 64 blocks.
     let mut colbits = vec![0u64; k];
@@ -700,12 +697,7 @@ fn apply_strip64_csr(
 }
 
 /// Single-block CSR kernel (tail strips whose block count < APPLY_STRIP).
-fn apply_one_block_csr(
-    row_ptr: &[u32],
-    cols: &[u32],
-    z_block: &[crate::field::F128],
-    out_block: &mut [crate::field::F128],
-) {
+fn apply_one_block_csr(row_ptr: &[u32], cols: &[u32], z_block: &[F128], out_block: &mut [F128]) {
     let z = as_u128s(z_block);
     let f128_per_block = z_block.len();
     for out_idx in 0..f128_per_block {
@@ -728,7 +720,7 @@ fn apply_one_block_csr(
 }
 
 #[inline]
-fn get_bit_packed(z_packed: &[crate::field::F128], global_bit: usize) -> bool {
+fn get_bit_packed(z_packed: &[F128], global_bit: usize) -> bool {
     let i_packed = global_bit / 128;
     let local = global_bit % 128;
     if local < 64 {
@@ -739,7 +731,7 @@ fn get_bit_packed(z_packed: &[crate::field::F128], global_bit: usize) -> bool {
 }
 
 #[inline]
-fn set_bit_packed(z_packed: &mut [crate::field::F128], global_bit: usize) {
+fn set_bit_packed(z_packed: &mut [F128], global_bit: usize) {
     let i_packed = global_bit / 128;
     let local = global_bit % 128;
     if local < 64 {
@@ -851,8 +843,8 @@ mod tests {
             c_0: identity(1 << k_log),
             layout: WitnessLayout::RowMajor,
             const_pin: None,
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         };
         for seed in 0..4 {
             let z: Vec<bool> = (0..(1 << m)).map(|i| ((i ^ seed) & 1) == 1).collect();
@@ -880,8 +872,8 @@ mod tests {
             c_0: identity(1 << k_log),
             layout: WitnessLayout::RowMajor,
             const_pin: None,
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         };
         let z_zero = vec![false; 1 << m];
         assert!(r1cs.satisfies(&z_zero));

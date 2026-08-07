@@ -35,8 +35,24 @@ pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
 use crate::challenger::Challenger;
 use crate::field::F128;
+use crate::lincheck::build_eq_table;
+use crate::merkle::cap_depth;
+use crate::merkle::cap_layer;
+#[cfg(test)]
+use crate::pcs::ligerito::ProverConfig;
+#[cfg(test)]
+use crate::pcs::ligerito::VerifierConfig;
+#[cfg(test)]
+use crate::pcs::ligerito::udr_queries;
+use crate::pcs::tensor_algebra::TensorAlgebra;
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
 use crate::zerocheck::PaddingSpec;
+use crate::zerocheck::multilinear::eq_eval_binary_x;
 use serde::{Deserialize, Serialize};
+use std::env::var;
+use std::mem::swap;
+use std::time::Instant;
 
 /// Batched opening proof: ring-switching frontend + Ligerito backend.
 /// The combined `b_combined` + target_combined feed
@@ -151,24 +167,20 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     // prove time instead of as a verifier reject.
     assert_eq!(
         commitment.cap.len(),
-        1usize
-            << crate::merkle::cap_depth(
-                lig_config.queries[0],
-                commitment.params.k_code(),
-            ),
+        1usize << cap_depth(lig_config.queries[0], commitment.params.k_code(),),
         "commitment cap size disagrees with the opener config's L0 query count"
     );
     debug_assert_eq!(
         commitment.cap.as_slice(),
-        crate::merkle::cap_layer(
+        cap_layer(
             &prover_data.merkle_tree,
             commitment.params.n_leaves(),
-            crate::merkle::cap_depth(lig_config.queries[0], commitment.params.k_code()),
+            cap_depth(lig_config.queries[0], commitment.params.k_code()),
         ),
         "commitment cap is not the prover tree's cap layer"
     );
-    let trace = std::env::var("PCS_TRACE").is_ok();
-    let t_total = std::time::Instant::now();
+    let trace = var("PCS_TRACE").is_ok();
+    let t_total = Instant::now();
 
     assert_eq!(
         lig_config.initial_k, commitment.params.log_batch_size,
@@ -212,7 +224,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         trace,
     );
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0_lanes(
         lig_config,
         packed_witness,
@@ -279,6 +291,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     challenger: &mut Ch,
     trace: bool,
 ) -> CombinedClaim {
+    use rayon::prelude::*;
     let n_rs = x_outers.len();
     let n_pd = packed_direct.len();
     assert!(n_rs + n_pd > 0, "open_batch_mixed: need at least one claim");
@@ -291,7 +304,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     challenger.observe_label(b"flock-pcs-open-batch-v0");
 
     // 1. Ring-switching for all x_outers.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let (rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
@@ -321,8 +334,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
     let gammas_pd: Vec<F128> = (0..n_pd).map(|_| challenger.sample_f128()).collect();
 
-    let t = std::time::Instant::now();
-    use rayon::prelude::*;
+    let t = Instant::now();
 
     let l = if let Some((_, out)) = rs_results.first() {
         out.rs_eq_ind.len()
@@ -479,7 +491,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
-    let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
+    let mut b_combined: Vec<F128> = take_f128(l);
 
     let (mut round0_u0, mut round0_u2) = if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
@@ -605,7 +617,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
                 );
             for v in materialized {
-                crate::scratch::give_f128(v);
+                give_f128(v);
             }
             prime
         }
@@ -654,7 +666,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         .map(|(p, o)| {
             // The per-claim rs_eq_ind (L F128s) dies here — recycle it.
             if let ring_switch::RsEqInd::Dense(v) = o.rs_eq_ind {
-                crate::scratch::give_f128(v);
+                give_f128(v);
             }
             p
         })
@@ -843,12 +855,17 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
     //    For BLAKE3 m=30: ris is 19 dims, yr is 4 dims → 19× prefix reuse.
     let log_n = commitment.params.m - LOG_PACKING;
     let eval_b_residual = |ris: &[F128], yr_log_n: usize| -> Vec<F128> {
+        // ---- Per-y assembly (parallel over yr positions; each y is independent).
+        //      y_suffix is binary (bits of y), so we use the binary-query
+        //      specializations of eval_rs_eq_finish / eq_eval — each suffix
+        //      step collapses to a single scale_vertical / scalar product.
         use crate::zerocheck::multilinear::eq_eval;
+        use rayon::prelude::*;
         let yr_len = 1usize << yr_log_n;
         let prefix_len = ris.len();
 
         // ---- RS claim prefixes ----
-        let rs_prefixes: Vec<crate::pcs::tensor_algebra::TensorAlgebra> = rs_outputs
+        let rs_prefixes: Vec<TensorAlgebra> = rs_outputs
             .iter()
             .zip(x_outers.iter())
             .map(|(_out, x_outer)| {
@@ -877,11 +894,6 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
             .map(|pt| eq_eval(&pt[..prefix_len], ris))
             .collect();
 
-        // ---- Per-y assembly (parallel over yr positions; each y is independent).
-        //      y_suffix is binary (bits of y), so we use the binary-query
-        //      specializations of eval_rs_eq_finish / eq_eval — each suffix
-        //      step collapses to a single scale_vertical / scalar product.
-        use rayon::prelude::*;
         debug_assert!(yr_log_n <= 32, "yr_log_n > 32 not supported by binary path");
         (0..yr_len)
             .into_par_iter()
@@ -907,12 +919,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
                     .zip(gammas_pd.iter())
                     .zip(pd_prefix_scalars.iter())
                 {
-                    sum += *g
-                        * *prefix_scalar
-                        * crate::zerocheck::multilinear::eq_eval_binary_x(
-                            &pt[prefix_len..],
-                            y_bits,
-                        );
+                    sum += *g * *prefix_scalar * eq_eval_binary_x(&pt[prefix_len..], y_bits);
                 }
                 sum
             })
@@ -1028,7 +1035,7 @@ fn scalar_claim_groups<'a>(
         match hot {
             Some(h) => cols[h] += g,
             None => {
-                for (dst, e) in cols.iter_mut().zip(crate::lincheck::build_eq_table(zc)) {
+                for (dst, e) in cols.iter_mut().zip(build_eq_table(zc)) {
                     *dst += g * e;
                 }
             }
@@ -1052,32 +1059,28 @@ pub fn open_batch_merged<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> MergedOpenProof {
-    let trace = std::env::var("PCS_TRACE").is_ok();
-    let t_total = std::time::Instant::now();
+    let trace = var("PCS_TRACE").is_ok();
+    let t_total = Instant::now();
     // Belt-and-braces on the cap-depth derivation: the commit-time cap
     // (from `PcsParams::l0_cap_depth`) must be the layer the opener's
     // config implies — a config-source disagreement fails loudly here at
     // prove time instead of as a verifier reject.
     assert_eq!(
         commitment.cap.len(),
-        1usize
-            << crate::merkle::cap_depth(
-                lig_config.queries[0],
-                commitment.params.k_code(),
-            ),
+        1usize << cap_depth(lig_config.queries[0], commitment.params.k_code(),),
         "commitment cap size disagrees with the opener config's L0 query count"
     );
     debug_assert_eq!(
         commitment.cap.as_slice(),
-        crate::merkle::cap_layer(
+        cap_layer(
             &prover_data.merkle_tree,
             commitment.params.n_leaves(),
-            crate::merkle::cap_depth(lig_config.queries[0], commitment.params.k_code()),
+            cap_depth(lig_config.queries[0], commitment.params.k_code()),
         ),
         "commitment cap is not the prover tree's cap layer"
     );
     challenger.observe_label(b"flock-merged-open-v0");
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     // Element-only registries produce no ring-switched claims; skip the batch
     // entirely (the callee asserts a non-empty batch). This branch DEFINES the
     // element-only merged transcript: nothing is absorbed for the empty batch,
@@ -1167,7 +1170,7 @@ pub fn open_batch_merged<Ch: Challenger>(
 
     // The twisted weight over the dense cube (count-proportional Φ-pass;
     // zero tail past the jagged area).
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let (w, (u0, u2)) = jagged::build_merged_weight_and_prime(&params, &weight_claims, &q);
     if trace {
         eprintln!(
@@ -1179,15 +1182,15 @@ pub fn open_batch_merged<Ch: Challenger>(
 
     // ---- Merged sumcheck: Σ_d q[d]·W[d] = target, dense_log rounds, same
     // message/fold conventions as the virtual-opening sumcheck.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let (mut g_one, mut g_inf) = (target + u0, u2);
     let mut merged_rounds = Vec::with_capacity(dense_log);
     let mut rho = Vec::with_capacity(dense_log);
     let l = q.len();
-    let mut sa = crate::scratch::take_f128(l / 2);
-    let mut sb = crate::scratch::take_f128(l / 2);
-    let mut a = crate::scratch::take_f128(l / 4);
-    let mut bb = crate::scratch::take_f128(l / 4);
+    let mut sa = take_f128(l / 2);
+    let mut sb = take_f128(l / 2);
+    let mut a = take_f128(l / 4);
+    let mut bb = take_f128(l / 4);
     let mut cur = l;
     for round in 0..dense_log {
         let half = cur / 2;
@@ -1218,8 +1221,8 @@ pub fn open_batch_merged<Ch: Challenger>(
                 &mut sb[..half],
             );
         }
-        std::mem::swap(&mut a, &mut sa);
-        std::mem::swap(&mut bb, &mut sb);
+        swap(&mut a, &mut sa);
+        swap(&mut bb, &mut sb);
         cur = half;
     }
     let q_eval = if dense_log == 0 { q[0] } else { a[0] };
@@ -1230,14 +1233,14 @@ pub fn open_batch_merged<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    crate::scratch::give_f128(w);
-    crate::scratch::give_f128(sa);
-    crate::scratch::give_f128(sb);
-    crate::scratch::give_f128(a);
-    crate::scratch::give_f128(bb);
+    give_f128(w);
+    give_f128(sa);
+    give_f128(sb);
+    give_f128(a);
+    give_f128(bb);
 
     // ---- Frobenius assist: proves V = Ŵ(ρ).
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let coeffs: Vec<Vec<F128>> = rs_results
         .iter()
         .map(|(_, o)| match &o.rs_eq_ind {
@@ -1269,14 +1272,13 @@ pub fn open_batch_merged<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t_assist = std::time::Instant::now();
+    let t_assist = Instant::now();
     // The two-product multipoint replacement
     // (docs/multipoint-twisted-assist.tex): 128R + P claimed dual values +
     // one two-product sumcheck + ONE untwisted anchor, instead of a
     // per-statement assist — family K collapses, and every verifier piece
     // is a shape the recursion circuit already has.
-    let frobenius =
-        jagged::prove_multipoint_twisted(&params, &fclaims, &gclaims, &rho, challenger);
+    let frobenius = jagged::prove_multipoint_twisted(&params, &fclaims, &gclaims, &rho, challenger);
     if trace {
         eprintln!(
             "  [open_merged] coeffs + multipoint assist: {:6.2} ms (assist alone {:6.2} ms)",
@@ -1311,7 +1313,7 @@ pub fn open_batch_merged<Ch: Challenger>(
         value: q_eval,
         eq_ind: DirectEqInd::EqPoint(rho.clone()),
     };
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let inner = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         q,
         prover_data,
@@ -1366,7 +1368,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
     // `VERIFY_TRACE` phase split. The Ligerito inner verify has its own
     // `LIG_VERIFY_TRACE`, but it is a small tail here — the jagged Frobenius
     // assist is the term that scales with the row/column split.
-    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let trace = var("VERIFY_TRACE").is_ok();
     let tfmt = |s: f64| -> String {
         let ms = s * 1000.0;
         if ms < 1.0 {
@@ -1376,7 +1378,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
         }
     };
     challenger.observe_label(b"flock-merged-open-v0");
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut rs_outputs = Vec::with_capacity(n_rs);
     for i in 0..n_rs {
         let out = ring_switch::verify_succinct(
@@ -1427,7 +1429,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
         rho.push(r);
     }
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
     let k_cols = params.k;
     if trace {
@@ -1436,7 +1438,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
             tfmt(t.elapsed().as_secs_f64())
         );
     }
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     // The claims' c_{i,j}: derived from the transcript (γ-scaled r''-eq
     // tensors → fold byte tables → linearized coefficients).
     let coeffs: Vec<Vec<F128>> = rs_outputs
@@ -1485,7 +1487,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
             tfmt(t.elapsed().as_secs_f64())
         );
     }
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     #[cfg(feature = "mul-count")]
     let assist_start = crate::field::gf2_128::op_count::snapshot();
     let v = jagged::verify_multipoint_twisted(
@@ -1519,7 +1521,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
         return Err(VerifyErrorOpen::VirtualOpen);
     }
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let pd = PackedDirectClaimRef {
         point: &rho,
         value: proof.q_eval,
@@ -1621,13 +1623,10 @@ mod tests {
 
         let recursive_ks = vec![3usize, 3, 3];
         let log_inv_rates = vec![1usize, 3, 4, 6];
-        let queries: Vec<usize> = log_inv_rates
-            .iter()
-            .map(|&r| crate::pcs::ligerito::udr_queries(r))
-            .collect();
+        let queries: Vec<usize> = log_inv_rates.iter().map(|&r| udr_queries(r)).collect();
         let grinding_bits = vec![0usize; log_inv_rates.len()];
         let n_levels = log_inv_rates.len();
-        let lig_p_cfg = crate::pcs::ligerito::ProverConfig {
+        let lig_p_cfg = ProverConfig {
             log_inv_rates: log_inv_rates.clone(),
             recursive_steps: recursive_ks.len(),
             initial_log_msg_cols: (m - LOG_PACKING) - initial_k,
@@ -1641,7 +1640,7 @@ mod tests {
             ood_samples: vec![0; n_levels],
             merkle_hash: Default::default(),
         };
-        let lig_v_cfg = crate::pcs::ligerito::VerifierConfig {
+        let lig_v_cfg = VerifierConfig {
             log_inv_rates,
             recursive_steps: recursive_ks.len(),
             initial_log_msg_cols: (m - LOG_PACKING) - initial_k,
@@ -1682,5 +1681,4 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
     }
-
 }

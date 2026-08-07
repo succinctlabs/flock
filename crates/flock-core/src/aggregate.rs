@@ -40,6 +40,14 @@
 //! So a leaf over two proofs folds `2 → 1`, and a `2 → 1` merge of two
 //! recursive proofs folds `4 → 1` (two inherited, two fresh).
 
+use crate::challenger::FsChallenger;
+use crate::circuit::Circuit;
+use crate::circuit::SigmaAssertion;
+use crate::element_r1cs::SparseF128Matrix;
+use crate::element_r1cs::union::VerifyError as ElementVerifyError;
+use crate::lincheck::LincheckCircuit;
+use crate::matrix_fold::bilinear;
+use crate::union::UnionInstance;
 use serde::{Deserialize, Serialize};
 
 use crate::challenger::Challenger;
@@ -57,10 +65,7 @@ pub type TypeMatrices<'a> = (&'a SparseBinaryMatrix, &'a SparseBinaryMatrix);
 
 /// The base matrices of one element type, `(A₀, B₀)` — `F128` coefficients,
 /// not `GF(2)` supports.
-pub type ElementMatrices<'a> = (
-    &'a crate::element_r1cs::SparseF128Matrix,
-    &'a crate::element_r1cs::SparseF128Matrix,
-);
+pub type ElementMatrices<'a> = (&'a SparseF128Matrix, &'a SparseF128Matrix);
 
 /// Accumulated matrix claims: one `(A₀, B₀)` pair per boolean type, in slot
 /// order, tied to the registry they are about.
@@ -104,10 +109,7 @@ impl Accumulator {
     /// pass does not have this problem, because there A and B share a row
     /// weight and one call serves both. Kept for callers without the raw
     /// matrices; prefer `discharge`.
-    pub fn discharge_with_circuits(
-        &self,
-        circuits: &[&dyn crate::lincheck::LincheckCircuit],
-    ) -> bool {
+    pub fn discharge_with_circuits(&self, circuits: &[&dyn LincheckCircuit]) -> bool {
         if self.per_type.len() != circuits.len() {
             return false;
         }
@@ -149,16 +151,13 @@ impl Accumulator {
 
     /// The sigma group's root discharge: the folded claim against the real
     /// sigma table — `O(2^mu)`, once. `true` when no sigma was accumulated.
-    pub fn discharge_sigma(&self, circuit: &crate::circuit::Circuit) -> bool {
+    pub fn discharge_sigma(&self, circuit: &Circuit) -> bool {
         match &self.sigma {
             None => true,
             Some((digest, claim)) => {
                 *digest == circuit.digest()
-                    && crate::matrix_fold::bilinear(
-                        &claim.row,
-                        &claim.col,
-                        &crate::circuit::SigmaAssertion::matrix(circuit),
-                    ) == claim.value
+                    && bilinear(&claim.row, &claim.col, &SigmaAssertion::matrix(circuit))
+                        == claim.value
             }
         }
     }
@@ -188,7 +187,7 @@ pub enum AggregateError {
     /// target (`MatrixAssertion::check_reported`).
     Reported(VerifyError),
     /// Likewise on the element side.
-    ReportedElement(crate::element_r1cs::union::VerifyError),
+    ReportedElement(ElementVerifyError),
     /// A fold did not verify.
     Fold(matrix_fold::FoldError),
     /// The accumulated claims did not hold against the real matrices.
@@ -230,12 +229,22 @@ fn bind<Ch: Challenger>(registry: &Registry, prior: Option<&Accumulator>, ch: &m
 pub fn prove_aggregate<Ch: Challenger>(
     registry: &Registry,
     mats: &[TypeMatrices<'_>],
-    circuits: &[&dyn crate::lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     assertions: &[MatrixAssertion],
     prior: Option<&Accumulator>,
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
-    prove_aggregate_classes(registry, mats, circuits, assertions, &[], &[], None, prior, ch)
+    prove_aggregate_classes(
+        registry,
+        mats,
+        circuits,
+        assertions,
+        &[],
+        &[],
+        None,
+        prior,
+        ch,
+    )
 }
 
 /// [`prove_aggregate`] over BOTH classes: the boolean assertions against
@@ -246,11 +255,11 @@ pub fn prove_aggregate<Ch: Challenger>(
 pub fn prove_aggregate_classes<Ch: Challenger>(
     registry: &Registry,
     mats: &[TypeMatrices<'_>],
-    circuits: &[&dyn crate::lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     assertions: &[MatrixAssertion],
     el_mats: &[ElementMatrices<'_>],
-    el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
-    sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
+    el_assertions: &[(&UnionInstance<'_>, ElementAssertion)],
+    sigma: Option<(&Circuit, &[SigmaAssertion])>,
     prior: Option<&Accumulator>,
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
@@ -322,8 +331,7 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
         per_element.push((out_a, out_b));
     }
 
-    let (sigma_fold, sigma_out) =
-        fold_sigma_prove(sigma, prior, ch)?;
+    let (sigma_fold, sigma_out) = fold_sigma_prove(sigma, prior, ch)?;
 
     Ok((
         AggregateProof {
@@ -344,7 +352,7 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
 /// one claim per assertion — the same fixed order every group uses. All
 /// claims must name the SAME circuit (digest-keyed; normalisation).
 fn fold_sigma_prove<Ch: Challenger>(
-    sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
+    sigma: Option<(&Circuit, &[SigmaAssertion])>,
     prior: Option<&Accumulator>,
     ch: &mut Ch,
 ) -> Result<(Option<FoldProof>, Option<([u8; 32], MatrixClaim)>), AggregateError> {
@@ -375,7 +383,7 @@ fn fold_sigma_prove<Ch: Challenger>(
     if claims.is_empty() {
         return Ok((None, None));
     }
-    let m = crate::circuit::SigmaAssertion::matrix(circuit);
+    let m = SigmaAssertion::matrix(circuit);
     let n_cols = matrix_fold::FoldMatrix::n_cols(&m);
     let combs: Vec<Vec<F128>> = claims
         .iter()
@@ -388,7 +396,7 @@ fn fold_sigma_prove<Ch: Challenger>(
 /// Element claims to fold for one type: the prior's first, then one per
 /// assertion — the same fixed order the boolean side uses.
 fn gather_element(
-    assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    assertions: &[(&UnionInstance<'_>, ElementAssertion)],
     prior: Option<&Accumulator>,
     t: usize,
 ) -> (Vec<MatrixClaim>, Vec<MatrixClaim>) {
@@ -419,12 +427,12 @@ fn gather_element(
 pub fn fold_and_discharge(
     registry: &Registry,
     mats: &[TypeMatrices<'_>],
-    circuits: &[&dyn crate::lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     assertions: &[MatrixAssertion],
 ) -> Result<(), AggregateError> {
-    let mut chp = crate::challenger::FsChallenger::new(DOMAIN);
+    let mut chp = FsChallenger::new(DOMAIN);
     let (proof, _) = prove_aggregate(registry, mats, circuits, assertions, None, &mut chp)?;
-    let mut chv = crate::challenger::FsChallenger::new(DOMAIN);
+    let mut chv = FsChallenger::new(DOMAIN);
     let acc = verify_aggregate(registry, assertions, None, &proof, &mut chv)?;
     if acc.discharge(mats) {
         Ok(())
@@ -457,8 +465,8 @@ pub fn verify_aggregate<Ch: Challenger>(
 pub fn verify_aggregate_classes<Ch: Challenger>(
     registry: &Registry,
     assertions: &[MatrixAssertion],
-    el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
-    sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
+    el_assertions: &[(&UnionInstance<'_>, ElementAssertion)],
+    sigma: Option<(&Circuit, &[SigmaAssertion])>,
     prior: Option<&Accumulator>,
     proof: &AggregateProof,
     ch: &mut Ch,
@@ -537,8 +545,8 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
                 match (claims.is_empty(), pf_opt) {
                     (true, None) => None,
                     (false, Some(pf)) => {
-                        let out =
-                            matrix_fold::verify_fold(&claims, pf, ch).map_err(AggregateError::Fold)?;
+                        let out = matrix_fold::verify_fold(&claims, pf, ch)
+                            .map_err(AggregateError::Fold)?;
                         Some((digest, out))
                     }
                     _ => return Err(AggregateError::Malformed),

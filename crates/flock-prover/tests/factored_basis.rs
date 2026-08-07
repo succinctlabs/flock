@@ -21,6 +21,7 @@
 use flock_core::field::F128;
 use flock_core::lincheck::build_eq_table;
 use rayon::prelude::*;
+use std::hint::black_box;
 use std::time::Instant;
 
 /// Materialized reference: W over the whole dense domain.
@@ -153,7 +154,7 @@ fn factored_basis_cost() {
         for _ in 0..4 {
             let t = Instant::now();
             let v = f();
-            std::hint::black_box(v);
+            black_box(v);
             b = b.min(t.elapsed().as_secs_f64());
         }
         println!("  {label:<46} {:6.2} ms", b * 1e3);

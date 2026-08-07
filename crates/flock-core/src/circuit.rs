@@ -70,7 +70,17 @@
 
 pub mod builder;
 
+use crate::matrix_fold::DenseMatrix;
+use crate::matrix_fold::MatrixClaim;
+use crate::matrix_fold::Weight;
+use crate::matrix_fold::bilinear;
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::env::var;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -616,13 +626,13 @@ pub fn prove_wiring<C: Challenger>(
     // Phase trace, `WIRING_TRACE=1` — the module's counterpart of `PCS_TRACE` /
     // `GKR_TRACE`, so the wiring overhead can be attributed (build w vs the
     // grand product vs the gather folds) without instrumenting the caller.
-    let trace = std::env::var("WIRING_TRACE").is_ok();
-    let t = std::time::Instant::now();
+    let trace = var("WIRING_TRACE").is_ok();
+    let t = Instant::now();
 
     // ---- w over the cell space. Gate cells read the committed buffer; public
     // cells take the statement words; dummy cells are zero (pooled buffers come
     // back dirty, so every slot is written).
-    let mut w = crate::scratch::take_f128(1usize << mu);
+    let mut w = take_f128(1usize << mu);
     for (iota, slot) in cells.slots().iter().enumerate() {
         let dst = &mut w[iota << nu..(iota + 1) << nu];
         match *slot {
@@ -648,9 +658,9 @@ pub fn prove_wiring<C: Challenger>(
     }
 
     // ---- One grand-product permutation check at f = g = w.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let (gkr, claim) = product_gkr::prove_batched(&w, &w, circuit.sigma(), ch);
-    crate::scratch::give_f128(w);
+    give_f128(w);
     if trace {
         eprintln!(
             "  [wiring] product GKR (μ = {mu}): {:7.2} ms",
@@ -661,7 +671,7 @@ pub fn prove_wiring<C: Challenger>(
     // ---- The gather: one eq-weighted row fold per gate cell-slot, O(2^ν)
     // each, landing on the packed-direct claim shape (design doc, Lemma
     // "Gather factorization").
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let eq_row = build_eq(&claim.rho[..nu]);
     let mut gather = Vec::with_capacity(cells.num_gate_slots());
     let mut claims = Vec::with_capacity(cells.num_gate_slots());
@@ -719,19 +729,19 @@ impl SigmaAssertion {
     /// The accumulator's form: a `MatrixClaim` on the sigma table reshaped
     /// `2^nu × 2^c` (`M[r, c] = s_sig[(c << nu) + r]` — the cell space's
     /// `(col << nu) | row` convention, so the point splits row-low).
-    pub fn claim(&self) -> crate::matrix_fold::MatrixClaim {
-        crate::matrix_fold::MatrixClaim {
-            row: crate::matrix_fold::Weight::eq(self.rho[..self.nu].to_vec()),
-            col: crate::matrix_fold::Weight::eq(self.rho[self.nu..].to_vec()),
+    pub fn claim(&self) -> MatrixClaim {
+        MatrixClaim {
+            row: Weight::eq(self.rho[..self.nu].to_vec()),
+            col: Weight::eq(self.rho[self.nu..].to_vec()),
             value: self.value,
         }
     }
 
     /// The sigma table in the accumulator's matrix shape, from the SAME
     /// encoding the verifier evaluates ([`product_gkr::build_s_sigma_vec`]).
-    pub fn matrix(circuit: &Circuit) -> crate::matrix_fold::DenseMatrix {
+    pub fn matrix(circuit: &Circuit) -> DenseMatrix {
         let cells = circuit.cells();
-        crate::matrix_fold::DenseMatrix {
+        DenseMatrix {
             vals: product_gkr::build_s_sigma_vec(cells.mu(), circuit.sigma()),
             n_rows_log: cells.nu(),
         }
@@ -741,7 +751,7 @@ impl SigmaAssertion {
     /// `O(2^mu)`, paid once at the root, never per node.
     pub fn check(&self, circuit: &Circuit) -> bool {
         let c = self.claim();
-        crate::matrix_fold::bilinear(&c.row, &c.col, &Self::matrix(circuit)) == self.value
+        bilinear(&c.row, &c.col, &Self::matrix(circuit)) == self.value
     }
 }
 
@@ -1104,8 +1114,7 @@ mod tests {
         let sigma = circuit.sigma();
         let cells = circuit.cells();
         assert_eq!(sigma.len(), 1 << cells.mu());
-        let wired: std::collections::BTreeSet<usize> =
-            circuit.wires().iter().flatten().copied().collect();
+        let wired: BTreeSet<usize> = circuit.wires().iter().flatten().copied().collect();
         for (x, &sx) in sigma.iter().enumerate() {
             if !wired.contains(&x) {
                 assert_eq!(sx, x, "unwired cells are fixed points");
@@ -1369,14 +1378,17 @@ mod tests {
         let mc = assertion.claim();
         let m = SigmaAssertion::matrix(&circuit);
         assert_eq!(
-            crate::matrix_fold::bilinear(&mc.row, &mc.col, &m),
+            bilinear(&mc.row, &mc.col, &m),
             mc.value,
             "the MatrixClaim form discharges — the accumulator's path"
         );
 
         let mut bad = assertion.clone();
         bad.value += F128::ONE;
-        assert!(!bad.check(&circuit), "a tampered assertion fails the discharge");
+        assert!(
+            !bad.check(&circuit),
+            "a tampered assertion fails the discharge"
+        );
 
         let mut bad_proof = proof.clone();
         bad_proof.gkr.s_sigma_eval += F128::ONE;

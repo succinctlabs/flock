@@ -28,6 +28,7 @@
 //! 192 (positions on Λ₄ = V₈ \ S) are the fresh extension that the zerocheck
 //! round-1 message uses.
 
+use crate::bits::lowest_one;
 use crate::field::F8;
 use crate::ntt::AdditiveNttGf8;
 
@@ -107,7 +108,7 @@ impl InvNttTableSToV8Gf8 {
             if (w & (w - 1)) == 0 {
                 continue; // skip powers of 2
             }
-            let lo_bit = crate::bits::lowest_one(w);
+            let lo_bit = lowest_one(w);
             let parent = w ^ lo_bit;
             let (parent_off, bit_off, entry_off) =
                 (parent * ell_out, lo_bit * ell_out, w * ell_out);

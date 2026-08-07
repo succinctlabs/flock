@@ -20,6 +20,7 @@
 //! Scalar/correctness-first implementation; NEON `apply_triple` and the
 //! unrolled `ntt_and_accum` can be added if the URM hot path needs them.
 
+use crate::bits::lowest_one;
 use crate::field::F8;
 use crate::ntt::AdditiveNttGf8;
 
@@ -41,6 +42,10 @@ impl InvNttTableByteSingleGf8 {
     /// domain, `ntt_L` over the output (extension) domain. Both must have the
     /// same `k`.
     pub fn new(ntt_s: &AdditiveNttGf8, ntt_l: &AdditiveNttGf8) -> Self {
+        // Vec<F8> only promises byte alignment. Over-allocate and select a
+        // cache-line-aligned logical start so an AVX-512 row load never
+        // straddles two cache lines.
+        const TABLE_ALIGNMENT: usize = 64;
         assert_eq!(ntt_s.k(), ntt_l.k(), "ntt_S and ntt_L must share k");
         let k = ntt_s.k();
         let ell = 1usize << k;
@@ -51,10 +56,6 @@ impl InvNttTableByteSingleGf8 {
             "n_chunks must fit the i'/chunk XOR encoding"
         );
 
-        // Vec<F8> only promises byte alignment. Over-allocate and select a
-        // cache-line-aligned logical start so an AVX-512 row load never
-        // straddles two cache lines.
-        const TABLE_ALIGNMENT: usize = 64;
         let table_len = 256 * ell;
         let mut data = vec![F8::ZERO; table_len + TABLE_ALIGNMENT - 1];
         let data_offset = (TABLE_ALIGNMENT - (data.as_ptr() as usize & (TABLE_ALIGNMENT - 1)))
@@ -84,7 +85,7 @@ impl InvNttTableByteSingleGf8 {
             if (w & (w - 1)) == 0 {
                 continue; // skip powers of 2 (already written)
             }
-            let lo_bit = crate::bits::lowest_one(w);
+            let lo_bit = lowest_one(w);
             let parent = w ^ lo_bit;
             // Borrow-checker friendly: read parent + bit_v slices, then write entry.
             let (parent_off, bit_off, entry_off) = (parent * ell, lo_bit * ell, w * ell);

@@ -62,14 +62,27 @@
 //! the slow `prove` path will report "everything satisfied vacuously" for
 //! this encoding — only use `prove_fast`/`prove_chain`.
 
+use crate::prover::prove_fast_ligerito_from_witness;
+use crate::r1cs_hashes::chain_common::ChainProofLigerito;
+use crate::r1cs_hashes::chain_common::prove_chain_ligerito_generic;
+use crate::r1cs_hashes::chain_common::verify_chain_ligerito_generic;
 use crate::r1cs_hashes::chain_common::{ChainLayout, ChainVerifyError};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
+use flock_core::pcs::ligerito::LigeritoProfile;
+use flock_core::pcs::prefault_codeword_during;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
+use flock_core::proof::R1csProofLigerito;
 use flock_core::r1cs::BlockR1cs;
+use flock_core::r1cs::WitnessLayout;
+use flock_core::scratch::prewarm_prover;
+use flock_core::scratch::take_f128;
 use flock_core::verifier;
+#[cfg(test)]
+use flock_core::verifier::VerifyError;
+use std::array::from_fn;
 
 // ===========================================================================
 // Keccak-f[1600] primitives
@@ -874,32 +887,29 @@ impl KeccakSetup {
     pub fn with_log_inv_rate(n_keccaks: usize, log_inv_rate: usize) -> Self {
         // Rate keys the legacy profiles: 1 -> Fast, 2 -> Slim.
         let profile = match log_inv_rate {
-            1 => flock_core::pcs::ligerito::LigeritoProfile::Fast,
-            2 => flock_core::pcs::ligerito::LigeritoProfile::Slim,
-            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // other rates default to Fast
+            1 => LigeritoProfile::Fast,
+            2 => LigeritoProfile::Slim,
+            _ => LigeritoProfile::Fast, // other rates default to Fast
         };
         Self::with_profile_and_rate(n_keccaks, profile, log_inv_rate)
     }
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
-    pub fn with_profile(
-        n_keccaks: usize,
-        profile: flock_core::pcs::ligerito::LigeritoProfile,
-    ) -> Self {
+    pub fn with_profile(n_keccaks: usize, profile: LigeritoProfile) -> Self {
         Self::with_profile_and_rate(n_keccaks, profile, profile.log_inv_rate())
     }
 
     fn with_profile_and_rate(
         n_keccaks: usize,
-        profile: flock_core::pcs::ligerito::LigeritoProfile,
+        profile: LigeritoProfile,
         log_inv_rate: usize,
     ) -> Self {
         assert!(n_keccaks >= 1);
         let n_log = min_n_keccaks_log(n_keccaks);
         let r1cs = build_block_r1cs(n_log);
         // Pre-fault the prove-cycle scratch buffers — see scratch::prewarm_prover.
-        flock_core::scratch::prewarm_prover(r1cs.m);
+        prewarm_prover(r1cs.m);
         let pcs_params = PcsParams {
             m: r1cs.m,
             log_inv_rate,
@@ -923,7 +933,7 @@ impl KeccakSetup {
         let mut s = Self::new(n_keccaks);
         // Safe to set post-construction: the digest/csc caches are lazy and
         // untouched by `new`.
-        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
+        s.r1cs.layout = WitnessLayout::BatchMajor;
         s
     }
 
@@ -933,10 +943,10 @@ impl KeccakSetup {
         initial_states: &[State],
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
         match self.r1cs.layout {
-            flock_core::r1cs::WitnessLayout::RowMajor => {
+            WitnessLayout::RowMajor => {
                 generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_keccaks_log())
             }
-            flock_core::r1cs::WitnessLayout::BatchMajor => {
+            WitnessLayout::BatchMajor => {
                 generate_witness_batch_major(initial_states, self.n_keccaks_log())
             }
         }
@@ -958,13 +968,11 @@ impl KeccakSetup {
         &self,
         initial_states: &[State],
         challenger: &mut Ch,
-    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+    ) -> (R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(initial_states.len(), self.n_keccaks);
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness(initial_states)
-            });
-        crate::prover::prove_fast_ligerito_from_witness(
+            prefault_codeword_during(&self.pcs_params, || self.generate_witness(initial_states));
+        prove_fast_ligerito_from_witness(
             &self.r1cs,
             &self.pcs_params,
             z_packed,
@@ -981,7 +989,7 @@ impl KeccakSetup {
     pub fn verify<Ch: Challenger>(
         &self,
         commitment: &Commitment,
-        proof: &flock_core::proof::R1csProofLigerito,
+        proof: &R1csProofLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, verifier::VerifyError> {
         verifier::verify_ligerito(
@@ -1002,14 +1010,11 @@ impl KeccakSetup {
         &self,
         initial_states: &[State],
         challenger: &mut Ch,
-    ) -> (
-        crate::r1cs_hashes::chain_common::ChainProofLigerito,
-        Commitment,
-    ) {
+    ) -> (ChainProofLigerito, Commitment) {
         assert_eq!(initial_states.len(), self.n_keccaks);
         assert_eq!(self.n_keccaks, self.n_keccak_slots());
         let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness(initial_states);
-        crate::r1cs_hashes::chain_common::prove_chain_ligerito_generic(
+        prove_chain_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
             &CHAIN_LAYOUT,
@@ -1026,7 +1031,7 @@ impl KeccakSetup {
     pub fn verify_chain<Ch: Challenger>(
         &self,
         commitment: &Commitment,
-        proof: &crate::r1cs_hashes::chain_common::ChainProofLigerito,
+        proof: &ChainProofLigerito,
         x_0: &State,
         x_last: &State,
         challenger: &mut Ch,
@@ -1035,7 +1040,7 @@ impl KeccakSetup {
         let n_log = self.n_keccaks_log();
         let x0_phys = state_to_phys_bits(x_0);
         let xlast_phys = state_to_phys_bits(x_last);
-        crate::r1cs_hashes::chain_common::verify_chain_ligerito_generic(
+        verify_chain_ligerito_generic(
             &self.r1cs,
             &CHAIN_LAYOUT,
             commitment,
@@ -1334,9 +1339,9 @@ pub fn generate_witness_batch_major(
     let useful_chunks = USEFUL_BITS.div_ceil(128);
     let total_f128 = n_total * (U64_PER_BLOCK / 2);
 
-    let mut z = flock_core::scratch::take_f128(total_f128);
-    let mut a = flock_core::scratch::take_f128(total_f128);
-    let mut b = flock_core::scratch::take_f128(total_f128);
+    let mut z = take_f128(total_f128);
+    let mut a = take_f128(total_f128);
+    let mut b = take_f128(total_f128);
     let stripe = vec![0u8; n_total * U64_PER_BLOCK * 8];
     // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
     // the group builder fully rewrites the useful prefix every call.
@@ -1359,8 +1364,7 @@ pub fn generate_witness_batch_major(
 
     (0..n_total / BM_V).into_par_iter().for_each(move |g| {
         let o0 = g * BM_V;
-        let group: [&State; BM_V] =
-            std::array::from_fn(|j| states_ref.get(o0 + j).unwrap_or(padding_ref));
+        let group: [&State; BM_V] = from_fn(|j| states_ref.get(o0 + j).unwrap_or(padding_ref));
         // SAFETY: disjoint per-group ranges; suffix pre-zeroed above.
         unsafe {
             build_group_batch_major(
@@ -1765,7 +1769,7 @@ mod tests {
         b.iter_mut().for_each(|v| *v = F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commitment, _) = crate::prover::prove_fast_ligerito_from_witness(
+        let (proof, commitment, _) = prove_fast_ligerito_from_witness(
             &setup.r1cs,
             &setup.pcs_params,
             z,
@@ -1779,7 +1783,7 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"poc");
         let res = setup.verify(&commitment, &proof, &mut ch_v);
         assert!(
-            matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
+            matches!(res, Err(VerifyError::Lincheck(_))),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
     }
@@ -1804,18 +1808,8 @@ mod tests {
             })
             .collect();
         let fold = ChainFold::new(&CHAIN_LAYOUT, tau_pos);
-        let (in_r, out_r) = fold_in_out(
-            &CHAIN_LAYOUT,
-            flock_core::r1cs::WitnessLayout::RowMajor,
-            &z_r,
-            &fold,
-        );
-        let (in_b, out_b) = fold_in_out(
-            &CHAIN_LAYOUT,
-            flock_core::r1cs::WitnessLayout::BatchMajor,
-            &z_b,
-            &fold,
-        );
+        let (in_r, out_r) = fold_in_out(&CHAIN_LAYOUT, WitnessLayout::RowMajor, &z_r, &fold);
+        let (in_b, out_b) = fold_in_out(&CHAIN_LAYOUT, WitnessLayout::BatchMajor, &z_b, &fold);
         assert_eq!(in_b, in_r, "In fold diverged across layouts");
         assert_eq!(out_b, out_r, "Out fold diverged across layouts");
     }

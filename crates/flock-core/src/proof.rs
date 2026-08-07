@@ -5,6 +5,9 @@
 //! produces these structs; the verifier consumes them.
 
 use crate::challenger::Challenger;
+use crate::circuit::WiringProof;
+use crate::element_r1cs::union::Claims;
+use crate::element_r1cs::union::Proof;
 use crate::field::F128;
 use crate::lincheck::{self, QuirkyPoint};
 use crate::pcs::{self, Commitment};
@@ -46,7 +49,7 @@ pub struct R1csProofMixedClassMerged {
     /// Boolean zerocheck + lincheck over the `M_bool` prefix subcube.
     pub boolean: Option<BooleanPiopProof>,
     /// The element-region zerocheck + lincheck.
-    pub element: Option<crate::element_r1cs::union::Proof>,
+    pub element: Option<Proof>,
     pub pcs_open: pcs::MergedOpenProof,
 }
 
@@ -62,8 +65,8 @@ pub struct R1csProofMixedClassMerged {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csProofCircuitMerged {
     pub boolean: Option<BooleanPiopProof>,
-    pub element: Option<crate::element_r1cs::union::Proof>,
-    pub wiring: crate::circuit::WiringProof,
+    pub element: Option<Proof>,
+    pub wiring: WiringProof,
     pub pcs_open: pcs::MergedOpenProof,
 }
 
@@ -82,7 +85,7 @@ pub struct UnionClassClaims {
     pub boolean: Option<R1csClaim>,
     /// Element C + LC, in union word coordinates — `None` when the registry
     /// has no element types.
-    pub element: Option<crate::element_r1cs::union::Claims>,
+    pub element: Option<Claims>,
 }
 
 /// A claim of the form `ẑ(point) = value` for the witness `z`.

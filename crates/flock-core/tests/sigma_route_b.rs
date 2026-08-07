@@ -76,7 +76,10 @@ fn sigma_claims_fold_and_discharge() {
         "the emitted sigma claim discharges against the reshaped table"
     );
     let c2 = sigma_claim(mu, nu, &sigma, b"sigma-route-b-2");
-    assert_ne!(c1.value, c2.value, "independent transcripts, distinct points");
+    assert_ne!(
+        c1.value, c2.value,
+        "independent transcripts, distinct points"
+    );
 
     // The merge-node operation: fold 2 -> 1, verify the fold, discharge the
     // folded claim — the root's single evaluation.

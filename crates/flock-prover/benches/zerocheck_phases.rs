@@ -17,6 +17,7 @@
 //! Plus an end-to-end `prove_packed` run for cross-check.
 
 use std::hint::black_box;
+use std::mem::swap;
 use std::time::Instant;
 
 use flock_prover::challenger::{Challenger, FsChallenger};
@@ -194,8 +195,8 @@ fn prove_with_phase_timing(
                         rho_prev,
                         &r_next,
                     );
-                    std::mem::swap(&mut a_mlv, &mut a_nxt);
-                    std::mem::swap(&mut b_mlv, &mut b_nxt);
+                    swap(&mut a_mlv, &mut a_nxt);
+                    swap(&mut b_mlv, &mut b_nxt);
                     a_mlv.truncate(half);
                     b_mlv.truncate(half);
                     fused_ms += t.elapsed().as_secs_f64() * 1000.0;

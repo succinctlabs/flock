@@ -21,6 +21,7 @@
 //! work, so validating the SHA path would validate one we do not use.
 
 use flock_core::circuit::builder::{CircuitBuilder, GateType, SlotWitness, Wire};
+use flock_core::element_r1cs::ElementTableType;
 use flock_core::field::F128;
 use flock_core::hash::HashKind;
 use flock_core::pcs::PcsParams;
@@ -28,9 +29,14 @@ use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_prover::challenger::FsChallenger;
 use flock_prover::prover::{self, UnionSlotProverInput};
 use flock_prover::r1cs_hashes::blake3;
+use flock_prover::r1cs_hashes::fs_chain::IV as FS_CHAIN_IV;
 use flock_prover::schedule::TableType;
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier;
+use std::array::from_fn;
+use std::iter::once;
+use std::sync::Arc;
+use std::time::Instant;
 
 const DOMAIN: &[u8] = b"flock-circuit-builder-v0";
 
@@ -152,9 +158,7 @@ fn blake3_chunk_chain_through_the_builder() {
     let n_blocks = 16usize; // one 1 KiB chunk
     let mut rng = Rng(0xB1A3_0001);
 
-    let messages: Vec<[u32; 16]> = (0..n_blocks)
-        .map(|_| std::array::from_fn(|_| rng.next_u32()))
-        .collect();
+    let messages: Vec<[u32; 16]> = (0..n_blocks).map(|_| from_fn(|_| rng.next_u32())).collect();
 
     let mut b = CircuitBuilder::new(nu);
     let g = b.slot(Blake3Gate { nu });
@@ -318,7 +322,7 @@ fn fs_chain_circuit_derives_the_challenges() {
     let c2 = ch.sample_f128();
     let shape = ch.shape();
 
-    let values: Vec<F128> = std::iter::once(scalars[0])
+    let values: Vec<F128> = once(scalars[0])
         .chain(slice.iter().copied())
         .chain([scalars[1], scalars[2]])
         .collect();
@@ -367,7 +371,7 @@ fn fs_chain_circuit_derives_the_challenges() {
     // ---- build the circuit ----
     let mut b = CircuitBuilder::new(nu);
     let g = b.slot(Blake3Gate { nu });
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&FS_CHAIN_IV);
     let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
 
     // Stream words become public cells, EXCEPT squeezed ones, which are wired
@@ -525,12 +529,12 @@ fn fs_chain_circuit_derives_the_challenges() {
 #[test]
 #[ignore] // Heavy — run with `-- --ignored`.
 fn mvp_fs_chain_of_a_real_proof() {
+    use Arc;
     use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
     use flock_prover::prover::UnionElementSlotInput;
     use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
     use flock_prover::schedule::Registry;
-    use std::sync::Arc;
 
     const INNER: &[u8] = b"flock-union-element-v0";
     let (inner_nu, kappa, count) = (12usize, 3usize, 1usize << 12);
@@ -639,7 +643,7 @@ fn mvp_fs_chain_of_a_real_proof() {
     let nu = (trace.rows.len().next_power_of_two().trailing_zeros() as usize).max(1);
     let mut b = CircuitBuilder::new(nu);
     let g = b.slot(Blake3Gate { nu });
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&FS_CHAIN_IV);
     let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
     let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
@@ -724,7 +728,7 @@ fn mvp_fs_chain_of_a_real_proof() {
     let lc = r1cs.csc_lincheck_circuit();
     let rows = built.rows::<Blake3Gate>(g);
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &outer,
@@ -740,7 +744,7 @@ fn mvp_fs_chain_of_a_real_proof() {
     );
     let prove_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_union_circuit(
         &outer,
@@ -788,7 +792,7 @@ fn mvp_fs_chain_of_a_real_proof() {
 /// Every operation the round needs is one call: `x·y` is `(x+0)·(y+0)`,
 /// `(x+y)·z` is direct, and `x+y+z` is the sum output.
 struct ArithGate {
-    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    ty: Arc<ElementTableType>,
 }
 
 impl ArithGate {
@@ -803,7 +807,7 @@ impl ArithGate {
             .mult_lin(4, &[(0, one), (1, one)], &[(2, one), (3, one)])
             .linear(5, &[(0, one), (1, one), (2, one), (3, one)]);
         Self {
-            ty: std::sync::Arc::new(b.build().expect("arith block")),
+            ty: Arc::new(b.build().expect("arith block")),
         }
     }
 }
@@ -911,7 +915,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     let arith = b.slot(ArithGate::new());
 
     let one = b.public_value(F128::ONE);
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&FS_CHAIN_IV);
     let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
     let mut outs: Vec<Vec<Wire>> = Vec::new();
     let mut inputs: Vec<[Wire; 7]> = Vec::new();
@@ -1125,6 +1129,12 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp2b_full_element_zerocheck_replayed() {
+    // Phase 2 continues on the SAME transcript — the recorder is a challenger,
+    // so the script just carries on. The round messages here are synthetic (a
+    // standalone lincheck would need the union's comb and g vectors); what is
+    // real is the round algebra and the transcript order.
+    const LC_LABEL: &[u8] = b"flock-element-union-lc-v0";
+    const LC_ROUNDS: usize = 3;
     use flock_core::challenger::Challenger as _;
     use flock_core::element_r1cs::{ElementTableBuilder, zerocheck};
     use flock_core::transcript_record::{RecordingChallenger, StreamWord};
@@ -1167,12 +1177,6 @@ fn mvp2b_full_element_zerocheck_replayed() {
     let mut rec = RecordingChallenger::new(FsChallenger::with_hash(D, HashKind::Blake3));
     zerocheck::verify_with_label(LABEL, m_words, &zc_proof, &mut rec).expect("zerocheck verifies");
 
-    // Phase 2 continues on the SAME transcript — the recorder is a challenger,
-    // so the script just carries on. The round messages here are synthetic (a
-    // standalone lincheck would need the union's comb and g vectors); what is
-    // real is the round algebra and the transcript order.
-    const LC_LABEL: &[u8] = b"flock-element-union-lc-v0";
-    const LC_ROUNDS: usize = 3;
     rec.observe_label(LC_LABEL);
     let alpha_v = rec.sample_f128();
     let lc_msgs: Vec<(F128, F128)> = (0..LC_ROUNDS).map(|_| (f(), f())).collect();
@@ -1215,7 +1219,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
     let arith = b.slot(ArithGate::new());
     let zero = b.public_value(F128::ZERO);
     let one = b.public_value(F128::ONE);
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&FS_CHAIN_IV);
     let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
 
     let mut outs: Vec<Vec<Wire>> = Vec::new();
@@ -1418,7 +1422,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
         SlotWitness::Element(z) => z.clone(),
         _ => unreachable!(),
     };
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &outer,
@@ -1435,7 +1439,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
         &mut c,
     );
     let prove_ms = t.elapsed().as_secs_f64() * 1e3;
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_union_circuit(
         &outer,

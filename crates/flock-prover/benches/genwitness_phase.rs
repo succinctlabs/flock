@@ -2,6 +2,7 @@
 //! (the "gen_witness_ab + lincheck" phase). Best-of-N to isolate it from the
 //! rest of the prove pipeline's thermal load. Honors RAYON_NUM_THREADS.
 
+use std::array::from_fn;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -24,8 +25,8 @@ impl Rng {
 }
 
 fn random_compression(rng: &mut Rng) -> Compression {
-    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+    let m: [u32; 16] = from_fn(|_| rng.next_u32());
     (cv, m, rng.next_u32() as u64, 64u32, 11u32)
 }
 

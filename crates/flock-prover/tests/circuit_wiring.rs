@@ -36,20 +36,30 @@
 //! --ignored`. A DEBUG run needs `--test-threads=1` (the repo's known
 //! pre-existing rayon stack hazard in the Ligerito recursion).
 
+use flock_core::circuit::CellSlot;
+use flock_core::circuit::WiringProof;
+use flock_core::circuit::prove_wiring;
+use flock_core::circuit::verify_wiring;
 use flock_core::circuit::{Cell, Circuit, CircuitError, WiringError};
+use flock_core::element_r1cs::union::verify as verify_element;
 use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::field::F128;
+use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::PcsParams;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::product_gkr;
 use flock_core::proof::R1csProofCircuitMerged;
+use flock_core::r1cs::BlockR1cs;
 use flock_prover::challenger::FsChallenger;
+use flock_prover::pcs::Commitment;
 use flock_prover::prover::{self, UnionElementSlotInput, UnionSlotProverInput};
 use flock_prover::r1cs_hashes::sha2;
 use flock_prover::schedule::{IoWord, Registry, TableType};
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier::{self, VerifyError};
+use std::array::from_fn;
 use std::sync::Arc;
+use std::time::Instant;
 
 const DOMAIN: &[u8] = b"flock-circuit-wiring-v0";
 
@@ -163,7 +173,7 @@ fn build_tree(k_leaves: usize, nu: usize, rng: &mut Rng) -> Tree {
 
     // Leaves: public messages under the IV.
     for _ in 0..leaves {
-        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+        let m: [u32; 16] = from_fn(|_| rng.next_u32());
         public.extend(pack_u32_words(&m));
         out.push(sha2::sha256_compress(&sha2::SHA256_IV, &m));
         compressions.push((sha2::SHA256_IV, m));
@@ -242,7 +252,7 @@ fn pub_cell(p: usize, nu: usize) -> Cell {
     Cell::new(PUB_SLOT + (p >> nu), p & ((1 << nu) - 1))
 }
 
-fn sha2_registry(nu: usize) -> (Registry, flock_core::r1cs::BlockR1cs) {
+fn sha2_registry(nu: usize) -> (Registry, BlockR1cs) {
     let r1cs = sha2::build_block_r1cs(nu);
     let registry = Registry::new(
         vec![TableType::from_block_r1cs(&r1cs).with_io_schema(sha2_schema())],
@@ -294,9 +304,7 @@ fn sha256_binary_tree_circuit() {
             &mut ch,
         )
     };
-    let verify = |public: &[F128],
-                  commitment: &flock_prover::pcs::Commitment,
-                  proof: &R1csProofCircuitMerged| {
+    let verify = |public: &[F128], commitment: &Commitment, proof: &R1csProofCircuitMerged| {
         let mut ch = FsChallenger::new(DOMAIN);
         verifier::verify_ligerito_union_circuit(
             &union,
@@ -541,13 +549,11 @@ fn g_side_forgery_is_rejected() {
     for (iota, slot) in cells.slots().iter().enumerate() {
         for row in 0..1usize << nu {
             w[(iota << nu) | row] = match *slot {
-                flock_core::circuit::CellSlot::Gate { .. } => {
-                    packed[cells.gate_word_addr(iota, row)]
-                }
-                flock_core::circuit::CellSlot::Public { s } => {
+                CellSlot::Gate { .. } => packed[cells.gate_word_addr(iota, row)],
+                CellSlot::Public { s } => {
                     public.get((s << nu) + row).copied().unwrap_or(F128::ZERO)
                 }
-                flock_core::circuit::CellSlot::Pad => F128::ZERO,
+                CellSlot::Pad => F128::ZERO,
             };
         }
     }
@@ -580,10 +586,10 @@ fn g_side_forgery_is_rejected() {
         })
         .collect();
 
-    let proof = flock_core::circuit::WiringProof { gkr, gather };
+    let proof = WiringProof { gkr, gather };
     let mut ch = FsChallenger::new(DOMAIN);
     assert_eq!(
-        flock_core::circuit::verify_wiring(&circuit, &public, &proof, &mut ch),
+        verify_wiring(&circuit, &public, &proof, &mut ch),
         Err(WiringError::GEvalMismatch),
         "the g-side check must be what stops this — the GKR and the \
          recombination both accept"
@@ -595,7 +601,7 @@ fn g_side_forgery_is_rejected() {
         let v = rng.f128();
         for &idx in class {
             let (iota, row) = (idx >> nu, idx & ((1 << nu) - 1));
-            if let flock_core::circuit::CellSlot::Gate { .. } = cells.slots()[iota] {
+            if let CellSlot::Gate { .. } = cells.slots()[iota] {
                 packed[cells.gate_word_addr(iota, row)] = v;
             }
         }
@@ -603,10 +609,9 @@ fn g_side_forgery_is_rejected() {
     // Public cells are not wired in this circuit, so the repair above is
     // complete.
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, _) = flock_core::circuit::prove_wiring(&circuit, &packed, &public, &mut ch);
+    let (proof, _) = prove_wiring(&circuit, &packed, &public, &mut ch);
     let mut ch = FsChallenger::new(DOMAIN);
-    flock_core::circuit::verify_wiring(&circuit, &public, &proof, &mut ch)
-        .expect("the honest control must verify");
+    verify_wiring(&circuit, &public, &proof, &mut ch).expect("the honest control must verify");
 }
 
 /// **A fabricated witness**: the GKR run honestly on a DIFFERENT (but
@@ -663,7 +668,7 @@ fn fabricated_witness_fails_recombination() {
 
     // The forger's transcript: an honest wiring proof of the FAKE buffer.
     let mut ch = FsChallenger::new(DOMAIN);
-    let (fake_proof, _) = flock_core::circuit::prove_wiring(&circuit, fake, &public, &mut ch);
+    let (fake_proof, _) = prove_wiring(&circuit, fake, &public, &mut ch);
 
     // Recover ρ by replaying, then compute the REAL buffer's gather values —
     // the ones the PCS opening would accept — and splice them in.
@@ -687,13 +692,13 @@ fn fabricated_witness_fails_recombination() {
                 .fold(F128::ZERO, |a, b| a + b)
         })
         .collect();
-    let spliced = flock_core::circuit::WiringProof {
+    let spliced = WiringProof {
         gkr: fake_proof.gkr.clone(),
         gather: real_gather,
     };
     let mut ch = FsChallenger::new(DOMAIN);
     assert_eq!(
-        flock_core::circuit::verify_wiring(&circuit, &public, &spliced, &mut ch),
+        verify_wiring(&circuit, &public, &spliced, &mut ch),
         Err(WiringError::Recombination),
         "jointly consistent evals over a fabricated vector must fail the \
          recombination against the committed gather values"
@@ -702,7 +707,7 @@ fn fabricated_witness_fails_recombination() {
     // consistent (it is an honest proof — of the wrong witness), which is
     // precisely why the gather claims must ride the PCS opening.
     let mut ch = FsChallenger::new(DOMAIN);
-    flock_core::circuit::verify_wiring(&circuit, &public, &fake_proof, &mut ch)
+    verify_wiring(&circuit, &public, &fake_proof, &mut ch)
         .expect("the fabricated proof is self-consistent — the opening is what rejects it");
 }
 
@@ -754,6 +759,7 @@ fn chain_witness(ty: &ElementTableType, nu: usize, a: &[F128], seed: F128) -> (V
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn element_chain_circuit() {
+    const PUB: usize = 3;
     let (nu, kappa, n) = (12usize, 3usize, 20usize);
     let registry = element_registry(nu, kappa);
     assert_eq!(registry.m_total(), 22);
@@ -768,7 +774,7 @@ fn element_chain_circuit() {
     let mut public = vec![seed];
     public.extend_from_slice(&a);
     public.push(result);
-    const PUB: usize = 3; // 3 gate slots, then the public slot
+    // 3 gate slots, then the public slot
 
     let mut wires = vec![vec![Cell::new(PUB, 0), Cell::new(EL_B, 0)]];
     for i in 0..n {
@@ -840,6 +846,9 @@ fn element_chain_circuit() {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn cross_class_hash_into_mult() {
+    // Cell-slots: 8 SHA-256 gate slots, then 3 element slots, then public.
+    const EL: usize = 8;
+    const PUB: usize = 11;
     let (nu, kappa) = (7usize, 2usize);
     let r1cs = sha2::build_block_r1cs(nu);
     let registry = Registry::new(
@@ -858,7 +867,7 @@ fn cross_class_hash_into_mult() {
     assert_eq!(registry.m_total(), 23);
 
     let mut rng = Rng::new(0xC205_0001);
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let m: [u32; 16] = from_fn(|_| rng.next_u32());
     let h_out = sha2::sha256_compress(&sha2::SHA256_IV, &m);
     let out_words = pack_u32_words(&h_out);
     let (o0, o1) = (out_words[0], out_words[1]);
@@ -868,9 +877,6 @@ fn cross_class_hash_into_mult() {
     public.extend(pack_u32_words(&m));
     public.push(o0 * o1);
 
-    // Cell-slots: 8 SHA-256 gate slots, then 3 element slots, then public.
-    const EL: usize = 8;
-    const PUB: usize = 11;
     let wires = vec![
         vec![Cell::new(PUB, 0), Cell::new(SHA_H0, 0)],
         vec![Cell::new(PUB, 1), Cell::new(SHA_H1, 0)],
@@ -1020,13 +1026,13 @@ fn gather_claims_are_bound_by_the_opening() {
     // the fabricated witness.
     let mut ch = FsChallenger::new(DOMAIN);
     union.bind_statement_circuit(&mut ch, &commitment, &circuit.digest(), &[]);
-    flock_core::element_r1cs::union::verify(
+    verify_element(
         &union,
         proof.element.as_ref().expect("element half"),
         &mut ch,
     )
     .expect("the honest element PIOP replays");
-    let (fake_wiring, _) = flock_core::circuit::prove_wiring(&circuit, &fake, &[], &mut ch);
+    let (fake_wiring, _) = prove_wiring(&circuit, &fake, &[], &mut ch);
 
     let mut spliced = proof.clone();
     spliced.wiring = fake_wiring;
@@ -1051,9 +1057,9 @@ fn oracle_accepts(circuit: &Circuit, z: &[F128], nu: usize, public: &[F128]) -> 
     // directly.
     let at = |slot: usize, row: usize| -> F128 {
         match cells.slots()[slot] {
-            flock_core::circuit::CellSlot::Gate { .. } => z[cells.gate_word_addr(slot, row)],
-            flock_core::circuit::CellSlot::Public { s } => public[(s << nu) + row],
-            flock_core::circuit::CellSlot::Pad => F128::ZERO,
+            CellSlot::Gate { .. } => z[cells.gate_word_addr(slot, row)],
+            CellSlot::Public { s } => public[(s << nu) + row],
+            CellSlot::Pad => F128::ZERO,
         }
     };
     circuit.wires().iter().all(|class| {
@@ -1070,12 +1076,13 @@ fn oracle_accepts(circuit: &Circuit, z: &[F128], nu: usize, public: &[F128]) -> 
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn randomized_wirings_agree_with_the_oracle() {
+    const PUB: usize = 3;
     let (nu, kappa, n) = (12usize, 3usize, 8usize);
     let registry = element_registry(nu, kappa);
     let ty = registry.types()[0].element_type().expect("element");
     let union = UnionInstance::new(&registry, vec![n]);
     let pcs_params = union_pcs_params(&union);
-    const PUB: usize = 3;
+
     let n_public = 6usize;
 
     let mut rng = Rng::new(0x0AC1_E000);
@@ -1237,12 +1244,11 @@ fn wiring_cost_probe() {
         z
     };
     let mut ch = FsChallenger::new(DOMAIN);
-    let t = std::time::Instant::now();
-    let (wiring, claims) =
-        flock_core::circuit::prove_wiring(&circuit, &z_packed, &tree.public, &mut ch);
+    let t = Instant::now();
+    let (wiring, claims) = prove_wiring(&circuit, &z_packed, &tree.public, &mut ch);
     let wiring_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut ch = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &union,
@@ -1258,7 +1264,7 @@ fn wiring_cost_probe() {
     );
     let prove_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut ch = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_union_circuit(
         &union,
@@ -1462,7 +1468,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
 
     // Its second job: fold both children's claims into ONE accumulator.
     let mats = [(&r1cs.a_0, &r1cs.b_0)];
-    let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![circuit_lc];
+    let circs: Vec<&dyn LincheckCircuit> = vec![circuit_lc];
     let mut chp = FsChallenger::new(b"merge");
     let (agg, acc) =
         aggregate::prove_aggregate(&registry, &mats, &circs, &assertions, None, &mut chp)

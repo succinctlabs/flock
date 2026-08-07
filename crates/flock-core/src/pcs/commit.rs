@@ -15,10 +15,32 @@
 //! Merkle leaf is **one** F_{2^128} element = 16 bytes.
 
 use crate::field::F128;
+#[cfg(test)]
+use crate::merkle::cap_layer;
+#[cfg(test)]
+use crate::merkle::merkle_tree;
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::AdditiveNttF128;
+use crate::pcs::ligerito::LigeritoProfile;
+use crate::pcs::ligerito::ProverConfig;
+use crate::pcs::ligerito::VerifierConfig;
+use crate::pcs::ligerito::prover_config_for;
+use crate::pcs::ligerito::udr_queries;
+use crate::pcs::ligerito::verifier_config_for;
 use crate::pcs::pack::LOG_PACKING;
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
+use crate::scratch::try_take_f128;
+use core::mem::size_of;
+use core::slice::from_raw_parts;
 use serde::{Deserialize, Serialize};
+use std::env::var_os;
+#[cfg(test)]
+use std::hint::black_box;
+use std::mem::take;
+use std::ptr::write_bytes;
+use std::thread::scope;
+use std::time::Instant;
 
 /// PCS configuration. Polynomial-basis subspace `{1, x, x², …}` for the NTT.
 ///
@@ -39,7 +61,7 @@ pub struct PcsParams {
     /// PCS opening; must agree with `log_inv_rate`
     /// (`profile.log_inv_rate() == log_inv_rate`). Defaults to `Fast`.
     #[serde(default)]
-    pub profile: crate::pcs::ligerito::LigeritoProfile,
+    pub profile: LigeritoProfile,
     /// **Integer-lane commit** (optional). `None` (the default) commits the
     /// full `2^log_batch_size` interleaved lanes — today's power-of-two
     /// scheme. `Some(t)` with `1 ≤ t ≤ 2^log_batch_size` commits exactly `t`
@@ -112,7 +134,7 @@ impl PcsParams {
     }
     /// Merkle leaf size in bytes = `num_ntts() * 16`.
     pub fn leaf_size_bytes(&self) -> usize {
-        self.num_ntts() * core::mem::size_of::<F128>()
+        self.num_ntts() * size_of::<F128>()
     }
 
     /// Ligerito prover config for these params.
@@ -124,24 +146,16 @@ impl PcsParams {
     /// recursive level cannot end up on different hashes.
     ///
     /// [`ligerito::prover_config_for`]: crate::pcs::ligerito::prover_config_for
-    pub fn ligerito_prover_config(&self) -> Result<crate::pcs::ligerito::ProverConfig, String> {
-        let mut cfg = crate::pcs::ligerito::prover_config_for(
-            self.log_msg_len(),
-            self.log_batch_size,
-            self.profile,
-        )?;
+    pub fn ligerito_prover_config(&self) -> Result<ProverConfig, String> {
+        let mut cfg = prover_config_for(self.log_msg_len(), self.log_batch_size, self.profile)?;
         cfg.merkle_hash = self.merkle_hash;
         Ok(cfg)
     }
 
     /// Verifier-side counterpart to [`Self::ligerito_prover_config`], stamped
     /// with the same Merkle hash for the same reason.
-    pub fn ligerito_verifier_config(&self) -> Result<crate::pcs::ligerito::VerifierConfig, String> {
-        let mut cfg = crate::pcs::ligerito::verifier_config_for(
-            self.log_msg_len(),
-            self.log_batch_size,
-            self.profile,
-        )?;
+    pub fn ligerito_verifier_config(&self) -> Result<VerifierConfig, String> {
+        let mut cfg = verifier_config_for(self.log_msg_len(), self.log_batch_size, self.profile)?;
         cfg.merkle_hash = self.merkle_hash;
         Ok(cfg)
     }
@@ -156,7 +170,7 @@ impl PcsParams {
     pub fn l0_queries(&self) -> usize {
         match self.ligerito_prover_config() {
             Ok(cfg) => cfg.queries[0],
-            Err(_) => crate::pcs::ligerito::udr_queries(self.log_inv_rate),
+            Err(_) => udr_queries(self.log_inv_rate),
         }
     }
 
@@ -212,7 +226,7 @@ pub struct ProverData {
 // 128 MB at m = 29) through the scratch pool instead of unmapping it.
 impl Drop for ProverData {
     fn drop(&mut self) {
-        crate::scratch::give_f128(std::mem::take(&mut self.codeword));
+        give_f128(take(&mut self.codeword));
     }
 }
 
@@ -249,7 +263,7 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     // `z_packed` into the lower half, and zero-fill JUST the upper half (the
     // RS-encoding zero coefficients that the NTT's first-layer butterfly will
     // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
-    let codeword = crate::scratch::take_f128(codeword_len);
+    let codeword = take_f128(codeword_len);
     commit_into(z_packed, params, codeword)
 }
 
@@ -329,13 +343,14 @@ pub fn dense_lanes(dense_words: usize, log_batch_size: usize, log_dim: usize) ->
 /// words, which stays in L2), so it runs at near-memcpy speed despite the
 /// strided writes.
 pub fn lane_grid_from_lane_major(q: &[F128], log_batch_size: usize) -> Vec<F128> {
+    const TILE: usize = 64;
     use rayon::prelude::*;
 
     let lanes = 1usize << log_batch_size;
     assert!(q.len().is_multiple_of(lanes), "dense stack must fill lanes");
     let d = q.len() >> log_batch_size;
-    let mut grid = crate::scratch::take_f128(q.len());
-    const TILE: usize = 64; // positions per tile
+    let mut grid = take_f128(q.len());
+    // positions per tile
     grid.par_chunks_mut(TILE * lanes)
         .enumerate()
         .for_each(|(tile, out)| {
@@ -376,7 +391,7 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
     );
     let _ = lanes;
     let codeword_len = params.n_positions() * t;
-    let mut codeword = crate::scratch::take_f128(codeword_len);
+    let mut codeword = take_f128(codeword_len);
     replicate_lane_major_fill(&mut codeword, q, t, d);
     finalize_commit(codeword, params)
 }
@@ -386,11 +401,12 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
 /// q[l·D + p]`. Cache-blocked over position tiles (see
 /// [`lane_grid_from_lane_major`]).
 fn replicate_lane_major_fill(codeword: &mut [F128], q: &[F128], t: usize, d: usize) {
+    const TILE: usize = 64;
     use rayon::prelude::*;
 
     let msg_len = t * d;
     debug_assert!(codeword.len().is_multiple_of(msg_len));
-    const TILE: usize = 64; // positions per tile
+    // positions per tile
     codeword.par_chunks_mut(msg_len).for_each(|rep| {
         rep.par_chunks_mut(TILE * t)
             .enumerate()
@@ -413,10 +429,11 @@ fn replicate_lane_major_fill(codeword: &mut [F128], q: &[F128], t: usize, d: usi
 /// `forward_transform_interleaved_from_layer(…, r)`. Every slot of `codeword`
 /// is written (input contents may be stale/uninit).
 pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
+    const COPY_CHUNK: usize = 1 << 16;
     use rayon::prelude::*;
     let msg_len = msg.len();
     debug_assert!(codeword.len().is_multiple_of(msg_len));
-    const COPY_CHUNK: usize = 1 << 16;
+
     // Fast finer-grained path only when the chunk size divides `msg_len` (so a
     // COPY_CHUNK-aligned slice never straddles a replica boundary). On the
     // integer-lane commit `msg_len = t · 2^log_dim` is not a power of two, but
@@ -442,8 +459,8 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
 fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
-    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
-    let t_ntt = std::time::Instant::now();
+    let timing = var_os("FLOCK_COMMIT_TIMING").is_some();
+    let t_ntt = Instant::now();
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
     // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
     // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
@@ -460,24 +477,23 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t_merkle = std::time::Instant::now();
+    let t_merkle = Instant::now();
 
     // ---- Merkle commitment: one leaf per codeword position = num_ntts F128.
     // Zero-copy: cast the codeword Vec<F128> directly to &[u8]. F128 is
     // repr(C, align(16)) with two u64s laid out little-endian — same bytes
     // as the explicit lo.to_le_bytes() + hi.to_le_bytes() serialization.
     let codeword_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
+        from_raw_parts(
             codeword.as_ptr() as *const u8,
-            codeword.len() * core::mem::size_of::<F128>(),
+            codeword.len() * size_of::<F128>(),
         )
     };
     // Initial tree: one leaf per codeword position, each containing the
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
     // Ligerito's L0 commitment.
     let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
-    let cap =
-        merkle::cap_layer(&merkle_tree, params.n_leaves(), params.l0_cap_depth()).to_vec();
+    let cap = merkle::cap_layer(&merkle_tree, params.n_leaves(), params.l0_cap_depth()).to_vec();
     if timing {
         eprintln!(
             "[commit-timing] merkle: {:.2} ms",
@@ -530,7 +546,7 @@ pub fn prefault_codeword_during<R>(
     params: &PcsParams,
     generate: impl FnOnce() -> R,
 ) -> (Option<Vec<F128>>, R) {
-    if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
+    if rayon::current_num_threads() <= 1 || var_os("FLOCK_NO_PREFAULT").is_some() {
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.
@@ -539,18 +555,18 @@ pub fn prefault_codeword_during<R>(
     let codeword_len = params.n_positions() * params.num_ntts();
     // Warm path: a pooled buffer is already resident — there is nothing to
     // pre-fault, and commit_into writes every slot itself. Skip the thread.
-    if let Some(buf) = crate::scratch::try_take_f128(codeword_len) {
+    if let Some(buf) = try_take_f128(codeword_len) {
         return (Some(buf), generate());
     }
     // Cold path: allocate + first-touch on a background-QoS thread, hidden
     // under witness generation. (commit_into rewrites all slots, so the
     // zero values themselves don't matter — the page faults do.)
-    std::thread::scope(|s| {
+    scope(|s| {
         let h = s.spawn(move || {
             set_background_qos();
             let mut buf: Vec<F128> = crate::alloc_uninit_f128_vec(codeword_len);
             unsafe {
-                std::ptr::write_bytes(buf.as_mut_ptr(), 0u8, codeword_len);
+                write_bytes(buf.as_mut_ptr(), 0u8, codeword_len);
             }
             buf
         });
@@ -661,16 +677,10 @@ mod tests {
                 pd.codeword, oracle,
                 "codeword mismatch at m={m} r={log_inv_rate}"
             );
-            let oracle_bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(oracle.as_ptr() as *const u8, oracle.len() * 16)
-            };
-            let oracle_tree =
-                crate::merkle::merkle_tree(oracle_bytes, params.n_leaves(), params.merkle_hash);
-            let oracle_cap = crate::merkle::cap_layer(
-                &oracle_tree,
-                params.n_leaves(),
-                params.l0_cap_depth(),
-            );
+            let oracle_bytes: &[u8] =
+                unsafe { from_raw_parts(oracle.as_ptr() as *const u8, oracle.len() * 16) };
+            let oracle_tree = merkle_tree(oracle_bytes, params.n_leaves(), params.merkle_hash);
+            let oracle_cap = cap_layer(&oracle_tree, params.n_leaves(), params.l0_cap_depth());
             assert_eq!(
                 commitment.cap, oracle_cap,
                 "cap mismatch at m={m} r={log_inv_rate}"
@@ -776,18 +786,13 @@ mod tests {
 
                 // Root is the Merkle tree over t-wide leaves of pd_t.codeword.
                 let bytes: &[u8] = unsafe {
-                    core::slice::from_raw_parts(
+                    from_raw_parts(
                         pd_t.codeword.as_ptr() as *const u8,
                         pd_t.codeword.len() * 16,
                     )
                 };
-                let tree =
-                    crate::merkle::merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash);
-                let cap = crate::merkle::cap_layer(
-                    &tree,
-                    t_params.n_leaves(),
-                    t_params.l0_cap_depth(),
-                );
+                let tree = merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash);
+                let cap = cap_layer(&tree, t_params.n_leaves(), t_params.l0_cap_depth());
                 assert_eq!(cap, _c_t.cap, "cap must be over t-wide leaves");
             }
         }
@@ -898,14 +903,13 @@ mod tests {
             // num_ntts F128 wide. Timed under the default hash (SHA-256) — this
             // probe compares lane counts, not hashes, and has no `PcsParams` in
             // scope; use `HashKind::Blake3` here to re-measure the other one.
-            let bytes: &[u8] =
-                unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 16) };
+            let bytes: &[u8] = unsafe { from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 16) };
             let mut best_merkle = f64::INFINITY;
             for _ in 0..n_runs {
                 let t = Instant::now();
                 let tree = merkle::merkle_tree(bytes, n_positions, HashKind::default());
                 best_merkle = best_merkle.min(t.elapsed().as_secs_f64() * 1e3);
-                std::hint::black_box(tree.last());
+                black_box(tree.last());
             }
             (best_ntt, best_merkle)
         };
@@ -978,7 +982,7 @@ mod tests {
             let (commitment, prover_data) = commit(&z_packed, &params);
             assert_eq!(prover_data.codeword.len(), params.codeword_len_f128());
             assert_eq!(
-                crate::merkle::cap_layer(
+                cap_layer(
                     &prover_data.merkle_tree,
                     params.n_leaves(),
                     params.l0_cap_depth(),

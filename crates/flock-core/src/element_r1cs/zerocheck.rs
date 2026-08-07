@@ -29,8 +29,13 @@
 //! - `ec = ẑ(r)`. Because `C = I` this is *directly* a witness evaluation, so it
 //!   leaves as a packed-direct claim with no lincheck term.
 
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
+use crate::zerocheck::multilinear::fold_in_place_single;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::mem::replace;
+use std::mem::take;
 
 use crate::challenger::Challenger;
 use crate::field::F128;
@@ -242,7 +247,7 @@ pub fn prove_with_support<C: Challenger>(
     let mut wz = match &sparse {
         Some(sup) => {
             let rows = 1usize << nu;
-            let mut w = crate::scratch::take_f128(n_words);
+            let mut w = take_f128(n_words);
             for (c, &n) in sup.live.iter().enumerate() {
                 w[c * rows..c * rows + n].copy_from_slice(&z[c * rows..c * rows + n]);
             }
@@ -282,7 +287,7 @@ pub fn prove_with_support<C: Challenger>(
                     // then fails to reconcile (a count-0 slot is exactly this
                     // case). `wz` really is zero: the witness is.
                     // O(columns), negligible.
-                    let done = std::mem::take(&mut sparse).expect("checked");
+                    let done = take(&mut sparse).expect("checked");
                     for (c, &n) in done.live.iter().enumerate() {
                         if n == 0 {
                             wa[c] = done.a_dead[c];
@@ -313,7 +318,7 @@ pub fn prove_with_support<C: Challenger>(
 
     // Recycle the folded tables (each still owns its full round-1 capacity).
     for v in [wa, wb, wz] {
-        crate::scratch::give_f128(v);
+        give_f128(v);
     }
 
     let proof = Proof { rounds, ea, eb, ec };
@@ -566,7 +571,7 @@ fn fold_low_sparse(u: &mut Vec<F128>, rho: F128, row_vars: usize, live: &[usize]
         .filter(|&(_, &n)| n > 0)
         .map(|(c, &n)| (c * pairs, c * pairs + n.div_ceil(2)))
         .collect();
-    let mut out = crate::scratch::take_f128(half);
+    let mut out = take_f128(half);
     {
         let src: &[F128] = u;
         let total = live_pairs_total(&iv);
@@ -599,8 +604,8 @@ fn fold_low_sparse(u: &mut Vec<F128>, rho: F128, row_vars: usize, live: &[usize]
             }
         }
     }
-    let old = std::mem::replace(u, out);
-    crate::scratch::give_f128(old);
+    let old = replace(u, out);
+    give_f128(old);
 }
 
 /// [`fold_low_sparse`] for the witness table, whose dead rows are genuinely
@@ -634,7 +639,7 @@ fn fold_low(u: &mut Vec<F128>, rho: F128) {
         Some(min_len) => {
             // `take_f128(half)` returns a length-`half` buffer; the map writes
             // every slot, satisfying the write-before-read contract.
-            let mut out = crate::scratch::take_f128(half);
+            let mut out = take_f128(half);
             {
                 let src: &[F128] = u;
                 out.par_iter_mut()
@@ -645,10 +650,10 @@ fn fold_low(u: &mut Vec<F128>, rho: F128) {
                         *o = a0 + rho * (src[2 * x + 1] + a0);
                     });
             }
-            let old = std::mem::replace(u, out);
-            crate::scratch::give_f128(old);
+            let old = replace(u, out);
+            give_f128(old);
         }
-        None => crate::zerocheck::multilinear::fold_in_place_single(u, rho),
+        None => fold_in_place_single(u, rho),
     }
 }
 
@@ -665,7 +670,7 @@ mod tests {
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
         let mut t = table.to_vec();
         for &p in point {
-            crate::zerocheck::multilinear::fold_in_place_single(&mut t, p);
+            fold_in_place_single(&mut t, p);
         }
         t[0]
     }
@@ -959,7 +964,7 @@ mod tests {
             let mut a = v.clone();
             fold_low(&mut a, rho);
             let mut b = v;
-            crate::zerocheck::multilinear::fold_in_place_single(&mut b, rho);
+            fold_in_place_single(&mut b, rho);
             assert_eq!(a, b, "log_n={log_n}");
         }
     }

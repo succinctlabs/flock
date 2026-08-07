@@ -79,7 +79,19 @@
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
+use crate::pcs::ring_switch::fold_one_slot;
+use crate::scratch::take_f128;
 use serde::{Deserialize, Serialize};
+use std::env::var;
+#[cfg(test)]
+use std::hint::black_box;
+#[cfg(test)]
+use std::mem::size_of;
+use std::mem::swap;
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 /// Configuration of a jagged function: the (zero-padded to `2^k`) column
 /// heights, summarized as the cumulative-height prefix sums.
@@ -296,6 +308,10 @@ fn generate_f_and_claim(
     z_row: &[F128],
     z_col: &[F128],
 ) -> (Vec<F128>, F128, F128, F128) {
+    // ~1 MB chunks: one binary search amortized over 64K elements. CHUNK is
+    // even and len is a power of two ≥ 2, so message pairs never straddle
+    // chunks.
+    const CHUNK: usize = 1 << 16;
     use rayon::prelude::*;
     let len = 1usize << params.m;
     let area = params.area() as usize;
@@ -316,10 +332,6 @@ fn generate_f_and_claim(
         return (b, q[0] * bi, F128::ZERO, F128::ZERO);
     }
 
-    // ~1 MB chunks: one binary search amortized over 64K elements. CHUNK is
-    // even and len is a power of two ≥ 2, so message pairs never straddle
-    // chunks.
-    const CHUNK: usize = 1 << 16;
     let (v, g_one, g_inf) = b
         .par_chunks_mut(CHUNK)
         .enumerate()
@@ -414,6 +426,9 @@ fn generate_f_and_claim_blocked(
     z_col: &[F128],
     d: usize,
 ) -> (Vec<F128>, F128, F128, F128) {
+    // Sub-range within a block pair; keeps the task count high when there are
+    // few pairs (32 pairs × 8 sub-ranges at M = 30).
+    const SUB: usize = 1 << 14;
     use rayon::prelude::*;
     let len = 1usize << params.m;
     assert!(d >= 1 && d <= len / 2 && d.is_power_of_two());
@@ -423,9 +438,6 @@ fn generate_f_and_claim_blocked(
     let prefix = &params.col_prefix_sums;
     let mut b = crate::alloc_uninit_f128_vec(len);
 
-    // Sub-range within a block pair; keeps the task count high when there are
-    // few pairs (32 pairs × 8 sub-ranges at M = 30).
-    const SUB: usize = 1 << 14;
     let (v, g_one, g_inf) = b
         .par_chunks_mut(2 * d)
         .enumerate()
@@ -547,8 +559,8 @@ pub(crate) fn prove_main<C: Challenger>(
                 &mut sb[..half],
             );
         }
-        std::mem::swap(&mut a, &mut sa);
-        std::mem::swap(&mut bb, &mut sb);
+        swap(&mut a, &mut sa);
+        swap(&mut bb, &mut sb);
         cur = half;
     }
 
@@ -1181,7 +1193,7 @@ fn fold_partials(
             gather(b, slot);
         }
     }
-    std::mem::swap(p, out);
+    swap(p, out);
     debug_assert_eq!(p.len(), blocks.n_blocks(layer + 1));
 }
 
@@ -1587,26 +1599,10 @@ pub(crate) fn build_merged_weight_and_prime(
     claims: &[MergedWeightClaim<'_>],
     q: &[F128],
 ) -> (Vec<F128>, (F128, F128)) {
-    use rayon::prelude::*;
-    let area = params.area() as usize;
-    let n_total = 1usize << params.m;
     enum ColSide<'a> {
         Fold(Vec<F128>, &'a [F128]),
         Combined(&'a [F128]),
     }
-    let tabs: Vec<(Vec<F128>, ColSide<'_>)> = claims
-        .iter()
-        .map(|c| match c {
-            MergedWeightClaim::Folded { z_row, z_col, table } => {
-                (build_eq_table(z_row), ColSide::Fold(build_eq_table(z_col), *table))
-            }
-            MergedWeightClaim::Scalar { z_row, cols } => {
-                (build_eq_table(z_row), ColSide::Combined(cols))
-            }
-        })
-        .collect();
-    assert_eq!(q.len(), n_total);
-    let mut w = crate::scratch::take_f128(n_total);
     // Segmented fill (the JaggedWeight lesson): per chunk, ONE cursor into
     // `col_prefix_sums`, then per column segment a claim-OUTER sweep — the
     // column factor hoisted, rows read sequentially, and one claim's 64 KB
@@ -1616,6 +1612,29 @@ pub(crate) fn build_merged_weight_and_prime(
     // pass (CHUNK is even, so element pairs never straddle chunks); the
     // dead tail past the area contributes zero on both sides.
     const CHUNK: usize = 1 << 14;
+    use rayon::prelude::*;
+    let area = params.area() as usize;
+    let n_total = 1usize << params.m;
+
+    let tabs: Vec<(Vec<F128>, ColSide<'_>)> = claims
+        .iter()
+        .map(|c| match c {
+            MergedWeightClaim::Folded {
+                z_row,
+                z_col,
+                table,
+            } => (
+                build_eq_table(z_row),
+                ColSide::Fold(build_eq_table(z_col), *table),
+            ),
+            MergedWeightClaim::Scalar { z_row, cols } => {
+                (build_eq_table(z_row), ColSide::Combined(cols))
+            }
+        })
+        .collect();
+    assert_eq!(q.len(), n_total);
+    let mut w = take_f128(n_total);
+
     let ps = &params.col_prefix_sums;
     let prime = w
         .par_chunks_mut(CHUNK)
@@ -1647,13 +1666,11 @@ pub(crate) fn build_merged_weight_and_prime(
                             let c_hoist = eq_c[col];
                             if first_claim {
                                 for (slot, &r) in dst.iter_mut().zip(rows) {
-                                    *slot =
-                                        crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                                    *slot = fold_one_slot(r * c_hoist, tab);
                                 }
                             } else {
                                 for (slot, &r) in dst.iter_mut().zip(rows) {
-                                    *slot +=
-                                        crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                                    *slot += fold_one_slot(r * c_hoist, tab);
                                 }
                             }
                         }
@@ -1759,13 +1776,14 @@ fn frobenius_statements(
     bounds: &[(u64, u64, u32)],
     prover: Option<(&AssistBlocks, &[[F128; 4]], usize)>,
 ) -> Vec<FrobeniusStatement> {
-    use rayon::prelude::*;
-    let m = params.m;
-    let sparse = assist_sparse_transitions();
     enum SpecCols<'b> {
         Point(Vec<F128>),
         Weights(&'b [F128]),
     }
+    use rayon::prelude::*;
+    let m = params.m;
+    let sparse = assist_sparse_transitions();
+
     let mut specs: Vec<(Vec<F128>, SpecCols<'_>, F128)> = Vec::new();
     for claim in claims {
         assert_eq!(claim.coeffs.len(), 128);
@@ -1897,8 +1915,8 @@ pub fn prove_frobenius_assist<C: Challenger>(
     use rayon::prelude::*;
     let m = params.m;
     assert_eq!(rho.len(), m);
-    let trace = std::env::var("PCS_TRACE").is_ok();
-    let t = std::time::Instant::now();
+    let trace = var("PCS_TRACE").is_ok();
+    let t = Instant::now();
     let sparse = assist_sparse_transitions();
     let bounds = assist_boundaries(params);
     let blocks = AssistBlocks::new(&bounds, m);
@@ -1908,7 +1926,14 @@ pub fn prove_frobenius_assist<C: Challenger>(
     let lo = params.n.clamp(1, m + 1);
     let tail = assist_shared_tail_blocked(&blocks, rho, &sparse, m, lo);
     let lo_off = blocks.off[lo];
-    let mut sts = frobenius_statements(params, claims, groups, rho, &bounds, Some((&blocks, &tail, lo)));
+    let mut sts = frobenius_statements(
+        params,
+        claims,
+        groups,
+        rho,
+        &bounds,
+        Some((&blocks, &tail, lo)),
+    );
     if trace {
         eprintln!(
             "    [frobenius] statements + suffix rows (x{}, {} low + {} shared blocks vs {} dense): {:6.2} ms",
@@ -1919,7 +1944,7 @@ pub fn prove_frobenius_assist<C: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t = std::time::Instant::now();
+    let t = Instant::now();
 
     let v = sts
         .par_iter()
@@ -2041,7 +2066,7 @@ pub fn verify_frobenius_assist<C: Challenger>(
     // verify, so its three phases are worth separating: the transcript replay,
     // building the 128·K statements (a `2^k`-column `eq` table each), and the
     // per-statement `W(σ)` walk + boundary DP.
-    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let trace = var("VERIFY_TRACE").is_ok();
     let tfmt = |s: f64| -> String {
         let ms = s * 1000.0;
         if ms < 1.0 {
@@ -2053,7 +2078,7 @@ pub fn verify_frobenius_assist<C: Challenger>(
     challenger.observe_label(b"flock-frobenius-assist-v0");
     challenger.observe_f128(proof.v);
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut claim = proof.v;
     let mut sigma = Vec::with_capacity(2 * (m + 1));
     for &(g_one, g_inf) in &proof.rounds {
@@ -2073,7 +2098,7 @@ pub fn verify_frobenius_assist<C: Challenger>(
 
     let bounds = assist_boundaries(params);
     let blocks = AssistBlocks::new(&bounds, m);
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let sts = frobenius_statements(params, claims, groups, rho, &bounds, None);
     if trace {
         eprintln!(
@@ -2087,7 +2112,7 @@ pub fn verify_frobenius_assist<C: Challenger>(
     // tree descent shared by all statements; each statement then pays a
     // plain weighted dot. Same field products as the per-statement ascent
     // ([`assist_w_at_blocked`]), reassociated, so `w` is bit-identical.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let eq_cols = assist_eq_at_blocked(&blocks, &sigma, m);
     if trace {
         eprintln!(
@@ -2097,7 +2122,7 @@ pub fn verify_frobenius_assist<C: Challenger>(
             tfmt(t.elapsed().as_secs_f64())
         );
     }
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let expect = sts
         .par_iter()
         .map(|st| {
@@ -2198,7 +2223,7 @@ pub fn verify_with_assist<C: Challenger>(
 /// Images of the `F₂`-basis under square root (`x ↦ x^{2^127}`, the inverse
 /// Frobenius) — square root is `F₂`-linear, so this table defines the map.
 fn sqrt_basis() -> &'static [F128; 128] {
-    static T: std::sync::OnceLock<[F128; 128]> = std::sync::OnceLock::new();
+    static T: OnceLock<[F128; 128]> = OnceLock::new();
     T.get_or_init(|| {
         let mut t = [F128::ZERO; 128];
         for (b, slot) in t.iter_mut().enumerate() {
@@ -2265,16 +2290,14 @@ fn twisted_eq_at(gpow: &[F128], rho_pows: &[Vec<F128>], x: &[F128]) -> F128 {
 /// endpoint factor.
 fn eq_at(a: &[F128], b: &[F128]) -> F128 {
     debug_assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b)
-        .fold(F128::ONE, |acc, (&x, &y)| {
-            acc * (x * y + (F128::ONE + x) * (F128::ONE + y))
-        })
+    a.iter().zip(b).fold(F128::ONE, |acc, (&x, &y)| {
+        acc * (x * y + (F128::ONE + x) * (F128::ONE + y))
+    })
 }
 
 /// Basis images of `x ↦ x^{2^{-j}}` for every `j` (level 0 = identity).
 fn inv_frob_basis() -> &'static Vec<[F128; 128]> {
-    static T: std::sync::OnceLock<Vec<[F128; 128]>> = std::sync::OnceLock::new();
+    static T: OnceLock<Vec<[F128; 128]>> = OnceLock::new();
     T.get_or_init(|| {
         let mut levels: Vec<[F128; 128]> = Vec::with_capacity(128);
         let mut cur = [F128::ZERO; 128];
@@ -2562,11 +2585,12 @@ fn build_combined_weight_and_msg(
     sides: &[(F128, Vec<F128>, &[F128])],
     partner: &[F128],
 ) -> (Vec<F128>, (F128, F128)) {
+    const CH: usize = 1 << 14;
     use rayon::prelude::*;
     let mut a = vec![F128::ZERO; 1usize << params.m];
     let pfx = &params.col_prefix_sums;
     let n_cols = pfx.len() - 1;
-    const CH: usize = 1 << 14;
+
     let msg = a
         .par_chunks_mut(CH)
         .zip(partner.par_chunks(CH))
@@ -2640,14 +2664,18 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         assert_eq!(claim.coeffs.len(), 128);
     }
     for g in groups {
-        assert_eq!(g.cols.len(), 1usize << params.k, "group cols must be dense over 2^k columns");
+        assert_eq!(
+            g.cols.len(),
+            1usize << params.k,
+            "group cols must be dense over 2^k columns"
+        );
     }
     let n_rs = claims.len();
     let n_g = groups.len();
     assert!(n_rs + n_g > 0, "multipoint over zero claims");
-    let trace = std::env::var("PCS_TRACE").is_ok();
+    let trace = var("PCS_TRACE").is_ok();
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     // The inverse-Frobenius points exist only for the twisted (RS) side.
     let rho_pows = (n_rs > 0).then(|| rho_inverse_powers(rho));
     let values = match &rho_pows {
@@ -2683,7 +2711,7 @@ pub fn prove_multipoint_twisted<C: Challenger>(
 
     // The dense vectors: e = eq(ρ,·) (the groups' partner), g = L_γ(e) via
     // one byte-table pass (the RS partner), and the two combined weights.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let eq_rho = super::ring_switch::build_eq_parallel(rho);
     let mut pairs: Vec<ProductPair> = Vec::with_capacity(2);
     let mut msg0 = (F128::ZERO, F128::ZERO);
@@ -2735,7 +2763,7 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     // and summed across the active products. The final fold never runs —
     // nothing reads the folded scalars; the anchor assist reproves the
     // endpoint.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut rounds = Vec::with_capacity(m);
     let mut point = Vec::with_capacity(m);
     let (mut g_one, mut g_inf) = msg0;
@@ -2769,12 +2797,16 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     // baked into the coefficients (RS claim i: γ^{128 i}·ĝ(ρ''); group k:
     // γ^{128 R + k}·eq(ρ,ρ'')), so the accept check is a plain equality
     // against the running claim and no extra scalar travels.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let g_at = match &rho_pows {
         Some(rp) => twisted_eq_at(&gpow, rp, &point),
         None => F128::ZERO,
     };
-    let e_at = if n_g > 0 { eq_at(rho, &point) } else { F128::ZERO };
+    let e_at = if n_g > 0 {
+        eq_at(rho, &point)
+    } else {
+        F128::ZERO
+    };
     let anchor_coeffs: Vec<Vec<F128>> = (0..n_rs)
         .map(|i| {
             let mut c = vec![F128::ZERO; 128];
@@ -2796,8 +2828,7 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         .enumerate()
         .map(|(k, g)| (*g, gpow[128 * n_rs + k] * e_at))
         .collect();
-    let anchor =
-        prove_frobenius_assist(params, &anchor_claims, &anchor_groups, &point, challenger);
+    let anchor = prove_frobenius_assist(params, &anchor_claims, &anchor_groups, &point, challenger);
     if trace {
         eprintln!(
             "    [multipoint] anchor assist (x{} + x{}): {:6.2} ms",
@@ -2886,7 +2917,11 @@ pub fn verify_multipoint_twisted<C: Challenger>(
         return None;
     }
     for g in groups {
-        assert_eq!(g.cols.len(), 1usize << params.k, "group cols must be dense over 2^k columns");
+        assert_eq!(
+            g.cols.len(),
+            1usize << params.k,
+            "group cols must be dense over 2^k columns"
+        );
     }
     let n_rs = claims.len();
     let n_g = groups.len();
@@ -2936,7 +2971,11 @@ pub fn verify_multipoint_twisted<C: Challenger>(
     } else {
         F128::ZERO
     };
-    let e_at = if n_g > 0 { eq_at(rho, &point) } else { F128::ZERO };
+    let e_at = if n_g > 0 {
+        eq_at(rho, &point)
+    } else {
+        F128::ZERO
+    };
     let anchor_coeffs: Vec<Vec<F128>> = (0..n_rs)
         .map(|i| {
             let mut c = vec![F128::ZERO; 128];
@@ -3121,13 +3160,14 @@ pub(crate) fn fold_and_round_oop_par(
     ao: &mut [F128],
     bo: &mut [F128],
 ) -> (F128, F128) {
-    use rayon::prelude::*;
-    debug_assert_eq!(a.len(), 2 * ao.len());
-    debug_assert!(a.len() >= 4);
     // Output chunk of `CO`; the aligned input chunk is `2*CO` (output is half
     // the input). Slice/`chunks_exact` iteration — no per-element bounds checks —
     // so the reduction scales like the fold (~6× vs ~2.6× for indexed access).
     const CO: usize = 1 << 13;
+    use rayon::prelude::*;
+    debug_assert_eq!(a.len(), 2 * ao.len());
+    debug_assert!(a.len() >= 4);
+
     ao.par_chunks_mut(CO)
         .zip(bo.par_chunks_mut(CO))
         .zip(a.par_chunks(2 * CO))
@@ -3393,10 +3433,10 @@ mod tests {
         let mut best = f64::INFINITY;
         for _ in 0..12 {
             let mut fs = FsChallenger::new(b"frobenius-assist-bench");
-            let t = std::time::Instant::now();
+            let t = Instant::now();
             let proof = prove_frobenius_assist(&params, &claims, &[], &rho, &mut fs);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
-            std::hint::black_box(proof);
+            black_box(proof);
         }
         println!("frobenius assist prove (256 stmts, 368 cols, m = 23): {best:.2} ms (min of 12)");
     }
@@ -3606,27 +3646,27 @@ mod tests {
             let mut kept = None;
             for _ in 0..3 {
                 let mut fs = FsChallenger::new(b"multipoint-bench");
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 let proof = prove_multipoint_twisted(&params, &claims, &[], &rho, &mut fs);
                 best = best.min(t.elapsed().as_secs_f64() * 1e3);
                 kept = Some(proof);
             }
             let proof = kept.unwrap();
-            let t = std::time::Instant::now();
+            let t = Instant::now();
             let mut fv = FsChallenger::new(b"multipoint-bench");
             let v = verify_multipoint_twisted(&params, &claims, &[], &rho, &proof, &mut fv)
                 .expect("bench proof verifies");
             let verify_ms = t.elapsed().as_secs_f64() * 1e3;
-            std::hint::black_box(v);
+            black_box(v);
 
             let assist = if run_assist {
                 let mut best_a = f64::INFINITY;
                 for _ in 0..3 {
                     let mut fa = FsChallenger::new(b"assist-bench");
-                    let t = std::time::Instant::now();
+                    let t = Instant::now();
                     let p = prove_frobenius_assist(&params, &claims, &[], &rho, &mut fa);
                     best_a = best_a.min(t.elapsed().as_secs_f64() * 1e3);
-                    std::hint::black_box(p);
+                    black_box(p);
                 }
                 format!("{best_a:6.2} ms")
             } else {
@@ -4159,6 +4199,7 @@ mod tests {
     #[test]
     #[ignore = "heavy benchmark; run explicitly with --release --ignored --nocapture"]
     fn runtime_m25() {
+        const REPS: usize = 3;
         use std::time::Instant;
 
         // Match the full-prover profile (P-core pool) for an apples-to-apples ratio.
@@ -4182,14 +4223,12 @@ mod tests {
         let z_row = sample_vec(&mut rc, n);
         let z_col = sample_vec(&mut rc, k);
 
-        let mb = (len * std::mem::size_of::<F128>()) as f64 / (1024.0 * 1024.0);
+        let mb = (len * size_of::<F128>()) as f64 / (1024.0 * 1024.0);
         eprintln!("\n[jagged runtime] m={m} ({len} F128 = {mb:.0} MB), n={n}, k={k}, cols={cols}");
 
-        const REPS: usize = 3;
-
         // --- Phase 1: B-vector + claim generation, serial vs parallel-fused. ---
-        let mut t_gen_ser = std::time::Duration::MAX;
-        let mut t_gen_par = std::time::Duration::MAX;
+        let mut t_gen_ser = Duration::MAX;
+        let mut t_gen_par = Duration::MAX;
         let (mut b, mut v) = (Vec::new(), F128::ZERO);
         for _ in 0..REPS {
             // Serial reference: column-major build + separate v reduction.
@@ -4210,7 +4249,7 @@ mod tests {
                 vs += *qi * *bi;
             }
             t_gen_ser = t_gen_ser.min(t0.elapsed());
-            std::hint::black_box(&bs);
+            black_box(&bs);
 
             // Parallel fused helper (the production path; also emits round 1's
             // message, so it does slightly more work than the serial baseline).
@@ -4227,7 +4266,7 @@ mod tests {
         // min over REPS to suppress thermal / allocator variance. ---
 
         // Serial: in-place fold; unfused = msg pass + fold pass, fused = both in one.
-        let run_serial = |fused: bool| -> std::time::Duration {
+        let run_serial = |fused: bool| -> Duration {
             let mut a = q.clone();
             let mut bb = b.clone();
             let mut ch = FsChallenger::new(b"flock-jagged-bench");
@@ -4254,12 +4293,12 @@ mod tests {
                     fold_in_place_pair(&mut a, &mut bb, r);
                 }
             }
-            std::hint::black_box(a[0]);
+            black_box(a[0]);
             t.elapsed()
         };
 
         // Parallel: rayon kernels, ping-pong between two out-of-place buffers.
-        let run_par = |fused: bool| -> std::time::Duration {
+        let run_par = |fused: bool| -> Duration {
             let mut a = q.clone(); // len N
             let mut bb = b.clone();
             let mut sa = vec![F128::ZERO; len / 2];
@@ -4296,18 +4335,18 @@ mod tests {
                 } else {
                     fold_oop_par(&a[..cur], &bb[..cur], r, &mut sa[..half], &mut sb[..half]);
                 }
-                std::mem::swap(&mut a, &mut sa);
-                std::mem::swap(&mut bb, &mut sb);
+                swap(&mut a, &mut sa);
+                swap(&mut bb, &mut sb);
                 cur = half;
             }
-            std::hint::black_box(a[0]);
+            black_box(a[0]);
             t.elapsed()
         };
 
-        let mut s_unf = std::time::Duration::MAX;
-        let mut s_fus = std::time::Duration::MAX;
-        let mut p_unf = std::time::Duration::MAX;
-        let mut p_fus = std::time::Duration::MAX;
+        let mut s_unf = Duration::MAX;
+        let mut s_fus = Duration::MAX;
+        let mut p_unf = Duration::MAX;
+        let mut p_fus = Duration::MAX;
         for _ in 0..REPS {
             s_unf = s_unf.min(run_serial(false));
             s_fus = s_fus.min(run_serial(true));
@@ -4319,12 +4358,10 @@ mod tests {
         let point: Vec<F128> = (0..m).map(|_| rc.sample_f128()).collect();
         let t2 = Instant::now();
         let beta = f_hat_t(&params, &z_row, &z_col, &point);
-        std::hint::black_box(beta);
+        black_box(beta);
         let t_ver = t2.elapsed();
 
-        let ratio = |unf: std::time::Duration, fus: std::time::Duration| {
-            unf.as_secs_f64() / fus.as_secs_f64()
-        };
+        let ratio = |unf: Duration, fus: Duration| unf.as_secs_f64() / fus.as_secs_f64();
         eprintln!("  threads: {}", rayon::current_num_threads());
         eprintln!(
             "  f̂_t-gen (B + claim) serial {:>8.1?} → parallel {:>8.1?}   ({:.2}x)",
@@ -4386,7 +4423,7 @@ mod tests {
         let z_row = sample_vec(&mut rc, n);
         let z_col = sample_vec(&mut rc, k);
 
-        let best3 = |f: &mut dyn FnMut() -> std::time::Duration| (0..3).map(|_| f()).min().unwrap();
+        let best3 = |f: &mut dyn FnMut() -> Duration| (0..3).map(|_| f()).min().unwrap();
 
         // Warm-up (thread pool + page faults).
         let mut ch = FsChallenger::new(b"flock-jagged-bits30");
@@ -4396,12 +4433,12 @@ mod tests {
         let t_prove = best3(&mut || {
             let mut ch = FsChallenger::new(b"flock-jagged-bits30");
             let t = Instant::now();
-            std::hint::black_box(prove(&params, &q, &z_row, &z_col, &mut ch));
+            black_box(prove(&params, &q, &z_row, &z_col, &mut ch));
             t.elapsed()
         });
 
         // Main + assist, and keep one transcript for the verifier runs.
-        let mut t_both = std::time::Duration::MAX;
+        let mut t_both = Duration::MAX;
         let mut kept = None;
         for _ in 0..3 {
             let mut ch = FsChallenger::new(b"flock-jagged-bits30");
@@ -4416,9 +4453,7 @@ mod tests {
         let t_verify_direct = best3(&mut || {
             let mut ch = FsChallenger::new(b"flock-jagged-bits30");
             let t = Instant::now();
-            std::hint::black_box(
-                verify(&params, &z_row, &z_col, v, &proof, &mut ch).expect("verify"),
-            );
+            black_box(verify(&params, &z_row, &z_col, v, &proof, &mut ch).expect("verify"));
             t.elapsed()
         });
 
@@ -4426,7 +4461,7 @@ mod tests {
         let t_verify_assist = best3(&mut || {
             let mut ch = FsChallenger::new(b"flock-jagged-bits30");
             let t = Instant::now();
-            std::hint::black_box(
+            black_box(
                 verify_with_assist(&params, &z_row, &z_col, v, &proof, &assist, &mut ch)
                     .expect("verify_with_assist"),
             );
@@ -4537,11 +4572,11 @@ mod tests {
                     );
                 }
                 per_round.push(t.elapsed());
-                std::mem::swap(&mut a, &mut sa);
-                std::mem::swap(&mut bb, &mut sb);
+                swap(&mut a, &mut sa);
+                swap(&mut bb, &mut sb);
                 cur = half;
             }
-            let t_rounds: std::time::Duration = per_round.iter().sum();
+            let t_rounds: Duration = per_round.iter().sum();
             let total = t_gen + t_alloc + t_rounds;
 
             eprintln!("--- trial {trial}  (total {total:.3?})");
@@ -4552,7 +4587,7 @@ mod tests {
             eprintln!("  buffer alloc    : {t_alloc:>9.3?}");
             // Fold round j reads 2·cur and writes cur elements (two arrays each).
             let round_bytes = |j: usize| 3 * (len >> j) * 16;
-            let tail: std::time::Duration = per_round[4..].iter().sum();
+            let tail: Duration = per_round[4..].iter().sum();
             for (j, d) in per_round.iter().take(4).enumerate() {
                 eprintln!(
                     "  fold+msg round {:>2}: {d:>8.3?}  ({:>5.1} GB/s of {} MB)",
@@ -4657,7 +4692,7 @@ mod tests {
             let t = Instant::now();
             let mut ch = FsChallenger::new(b"flock-assist-cmp");
             let p = prove_assist(&params, &z_row, &z_col, &z_idx, &mut ch);
-            std::hint::black_box(&p);
+            black_box(&p);
             t_single = t_single.min(t.elapsed().as_secs_f64());
         }
 
@@ -4687,7 +4722,7 @@ mod tests {
             let t = Instant::now();
             let mut ch = FsChallenger::new(b"flock-assist-cmp");
             let p = prove_frobenius_assist(&params, &claims, &[], &rho, &mut ch);
-            std::hint::black_box(&p);
+            black_box(&p);
             t_frob = t_frob.min(t.elapsed().as_secs_f64());
         }
 
@@ -4720,6 +4755,8 @@ mod tests {
     #[test]
     #[ignore = "diagnostic; run with --release --ignored --nocapture"]
     fn scaling_diag() {
+        const REPS: usize = 6;
+        const CHUNK: usize = 1 << 13;
         use rayon::prelude::*;
         use std::time::{Duration, Instant};
         let _ = crate::init_perf_thread_pool();
@@ -4737,8 +4774,8 @@ mod tests {
             lo: 0x9E37,
             hi: 0x1234,
         };
-        const REPS: usize = 6;
-        const CHUNK: usize = 1 << 13; // coarse: 8K outputs / task
+
+        // coarse: 8K outputs / task
 
         let bench = |f: &mut dyn FnMut()| {
             let mut t = Duration::MAX;
@@ -4809,10 +4846,10 @@ mod tests {
 
         // --- real round message (contiguous a+b read): round_msg vs round_msg_par ---
         let ts = bench(&mut || {
-            std::hint::black_box(round_msg(&a, &b));
+            black_box(round_msg(&a, &b));
         });
         let tp_fine = bench(&mut || {
-            std::hint::black_box(round_msg_par(&a, &b));
+            black_box(round_msg_par(&a, &b));
         });
         // Coarse reduction: per-chunk local accumulator, then combine.
         let tp_coarse = bench(&mut || {
@@ -4828,7 +4865,7 @@ mod tests {
                     },
                 )
                 .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (s, t)| (p + s, q + t));
-            std::hint::black_box(acc);
+            black_box(acc);
         });
         let rd_bytes = len * 16 * 2; // read all of a and b
         eprintln!(
@@ -4860,7 +4897,7 @@ mod tests {
                     (g1, gi)
                 })
                 .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (s, t)| (p + s, q + t));
-            std::hint::black_box(acc);
+            black_box(acc);
         });
         eprintln!(
             "  round_msg par.slice(chunks_exact)   {:>7.1?} ({:>4.0} GB/s)  {:.2}x",
@@ -4900,8 +4937,8 @@ mod tests {
                         &mut sb[..half_r],
                     );
                 }
-                std::mem::swap(&mut av, &mut sa);
-                std::mem::swap(&mut bv, &mut sb);
+                swap(&mut av, &mut sa);
+                swap(&mut bv, &mut sb);
                 round_t[rd + 1] = round_t[rd + 1].min(t.elapsed());
                 cur = half_r;
             }
@@ -4917,8 +4954,8 @@ mod tests {
             tail,
             100.0 * tail.as_secs_f64() / total.as_secs_f64()
         );
-        std::hint::black_box(&out);
-        std::hint::black_box(&dst);
+        black_box(&out);
+        black_box(&dst);
     }
 
     #[test]

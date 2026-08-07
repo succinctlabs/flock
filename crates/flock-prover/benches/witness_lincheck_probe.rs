@@ -12,6 +12,8 @@
 //! outputs. Inputs are seeded, so the checksums must be bit-stable across
 //! any valid optimization.
 
+use std::array::from_fn;
+use std::env::args;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -47,8 +49,8 @@ impl Rng {
 }
 
 fn random_compression(rng: &mut Rng) -> Compression {
-    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+    let m: [u32; 16] = from_fn(|_| rng.next_u32());
     (cv, m, rng.next_u32() as u64, 64u32, 11u32)
 }
 
@@ -72,14 +74,8 @@ impl Fnv {
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
-    let n_runs: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-    let n_blocks: usize = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(65536);
+    let n_runs: usize = args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let n_blocks: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(65536);
 
     let n_log = min_n_blocks_log(n_blocks);
     let setup = Blake3Setup::new(n_blocks);

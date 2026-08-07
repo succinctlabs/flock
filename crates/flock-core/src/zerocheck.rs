@@ -18,7 +18,16 @@
 use crate::challenger::Challenger;
 use crate::field::{F8, F128};
 use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
+use crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v;
 use serde::{Deserialize, Serialize};
+use std::env::var;
+use std::env::var_os;
+use std::mem::replace;
+use std::mem::swap;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 pub mod multilinear;
 pub mod univariate_skip;
@@ -56,9 +65,9 @@ pub const SPARSE_TAIL_GATE: usize = 1;
 /// tuning knob for A/B experiments; the constant above is the default.
 /// Value-identical either way (the sparse kernels drop only zero terms).
 fn sparse_tail_gate() -> usize {
-    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static GATE: OnceLock<usize> = OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("FLOCK_SPARSE_GATE")
+        var("FLOCK_SPARSE_GATE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(SPARSE_TAIL_GATE)
@@ -368,8 +377,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     capture_s_hat_v_c: bool,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
+    const N_INNER: usize = 7;
     let k_skip = K_SKIP;
-    const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
+    // 3 small + 4 medium fixed-constant eq dims
     assert!(
         m >= k_skip + N_INNER,
         "prove requires m >= k_skip + N_INNER (= {})",
@@ -411,23 +421,15 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
-    let t_round1 = std::time::Instant::now();
+    let zc_timing = var_os("FLOCK_ZC_TIMING").is_some();
+    let t_round1 = Instant::now();
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
     let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if capture_s_hat_v_c {
-        let (ab, c, s) =
-            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
-                a_packed,
-                b_packed,
-                c_packed,
-                m,
-                k_skip,
-                &r,
-                &inv_table,
-                padding,
-            );
+        let (ab, c, s) = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+            a_packed, b_packed, c_packed, m, k_skip, &r, &inv_table, padding,
+        );
         (ab, c, Some(s))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
@@ -464,7 +466,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Convention A wrapping: pass `mlv_arg[0] = ONE` so the function's output
     // `mlv_arg[0] · G(1)` becomes the bare `G(1)` we send on the wire. The
     // verifier samples ρ_1 after observing this message.
-    let t_round2 = std::time::Instant::now();
+    let t_round2 = Instant::now();
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
@@ -523,7 +525,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             t_round2.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t_tail = std::time::Instant::now();
+    let t_tail = Instant::now();
     let mut multilinear_msgs = Vec::with_capacity(n_mlv);
     multilinear_msgs.push((msg_1, msg_inf));
     challenger.observe_f128(msg_1);
@@ -546,10 +548,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // output); only needed when the first round is actually fused.
     let n_in = a_mlv.len();
     let (mut a_nxt, mut b_nxt) = if n_in >= 1024 {
-        (
-            crate::scratch::take_f128(n_in / 2),
-            crate::scratch::take_f128(n_in / 2),
-        )
+        (take_f128(n_in / 2), take_f128(n_in / 2))
     } else {
         (Vec::new(), Vec::new())
     };
@@ -585,8 +584,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             // padded buffer and zero the rest.
             let a_full = multilinear::expand_to_dense(&a_mlv, &st, domain);
             let b_full = multilinear::expand_to_dense(&b_mlv, &st, domain);
-            crate::scratch::give_f128(std::mem::replace(&mut a_mlv, a_full));
-            crate::scratch::give_f128(std::mem::replace(&mut b_mlv, b_full));
+            give_f128(replace(&mut a_mlv, a_full));
+            give_f128(replace(&mut b_mlv, b_full));
             sparse_dirty = false;
         }
 
@@ -596,10 +595,10 @@ fn prove_packed_padded_inner<C: Challenger>(
             // only round outward by one slot per interval end.
             let cap = st.len() + 2 * st.intervals().len() + 2;
             if a_nxt.len() < cap {
-                crate::scratch::give_f128(a_nxt);
-                crate::scratch::give_f128(b_nxt);
-                a_nxt = crate::scratch::take_f128(cap);
-                b_nxt = crate::scratch::take_f128(cap);
+                give_f128(a_nxt);
+                give_f128(b_nxt);
+                a_nxt = take_f128(cap);
+                b_nxt = take_f128(cap);
             }
             let (m1, mi, store_out) = fold_and_round_pair_sparse_into(
                 &a_mlv,
@@ -611,8 +610,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                 st,
                 domain,
             );
-            std::mem::swap(&mut a_mlv, &mut a_nxt);
-            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            swap(&mut a_mlv, &mut a_nxt);
+            swap(&mut b_mlv, &mut b_nxt);
             a_mlv.truncate(store_out.len());
             b_mlv.truncate(store_out.len());
             store = Some(store_out);
@@ -632,8 +631,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             // folded size. The old (larger) buffer becomes scratch; we only
             // ever write its leading `half` slots next round, so its stale
             // length is harmless.
-            std::mem::swap(&mut a_mlv, &mut a_nxt);
-            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            swap(&mut a_mlv, &mut a_nxt);
+            swap(&mut b_mlv, &mut b_nxt);
             a_mlv.truncate(half);
             b_mlv.truncate(half);
             (m1, mi)
@@ -679,10 +678,10 @@ fn prove_packed_padded_inner<C: Challenger>(
 
     // Recycle the four tail buffers (the two len-1 survivors still own their
     // full round-2 capacity) for the next phase/prove.
-    crate::scratch::give_f128(a_mlv);
-    crate::scratch::give_f128(b_mlv);
-    crate::scratch::give_f128(a_nxt);
-    crate::scratch::give_f128(b_nxt);
+    give_f128(a_mlv);
+    give_f128(b_mlv);
+    give_f128(a_nxt);
+    give_f128(b_nxt);
 
     if zc_timing {
         eprintln!(
@@ -725,9 +724,9 @@ pub fn verify<C: Challenger>(
     proof: &ZerocheckProof,
     challenger: &mut C,
 ) -> Result<ZerocheckClaim, VerifyError> {
+    const N_INNER: usize = 7;
     let m = log_n;
     let k_skip = K_SKIP;
-    const N_INNER: usize = 7;
 
     if m < k_skip + N_INNER {
         return Err(VerifyError::LogNTooSmall { log_n: m, k_skip });

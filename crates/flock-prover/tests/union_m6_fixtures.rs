@@ -32,6 +32,7 @@
 //! Re-pinned 2026-08-02: Merkle capping (proof_io v7): cap layers absorbed instead of roots (ObserveBytes 32 -> 32*2^c per commit absorb); octopus multi-proofs replaced by flat per-query capped paths.
 
 use ::sha2 as sha2_hash;
+use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
 use flock_prover::challenger::FsChallenger;
 use flock_prover::mixed::MixedRegistryId;
@@ -42,6 +43,8 @@ use flock_prover::r1cs_hashes::{blake3, sha2};
 use flock_prover::schedule::{Registry, TableType};
 use flock_prover::union::UnionInstance;
 use sha2_hash::Digest as _;
+use std::array::from_fn;
+use std::env::var_os;
 
 const DOMAIN: &[u8] = b"flock-m6-fixture-v0";
 
@@ -63,8 +66,8 @@ impl Rng {
 fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
     (0..n)
         .map(|_| {
-            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = from_fn(|_| rng.next_u32());
             let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
             (cv, m, counter, 64u32, 11u32)
         })
@@ -73,12 +76,7 @@ fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
 
 fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
     (0..n)
-        .map(|_| {
-            (
-                std::array::from_fn(|_| rng.next_u32()),
-                std::array::from_fn(|_| rng.next_u32()),
-            )
-        })
+        .map(|_| (from_fn(|_| rng.next_u32()), from_fn(|_| rng.next_u32())))
         .collect()
 }
 
@@ -90,7 +88,7 @@ fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
 // dual value each); the multipoint label bumped to v1, so even the
 // boolean-only fixtures here (no packed-direct claims) move.
 fn check(label: &str, expected: &str, got: String) {
-    if std::env::var_os("M6_FIXTURES_PRINT").is_some() {
+    if var_os("M6_FIXTURES_PRINT").is_some() {
         println!("(\"{label}\", \"{got}\"),");
         return;
     }
@@ -172,7 +170,7 @@ fn m6_merged_union_proof_bytes_pinned() {
             m: union.dense_m(),
             log_inv_rate: 1,
             log_batch_size: 6,
-            profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+            profile: LigeritoProfile::Fast,
             // The shipped union configuration (integer-lane commit).
             num_lanes: union.commit_lanes(6),
             merkle_hash: Default::default(),
@@ -241,12 +239,8 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
             circuit,
         );
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claim) = prover::prove_fast_ligerito_union(
-            &union,
-            &setup.pcs_params,
-            vec![slot],
-            &mut ch,
-        );
+        let (proof, commitment, claim) =
+            prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         check(
             "merged-anchor-blake3-m22",
             EXPECTED,
@@ -273,12 +267,8 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
             circuit,
         );
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claim) = prover::prove_fast_ligerito_union(
-            &union,
-            &setup.pcs_params,
-            vec![slot],
-            &mut ch,
-        );
+        let (proof, commitment, claim) =
+            prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         check(
             "merged-anchor-sha2-m22",
             EXPECTED,

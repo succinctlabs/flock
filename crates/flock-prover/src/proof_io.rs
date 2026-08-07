@@ -32,6 +32,27 @@
 //! // Then call e.g. `setup.verify(&bundle.commitment, &bundle.proof, ...)`.
 //! ```
 
+use crate::mixed::MixedRegistryId;
+#[cfg(test)]
+use crate::r1cs_hashes::blake3::Compression as Blake3Compression;
+use crate::r1cs_hashes::chain_common::ChainProofLigerito;
+#[cfg(test)]
+use crate::r1cs_hashes::sha2::Compression as Sha2Compression;
+use flock_core::proof::R1csProofLigerito;
+use flock_core::proof::R1csProofMergedLigerito;
+#[cfg(test)]
+use std::array::from_fn;
+#[cfg(test)]
+use std::env::temp_dir;
+use std::error::Error;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::fs::read;
+#[cfg(test)]
+use std::fs::remove_file;
+use std::fs::rename;
+use std::fs::write;
 use std::io;
 use std::path::Path;
 
@@ -170,8 +191,8 @@ pub enum DeserializeError {
     Bincode(bincode::Error),
 }
 
-impl std::fmt::Display for DeserializeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for DeserializeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::BadMagic => write!(f, "bad magic: not a FLOCK proof file"),
             Self::UnsupportedVersion(v) => {
@@ -187,7 +208,7 @@ impl std::fmt::Display for DeserializeError {
     }
 }
 
-impl std::error::Error for DeserializeError {}
+impl Error for DeserializeError {}
 
 impl From<bincode::Error> for DeserializeError {
     fn from(e: bincode::Error) -> Self {
@@ -202,7 +223,7 @@ impl From<bincode::Error> for DeserializeError {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct R1csProofBundleLigerito {
     pub commitment: Commitment,
-    pub proof: flock_core::proof::R1csProofLigerito,
+    pub proof: R1csProofLigerito,
 }
 
 /// Bundles a hash-chain proof with its commitment + public endpoint bits
@@ -214,7 +235,7 @@ pub struct R1csProofBundleLigerito {
 pub struct ChainProofBundleLigerito {
     pub hash_kind: HashKind,
     pub commitment: Commitment,
-    pub proof: crate::r1cs_hashes::chain_common::ChainProofLigerito,
+    pub proof: ChainProofLigerito,
     pub cv_0_phys: Vec<bool>,
     pub cv_last_phys: Vec<bool>,
 }
@@ -258,12 +279,12 @@ impl ChainProofBundleLigerito {
 /// — no per-invocation I/O binding.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MixedProofBundleLigerito {
-    pub registry_id: crate::mixed::MixedRegistryId,
+    pub registry_id: MixedRegistryId,
     /// Declared invocation counts, in slot order (for the current tiers:
     /// SHA-256, then BLAKE3).
     pub counts: Vec<u64>,
     pub commitment: Commitment,
-    pub proof: flock_core::proof::R1csProofMergedLigerito,
+    pub proof: R1csProofMergedLigerito,
 }
 
 impl MixedProofBundleLigerito {
@@ -350,13 +371,13 @@ pub fn write_bytes_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<
         )),
         None => Path::new(".flock-proof.tmp").to_path_buf(),
     };
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    write(&tmp, bytes)?;
+    rename(&tmp, path)
 }
 
 /// Read raw bytes from a file. Thin wrapper over `std::fs::read`.
 pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-    std::fs::read(path)
+    read(path)
 }
 
 /// Write a Ligerito chain bundle to `path`.
@@ -383,8 +404,8 @@ pub enum BundleReadError {
     Deserialize(DeserializeError),
 }
 
-impl std::fmt::Display for BundleReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for BundleReadError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Deserialize(e) => write!(f, "deserialize error: {e}"),
@@ -392,7 +413,7 @@ impl std::fmt::Display for BundleReadError {
     }
 }
 
-impl std::error::Error for BundleReadError {}
+impl Error for BundleReadError {}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -422,11 +443,11 @@ mod tests {
     /// Build a small honest BLAKE3 chain (n=8) for the bundle tests.
     fn honest_chain(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8]) {
         let mut rng = Rng::new(seed);
-        let mut cv: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
+        let mut cv: [u32; 8] = from_fn(|_| rng.nx() as u32);
         let cv0 = cv;
         let mut blocks = Vec::with_capacity(n);
         for _ in 0..n {
-            let m: [u32; 16] = std::array::from_fn(|_| rng.nx() as u32);
+            let m: [u32; 16] = from_fn(|_| rng.nx() as u32);
             let counter = 0u64;
             let block_len = 64u32;
             let flags = 0u32;
@@ -481,10 +502,10 @@ mod tests {
         }
 
         // File roundtrip.
-        let path = std::env::temp_dir().join("flock-proofio-roundtrip.bin");
+        let path = temp_dir().join("flock-proofio-roundtrip.bin");
         write_bytes_to_file(&path, &bytes).expect("write");
         let read_back = read_bytes_from_file(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
+        let _ = remove_file(&path);
         let bundle4 = R1csProofBundleLigerito::from_bytes(&read_back).expect("file round-trip");
         let mut chv = FsChallenger::new(b"flock-proofio-lig");
         setup
@@ -599,10 +620,10 @@ mod tests {
         );
 
         // File roundtrip.
-        let path = std::env::temp_dir().join("flock-proofio-mixed-roundtrip.bin");
+        let path = temp_dir().join("flock-proofio-mixed-roundtrip.bin");
         write_mixed_bundle_ligerito_to_file(&path, &bundle).expect("write");
         let bundle3 = read_mixed_bundle_ligerito_from_file(&path).expect("file round-trip");
-        let _ = std::fs::remove_file(&path);
+        let _ = remove_file(&path);
         assert_eq!(bundle3.counts, bundle.counts);
 
         eprintln!(
@@ -615,32 +636,21 @@ mod tests {
 
     /// Deterministic input generators shared with the mixed bundle test.
     mod flock_prover_test_inputs {
-        use super::Rng;
+        use super::{Blake3Compression, Rng, Sha2Compression, from_fn};
 
-        pub fn random_blake3_inputs(
-            rng: &mut Rng,
-            n: usize,
-        ) -> Vec<crate::r1cs_hashes::blake3::Compression> {
+        pub fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<Blake3Compression> {
             (0..n)
                 .map(|_| {
-                    let cv: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
-                    let m: [u32; 16] = std::array::from_fn(|_| rng.nx() as u32);
+                    let cv: [u32; 8] = from_fn(|_| rng.nx() as u32);
+                    let m: [u32; 16] = from_fn(|_| rng.nx() as u32);
                     (cv, m, rng.nx(), 64u32, 11u32)
                 })
                 .collect()
         }
 
-        pub fn random_sha2_inputs(
-            rng: &mut Rng,
-            n: usize,
-        ) -> Vec<crate::r1cs_hashes::sha2::Compression> {
+        pub fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<Sha2Compression> {
             (0..n)
-                .map(|_| {
-                    (
-                        std::array::from_fn(|_| rng.nx() as u32),
-                        std::array::from_fn(|_| rng.nx() as u32),
-                    )
-                })
+                .map(|_| (from_fn(|_| rng.nx() as u32), from_fn(|_| rng.nx() as u32)))
                 .collect()
         }
     }

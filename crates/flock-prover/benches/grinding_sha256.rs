@@ -8,6 +8,7 @@
 //! For each `c`, runs many independent grindings (each with a fresh 32-byte
 //! prefix) so the geometric noise in number of tries averages out.
 
+use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -165,7 +166,7 @@ fn main() {
 
     // Pre-warm the SHA-256 unit (first call sometimes shows JIT-style startup).
     let warm = hash_with_nonce(&[0u8; 32], 0);
-    std::hint::black_box(&warm);
+    black_box(&warm);
 
     println!("SHA-256 grinding cost — hardware-accelerated (sha2 crate, asm feature)");
     #[cfg(target_arch = "aarch64")]

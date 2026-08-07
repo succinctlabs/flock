@@ -17,6 +17,15 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+use crate::field::F128;
+use std::alloc::Layout;
+use std::alloc::alloc_zeroed;
+use std::alloc::handle_alloc_error;
+use std::env::var;
+use std::process::Command;
+use std::str::from_utf8;
+use std::sync::OnceLock;
+use std::thread::available_parallelism;
 pub mod aggregate;
 pub mod bits;
 pub mod challenger;
@@ -60,7 +69,7 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
-    if std::env::var("RAYON_NUM_THREADS").is_ok() {
+    if var("RAYON_NUM_THREADS").is_ok() {
         return None;
     }
     let n = perf_core_count();
@@ -105,8 +114,8 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
 }
 
 /// Compatibility shim — same as `alloc_uninit_vec::<F128>(n)`.
-pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<crate::field::F128> {
-    alloc_uninit_vec::<crate::field::F128>(n)
+pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<F128> {
+    alloc_uninit_vec::<F128>(n)
 }
 
 /// At/above this round width (in summed elements) a sumcheck round uses the full
@@ -153,9 +162,9 @@ pub(crate) fn sumcheck_round_min_len(pairs: usize, n_blocks: usize) -> Option<us
 pub(crate) const FOLD_PAR_THRESHOLD_DEFAULT: usize = 1 << 16;
 
 pub(crate) fn fold_par_threshold() -> usize {
-    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static GATE: OnceLock<usize> = OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("FLOCK_FOLD_GATE")
+        var("FLOCK_FOLD_GATE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(FOLD_PAR_THRESHOLD_DEFAULT)
@@ -194,8 +203,8 @@ pub(crate) fn fold_min_len(half: usize) -> Option<usize> {
 /// part; that module is not in this tree, so the knob preserves it rather than
 /// deleting it.
 pub(crate) fn fold_sqrt_rule() -> bool {
-    static RULE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *RULE.get_or_init(|| std::env::var("FLOCK_FOLD_RULE").is_ok_and(|v| v == "sqrt"))
+    static RULE: OnceLock<bool> = OnceLock::new();
+    *RULE.get_or_init(|| var("FLOCK_FOLD_RULE").is_ok_and(|v| v == "sqrt"))
 }
 
 /// A length-`n` all-zero vector from `alloc_zeroed` — LAZY zero pages from
@@ -206,16 +215,16 @@ pub(crate) fn alloc_zeroed_vec<T: Copy>(n: usize) -> Vec<T> {
     if n == 0 {
         return Vec::new();
     }
-    let layout = std::alloc::Layout::array::<T>(n).expect("allocation size overflows");
+    let layout = Layout::array::<T>(n).expect("allocation size overflows");
     // SAFETY:
     // - `alloc_zeroed` returns `n * size_of::<T>()` zeroed bytes with the
     //   layout's alignment (or null, handled below).
     // - T: Copy (no Drop) and the all-zero bit pattern must be a valid T —
     //   true for the plain-old-data field/word types this crate uses it for.
     unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
+        let ptr = alloc_zeroed(layout) as *mut T;
         if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
+            handle_alloc_error(layout);
         }
         Vec::from_raw_parts(ptr, n, n)
     }
@@ -244,10 +253,10 @@ pub(crate) fn perf_core_count_cached() -> usize {
 fn perf_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("sysctl")
+        if let Ok(out) = Command::new("sysctl")
             .args(["-n", "hw.perflevel0.physicalcpu"])
             .output()
-            && let Ok(s) = std::str::from_utf8(&out.stdout)
+            && let Ok(s) = from_utf8(&out.stdout)
             && let Ok(n) = s.trim().parse::<usize>()
             && n > 0
         {
@@ -265,9 +274,7 @@ fn perf_core_count() -> usize {
             return n.min(available);
         }
     }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 /// Count distinct physical cores via `/sys` topology: one entry per unique

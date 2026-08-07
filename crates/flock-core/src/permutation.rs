@@ -58,8 +58,14 @@
 //! F128-packed multilinears, and mirrors the eq-trick sumcheck verifier chain in
 //! `zerocheck.rs`.
 
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::env::var;
+use std::mem::replace;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::challenger::Challenger;
 use crate::field::F128;
@@ -252,9 +258,9 @@ const PAR_THRESHOLD_DEFAULT: usize = 1 << 14;
 /// [`PAR_THRESHOLD_DEFAULT`], overridable via `FLOCK_PERM_PAR_GATE` for tuning
 /// (mirrors `zerocheck::sparse_tail_gate`). Read once.
 fn par_threshold() -> usize {
-    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static GATE: OnceLock<usize> = OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("FLOCK_PERM_PAR_GATE")
+        var("FLOCK_PERM_PAR_GATE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(PAR_THRESHOLD_DEFAULT)
@@ -271,12 +277,12 @@ fn fold_in_place(u: &mut Vec<F128>, rho: F128) {
     if half >= par_threshold() {
         // `take_f128(half)` returns a length-`half` buffer; the map writes every
         // slot (write-before-read contract satisfied).
-        let mut out = crate::scratch::take_f128(half);
+        let mut out = take_f128(half);
         out.par_iter_mut().enumerate().for_each(|(x, o)| {
             *o = u[2 * x] * one_minus + u[2 * x + 1] * rho;
         });
-        let old = std::mem::replace(u, out);
-        crate::scratch::give_f128(old);
+        let old = replace(u, out);
+        give_f128(old);
     } else {
         for x in 0..half {
             u[x] = u[2 * x] * one_minus + u[2 * x + 1] * rho;
@@ -541,15 +547,15 @@ pub fn prove<C: Challenger>(
     let mu = n.trailing_zeros() as usize;
 
     // Phase timing (set PERM_TRACE=1). `tp` returns ms since the last reset.
-    let trace = std::env::var("PERM_TRACE").is_ok();
-    let mut t = std::time::Instant::now();
+    let trace = var("PERM_TRACE").is_ok();
+    let mut t = Instant::now();
     let mut tp = |label: &str| {
         if trace {
             eprintln!(
                 "  [perm-prove] {label:<14} {:8.3} ms",
                 t.elapsed().as_secs_f64() * 1e3
             );
-            t = std::time::Instant::now();
+            t = Instant::now();
         }
     };
 

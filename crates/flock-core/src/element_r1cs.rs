@@ -67,7 +67,10 @@ pub mod lincheck;
 pub mod union;
 pub mod zerocheck;
 
+use crate::zerocheck::univariate_skip::build_eq;
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::time::Instant;
 
 use crate::challenger::Challenger;
 use crate::field::F128;
@@ -922,7 +925,7 @@ fn broadcast_add(v: &mut [F128], c: &[F128], n_log: usize) {
 /// unity over the row block). `O(2^kappa)` for the verifier.
 fn strip_constants(ty: &ElementTableType, zc: &zerocheck::Claim) -> (F128, F128) {
     let r_con = &zc.r[zc.r.len() - ty.kappa()..];
-    let eq_con = crate::zerocheck::univariate_skip::build_eq(r_con);
+    let eq_con = build_eq(r_con);
     let dot = |c: &[F128]| -> F128 {
         eq_con
             .iter()
@@ -1399,6 +1402,9 @@ mod e2e_tests {
     /// `ẑ(r')` by the lincheck's residual check.
     #[test]
     fn wrong_claim_values_are_rejected() {
+        // `ea`/`eb` feed the lincheck target, so tampering with either breaks
+        // the reduction rather than the zerocheck.
+        type Tamper = fn(&mut ElementProof);
         let mut rng = Rng::new(161803);
         let (n_log, n) = (6usize, 40usize);
         let ty = mult_gate(2);
@@ -1427,9 +1433,6 @@ mod e2e_tests {
             "wrong z_eval"
         );
 
-        // `ea`/`eb` feed the lincheck target, so tampering with either breaks
-        // the reduction rather than the zerocheck.
-        type Tamper = fn(&mut ElementProof);
         for (name, mutate) in [
             ("ea", (|p| p.zerocheck.ea += F128::ONE) as Tamper),
             ("eb", |p| p.zerocheck.eb += F128::ONE),
@@ -1572,19 +1575,19 @@ mod e2e_tests {
         let n = (1usize << n_log) - 3; // non-trivial, near-full utilization
         let z = mult_witness(&ty, n_log, n, &mut Rng::new(7));
 
-        let t_wit = std::time::Instant::now();
+        let t_wit = Instant::now();
         let (mut pa, mut pb) = ty.apply(&z, n_log);
         broadcast_add(&mut pa, ty.a_const(), n_log);
         broadcast_add(&mut pb, ty.b_const(), n_log);
         let wit_ms = t_wit.elapsed().as_secs_f64() * 1e3;
 
         let mut ch = FsChallenger::new(b"element-smoke");
-        let t_zc = std::time::Instant::now();
+        let t_zc = Instant::now();
         let (_zc_proof, zc_claim) = zerocheck::prove(pa, pb, &z, n_log + kappa, &mut ch);
         let zc_ms = t_zc.elapsed().as_secs_f64() * 1e3;
 
         let (va, vb) = strip_constants(&ty, &zc_claim);
-        let t_lc = std::time::Instant::now();
+        let t_lc = Instant::now();
         let (_lc_proof, lc_claim) = lincheck::prove(&ty, &z, n_log, &zc_claim.r, va, vb, &mut ch);
         let lc_ms = t_lc.elapsed().as_secs_f64() * 1e3;
 

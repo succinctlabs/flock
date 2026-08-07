@@ -949,6 +949,7 @@ fn round1_shift_reduce_extract_c_packed_serial(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(test)]
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
 
@@ -1528,7 +1529,7 @@ mod tests {
             for i in 0..3 {
                 r[K_SKIP + i] = phi8(F8(SMALL_CHAL_F8[i]));
             }
-            let medium = crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash();
+            let medium = medium_challenges_ghash();
             for i in 0..4 {
                 r[K_SKIP + 3 + i] = medium[i];
             }
@@ -1540,8 +1541,8 @@ mod tests {
             }
 
             let inv_table = {
-                let ntt_s = crate::ntt::AdditiveNttGf8::new(K_SKIP, F8::ZERO);
-                let ntt_l = crate::ntt::AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
+                let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
+                let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
                 InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
             };
 

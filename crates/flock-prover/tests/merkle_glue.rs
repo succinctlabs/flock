@@ -8,11 +8,13 @@
 
 use flock_core::r1cs::BlockR1cs;
 use flock_prover::r1cs_hashes::blake3;
+use flock_prover::r1cs_hashes::blake3::build_matrices;
 use flock_prover::r1cs_hashes::merkle_glue::{BitSpreadTable, SwapInput, SwapTable};
 use flock_prover::r1cs_hashes::merkle_r1cs::{
     BLAKE3_FLAG_CHUNK_END, BLAKE3_FLAG_CHUNK_START, BLAKE3_FLAG_PARENT, ChunkPathInput,
     MerkleTreeLayout, NODE_BLOCK_LEN, NODE_COUNTER, SLOT_WORDS, blake3_spec,
 };
+use std::array::from_fn;
 
 /// One compression's output chaining value.
 fn cv(h: &[u32; 8], m: &[u32; 16], flags: u32) -> [u32; SLOT_WORDS] {
@@ -30,7 +32,7 @@ impl Rng {
         (z ^ (z >> 31)) as u32
     }
     fn digest(&mut self) -> [u32; SLOT_WORDS] {
-        std::array::from_fn(|_| self.next_u32())
+        from_fn(|_| self.next_u32())
     }
     fn word(&mut self) -> u128 {
         (0..4).fold(0u128, |a, _| (a << 32) | self.next_u32() as u128)
@@ -140,7 +142,7 @@ fn swap_matches_the_composite_fold() {
             let blocks = leaf_bytes / 64;
             let mut prev = blake3::BLAKE3_IV;
             for i in 0..blocks {
-                let m: [u32; 16] = std::array::from_fn(|w| {
+                let m: [u32; 16] = from_fn(|w| {
                     let o = i * 64 + 4 * w;
                     u32::from_le_bytes(input.leaf_data[o..o + 4].try_into().unwrap())
                 });
@@ -211,7 +213,7 @@ fn bit_spread_relocates_and_is_tight() {
 #[test]
 fn glue_is_negligible_against_blake3() {
     let b3 = {
-        let (a, b) = flock_prover::r1cs_hashes::blake3::build_matrices();
+        let (a, b) = build_matrices();
         a.rows.iter().map(|r| r.len()).sum::<usize>()
             + b.rows.iter().map(|r| r.len()).sum::<usize>()
     };

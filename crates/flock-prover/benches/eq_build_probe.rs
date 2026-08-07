@@ -102,6 +102,7 @@ fn fmt_ms(s: f64) -> String {
 }
 
 fn main() {
+    const RUNS: usize = 30;
     let _ = flock_prover::init_perf_thread_pool();
     println!("eq-build probe: PMULL vs mul_by_x for medium friendlies\n");
 
@@ -110,8 +111,8 @@ fn main() {
     //   round 3: r[8..23] (n=15)
     //   ...
     for n in [10usize, 12, 14, 16, 18, 20].iter().copied() {
-        let r = make_r_round2(n);
         const RUNS: usize = 50;
+        let r = make_r_round2(n);
 
         // Standard build.
         let mut tot_std = 0.0;
@@ -155,7 +156,7 @@ fn main() {
     // Also: measure SplitEqGhash::new since that's what the rounds actually call.
     println!("\nSplitEqGhash::new (round-2 shape at m=30: n=23, n_lo=16, n_hi=7):");
     let r = make_r_round2(23);
-    const RUNS: usize = 30;
+
     let mut tot = 0.0;
     for _ in 0..RUNS {
         let t = Instant::now();

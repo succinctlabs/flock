@@ -8,6 +8,8 @@
 //!
 //! Run: `cargo bench --bench keccak3_profiles`   (ST: RAYON_NUM_THREADS=1)
 
+use flock_prover::proof_io::R1csProofBundleLigerito;
+use std::env::var;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -81,7 +83,7 @@ fn bench_profile(n_keccaks: usize, profile: LigeritoProfile, n_runs: usize, labe
         verify_t = verify_t.min(t0.elapsed().as_secs_f64());
     }
 
-    let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
+    let bundle = R1csProofBundleLigerito { commitment, proof };
     let size = bundle.to_bytes().len();
     black_box(&bundle);
 
@@ -104,11 +106,11 @@ fn main() {
     } else {
         format!("MT, {threads} threads")
     };
-    let n_keccaks: usize = std::env::var("KECCAK3_K")
+    let n_keccaks: usize = var("KECCAK3_K")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(24576);
-    let n_runs: usize = std::env::var("FLOCK_BENCH_RUNS")
+    let n_runs: usize = var("FLOCK_BENCH_RUNS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);

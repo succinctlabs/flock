@@ -9,6 +9,7 @@ use flock_prover::pcs::{self, PcsParams};
 use flock_prover::prover::prove_ligerito;
 use flock_prover::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 use flock_prover::verifier::{self, VerifyError};
+use std::sync::OnceLock;
 
 struct Rng(u64);
 impl Rng {
@@ -47,8 +48,8 @@ fn identity_r1cs(m: usize, k_log: usize, k_skip: usize, useful_bits: usize) -> B
         c_0: identity(1 << k_log),
         layout: WitnessLayout::RowMajor,
         const_pin: None,
-        digest_cache: std::sync::OnceLock::new(),
-        csc_cache: std::sync::OnceLock::new(),
+        digest_cache: OnceLock::new(),
+        csc_cache: OnceLock::new(),
     }
 }
 

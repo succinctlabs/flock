@@ -78,6 +78,15 @@
 //! fixed Boolean pattern, which is why they open as **packed-direct** claims
 //! with a `Sparse` eq tensor and no ring-switching.
 
+#[cfg(test)]
+use crate::element_r1cs::broadcast_add;
+use crate::matrix_fold::Weight;
+use crate::matrix_fold::bilinear;
+use crate::pcs::ring_switch::build_eq_parallel;
+#[cfg(test)]
+use crate::r1cs::SparseBinaryMatrix;
+#[cfg(test)]
+use crate::schedule::TableClass;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -450,11 +459,11 @@ fn slot_matrix_evals(
         .iter()
         .map(|s| {
             let kappa = s.layout.kappa;
-            let row = crate::matrix_fold::Weight::eq(r[nu..nu + kappa].to_vec());
-            let col = crate::matrix_fold::Weight::eq(r_col[..kappa].to_vec());
+            let row = Weight::eq(r[nu..nu + kappa].to_vec());
+            let col = Weight::eq(r_col[..kappa].to_vec());
             (
-                crate::matrix_fold::bilinear(&row, &col, s.ty.a_0()),
-                crate::matrix_fold::bilinear(&row, &col, s.ty.b_0()),
+                bilinear(&row, &col, s.ty.a_0()),
+                bilinear(&row, &col, s.ty.b_0()),
             )
         })
         .collect()
@@ -485,8 +494,8 @@ impl ElementAssertion {
             .zip(&self.evals)
             .map(|(s, &(va, vb))| {
                 let kappa = s.layout.kappa;
-                let row = crate::matrix_fold::Weight::eq(self.r_con[..kappa].to_vec());
-                let col = crate::matrix_fold::Weight::eq(self.r_col[..kappa].to_vec());
+                let row = Weight::eq(self.r_con[..kappa].to_vec());
+                let col = Weight::eq(self.r_col[..kappa].to_vec());
                 (
                     MatrixClaim {
                         row: row.clone(),
@@ -577,7 +586,7 @@ fn region_comb_at(
 /// (where it is zero), which is what makes the output claim an evaluation of
 /// the committed polynomial.
 fn collapse_rows(z: &[F128], r_row: &[F128], live: Option<&[usize]>) -> Vec<F128> {
-    let eq_row = crate::pcs::ring_switch::build_eq_parallel(r_row);
+    let eq_row = build_eq_parallel(r_row);
     let rows = eq_row.len();
     debug_assert_eq!(z.len() % rows, 0);
     z.par_chunks(rows)
@@ -713,23 +722,23 @@ mod tests {
         TableType {
             k_log,
             useful_bits,
-            a_0: crate::r1cs::SparseBinaryMatrix {
+            a_0: SparseBinaryMatrix {
                 num_rows: 0,
                 num_cols: 0,
                 rows: Vec::new(),
             },
-            b_0: crate::r1cs::SparseBinaryMatrix {
+            b_0: SparseBinaryMatrix {
                 num_rows: 0,
                 num_cols: 0,
                 rows: Vec::new(),
             },
-            c_0: crate::r1cs::SparseBinaryMatrix {
+            c_0: SparseBinaryMatrix {
                 num_rows: 0,
                 num_cols: 0,
                 rows: Vec::new(),
             },
             const_pin: None,
-            class: crate::schedule::TableClass::Boolean,
+            class: TableClass::Boolean,
             io_schema: Vec::new(),
         }
     }
@@ -1445,8 +1454,8 @@ dense {:6.2} [{:5.2} – {:5.2}]  support {:6.2} [{:5.2} – {:5.2}]  {:4.1}x",
         let rows = mixed_witness(&ty, nu, n, &mut rng);
 
         let (mut apply_a, mut apply_b) = ty.apply(&rows, nu);
-        crate::element_r1cs::broadcast_add(&mut apply_a, ty.a_const(), nu);
-        crate::element_r1cs::broadcast_add(&mut apply_b, ty.b_const(), nu);
+        broadcast_add(&mut apply_a, ty.a_const(), nu);
+        broadcast_add(&mut apply_b, ty.b_const(), nu);
 
         let words = ty.width() << nu;
         let mut z = vec![F128::ZERO; words];

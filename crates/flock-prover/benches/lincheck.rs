@@ -10,6 +10,8 @@
 //! delta isolates the kernel speedup. Expect ~1.0× below the guard (both iblock)
 //! and oblock's win above it (≈1.4–1.7× by m=28–29 at this k_log).
 
+use std::collections::HashSet;
+use std::env::var;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -60,7 +62,7 @@ impl Rng {
 /// Sparse matrix with ~`nnz` random nonzeros across `k × k` slots.
 fn random_sparse_matrix(k: usize, nnz: usize, rng: &mut Rng) -> SparseBinaryMatrix {
     let mut rows: Vec<Vec<usize>> = vec![Vec::new(); k];
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut count = 0;
     while count < nnz {
         let r = (rng.next_u64() as usize) % k;
@@ -82,7 +84,7 @@ fn random_sparse_matrix(k: usize, nnz: usize, rng: &mut Rng) -> SparseBinaryMatr
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
-    let fold_ab = std::env::var("FOLD_AB").is_ok();
+    let fold_ab = var("FOLD_AB").is_ok();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes)");
     println!("k_log = {K_LOG}, k = {}", 1usize << K_LOG);

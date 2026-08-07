@@ -21,9 +21,12 @@ use flock_prover::challenger::FsChallenger;
 use flock_prover::mixed::{MerkleMixedCounts, MerkleMixedSetup, MixedRegistryId};
 use flock_prover::prover::{self, UnionSlotProverInput};
 use flock_prover::r1cs_hashes::blake3;
+use flock_prover::r1cs_hashes::merkle_r1cs::MerkleWalkerCircuit;
 use flock_prover::r1cs_hashes::merkle_r1cs::{
     MerkleTreeLayout, PathInput, SLOT_WORDS, blake3_spec, reference_root,
 };
+use std::array::from_fn;
+use std::time::Instant;
 
 const DOMAIN: &[u8] = b"flock-merkle-union-e2e-v0";
 const DEPTH: usize = 26;
@@ -42,7 +45,7 @@ impl Rng {
         (z ^ (z >> 31)) as u32
     }
     fn digest(&mut self) -> [u32; SLOT_WORDS] {
-        std::array::from_fn(|_| self.next_u32())
+        from_fn(|_| self.next_u32())
     }
     fn path(&mut self, depth: usize) -> PathInput {
         let index =
@@ -58,7 +61,7 @@ impl Rng {
 /// Everything a Merkle-table union proof needs, built once.
 struct Setup {
     layout: MerkleTreeLayout,
-    walker: flock_prover::r1cs_hashes::merkle_r1cs::MerkleWalkerCircuit,
+    walker: MerkleWalkerCircuit,
     registry: Registry,
 }
 
@@ -123,11 +126,11 @@ fn depth26_roundtrip() {
 
     let union = s.union(n_paths);
     let pcs_params = s.pcs_params(&union);
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let witness = s.layout.generate_witness_batch_major_partial(&paths, NU);
     let t_wit = t.elapsed();
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (proof, commitment, claim) = prover::prove_fast_ligerito_union(
         &union,
@@ -137,7 +140,7 @@ fn depth26_roundtrip() {
     );
     let t_prove = t.elapsed();
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut ch_v = FsChallenger::new(DOMAIN);
     let claim_v = verifier::verify_ligerito_union(
         &union,
@@ -215,8 +218,8 @@ fn depth26_partial_counts_roundtrip() {
 fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
     (0..n)
         .map(|_| {
-            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = from_fn(|_| rng.next_u32());
             let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
             (cv, m, counter, 64u32, 11u32)
         })
@@ -239,13 +242,13 @@ fn merkle_blake3_mixed_roundtrip() {
             blake3: n_blake3,
         };
 
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let mut ch_p = FsChallenger::new(DOMAIN);
         let (proof, commitment, claim) =
             setup.prove(&paths, &blake3_inputs, LigeritoProfile::Fast, &mut ch_p);
         let t_prove = t.elapsed();
 
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let mut ch_v = FsChallenger::new(DOMAIN);
         let claim_v = setup
             .verify(counts, &commitment, &proof, &mut ch_v)

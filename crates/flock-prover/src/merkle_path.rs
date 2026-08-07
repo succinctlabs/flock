@@ -31,6 +31,7 @@
 //! extra evaluation just constrains the interpolation to the lower-degree
 //! polynomial.
 
+use crate::chain::shift_mle as chain_shift_mle;
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::build_eq_table;
@@ -184,7 +185,7 @@ fn slot_indicator(target_slot: u8, ss: F128, sd: F128) -> F128 {
 
 #[inline]
 fn shift_mle(a: &[F128], b: &[F128]) -> F128 {
-    crate::chain::shift_mle(a, b)
+    chain_shift_mle(a, b)
 }
 
 // ---------------------------------------------------------------------------

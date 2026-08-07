@@ -2,7 +2,11 @@
 //! timing breakdown. Times the fast prover path (`Blake3Setup::prove_fast`);
 //! the slow `prove` path is exercised by unit tests in `src/blake3.rs`.
 
+use flock_prover::proof_io::R1csProofBundleLigerito;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::array::from_fn;
+use std::env::var;
+use std::env::var_os;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -66,8 +70,8 @@ impl Rng {
 }
 
 fn random_compression(rng: &mut Rng) -> Compression {
-    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+    let m: [u32; 16] = from_fn(|_| rng.next_u32());
     // counter varies per instance; block_len = 64 (full block), flags = a
     // typical CHUNK_START|CHUNK_END|ROOT for a single-block chunk.
     (cv, m, rng.next_u32() as u64, 64u32, 11u32)
@@ -96,7 +100,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     );
 
     // BLAKE3_BATCH_MAJOR=1 switches the witness layout (WitnessLayout::BatchMajor).
-    let mut setup = if std::env::var_os("BLAKE3_BATCH_MAJOR").is_some() {
+    let mut setup = if var_os("BLAKE3_BATCH_MAJOR").is_some() {
         Blake3Setup::new_batch_major(n_blocks)
     } else {
         Blake3Setup::new(n_blocks)
@@ -105,14 +109,14 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     // sha256). Setting it on `pcs_params` is enough: the Ligerito prover and
     // verifier configs are derived from those params, so the L0 commitment and
     // every recursive level follow.
-    if let Ok(h) = std::env::var("FLOCK_MERKLE_HASH") {
+    if let Ok(h) = var("FLOCK_MERKLE_HASH") {
         setup.pcs_params.merkle_hash =
             HashKind::parse(&h).expect("FLOCK_MERKLE_HASH must be sha256 or blake3");
     }
     let setup = setup;
     // FLOCK_FS_HASH=sha256|blake3 selects the Fiat-Shamir transcript hash
     // (default sha256), independently of the Merkle hash above.
-    let fs_hash = match std::env::var("FLOCK_FS_HASH") {
+    let fs_hash = match var("FLOCK_FS_HASH") {
         Ok(h) => HashKind::parse(&h).expect("FLOCK_FS_HASH must be sha256 or blake3"),
         Err(_) => HashKind::default(),
     };
@@ -182,7 +186,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
             .expect("verify failed");
         println!("  verify: {}", fmt_ms(t.elapsed().as_secs_f64()));
 
-        let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
+        let bundle = R1csProofBundleLigerito { commitment, proof };
         let proof_size = bundle.to_bytes().len();
         println!(
             "  proof size: {} bytes ({:.2} KiB)",
@@ -225,7 +229,7 @@ fn main() {
     // to sweep at the same sizes as the competitors; each listed size is benched
     // best-of-3. Default: small-scale context + the SHA-256/Keccak baseline sizes.
     // n_blocks → m: K_LOG=14, so m = 14 + ceil_log2(max(n_blocks, 8)).
-    let specs: Vec<(usize, usize)> = match std::env::var("BLAKE3_LOG2S") {
+    let specs: Vec<(usize, usize)> = match var("BLAKE3_LOG2S") {
         Ok(s) => s
             .split([',', ' '])
             .filter(|t| !t.is_empty())

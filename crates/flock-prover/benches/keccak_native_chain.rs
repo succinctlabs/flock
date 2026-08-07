@@ -17,6 +17,7 @@
 //!
 //! Run: `cargo bench --bench keccak_native_chain`
 
+use std::hint::black_box;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -91,13 +92,13 @@ fn bench_single_chain(t: u64, runs: usize) {
     rng.fill_bytes(&mut initial);
 
     // Warm up branch predictor + caches.
-    let _ = std::hint::black_box(hash_chain(initial, 1024));
+    let _ = black_box(hash_chain(initial, 1024));
 
     let mut best = f64::INFINITY;
     let mut last_out = [0u8; 32];
     for run in 0..runs {
         let t0 = Instant::now();
-        let out = hash_chain(std::hint::black_box(initial), t);
+        let out = hash_chain(black_box(initial), t);
         let elapsed = t0.elapsed().as_secs_f64();
         let hps = t as f64 / elapsed;
         let ns_per_hash = elapsed * 1e9 / t as f64;

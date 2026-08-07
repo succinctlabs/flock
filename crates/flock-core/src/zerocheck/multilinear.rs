@@ -33,6 +33,8 @@
 //! Verifier reconstructs `G(0)` from the running claim via
 //! `current_claim = (1+r_now)·G(0) + r_now·G(1)`.
 
+use crate::bits::lowest_one;
+use crate::field::f128_slice::fold_pairs;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -40,8 +42,13 @@
 ))]
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
 use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
+use crate::scratch::take_f128;
+use crate::zerocheck::PaddingRun;
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
+use std::array::from_fn;
+use std::mem::take;
+use std::ops::Range;
 
 mod kernels;
 
@@ -67,7 +74,7 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 /// when `useful_bits` is odd in chunk units) is INSIDE the useful range and
 /// processed normally — its padding side has value 0 so the message
 /// contribution is naturally correct.
-fn round2_pair_skip(run: &crate::zerocheck::PaddingRun, k_skip: usize) -> (usize, usize) {
+fn round2_pair_skip(run: &PaddingRun, k_skip: usize) -> (usize, usize) {
     if run.k_log <= k_skip + 1 {
         return (0, usize::MAX);
     }
@@ -111,7 +118,7 @@ fn subspace_denominator_pair(dim: usize) -> (F128, F128) {
     use std::sync::OnceLock;
     static CACHE: OnceLock<[(F128, F128); 9]> = OnceLock::new();
     let table = CACHE.get_or_init(|| {
-        std::array::from_fn(|d| {
+        from_fn(|d| {
             let den = (1..(1usize << d)).fold(F128::ONE, |acc, i| acc * PHI_8_TABLE[i]);
             (den, den.inv())
         })
@@ -447,7 +454,7 @@ impl UniSkipFoldTable {
                 if (v & (v - 1)) == 0 {
                     continue; // skip powers of 2 (already written)
                 }
-                let lo_bit = crate::bits::lowest_one(v);
+                let lo_bit = lowest_one(v);
                 let parent = v ^ lo_bit;
                 data[j * 256 + v] = data[j * 256 + parent] + data[j * 256 + lo_bit];
             }
@@ -572,7 +579,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 pub(crate) fn balanced_interval_tasks(
     live: &[(usize, usize)],
     target: usize,
-) -> (Vec<(usize, usize)>, Vec<std::ops::Range<usize>>) {
+) -> (Vec<(usize, usize)>, Vec<Range<usize>>) {
     debug_assert!(target > 0);
     let mut pieces: Vec<(usize, usize)> = Vec::with_capacity(live.len());
     for &(s, e) in live {
@@ -583,7 +590,7 @@ pub(crate) fn balanced_interval_tasks(
             c = next;
         }
     }
-    let mut tasks: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut tasks: Vec<Range<usize>> = Vec::new();
     let (mut start, mut acc) = (0usize, 0usize);
     for (i, &(s, e)) in pieces.iter().enumerate() {
         acc += e - s;
@@ -878,8 +885,8 @@ where
         Some(iv) => 2 * iv.iter().map(|&(s, e)| e - s).sum::<usize>(),
         None => n_out,
     };
-    let mut a_folded: Vec<F128> = crate::scratch::take_f128(out_len);
-    let mut b_folded: Vec<F128> = crate::scratch::take_f128(out_len);
+    let mut a_folded: Vec<F128> = take_f128(out_len);
+    let mut b_folded: Vec<F128> = take_f128(out_len);
 
     let eq = SplitEqGhash::new(&mlv_challenges[1..]);
     let lo_size = 1usize << eq.n_lo;
@@ -922,9 +929,9 @@ where
                 (&mut a_folded[..], &mut b_folded[..]);
             for t in &tasks {
                 let span: usize = pieces[t.clone()].iter().map(|&(s, e)| 2 * (e - s)).sum();
-                let (a_task, rest) = std::mem::take(&mut a_rem).split_at_mut(span);
+                let (a_task, rest) = take(&mut a_rem).split_at_mut(span);
                 a_rem = rest;
-                let (b_task, rest) = std::mem::take(&mut b_rem).split_at_mut(span);
+                let (b_task, rest) = take(&mut b_rem).split_at_mut(span);
                 b_rem = rest;
                 work.push((&pieces[t.clone()], a_task, b_task));
             }
@@ -1282,8 +1289,8 @@ pub fn fold_and_compute_round_pair_into(
                 // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
                 // selects the architecture kernel; this loop only consumes
                 // the resulting values to build the message.
-                crate::field::f128_slice::fold_pairs(a_in, 0, a_out, r_fold);
-                crate::field::f128_slice::fold_pairs(b_in, 0, b_out, r_fold);
+                fold_pairs(a_in, 0, a_out, r_fold);
+                fold_pairs(b_in, 0, b_out, r_fold);
 
                 let mut p1_acc = F256Unreduced::ZERO;
                 let mut pinf_acc = F256Unreduced::ZERO;
@@ -1570,6 +1577,21 @@ pub fn fold_and_round_pair_sparse_into(
     store_in: &LiveLayout,
     domain: usize,
 ) -> (F128, F128, LiveLayout) {
+    // The pair cover split into tasks of roughly equal LIVE work, each with
+    // its own disjoint output slices — parallel like the dense kernel,
+    // instead of one scalar walk (measured ~3x per element at low
+    // utilization: no cores, no hoisted eq_hi, one reduced multiply per
+    // term). Tasks are cut from the interval list, so their count follows the
+    // live support and not the domain: a fragmented slot schedule (367
+    // intervals at 6.25% utilization, against 2 at full) would otherwise
+    // spawn one near-empty task per interval per round — 6.6K tasks over the
+    // tail against 1.5K for the same live volume when unfragmented.
+    // Within a task the per-hi-run products accumulate UNREDUCED and reduce
+    // once, and eq_hi multiplies the run total — pure reassociation of exact
+    // field algebra (reduction commutes with XOR), so the message stays
+    // byte-identical to the scalar loop and to the dense kernel.
+    const CHUNK: usize = 1 << 12;
+    use rayon::prelude::*;
     assert!(domain.is_power_of_two() && domain >= 8);
     assert_eq!(a.len(), store_in.len());
     assert_eq!(b.len(), store_in.len());
@@ -1594,20 +1616,6 @@ pub fn fold_and_round_pair_sparse_into(
     let store_out = LiveLayout::new(pair_cover.iter().map(|&(s, e)| (2 * s, 2 * e)).collect());
     assert!(a_out.len() >= store_out.len() && b_out.len() >= store_out.len());
 
-    // The pair cover split into tasks of roughly equal LIVE work, each with
-    // its own disjoint output slices — parallel like the dense kernel,
-    // instead of one scalar walk (measured ~3x per element at low
-    // utilization: no cores, no hoisted eq_hi, one reduced multiply per
-    // term). Tasks are cut from the interval list, so their count follows the
-    // live support and not the domain: a fragmented slot schedule (367
-    // intervals at 6.25% utilization, against 2 at full) would otherwise
-    // spawn one near-empty task per interval per round — 6.6K tasks over the
-    // tail against 1.5K for the same live volume when unfragmented.
-    // Within a task the per-hi-run products accumulate UNREDUCED and reduce
-    // once, and eq_hi multiplies the run total — pure reassociation of exact
-    // field algebra (reduction commutes with XOR), so the message stays
-    // byte-identical to the scalar loop and to the dense kernel.
-    const CHUNK: usize = 1 << 12;
     let (pieces, tasks) = balanced_interval_tasks(&pair_cover, CHUNK);
     let mut work: Vec<(&[(usize, usize)], &mut [F128], &mut [F128])> =
         Vec::with_capacity(tasks.len());
@@ -1616,15 +1624,14 @@ pub fn fold_and_round_pair_sparse_into(
         let mut b_rem: &mut [F128] = &mut b_out[..store_out.len()];
         for t in &tasks {
             let span: usize = pieces[t.clone()].iter().map(|&(s, e)| 2 * (e - s)).sum();
-            let (a_task, rest) = std::mem::take(&mut a_rem).split_at_mut(span);
+            let (a_task, rest) = take(&mut a_rem).split_at_mut(span);
             a_rem = rest;
-            let (b_task, rest) = std::mem::take(&mut b_rem).split_at_mut(span);
+            let (b_task, rest) = take(&mut b_rem).split_at_mut(span);
             b_rem = rest;
             work.push((&pieces[t.clone()], a_task, b_task));
         }
     }
 
-    use rayon::prelude::*;
     let (sum1, sum_inf) = work
         .into_par_iter()
         .map(|(task_pieces, a_task, b_task)| {
@@ -1695,7 +1702,7 @@ pub fn fold_and_round_pair_sparse_into(
 /// (`SPARSE_TAIL_GATE > 1`, or the domain drops below the fused threshold).
 pub fn expand_to_dense(compact: &[F128], store: &LiveLayout, domain: usize) -> Vec<F128> {
     debug_assert_eq!(compact.len(), store.len());
-    let mut out = crate::scratch::take_f128(domain);
+    let mut out = take_f128(domain);
     out.fill(F128::ZERO);
     for (i, &(s, e)) in store.intervals().iter().enumerate() {
         let off = store.offset_of(i);

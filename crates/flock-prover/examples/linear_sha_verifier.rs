@@ -23,7 +23,10 @@
 //! Verified for correctness against the standard verifier path. Times both
 //! at the sha2 R1CS dimensions.
 
+use flock_prover::r1cs::SparseBinaryMatrix;
+use std::array::from_fn;
 use std::hint::black_box;
+use std::process::exit;
 use std::time::Instant;
 
 use flock_prover::field::F128;
@@ -196,7 +199,7 @@ fn linear_ab_consistency(z_vec: &[F128], eq_inner: &[F128]) -> (F128, F128) {
     }
 
     // 3. State words derived from H_in slots.
-    let h_in: [FWord; 8] = std::array::from_fn(|w| FWord::read_from(z_vec, h_bit(w, 0)));
+    let h_in: [FWord; 8] = from_fn(|w| FWord::read_from(z_vec, h_bit(w, 0)));
 
     // 4. Message schedule.
     let mut w_words: Vec<FWord> = (0..N_SCHED + 16).map(|_| FWord::zero()).collect();
@@ -377,8 +380,8 @@ fn linear_ab_consistency(z_vec: &[F128], eq_inner: &[F128]) -> (F128, F128) {
 // ───────────────────────────────────────────────────────────────────────────
 
 fn standard_ab_consistency(
-    a_0: &flock_prover::r1cs::SparseBinaryMatrix,
-    b_0: &flock_prover::r1cs::SparseBinaryMatrix,
+    a_0: &SparseBinaryMatrix,
+    b_0: &SparseBinaryMatrix,
     z_vec: &[F128],
     eq_inner: &[F128],
 ) -> (F128, F128) {
@@ -421,6 +424,7 @@ impl Rng {
 }
 
 fn main() {
+    const N_ITERS: usize = 200;
     use flock_prover::r1cs_hashes::sha2::build_block_witness;
 
     let mut rng = Rng::new(0x00C0_FFEE_5A55);
@@ -434,7 +438,7 @@ fn main() {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
     ];
-    let m_in: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
+    let m_in: [u32; 16] = from_fn(|_| rng.next_u64() as u32);
     let z_bool = build_block_witness(&h_in, &m_in);
     let z_vec: Vec<F128> = z_bool
         .iter()
@@ -462,13 +466,12 @@ fn main() {
         println!("  ✓ both match");
     } else {
         println!("  ✗ MISMATCH");
-        std::process::exit(1);
+        exit(1);
     }
 
     // ---- Timing (single-threaded, no rayon).
     println!();
     println!("=== Timing (single-threaded, full A+B consistency check) ===");
-    const N_ITERS: usize = 200;
 
     // Warm up both paths.
     let _ = black_box(standard_ab_consistency(&a_0, &b_0, &z_vec, &eq_inner));

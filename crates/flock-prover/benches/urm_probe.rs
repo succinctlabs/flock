@@ -14,6 +14,7 @@
 //!
 //! Default: 30 runs at m=29 (~3.2 sec ST).
 
+use std::env::args;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -47,14 +48,8 @@ impl Rng {
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
-    let n_runs: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
-    let m: usize = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(29);
+    let n_runs: usize = args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);
+    let m: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(29);
 
     let n_bytes = (1usize << m) / 8;
     let mut rng = Rng::new(0xDEAD_C0DE ^ (m as u64));
@@ -84,9 +79,7 @@ fn main() {
     let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
     let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
-    let padding_mode = std::env::args()
-        .nth(3)
-        .unwrap_or_else(|| "dense".to_string());
+    let padding_mode = args().nth(3).unwrap_or_else(|| "dense".to_string());
     let padding = match padding_mode.as_str() {
         "dense" => PaddingSpec::dense(m),
         // BLAKE3 prove_fast shape: K_LOG=14, USEFUL_BITS=15,409.

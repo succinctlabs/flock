@@ -18,6 +18,8 @@
 #![allow(clippy::uninit_vec)]
 
 use std::hint::black_box;
+use std::ptr::write_bytes;
+use std::thread::scope;
 use std::time::Instant;
 
 use flock_prover::field::F128;
@@ -41,7 +43,7 @@ fn alloc_and_pad(src: &[F128]) -> Vec<F128> {
     buf[..half.min(src.len())].copy_from_slice(&src[..half.min(src.len())]);
     // write_bytes count is in F128 ELEMENTS (each set to the 0 byte pattern).
     unsafe {
-        std::ptr::write_bytes(buf.as_mut_ptr().add(half), 0u8, N - half);
+        write_bytes(buf.as_mut_ptr().add(half), 0u8, N - half);
     }
     buf
 }
@@ -94,7 +96,7 @@ fn prefault_then_work<R>(src: &[F128], work: impl FnOnce() -> R) -> (Vec<F128>, 
         let r = work();
         (buf, r)
     } else {
-        std::thread::scope(|s| {
+        scope(|s| {
             let h = s.spawn(|| {
                 SPAWNED.fetch_add(1, Ordering::Relaxed);
                 set_background_qos();
@@ -160,7 +162,7 @@ fn main() {
     for _ in 0..n_runs {
         let src_ref = &src;
         let t = Instant::now();
-        let buf = std::thread::scope(|s| {
+        let buf = scope(|s| {
             let h = s.spawn(|| alloc_and_pad(src_ref));
             black_box(pcore_workload(rounds));
             h.join().unwrap()
@@ -175,7 +177,7 @@ fn main() {
     for _ in 0..n_runs {
         let src_ref = &src;
         let t = Instant::now();
-        let buf = std::thread::scope(|s| {
+        let buf = scope(|s| {
             let h = s.spawn(|| {
                 set_background_qos();
                 alloc_and_pad(src_ref)

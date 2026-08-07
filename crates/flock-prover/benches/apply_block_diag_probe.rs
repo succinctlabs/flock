@@ -13,7 +13,12 @@
 //! density — exactly why the fused generators exist — but the kernel ratio
 //! is still meaningful).
 
+use flock_prover::r1cs_hashes::blake3::build_matrices as Blake3build_matrices;
+use flock_prover::r1cs_hashes::sha2::build_matrices as Sha2build_matrices;
+use std::array::from_fn;
 use std::hint::black_box;
+use std::slice::from_raw_parts;
+use std::slice::from_raw_parts_mut;
 use std::time::Instant;
 
 use flock_prover::field::F128;
@@ -67,8 +72,7 @@ fn apply_one_block_aligned_old(
     out_block: &mut [F128],
     k: usize,
 ) {
-    let z_u128: &[u128] =
-        unsafe { std::slice::from_raw_parts(z_block.as_ptr() as *const u128, z_block.len()) };
+    let z_u128: &[u128] = unsafe { from_raw_parts(z_block.as_ptr() as *const u128, z_block.len()) };
     let f128_per_block = k / 128;
     let mut row_iter = m_0.rows.iter();
     for out_idx in 0..f128_per_block {
@@ -136,6 +140,7 @@ fn apply_block_diag_packed_strip64(
     m: usize,
     k_log: usize,
 ) -> Vec<F128> {
+    const S: usize = 64;
     use rayon::prelude::*;
     let k = 1usize << k_log;
     let n_packed = 1usize << (m - 7);
@@ -144,20 +149,15 @@ fn apply_block_diag_packed_strip64(
     let (row_ptr, cols) = flatten_csr_local(m_0);
     let mut out = vec![F128::ZERO; n_packed];
 
-    const S: usize = 64;
     out.par_chunks_mut(S * f128_per_block)
         .zip(z_packed.par_chunks(S * f128_per_block))
         .for_each(|(out_strip, z_strip)| {
             let n_blocks = z_strip.len() / f128_per_block;
             assert_eq!(n_blocks, S, "probe requires n_outer % 64 == 0");
-            let z_u64: &[u64] = unsafe {
-                std::slice::from_raw_parts(z_strip.as_ptr() as *const u64, z_strip.len() * 2)
-            };
+            let z_u64: &[u64] =
+                unsafe { from_raw_parts(z_strip.as_ptr() as *const u64, z_strip.len() * 2) };
             let out_u64: &mut [u64] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    out_strip.as_mut_ptr() as *mut u64,
-                    out_strip.len() * 2,
-                )
+                from_raw_parts_mut(out_strip.as_mut_ptr() as *mut u64, out_strip.len() * 2)
             };
 
             // Transpose in: colbits[j] = bit j of all 64 blocks.
@@ -251,13 +251,13 @@ fn main() {
     );
     println!("threads: {}\n", rayon::current_num_threads());
 
-    let (sha2_a, sha2_b) = flock_prover::r1cs_hashes::sha2::build_matrices();
+    let (sha2_a, sha2_b) = Sha2build_matrices();
     for n_log in [10usize, 12, 14] {
         probe("sha2 A0", &sha2_a, 15, n_log, 3);
     }
     probe("sha2 B0", &sha2_b, 15, 12, 3);
 
-    let (bl_a, _) = flock_prover::r1cs_hashes::blake3::build_matrices();
+    let (bl_a, _) = Blake3build_matrices();
     probe("blake3 A0", &bl_a, 14, 6, 3);
 
     // e2e context: the generic (non-fused) sha2 prove materializes a = A·z
@@ -272,8 +272,8 @@ fn main() {
         let comps: Vec<([u32; 8], [u32; 16])> = (0..n)
             .map(|_| {
                 (
-                    std::array::from_fn(|_| rng.next_u64() as u32),
-                    std::array::from_fn(|_| rng.next_u64() as u32),
+                    from_fn(|_| rng.next_u64() as u32),
+                    from_fn(|_| rng.next_u64() as u32),
                 )
             })
             .collect();

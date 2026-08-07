@@ -5,6 +5,8 @@
 //! `RAYON_NUM_THREADS`; `benchmarks/bench_hash_throughput.sh` runs the complete
 //! single- and multi-threaded matrix and renders it as Markdown.
 
+use std::array::from_fn;
+use std::env::var;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -51,16 +53,13 @@ impl Rng {
 }
 
 fn random_sha2_input(rng: &mut Rng) -> ([u32; 8], [u32; 16]) {
-    (
-        std::array::from_fn(|_| rng.next_u32()),
-        std::array::from_fn(|_| rng.next_u32()),
-    )
+    (from_fn(|_| rng.next_u32()), from_fn(|_| rng.next_u32()))
 }
 
 fn random_blake3_input(rng: &mut Rng) -> Compression {
     (
-        std::array::from_fn(|_| rng.next_u32()),
-        std::array::from_fn(|_| rng.next_u32()),
+        from_fn(|_| rng.next_u32()),
+        from_fn(|_| rng.next_u32()),
         rng.next_u64(),
         64,
         11,
@@ -194,7 +193,7 @@ fn bench_keccak(batch: usize, layout: BenchLayout, runs: usize) {
 }
 
 fn parse_log2_batches() -> Vec<u32> {
-    let value = std::env::var("HASH_BENCH_LOG2S").unwrap_or_else(|_| "10 12 14 16 18".to_owned());
+    let value = var("HASH_BENCH_LOG2S").unwrap_or_else(|_| "10 12 14 16 18".to_owned());
     let batches: Vec<u32> = value
         .split([',', ' '])
         .filter(|part| !part.is_empty())
@@ -218,7 +217,7 @@ fn parse_log2_batches() -> Vec<u32> {
 }
 
 fn parse_runs() -> usize {
-    let runs = std::env::var("HASH_BENCH_RUNS")
+    let runs = var("HASH_BENCH_RUNS")
         .unwrap_or_else(|_| "3".to_owned())
         .parse::<usize>()
         .expect("HASH_BENCH_RUNS must be a positive integer");

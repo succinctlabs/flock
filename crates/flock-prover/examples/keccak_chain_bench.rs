@@ -4,6 +4,8 @@
 //!
 //! Run: `cargo run --release --example keccak_chain_bench`
 
+use flock_prover::chain::prove_chain_shift;
+use flock_prover::r1cs::WitnessLayout;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -114,12 +116,7 @@ fn bench(n_keccaks: usize, n_runs: usize) {
     let mut io = (Vec::new(), Vec::new());
     for _ in 0..n_runs {
         let t = Instant::now();
-        io = fold_in_out(
-            &CHAIN_LAYOUT,
-            flock_prover::r1cs::WitnessLayout::RowMajor,
-            &z_packed,
-            &fold,
-        );
+        io = fold_in_out(&CHAIN_LAYOUT, WitnessLayout::RowMajor, &z_packed, &fold);
         best_fold = best_fold.min(t.elapsed().as_secs_f64());
     }
     let (in_vals, out_vals) = io;
@@ -130,7 +127,7 @@ fn bench(n_keccaks: usize, n_runs: usize) {
         let mut ch = FsChallenger::new(b"chain-bench-shift");
         let _ = ch.sample_f128(); // keep transcript nondegenerate
         let t = Instant::now();
-        let (p, _) = flock_prover::chain::prove_chain_shift(&in_vals, &out_vals, &mut ch);
+        let (p, _) = prove_chain_shift(&in_vals, &out_vals, &mut ch);
         best_shift = best_shift.min(t.elapsed().as_secs_f64());
         black_box(&p);
     }

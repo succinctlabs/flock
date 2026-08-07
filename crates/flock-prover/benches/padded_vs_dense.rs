@@ -8,6 +8,8 @@
 //! padded_vs_dense`. Default sizes target m=30 (16384 Keccak permutations,
 //! 32768 SHA-256 compressions).
 
+use std::array::from_fn;
+use std::env::var;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -136,12 +138,7 @@ fn bench_sha2(n_compressions: usize, n_runs: usize) {
     let mut setup = Sha256HybridSetup::new(n_compressions);
     let mut rng = Rng::new(0xC0FFEE_5A55_u64.wrapping_add(n_compressions as u64));
     let inputs: Vec<([u32; 8], [u32; 16])> = (0..n_compressions)
-        .map(|_| {
-            (
-                std::array::from_fn(|_| rng.next_u32()),
-                std::array::from_fn(|_| rng.next_u32()),
-            )
-        })
+        .map(|_| (from_fn(|_| rng.next_u32()), from_fn(|_| rng.next_u32())))
         .collect();
 
     // Padded path.
@@ -194,7 +191,7 @@ fn bench_sha2(n_compressions: usize, n_runs: usize) {
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
-    let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "(default)".into());
+    let threads = var("RAYON_NUM_THREADS").unwrap_or_else(|_| "(default)".into());
     println!("URM padding-skip A/B for prove_fast (RAYON_NUM_THREADS={threads})");
 
     // m=30: 16384 Keccak perms, 32768 SHA-256 compressions.

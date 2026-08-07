@@ -8,6 +8,7 @@
 //!
 //! Default: 50 runs at m=29 (~3 sec ST). Matches BLAKE3 num_ntts=64 (K_LOG=14, log_batch_size=6).
 
+use std::env::args;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -36,15 +37,9 @@ impl Rng {
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
-    let n_runs: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let n_runs: usize = args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50);
     // BLAKE3 m=29: log_msg_len = 22, log_batch_size = 6, k_code = 17, num_ntts = 64.
-    let m: usize = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(29);
+    let m: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(29);
     let log_msg_len = m - 7;
     let log_batch_size = 6usize;
     let log_inv_rate = 1usize;

@@ -9,6 +9,7 @@
 //! Prints best-of-N per phase, their sum, and FNV checksums over all phase
 //! outputs (seeded inputs ⇒ bit-stable across valid optimizations).
 
+use std::env::args;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -71,14 +72,8 @@ impl Fnv {
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
-    let n_runs: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-    let n_keccaks: usize = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24576);
+    let n_runs: usize = args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let n_keccaks: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(24576);
 
     let setup = KeccakSetup::new(n_keccaks);
     let r1cs = &setup.r1cs;

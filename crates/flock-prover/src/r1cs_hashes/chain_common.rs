@@ -17,14 +17,35 @@
 //! above. The two slots must be consecutive (slot 0 = input, slot 1 = output)
 //! so the chain claim's selector is a single bit-flip in the multilinear cube.
 
+use crate::chain::ChainClaims;
+use crate::chain::ChainError;
+use crate::chain::ChainShiftProof;
+use crate::chain::prove_chain_shift;
+use crate::chain::verify_chain_shift;
+use crate::prover::ProveCore;
+use crate::prover::prove_fast_core;
+use crate::prover::quirky_x_outer_full;
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
+use flock_core::lincheck::LincheckCircuit;
+use flock_core::lincheck::LincheckProof;
 use flock_core::lincheck::build_eq_table;
+use flock_core::pcs::BatchOpeningProofLigerito;
+use flock_core::pcs::VerifyError as PcsVerifyError;
+use flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v;
+use flock_core::pcs::ring_switch::build_eq_sparse;
+use flock_core::pcs::verify_opening_batch_ligerito_mixed;
 use flock_core::pcs::{
     Commitment, DirectEqInd, LOG_PACKING, PackedDirectClaim, PackedDirectClaimRef, PcsParams,
 };
 use flock_core::r1cs::BlockR1cs;
+use flock_core::r1cs::WitnessLayout;
+use flock_core::verifier::VerifyError as VerifierVerifyError;
+use flock_core::verifier::verify_core;
+use flock_core::zerocheck::ZerocheckProof;
 use serde::{Deserialize, Serialize};
+use std::iter::repeat_n;
+use std::slice::from_ref;
 
 /// Geometry of one hash's input/output regions within a witness block. All
 /// fields are `const`-known per hash.
@@ -130,7 +151,7 @@ impl ChainFold {
 /// mul-adds (16 for keccak, 2 for blake3/sha2).
 pub fn fold_in_out(
     layout: &ChainLayout,
-    wl: flock_core::r1cs::WitnessLayout,
+    wl: WitnessLayout,
     packed: &[F128],
     fold: &ChainFold,
 ) -> (Vec<F128>, Vec<F128>) {
@@ -156,8 +177,8 @@ pub fn fold_in_out(
     // contiguous (`(w << n_log) + i`).
     let word_addr = move |i: usize, w: usize| -> usize {
         match wl {
-            flock_core::r1cs::WitnessLayout::RowMajor => i * block_packed + w,
-            flock_core::r1cs::WitnessLayout::BatchMajor => (w << n_log) + i,
+            WitnessLayout::RowMajor => i * block_packed + w,
+            WitnessLayout::BatchMajor => (w << n_log) + i,
         }
     };
 
@@ -195,12 +216,12 @@ pub fn fold_in_out(
 /// `build_eq_sparse` to skip the zero-coord halvings.
 pub fn assemble_chain_claim(
     layout: &ChainLayout,
-    wl: flock_core::r1cs::WitnessLayout,
+    wl: WitnessLayout,
     fold: &ChainFold,
-    claims: &crate::chain::ChainClaims,
+    claims: &ChainClaims,
 ) -> PackedDirectClaim {
     let point = build_chain_claim_point(layout, wl, fold, claims);
-    let sparse_eq = flock_core::pcs::ring_switch::build_eq_sparse(&point);
+    let sparse_eq = build_eq_sparse(&point);
     PackedDirectClaim {
         point,
         value: claims.value,
@@ -219,20 +240,20 @@ pub fn assemble_chain_claim(
 /// verifier evaluates `eq_eval(point, residual_challenges)` directly).
 fn build_chain_claim_point(
     layout: &ChainLayout,
-    wl: flock_core::r1cs::WitnessLayout,
+    wl: WitnessLayout,
     fold: &ChainFold,
-    claims: &crate::chain::ChainClaims,
+    claims: &ChainClaims,
 ) -> Vec<F128> {
     let high = layout.high_zeros();
     let point_len = fold.tau_pos.len() + 1 + high + claims.instance_point.len();
     let mut point = Vec::with_capacity(point_len);
-    if wl == flock_core::r1cs::WitnessLayout::BatchMajor {
+    if wl == WitnessLayout::BatchMajor {
         point.extend_from_slice(&claims.instance_point);
     }
     point.extend_from_slice(&fold.tau_pos);
     point.push(claims.sel0);
-    point.extend(std::iter::repeat_n(F128::ZERO, high));
-    if wl == flock_core::r1cs::WitnessLayout::RowMajor {
+    point.extend(repeat_n(F128::ZERO, high));
+    if wl == WitnessLayout::RowMajor {
         point.extend_from_slice(&claims.instance_point);
     }
     debug_assert_eq!(point.len(), point_len);
@@ -245,21 +266,21 @@ fn build_chain_claim_point(
 /// `[ab, c] (ring-switched) + [chain] (packed-direct)`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainProofLigerito {
-    pub zerocheck: flock_core::zerocheck::ZerocheckProof,
-    pub lincheck: flock_core::lincheck::LincheckProof,
-    pub shift: crate::chain::ChainShiftProof,
-    pub pcs_open: flock_core::pcs::BatchOpeningProofLigerito,
+    pub zerocheck: ZerocheckProof,
+    pub lincheck: LincheckProof,
+    pub shift: ChainShiftProof,
+    pub pcs_open: BatchOpeningProofLigerito,
 }
 
 /// Errors from chain verification.
 #[derive(Debug)]
 pub enum ChainVerifyError {
     /// Base R1CS (zerocheck/lincheck) replay failed.
-    R1cs(flock_core::verifier::VerifyError),
+    R1cs(VerifierVerifyError),
     /// The shift-sumcheck (glue + endpoints) check failed.
-    Shift(crate::chain::ChainError),
+    Shift(ChainError),
     /// The batched PCS opening failed.
-    Pcs(flock_core::pcs::VerifyError),
+    Pcs(PcsVerifyError),
 }
 
 /// Generic chain prover. The caller supplies the hash's already-generated
@@ -276,14 +297,14 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     a_packed: Vec<F128>,
     b_packed: Vec<F128>,
     z_lincheck: Vec<u8>,
-    lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
+    lincheck_circuit: &dyn LincheckCircuit,
     challenger: &mut Ch,
 ) -> (ChainProofLigerito, Commitment) {
     let lig_config = pcs_params
         .ligerito_prover_config()
         .expect("Ligerito default config for chain prove; bump m for tiny instances");
 
-    let core = crate::prover::prove_fast_core(
+    let core = prove_fast_core(
         r1cs,
         pcs_params,
         z_packed,
@@ -298,15 +319,15 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     let fold = ChainFold::new(layout, tau_pos);
     let (in_vals, out_vals) = fold_in_out(layout, r1cs.layout, &core.z_packed, &fold);
 
-    let (shift, claims) = crate::chain::prove_chain_shift(&in_vals, &out_vals, challenger);
+    let (shift, claims) = prove_chain_shift(&in_vals, &out_vals, challenger);
     let chain_claim = assemble_chain_claim(layout, r1cs.layout, &fold, &claims);
 
     let padding = r1cs.padding_spec();
-    let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
-    let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
+    let ab_x_outer = quirky_x_outer_full(&core.ab.point);
+    let c_x_outer = quirky_x_outer_full(&core.c.point);
     // Destructure core to move z_packed by value into the open (saves a 128 MB
     // clone at m=30 BLAKE3).
-    let crate::prover::ProveCore {
+    let ProveCore {
         zc_proof,
         lc_proof,
         commitment,
@@ -318,13 +339,13 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     } = core;
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
-    let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    let pcs_open = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         &prover_data,
         &commitment,
         &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
         &[pre_ab, pre_c],
-        std::slice::from_ref(&chain_claim),
+        from_ref(&chain_claim),
         &padding,
         &lig_config,
         challenger,
@@ -353,11 +374,11 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
     n_log: usize,
     x0_phys: &[bool],
     xlast_phys: &[bool],
-    lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
+    lincheck_circuit: &dyn LincheckCircuit,
     pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> Result<(), ChainVerifyError> {
-    let (ab, c) = flock_core::verifier::verify_core(
+    let (ab, c) = verify_core(
         r1cs,
         &proof.zerocheck,
         &proof.lincheck,
@@ -372,12 +393,12 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
 
     let x0_r = fold.fold_public_phys(x0_phys);
     let xlast_r = fold.fold_public_phys(xlast_phys);
-    let claims = crate::chain::verify_chain_shift(&proof.shift, x0_r, xlast_r, n_log, challenger)
+    let claims = verify_chain_shift(&proof.shift, x0_r, xlast_r, n_log, challenger)
         .map_err(ChainVerifyError::Shift)?;
 
     let chain_point = build_chain_claim_point(layout, r1cs.layout, &fold, &claims);
-    let ab_x_outer = crate::prover::quirky_x_outer_full(&ab.point);
-    let c_x_outer = crate::prover::quirky_x_outer_full(&c.point);
+    let ab_x_outer = quirky_x_outer_full(&ab.point);
+    let c_x_outer = quirky_x_outer_full(&c.point);
     let pd_ref = PackedDirectClaimRef {
         point: &chain_point,
         value: claims.value,
@@ -387,12 +408,12 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
         .ligerito_verifier_config()
         .expect("Ligerito default verifier config for chain verify");
 
-    flock_core::pcs::verify_opening_batch_ligerito_mixed(
+    verify_opening_batch_ligerito_mixed(
         commitment,
         &[ab.value, c.value],
         &[ab.point.z_skip, c.point.z_skip],
         &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
-        std::slice::from_ref(&pd_ref),
+        from_ref(&pd_ref),
         &proof.pcs_open,
         &lig_v_config,
         challenger,

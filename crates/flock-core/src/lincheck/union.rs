@@ -66,6 +66,8 @@ use crate::schedule::Registry;
 use crate::union::UnionInstance;
 use crate::zerocheck::K_SKIP;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
+use std::env::var;
+use std::time::Instant;
 
 use super::{
     LincheckCircuit, LincheckClaim, LincheckProof, QuirkyPoint, VerifyError, build_eq_table,
@@ -221,7 +223,7 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     }
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let trace = var("LINCHECK_TRACE").is_ok();
 
     // 1. Sample α (matches verifier's order). ONE α batches the A- and
     //    B-claims for every slot (doc §"The B-claim, and batching the two
@@ -239,11 +241,7 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     // slot to FILL the boolean region — true for every single-type registry,
     // and for no multi-slot one.
     let single = registry.num_boolean() == 1 && registry.slots()[0].m_slot == registry.m_bool();
-    let t_comb = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t_comb = if trace { Some(Instant::now()) } else { None };
     let mut comb_vec: Vec<F128> = if single {
         Vec::new()
     } else {
@@ -304,11 +302,7 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     //    single partial fold. Dummy rows are honest zeros, so folding only
     //    the DECLARED rows equals the full-capacity fold byte for byte —
     //    the row-aware dispatch makes the fold count-proportional (M6).
-    let t_fold = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t_fold = if trace { Some(Instant::now()) } else { None };
     let eq_x_outer = build_eq_table(&x_ab.x_outer);
     let mut z_vec: Vec<F128> = if single {
         Vec::new()
@@ -772,7 +766,7 @@ pub fn verify_union_timed<Ch: Challenger>(
 ) -> Result<(LincheckClaim, f64), VerifyError> {
     let (claim, assertion) =
         verify_union_deferred(union, circuits, x_ab, v_a, v_b, proof, challenger)?;
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     assertion.check(union, circuits)?;
     Ok((claim, t.elapsed().as_secs_f64()))
 }

@@ -13,6 +13,7 @@
 //! Keccak has no generic path at all — its BlockR1cs carries empty matrix
 //! stubs by design, so the matrices the generic path needs don't exist.
 
+use std::array::from_fn;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -60,12 +61,7 @@ fn bench_sha2(n: usize) {
     let m = setup.m();
     let mut rng = Rng(0x5A2 ^ n as u64);
     let comps: Vec<Compression> = (0..n)
-        .map(|_| {
-            (
-                std::array::from_fn(|_| rng.u32()),
-                std::array::from_fn(|_| rng.u32()),
-            )
-        })
+        .map(|_| (from_fn(|_| rng.u32()), from_fn(|_| rng.u32())))
         .collect();
 
     println!("\n=== sha2, {n} compressions (m = {m}) ===");
@@ -113,8 +109,8 @@ fn bench_blake3(n: usize) {
     let blocks: Vec<Compression> = (0..n)
         .map(|_| {
             (
-                std::array::from_fn(|_| rng.u32()),
-                std::array::from_fn(|_| rng.u32()),
+                from_fn(|_| rng.u32()),
+                from_fn(|_| rng.u32()),
                 rng.next_u64(),
                 rng.u32(),
                 64u32,

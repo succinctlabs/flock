@@ -25,15 +25,42 @@
 //!     R1csClaim { ab: z-claim from lincheck,  c: z-claim from extract_c }
 //! ```
 
+use core::mem::size_of;
 use flock_core::challenger::Challenger;
+use flock_core::circuit::Circuit;
+use flock_core::circuit::WiringProof;
+use flock_core::circuit::prove_wiring;
+use flock_core::element_r1cs::ElementTableType;
+use flock_core::element_r1cs::union::Claims;
+use flock_core::element_r1cs::union::Proof;
+use flock_core::element_r1cs::union::copy_live_region;
+use flock_core::element_r1cs::union::dead_rows_unread;
+use flock_core::element_r1cs::union::fill_slot;
+use flock_core::element_r1cs::union::prove;
 use flock_core::field::F128;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
-use flock_core::proof::{
-    R1csClaim, R1csProofLigerito, ZClaim, bind_statement,
-};
+use flock_core::proof::BooleanPiopProof;
+use flock_core::proof::R1csProofCircuitMerged;
+use flock_core::proof::R1csProofMergedLigerito;
+use flock_core::proof::R1csProofMixedClassMerged;
+use flock_core::proof::UnionClassClaims;
+use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
+use flock_core::r1cs::WitnessLayout;
+use flock_core::schedule::TableClass;
+use flock_core::scratch::give_f128;
+use flock_core::scratch::give_u8;
+use flock_core::union::SlotWitness;
+use flock_core::union::SlotWitnessDest;
+use flock_core::union::UnionInstance;
+use flock_core::union::WitnessBufMode;
 use flock_core::zerocheck;
+use std::env::var;
+use std::mem::size_of_val;
+use std::slice::from_raw_parts;
+use std::sync::Arc;
+use std::time::Instant;
 
 /// Construct a multilinear `x_outer_full` of length `m − k_skip` from a
 /// QuirkyPoint: concatenate `x_inner_rest` and `x_outer`. This is the format
@@ -102,7 +129,7 @@ pub fn prove_ligerito<Ch: Challenger>(
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     assert_eq!(
         r1cs.layout,
-        flock_core::r1cs::WitnessLayout::RowMajor,
+        WitnessLayout::RowMajor,
         "the generic matrix-driven provers assume the row-major layout \
          (block-diagonal apply + lincheck stripe packing); batch-major \
          setups must use the per-hash prove_fast paths"
@@ -126,7 +153,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         r1cs.apply_c_packed(&z_packed)
     };
     let cast = |v: &[F128]| -> &[u8] {
-        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+        unsafe { from_raw_parts(v.as_ptr() as *const u8, size_of_val(v)) }
     };
     let a_packed: &[u8] = cast(&a_packed_f128);
     let b_packed: &[u8] = cast(&b_packed_f128);
@@ -275,19 +302,19 @@ enum UnionSlotWitnessSource<'a> {
     /// Already generated into the slot's own buffers — the union assembly
     /// COPIES them to the slot's aligned block.
     Prebuilt {
-        witness: flock_core::union::SlotWitness,
+        witness: SlotWitness,
         z_lincheck: Vec<u8>,
     },
     /// Generated in place: the closure is handed the slot's block of the
     /// union buffers and writes it directly, returning the lincheck stripe.
     /// No copy — see [`flock_core::union::SlotWitnessDest`].
-    InPlace(Box<dyn FnOnce(flock_core::union::SlotWitnessDest<'_>) -> Vec<u8> + Send + 'a>),
+    InPlace(Box<dyn FnOnce(SlotWitnessDest<'_>) -> Vec<u8> + Send + 'a>),
     /// An ELEMENT slot: the closure writes the slot's committed element words
     /// into the `z` view and `element_r1cs::union::fill_slot` derives `a`/`b`
     /// from them by sparse gather. There is no lincheck stripe — the element
     /// lincheck folds the committed region itself.
     Element {
-        ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+        ty: Arc<ElementTableType>,
         generate: Box<dyn FnOnce(&mut [F128]) + Send + 'a>,
     },
 }
@@ -330,7 +357,7 @@ impl<'a> UnionSlotProverInput<'a> {
     ) -> Self {
         Self {
             source: UnionSlotWitnessSource::Prebuilt {
-                witness: flock_core::union::SlotWitness {
+                witness: SlotWitness {
                     z_packed,
                     a_packed,
                     b_packed,
@@ -357,7 +384,7 @@ impl<'a> UnionSlotProverInput<'a> {
     /// — a slot's BatchMajor layout IS its aligned union sub-block — so the
     /// proof is byte-identical, only the copy is gone.
     pub fn in_place(
-        generate: impl FnOnce(flock_core::union::SlotWitnessDest<'_>) -> Vec<u8> + Send + 'a,
+        generate: impl FnOnce(SlotWitnessDest<'_>) -> Vec<u8> + Send + 'a,
         lincheck_circuit: &'a dyn lincheck::LincheckCircuit,
     ) -> Self {
         Self {
@@ -382,7 +409,7 @@ impl<'a> UnionSlotProverInput<'a> {
 /// vector has one entry per slot, EMPTY for element slots — the element
 /// lincheck folds the committed region directly and has no stripe.
 fn build_union_witness(
-    union: &flock_core::union::UnionInstance<'_>,
+    union: &UnionInstance<'_>,
     sources: Vec<UnionSlotWitnessSource<'_>>,
     padding_unread: bool,
 ) -> (
@@ -390,7 +417,7 @@ fn build_union_witness(
     Vec<F128>,
     Vec<F128>,
     Vec<Vec<u8>>,
-    flock_core::union::WitnessBufMode,
+    WitnessBufMode,
 ) {
     assert_eq!(
         sources.len(),
@@ -416,25 +443,18 @@ fn build_union_witness(
             }
         }
         let (z, a, b) = union.assemble_witness(witnesses);
-        return (
-            z,
-            a,
-            b,
-            stripes,
-            flock_core::union::WitnessBufMode::PooledZeroed,
-        );
+        return (z, a, b, stripes, WitnessBufMode::PooledZeroed);
     }
 
     let (mut z, mut a, mut b, mode) = union.take_witness_buffers(padding_unread);
-    let elide = mode != flock_core::union::WitnessBufMode::PooledZeroed;
+    let elide = mode != WitnessBufMode::PooledZeroed;
     let nu = union.n_log();
     // Live-only element `pa`/`pb` derivation: when the region zerocheck will
     // take its sparse arm, dead rows of `a`/`b` are unread everywhere (their
     // values are substituted analytically), so the gather skips them — the
     // same pay-per-live discipline the boolean side's run-lists apply. Gated
     // by the zerocheck's OWN predicate so the two cannot drift.
-    let elem_live = union.has_element()
-        && flock_core::element_r1cs::union::dead_rows_unread(union);
+    let elem_live = union.has_element() && dead_rows_unread(union);
     let stripes = union
         .slot_dests(&mut z, &mut a, &mut b, elide)
         .into_iter()
@@ -453,9 +473,7 @@ fn build_union_witness(
             }
             UnionSlotWitnessSource::Element { ty, generate } => {
                 let live = elem_live.then(|| union.counts()[i]);
-                flock_core::element_r1cs::union::fill_slot(
-                    &ty, nu, live, dst.z, dst.a, dst.b, generate,
-                );
+                fill_slot(&ty, nu, live, dst.z, dst.a, dst.b, generate);
                 Vec::new()
             }
         })
@@ -479,7 +497,7 @@ enum UnionProveBinding<'a> {
 /// union's declared counts) and its public words, in public-segment order.
 #[derive(Clone, Copy)]
 pub struct CircuitProverInput<'a> {
-    pub circuit: &'a flock_core::circuit::Circuit,
+    pub circuit: &'a Circuit,
     pub public: &'a [F128],
 }
 
@@ -497,18 +515,14 @@ pub struct CircuitProverInput<'a> {
 /// Verify with [`flock_core::verifier::verify_ligerito_union_circuit`].
 #[allow(clippy::too_many_arguments)]
 pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
-    union: &flock_core::union::UnionInstance<'_>,
-    circuit: &flock_core::circuit::Circuit,
+    union: &UnionInstance<'_>,
+    circuit: &Circuit,
     public: &[F128],
     pcs_params: &PcsParams,
     slots: Vec<UnionSlotProverInput<'_>>,
     element_slots: Vec<UnionElementSlotInput<'_>>,
     challenger: &mut Ch,
-) -> (
-    flock_core::proof::R1csProofCircuitMerged,
-    Commitment,
-    flock_core::proof::UnionClassClaims,
-) {
+) -> (R1csProofCircuitMerged, Commitment, UnionClassClaims) {
     assert!(
         circuit.check_instance(union),
         "the circuit and the union instance must be the same statement \
@@ -537,14 +551,14 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
         None => (None, None),
     };
     (
-        flock_core::proof::R1csProofCircuitMerged {
+        R1csProofCircuitMerged {
             boolean: bool_proof,
             element: el_proof,
             wiring: wiring.expect("the circuit binding runs the wiring argument"),
             pcs_open,
         },
         commitment,
-        flock_core::proof::UnionClassClaims {
+        UnionClassClaims {
             boolean: bool_claim,
             element: el_claim,
         },
@@ -569,15 +583,11 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
 /// `generate_witness_batch_major` drivers fill padding rows with real dummy
 /// invocations (pin = 1) and are only valid here at `n_t = 2^nu`.
 pub fn prove_fast_ligerito_union<Ch: Challenger>(
-    union: &flock_core::union::UnionInstance<'_>,
+    union: &UnionInstance<'_>,
     pcs_params: &PcsParams,
     slots: Vec<UnionSlotProverInput<'_>>,
     challenger: &mut Ch,
-) -> (
-    flock_core::proof::R1csProofMergedLigerito,
-    Commitment,
-    R1csClaim,
-) {
+) -> (R1csProofMergedLigerito, Commitment, R1csClaim) {
     // This entry returns `R1csClaim` — structurally boolean-only. Element
     // registries go through the mixed-class entry, whose merged open carries
     // their claims packed-direct.
@@ -596,7 +606,7 @@ pub fn prove_fast_ligerito_union<Ch: Challenger>(
     );
     let (piop, claim) = out.boolean.expect("asserted boolean-only above");
     (
-        flock_core::proof::R1csProofMergedLigerito {
+        R1csProofMergedLigerito {
             zerocheck: piop.zerocheck,
             lincheck: piop.lincheck,
             pcs_open: out.pcs_open,
@@ -610,14 +620,11 @@ pub fn prove_fast_ligerito_union<Ch: Challenger>(
 /// paired with its claims (`None` when the registry has no type of that class),
 /// plus the single opening covering all of them.
 struct UnionProveOutput {
-    boolean: Option<(flock_core::proof::BooleanPiopProof, R1csClaim)>,
-    element: Option<(
-        flock_core::element_r1cs::union::Proof,
-        flock_core::element_r1cs::union::Claims,
-    )>,
+    boolean: Option<(BooleanPiopProof, R1csClaim)>,
+    element: Option<(Proof, Claims)>,
     /// The wiring argument's transcript — `Some` exactly under
     /// [`UnionProveBinding::Circuit`].
-    wiring: Option<flock_core::circuit::WiringProof>,
+    wiring: Option<WiringProof>,
     pcs_open: pcs::MergedOpenProof,
 }
 
@@ -628,7 +635,7 @@ struct UnionProveOutput {
 /// order documented on [`prove_fast_ligerito_union_mixed_class`],
 /// then batches all four claims into one merged opening.
 fn prove_union_with_binding<Ch: Challenger>(
-    union: &flock_core::union::UnionInstance<'_>,
+    union: &UnionInstance<'_>,
     binding: UnionProveBinding,
     pcs_params: &PcsParams,
     slots: Vec<UnionSlotProverInput<'_>>,
@@ -671,8 +678,8 @@ fn prove_union_with_binding<Ch: Challenger>(
     }
     for (ty, input) in union.registry().element_types().iter().zip(element_slots) {
         let element = match &ty.class {
-            flock_core::schedule::TableClass::LargeField(el) => el.clone(),
-            flock_core::schedule::TableClass::Boolean => {
+            TableClass::LargeField(el) => el.clone(),
+            TableClass::Boolean => {
                 unreachable!("element_types() are LargeField")
             }
         };
@@ -681,9 +688,9 @@ fn prove_union_with_binding<Ch: Challenger>(
             generate: input.generate,
         });
     }
-    let trace = std::env::var("PCS_TRACE").is_ok();
-    let t_all = std::time::Instant::now();
-    let t = std::time::Instant::now();
+    let trace = var("PCS_TRACE").is_ok();
+    let t_all = Instant::now();
+    let t = Instant::now();
     // BOOLEAN-only registries never read dropped words: the zerocheck is
     // run-list-gated, the union lincheck is count-proportional, compaction
     // reads declared rows only, and (when s_hat_v is precomputed) the
@@ -703,7 +710,7 @@ fn prove_union_with_binding<Ch: Challenger>(
         && union.m_total() - union.n_log() >= pcs::LOG_PACKING;
     let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
         build_union_witness(union, sources, padding_unread);
-    let give_back = buf_mode != flock_core::union::WitnessBufMode::FreshZeroed;
+    let give_back = buf_mode != WitnessBufMode::FreshZeroed;
     if trace {
         eprintln!(
             "  [prove_union] witgen (padded 2^{}, {:?}): {:7.2} ms",
@@ -728,10 +735,10 @@ fn prove_union_with_binding<Ch: Challenger>(
     // cost only. Under PooledDirty, dropped words are dirty by design —
     // and never read — so the compaction skips the honest-zeros
     // debug_assert.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let q: Vec<F128> = if union.compaction_is_identity() {
         z_packed.clone()
-    } else if buf_mode == flock_core::union::WitnessBufMode::PooledDirty {
+    } else if buf_mode == WitnessBufMode::PooledDirty {
         union.compact_witness_unchecked(&z_packed)
     } else {
         union.compact_witness(&z_packed)
@@ -751,7 +758,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     // chunk-columns are still a contiguous zero tail (BLAKE3 commits 121 of
     // 128, so t = 61 of 64 lanes at M = 30). Both arms therefore dispatch on
     // `num_lanes` alone.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let (commitment, prover_data) = if pcs_params.num_lanes.is_some() {
         pcs::commit_lane_major(&q, pcs_params)
     } else {
@@ -763,7 +770,7 @@ fn prove_union_with_binding<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     match binding {
         UnionProveBinding::Mixed => union.bind_statement(challenger, &commitment),
         UnionProveBinding::Circuit(ci) => {
@@ -811,15 +818,11 @@ fn prove_union_with_binding<Ch: Challenger>(
     // On the dense arm (> 50% region utilization) the zerocheck reads the
     // whole region, so the copy stays faithful — including whatever the
     // full derivation wrote on dead rows (the per-column constants).
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let element_ab: Option<(Vec<F128>, Vec<F128>)> = union.has_element().then(|| {
         let r = union.element_word_range();
-        if flock_core::element_r1cs::union::dead_rows_unread(union) {
-            flock_core::element_r1cs::union::copy_live_region(
-                union,
-                &a_packed_f128[r.clone()],
-                &b_packed_f128[r],
-            )
+        if dead_rows_unread(union) {
+            copy_live_region(union, &a_packed_f128[r.clone()], &b_packed_f128[r])
         } else {
             (a_packed_f128[r.clone()].to_vec(), b_packed_f128[r].to_vec())
         }
@@ -834,17 +837,12 @@ fn prove_union_with_binding<Ch: Challenger>(
     }
 
     // ---- The boolean class's PIOP pair, over the prefix subcube.
-    let t_bool = std::time::Instant::now();
+    let t_bool = Instant::now();
     let boolean = (union.num_boolean() > 0).then(|| {
         let (zc_proof, zc_claim, s_hat_v_c) = {
             // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
             let view = |v: &[F128]| -> &[u8] {
-                unsafe {
-                    std::slice::from_raw_parts(
-                        v.as_ptr() as *const u8,
-                        bool_words * core::mem::size_of::<F128>(),
-                    )
-                }
+                unsafe { from_raw_parts(v.as_ptr() as *const u8, bool_words * size_of::<F128>()) }
             };
             let a_packed = view(&a_packed_f128);
             let b_packed = view(&b_packed_f128);
@@ -910,7 +908,7 @@ fn prove_union_with_binding<Ch: Challenger>(
             None
         };
         (
-            flock_core::proof::BooleanPiopProof {
+            BooleanPiopProof {
                 zerocheck: zc_proof,
                 lincheck: lc_proof,
             },
@@ -929,24 +927,24 @@ fn prove_union_with_binding<Ch: Challenger>(
     }
     // a/b are consumed; recycle the buffers as in `prove_fast_core`.
     if give_back {
-        flock_core::scratch::give_f128(a_packed_f128);
-        flock_core::scratch::give_f128(b_packed_f128);
+        give_f128(a_packed_f128);
+        give_f128(b_packed_f128);
     }
     // Recycle the stripes (as large as the witness itself) rather than
     // unmapping them — the drivers take them from the same pool.
     for (stripe, _) in linchecks {
         if give_back {
-            flock_core::scratch::give_u8(stripe);
+            give_u8(stripe);
         }
     }
 
     // ---- The element class's PIOP pair, over the element region. Runs AFTER
     // the boolean pair, so its τ' is drawn from a transcript that already
     // absorbed every boolean message (and vice versa is impossible).
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let element = element_ab.map(|(pa, pb)| {
         let r = union.element_word_range();
-        flock_core::element_r1cs::union::prove(union, &z_packed[r], pa, pb, challenger)
+        prove(union, &z_packed[r], pa, pb, challenger)
     });
     if trace && element.is_some() {
         eprintln!(
@@ -963,11 +961,11 @@ fn prove_union_with_binding<Ch: Challenger>(
     // It reads `z_packed` — the padded buffer the commitment was built from,
     // whose dummy rows are zero by the union's witness contract, which is what
     // makes the dummy cells' `w = 0` honest.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let wiring = match &binding {
-        UnionProveBinding::Circuit(ci) => Some(flock_core::circuit::prove_wiring(
-            ci.circuit, &z_packed, ci.public, challenger,
-        )),
+        UnionProveBinding::Circuit(ci) => {
+            Some(prove_wiring(ci.circuit, &z_packed, ci.public, challenger))
+        }
         _ => None,
     };
     if trace && let Some((_, claims)) = &wiring {
@@ -984,10 +982,10 @@ fn prove_union_with_binding<Ch: Challenger>(
     // PACKED-DIRECT — carried unbuilt by the merged open (it derives its
     // identity-fold weights from `point`/`value` alone and never reads
     // `eq_ind`).
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let heights = union.jagged_heights();
     let t_h = t.elapsed().as_secs_f64() * 1e3;
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let (z_claims, pre): (Vec<ZClaim>, Vec<Option<&[F128]>>) = match &boolean {
         Some((_, claim, s_hat_v_ab, s_hat_v_c)) => (
             vec![claim.ab.clone(), claim.c.clone()],
@@ -996,13 +994,13 @@ fn prove_union_with_binding<Ch: Challenger>(
         None => (Vec::new(), Vec::new()),
     };
     let t_z = t.elapsed().as_secs_f64() * 1e3;
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut packed_direct: Vec<pcs::PackedDirectClaim> = match &element {
         Some((_, claims)) => element_packed_direct_claims(claims),
         None => Vec::new(),
     };
     let t_e = t.elapsed().as_secs_f64() * 1e3;
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let wiring = wiring.map(|(proof, gather_claims)| {
         packed_direct.extend(gather_claims);
         proof
@@ -1015,9 +1013,11 @@ fn prove_union_with_binding<Ch: Challenger>(
             t_h + t_z + t_e + t_w
         );
     }
-    let t = std::time::Instant::now();
-    let x_fulls: Vec<Vec<F128>> =
-        z_claims.iter().map(|cl| quirky_x_outer_full(&cl.point)).collect();
+    let t = Instant::now();
+    let x_fulls: Vec<Vec<F128>> = z_claims
+        .iter()
+        .map(|cl| quirky_x_outer_full(&cl.point))
+        .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let pcs_open = pcs::open_batch_merged(
         q,
@@ -1033,7 +1033,7 @@ fn prove_union_with_binding<Ch: Challenger>(
         &lig_config,
         challenger,
     );
-    flock_core::scratch::give_f128(z_packed);
+    give_f128(z_packed);
     if trace {
         eprintln!(
             "  [prove_union] open (rs×{}, pd×{}): {:7.2} ms",
@@ -1079,9 +1079,7 @@ fn binding_circuit_mu(binding: &UnionProveBinding<'_>) -> usize {
 /// forgotten conversion on a path that DID need a tensor would trip the
 /// combine's "EqPoint claims are only supported alone" assert rather than
 /// silently dropping the contribution.)
-fn element_packed_direct_claims(
-    claims: &flock_core::element_r1cs::union::Claims,
-) -> Vec<pcs::PackedDirectClaim> {
+fn element_packed_direct_claims(claims: &Claims) -> Vec<pcs::PackedDirectClaim> {
     [
         (&claims.c_point, claims.c_value),
         (&claims.lc_point, claims.lc_value),
@@ -1178,21 +1176,21 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     let (zc_proof, zc_claim, s_hat_v_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
         let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
+            from_raw_parts(
                 a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
+                a_packed_f128.len() * size_of::<F128>(),
             )
         };
         let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
+            from_raw_parts(
                 b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
+                b_packed_f128.len() * size_of::<F128>(),
             )
         };
         let c_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
+            from_raw_parts(
                 z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
+                z_packed.len() * size_of::<F128>(),
             )
         };
         zerocheck::prove_packed_padded_capture_s_hat_v_c(
@@ -1202,8 +1200,8 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    give_f128(a_packed_f128);
+    give_f128(b_packed_f128);
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
@@ -1221,7 +1219,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     );
     // The lincheck stripe copy of z is dead from here on; free it before the
     // PCS open (2^(m-3) bytes — 64 MB at m = 29).
-    flock_core::scratch::give_u8(z_packed_lincheck);
+    give_u8(z_packed_lincheck);
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -1322,21 +1320,21 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     let t0 = Instant::now();
     let (zc_proof, zc_claim, s_hat_v_c) = {
         let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
+            from_raw_parts(
                 a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
+                a_packed_f128.len() * size_of::<F128>(),
             )
         };
         let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
+            from_raw_parts(
                 b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
+                b_packed_f128.len() * size_of::<F128>(),
             )
         };
         let c_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
+            from_raw_parts(
                 z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
+                z_packed.len() * size_of::<F128>(),
             )
         };
         zerocheck::prove_packed_padded_capture_s_hat_v_c(
@@ -1344,8 +1342,8 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         )
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    give_f128(a_packed_f128);
+    give_f128(b_packed_f128);
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
@@ -1361,7 +1359,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         &x_ab,
         challenger,
     );
-    flock_core::scratch::give_u8(z_packed_lincheck);
+    give_u8(z_packed_lincheck);
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,
@@ -1419,16 +1417,12 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
 /// only the proof struct differs), an element-only one `boolean: None` and
 /// an opening with no ring-switched claims at all.
 pub fn prove_fast_ligerito_union_mixed_class<Ch: Challenger>(
-    union: &flock_core::union::UnionInstance<'_>,
+    union: &UnionInstance<'_>,
     pcs_params: &PcsParams,
     slots: Vec<UnionSlotProverInput<'_>>,
     element_slots: Vec<UnionElementSlotInput<'_>>,
     challenger: &mut Ch,
-) -> (
-    flock_core::proof::R1csProofMixedClassMerged,
-    Commitment,
-    flock_core::proof::UnionClassClaims,
-) {
+) -> (R1csProofMixedClassMerged, Commitment, UnionClassClaims) {
     let (out, commitment) = prove_union_with_binding(
         union,
         UnionProveBinding::Mixed,
@@ -1453,13 +1447,13 @@ pub fn prove_fast_ligerito_union_mixed_class<Ch: Challenger>(
         None => (None, None),
     };
     (
-        flock_core::proof::R1csProofMixedClassMerged {
+        R1csProofMixedClassMerged {
             boolean: bool_proof,
             element: el_proof,
             pcs_open,
         },
         commitment,
-        flock_core::proof::UnionClassClaims {
+        UnionClassClaims {
             boolean: bool_claim,
             element: el_claim,
         },

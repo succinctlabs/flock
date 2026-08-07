@@ -28,6 +28,8 @@
 use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::field::F128;
 use flock_core::pcs::ligerito::LigeritoProfile;
+use flock_core::schedule::TableClass;
+use flock_core::transcript_record::TranscriptShape;
 use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
 use flock_prover::challenger::FsChallenger;
 use flock_prover::pcs::PcsParams;
@@ -35,6 +37,7 @@ use flock_prover::prover::{self, UnionElementSlotInput};
 use flock_prover::schedule::{Registry, TableType};
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier;
+use std::env::var_os;
 use std::sync::Arc;
 
 const DOMAIN: &[u8] = b"flock-union-element-v0";
@@ -106,10 +109,7 @@ fn record_element_only(
     kappas: &[usize],
     counts: &[usize],
     seed: u64,
-) -> (
-    flock_core::transcript_record::TranscriptShape,
-    flock_core::transcript_record::TranscriptShape,
-) {
+) -> (TranscriptShape, TranscriptShape) {
     let mut rng = Rng::new(seed);
     let (w0, w1) = (F128::new(7, 0), F128::new(0, 3));
 
@@ -122,7 +122,7 @@ fn record_element_only(
         .element_types()
         .iter()
         .map(|t| match &t.class {
-            flock_core::schedule::TableClass::LargeField(e) => e.clone(),
+            TableClass::LargeField(e) => e.clone(),
             _ => unreachable!("element-only registry"),
         })
         .collect();
@@ -182,7 +182,7 @@ fn element_only_transcript_shape_is_data_independent() {
         (0, 0xA11CE_0004),
     ];
 
-    let mut reference: Option<flock_core::transcript_record::TranscriptShape> = None;
+    let mut reference: Option<TranscriptShape> = None;
     for (count, seed) in cases {
         let (shape_p, shape_v) = record_element_only(nu, &kappas, &[count], seed);
 
@@ -258,13 +258,13 @@ fn element_only_transcript_shape_is_data_independent() {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn element_only_transcript_shape_is_pinned() {
-// Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
-// per-statement assist became 128K dual values + one product sumcheck +
-// one untwisted anchor; transcript + wire moved by design.
-// Re-pinned 2026-08-02: two-product multipoint grouping (proof_io v9) —
-// element-only claims are all packed-direct, so the values absorb shrinks
-// from 128·K to ONE word per merged-row group and the sumcheck is the
-// single untwisted product; multipoint label v1.
+    // Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
+    // per-statement assist became 128K dual values + one product sumcheck +
+    // one untwisted anchor; transcript + wire moved by design.
+    // Re-pinned 2026-08-02: two-product multipoint grouping (proof_io v9) —
+    // element-only claims are all packed-direct, so the values absorb shrinks
+    // from 128·K to ONE word per merged-row group and the sumcheck is the
+    // single untwisted product; multipoint label v1.
     const EXPECTED: &str = "25a137909e6f2bbd3c92b16010ce0b2ef07307994b828889e52ce2c641944261";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
@@ -302,7 +302,7 @@ fn element_only_transcript_shape_is_pinned() {
         inv.finalize_parents,
     );
 
-    if std::env::var_os("TRANSCRIPT_SHAPE_PRINT").is_some() {
+    if var_os("TRANSCRIPT_SHAPE_PRINT").is_some() {
         println!("const EXPECTED: &str = \"{}\";", shape.digest_hex());
         return;
     }

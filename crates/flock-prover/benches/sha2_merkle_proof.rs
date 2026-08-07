@@ -13,6 +13,7 @@
 //! Reports both the chain overhead and the Merkle overhead over `prove_fast`,
 //! and the Merkle-vs-chain delta. K_LOG=15 → m=29 at 16,384 blocks.
 
+use std::array::from_fn;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -53,7 +54,7 @@ fn fmt_ms(s: f64) -> String {
 /// All blocks use the public SHA-256 IV as H_in.
 fn honest_merkle_path(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8], Vec<bool>) {
     let mut rng = Rng::new(seed);
-    let leaf: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
+    let leaf: [u32; 8] = from_fn(|_| rng.nx() as u32);
     let mut b_bits = vec![false; n];
     for bit in b_bits.iter_mut().skip(1) {
         *bit = rng.nx() & 1 == 1;
@@ -61,7 +62,7 @@ fn honest_merkle_path(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32;
     let mut blocks = Vec::with_capacity(n);
     let mut current = leaf;
     for i in 0..n {
-        let sibling: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
+        let sibling: [u32; 8] = from_fn(|_| rng.nx() as u32);
         let mut m = [0u32; 16];
         if !b_bits[i] {
             m[..8].copy_from_slice(&current);

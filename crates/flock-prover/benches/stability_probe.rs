@@ -7,6 +7,8 @@
 //!
 //! Prints one `RUN <bench> <ms>` line per timed prove (machine-readable).
 
+use std::array::from_fn;
+use std::env::var;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -31,12 +33,12 @@ impl Rng {
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
-    let runs: usize = std::env::var("STAB_RUNS")
+    let runs: usize = var("STAB_RUNS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
     // STAB_WARMUP=0 exposes cold-start (first-prove) behavior.
-    let warmup: usize = std::env::var("STAB_WARMUP")
+    let warmup: usize = var("STAB_WARMUP")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
@@ -49,12 +51,7 @@ fn main() {
         let mut rng = Rng::new(0x57AB);
         let mk = |rng: &mut Rng| -> Vec<([u32; 8], [u32; 16])> {
             (0..n)
-                .map(|_| {
-                    (
-                        std::array::from_fn(|_| rng.u32()),
-                        std::array::from_fn(|_| rng.u32()),
-                    )
-                })
+                .map(|_| (from_fn(|_| rng.u32()), from_fn(|_| rng.u32())))
                 .collect()
         };
         for _ in 0..warmup {
@@ -81,7 +78,7 @@ fn main() {
         let mut rng = Rng::new(0x57AC);
         let mk = |rng: &mut Rng| -> Vec<State> {
             (0..k)
-                .map(|_| std::array::from_fn(|_| rng.next_u64() & 1 == 1))
+                .map(|_| from_fn(|_| rng.next_u64() & 1 == 1))
                 .collect()
         };
         for _ in 0..warmup {

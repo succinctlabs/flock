@@ -57,6 +57,7 @@
 //! `(q(1), q(∞))` with `q(0)` re-derived from the running claim, and each
 //! round binds the LOW remaining variable.
 
+use crate::element_r1cs::SparseF128Matrix;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -474,7 +475,7 @@ impl FoldMatrix for SparseBinaryMatrix {
     }
 }
 
-impl FoldMatrix for crate::element_r1cs::SparseF128Matrix {
+impl FoldMatrix for SparseF128Matrix {
     fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
         let mut out = vec![F128::ZERO; n_rows];
         out.par_chunks_mut(G_ROW_CHUNK)

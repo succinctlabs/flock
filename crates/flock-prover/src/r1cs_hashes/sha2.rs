@@ -46,8 +46,29 @@
 //! - `H_out[w]` — the public output of the compression.
 
 use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit};
+use crate::prover::ProvePhaseTimings;
+use crate::prover::prove_fast_ligerito_from_witness;
+use crate::prover::prove_fast_ligerito_timed;
+use crate::prover::prove_ligerito;
+use flock_core::challenger::Challenger;
 use flock_core::field::F128;
+#[cfg(test)]
+use flock_core::lincheck::CscCircuit;
+use flock_core::lincheck::LincheckCircuit;
+use flock_core::pcs::Commitment;
+use flock_core::pcs::PcsParams;
+use flock_core::pcs::ligerito::LigeritoProfile;
+use flock_core::pcs::prefault_codeword_during;
+use flock_core::proof::R1csClaim;
+use flock_core::proof::R1csProofLigerito;
+use flock_core::r1cs::WitnessLayout;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
+use flock_core::scratch::prewarm_prover;
+use flock_core::union::SlotWitnessDest;
+use flock_core::verifier::VerifyError;
+use flock_core::verifier::verify_ligerito;
+use std::array::from_fn;
+use std::time::Instant;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Compile-time slot layout
@@ -609,9 +630,7 @@ pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
 
 /// Read the 8-word post-compression hash out of a single block of witness.
 pub fn read_h_out(z: &[bool]) -> [u32; 8] {
-    std::array::from_fn(|w| {
-        (0..WORD_BITS).fold(0u32, |acc, b| acc | ((z[h_out_bit(w, b)] as u32) << b))
-    })
+    from_fn(|w| (0..WORD_BITS).fold(0u32, |acc, b| acc | ((z[h_out_bit(w, b)] as u32) << b)))
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -707,7 +726,7 @@ fn scatter_add32_alloc<F1: Fn(usize) -> usize, F2: Fn(usize) -> usize>(
 
 pub struct Sha2LincheckCircuit;
 
-impl flock_core::lincheck::LincheckCircuit for Sha2LincheckCircuit {
+impl LincheckCircuit for Sha2LincheckCircuit {
     fn n_cols(&self) -> usize {
         K
     }
@@ -959,9 +978,10 @@ fn add_inline_ab(
     b: &mut [u64],
     carry_base: usize,
 ) -> u32 {
+    const MASK_LO31: u32 = 0x7FFF_FFFF;
     let sum_word: u32 = x.wrapping_add(y);
     let cin: u32 = sum_word ^ x ^ y;
-    const MASK_LO31: u32 = 0x7FFF_FFFF;
+
     let left = (x ^ cin) & MASK_LO31;
     let right = (y ^ cin) & MASK_LO31;
     let carry_aux = left & right;
@@ -1000,6 +1020,9 @@ fn build_block_ab_packed_into(
     a: &mut [u64],
     b: &mut [u64],
 ) {
+    const SC0: usize = 0;
+    const SC1: usize = CARRIES_PER_ADD;
+    const SC2: usize = 2 * CARRIES_PER_ADD;
     const U64_PER_BLOCK: usize = K / 64;
     debug_assert_eq!(z.len(), U64_PER_BLOCK);
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
@@ -1032,9 +1055,7 @@ fn build_block_ab_packed_into(
     // [`BitRecord`]).
     let mut w_sched = [0u32; 64];
     w_sched[..16].copy_from_slice(m);
-    const SC0: usize = 0;
-    const SC1: usize = CARRIES_PER_ADD;
-    const SC2: usize = 2 * CARRIES_PER_ADD;
+
     for t in 16..64 {
         let mut rz = BitRecord::<2>::new();
         let mut ra = BitRecord::<2>::new();
@@ -1080,6 +1101,15 @@ fn build_block_ab_packed_into(
         mut hh,
     ] = *h_in;
     for r in 0..N_ROUNDS {
+        // The 7 × 31-bit round carries are contiguous (217 bits at stride
+        // 217) — composed in a register record and flushed once per buffer.
+        const RC0: usize = 0;
+        const RC1: usize = CARRIES_PER_ADD;
+        const RC2: usize = 2 * CARRIES_PER_ADD;
+        const RC3: usize = 3 * CARRIES_PER_ADD;
+        const RC4: usize = 4 * CARRIES_PER_ADD;
+        const RC5: usize = 5 * CARRIES_PER_ADD;
+        const RC6: usize = 6 * CARRIES_PER_ADD;
         // ch_and AND row: (z, a, b) = (ch, e, f⊕g); c == z = ch.
         let f_xor_g = ff ^ gg;
         let ch_and_v = ee & f_xor_g;
@@ -1099,15 +1129,6 @@ fn build_block_ab_packed_into(
         or_u32_at_bit(b, off, c_xor_a);
         let maj_out = maj_and_v ^ aa;
 
-        // The 7 × 31-bit round carries are contiguous (217 bits at stride
-        // 217) — composed in a register record and flushed once per buffer.
-        const RC0: usize = 0;
-        const RC1: usize = CARRIES_PER_ADD;
-        const RC2: usize = 2 * CARRIES_PER_ADD;
-        const RC3: usize = 3 * CARRIES_PER_ADD;
-        const RC4: usize = 4 * CARRIES_PER_ADD;
-        const RC5: usize = 5 * CARRIES_PER_ADD;
-        const RC6: usize = 6 * CARRIES_PER_ADD;
         let mut rz = BitRecord::<4>::new();
         let mut ra = BitRecord::<4>::new();
         let mut rb = BitRecord::<4>::new();
@@ -1185,12 +1206,7 @@ fn build_block_ab_packed_into(
 pub fn generate_witness_with_ab_packed_and_lincheck(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
-) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<u8>,
-) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid compression (of the all-zero input) so the constant cell is 1 in
     // every block. (The chain forbids padding, so this only affects the
@@ -1245,7 +1261,7 @@ pub fn generate_witness(compressions: &[([u32; 8], [u32; 16])], n_blocks_log: us
 pub struct Sha256HybridSetup {
     pub n_compressions: usize,
     pub r1cs: BlockR1cs,
-    pub pcs_params: flock_core::pcs::PcsParams,
+    pub pcs_params: PcsParams,
 }
 
 impl Sha256HybridSetup {
@@ -1258,7 +1274,7 @@ impl Sha256HybridSetup {
     /// chain/Merkle wrappers still require row-major.
     pub fn new_batch_major(n_compressions: usize) -> Self {
         let mut s = Self::new(n_compressions);
-        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
+        s.r1cs.layout = WitnessLayout::BatchMajor;
         s
     }
 
@@ -1266,17 +1282,12 @@ impl Sha256HybridSetup {
     fn generate_witness_ab(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
-    ) -> (
-        Vec<flock_core::field::F128>,
-        Vec<flock_core::field::F128>,
-        Vec<flock_core::field::F128>,
-        Vec<u8>,
-    ) {
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
         match self.r1cs.layout {
-            flock_core::r1cs::WitnessLayout::RowMajor => {
+            WitnessLayout::RowMajor => {
                 generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log())
             }
-            flock_core::r1cs::WitnessLayout::BatchMajor => {
+            WitnessLayout::BatchMajor => {
                 generate_witness_batch_major(compressions, self.n_blocks_log())
             }
         }
@@ -1285,25 +1296,22 @@ impl Sha256HybridSetup {
     pub fn with_log_inv_rate(n_compressions: usize, log_inv_rate: usize) -> Self {
         // Rate keys the legacy profiles: 1 -> Fast, 2 -> Slim.
         let profile = match log_inv_rate {
-            1 => flock_core::pcs::ligerito::LigeritoProfile::Fast,
-            2 => flock_core::pcs::ligerito::LigeritoProfile::Slim,
-            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // other rates default to Fast
+            1 => LigeritoProfile::Fast,
+            2 => LigeritoProfile::Slim,
+            _ => LigeritoProfile::Fast, // other rates default to Fast
         };
         Self::with_profile_and_rate(n_compressions, profile, log_inv_rate)
     }
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
-    pub fn with_profile(
-        n_compressions: usize,
-        profile: flock_core::pcs::ligerito::LigeritoProfile,
-    ) -> Self {
+    pub fn with_profile(n_compressions: usize, profile: LigeritoProfile) -> Self {
         Self::with_profile_and_rate(n_compressions, profile, profile.log_inv_rate())
     }
 
     fn with_profile_and_rate(
         n_compressions: usize,
-        profile: flock_core::pcs::ligerito::LigeritoProfile,
+        profile: LigeritoProfile,
         log_inv_rate: usize,
     ) -> Self {
         assert!(n_compressions >= 1, "n_compressions must be ≥ 1");
@@ -1313,8 +1321,8 @@ impl Sha256HybridSetup {
         // first prove/verify, and pre-fault the prove-cycle scratch buffers
         // so even the first prove performs no page faults.
         r1cs.csc_lincheck_circuit();
-        flock_core::scratch::prewarm_prover(r1cs.m);
-        let pcs_params = flock_core::pcs::PcsParams {
+        prewarm_prover(r1cs.m);
+        let pcs_params = PcsParams {
             m: r1cs.m,
             log_inv_rate,
             log_batch_size: 6,
@@ -1348,10 +1356,7 @@ impl Sha256HybridSetup {
     /// per-circuit code they need. Implemented by reusing the fused builder
     /// (its a/b outputs are discarded): no separate packed-trace writer to
     /// maintain, and ~5× cheaper than the bool trace → `pack_witness` path.
-    pub fn generate_witness_packed(
-        &self,
-        compressions: &[([u32; 8], [u32; 16])],
-    ) -> Vec<flock_core::field::F128> {
+    pub fn generate_witness_packed(&self, compressions: &[([u32; 8], [u32; 16])]) -> Vec<F128> {
         let (z_packed, _a, _b, _stripe) = self.generate_witness_ab(compressions);
         z_packed
     }
@@ -1359,40 +1364,30 @@ impl Sha256HybridSetup {
     /// Generic (matrix-driven) prover. Same witness path (bool trace →
     /// pack) as the fused [`Self::prove_fast`]; produces a byte-identical
     /// proof, verifiable with [`Self::verify`].
-    pub fn prove_ligerito<Ch: flock_core::challenger::Challenger>(
+    pub fn prove_ligerito<Ch: Challenger>(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
         challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProofLigerito,
-        flock_core::pcs::Commitment,
-        flock_core::proof::R1csClaim,
-    ) {
+    ) -> (R1csProofLigerito, Commitment, R1csClaim) {
         let z_packed = self.generate_witness_packed(compressions);
-        crate::prover::prove_ligerito(&self.r1cs, z_packed, &self.pcs_params, challenger)
+        prove_ligerito(&self.r1cs, z_packed, &self.pcs_params, challenger)
     }
 
     /// Fast prover: skips `pack_witness`, `apply_{a,b,c}_packed`, and
     /// `pack_z_lincheck_from_packed` by emitting `(z, a, b, c, z_lincheck)`
     /// directly via the fused witness builder. Requires m ≥ ~21 (Ligerito).
-    pub fn prove_fast<Ch: flock_core::challenger::Challenger>(
+    pub fn prove_fast<Ch: Challenger>(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
         challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProofLigerito,
-        flock_core::pcs::Commitment,
-        flock_core::proof::R1csClaim,
-    ) {
+    ) -> (R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(compressions.len(), self.n_compressions);
         // Pre-fault the commit codeword buffer on a background (E-core) thread
         // while witness generation runs on the perf cores; gated so
         // RAYON_NUM_THREADS=1 stays truly serial (no extra thread).
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness_ab(compressions)
-            });
-        crate::prover::prove_fast_ligerito_from_witness(
+            prefault_codeword_during(&self.pcs_params, || self.generate_witness_ab(compressions));
+        prove_fast_ligerito_from_witness(
             &self.r1cs,
             &self.pcs_params,
             z_packed,
@@ -1408,23 +1403,18 @@ impl Sha256HybridSetup {
     /// [`Self::prove_fast`] with a per-phase timing breakdown of the real
     /// Ligerito prover (witness gen + commit + zerocheck + lincheck + recursive
     /// open). Benchmark-only.
-    pub fn prove_fast_timed<Ch: flock_core::challenger::Challenger>(
+    pub fn prove_fast_timed<Ch: Challenger>(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
         challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProofLigerito,
-        flock_core::pcs::Commitment,
-        flock_core::proof::R1csClaim,
-        crate::prover::ProvePhaseTimings,
-    ) {
+    ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
         assert_eq!(compressions.len(), self.n_compressions);
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
             self.generate_witness_ab(compressions);
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
+        let (proof, commitment, claim, mut timings) = prove_fast_ligerito_timed(
             &self.r1cs,
             &self.pcs_params,
             z_packed,
@@ -1439,13 +1429,13 @@ impl Sha256HybridSetup {
         (proof, commitment, claim, timings)
     }
 
-    pub fn verify<Ch: flock_core::challenger::Challenger>(
+    pub fn verify<Ch: Challenger>(
         &self,
-        commitment: &flock_core::pcs::Commitment,
-        proof: &flock_core::proof::R1csProofLigerito,
+        commitment: &Commitment,
+        proof: &R1csProofLigerito,
         challenger: &mut Ch,
-    ) -> Result<flock_core::proof::R1csClaim, flock_core::verifier::VerifyError> {
-        flock_core::verifier::verify_ligerito(
+    ) -> Result<R1csClaim, VerifyError> {
+        verify_ligerito(
             &self.r1cs,
             commitment,
             proof,
@@ -1555,14 +1545,11 @@ impl Sha256HybridSetup {
     /// The prover is **given the full sequence** of `Compression`s (one per
     /// instance) so trace-gen is parallel; for an honest chain the caller sets
     /// `blocks[i+1].0 = sha256_compress(&blocks[i].0, &blocks[i].1)`.
-    pub fn prove_chain<Ch: flock_core::challenger::Challenger>(
+    pub fn prove_chain<Ch: Challenger>(
         &self,
         compressions: &[Compression],
         challenger: &mut Ch,
-    ) -> (
-        super::chain_common::ChainProofLigerito,
-        flock_core::pcs::Commitment,
-    ) {
+    ) -> (super::chain_common::ChainProofLigerito, Commitment) {
         assert_eq!(compressions.len(), self.n_compressions);
         // The chain shift sumcheck enforces the relation across ALL witness
         // slots, including padding — require an exact fit.
@@ -1589,9 +1576,9 @@ impl Sha256HybridSetup {
         )
     }
 
-    pub fn verify_chain<Ch: flock_core::challenger::Challenger>(
+    pub fn verify_chain<Ch: Challenger>(
         &self,
-        commitment: &flock_core::pcs::Commitment,
+        commitment: &Commitment,
         proof: &super::chain_common::ChainProofLigerito,
         cv_0: &[u32; 8],
         cv_last: &[u32; 8],
@@ -1660,12 +1647,12 @@ impl Sha256HybridSetup {
     /// `compressions[i-1].1[H_out]` (i.e. the previous compression's digest,
     /// byte-equivalent). Requires a registered Ligerito security config for
     /// this `m` (m ≥ 22).
-    pub fn prove_merkle_path_ligerito<Ch: flock_core::challenger::Challenger>(
+    pub fn prove_merkle_path_ligerito<Ch: Challenger>(
         &self,
         compressions: &[Compression],
         b_bits: &[bool],
         challenger: &mut Ch,
-    ) -> (MerklePathProofLigerito, flock_core::pcs::Commitment) {
+    ) -> (MerklePathProofLigerito, Commitment) {
         assert_eq!(compressions.len(), self.n_compressions);
         assert_eq!(
             self.n_compressions,
@@ -1698,9 +1685,9 @@ impl Sha256HybridSetup {
     }
 
     /// Ligerito-backend mirror of [`Self::verify_merkle_path`].
-    pub fn verify_merkle_path_ligerito<Ch: flock_core::challenger::Challenger>(
+    pub fn verify_merkle_path_ligerito<Ch: Challenger>(
         &self,
-        commitment: &flock_core::pcs::Commitment,
+        commitment: &Commitment,
         proof: &MerklePathProofLigerito,
         leaf: &[u32; 8],
         root: &[u32; 8],
@@ -1738,13 +1725,13 @@ impl Sha256HybridSetup {
     }
 
     /// Ligerito-backend mirror of [`Self::prove_merkle_paths`].
-    pub fn prove_merkle_paths_ligerito<Ch: flock_core::challenger::Challenger>(
+    pub fn prove_merkle_paths_ligerito<Ch: Challenger>(
         &self,
         path_log: usize,
         compressions: &[Compression],
         b_bits: &[bool],
         challenger: &mut Ch,
-    ) -> (MerklePathProofLigerito, flock_core::pcs::Commitment) {
+    ) -> (MerklePathProofLigerito, Commitment) {
         assert_eq!(compressions.len(), self.n_compressions);
         assert_eq!(
             self.n_compressions,
@@ -1783,10 +1770,10 @@ impl Sha256HybridSetup {
     }
 
     /// Ligerito-backend mirror of [`Self::verify_merkle_paths`].
-    pub fn verify_merkle_paths_ligerito<Ch: flock_core::challenger::Challenger>(
+    pub fn verify_merkle_paths_ligerito<Ch: Challenger>(
         &self,
         path_log: usize,
-        commitment: &flock_core::pcs::Commitment,
+        commitment: &Commitment,
         proof: &MerklePathProofLigerito,
         leaves: &[[u32; 8]],
         root: &[u32; 8],
@@ -1845,15 +1832,15 @@ use super::common::{BM_V, BmRow, add_carry_parts_v, or_bit_row, or_u32_row};
 
 #[inline(always)]
 fn map_v(x: &[u32; BM_V], f: impl Fn(u32) -> u32) -> [u32; BM_V] {
-    std::array::from_fn(|j| f(x[j]))
+    from_fn(|j| f(x[j]))
 }
 #[inline(always)]
 fn xor_v(x: &[u32; BM_V], y: &[u32; BM_V]) -> [u32; BM_V] {
-    std::array::from_fn(|j| x[j] ^ y[j])
+    from_fn(|j| x[j] ^ y[j])
 }
 #[inline(always)]
 fn and_v(x: &[u32; BM_V], y: &[u32; BM_V]) -> [u32; BM_V] {
-    std::array::from_fn(|j| x[j] & y[j])
+    from_fn(|j| x[j] & y[j])
 }
 
 struct BmRows<'a> {
@@ -1899,8 +1886,8 @@ fn build_group_batch_major(
         a: ra,
         b: rb,
     };
-    let h_in: [[u32; BM_V]; 8] = std::array::from_fn(|w| std::array::from_fn(|j| inputs[j].0[w]));
-    let m: [[u32; BM_V]; 16] = std::array::from_fn(|i| std::array::from_fn(|j| inputs[j].1[i]));
+    let h_in: [[u32; BM_V]; 8] = from_fn(|w| from_fn(|j| inputs[j].0[w]));
+    let m: [[u32; BM_V]; 16] = from_fn(|i| from_fn(|j| inputs[j].1[i]));
 
     or_bit_row(rows.z, Z_CONST_POS);
     or_bit_row(rows.a, Z_CONST_POS);
@@ -2006,12 +1993,7 @@ fn build_group_batch_major(
 pub fn generate_witness_batch_major(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
-) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<u8>,
-) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     let padding: ([u32; 8], [u32; 16]) = ([0u32; 8], [0u32; 16]);
     super::common::drive_witness_batch_major(
         compressions,
@@ -2032,12 +2014,7 @@ pub fn generate_witness_batch_major(
 pub fn generate_witness_batch_major_partial(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
-) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<u8>,
-) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     super::common::drive_witness_batch_major_partial(
         compressions,
         n_blocks_log,
@@ -2053,7 +2030,7 @@ pub fn generate_witness_batch_major_partial(
 pub fn generate_witness_batch_major_into(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
-    dst: flock_core::union::SlotWitnessDest<'_>,
+    dst: SlotWitnessDest<'_>,
 ) -> Vec<u8> {
     let padding: ([u32; 8], [u32; 16]) = ([0u32; 8], [0u32; 16]);
     super::common::drive_witness_batch_major_into(
@@ -2072,7 +2049,7 @@ pub fn generate_witness_batch_major_into(
 pub fn generate_witness_batch_major_partial_into(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
-    dst: flock_core::union::SlotWitnessDest<'_>,
+    dst: SlotWitnessDest<'_>,
 ) -> Vec<u8> {
     super::common::drive_witness_batch_major_partial_into(
         compressions,
@@ -2102,7 +2079,7 @@ mod tests {
             (z ^ (z >> 31)) as u32
         }
         fn next_block(&mut self) -> [u32; 16] {
-            std::array::from_fn(|_| self.next_u32())
+            from_fn(|_| self.next_u32())
         }
     }
 
@@ -2113,7 +2090,7 @@ mod tests {
         for (n_inputs, n_log) in [(8usize, 3usize), (11, 4)] {
             let mut rng = Rng::new(0xBA7C_5A + n_log as u64);
             let inputs: Vec<([u32; 8], [u32; 16])> = (0..n_inputs)
-                .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+                .map(|_| (from_fn(|_| rng.next_u32()), rng.next_block()))
                 .collect();
 
             let (z_r, a_r, b_r, stripe_r) =
@@ -2123,8 +2100,8 @@ mod tests {
             assert_eq!(stripe_b, stripe_r, "stripe diverged (n_log={n_log})");
 
             let chunks_per_block = K / 128;
-            let transpose = |row: &[flock_core::field::F128]| {
-                let mut out = vec![flock_core::field::F128::ZERO; row.len()];
+            let transpose = |row: &[F128]| {
+                let mut out = vec![F128::ZERO; row.len()];
                 for o in 0..1usize << n_log {
                     for c in 0..chunks_per_block {
                         out[(c << n_log) + o] = row[o * chunks_per_block + c];
@@ -2153,7 +2130,7 @@ mod tests {
         let m = K_LOG + n_log;
         let mut rng = Rng::new(0xBA7C_5427);
         let inputs: Vec<([u32; 8], [u32; 16])> = (0..n_total)
-            .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+            .map(|_| (from_fn(|_| rng.next_u32()), rng.next_block()))
             .collect();
         let (z_f, a_f, b_f, _) = generate_witness_batch_major(&inputs, n_log);
 
@@ -2205,7 +2182,7 @@ mod tests {
         let setup = Sha256HybridSetup::new_batch_major(128);
         let mut rng = Rng::new(0xBA7C_F012);
         let inputs: Vec<([u32; 8], [u32; 16])> = (0..128)
-            .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+            .map(|_| (from_fn(|_| rng.next_u32()), rng.next_block()))
             .collect();
 
         let mut ch_p = FsChallenger::new(b"flock-lig-batch-major-v0");
@@ -2292,7 +2269,7 @@ mod tests {
                 ],
             ),
             (SHA256_IV, rng.next_block()),
-            (std::array::from_fn(|_| rng.next_u32()), rng.next_block()),
+            (from_fn(|_| rng.next_u32()), rng.next_block()),
         ];
         for (h_in, m) in cases {
             let z = build_block_witness(&h_in, &m);
@@ -2342,7 +2319,7 @@ mod tests {
         }
 
         // CSC gather (what prove_fast/verify actually use) matches too.
-        let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
+        let csc = CscCircuit::from_matrices(&a_0, &b_0);
         let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
         assert_eq!(expected, got_csc, "CSC fold mismatch");
     }
@@ -2377,12 +2354,7 @@ mod tests {
         let setup = Sha256HybridSetup::new(n);
         let mut rng = Rng::new(0x5A2_63112);
         let comps: Vec<Compression> = (0..n)
-            .map(|_| {
-                (
-                    std::array::from_fn(|_| rng.next_u32()),
-                    std::array::from_fn(|_| rng.next_u32()),
-                )
-            })
+            .map(|_| (from_fn(|_| rng.next_u32()), from_fn(|_| rng.next_u32())))
             .collect();
         let mut ch_f = FsChallenger::new(b"flock-sha2-gvf");
         let (proof_f, commit_f, claim_f) = setup.prove_fast(&comps, &mut ch_f);
@@ -2431,16 +2403,13 @@ mod tests {
         let zeros: Vec<([u32; 8], [u32; 16])> = vec![([0u32; 8], [0u32; 16]); n];
         let (mut z, mut a, mut b, mut zlc) =
             generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_blocks_log());
-        z.iter_mut()
-            .for_each(|v| *v = flock_core::field::F128::ZERO);
-        a.iter_mut()
-            .for_each(|v| *v = flock_core::field::F128::ZERO);
-        b.iter_mut()
-            .for_each(|v| *v = flock_core::field::F128::ZERO);
+        z.iter_mut().for_each(|v| *v = F128::ZERO);
+        a.iter_mut().for_each(|v| *v = F128::ZERO);
+        b.iter_mut().for_each(|v| *v = F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commit, _) = crate::prover::prove_fast_ligerito_from_witness(
+        let (proof, commit, _) = prove_fast_ligerito_from_witness(
             &setup.r1cs,
             &setup.pcs_params,
             z,
@@ -2454,7 +2423,7 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"poc");
         let res = setup.verify(&commit, &proof, &mut ch_v);
         assert!(
-            matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
+            matches!(res, Err(VerifyError::Lincheck(_))),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
     }
@@ -2490,7 +2459,7 @@ mod tests {
     /// Returns `(blocks, cv_0, cv_last)`.
     fn honest_chain(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8]) {
         let mut rng = Rng::new(seed);
-        let mut cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+        let mut cv: [u32; 8] = from_fn(|_| rng.next_u32());
         let cv0 = cv;
         let mut blocks = Vec::with_capacity(n);
         for _ in 0..n {
@@ -2558,7 +2527,7 @@ mod tests {
         seed: u64,
     ) -> (Vec<Compression>, [u32; 8], [u32; 8], Vec<bool>) {
         let mut rng = Rng::new(seed);
-        let leaf: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+        let leaf: [u32; 8] = from_fn(|_| rng.next_u32());
         let mut b_bits = vec![false; n];
         for bit in b_bits.iter_mut().skip(1) {
             *bit = rng.next_u32() & 1 == 1;
@@ -2566,7 +2535,7 @@ mod tests {
         let mut blocks = Vec::with_capacity(n);
         let mut current = leaf;
         for i in 0..n {
-            let sibling: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+            let sibling: [u32; 8] = from_fn(|_| rng.next_u32());
             let m: [u32; 16] = if !b_bits[i] {
                 // selected = left half of M = current; unselected = sibling
                 let mut m = [0u32; 16];

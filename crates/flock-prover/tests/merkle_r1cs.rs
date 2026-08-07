@@ -10,6 +10,8 @@ use flock_core::zerocheck::K_SKIP;
 use flock_prover::r1cs_hashes::merkle_r1cs::{
     MerkleTreeLayout, PathInput, SLOT_WORDS, blake3_spec, reference_root,
 };
+use std::array::from_fn;
+use std::mem::size_of;
 
 struct Rng(u64);
 impl Rng {
@@ -24,7 +26,7 @@ impl Rng {
         (z ^ (z >> 31)) as u32
     }
     fn digest(&mut self) -> [u32; SLOT_WORDS] {
-        std::array::from_fn(|_| self.next_u32())
+        from_fn(|_| self.next_u32())
     }
 }
 
@@ -41,9 +43,11 @@ fn path(rng: &mut Rng, depth: usize, index: u64) -> PathInput {
 /// and the useful region ends after the last level's `t` block.
 #[test]
 fn layout_geometry() {
-    let spec = blake3_spec();
-    const U: usize = 15_409; // blake3 useful bits
+    const U: usize = 15_409;
+    // blake3 useful bits
     const STRIDE: usize = 1 << 14;
+    let spec = blake3_spec();
+
     for (depth, want_k_log) in [(1usize, 14usize), (2, 15), (3, 16), (26, 19)] {
         let layout = MerkleTreeLayout::new(depth, spec.clone());
         // Level 0 additionally carries const + leaf + index bits; every later
@@ -565,7 +569,7 @@ fn walker_is_compact_at_depth26() {
     let layout = MerkleTreeLayout::new(26, blake3_spec());
     let walker = layout.build_walker();
     let resident = walker.resident_bytes();
-    let materialized = walker.effective_nnz() * std::mem::size_of::<usize>();
+    let materialized = walker.effective_nnz() * size_of::<usize>();
     println!(
         "depth 26: walker resident {:.1} MB, effective nnz {} ({:.2} GB materialized), \
          ratio {:.0}x",
@@ -623,7 +627,7 @@ fn digest_to_hash(d: &[u32; SLOT_WORDS]) -> [u8; 32] {
 }
 
 fn hash_to_digest(h: &[u8; 32]) -> [u32; SLOT_WORDS] {
-    std::array::from_fn(|w| u32::from_le_bytes(h[4 * w..4 * w + 4].try_into().unwrap()))
+    from_fn(|w| u32::from_le_bytes(h[4 * w..4 * w + 4].try_into().unwrap()))
 }
 
 /// Geometry of the chunk-leaf layout: chunk blocks tile first, node levels
@@ -632,9 +636,10 @@ fn hash_to_digest(h: &[u8; 32]) -> [u32; SLOT_WORDS] {
 /// same width as the depth-26 digest table.
 #[test]
 fn chunk_layout_geometry() {
-    let spec = blake3_spec();
     const U: usize = 15_409;
     const STRIDE: usize = 1 << 14;
+    let spec = blake3_spec();
+
     for (depth, leaf_bytes, want_k_log) in
         [(1usize, 64usize, 15usize), (2, 128, 16), (13, 1024, 19)]
     {
@@ -807,7 +812,7 @@ fn chunk_root_matches_flock_core_blake3_tree() {
             siblings: (0..depth).map(|_| rng.digest()).collect(),
         };
         let z = layout.build_witness_chunk(&input);
-        let leaf_cv: [u32; SLOT_WORDS] = std::array::from_fn(|w| {
+        let leaf_cv: [u32; SLOT_WORDS] = from_fn(|w| {
             let base = layout.hash_bit(0, 0) - (1 << 14) + layout.spec.out_cv_base; // last chunk block
             let mut word = 0u32;
             for b in 0..32 {

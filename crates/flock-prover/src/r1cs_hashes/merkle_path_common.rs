@@ -20,15 +20,37 @@
 //! coords, so its contents are invisible to the sumcheck but participate in
 //! the multilinear extension over the slot-selector dimensions.
 
+use crate::merkle_path::MerklePathClaims;
+use crate::merkle_path::MerklePathError;
+use crate::merkle_path::prove_merkle_path_shift;
+use crate::merkle_path::verify_merkle_path_shift;
 use crate::merkle_path::{MerklePathShiftProof, SlotLayout};
+use crate::prover::ProveCore;
+use crate::prover::prove_fast_core;
+use crate::prover::quirky_x_outer_full;
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
+use flock_core::lincheck::LincheckCircuit;
+use flock_core::lincheck::LincheckProof;
 use flock_core::lincheck::build_eq_table;
+use flock_core::pcs::BatchOpeningProofLigerito;
+use flock_core::pcs::VerifyError as PcsVerifyError;
+use flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v;
+use flock_core::pcs::ring_switch::build_eq_sparse;
+use flock_core::pcs::verify_opening_batch_ligerito_mixed;
 use flock_core::pcs::{
     Commitment, DirectEqInd, LOG_PACKING, PackedDirectClaim, PackedDirectClaimRef, PcsParams,
 };
 use flock_core::r1cs::BlockR1cs;
+use flock_core::r1cs::WitnessLayout;
+use flock_core::verifier::VerifyError as VerifierVerifyError;
+use flock_core::verifier::verify_core;
+use flock_core::zerocheck::ZerocheckProof;
 use serde::{Deserialize, Serialize};
+use std::env::var;
+use std::iter::repeat_n;
+use std::slice::from_ref;
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Layout
@@ -164,7 +186,7 @@ impl MerklePathFold {
 /// `s = sel_slot | (side << 1)`, matching the cube convention.
 pub fn fold_all_slots(
     layout: &MerkleLayout,
-    wl: flock_core::r1cs::WitnessLayout,
+    wl: WitnessLayout,
     packed: &[F128],
     fold: &MerklePathFold,
 ) -> [Vec<F128>; 4] {
@@ -188,8 +210,8 @@ pub fn fold_all_slots(
     // `chain_common::fold_in_out`).
     let word_addr = move |i: usize, w: usize| -> usize {
         match wl {
-            flock_core::r1cs::WitnessLayout::RowMajor => i * block_packed + w,
-            flock_core::r1cs::WitnessLayout::BatchMajor => (w << n_log) + i,
+            WitnessLayout::RowMajor => i * block_packed + w,
+            WitnessLayout::BatchMajor => (w << n_log) + i,
         }
     };
 
@@ -230,12 +252,12 @@ pub fn fold_all_slots(
 /// `eq_ind(point)` sparse with a `2^high_zeros ×` density reduction.
 pub fn assemble_merkle_path_claim(
     layout: &MerkleLayout,
-    wl: flock_core::r1cs::WitnessLayout,
+    wl: WitnessLayout,
     fold: &MerklePathFold,
-    claims: &crate::merkle_path::MerklePathClaims,
+    claims: &MerklePathClaims,
 ) -> PackedDirectClaim {
     let point = build_merkle_claim_point(layout, wl, fold, claims);
-    let sparse_eq = flock_core::pcs::ring_switch::build_eq_sparse(&point);
+    let sparse_eq = build_eq_sparse(&point);
     PackedDirectClaim {
         point,
         value: claims.value,
@@ -251,21 +273,21 @@ pub fn assemble_merkle_path_claim(
 /// BatchMajor `[instance…, τ_pos…, sel_slot, side, 0^high]`.
 fn build_merkle_claim_point(
     layout: &MerkleLayout,
-    wl: flock_core::r1cs::WitnessLayout,
+    wl: WitnessLayout,
     fold: &MerklePathFold,
-    claims: &crate::merkle_path::MerklePathClaims,
+    claims: &MerklePathClaims,
 ) -> Vec<F128> {
     let high = layout.high_zeros();
     let point_len = fold.tau_pos.len() + 2 + high + claims.instance_point.len();
     let mut point = Vec::with_capacity(point_len);
-    if wl == flock_core::r1cs::WitnessLayout::BatchMajor {
+    if wl == WitnessLayout::BatchMajor {
         point.extend_from_slice(&claims.instance_point);
     }
     point.extend_from_slice(&fold.tau_pos);
     point.push(claims.sel_slot);
     point.push(claims.side);
-    point.extend(std::iter::repeat_n(F128::ZERO, high));
-    if wl == flock_core::r1cs::WitnessLayout::RowMajor {
+    point.extend(repeat_n(F128::ZERO, high));
+    if wl == WitnessLayout::RowMajor {
         point.extend_from_slice(&claims.instance_point);
     }
     debug_assert_eq!(point.len(), point_len);
@@ -281,20 +303,20 @@ fn build_merkle_claim_point(
 /// sub-proof, and ONE batched Ligerito PCS open.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MerklePathProofLigerito {
-    pub zerocheck: flock_core::zerocheck::ZerocheckProof,
-    pub lincheck: flock_core::lincheck::LincheckProof,
+    pub zerocheck: ZerocheckProof,
+    pub lincheck: LincheckProof,
     pub shift: MerklePathShiftProof,
-    pub pcs_open: flock_core::pcs::BatchOpeningProofLigerito,
+    pub pcs_open: BatchOpeningProofLigerito,
 }
 
 #[derive(Debug)]
 pub enum MerklePathVerifyError {
     /// Base R1CS replay failed.
-    R1cs(flock_core::verifier::VerifyError),
+    R1cs(VerifierVerifyError),
     /// Merkle-path shift sumcheck check failed.
-    Shift(crate::merkle_path::MerklePathError),
+    Shift(MerklePathError),
     /// The batched PCS opening failed.
-    Pcs(flock_core::pcs::VerifyError),
+    Pcs(PcsVerifyError),
 }
 
 // ---------------------------------------------------------------------------
@@ -321,22 +343,18 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     b_packed: Vec<F128>,
     z_lincheck: Vec<u8>,
     b_bits: &[bool],
-    lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
+    lincheck_circuit: &dyn LincheckCircuit,
     challenger: &mut Ch,
 ) -> (MerklePathProofLigerito, Commitment) {
-    let trace = std::env::var("MERKLE_TRACE").is_ok();
+    let trace = var("MERKLE_TRACE").is_ok();
 
     let lig_config = pcs_params
         .ligerito_prover_config()
         .expect("Ligerito config for merkle-path prove; bump m for tiny instances");
 
     // ---- Core: commit → zerocheck → lincheck.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let core = crate::prover::prove_fast_core(
+    let t = if trace { Some(Instant::now()) } else { None };
+    let core = prove_fast_core(
         r1cs,
         pcs_params,
         z_packed,
@@ -355,11 +373,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     }
 
     // ---- Packed-pos fold.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t = if trace { Some(Instant::now()) } else { None };
     let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
     let slot_vals = fold_all_slots(layout, r1cs.layout, &core.z_packed, &fold);
@@ -372,16 +386,12 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     }
 
     // ---- Merkle-path shift sumcheck.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t = if trace { Some(Instant::now()) } else { None };
     let x_l_vals = &slot_vals[layout.x_l_slot as usize];
     let x_r_vals = &slot_vals[layout.x_r_slot as usize];
     let z_vals = &slot_vals[layout.z_slot as usize];
     let iv_vals = &slot_vals[layout.other_slot() as usize];
-    let (shift, claims) = crate::merkle_path::prove_merkle_path_shift(
+    let (shift, claims) = prove_merkle_path_shift(
         path_log,
         x_l_vals,
         x_r_vals,
@@ -401,17 +411,13 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     }
 
     // ---- Batched open: [ab, c] ring-switched + [merkle] packed-direct, via Ligerito.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t = if trace { Some(Instant::now()) } else { None };
     let padding = r1cs.padding_spec();
-    let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
-    let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
+    let ab_x_outer = quirky_x_outer_full(&core.ab.point);
+    let c_x_outer = quirky_x_outer_full(&core.c.point);
     // Destructure core to move z_packed by value into the open (saves a large
     // clone at high m), mirroring `prove_chain_ligerito_generic`.
-    let crate::prover::ProveCore {
+    let ProveCore {
         zc_proof,
         lc_proof,
         commitment,
@@ -423,13 +429,13 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     } = core;
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
-    let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    let pcs_open = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         &prover_data,
         &commitment,
         &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
         &[pre_ab, pre_c],
-        std::slice::from_ref(&merkle_claim),
+        from_ref(&merkle_claim),
         &padding,
         &lig_config,
         challenger,
@@ -466,7 +472,7 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
     leaves_phys: &[&[bool]],
     root_phys: &[bool],
     b_bits: &[bool],
-    lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
+    lincheck_circuit: &dyn LincheckCircuit,
     pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> Result<(), MerklePathVerifyError> {
@@ -478,7 +484,7 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
         "leaves_phys must have length 2^path_log"
     );
 
-    let (ab, c) = flock_core::verifier::verify_core(
+    let (ab, c) = verify_core(
         r1cs,
         &proof.zerocheck,
         &proof.lincheck,
@@ -497,7 +503,7 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
         .collect();
     let root_r = fold.fold_public_phys(root_phys);
 
-    let claims = crate::merkle_path::verify_merkle_path_shift(
+    let claims = verify_merkle_path_shift(
         path_log,
         &proof.shift,
         &leaf_evals,
@@ -510,8 +516,8 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
     .map_err(MerklePathVerifyError::Shift)?;
 
     let merkle_point = build_merkle_claim_point(layout, r1cs.layout, &fold, &claims);
-    let ab_x_outer = crate::prover::quirky_x_outer_full(&ab.point);
-    let c_x_outer = crate::prover::quirky_x_outer_full(&c.point);
+    let ab_x_outer = quirky_x_outer_full(&ab.point);
+    let c_x_outer = quirky_x_outer_full(&c.point);
     let pd_ref = PackedDirectClaimRef {
         point: &merkle_point,
         value: claims.value,
@@ -521,12 +527,12 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
         .ligerito_verifier_config()
         .expect("Ligerito verifier config for merkle-path verify");
 
-    flock_core::pcs::verify_opening_batch_ligerito_mixed(
+    verify_opening_batch_ligerito_mixed(
         commitment,
         &[ab.value, c.value],
         &[ab.point.z_skip, c.point.z_skip],
         &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
-        std::slice::from_ref(&pd_ref),
+        from_ref(&pd_ref),
         &proof.pcs_open,
         &lig_v_config,
         challenger,

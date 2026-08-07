@@ -57,11 +57,13 @@
 //! `eq(τ',0ⁿ)`. Soundness rests on the PCS binding `g(τ',s₀*)` to the committed
 //! `ẑ`; the sumcheck (random `τ`, `α`) proves the glue + both endpoints at once.
 
+use flock_core::bits::lowest_one;
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::build_eq_table;
 use flock_core::zerocheck::multilinear::eq_eval;
 use serde::{Deserialize, Serialize};
+use std::slice::from_raw_parts;
 
 /// Multilinear extension of the successor relation `b = a + 1` (integer
 /// increment on `n` bits, LSB-first), evaluated at `(a, b) ∈ Fⁿ × Fⁿ`.
@@ -396,7 +398,7 @@ pub fn fold_contiguous_regions(
     for bo in 0..n_bytes {
         let t = &mut tab[bo];
         for v in 1usize..256 {
-            let lsb = flock_core::bits::lowest_one(v);
+            let lsb = lowest_one(v);
             let bit = lsb.trailing_zeros() as usize;
             t[v] = t[v ^ lsb] + region_weights[8 * bo + bit];
         }
@@ -404,8 +406,7 @@ pub fn fold_contiguous_regions(
 
     // SAFETY: F128 is repr(C, align(16)) = two LE u64s, so byte B of this view
     // holds logical bits [8B, 8B+8); bit (8B+r) = (byte >> r) & 1.
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(packed.as_ptr() as *const u8, packed.len() * 16) };
+    let bytes: &[u8] = unsafe { from_raw_parts(packed.as_ptr() as *const u8, packed.len() * 16) };
 
     // Single par_iter over instances producing one length-`n_regions` row per
     // instance — fuses what was previously N sequential `(par_iter).collect()`

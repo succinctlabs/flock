@@ -21,6 +21,7 @@
 //! [DP24]: https://eprint.iacr.org/2024/504
 
 use crate::field::F128;
+use core::slice::from_raw_parts;
 
 /// `log_2` of the packing width. F_{2^128} holds 128 bits = 2^7.
 pub const LOG_PACKING: usize = 7;
@@ -38,6 +39,15 @@ pub const PACKING_WIDTH: usize = 1 << LOG_PACKING;
 /// - if `z.len() != 1 << m`
 /// - if `m < LOG_PACKING`
 pub fn pack_witness(z: &[bool], m: usize) -> Vec<F128> {
+    #[inline]
+    fn pack64(b: &[u8]) -> u64 {
+        let mut w = 0u64;
+        for (i, ch) in b.as_chunks::<8>().0.iter().enumerate() {
+            let x = u64::from_le_bytes(*ch);
+            w |= (x.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * i);
+        }
+        w
+    }
     use rayon::prelude::*;
     assert_eq!(z.len(), 1usize << m, "z length must be 2^m");
     assert!(
@@ -51,16 +61,8 @@ pub fn pack_witness(z: &[bool], m: usize) -> Vec<F128> {
     // byte 7 of `x * 0x0102040810204080` is Σ_r b_r·2^r (each lower product
     // byte sums distinct powers of two ≤ 0xFE — no carry into byte 7).
     // SAFETY: same length, and any &[bool] is a valid &[u8].
-    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(z.as_ptr() as *const u8, z.len()) };
-    #[inline]
-    fn pack64(b: &[u8]) -> u64 {
-        let mut w = 0u64;
-        for (i, ch) in b.as_chunks::<8>().0.iter().enumerate() {
-            let x = u64::from_le_bytes(*ch);
-            w |= (x.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * i);
-        }
-        w
-    }
+    let bytes: &[u8] = unsafe { from_raw_parts(z.as_ptr() as *const u8, z.len()) };
+
     let one = |i_rest: usize| {
         let base = i_rest << LOG_PACKING;
         F128 {

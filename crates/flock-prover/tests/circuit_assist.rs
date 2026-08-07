@@ -15,6 +15,7 @@
 //! from the verifier it transcribes.
 
 use flock_core::circuit::builder::{GateType, ShapeBuilder, SlotWitness};
+use flock_core::element_r1cs::ElementTableType;
 use flock_core::field::F128;
 use flock_core::pcs::PcsParams;
 use flock_core::pcs::jagged::{STATE_INITIAL, STATE_SUCCESS, assist_sparse_transitions};
@@ -23,7 +24,9 @@ use flock_core::schedule::IoWord;
 use flock_core::verifier;
 use flock_prover::challenger::FsChallenger;
 use flock_prover::prover::{self, UnionElementSlotInput};
+use flock_prover::schedule::TableType;
 use flock_prover::union::UnionInstance;
+use std::sync::Arc;
 
 const DOMAIN: &[u8] = b"flock-circuit-assist-v0";
 
@@ -66,7 +69,7 @@ fn pb(z: &[F128], layer: usize) -> F128 {
 /// 53 columns — kappa 6. The sparse table is baked from
 /// [`assist_sparse_transitions`] at construction.
 struct AssistLayerGate {
-    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    ty: Arc<ElementTableType>,
 }
 
 const AL_IN: usize = 9; // g0..g3, za, rb, rc, rd, one
@@ -117,16 +120,11 @@ impl AssistLayerGate {
         for s in 0..4 {
             b.linear(
                 AL_OUT0 + s,
-                &[
-                    (33 + s, one),
-                    (37 + s, one),
-                    (41 + s, one),
-                    (45 + s, one),
-                ],
+                &[(33 + s, one), (37 + s, one), (41 + s, one), (45 + s, one)],
             );
         }
         Self {
-            ty: std::sync::Arc::new(b.build().expect("assist layer gate is valid")),
+            ty: Arc::new(b.build().expect("assist layer gate is valid")),
         }
     }
 }
@@ -135,12 +133,12 @@ impl GateType for AssistLayerGate {
     type Row = Vec<F128>;
     type Hint = ();
 
-    fn table(&self) -> flock_prover::schedule::TableType {
+    fn table(&self) -> TableType {
         let mut schema: Vec<IoWord> = (0..AL_IN).map(IoWord::input).collect();
         for s in 0..4 {
             schema.push(IoWord::output(AL_OUT0 + s));
         }
-        flock_prover::schedule::TableType::element(self.ty.clone()).with_io_schema(schema)
+        TableType::element(self.ty.clone()).with_io_schema(schema)
     }
 
     fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
@@ -242,7 +240,12 @@ fn assist_layer_gate_chains_match_the_native_dp() {
         g[STATE_SUCCESS] = ow;
         for layer in (0..=m).rev() {
             let mut a_in = g.to_vec();
-            for v in [pb(zr, layer), pb(rho, layer), sigma[2 * layer], sigma[2 * layer + 1]] {
+            for v in [
+                pb(zr, layer),
+                pb(rho, layer),
+                sigma[2 * layer],
+                sigma[2 * layer + 1],
+            ] {
                 vals.push(v);
                 a_in.push(sb.public_input());
             }

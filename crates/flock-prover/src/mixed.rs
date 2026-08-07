@@ -42,6 +42,7 @@ use flock_core::r1cs::BlockR1cs;
 use flock_core::schedule::{Registry, TableType};
 use flock_core::union::UnionInstance;
 use flock_core::verifier::{self, VerifyError};
+use serde::de::Error;
 use serde::{Deserialize, Serialize};
 
 use crate::prover::{self, UnionSlotProverInput};
@@ -161,7 +162,7 @@ impl<'de> Deserialize<'de> for MixedRegistryId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let code = u8::deserialize(d)?;
         Self::from_code(code)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown mixed registry id {code}")))
+            .ok_or_else(|| Error::custom(format!("unknown mixed registry id {code}")))
     }
 }
 

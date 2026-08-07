@@ -33,7 +33,10 @@
 //! a *regenerated* circuit must be the SAME circuit, not merely an equivalent
 //! one.
 
+use std::any::type_name;
 use std::any::{Any, TypeId};
+use std::cmp::Reverse;
+use std::mem::take;
 
 use crate::field::F128;
 use crate::schedule::{IoDirection, Registry, TableType};
@@ -175,7 +178,7 @@ where
         let hint = hint.downcast_ref::<G::Hint>().unwrap_or_else(|| {
             panic!(
                 "gate expects a hint of type {}; use gate_hinted and supply one",
-                std::any::type_name::<G::Hint>()
+                type_name::<G::Hint>()
             )
         });
         let (outputs, row) = self.gate.eval(inputs, hint);
@@ -390,7 +393,7 @@ impl ShapeBuilder {
         if ra == rb {
             return;
         }
-        let cells = std::mem::take(&mut self.wires[rb]);
+        let cells = take(&mut self.wires[rb]);
         self.wires[ra].extend(cells);
         self.parent[rb] = ra;
     }
@@ -418,7 +421,7 @@ impl ShapeBuilder {
             })
             .collect();
         let mut order: Vec<usize> = (0..meta.len()).collect();
-        order.sort_by_key(|&i| (meta[i].0, std::cmp::Reverse(meta[i].1)));
+        order.sort_by_key(|&i| (meta[i].0, Reverse(meta[i].1)));
 
         let registry = Registry::new(
             order

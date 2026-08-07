@@ -337,8 +337,8 @@ fn bench_f128_mul() {
 }
 
 fn bench_f128_mul_by_x() {
-    header("F128 mul_by_x (shift + conditional fold)");
     use flock_prover::field::mul_by_x;
+    header("F128 mul_by_x (shift + conditional fold)");
 
     // Latency
     {
@@ -386,6 +386,10 @@ fn bench_f128_mul_by_x() {
 }
 
 fn bench_f128_deferred() {
+    // Vary BOTH `lo` and `hi` of each `a` every iter. If only `lo` changes,
+    // the compiler hoists PMULL(a.hi, b.*) out of the loop, halving the work.
+    const STEP_LO: u64 = 1;
+    const STEP_HI: u64 = 0x9E3779B97F4A7C15;
     header("F128 deferred-reduction sumcheck pattern");
     // The realistic sumcheck pattern: accumulate K unreduced products into a
     // single F256Unreduced, then call .reduce() once. We measure cost per
@@ -418,10 +422,7 @@ fn bench_f128_deferred() {
     let mut acc1 = F256Unreduced::ZERO;
     let mut acc2 = F256Unreduced::ZERO;
     let mut acc3 = F256Unreduced::ZERO;
-    // Vary BOTH `lo` and `hi` of each `a` every iter. If only `lo` changes,
-    // the compiler hoists PMULL(a.hi, b.*) out of the loop, halving the work.
-    const STEP_LO: u64 = 1;
-    const STEP_HI: u64 = 0x9E3779B97F4A7C15;
+
     for _ in 0..iters {
         acc0 ^= a0.mul_unreduced(b);
         acc1 ^= a1.mul_unreduced(b);

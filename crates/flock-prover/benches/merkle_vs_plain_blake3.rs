@@ -36,6 +36,10 @@
 //! FLOCK_VERIFY_THREADS=4 cargo bench -p flock-prover --bench merkle_vs_plain_blake3
 //! ```
 
+use flock_core::field::F128;
+use flock_core::lincheck::LincheckCircuit;
+use std::array::from_fn;
+use std::env::var;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -56,7 +60,7 @@ const DOMAIN: &[u8] = b"flock-merkle-vs-blake3-bench-v0";
 /// `2^(k_log-7)` that the Frobenius assist scales with — so it is the knob that
 /// moves the assist, unlike the path count.
 fn depth() -> usize {
-    std::env::var("MVB_DEPTH")
+    var("MVB_DEPTH")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&d| d >= 1)
@@ -67,7 +71,7 @@ fn depth() -> usize {
 /// that 3 reps left the BLAKE3 column visibly non-monotonic in size.
 /// Override with `MVB_REPS` (`MVB_REPS=1` for a quick `VERIFY_TRACE` run).
 fn reps() -> usize {
-    std::env::var("MVB_REPS")
+    var("MVB_REPS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0)
@@ -77,7 +81,7 @@ fn reps() -> usize {
 /// Path counts to sweep; override with e.g. `MVB_PATHS=8,16`. Each must be a
 /// power of two — it is the registry's `2^nu` row capacity.
 fn path_counts() -> Vec<usize> {
-    match std::env::var("MVB_PATHS") {
+    match var("MVB_PATHS") {
         Ok(v) => v
             .split(',')
             .filter_map(|s| s.trim().parse::<usize>().ok())
@@ -102,7 +106,7 @@ impl Rng {
         (z ^ (z >> 31)) as u32
     }
     fn digest(&mut self) -> [u32; merkle_r1cs::SLOT_WORDS] {
-        std::array::from_fn(|_| self.next_u32())
+        from_fn(|_| self.next_u32())
     }
     fn path(&mut self, depth: usize) -> PathInput {
         PathInput {
@@ -112,8 +116,8 @@ impl Rng {
         }
     }
     fn compression(&mut self) -> blake3::Compression {
-        let cv: [u32; 8] = std::array::from_fn(|_| self.next_u32());
-        let m: [u32; 16] = std::array::from_fn(|_| self.next_u32());
+        let cv: [u32; 8] = from_fn(|_| self.next_u32());
+        let m: [u32; 16] = from_fn(|_| self.next_u32());
         let counter = ((self.next_u32() as u64) << 32) | self.next_u32() as u64;
         (cv, m, counter, 64u32, 11u32)
     }
@@ -175,15 +179,8 @@ fn measure(
     k_log: usize,
     useful_bits: usize,
     base_nnz: usize,
-    circuit: &dyn flock_core::lincheck::LincheckCircuit,
-    make_witness: &(
-         dyn Fn() -> (
-        Vec<flock_core::field::F128>,
-        Vec<flock_core::field::F128>,
-        Vec<flock_core::field::F128>,
-        Vec<u8>,
-    ) + Sync
-     ),
+    circuit: &dyn LincheckCircuit,
+    make_witness: &(dyn Fn() -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) + Sync),
     solo: &rayon::ThreadPool,
 ) -> Row {
     let union = UnionInstance::new(registry, vec![rows]);
@@ -329,8 +326,8 @@ fn main() {
     println!("  prover pool     : {threads} threads (physical P-cores)");
     println!(
         "  verify pool     : {} thread(s){}",
-        std::env::var("FLOCK_VERIFY_THREADS").unwrap_or_else(|_| "1".into()),
-        if std::env::var("FLOCK_VERIFY_THREADS").is_ok() {
+        var("FLOCK_VERIFY_THREADS").unwrap_or_else(|_| "1".into()),
+        if var("FLOCK_VERIFY_THREADS").is_ok() {
             " (FLOCK_VERIFY_THREADS override)"
         } else {
             " (production default)"

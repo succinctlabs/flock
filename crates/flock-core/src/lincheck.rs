@@ -121,7 +121,15 @@ use crate::field::F128;
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::collections::HashSet;
+use std::env::var;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 mod kernels;
 mod union;
@@ -328,8 +336,8 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
 }
 
 // Compact Debug — the row arrays run to millions of entries.
-impl std::fmt::Debug for CscCircuit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for CscCircuit {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("CscCircuit")
             .field("n_cols", &self.n_cols)
             .field("nnz_a", &self.a_rows.len())
@@ -839,8 +847,7 @@ fn partial_fold_packed_z_best(
             // n_log ≥ 16; below that the L1-resident `iblock` wins. `FOLD_IBLOCK` forces
             // iblock everywhere (bench A/B).
             let n_log = m - k_log;
-            if n_log >= OBLOCK_MIN_N_LOG && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if n_log >= OBLOCK_MIN_N_LOG && !FOLD_IBLOCK.load(Ordering::Relaxed) {
                 return partial_fold_packed_z_neon_oblock_padded(
                     z_packed,
                     m,
@@ -974,11 +981,7 @@ pub fn pack_z_lincheck(z_logical: &[bool], m: usize, k_log: usize) -> Vec<u8> {
 /// Same output as [`pack_z_lincheck`] but reads bits from an F_{2^128}-packed
 /// witness (polynomial basis: bit `i` of logical = bit `i % 128` of
 /// `z_packed_f128[i / 128]`).
-pub fn pack_z_lincheck_from_packed(
-    z_packed_f128: &[crate::field::F128],
-    m: usize,
-    k_log: usize,
-) -> Vec<u8> {
+pub fn pack_z_lincheck_from_packed(z_packed_f128: &[F128], m: usize, k_log: usize) -> Vec<u8> {
     use rayon::prelude::*;
     let k = 1usize << k_log;
     let n_total = 1usize << m;
@@ -1407,7 +1410,7 @@ fn prove_padded_inner<Ch: Challenger>(
     assert_eq!(x_ab.x_outer.len(), n_log);
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let trace = var("LINCHECK_TRACE").is_ok();
 
     // 1. Sample α (matches verifier's order). Used to batch the two scalar
     //    consistency checks v_a, v_b into a single sumcheck.
@@ -1417,11 +1420,7 @@ fn prove_padded_inner<Ch: Challenger>(
     //    the sparse-matrix default this is the fused single-pass row-fold;
     //    per-hash circuit walkers compute the same `comb_vec` directly from
     //    the constraint graph.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t = if trace { Some(Instant::now()) } else { None };
     let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
     if let Some(t) = t {
         eprintln!(
@@ -1430,11 +1429,7 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t = if trace { Some(Instant::now()) } else { None };
     let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
     if let Some(t) = t {
         eprintln!(
@@ -1455,11 +1450,7 @@ fn prove_padded_inner<Ch: Challenger>(
     }
 
     // 3. Partial fold of z at the shared outer half (length-k F128 vector).
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t = if trace { Some(Instant::now()) } else { None };
     let eq_x_outer = build_eq_table(&x_ab.x_outer);
     let z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
     if let Some(t) = t {
@@ -1502,11 +1493,7 @@ fn column_sumcheck_prove<Ch: Challenger>(
     debug_assert_eq!(comb_vec.len(), z_vec.len());
     debug_assert!(comb_vec.len().is_power_of_two());
     let inner_rest_len = comb_vec.len().trailing_zeros() as usize - k_skip;
-    let t_sumcheck_start = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t_sumcheck_start = if trace { Some(Instant::now()) } else { None };
 
     // 5. Standard multilinear product-sumcheck over the high `inner_rest_len`
     //    bits of `i`. Each round binds the TOP remaining bit (mirrors
@@ -1646,7 +1633,7 @@ pub fn verify<Ch: Challenger>(
 
     challenger.observe_label(b"flock-lincheck-v0");
 
-    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let trace = var("VERIFY_TRACE").is_ok();
     let fmt = |s: f64| -> String {
         let ms = s * 1000.0;
         if ms < 1.0 {
@@ -1662,7 +1649,7 @@ pub fn verify<Ch: Challenger>(
     // 2. Build α-batched comb_vec via the circuit's per-block fold (same call
     //    the prover made — sparse default delegates to the fused row-fold;
     //    per-hash impls walk the constraint graph directly).
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
     if trace {
         eprintln!(
@@ -1670,7 +1657,7 @@ pub fn verify<Ch: Challenger>(
             fmt(t.elapsed().as_secs_f64())
         );
     }
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
     if trace {
         eprintln!(
@@ -1682,7 +1669,7 @@ pub fn verify<Ch: Challenger>(
     // 3. Replay the multilinear product-sumcheck (inner_rest_len rounds),
     //    folding comb_vec in lockstep so we end up with the "comb_partial"
     //    vector of length 2^k_skip. Parallel fold for the early (large) rounds.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     // Constant-wire pin (mirror of prove): β sampled after α, comb gains +β at
     // the constant column, and the initial target gains +β·1 — the honest
     // all-ones constant column folds to 1. See docs/const-wire-pin.md.
@@ -1734,7 +1721,7 @@ pub fn verify<Ch: Challenger>(
     // 7. Derive output claim value via φ8 Lagrange on z_partial at z_skip.
     //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest;
     //    PCS catches mismatches downstream.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
     let w = inner_product(&lambda, &proof.z_partial);
     if trace {
@@ -1839,7 +1826,7 @@ mod tests {
         let n_outer = 1usize << (m - k_log);
         assert_eq!(f.len(), 1 << m);
 
-        let lambda = crate::zerocheck::multilinear::lagrange_weights_naive(k_skip, point.z_skip);
+        let lambda = lagrange_weights_naive(k_skip, point.z_skip);
         let eq_rest = build_eq_table(&point.x_inner_rest);
         let eq_outer = build_eq_table(&point.x_outer);
         debug_assert_eq!(lambda.len(), k_skip_dim);
@@ -1896,7 +1883,7 @@ mod tests {
     /// `k × k` slots. Used for tests.
     fn random_sparse_matrix(k: usize, nnz: usize, rng: &mut Rng) -> SparseBinaryMatrix {
         let mut rows: Vec<Vec<usize>> = vec![Vec::new(); k];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut count = 0;
         while count < nnz {
             let r = (rng.next_u64() as usize) % k;

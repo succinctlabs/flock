@@ -9,6 +9,7 @@
 use flock_core::field::F128;
 use flock_core::lincheck::build_eq_table;
 use rayon::prelude::*;
+use std::hint::black_box;
 use std::time::Instant;
 
 const JM: usize = 23;
@@ -21,7 +22,7 @@ fn bench(label: &str, f: &mut dyn FnMut() -> usize) -> f64 {
     f();
     for _ in 0..4 {
         let t = Instant::now();
-        std::hint::black_box(f());
+        black_box(f());
         b = b.min(t.elapsed().as_secs_f64());
     }
     println!("  {label:<52} {:6.2} ms", b * 1e3);

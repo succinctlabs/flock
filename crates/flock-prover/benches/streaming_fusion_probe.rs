@@ -119,11 +119,13 @@ fn build_eq(r: &[F128]) -> Vec<F128> {
 }
 
 fn main() {
+    const M: usize = 30;
+    const RUNS: usize = 5;
+    const MICRO: usize = 256;
     let _ = flock_prover::init_perf_thread_pool();
     let threads = rayon::current_num_threads();
     println!("streaming-fusion probe ({threads} thread(s))\n");
 
-    const M: usize = 30;
     let l = 1usize << (M - 7);
     let n_lo = (M - 7) / 2;
     let n_hi = (M - 7) - n_lo;
@@ -171,7 +173,7 @@ fn main() {
     // (par_chunks_mut(2) writes b_combined and accumulates prime).
     // ============================================================
     println!("\n[PATH A] current (materialize per-claim + fused combine + prime)");
-    const RUNS: usize = 5;
+
     let mut a_fold0_total = 0.0;
     let mut a_fold1_total = 0.0;
     let mut a_combine_total = 0.0;
@@ -180,6 +182,7 @@ fn main() {
     let mut path_a_u0 = F128::ZERO;
     let mut path_a_u2 = F128::ZERO;
     for run in 0..RUNS {
+        use rayon::prelude::*;
         let t_all = Instant::now();
         let t0 = Instant::now();
         let b0 = fold_b128_elems_split(&eq_lo_0, &eq_hi_0, &scaled_0);
@@ -190,7 +193,7 @@ fn main() {
 
         // Combine + prime in one par_chunks_mut(2) pass (mirrors current pcs::open_batch_mixed).
         let tc = Instant::now();
-        use rayon::prelude::*;
+
         let mut b_combined: Vec<F128> = vec![F128 { lo: 0, hi: 0 }; l];
         let (u_0, u_2) = b_combined
             .par_chunks_mut(2)
@@ -246,6 +249,7 @@ fn main() {
     let mut path_b_u0 = F128::ZERO;
     let mut path_b_u2 = F128::ZERO;
     for run in 0..RUNS {
+        use rayon::prelude::*;
         let t_all = Instant::now();
         // Build γ-baked byte tables.
         let tb = Instant::now();
@@ -257,7 +261,7 @@ fn main() {
         // task processes one i_hi worth of slots (= one row of the
         // logical (i_hi, i_lo) grid).
         let tp = Instant::now();
-        use rayon::prelude::*;
+
         let mut b_combined: Vec<F128> = vec![F128 { lo: 0, hi: 0 }; l];
         let (u_0, u_2) = b_combined
             .par_chunks_mut(b_lo)
@@ -326,7 +330,7 @@ fn main() {
     // and eq_lo lines pushed it over).
     // ============================================================
     println!("\n[PATH C] micro-tiled fusion (256-element scratchpad, 1 active table per sub-pass)");
-    const MICRO: usize = 256;
+
     let mut c_total = 0.0;
     let mut c_table_build_total = 0.0;
     let mut c_fused_pass_total = 0.0;
@@ -334,6 +338,7 @@ fn main() {
     let mut path_c_u0 = F128::ZERO;
     let mut path_c_u2 = F128::ZERO;
     for run in 0..RUNS {
+        use rayon::prelude::*;
         let t_all = Instant::now();
         let tb = Instant::now();
         let table_0 = build_phi_byte_table(&scaled_0);
@@ -341,7 +346,7 @@ fn main() {
         c_table_build_total += tb.elapsed().as_secs_f64();
 
         let tp = Instant::now();
-        use rayon::prelude::*;
+
         let mut b_combined: Vec<F128> = vec![F128 { lo: 0, hi: 0 }; l];
         let (u_0, u_2) = b_combined
             .par_chunks_mut(b_lo)

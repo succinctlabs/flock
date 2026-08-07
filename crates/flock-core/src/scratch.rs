@@ -18,6 +18,9 @@
 //! e.g. after the last prove of a batch.
 
 use crate::field::F128;
+use core::mem::size_of;
+use std::env::var_os;
+use std::ptr::write_bytes;
 use std::sync::Mutex;
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
@@ -78,7 +81,7 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
     if let Some(i) = best {
         let mut v = pool.swap_remove(i);
         drop(pool);
-        if std::env::var_os("FLOCK_POOL_TRACE").is_some() {
+        if var_os("FLOCK_POOL_TRACE").is_some() {
             eprintln!(
                 "      [pool] take_f128 n=2^{:.1} cap=2^{:.1} ({}x)",
                 (n as f64).log2(),
@@ -93,7 +96,7 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
         unsafe { v.set_len(n) };
         return Some(v);
     }
-    if std::env::var_os("FLOCK_POOL_TRACE").is_some() {
+    if var_os("FLOCK_POOL_TRACE").is_some() {
         eprintln!(
             "      [pool] take_f128 n=2^{:.1} MISS (fresh)",
             (n as f64).log2()
@@ -280,7 +283,7 @@ fn prewarm_sets(sets: &[(usize, usize, usize)]) {
     use rayon::prelude::*;
     let mut bufs: Vec<Vec<F128>> = Vec::new();
     let mut budget = PREWARM_BUDGET_BYTES;
-    let w = core::mem::size_of::<F128>();
+    let w = size_of::<F128>();
     for &(m, n_large, n_small) in sets {
         if m < 7 {
             continue;
@@ -301,7 +304,7 @@ fn prewarm_sets(sets: &[(usize, usize, usize)]) {
     bufs.par_iter_mut().for_each(|b| {
         b.par_chunks_mut(1 << 16).for_each(|chunk| {
             // SAFETY: F128 is plain bytes (no Drop); zero is a valid pattern.
-            unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
+            unsafe { write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
         });
     });
     for b in bufs {

@@ -20,6 +20,7 @@
 //!
 //! Run: `cargo bench --bench merkle`
 
+use std::hint::black_box;
 use std::time::Instant;
 
 use flock_prover::merkle::{HashKind, hash_leaf, merkle_tree};
@@ -163,7 +164,7 @@ fn bench_merkle_tree(num_leaves: usize, leaf_size: usize, kind: HashKind) -> f64
         let t0 = Instant::now();
         let tree = merkle_tree(&data, num_leaves, kind);
         best = best.min(t0.elapsed().as_secs_f64());
-        std::hint::black_box(&tree);
+        black_box(&tree);
     }
     // Tree work = leaves + internal nodes; internal = num_leaves - 1 hashes.
     let total_hashes = (2 * num_leaves - 1) as u64;

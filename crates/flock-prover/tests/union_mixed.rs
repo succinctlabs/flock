@@ -22,10 +22,17 @@
 
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
+use flock_core::lincheck::VerifyError as LincheckVerifyError;
+use flock_core::pcs::commit;
+use flock_core::pcs::commit_lane_major;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::pcs::{PcsParams, VerifyErrorOpen};
 use flock_core::proof::R1csProofMergedLigerito;
 use flock_core::r1cs::BlockR1cs;
+use flock_core::scratch::give_f128;
+use flock_core::scratch::give_u8;
+use flock_core::scratch::prewarm_prover;
+use flock_core::scratch::prewarm_prover_union;
 use flock_core::union::SlotWitness;
 use flock_core::verifier::VerifyError;
 use flock_prover::challenger::FsChallenger;
@@ -34,6 +41,10 @@ use flock_prover::r1cs_hashes::{blake3, sha2};
 use flock_prover::schedule::{Registry, TableType};
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier;
+use std::array::from_fn;
+use std::env::var;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 struct Rng(u64);
 impl Rng {
@@ -56,16 +67,16 @@ const DOMAIN: &[u8] = b"flock-mixed-e2e-v0";
 /// wall-clock reading (a single-shot arm measured 3x its quiet value) and
 /// occasionally trips the loose timing gates. Correctness tests stay
 /// parallel; only tests that assert or print wall times take this lock.
-fn timing_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn timing_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
     (0..n)
         .map(|_| {
-            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = from_fn(|_| rng.next_u32());
             let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
             (cv, m, counter, 64u32, 11u32)
         })
@@ -74,12 +85,7 @@ fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
 
 fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
     (0..n)
-        .map(|_| {
-            (
-                std::array::from_fn(|_| rng.next_u32()),
-                std::array::from_fn(|_| rng.next_u32()),
-            )
-        })
+        .map(|_| (from_fn(|_| rng.next_u32()), from_fn(|_| rng.next_u32())))
         .collect()
 }
 
@@ -204,9 +210,9 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     // Mirrors the prover's dispatch: the integer-lane commit encodes only the
     // dense stack's nonzero high-bit lanes (`UnionInstance::commit_lanes`).
     let (comm_direct, _prover_data) = if pcs_params.num_lanes.is_some() {
-        flock_core::pcs::commit_lane_major(&q, &pcs_params)
+        commit_lane_major(&q, &pcs_params)
     } else {
-        flock_core::pcs::commit(&q, &pcs_params)
+        commit(&q, &pcs_params)
     };
     assert_eq!(
         commitment.cap, comm_direct.cap,
@@ -310,9 +316,7 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
         let mut bad = proof.clone();
         bad.lincheck.rounds[0].0.lo ^= 1;
         match verify(&union, &bad) {
-            Err(VerifyError::Lincheck(flock_core::lincheck::VerifyError::ConsistencyFailed {
-                ..
-            })) => {}
+            Err(VerifyError::Lincheck(LincheckVerifyError::ConsistencyFailed { .. })) => {}
             other => panic!(
                 "tampered lincheck round: expected Lincheck(ConsistencyFailed), got {other:?}"
             ),
@@ -635,8 +639,8 @@ fn identity_compaction_roundtrips_over_the_merged_transport() {
 #[test]
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn mixed_throughput_smoke() {
-    let _quiet = timing_lock();
     use std::time::Instant;
+    let _quiet = timing_lock();
 
     // ν = 10: 1024 invocations per type; mixed M = 26, singles at m = 24
     // (BLAKE3) / 25 (SHA-256).
@@ -663,12 +667,8 @@ fn mixed_throughput_smoke() {
             blake3::generate_witness_batch_major(&blake3_inputs, nu),
             b3_circuit,
         );
-        let _ = prover::prove_fast_ligerito_union(
-            &b3_union,
-            &b3_setup.pcs_params,
-            vec![slot],
-            &mut ch,
-        );
+        let _ =
+            prover::prove_fast_ligerito_union(&b3_union, &b3_setup.pcs_params, vec![slot], &mut ch);
         if timed {
             b3_ms = t.elapsed().as_secs_f64() * 1e3;
         }
@@ -687,12 +687,8 @@ fn mixed_throughput_smoke() {
             sha2::generate_witness_batch_major(&sha2_inputs, nu),
             s2_circuit,
         );
-        let _ = prover::prove_fast_ligerito_union(
-            &s2_union,
-            &s2_setup.pcs_params,
-            vec![slot],
-            &mut ch,
-        );
+        let _ =
+            prover::prove_fast_ligerito_union(&s2_union, &s2_setup.pcs_params, vec![slot], &mut ch);
         if timed {
             s2_ms = t.elapsed().as_secs_f64() * 1e3;
         }
@@ -702,7 +698,7 @@ fn mixed_throughput_smoke() {
     let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
     let union = UnionInstance::new(&registry, vec![n_per_type, n_per_type]);
     let pcs_params = union_pcs_params(&union);
-    flock_core::scratch::prewarm_prover(registry.m_total());
+    prewarm_prover(registry.m_total());
     let s2_mix_circuit = sha2_r1cs.csc_lincheck_circuit();
     let b3_mix_circuit = blake3_r1cs.csc_lincheck_circuit();
     let mut mixed_ms = 0.0;
@@ -754,15 +750,15 @@ fn mixed_throughput_smoke() {
 #[test]
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn mixed_low_utilization_smoke() {
-    let _quiet = timing_lock();
     use std::time::Instant;
+    let _quiet = timing_lock();
 
     let nu = 10usize;
     let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
     let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
     let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
     let mut rng = Rng::new(0x05_31_77_77);
-    flock_core::scratch::prewarm_prover(registry.m_total());
+    prewarm_prover(registry.m_total());
 
     let mut results = Vec::new();
     for counts in [[8usize, 8usize], [1024, 1024]] {
@@ -904,10 +900,17 @@ fn capacity_sweep_m30_load() {
 }
 
 fn run_capacity_sweep(counts: [usize; 2], nus: &[usize]) {
+    // Per-config minima: [prove total, verify]. (The per-phase columns died
+    // with the jagged `_timed` entry; `PCS_TRACE=1` on the merged prover
+    // gives the per-phase attribution instead — see
+    // `merged_capacity_attribution`.)
+    const PROVE: usize = 0;
+    const VERIFY: usize = 1;
+    const PASSES: usize = 4;
     use std::time::Instant;
 
     let cfgs: Vec<_> = nus.iter().map(|&nu| mixed_registry(nu)).collect();
-    flock_core::scratch::prewarm_prover(cfgs.last().unwrap().0.m_total());
+    prewarm_prover(cfgs.last().unwrap().0.m_total());
 
     let mut rng = Rng::new(0xCA9A_C17F_5EED);
     let sha2_inputs = random_sha2_inputs(&mut rng, counts[0]);
@@ -932,15 +935,9 @@ fn run_capacity_sweep(counts: [usize; 2], nus: &[usize]) {
         }
     }
 
-    // Per-config minima: [prove total, verify]. (The per-phase columns died
-    // with the jagged `_timed` entry; `PCS_TRACE=1` on the merged prover
-    // gives the per-phase attribution instead — see
-    // `merged_capacity_attribution`.)
-    const PROVE: usize = 0;
-    const VERIFY: usize = 1;
     let mut mins = vec![[f64::INFINITY; 2]; nus.len()];
 
-    const PASSES: usize = 4; // pass 0 is an untimed warm-up
+    // pass 0 is an untimed warm-up
     for pass in 0..PASSES {
         let order: Vec<usize> = if pass % 2 == 0 {
             (0..nus.len()).collect()
@@ -1090,7 +1087,7 @@ fn merged_transport_roundtrip_and_tamper() {
         assert_eq!(claim_v, claim);
 
         // Tamper matrix over the transport's new pieces + one PIOP field.
-        let reject = |p: &flock_core::proof::R1csProofMergedLigerito, what: &str| {
+        let reject = |p: &R1csProofMergedLigerito, what: &str| {
             let mut ch_v = FsChallenger::new(DOMAIN);
             assert!(
                 verifier::verify_ligerito_union(
@@ -1239,13 +1236,13 @@ fn merged_transport_roundtrip_and_tamper() {
 #[test]
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn merged_transport_m30_probe() {
-    let _quiet = timing_lock();
     use std::time::Instant;
     const COUNTS: [usize; 2] = [16384, 16384];
     const NUS: [usize; 3] = [14, 15, 16];
+    let _quiet = timing_lock();
 
     let cfgs: Vec<_> = NUS.iter().map(|&nu| mixed_registry(nu)).collect();
-    flock_core::scratch::prewarm_prover(cfgs.last().unwrap().0.m_total());
+    prewarm_prover(cfgs.last().unwrap().0.m_total());
     let mut rng = Rng::new(0x_4E_26_ED_30);
     let sha2_inputs = random_sha2_inputs(&mut rng, COUNTS[0]);
     let blake3_inputs = random_blake3_inputs(&mut rng, COUNTS[1]);
@@ -1264,7 +1261,9 @@ fn merged_transport_m30_probe() {
                     s2_circuit,
                 ),
                 UnionSlotProverInput::in_place(
-                    |dst| blake3::generate_witness_batch_major_partial_into(&blake3_inputs, nu, dst),
+                    |dst| {
+                        blake3::generate_witness_batch_major_partial_into(&blake3_inputs, nu, dst)
+                    },
                     b3_circuit,
                 ),
             ];
@@ -1294,7 +1293,11 @@ fn merged_transport_m30_probe() {
     }
     println!("merged m30 probe, counts {COUNTS:?} (min of 2, ms, prove incl. witgen):");
     for (i, &nu) in NUS.iter().enumerate() {
-        println!("  nu = {nu} (M = {}): merged {:.1}", cfgs[i].0.m_total(), mins[i]);
+        println!(
+            "  nu = {nu} (M = {}): merged {:.1}",
+            cfgs[i].0.m_total(),
+            mins[i]
+        );
     }
     // The capacity-free design claim, now as an ABSOLUTE flatness bound (the
     // jagged comparator is gone — its final A/B record, 2026-08-02 on this
@@ -1318,15 +1321,16 @@ fn merged_transport_m30_probe() {
 #[test]
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn merged_capacity_attribution() {
-    let _quiet = timing_lock();
     use std::time::Instant;
     const COUNTS: [usize; 2] = [16384, 16384];
+    let _quiet = timing_lock();
+
     // Tier list, overridable so a tier can be measured in ISOLATION
     // (`FLOCK_PROBE_NUS=18`). Required above nu = 16: the later tiers touch
     // GBs, and both the heat and the mid-run pool prewarms they leave behind
     // read back as several ms on whatever runs after them in the same
     // process. Citable per-tier numbers come from separate invocations.
-    let nus: Vec<usize> = match std::env::var("FLOCK_PROBE_NUS") {
+    let nus: Vec<usize> = match var("FLOCK_PROBE_NUS") {
         Ok(s) => s
             .split(',')
             .map(|t| {
@@ -1359,12 +1363,12 @@ fn merged_capacity_attribution() {
         let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
         let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
         let union = UnionInstance::new(registry, COUNTS.to_vec());
-        match std::env::var("FLOCK_PROBE_PREWARM").as_deref() {
+        match var("FLOCK_PROBE_PREWARM").as_deref() {
             Ok("0") => {}
             // The old shape: whole set sized off the PADDED m. Kept behind the
             // knob as the A/B arm that shows why it is wrong above nu = 16.
-            Ok("m") => flock_core::scratch::prewarm_prover(registry.m_total()),
-            _ => flock_core::scratch::prewarm_prover_union(registry.m_total(), union.dense_m()),
+            Ok("m") => prewarm_prover(registry.m_total()),
+            _ => prewarm_prover_union(registry.m_total(), union.dense_m()),
         }
         let pcs_params = union_pcs_params(&union);
         // Timed passes, `FLOCK_PROBE_PASSES` (default 3; pass 0 is an untimed
@@ -1375,7 +1379,7 @@ fn merged_capacity_attribution() {
         // and more samples strictly help. Long inter-process cooldowns do not:
         // they were sized for a heat model that the gate disproved (it returns
         // to the cold band with zero cooldown).
-        let passes: usize = std::env::var("FLOCK_PROBE_PASSES")
+        let passes: usize = var("FLOCK_PROBE_PASSES")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3);
@@ -1397,12 +1401,8 @@ fn merged_capacity_attribution() {
             ];
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
-            let (_p, _c, _cl) = prover::prove_fast_ligerito_union(
-                &union,
-                &pcs_params,
-                slots,
-                &mut ch,
-            );
+            let (_p, _c, _cl) =
+                prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
             let ms = t.elapsed().as_secs_f64() * 1e3;
             if pass == 0 {
                 // The genuine ONE-SHOT cost: nothing resident, every buffer
@@ -1465,10 +1465,10 @@ fn merged_padding_unread_poison_pool() {
         let len = union.packed_len();
         let poison = F128::new(0xDEAD_BEEF_DEAD_BEEF, 0xDEAD_BEEF_DEAD_BEEF);
         for _ in 0..6 {
-            flock_core::scratch::give_f128(vec![poison; len]);
+            give_f128(vec![poison; len]);
         }
         for _ in 0..4 {
-            flock_core::scratch::give_u8(vec![0xAD; 1 << 20]);
+            give_u8(vec![0xAD; 1 << 20]);
         }
         let (p2, c2, cl2) = prove();
         assert_eq!(c1.cap, c2.cap, "commitment must ignore dropped words");
@@ -1476,15 +1476,8 @@ fn merged_padding_unread_poison_pool() {
         assert_eq!(cl1, cl2);
         let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
         let mut chv = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union(
-            &union,
-            &circuits,
-            &c2,
-            &p2,
-            &pcs_params,
-            &mut chv,
-        )
-        .expect("poison-pool proof verifies");
+        verifier::verify_ligerito_union(&union, &circuits, &c2, &p2, &pcs_params, &mut chv)
+            .expect("poison-pool proof verifies");
     }
 }
 
@@ -1590,10 +1583,11 @@ fn in_place_generation_matches_prebuilt_byte_identical() {
 #[test]
 #[ignore] // Heavy (M = 30, ~2 GB) + informational — run explicitly with --ignored --nocapture
 fn mixed_m30_throughput() {
-    let _quiet = timing_lock();
     use std::time::Instant;
+    const ITERS: usize = 2;
+    let _quiet = timing_lock();
 
-    const ITERS: usize = 2; // timed runs after one warm-up; best reported
+    // timed runs after one warm-up; best reported
     let nu = 14usize; // M = 30; full utilization = 16384 invocations per type
     let n_per_type = 1usize << nu;
     let mut rng = Rng::new(0x30_31_2B_B3);
@@ -1615,12 +1609,8 @@ fn mixed_m30_throughput() {
                 circuit,
             );
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ = prover::prove_fast_ligerito_union(
-                &union,
-                &setup.pcs_params,
-                vec![slot],
-                &mut ch,
-            );
+            let _ =
+                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         }
         let mut best = f64::INFINITY;
         for _ in 0..ITERS {
@@ -1630,12 +1620,8 @@ fn mixed_m30_throughput() {
                 blake3::generate_witness_batch_major(&blake3_inputs, nu),
                 circuit,
             );
-            let _ = prover::prove_fast_ligerito_union(
-                &union,
-                &setup.pcs_params,
-                vec![slot],
-                &mut ch,
-            );
+            let _ =
+                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
         }
         (best, setup.m())
@@ -1655,12 +1641,8 @@ fn mixed_m30_throughput() {
                 circuit,
             );
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ = prover::prove_fast_ligerito_union(
-                &union,
-                &setup.pcs_params,
-                vec![slot],
-                &mut ch,
-            );
+            let _ =
+                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         }
         let mut best = f64::INFINITY;
         for _ in 0..ITERS {
@@ -1670,12 +1652,8 @@ fn mixed_m30_throughput() {
                 sha2::generate_witness_batch_major(&sha2_inputs, nu),
                 circuit,
             );
-            let _ = prover::prove_fast_ligerito_union(
-                &union,
-                &setup.pcs_params,
-                vec![slot],
-                &mut ch,
-            );
+            let _ =
+                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
         }
         (best, setup.m())
@@ -1695,7 +1673,7 @@ fn mixed_m30_throughput() {
     assert_eq!(union.dense_m(), 30);
     assert_eq!(union.committed_words(), union.packed_len());
     assert_eq!(pcs_params.m, 30);
-    flock_core::scratch::prewarm_prover(registry.m_total());
+    prewarm_prover(registry.m_total());
     let s2_mix_circuit = sha2_r1cs.csc_lincheck_circuit();
     let b3_mix_circuit = blake3_r1cs.csc_lincheck_circuit();
     {
@@ -1813,10 +1791,11 @@ fn mixed_m30_throughput() {
 #[test]
 #[ignore] // Heavy (m = 30, ~2 GB) + informational — run explicitly with --ignored --nocapture
 fn two_blake3_tables_vs_direct() {
-    let _quiet = timing_lock();
     use std::time::Instant;
+    const ITERS: usize = 2;
+    let _quiet = timing_lock();
 
-    const ITERS: usize = 2; // timed runs after one warm-up; best reported
+    // timed runs after one warm-up; best reported
     let n_total = 1usize << 16; // 2N = 65536 total BLAKE3 compressions
 
     // Shared inputs: 65536 BLAKE3 compressions. The two-table row proves the
@@ -1914,7 +1893,7 @@ fn two_blake3_tables_vs_direct() {
         assert_eq!(union.dense_m(), 30);
         assert_eq!(pcs_params.m, 30);
         let circuit = b3_r1cs.csc_lincheck_circuit();
-        flock_core::scratch::prewarm_prover(registry.m_total());
+        prewarm_prover(registry.m_total());
         let (lo, hi) = blake3_inputs.split_at(n_per);
         // Untimed warm-up.
         {
@@ -1943,15 +1922,8 @@ fn two_blake3_tables_vs_direct() {
         let circuits: [&dyn LincheckCircuit; 2] = [circuit, circuit];
         let t = Instant::now();
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union(
-            &union,
-            &circuits,
-            &comm,
-            &proof,
-            &pcs_params,
-            &mut ch,
-        )
-        .expect("union two-table verify rejected honest proof");
+        verifier::verify_ligerito_union(&union, &circuits, &comm, &proof, &pcs_params, &mut ch)
+            .expect("union two-table verify rejected honest proof");
         let v_ms = t.elapsed().as_secs_f64() * 1e3;
         (best, bytes, v_ms, union.committed_words())
     };
@@ -1969,7 +1941,7 @@ fn two_blake3_tables_vs_direct() {
         assert_eq!(union.dense_m(), 30);
         assert_eq!(pcs_params.m, 30);
         let circuit = b3_r1cs.csc_lincheck_circuit();
-        flock_core::scratch::prewarm_prover(registry.m_total());
+        prewarm_prover(registry.m_total());
         // Untimed warm-up.
         {
             let slots = vec![UnionSlotProverInput::new(
@@ -1997,22 +1969,14 @@ fn two_blake3_tables_vs_direct() {
         let circuits: [&dyn LincheckCircuit; 1] = [circuit];
         let t = Instant::now();
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union(
-            &union,
-            &circuits,
-            &comm,
-            &proof,
-            &pcs_params,
-            &mut ch,
-        )
-        .expect("union single-table verify rejected honest proof");
+        verifier::verify_ligerito_union(&union, &circuits, &comm, &proof, &pcs_params, &mut ch)
+            .expect("union single-table verify rejected honest proof");
         let v_ms = t.elapsed().as_secs_f64() * 1e3;
         (best, bytes, v_ms, union.committed_words())
     };
 
     // ---- Report.
-    let committed_all_equal =
-        direct_committed == u2_committed && u2_committed == u1_committed;
+    let committed_all_equal = direct_committed == u2_committed && u2_committed == u1_committed;
     println!(
         "\ntwo-blake3-table control: 2N = {n_total} total invocations, \
          best-of-{ITERS} (prove incl. witgen)\n"

@@ -288,26 +288,12 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
-        use rayon::prelude::*;
-        let n_total = data.len();
-        let log_d = log2_pow2(n_total / num_ntts);
-
         // Target sub-group size = 2 MB total bytes. Each position is
         // `num_ntts × 16` bytes, so positions per sub-group =
         // 2^21 / (num_ntts · 16). With num_ntts=1: 2^17 positions. With
         // num_ntts=32: 2^12 positions. (Without this scaling, sub-groups at
         // num_ntts=32 would be 64 MB and overflow L2 cache.)
         const TARGET_SUBGROUP_LOG_BYTES: usize = 21;
-        // `num_ntts` need not be a power of two (integer-lane commit). Round the
-        // lane count UP to a power of two for the cache-blocking heuristic so an
-        // integer `t` blocks exactly like the padded `2^ceil(log2 t)` (measured:
-        // this recovers the full per-lane efficiency — a floor-log2 here left
-        // t=46 with oversized 3 MB sub-groups and ~15% slower than ideal). Only
-        // affects the sub-group SIZE (a tuning knob), never correctness.
-        let log_bytes_per_position = 4 + ceil_log2(num_ntts);
-        let target_log_positions = TARGET_SUBGROUP_LOG_BYTES.saturating_sub(log_bytes_per_position);
-        let cache_n_top = log_d.saturating_sub(target_log_positions);
-
         // Parallelism floor. The cache heuristic keeps each sub-NTT ~2 MB, but
         // for a mid-size transform whose whole codeword already fits that
         // budget it yields `cache_n_top == 0` and the transform runs fully
@@ -324,6 +310,20 @@ impl AdditiveNttF128 {
         // than the ~0.04 ms of work, so those stay scalar.
         const PARALLEL_FLOOR_LOG_D: usize = 12;
         const MIN_SUB_LOG: usize = 8;
+        use rayon::prelude::*;
+        let n_total = data.len();
+        let log_d = log2_pow2(n_total / num_ntts);
+
+        // `num_ntts` need not be a power of two (integer-lane commit). Round the
+        // lane count UP to a power of two for the cache-blocking heuristic so an
+        // integer `t` blocks exactly like the padded `2^ceil(log2 t)` (measured:
+        // this recovers the full per-lane efficiency — a floor-log2 here left
+        // t=46 with oversized 3 MB sub-groups and ~15% slower than ideal). Only
+        // affects the sub-group SIZE (a tuning knob), never correctness.
+        let log_bytes_per_position = 4 + ceil_log2(num_ntts);
+        let target_log_positions = TARGET_SUBGROUP_LOG_BYTES.saturating_sub(log_bytes_per_position);
+        let cache_n_top = log_d.saturating_sub(target_log_positions);
+
         let n_top = if log_d >= PARALLEL_FLOOR_LOG_D {
             let want_subs_log = log2_pow2(rayon::current_num_threads().next_power_of_two());
             let max_n_top = log_d.saturating_sub(MIN_SUB_LOG);
@@ -522,13 +522,14 @@ impl AdditiveNttF128 {
     /// Rayon-parallel + NEON forward transform.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     pub fn forward_transform_parallel(&self, data: &mut [F128]) {
+        // For small data (or shallow layers with few large blocks), the rayon
+        // overhead exceeds the gain — fall back to the NEON single-thread path.
+        const PARALLEL_THRESHOLD_LOG: usize = 14;
         use rayon::prelude::*;
         let log_d = log2_pow2(data.len());
         assert!(log_d <= self.log_domain_size());
 
-        // For small data (or shallow layers with few large blocks), the rayon
-        // overhead exceeds the gain — fall back to the NEON single-thread path.
-        const PARALLEL_THRESHOLD_LOG: usize = 14; // 2^14 = 16K elements (256 KB)
+        // 2^14 = 16K elements (256 KB)
         if log_d <= PARALLEL_THRESHOLD_LOG {
             self.forward_transform_neon(data);
             return;
@@ -613,12 +614,12 @@ impl AdditiveNttF128 {
     /// per-layer parallel path.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     pub fn forward_transform_batched(&self, data: &mut [F128]) {
+        // Target sub-NTT size: 2^17 F_{2^128} = 2 MB. Tunable.
+        const TARGET_SUB_NTT_LOG: usize = 17;
         use rayon::prelude::*;
         let log_d = log2_pow2(data.len());
         assert!(log_d <= self.log_domain_size());
 
-        // Target sub-NTT size: 2^17 F_{2^128} = 2 MB. Tunable.
-        const TARGET_SUB_NTT_LOG: usize = 17;
         if log_d <= TARGET_SUB_NTT_LOG {
             self.forward_transform_parallel(data);
             return;

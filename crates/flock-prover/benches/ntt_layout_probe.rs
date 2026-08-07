@@ -46,6 +46,7 @@
 //!
 //! Run: `cargo bench --bench ntt_layout_probe [n_runs]`
 
+use std::env::args;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -365,10 +366,7 @@ fn main() {
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
     println!("(target: non-aarch64 / software fallback path)");
 
-    let n_runs: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let n_runs: usize = args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(20);
 
     // m=30-representative: log_dim=19, num_ntts=16 (log_batch_size=4), k=12
     // real lanes (25% zero padding). Rate 1/2 is the pcs_commit default; rate

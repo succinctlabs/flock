@@ -9,6 +9,7 @@
 //! Default: 50 runs at m=29 (~3 sec ST) under sha256. Pass `blake3` as the
 //! third argument to profile the other Merkle hash.
 
+use std::env::args;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -30,15 +31,9 @@ impl Rng {
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
-    let n_runs: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
-    let m: usize = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(29);
-    let kind = match std::env::args().nth(3) {
+    let n_runs: usize = args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50);
+    let m: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(29);
+    let kind = match args().nth(3) {
         Some(s) => HashKind::parse(&s).expect("third arg must be sha256 or blake3"),
         None => HashKind::Sha256,
     };

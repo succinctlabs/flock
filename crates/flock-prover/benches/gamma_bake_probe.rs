@@ -35,13 +35,29 @@ fn fmt_ms(s: f64) -> String {
 }
 
 fn main() {
+    // m=30 setup: x_outer has length m - 6 = 24. Suffix x_outer[1..] has length
+    // 23. Split into n_hi = 12 / n_lo = 11 for the dense_splits factor.
+    const M: usize = 30;
+    // Build eq_r_dprime (length 128) for 2 claims via the standard
+    // tensor-product expansion of 7-coord r''.
+    fn build_eq(r: &[F128]) -> Vec<F128> {
+        let mut acc = vec![F128 { lo: 1, hi: 0 }];
+        for &ri in r {
+            let mut next = Vec::with_capacity(acc.len() * 2);
+            let one = F128 { lo: 1, hi: 0 };
+            for &a in &acc {
+                next.push(a * (one + ri));
+                next.push(a * ri);
+            }
+            acc = next;
+        }
+        acc
+    }
+    const RUNS: usize = 5;
     let _ = flock_prover::init_perf_thread_pool();
     let threads = rayon::current_num_threads();
     println!("gamma-bake probe ({threads} thread(s))\n");
 
-    // m=30 setup: x_outer has length m - 6 = 24. Suffix x_outer[1..] has length
-    // 23. Split into n_hi = 12 / n_lo = 11 for the dense_splits factor.
-    const M: usize = 30;
     let l = 1usize << (M - 7); // 8.4M
     let n_lo = (M - 7) / 2; // 11
     let n_hi = (M - 7) - n_lo; // 12
@@ -62,21 +78,6 @@ fn main() {
     let eq_lo_1: Vec<F128> = (0..b_lo).map(|_| rng.f128()).collect();
     let eq_hi_1: Vec<F128> = (0..b_hi).map(|_| rng.f128()).collect();
 
-    // Build eq_r_dprime (length 128) for 2 claims via the standard
-    // tensor-product expansion of 7-coord r''.
-    fn build_eq(r: &[F128]) -> Vec<F128> {
-        let mut acc = vec![F128 { lo: 1, hi: 0 }];
-        for &ri in r {
-            let mut next = Vec::with_capacity(acc.len() * 2);
-            let one = F128 { lo: 1, hi: 0 };
-            for &a in &acc {
-                next.push(a * (one + ri));
-                next.push(a * ri);
-            }
-            acc = next;
-        }
-        acc
-    }
     let r_dprime_0: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
     let r_dprime_1: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
     let eq_r_dprime_0 = build_eq(&r_dprime_0);
@@ -99,9 +100,10 @@ fn main() {
     let mut a_fold1_total = 0.0;
     let mut a_combine_total = 0.0;
     let mut a_total = 0.0;
-    const RUNS: usize = 5;
+
     let mut b_a = Vec::new();
     for run in 0..RUNS {
+        use rayon::prelude::*;
         let t_all = Instant::now();
         let t0 = Instant::now();
         let b0 = fold_b128_elems_split(&eq_lo_0, &eq_hi_0, &eq_r_dprime_0);
@@ -114,7 +116,7 @@ fn main() {
         a_fold1_total += dt1;
 
         let tc = Instant::now();
-        use rayon::prelude::*;
+
         let b_combined: Vec<F128> = (0..l)
             .into_par_iter()
             .map(|j| g0 * b0[j] + g1 * b1[j])
@@ -157,6 +159,7 @@ fn main() {
     let mut b_total = 0.0;
     let mut b_b = Vec::new();
     for run in 0..RUNS {
+        use rayon::prelude::*;
         let t_all = Instant::now();
 
         let ts0 = Instant::now();
@@ -180,7 +183,7 @@ fn main() {
         b_fold1_total += dt1;
 
         let tc = Instant::now();
-        use rayon::prelude::*;
+
         let b_combined: Vec<F128> = (0..l).into_par_iter().map(|j| b0[j] + b1[j]).collect();
         let dtc = tc.elapsed().as_secs_f64();
         b_combine_total += dtc;

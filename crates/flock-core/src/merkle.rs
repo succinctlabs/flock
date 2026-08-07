@@ -46,8 +46,14 @@
 //! attacks via interpretation collision, and a production PCS commit should
 //! prepend `0x00`/`0x01` (or equivalent) before relying on it.
 
+use blake3::hazmat::Mode;
+use blake3::hazmat::merge_subtrees_non_root;
+use blake3::platform::Platform;
+use core::slice::from_raw_parts;
+use core::slice::from_raw_parts_mut;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::slice::from_ref;
 
 pub type Hash = [u8; 32];
 
@@ -197,7 +203,7 @@ fn blake3_leaf_cv(data: &[u8]) -> Hash {
 /// BLAKE3 parent-node chaining value of two children.
 #[inline]
 fn blake3_parent_cv(left: &Hash, right: &Hash) -> Hash {
-    blake3::hazmat::merge_subtrees_non_root(left, right, blake3::hazmat::Mode::Hash)
+    merge_subtrees_non_root(left, right, Mode::Hash)
 }
 
 /// Hash one leaf of arbitrary byte length.
@@ -283,10 +289,10 @@ const BLAKE3_PARENT: u8 = 4;
 
 /// Cached SIMD platform. `Platform::detect()` is cheap but not free, and the
 /// tree build reaches the batched path once per [`BLAKE3_BATCH`] nodes.
-fn blake3_platform() -> blake3::platform::Platform {
+fn blake3_platform() -> Platform {
     use std::sync::OnceLock;
-    static PLATFORM: OnceLock<blake3::platform::Platform> = OnceLock::new();
-    *PLATFORM.get_or_init(blake3::platform::Platform::detect)
+    static PLATFORM: OnceLock<Platform> = OnceLock::new();
+    *PLATFORM.get_or_init(Platform::detect)
 }
 
 /// Inputs handed to `hash_many` per call.
@@ -333,7 +339,7 @@ fn blake3_hash_many<const N: usize>(
         // initialized, contiguous, unpadded storage — the amount `hash_many`
         // writes for `n` inputs.
         let out_bytes: &mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
+            unsafe { from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
         plat.hash_many(
             &inputs[..n],
             &BLAKE3_IV,
@@ -452,13 +458,13 @@ const BLAKE3_GROUP: usize = 1024;
 /// 2^18 tree); those are hashed serially — still SIMD-batched — and only the
 /// wide lower levels fan out.
 fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
+    const SERIAL_LEVEL_NODES: usize = 1024;
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: `Hash` is `[u8; 32]`, so a slice of `n` hashes is exactly `32n`
     // initialized bytes with no padding.
-    let read_bytes: &[u8] =
-        unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
-    const SERIAL_LEVEL_NODES: usize = 1024;
+    let read_bytes: &[u8] = unsafe { from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
+
     let serial = write.len() <= SERIAL_LEVEL_NODES;
 
     match kind {
@@ -633,12 +639,7 @@ pub fn cap_layer(tree: &[Hash], num_leaves: usize, c: usize) -> &[Hash] {
 /// `log2(num_leaves) − c` hashes. `c = 0` is the classic root-anchored path.
 ///
 /// Verify with [`verify_merkle_proof_capped`].
-pub fn merkle_proof_capped(
-    tree: &[Hash],
-    num_leaves: usize,
-    index: usize,
-    c: usize,
-) -> Vec<Hash> {
+pub fn merkle_proof_capped(tree: &[Hash], num_leaves: usize, index: usize, c: usize) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert!(index < num_leaves);
     assert_eq!(tree.len(), 2 * num_leaves - 1);
@@ -720,7 +721,7 @@ pub fn verify_merkle_proof(
     kind: HashKind,
 ) -> bool {
     verify_merkle_proof_capped(
-        std::slice::from_ref(root),
+        from_ref(root),
         1usize << proof.len(),
         leaf_hash,
         index,
@@ -784,7 +785,7 @@ mod tests {
         );
         assert_eq!(
             hash_pair(&l, &r, HashKind::Blake3),
-            blake3::hazmat::merge_subtrees_non_root(&l, &r, blake3::hazmat::Mode::Hash)
+            merge_subtrees_non_root(&l, &r, Mode::Hash)
         );
         // Deliberately NOT `blake3::hash` — that is the root finalization, and
         // interior tree nodes must not be root hashes.
@@ -1144,10 +1145,14 @@ mod tests {
                 let leaf_hash = hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind);
                 let path = merkle_proof_capped(&tree, n_leaves, i, d);
                 assert!(path.is_empty());
-                assert!(verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &path, kind));
+                assert!(verify_merkle_proof_capped(
+                    cap, n_leaves, &leaf_hash, i, &path, kind
+                ));
                 let mut wrong = leaf_hash;
                 wrong[0] ^= 1;
-                assert!(!verify_merkle_proof_capped(cap, n_leaves, &wrong, i, &path, kind));
+                assert!(!verify_merkle_proof_capped(
+                    cap, n_leaves, &wrong, i, &path, kind
+                ));
             }
         }
     }
@@ -1187,13 +1192,24 @@ mod tests {
             let i = 5usize;
             let leaf_hash = hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind);
             let path = merkle_proof_capped(&tree, n_leaves, i, c);
-            assert!(verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &path, kind));
+            assert!(verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &path, kind
+            ));
             // Wrong index (same cap node, sibling half).
-            assert!(!verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i ^ 1, &path, kind));
+            assert!(!verify_merkle_proof_capped(
+                cap,
+                n_leaves,
+                &leaf_hash,
+                i ^ 1,
+                &path,
+                kind
+            ));
             // Tampered sibling.
             let mut bad = path.clone();
             bad[0][0] ^= 1;
-            assert!(!verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &bad, kind));
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &bad, kind
+            ));
             // The other hash kind.
             let other = match kind {
                 HashKind::Sha256 => HashKind::Blake3,
@@ -1201,7 +1217,9 @@ mod tests {
                 #[allow(unreachable_patterns)]
                 _ => continue,
             };
-            assert!(!verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &path, other));
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &path, other
+            ));
         }
     }
 
@@ -1221,10 +1239,14 @@ mod tests {
             let path = merkle_proof_capped(&tree, n_leaves, i, c);
             let mut short = path.clone();
             short.pop();
-            assert!(!verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &short, kind));
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &short, kind
+            ));
             let mut long = path.clone();
             long.push([0u8; 32]);
-            assert!(!verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &long, kind));
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &long, kind
+            ));
         }
     }
 
@@ -1245,5 +1267,4 @@ mod tests {
         assert_eq!(cap_depth(218, 4), 4);
         assert_eq!(cap_depth(131, 8), 8);
     }
-
 }

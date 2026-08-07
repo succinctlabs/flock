@@ -8,6 +8,8 @@
 //!
 //! Run: `cargo bench --bench pcs_commit`
 
+use core::mem::size_of;
+use core::slice::from_raw_parts;
 use std::time::Instant;
 
 use flock_prover::field::F128;
@@ -313,9 +315,9 @@ fn bench_commit_packed_breakdown(m: usize) {
 
     // ---- 3. Cast codeword bytes (zero-copy — same as pcs::commit).
     let codeword_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
+        from_raw_parts(
             codeword.as_ptr() as *const u8,
-            codeword.len() * core::mem::size_of::<F128>(),
+            codeword.len() * size_of::<F128>(),
         )
     };
 

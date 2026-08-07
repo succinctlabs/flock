@@ -25,6 +25,7 @@ use flock_core::union::UnionInstance;
 use flock_core::zerocheck::multilinear::lagrange_weights_naive;
 use flock_core::zerocheck::univariate_skip::pack_bits;
 use flock_core::zerocheck::{self, K_SKIP};
+use std::collections::BTreeSet;
 
 const DOMAIN: &[u8] = b"flock-union-lincheck-test-v0";
 
@@ -75,7 +76,7 @@ fn random_useful_matrix(
 ) -> SparseBinaryMatrix {
     let mut rows: Vec<Vec<usize>> = vec![Vec::new(); k];
     for row in rows.iter_mut().take(useful) {
-        let mut cols = std::collections::BTreeSet::new();
+        let mut cols = BTreeSet::new();
         for _ in 0..per_row {
             cols.insert((rng.next_u64() as usize) % useful);
         }

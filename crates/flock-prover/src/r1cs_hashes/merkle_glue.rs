@@ -45,6 +45,8 @@
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 use flock_core::schedule::IoWord;
+use flock_core::zerocheck::K_SKIP;
+use std::sync::OnceLock;
 
 use super::common::identity;
 use super::merkle_r1cs::SLOT_WORDS;
@@ -84,6 +86,7 @@ fn scatter_zab(
     useful_bits: usize,
     nu: usize,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+    use rayon::prelude::*;
     let n_total = 1usize << nu;
     assert!(
         n_total.is_multiple_of(8),
@@ -104,7 +107,6 @@ fn scatter_zab(
         }
     }
 
-    use rayon::prelude::*;
     let mut stripe = vec![0u8; (n_total / 8) * k];
     stripe.par_chunks_mut(k).enumerate().for_each(|(g, chunk)| {
         for r in 0..8 {
@@ -237,15 +239,15 @@ impl SwapTable {
         BlockR1cs {
             m: n_log + Self::K_LOG,
             k_log: Self::K_LOG,
-            k_skip: flock_core::zerocheck::K_SKIP,
+            k_skip: K_SKIP,
             useful_bits: Self::USEFUL_BITS,
             a_0,
             b_0,
             c_0: identity(Self::k()),
             layout: WitnessLayout::BatchMajor,
             const_pin: Some(Self::CONST),
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
 
@@ -430,15 +432,15 @@ impl BitSpreadTable {
         BlockR1cs {
             m: n_log + self.k_log(),
             k_log: self.k_log(),
-            k_skip: flock_core::zerocheck::K_SKIP,
+            k_skip: K_SKIP,
             useful_bits: self.useful_bits(),
             a_0,
             b_0,
             c_0: identity(self.k()),
             layout: WitnessLayout::BatchMajor,
             const_pin: Some(self.const_pos()),
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
 

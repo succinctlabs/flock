@@ -39,13 +39,22 @@
 //!   with `state_r` implicit via the φ substitution.
 //! - Padding: empty A, B.
 
+use crate::prover::ProvePhaseTimings;
+use crate::prover::prove_fast_ligerito_from_witness;
+use crate::prover::prove_fast_ligerito_timed;
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
+use flock_core::pcs::ligerito::LigeritoProfile;
+use flock_core::pcs::prefault_codeword_during;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
+use flock_core::proof::R1csProofLigerito;
 use flock_core::r1cs::BlockR1cs;
 use flock_core::verifier;
+#[cfg(test)]
+use std::hint::black_box;
+use std::time::Instant;
 
 use super::keccak::{
     LANE_BITS, Lanes, N_LANES, N_ROUNDS, N_T, ROUND_CONSTANTS, STATE_BITS, STATE_SIZE_BITS, State,
@@ -297,6 +306,11 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
 /// shared const self-loop, which [`KeccakLincheckCircuit::fold_alpha_batched`]
 /// adds once).
 fn accumulate_subkeccak(i: usize, alpha: F128, eq_inner: &[F128], comb: &mut [F128]) {
+    // ---- t-AND rows: per-round χ marginals on state_r positions.
+    // Rounds are independent (each writes only chi_*[r]); F128 addition is
+    // XOR (exactly associative/commutative), so the parallel reduction is
+    // bit-identical to the serial loop.
+    use rayon::prelude::*;
     // ---- state_0 input self-loops: A = [row], B = [Z_CONST].
     for j in 0..STATE_BITS {
         let row = z_pos_state(i, 0, j);
@@ -316,11 +330,6 @@ fn accumulate_subkeccak(i: usize, alpha: F128, eq_inner: &[F128], comb: &mut [F1
     }
     comb[Z_CONST] += sum_eq_pin; // B-side from pin's B = [Z_CONST]
 
-    // ---- t-AND rows: per-round χ marginals on state_r positions.
-    // Rounds are independent (each writes only chi_*[r]); F128 addition is
-    // XOR (exactly associative/commutative), so the parallel reduction is
-    // bit-identical to the serial loop.
-    use rayon::prelude::*;
     let chi: Vec<(Vec<F128>, Vec<F128>, F128)> = (0..N_T)
         .into_par_iter()
         .map(|r| {
@@ -502,25 +511,22 @@ impl KeccakSetup {
     pub fn with_log_inv_rate(n_keccaks: usize, log_inv_rate: usize) -> Self {
         // Rate keys the legacy profiles: 1 -> Fast, 2 -> Slim.
         let profile = match log_inv_rate {
-            1 => flock_core::pcs::ligerito::LigeritoProfile::Fast,
-            2 => flock_core::pcs::ligerito::LigeritoProfile::Slim,
-            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // other rates default to Fast
+            1 => LigeritoProfile::Fast,
+            2 => LigeritoProfile::Slim,
+            _ => LigeritoProfile::Fast, // other rates default to Fast
         };
         Self::with_profile_and_rate(n_keccaks, profile, log_inv_rate)
     }
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
-    pub fn with_profile(
-        n_keccaks: usize,
-        profile: flock_core::pcs::ligerito::LigeritoProfile,
-    ) -> Self {
+    pub fn with_profile(n_keccaks: usize, profile: LigeritoProfile) -> Self {
         Self::with_profile_and_rate(n_keccaks, profile, profile.log_inv_rate())
     }
 
     fn with_profile_and_rate(
         n_keccaks: usize,
-        profile: flock_core::pcs::ligerito::LigeritoProfile,
+        profile: LigeritoProfile,
         log_inv_rate: usize,
     ) -> Self {
         assert!(n_keccaks >= 1);
@@ -557,13 +563,13 @@ impl KeccakSetup {
         &self,
         initial_states: &[State],
         challenger: &mut Ch,
-    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+    ) -> (R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(initial_states.len(), self.n_keccaks);
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+            prefault_codeword_during(&self.pcs_params, || {
                 generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_blocks_log())
             });
-        crate::prover::prove_fast_ligerito_from_witness(
+        prove_fast_ligerito_from_witness(
             &self.r1cs,
             &self.pcs_params,
             z_packed,
@@ -579,7 +585,7 @@ impl KeccakSetup {
     pub fn verify<Ch: Challenger>(
         &self,
         commitment: &Commitment,
-        proof: &flock_core::proof::R1csProofLigerito,
+        proof: &R1csProofLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, verifier::VerifyError> {
         verifier::verify_ligerito(
@@ -599,18 +605,13 @@ impl KeccakSetup {
         &self,
         initial_states: &[State],
         challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProofLigerito,
-        Commitment,
-        R1csClaim,
-        crate::prover::ProvePhaseTimings,
-    ) {
+    ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
         assert_eq!(initial_states.len(), self.n_keccaks);
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
             generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_blocks_log());
         let witness_s = t0.elapsed().as_secs_f64();
-        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
+        let (proof, commitment, claim, mut timings) = prove_fast_ligerito_timed(
             &self.r1cs,
             &self.pcs_params,
             z_packed,
@@ -822,13 +823,13 @@ mod tests {
         let mut ch = FsChallenger::new(b"pack-bench");
         let (p1, _, _) = s1.prove_fast(&inputs, &mut ch);
         let single = t.elapsed().as_secs_f64();
-        std::hint::black_box(&p1);
+        black_box(&p1);
 
         t = Instant::now();
         let mut ch = FsChallenger::new(b"pack-bench");
         let (p3, _, _) = s3.prove_fast(&inputs, &mut ch);
         let wide = t.elapsed().as_secs_f64();
-        std::hint::black_box(&p3);
+        black_box(&p3);
 
         println!(
             "prove_fast: single={:.1} ms  3-wide={:.1} ms  ({:.2}x)",
@@ -930,7 +931,7 @@ mod tests {
         zlc.iter_mut().for_each(|v| *v = 0);
 
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commitment, _claim) = crate::prover::prove_fast_ligerito_from_witness(
+        let (proof, commitment, _claim) = prove_fast_ligerito_from_witness(
             &setup.r1cs,
             &setup.pcs_params,
             z,

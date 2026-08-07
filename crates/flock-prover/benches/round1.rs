@@ -7,6 +7,7 @@
 //! and in any real prover). The naive variant only runs at m ≤ 20 — beyond
 //! that it's many seconds and uninformative.
 
+use flock_prover::zerocheck::PaddingSpec;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -219,7 +220,7 @@ fn main() {
             K_SKIP,
             &r,
             &table,
-            &flock_prover::zerocheck::PaddingSpec::dense(m),
+            &PaddingSpec::dense(m),
         );
         let mut best_fusion_ms = f64::INFINITY;
         for run in 0..n_runs {
@@ -237,7 +238,7 @@ fn main() {
                 K_SKIP,
                 &r,
                 &table,
-                &flock_prover::zerocheck::PaddingSpec::dense(m),
+                &PaddingSpec::dense(m),
             );
             let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
             println!("  {:<40} {:>10.2} ms", label, elapsed);

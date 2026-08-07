@@ -187,11 +187,6 @@ mod tests {
 
     #[test]
     fn transpose_bit_semantics() {
-        // bit_j(elems[i]) on input becomes bit_i(elems[j]) on output.
-        let mut rng = Rng::new(42);
-        let original = rng.ta();
-        let transposed = original.clone().transpose();
-
         fn bit(x: F128, b: usize) -> u64 {
             if b < 64 {
                 (x.lo >> b) & 1
@@ -199,6 +194,10 @@ mod tests {
                 (x.hi >> (b - 64)) & 1
             }
         }
+        // bit_j(elems[i]) on input becomes bit_i(elems[j]) on output.
+        let mut rng = Rng::new(42);
+        let original = rng.ta();
+        let transposed = original.clone().transpose();
 
         for i in 0..DEGREE {
             for j in 0..DEGREE {

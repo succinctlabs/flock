@@ -13,6 +13,9 @@
 //! keep their behaviour.
 
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
 
 /// Which hash function backs a component.
 ///
@@ -51,8 +54,8 @@ impl HashKind {
     }
 }
 
-impl std::fmt::Display for HashKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for HashKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str(self.as_str())
     }
 }

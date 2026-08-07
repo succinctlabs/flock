@@ -106,7 +106,17 @@
 //! §8, §11).
 
 use flock_core::field::F128;
+use flock_core::lincheck::LincheckCircuit;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
+use flock_core::schedule::IoWord;
+use flock_core::union::SlotWitnessDest;
+use flock_core::zerocheck::K_SKIP;
+use std::array::from_fn;
+use std::env::var;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Result;
+use std::sync::OnceLock;
 
 use super::blake3;
 use super::common::{empty_matrix, identity};
@@ -324,7 +334,7 @@ fn blake3_node_group_ab(
     ra: &mut [[u64; 8]],
     rb: &mut [[u64; 8]],
 ) {
-    let blocks: [blake3::Compression; 8] = std::array::from_fn(|j| {
+    let blocks: [blake3::Compression; 8] = from_fn(|j| {
         (
             blake3::BLAKE3_IV,
             node_msg(&pairs[j].0, &pairs[j].1),
@@ -333,7 +343,7 @@ fn blake3_node_group_ab(
             BLAKE3_FLAG_PARENT,
         )
     });
-    let refs: [&blake3::Compression; 8] = std::array::from_fn(|j| &blocks[j]);
+    let refs: [&blake3::Compression; 8] = from_fn(|j| &blocks[j]);
     blake3::build_group_batch_major(refs, rz, ra, rb);
 }
 
@@ -345,7 +355,7 @@ fn blake3_raw_group_ab(
     ra: &mut [[u64; 8]],
     rb: &mut [[u64; 8]],
 ) {
-    let refs: [&blake3::Compression; 8] = std::array::from_fn(|j| &blocks[j]);
+    let refs: [&blake3::Compression; 8] = from_fn(|j| &blocks[j]);
     blake3::build_group_batch_major(refs, rz, ra, rb);
 }
 
@@ -639,7 +649,7 @@ impl MerkleTreeLayout {
     /// Everything that IS here has an outside claimant: the leaf data is read
     /// by whatever proves the opened values, the index binds to the
     /// Fiat–Shamir query, and the root binds to the committed root.
-    pub fn io_schema(&self) -> Vec<flock_core::schedule::IoWord> {
+    pub fn io_schema(&self) -> Vec<IoWord> {
         use flock_core::schedule::IoWord;
         assert!(
             self.leaf_blocks > 0,
@@ -961,15 +971,15 @@ impl MerkleTreeLayout {
         BlockR1cs {
             m: n_paths_log + self.k_log,
             k_log: self.k_log,
-            k_skip: flock_core::zerocheck::K_SKIP,
+            k_skip: K_SKIP,
             useful_bits: self.useful_bits,
             a_0,
             b_0,
             c_0: identity(self.k()),
             layout: WitnessLayout::BatchMajor,
             const_pin: Some(self.const_pos()),
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
 
@@ -1223,7 +1233,7 @@ impl MerkleTreeLayout {
         &self,
         paths: &[PathInput],
         nu: usize,
-        dst: flock_core::union::SlotWitnessDest<'_>,
+        dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
         use super::common::{BM_V, BmRow, or_bit_row, or_u32_row};
 
@@ -1279,7 +1289,7 @@ impl MerkleTreeLayout {
             dst,
             move |group, rz, ra, rb| {
                 // Per-lane running digest: the leaf, then each level's output.
-                let mut prev: [[u32; SLOT_WORDS]; BM_V] = std::array::from_fn(|j| group[j].leaf);
+                let mut prev: [[u32; SLOT_WORDS]; BM_V] = from_fn(|j| group[j].leaf);
 
                 for l in 0..depth {
                     let w0 = l * words_per_level;
@@ -1305,14 +1315,14 @@ impl MerkleTreeLayout {
 
                     for w in 0..SLOT_WORDS {
                         // Sibling: a free column (z = a = S, b = 1).
-                        let sib: [u32; BM_V] = std::array::from_fn(|j| group[j].siblings[l][w]);
+                        let sib: [u32; BM_V] = from_fn(|j| group[j].siblings[l][w]);
                         or_u32_row(wz, sib_off + 32 * w, &sib);
                         or_u32_row(wa, sib_off + 32 * w, &sib);
                         or_u32_row(wb, sib_off + 32 * w, &[!0u32; BM_V]);
 
                         // t = b_l · (prev ⊕ S): A = [b_l], B = [prev, S].
-                        let xor: [u32; BM_V] = std::array::from_fn(|j| prev[j][w] ^ sib[j]);
-                        let t: [u32; BM_V] = std::array::from_fn(|j| mask[j] & xor[j]);
+                        let xor: [u32; BM_V] = from_fn(|j| prev[j][w] ^ sib[j]);
+                        let t: [u32; BM_V] = from_fn(|j| mask[j] & xor[j]);
                         or_u32_row(wz, t_off + 32 * w, &t);
                         or_u32_row(wa, t_off + 32 * w, &mask);
                         or_u32_row(wb, t_off + 32 * w, &xor);
@@ -1324,7 +1334,7 @@ impl MerkleTreeLayout {
                         or_bit_row(wa, const_off);
                         or_bit_row(wb, const_off);
                         for w in 0..SLOT_WORDS {
-                            let leaf: [u32; BM_V] = std::array::from_fn(|j| group[j].leaf[w]);
+                            let leaf: [u32; BM_V] = from_fn(|j| group[j].leaf[w]);
                             or_u32_row(wz, leaf_off + 32 * w, &leaf);
                             or_u32_row(wa, leaf_off + 32 * w, &leaf);
                             or_u32_row(wb, leaf_off + 32 * w, &[!0u32; BM_V]);
@@ -1334,8 +1344,7 @@ impl MerkleTreeLayout {
                         // are interior padding that empty rows force to zero,
                         // so a wider store would break the R1CS.
                         for i in 0..depth {
-                            let v: [u32; BM_V] =
-                                std::array::from_fn(|j| ((group[j].index >> i) & 1) as u32);
+                            let v: [u32; BM_V] = from_fn(|j| ((group[j].index >> i) & 1) as u32);
                             or_u32_row(wz, index_off + i, &v);
                             or_u32_row(wa, index_off + i, &v);
                             or_bit_row(wb, index_off + i);
@@ -1656,7 +1665,7 @@ impl MerkleTreeLayout {
         &self,
         paths: &[ChunkPathInput],
         nu: usize,
-        dst: flock_core::union::SlotWitnessDest<'_>,
+        dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
         use super::common::{BM_V, BmRow, or_bit_row, or_u32_row};
 
@@ -1720,7 +1729,7 @@ impl MerkleTreeLayout {
                         f
                     };
                     let blocks: [([u32; SLOT_WORDS], [u32; 16], u64, u32, u32); BM_V] =
-                        std::array::from_fn(|j| {
+                        from_fn(|j| {
                             (
                                 prev[j],
                                 leaf_msg_words(&group[j].leaf_data, i),
@@ -1741,8 +1750,7 @@ impl MerkleTreeLayout {
                         // `depth` are read by no row; they carry whatever the
                         // wired Fiat-Shamir challenge put there.
                         for l in 0..128 {
-                            let v: [u32; BM_V] =
-                                std::array::from_fn(|j| ((group[j].index >> l) & 1) as u32);
+                            let v: [u32; BM_V] = from_fn(|j| ((group[j].index >> l) & 1) as u32);
                             or_u32_row(wz, index_off + l, &v);
                             or_u32_row(wa, index_off + l, &v);
                             or_bit_row(wb, index_off + l);
@@ -1777,13 +1785,13 @@ impl MerkleTreeLayout {
                     (spec.node_group_ab)(&pairs, wz, wa, wb);
 
                     for w in 0..SLOT_WORDS {
-                        let sib: [u32; BM_V] = std::array::from_fn(|j| group[j].siblings[l][w]);
+                        let sib: [u32; BM_V] = from_fn(|j| group[j].siblings[l][w]);
                         or_u32_row(wz, sib_off + 32 * w, &sib);
                         or_u32_row(wa, sib_off + 32 * w, &sib);
                         or_u32_row(wb, sib_off + 32 * w, &[!0u32; BM_V]);
 
-                        let xor: [u32; BM_V] = std::array::from_fn(|j| prev[j][w] ^ sib[j]);
-                        let t: [u32; BM_V] = std::array::from_fn(|j| mask[j] & xor[j]);
+                        let xor: [u32; BM_V] = from_fn(|j| prev[j][w] ^ sib[j]);
+                        let t: [u32; BM_V] = from_fn(|j| mask[j] & xor[j]);
                         or_u32_row(wz, t_off + 32 * w, &t);
                         or_u32_row(wa, t_off + 32 * w, &mask);
                         or_u32_row(wb, t_off + 32 * w, &xor);
@@ -1908,7 +1916,7 @@ pub struct ChunkPathInput {
 /// Chunk block `i`'s 16-word message: bytes `[64i, 64(i+1))` of the leaf
 /// data as little-endian words, per the BLAKE3 spec.
 fn leaf_msg_words(data: &[u8], block: usize) -> [u32; 16] {
-    std::array::from_fn(|w| {
+    from_fn(|w| {
         let o = block * 64 + 4 * w;
         u32::from_le_bytes(data[o..o + 4].try_into().unwrap())
     })
@@ -2060,8 +2068,8 @@ pub struct MerkleWalkerCircuit {
     const_pin: Option<usize>,
 }
 
-impl std::fmt::Debug for MerkleWalkerCircuit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for MerkleWalkerCircuit {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         let (ba, bb) = self.base.nnz();
         let (xa, xb) = self.extras.nnz();
         f.debug_struct("MerkleWalkerCircuit")
@@ -2246,7 +2254,7 @@ impl MerkleWalkerCircuit {
     }
 }
 
-impl flock_core::lincheck::LincheckCircuit for MerkleWalkerCircuit {
+impl LincheckCircuit for MerkleWalkerCircuit {
     fn n_cols(&self) -> usize {
         self.n_cols
     }
@@ -2272,9 +2280,9 @@ impl flock_core::lincheck::LincheckCircuit for MerkleWalkerCircuit {
 /// factorization is verified before use — so one process can time both and
 /// cancel thermal drift. Same role as `lincheck::FOLD_IBLOCK`.
 fn force_per_level() -> bool {
-    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static FORCE: OnceLock<bool> = OnceLock::new();
     *FORCE.get_or_init(|| {
-        std::env::var("FLOCK_MERKLE_FOLD_PER_LEVEL")
+        var("FLOCK_MERKLE_FOLD_PER_LEVEL")
             .ok()
             .is_some_and(|v| v != "0" && !v.is_empty())
     })

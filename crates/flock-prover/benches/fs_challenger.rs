@@ -55,11 +55,15 @@ fn report(label: &str, secs: f64, ops: u64) {
 }
 
 fn main() {
+    const N_OBSERVE: usize = 1 << 16;
+    const N_SAMPLE: usize = 1 << 14;
+    const N_POW: usize = 1 << 20;
+    const N_MIXED: usize = 1 << 14;
     println!("Fiat-Shamir transcript cost by hash (best of {REPS}).");
 
     // ---- 1. Absorption.
     println!("\n===== observe_f128 (transcript absorption) =====");
-    const N_OBSERVE: usize = 1 << 16;
+
     for kind in KINDS {
         let secs = best(|| {
             let mut ch = FsChallenger::with_hash(b"fs-bench", kind);
@@ -80,7 +84,7 @@ fn main() {
 
     // ---- 2. Squeezing, scalar.
     println!("\n===== sample_f128 (16-byte squeeze each) =====");
-    const N_SAMPLE: usize = 1 << 14;
+
     for kind in KINDS {
         let secs = best(|| {
             let mut ch = FsChallenger::with_hash(b"fs-bench", kind);
@@ -127,7 +131,7 @@ fn main() {
     // per-hash: SHA-256 uses 40 bytes (one compression), BLAKE3 uses a padded
     // 64-byte whole block so the search can be SIMD-batched.
     println!("\n===== PoW inner loop, scalar (one nonce at a time) =====");
-    const N_POW: usize = 1 << 20;
+
     let state = [0xA5u8; 32];
     for kind in KINDS {
         let secs = best(|| {
@@ -180,7 +184,7 @@ fn main() {
     // ---- 4. A transcript shaped like a real proof: interleaved observes and
     // samples, which is what the sumcheck rounds actually do.
     println!("\n===== mixed script (2 observes + 1 sample, ×N) =====");
-    const N_MIXED: usize = 1 << 14;
+
     for kind in KINDS {
         let secs = best(|| {
             let mut ch = FsChallenger::with_hash(b"fs-bench", kind);

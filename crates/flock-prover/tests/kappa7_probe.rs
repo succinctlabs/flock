@@ -11,6 +11,9 @@
 //! schema words at columns >= 64, the wired circuit path, and the
 //! cross-class crossing. All small shapes — they run un-ignored.
 
+use flock_core::element_r1cs::ElementTableType;
+use flock_core::pcs::ligerito::LigeritoProfile;
+use std::array::from_fn;
 use std::sync::Arc;
 
 use flock_core::circuit::{Cell, Circuit};
@@ -59,7 +62,7 @@ fn mult_ty(kappa: usize) -> TableType {
 
 /// A WIDE kappa=7 gate — `used` live columns (the residual gates' shape:
 /// c approaches the column budget), a running product down the row.
-fn wide_ty(kappa: usize, used: usize) -> Arc<flock_core::element_r1cs::ElementTableType> {
+fn wide_ty(kappa: usize, used: usize) -> Arc<ElementTableType> {
     assert!(used >= 3 && used <= 1 << kappa);
     let mut b = ElementTableBuilder::new(kappa);
     b.free_wire(0).free_wire(1);
@@ -90,14 +93,17 @@ fn kappa7_wide_gate_union() {
                 z[at(c, j)] = prev;
             }
         }
-        assert!(ty.satisfies(&z, nu, n), "wide witness must satisfy (used={used})");
+        assert!(
+            ty.satisfies(&z, nu, n),
+            "wide witness must satisfy (used={used})"
+        );
 
         let union = UnionInstance::new(&registry, vec![n]);
         let pcs_params = PcsParams {
             m: union.dense_m(),
             log_inv_rate: 1,
             log_batch_size: 6,
-            profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+            profile: LigeritoProfile::Fast,
             num_lanes: union.commit_lanes(6),
             merkle_hash: Default::default(),
         };
@@ -129,6 +135,7 @@ fn kappa7_wide_gate_union() {
 /// in-slot word coordinate set), wired through the circuit path.
 #[test]
 fn kappa7_high_column_schema_circuit() {
+    const PUB: usize = 3;
     let (nu, n) = (8usize, 20usize);
     let (ca, cb, cc) = (80usize, 81, 100);
     let mut b = ElementTableBuilder::new(7);
@@ -160,7 +167,6 @@ fn kappa7_high_column_schema_circuit() {
     let mut public = vec![seed];
     public.extend_from_slice(&a);
     public.push(result);
-    const PUB: usize = 3;
 
     let mut wires = vec![vec![Cell::new(PUB, 0), Cell::new(EL_B, 0)]];
     for i in 0..n {
@@ -176,7 +182,7 @@ fn kappa7_high_column_schema_circuit() {
         m: union.dense_m(),
         log_inv_rate: 1,
         log_batch_size: 6,
-        profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+        profile: LigeritoProfile::Fast,
         num_lanes: union.commit_lanes(6),
         merkle_hash: Default::default(),
     };
@@ -213,6 +219,8 @@ fn kappa7_high_column_schema_circuit() {
 /// gate, mirroring `cross_class_hash_into_mult` at the packed-word width.
 #[test]
 fn kappa7_cross_class_circuit() {
+    const EL: usize = 8;
+    const PUB: usize = 11;
     use flock_prover::prover::UnionSlotProverInput;
     use flock_prover::r1cs_hashes::sha2;
 
@@ -257,7 +265,7 @@ fn kappa7_cross_class_circuit() {
     assert!(registry.types()[1].is_element());
 
     let mut rng = Rng::new(0xC205_0007);
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
+    let m: [u32; 16] = from_fn(|_| rng.next_u64() as u32);
     let h_out = sha2::sha256_compress(&sha2::SHA256_IV, &m);
     let out_words = pack_u32_words(&h_out);
     let (o0, o1) = (out_words[0], out_words[1]);
@@ -266,8 +274,6 @@ fn kappa7_cross_class_circuit() {
     public.extend(pack_u32_words(&m));
     public.push(o0 * o1);
 
-    const EL: usize = 8;
-    const PUB: usize = 11;
     let wires = vec![
         vec![Cell::new(PUB, 0), Cell::new(SHA_H0, 0)],
         vec![Cell::new(PUB, 1), Cell::new(SHA_H1, 0)],
@@ -286,7 +292,7 @@ fn kappa7_cross_class_circuit() {
         m: union.dense_m(),
         log_inv_rate: 1,
         log_batch_size: 6,
-        profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+        profile: LigeritoProfile::Fast,
         num_lanes: union.commit_lanes(6),
         merkle_hash: Default::default(),
     };
@@ -331,6 +337,7 @@ fn kappa7_cross_class_circuit() {
 
 #[test]
 fn kappa7_element_chain_circuit() {
+    const PUB: usize = 3;
     let (nu, kappa, n) = (8usize, 7usize, 20usize);
     let registry = Registry::new(vec![mult_ty(kappa)], nu);
     assert_eq!(registry.m_total(), 22);
@@ -354,7 +361,6 @@ fn kappa7_element_chain_circuit() {
     let mut public = vec![seed];
     public.extend_from_slice(&a);
     public.push(result);
-    const PUB: usize = 3;
 
     let mut wires = vec![vec![Cell::new(PUB, 0), Cell::new(EL_B, 0)]];
     for i in 0..n {
@@ -370,7 +376,7 @@ fn kappa7_element_chain_circuit() {
         m: union.dense_m(),
         log_inv_rate: 1,
         log_batch_size: 6,
-        profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+        profile: LigeritoProfile::Fast,
         num_lanes: union.commit_lanes(6),
         merkle_hash: Default::default(),
     };

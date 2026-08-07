@@ -55,6 +55,11 @@
 //! Rounds bind the **top** remaining variable, so the challenge list reversed is
 //! the column point LSB-first — matching the rows-low witness layout.
 
+#[cfg(test)]
+use crate::element_r1cs::ElementTableBuilder;
+use crate::pcs::ring_switch::build_eq_parallel;
+#[cfg(test)]
+use crate::zerocheck::multilinear::fold_in_place_single;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -342,7 +347,7 @@ fn comb_vector(ty: &ElementTableType, alpha: F128, eq_con: &[F128]) -> Vec<F128>
 /// reducing per-column accumulators is the thing to try. Left simple: the
 /// milestone is 3× inside its target.
 fn partial_fold_rows(z: &[F128], r_row: &[F128]) -> Vec<F128> {
-    let eq_row = crate::pcs::ring_switch::build_eq_parallel(r_row);
+    let eq_row = build_eq_parallel(r_row);
     let rows = eq_row.len();
     debug_assert_eq!(z.len() % rows, 0);
     z.par_chunks(rows)
@@ -366,7 +371,7 @@ mod tests {
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
         let mut t = table.to_vec();
         for &p in point {
-            crate::zerocheck::multilinear::fold_in_place_single(&mut t, p);
+            fold_in_place_single(&mut t, p);
         }
         t[0]
     }
@@ -597,7 +602,7 @@ mod tests {
     fn kappa_one_roundtrips() {
         let mut rng = Rng::new(31337);
         // kappa = 1: one column, a free wire (tautology row).
-        let mut b = crate::element_r1cs::ElementTableBuilder::new(1);
+        let mut b = ElementTableBuilder::new(1);
         b.free_wire(0);
         let ty = b.build().expect("free wire is valid");
         let n_log = 4usize;

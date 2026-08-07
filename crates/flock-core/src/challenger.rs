@@ -33,6 +33,9 @@
 use crate::field::F128;
 use crate::hash::HashKind;
 use sha2::{Digest, Sha256};
+use std::array::from_fn;
+#[cfg(test)]
+use std::collections::HashSet;
 
 // `Send` supertrait: the verifier runs its PIOP/PCS replay inside a dedicated
 // single-thread rayon pool (see `verifier::verifier_pool`), so the challenger
@@ -446,8 +449,6 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
-        let kind = self.hash_kind();
-        let state_digest = self.state_digest();
         // Aggregate-aware parallelism: decide on the grind's *expected hash
         // work* (`2^bits`), not a raw bit threshold. Fold-challenge grinds are
         // individually modest — e.g. 2^15 at L0 under the per-round profiles —
@@ -465,6 +466,9 @@ impl Challenger for FsChallenger {
         // per task, small enough to keep cancellation granular once an earlier
         // task has found a match.
         const GRIND_CHUNK: u64 = 1 << 10;
+        let kind = self.hash_kind();
+        let state_digest = self.state_digest();
+
         let nonce = if bits == 0 {
             0
         } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
@@ -671,7 +675,7 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
         }
         #[cfg(feature = "hash-count")]
         fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        let inputs: [&[u8; 64]; BLAKE3_POW_BATCH] = std::array::from_fn(|i| &pre[i]);
+        let inputs: [&[u8; 64]; BLAKE3_POW_BATCH] = from_fn(|i| &pre[i]);
         plat.hash_many(
             &inputs[..n],
             &IV,
@@ -859,7 +863,7 @@ mod tests {
             // catches a counter that fails to advance, or an XOF read that
             // restarts per block.
             let vals = FsChallenger::with_hash(b"d", kind).sample_f128_vec(16);
-            let unique: std::collections::HashSet<_> = vals.iter().collect();
+            let unique: HashSet<_> = vals.iter().collect();
             assert_eq!(unique.len(), vals.len(), "{kind}: squeeze stream repeats");
         }
     }

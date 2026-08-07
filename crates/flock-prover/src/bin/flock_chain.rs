@@ -17,6 +17,10 @@
 //! Build the prover: `cargo build --release --bin flock_chain`.
 //! Run via `cargo run --release --bin flock_chain -- <subcommand> [args]`.
 
+use flock_prover::pcs::PcsParams;
+use flock_prover::pcs::ligerito::LigeritoProfile;
+use flock_prover::r1cs::BlockR1cs;
+use std::array::from_fn;
 use std::env;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -49,7 +53,7 @@ use flock_prover::r1cs_hashes::sha2::{
 /// Johnson+OOD, 100-bit (default). `Slim` = rate 1/4, Johnson+OOD + query
 /// grinding, 100-bit (smaller proof, slower prover). `Secure` = rate 1/2,
 /// unique-decoding regime, 120-bit (largest proof, most conservative).
-type Mode = flock_prover::pcs::ligerito::LigeritoProfile;
+type Mode = LigeritoProfile;
 
 #[derive(Default)]
 struct Args {
@@ -239,7 +243,7 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn next_block(&mut self) -> [u32; 16] {
-        std::array::from_fn(|_| self.nx() as u32)
+        from_fn(|_| self.nx() as u32)
     }
 }
 
@@ -328,13 +332,13 @@ fn cmd_prove_mix(mix: MixSpec, args: Args) -> Result<(), String> {
     let mut rng = Rng::new(seed);
     let blake3_inputs: Vec<blake3_chain::Compression> = (0..mix.blake3)
         .map(|_| {
-            let cv: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
+            let cv: [u32; 8] = from_fn(|_| rng.nx() as u32);
             let m = rng.next_block();
             (cv, m, 0u64, 64u32, 0u32)
         })
         .collect();
     let sha2_inputs: Vec<sha2_chain::Compression> = (0..mix.sha2)
-        .map(|_| (std::array::from_fn(|_| rng.nx() as u32), rng.next_block()))
+        .map(|_| (from_fn(|_| rng.nx() as u32), rng.next_block()))
         .collect();
 
     let t = Instant::now();
@@ -382,7 +386,7 @@ fn prove_blake3(
 ) -> Result<ChainProofBundleLigerito, String> {
     let initial_cv: [u32; 8] = if let Some(h) = initial_hex {
         let v = parse_u32_be_words(h, 8)?;
-        std::array::from_fn(|i| v[i])
+        from_fn(|i| v[i])
     } else {
         BLAKE3_IV
     };
@@ -423,7 +427,7 @@ fn prove_sha2(
 ) -> Result<ChainProofBundleLigerito, String> {
     let initial_cv: [u32; 8] = if let Some(h) = initial_hex {
         let v = parse_u32_be_words(h, 8)?;
-        std::array::from_fn(|i| v[i])
+        from_fn(|i| v[i])
     } else {
         SHA256_IV
     };
@@ -660,12 +664,12 @@ fn cmd_verify_mix(input: &str, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn verify_ligerito_with_layout(
-    r1cs: &flock_prover::r1cs::BlockR1cs,
+    r1cs: &BlockR1cs,
     layout: &chain_common::ChainLayout,
     commitment: &Commitment,
     bundle: &ChainProofBundleLigerito,
     n_log: usize,
-    pcs_params: &flock_prover::pcs::PcsParams,
+    pcs_params: &PcsParams,
     challenger: &mut FsChallenger,
 ) -> Result<(), chain_common::ChainVerifyError> {
     let lc_circuit = r1cs.csc_lincheck_circuit();
