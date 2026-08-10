@@ -23,4 +23,10 @@ pub mod keccak3;
 ///
 /// [`MerkleLayout`]: merkle_path_common::MerkleLayout
 pub mod merkle_path_common;
+/// u64 × u64 → u128 batch multiplication R1CS (one product per K_LOG=13
+/// block, ~100% fill) — the bit-level integer-multiplication statement.
+pub mod mul64;
+/// Two-level Karatsuba variant of [`mul64`] (~30% fewer committed bits via
+/// the complement trick + const-1 wire).
+pub mod mul64_karatsuba;
 pub mod sha2;

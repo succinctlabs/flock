@@ -216,3 +216,11 @@ harness = false
 [[bench]]
 name = "fs_challenger"
 harness = false
+
+[[bench]]
+name = "mul64_proof"
+harness = false
+
+[[bench]]
+name = "mul64k_proof"
+harness = false
