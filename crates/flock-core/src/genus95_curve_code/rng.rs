@@ -73,3 +73,82 @@ impl RngCore for Sha256Rng {
         }
     }
 }
+
+/// BLAKE3-XOF sibling of [`Sha256Rng`]: the stream is the XOF of
+/// `blake3(seed)`. Used when the Fiat-Shamir transcript runs BLAKE3
+/// ([`crate::hash::HashKind::Blake3`]) so the sampler's expander follows the
+/// transcript's hash and no second primitive enters the soundness argument.
+pub struct Blake3Rng {
+    reader: blake3::OutputReader,
+}
+
+impl Blake3Rng {
+    pub fn new(seed: [u8; 32]) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(&seed);
+        Self {
+            reader: h.finalize_xof(),
+        }
+    }
+}
+
+impl RngCore for Blake3Rng {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        self.fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0u8; 8];
+        self.fill_bytes(&mut b);
+        u64::from_le_bytes(b)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.reader.fill(dest);
+    }
+}
+
+/// Hash-dispatched DRBG over the two transcript hashes: SHA-256 counter mode
+/// or BLAKE3 XOF, seeded from 32 bytes. Protocol components that expand
+/// transcript squeezes (the AG-skip `r₁` derivation, the lincheck AG
+/// skip-point sampler) pick the arm from the challenger's
+/// [`hash_kind`](crate::challenger::Challenger::hash_kind), so the expander
+/// always matches the Fiat-Shamir hash.
+pub enum FsRng {
+    Sha256(Sha256Rng),
+    Blake3(Blake3Rng),
+}
+
+impl FsRng {
+    pub fn new(kind: crate::hash::HashKind, seed: [u8; 32]) -> Self {
+        match kind {
+            crate::hash::HashKind::Sha256 => FsRng::Sha256(Sha256Rng::new(seed)),
+            crate::hash::HashKind::Blake3 => FsRng::Blake3(Blake3Rng::new(seed)),
+        }
+    }
+}
+
+impl RngCore for FsRng {
+    fn next_u32(&mut self) -> u32 {
+        match self {
+            FsRng::Sha256(r) => r.next_u32(),
+            FsRng::Blake3(r) => r.next_u32(),
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        match self {
+            FsRng::Sha256(r) => r.next_u64(),
+            FsRng::Blake3(r) => r.next_u64(),
+        }
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        match self {
+            FsRng::Sha256(r) => r.fill_bytes(dest),
+            FsRng::Blake3(r) => r.fill_bytes(dest),
+        }
+    }
+}

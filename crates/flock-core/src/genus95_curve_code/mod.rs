@@ -45,7 +45,7 @@ pub use field::F128;
 pub use messages::{BaseMessage, ProductMessage};
 pub use product::product_code_message;
 pub use rand_core::RngCore;
-pub use rng::Sha256Rng;
+pub use rng::{Blake3Rng, FsRng, Sha256Rng};
 pub use sampling::{
     SAMPLE_ATTEMPT_BUDGET, SampleError, evaluation_point_from_nonce,
     sample_random_evaluation_point, try_evaluation_point,

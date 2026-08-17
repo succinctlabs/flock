@@ -21,6 +21,20 @@ pub struct R1csProofLigerito {
     pub pcs_open: pcs::BatchOpeningProofLigerito,
 }
 
+/// Top-level R1CS proof with the **AG-skip** zerocheck + Ligerito PCS backend.
+/// Identical downstream of the zerocheck (lincheck + the same standard
+/// ring-switch open on the std pack); only round 1 of the zerocheck differs
+/// (the genus-95 AG multiplication code replaces the RS additive-NTT skip), so
+/// `ag` carries the AG round messages instead of a `ZerocheckProof`. The skip
+/// stays in the packing prefix `[skip 6 | bit6]`, so both `(ab, c)` claims open
+/// via the unchanged RS path with AG base-code skip weights.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct R1csProofLigeritoAg {
+    pub ag: zerocheck::ag_skip::AgProof,
+    pub lincheck: lincheck::LincheckProof,
+    pub pcs_open: pcs::BatchOpeningProofLigerito,
+}
+
 /// A claim of the form `ẑ(point) = value` for the witness `z`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZClaim {

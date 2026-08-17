@@ -2,7 +2,6 @@ use super::artin_schreier::ArtinSchreierSolver;
 use super::constants::{BASE_Y_DEGREE, SAMPLE_X_POWER_COUNT};
 use super::evaluator::{EvaluationPoint, eval_poly_mask, x_powers, y_powers};
 use super::field::{F128, F128Ext};
-use super::rng::Sha256Rng;
 #[cfg(test)]
 use super::tables::RationalMask;
 use super::tables::TABLES;
@@ -32,15 +31,32 @@ pub fn sample_random_evaluation_point(
 }
 
 /// One attempt from a 32-byte transcript seed and a grinding nonce: the
-/// attempt's DRBG is `Sha256Rng::new(SHA-256(seed ‖ LE32(nonce)))`, so each
-/// nonce yields an independent uniform draw. `None` = this nonce is rejected.
-pub fn evaluation_point_from_nonce(seed: &[u8; 32], nonce: u32) -> Option<EvaluationPoint> {
-    let mut h = Sha256::new();
-    h.update(seed);
-    h.update(nonce.to_le_bytes());
+/// attempt's DRBG is `FsRng::new(kind, H(seed ‖ LE32(nonce)))` where `H` and
+/// the DRBG follow the transcript hash `kind` (SHA-256 counter mode or BLAKE3
+/// XOF — see [`super::rng::FsRng`]), so each nonce yields an independent
+/// uniform draw and no second primitive enters the soundness argument.
+/// `None` = this nonce is rejected.
+pub fn evaluation_point_from_nonce(
+    seed: &[u8; 32],
+    nonce: u32,
+    kind: crate::hash::HashKind,
+) -> Option<EvaluationPoint> {
     let mut nonce_seed = [0u8; 32];
-    nonce_seed.copy_from_slice(&h.finalize());
-    try_evaluation_point(&mut Sha256Rng::new(nonce_seed))
+    match kind {
+        crate::hash::HashKind::Sha256 => {
+            let mut h = Sha256::new();
+            h.update(seed);
+            h.update(nonce.to_le_bytes());
+            nonce_seed.copy_from_slice(&h.finalize());
+        }
+        crate::hash::HashKind::Blake3 => {
+            let mut h = blake3::Hasher::new();
+            h.update(seed);
+            h.update(&nonce.to_le_bytes());
+            nonce_seed.copy_from_slice(h.finalize().as_bytes());
+        }
+    }
+    try_evaluation_point(&mut super::rng::FsRng::new(kind, nonce_seed))
 }
 
 /// One rejection-sampling attempt: draw `x` and lift `(y, z1, z2, z3)`,
