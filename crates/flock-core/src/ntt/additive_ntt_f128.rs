@@ -45,6 +45,21 @@ use crate::field::F128;
 
 mod kernels;
 
+/// A/B toggle: when set, the deep (cache-resident) pass of the interleaved
+/// parallel NTT stays on the caller's (P-core) pool instead of hopping to
+/// [`crate::all_core_pool`] for large transforms. `NTT_DEEP_PCORES_ONLY=1`
+/// in the environment forces the same fallback (production kill-switch); the
+/// AtomicBool exists for paired within-process A/B.
+pub static NTT_DEEP_PCORES_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A/B toggle: when set, the deep pass runs every layer as its own sweep
+/// instead of fusing general-width layer pairs. `NTT_DEEP_NOFUSE=1` env is
+/// the production kill-switch; the AtomicBool is for paired within-process
+/// A/B.
+pub static NTT_DEEP_NOFUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
 /// Returns `evals` where `evals[i] = [Ŵ_i(β_i), Ŵ_i(β_{i+1}), …, Ŵ_i(β_{ℓ-1})]`.
@@ -413,25 +428,85 @@ impl AdditiveNttF128 {
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
 
-        data.par_chunks_mut(sub_bytes)
-            .enumerate()
-            .for_each(|(sub_idx, sub_data)| {
-                for layer in n_top.max(start_layer)..log_d {
-                    let layer_in_sub = layer - n_top;
-                    let num_blocks_in_sub = 1usize << layer_in_sub;
-                    let block_size = 1usize << (log_d - layer);
-                    let block_size_half = block_size >> 1;
-                    let block_bytes = block_size * num_ntts;
+        // Within each sub-group, fuse consecutive GENERAL-width layer pairs
+        // into one sweep (halves the sub's L1/L2 traffic and the butterfly
+        // load/store count for those layers — the deep pass is compute-bound,
+        // not DRAM-bound, so in-cache traffic and instruction count are what
+        // matter). The three deepest layers stay single-layer: their twiddles
+        // are all half-width (see `mul_small_twiddle`) and the fast path in
+        // `butterfly_interleaved_block` beats fusion's general muls.
+        // `NTT_DEEP_NOFUSE` restores per-layer sweeps (A/B).
+        let fuse = !NTT_DEEP_NOFUSE.load(std::sync::atomic::Ordering::Relaxed)
+            && std::env::var("NTT_DEEP_NOFUSE").is_err();
+        let halfwidth_start = log_d.saturating_sub(3);
+        let deep = |data: &mut [F128]| {
+            data.par_chunks_mut(sub_bytes)
+                .enumerate()
+                .for_each(|(sub_idx, sub_data)| {
+                    let mut layer = n_top.max(start_layer);
+                    while layer < log_d {
+                        let layer_in_sub = layer - n_top;
+                        let num_blocks_in_sub = 1usize << layer_in_sub;
+                        let block_size = 1usize << (log_d - layer);
+                        let block_bytes = block_size * num_ntts;
 
-                    for block_in_sub in 0..num_blocks_in_sub {
-                        let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                        let twiddle = self.twiddle(layer, global_block);
-                        let block_start = block_in_sub * block_bytes;
-                        let block = &mut sub_data[block_start..block_start + block_bytes];
-                        butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
+                        if fuse && layer + 2 <= halfwidth_start && block_size >= 4 {
+                            let quarter = block_size >> 2;
+                            for block_in_sub in 0..num_blocks_in_sub {
+                                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                                let t_outer = self.twiddle(layer, global_block);
+                                let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
+                                let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
+                                let block_start = block_in_sub * block_bytes;
+                                let block = &mut sub_data[block_start..block_start + block_bytes];
+                                butterfly_interleaved_fused_2layer_serial(
+                                    block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                                );
+                            }
+                            layer += 2;
+                        } else {
+                            let block_size_half = block_size >> 1;
+                            for block_in_sub in 0..num_blocks_in_sub {
+                                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                                let twiddle = self.twiddle(layer, global_block);
+                                let block_start = block_in_sub * block_bytes;
+                                let block = &mut sub_data[block_start..block_start + block_bytes];
+                                butterfly_interleaved_block(
+                                    block,
+                                    twiddle,
+                                    block_size_half,
+                                    num_ntts,
+                                );
+                            }
+                            layer += 1;
+                        }
                     }
-                }
-            });
+                });
+        };
+        // The deep pass is a flat parallel-for over independent ~2 MB
+        // sub-groups with a single join — measured ~80% PMULL-compute-bound at
+        // m=30 (one streaming pass of traffic, 11 in-cache layers). Unlike the
+        // barrier-per-block top passes, it drains cleanly around slow cores,
+        // and the E-cores have PMULL too — so large transforms hop to the
+        // all-core (P+E) pool. Pool choice cannot change output bits (each
+        // sub-group is written deterministically). Gate: enough sub-groups to
+        // drain (≥ 4× workers) and ≥ 64 MB of data so the pool switch and
+        // E-core L2 pressure can't hurt small/recursive commits.
+        // `NTT_DEEP_PCORES_ONLY` (atomic or env) restores the caller's pool.
+        let n_subs = data.len() / sub_bytes;
+        let use_all_cores = std::mem::size_of_val(data) >= (64 << 20)
+            && !NTT_DEEP_PCORES_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+            && std::env::var("NTT_DEEP_PCORES_ONLY").is_err()
+            && {
+                let pool = crate::all_core_pool();
+                pool.current_num_threads() > rayon::current_num_threads()
+                    && n_subs >= 4 * pool.current_num_threads()
+            };
+        if use_all_cores {
+            crate::all_core_pool().install(|| deep(data));
+        } else {
+            deep(data);
+        }
     }
 
     /// Scalar reference implementation. Used as the test oracle and on
@@ -720,11 +795,88 @@ fn butterfly_interleaved_block_par_rows(
     }
     let half_offset = block_size_half * num_ntts;
     let (top, bot) = block.split_at_mut(half_offset);
+    // Zero-twiddle fast path (see `butterfly_interleaved_block`).
+    if twiddle == F128::ZERO {
+        top.par_chunks_mut(num_ntts)
+            .zip(bot.par_chunks_mut(num_ntts))
+            .for_each(|(top_row, bot_row)| {
+                for lane in 0..num_ntts {
+                    bot_row[lane] += top_row[lane];
+                }
+            });
+        return;
+    }
     top.par_chunks_mut(num_ntts)
         .zip(bot.par_chunks_mut(num_ntts))
         .for_each(|(top_row, bot_row)| {
             kernels::butterfly_row_pair(top_row, bot_row, twiddle);
         });
+}
+
+/// One quarter-row of the fused 2-layer butterfly, with the zero-twiddle
+/// short-circuit for outer block 0 (`t_outer = t_inner_a = 0` — only the
+/// (c,d) inner butterfly multiplies; the branch is per-row, not per-lane).
+/// The general case delegates to the arch-dispatched
+/// [`kernels::butterfly_fused_2layer`].
+#[inline(always)]
+fn fused_2layer_row_op(
+    row_a: &mut [F128],
+    row_b: &mut [F128],
+    row_c: &mut [F128],
+    row_d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    zero_block: bool,
+    num_ntts: usize,
+) {
+    if zero_block {
+        for lane in 0..num_ntts {
+            let a = row_a[lane];
+            let b = row_b[lane];
+            // Layer L with t_outer=0: a,b unchanged; c += a; d += b.
+            let c = row_c[lane] + a;
+            let d = row_d[lane] + b;
+            // Layer L+1: (a,b) with t_inner_a=0: a unchanged; b += a.
+            row_b[lane] = b + a;
+            // (c,d) with the real t_inner_b.
+            let new_c2 = c + d * t_inner_b;
+            row_c[lane] = new_c2;
+            row_d[lane] = d + new_c2;
+        }
+        return;
+    }
+    kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
+}
+
+/// Forced-serial fused 2-layer butterfly for use INSIDE the deep pass's
+/// per-sub-group workers (already running one task per pool worker — nested
+/// row-parallelism would only add dispatch overhead). Same math as
+/// [`butterfly_interleaved_fused_2layer_par_rows`].
+fn butterfly_interleaved_fused_2layer_serial(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+) {
+    let stride = quarter * num_ntts;
+    debug_assert_eq!(block.len(), 4 * stride);
+    let zero_block = t_outer == F128::ZERO && t_inner_a == F128::ZERO;
+    let (top_half, bot_half) = block.split_at_mut(2 * stride);
+    let (q1, q2) = top_half.split_at_mut(stride);
+    let (q3, q4) = bot_half.split_at_mut(stride);
+    for r in 0..quarter {
+        let off = r * num_ntts;
+        let (q1r, _) = q1[off..].split_at_mut(num_ntts);
+        let (q2r, _) = q2[off..].split_at_mut(num_ntts);
+        let (q3r, _) = q3[off..].split_at_mut(num_ntts);
+        let (q4r, _) = q4[off..].split_at_mut(num_ntts);
+        fused_2layer_row_op(
+            q1r, q2r, q3r, q4r, t_outer, t_inner_a, t_inner_b, zero_block, num_ntts,
+        );
+    }
 }
 
 /// Fused 2-layer butterfly: combines layer L (twiddle `t_outer`, shared by
@@ -752,12 +904,16 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     let stride = quarter * num_ntts;
     debug_assert_eq!(block.len(), 4 * stride);
 
-    let do_one = |row_a: &mut [F128],
-                  row_b: &mut [F128],
-                  row_c: &mut [F128],
-                  row_d: &mut [F128]| {
-        kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
-    };
+    // Block 0 of the outer layer has t_outer = 0 AND t_inner_a =
+    // twiddle(L+1, 0) = 0 — only the (c,d) inner butterfly multiplies. The
+    // branch is per-row, not per-lane.
+    let zero_block = t_outer == F128::ZERO && t_inner_a == F128::ZERO;
+    let do_one =
+        |row_a: &mut [F128], row_b: &mut [F128], row_c: &mut [F128], row_d: &mut [F128]| {
+            fused_2layer_row_op(
+                row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b, zero_block, num_ntts,
+            );
+        };
 
     // Split the block into four quarters, then zip row-wise. Each rayon task
     // processes one quarter-row index = 4 logical rows of work.
@@ -799,6 +955,29 @@ fn butterfly_interleaved_fused_2layer_par_rows(
 /// tried but **regressed** by ~10-30% because the explicit batching prevented
 /// ILP across more than 2 muls and added load/store overhead.
 #[inline]
+/// `v · t` for a HALF-WIDTH twiddle (`t.hi == 0`, i.e. deg(t) ≤ 63): the
+/// schoolbook shrinks to 2 PMULL and the 192-bit product needs only a single
+/// reduction fold (overflow deg ≤ 62+7 < 128) — half the cost of the general
+/// multiply. In the polynomial basis `{1, x, x², …}` the THREE DEEPEST layers'
+/// twiddles are all half-width (they are spans/short combinations of low
+/// basis powers): 3/17 ≈ 18% of all NTT mults.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn mul_small_twiddle(v: F128, t_lo: u64) -> F128 {
+    use core::arch::aarch64::*;
+    unsafe {
+        let d0 = vreinterpretq_u64_p128(vmull_p64(v.lo, t_lo));
+        let d1 = vreinterpretq_u64_p128(vmull_p64(v.hi, t_lo));
+        // 192-bit product: r0 = d0.lo, r1 = d0.hi ^ d1.lo, r2 = d1.hi (r3 = 0).
+        let r2 = vgetq_lane_u64::<1>(d1);
+        // One fold: r2 · (x^7+x^2+x+1) lands entirely within 128 bits.
+        let h = vreinterpretq_u64_p128(vmull_p64(r2, 0x87));
+        F128 {
+            lo: vgetq_lane_u64::<0>(d0) ^ vgetq_lane_u64::<0>(h),
+            hi: vgetq_lane_u64::<1>(d0) ^ vgetq_lane_u64::<0>(d1) ^ vgetq_lane_u64::<1>(h),
+        }
+    }
+}
+
 fn butterfly_interleaved_block(
     block: &mut [F128],
     twiddle: F128,
@@ -806,6 +985,37 @@ fn butterfly_interleaved_block(
     num_ntts: usize,
 ) {
     let off_bot = block_size_half * num_ntts;
+    // Zero-twiddle fast path: block 0 of EVERY layer has twiddle 0
+    // (`twiddle(l, 0) = span_get(_, 0) = 0`), so its butterfly degenerates to
+    // (u, v + u) — no multiply. Σ_l 2^-l ≈ 1 layer-equivalent ≈ 6% of all NTT
+    // mults, and the NTT is mult-throughput-bound.
+    if twiddle == F128::ZERO {
+        for r in 0..block_size_half {
+            let off_top = r * num_ntts;
+            let off_bot_r = off_top + off_bot;
+            for lane in 0..num_ntts {
+                let u = block[off_top + lane];
+                block[off_bot_r + lane] += u;
+            }
+        }
+        return;
+    }
+    // Half-width-twiddle fast path (see `mul_small_twiddle`): the deep layers
+    // this kernel serves are exactly where all twiddles are half-width.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if twiddle.hi == 0 {
+        for r in 0..block_size_half {
+            let off_top = r * num_ntts;
+            let off_bot_r = off_top + off_bot;
+            for lane in 0..num_ntts {
+                let v = block[off_bot_r + lane];
+                let new_u = block[off_top + lane] + mul_small_twiddle(v, twiddle.lo);
+                block[off_top + lane] = new_u;
+                block[off_bot_r + lane] = v + new_u;
+            }
+        }
+        return;
+    }
     let (top, bot) = block.split_at_mut(off_bot);
     for r in 0..block_size_half {
         let o = r * num_ntts;

@@ -2586,55 +2586,63 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// Returns `(folded_f, folded_b, next_msg)` where `next_msg = round_msg_lsb
 /// (folded_f, folded_b)`. Bit-identical to the unfused sequence.
 fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
+    use crate::field::F256Unreduced;
     use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
-    let one_plus_r = F128::ONE + r;
 
+    // Fold with ONE mul per output via `v0 + r·(v0 + v1)` (= `(1+r)·v0 + r·v1`
+    // exactly in GF(2^128)), and accumulate the message as unreduced 256-bit
+    // products, reduced once at the end — reduction is XOR-linear, so the
+    // result is bit-identical to the reduced-per-term sum.
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
         let mut nf = Vec::with_capacity(half);
         let mut nb = Vec::with_capacity(half);
         for j in 0..half {
-            nf.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
-            nb.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
+            let f0 = f[2 * j];
+            let b0 = b[2 * j];
+            nf.push(f0 + (f0 + f[2 * j + 1]) * r);
+            nb.push(b0 + (b0 + b[2 * j + 1]) * r);
         }
-        let mut u_0 = F128::ZERO;
-        let mut u_2 = F128::ZERO;
+        let mut u_0 = F256Unreduced::ZERO;
+        let mut u_2 = F256Unreduced::ZERO;
         let mut k = 0;
         while k + 1 < half {
             let f0 = nf[k];
             let f1 = nf[k + 1];
             let b0 = nb[k];
             let b1 = nb[k + 1];
-            u_0 += f0 * b0;
-            u_2 += (f0 + f1) * (b0 + b1);
+            u_0 ^= f0.mul_unreduced(b0);
+            u_2 ^= (f0 + f1).mul_unreduced(b0 + b1);
             k += 2;
         }
-        return (nf, nb, SumcheckMessage { u_0, u_2 });
+        return (
+            nf,
+            nb,
+            SumcheckMessage {
+                u_0: u_0.reduce(),
+                u_2: u_2.reduce(),
+            },
+        );
     }
 
     // Parallel path: `half` is a power of two ≥ PAR_THRESHOLD and CHUNK is a
     // power of two, so every chunk has even length and starts at an even
     // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
+    //
+    // Output buffers come from the scratch pool: a fresh 64 MB alloc per fold
+    // round pays first-touch page faults inside the parallel loop and a
+    // single-threaded munmap on drop of the old buffer — measured as the
+    // dominant cost of the open's initial sumcheck (~18 ms → ~7 ms at m=30
+    // for the 6-fold chain once both buffers recycle through the pool; the
+    // caller returns the outgoing pair via `scratch::give_f128`, see
+    // [`SumcheckProver::fold`]).
     const CHUNK: usize = 2048;
-    // On x86_64, pull the fold outputs from the prewarmed scratch pool (the
-    // prover gives the previous round's buffers back in `SumcheckProver::fold`),
-    // so the initial sumcheck reuses resident pages instead of faulting ~128 MB
-    // of fresh memory every round. On aarch64 this pooling measured slower, so
-    // there we allocate fresh each round.
-    #[cfg(target_arch = "x86_64")]
-    let (mut nf, mut nb) = (
-        crate::scratch::take_f128(half),
-        crate::scratch::take_f128(half),
-    );
-    #[cfg(not(target_arch = "x86_64"))]
-    let (mut nf, mut nb) = (
-        crate::alloc_uninit_f128_vec(half),
-        crate::alloc_uninit_f128_vec(half),
-    );
+    let mut nf = crate::scratch::take_f128(half);
+    let mut nb = crate::scratch::take_f128(half);
     let (u_0, u_2) = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -2642,9 +2650,12 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
         .map(|(ci, (fc, bc))| {
             let base = ci * CHUNK;
             let len = fc.len();
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            // Fold this slice, then pair up the just-folded values for the msg.
+            let mut u0 = F256Unreduced::ZERO;
+            let mut u2 = F256Unreduced::ZERO;
+            // Fold this slice via the arch-dispatched slice kernel (AVX-512 on
+            // x86, NEON on aarch64), then pair up the just-folded values for
+            // the msg. `src[2j]·(1+r) + src[2j+1]·r = v0 + (v0+v1)·r` exactly
+            // in GF(2^128), so the kernel choice cannot change the bits.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             crate::field::f128_slice::fold_pairs(b, base, bc, r);
             let mut k = 0;
@@ -2653,17 +2664,266 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
                 let f1 = fc[k + 1];
                 let b0 = bc[k];
                 let b1 = bc[k + 1];
-                u0 += f0 * b0;
-                u2 += (f0 + f1) * (b0 + b1);
+                u0 ^= f0.mul_unreduced(b0);
+                u2 ^= (f0 + f1).mul_unreduced(b0 + b1);
                 k += 2;
             }
             (u0, u2)
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |(a0, a2), (c0, c2)| (a0 ^ c0, a2 ^ c2),
         );
-    (nf, nb, SumcheckMessage { u_0, u_2 })
+    (
+        nf,
+        nb,
+        SumcheckMessage {
+            u_0: u_0.reduce(),
+            u_2: u_2.reduce(),
+        },
+    )
+}
+
+/// Quadratic coefficients of the NEXT round's message as a polynomial in the
+/// not-yet-sampled fold challenge `r`:
+/// `u_0(r) = u0[0] + r·u0[1] + r²·u0[2]` (same for `u_2`).
+///
+/// Produced by the lookahead fold passes ([`fold1_lookahead_lsb`] /
+/// [`fold2_lookahead_lsb`]) so the round in between two passes costs an O(1)
+/// polynomial evaluation instead of a full array pass. The evaluated message
+/// equals the direct `round_msg_lsb` over the folded arrays by exact
+/// polynomial identity (every op is exact in GF(2^128)), so the transcript is
+/// bit-identical.
+#[derive(Clone, Copy, Debug)]
+pub struct FoldLookahead {
+    u0: [F128; 3],
+    u2: [F128; 3],
+}
+
+use crate::field::F256Unreduced;
+
+impl FoldLookahead {
+    #[inline]
+    fn eval(&self, r: F128) -> SumcheckMessage {
+        let r2 = r * r;
+        SumcheckMessage {
+            u_0: self.u0[0] + r * self.u0[1] + r2 * self.u0[2],
+            u_2: self.u2[0] + r * self.u2[1] + r2 * self.u2[2],
+        }
+    }
+}
+
+/// Shared per-group-of-4 kernel for the lookahead passes: given 4 freshly
+/// folded consecutive outputs of each array (still in registers), accumulate
+/// - this round's message contribution (pairs `(0,1)` and `(2,3)`), and
+/// - the quadratic coefficients of the NEXT round's message in the future
+///   challenge `r'` (next fold pairs `(0,1)`→slot 0 and `(2,3)`→slot 1; next
+///   message pairs those two slots).
+///
+/// Accumulator layout: `[u0, u2, c0, c1, c2, d0, d1, d2]` where `c*` are the
+/// `u_0(r')` coefficients and `d*` the `u_2(r')` coefficients.
+///
+/// 8 unreduced muls per group (Karatsuba middle terms: the `r'`-linear
+/// coefficient is `m1 + m2 + (A+dA)(B+dB)` — exact in char 2).
+#[inline(always)]
+pub(crate) fn lookahead_accum_group(fq: &[F128; 4], bq: &[F128; 4], acc: &mut [F256Unreduced; 8]) {
+    let a0 = fq[0];
+    let da0 = fq[0] + fq[1];
+    let a1 = fq[2];
+    let da1 = fq[2] + fq[3];
+    let b0 = bq[0];
+    let db0 = bq[0] + bq[1];
+    let b1 = bq[2];
+    let db1 = bq[2] + bq[3];
+
+    let m1 = a0.mul_unreduced(b0);
+    let m2 = da0.mul_unreduced(db0);
+    let m3 = (a0 + da0).mul_unreduced(b0 + db0);
+    let p1 = a1.mul_unreduced(b1);
+    let p2 = da1.mul_unreduced(db1);
+    let n1 = (a0 + a1).mul_unreduced(b0 + b1);
+    let n2 = (da0 + da1).mul_unreduced(db0 + db1);
+    let n3 = (a0 + a1 + da0 + da1).mul_unreduced(b0 + b1 + db0 + db1);
+
+    // This round's message: pairs (0,1) and (2,3).
+    acc[0] ^= m1 ^ p1; // u_0 += A0·B0 + A1·B1
+    acc[1] ^= m2 ^ p2; // u_2 += dA0·dB0 + dA1·dB1
+    // Next round's u_0(r') = Σ (A0 + r'·dA0)(B0 + r'·dB0).
+    acc[2] ^= m1;
+    acc[3] ^= m1 ^ m2 ^ m3;
+    acc[4] ^= m2;
+    // Next round's u_2(r') = Σ (S + r'·dS)(T + r'·dT), S = A0+A1 etc.
+    acc[5] ^= n1;
+    acc[6] ^= n1 ^ n2 ^ n3;
+    acc[7] ^= n2;
+}
+
+/// Reduce the 8 lookahead accumulators into `(msg, coeffs)`.
+#[inline]
+pub(crate) fn lookahead_finish(acc: [F256Unreduced; 8]) -> (SumcheckMessage, FoldLookahead) {
+    (
+        SumcheckMessage {
+            u_0: acc[0].reduce(),
+            u_2: acc[1].reduce(),
+        },
+        FoldLookahead {
+            u0: [acc[2].reduce(), acc[3].reduce(), acc[4].reduce()],
+            u2: [acc[5].reduce(), acc[6].reduce(), acc[7].reduce()],
+        },
+    )
+}
+
+#[inline]
+pub(crate) fn xor_acc8(mut a: [F256Unreduced; 8], b: [F256Unreduced; 8]) -> [F256Unreduced; 8] {
+    for k in 0..8 {
+        a[k] ^= b[k];
+    }
+    a
+}
+
+/// Entry lookahead pass: fold ONE variable (`n → n/2`) and return this
+/// round's message plus the next round's [`FoldLookahead`] coefficients.
+/// Identical fold/message values to [`fold_and_msg_lsb`]; the extra
+/// coefficients cost ~1 extra mul per output in the same pass.
+fn fold1_lookahead_lsb(
+    f: &[F128],
+    b: &[F128],
+    r: F128,
+) -> (Vec<F128>, Vec<F128>, SumcheckMessage, FoldLookahead) {
+    use rayon::prelude::*;
+    let n = f.len();
+    debug_assert_eq!(b.len(), n);
+    let half = n / 2;
+    assert!(
+        n.is_power_of_two() && half >= 4 && half.is_multiple_of(4),
+        "fold1_lookahead_lsb: need n ≥ 8"
+    );
+
+    const CHUNK: usize = 2048;
+    let mut nf = crate::scratch::take_f128(half);
+    let mut nb = crate::scratch::take_f128(half);
+    let acc = nf
+        .par_chunks_mut(CHUNK)
+        .zip(nb.par_chunks_mut(CHUNK))
+        .enumerate()
+        .map(|(ci, (fc, bc))| {
+            let base = ci * CHUNK;
+            let len = fc.len();
+            debug_assert!(len.is_multiple_of(4) || len == half - base);
+            let mut acc = [F256Unreduced::ZERO; 8];
+            // Fold this slice (1 mul per output per array)…
+            for t in 0..len {
+                let j = base + t;
+                let f0 = f[2 * j];
+                let f1 = f[2 * j + 1];
+                let b0 = b[2 * j];
+                let b1 = b[2 * j + 1];
+                fc[t] = f0 + (f0 + f1) * r;
+                bc[t] = b0 + (b0 + b1) * r;
+            }
+            // …then message + lookahead over groups of 4 just-written outputs.
+            let mut g = 0;
+            while g + 4 <= len {
+                let fq = [fc[g], fc[g + 1], fc[g + 2], fc[g + 3]];
+                let bq = [bc[g], bc[g + 1], bc[g + 2], bc[g + 3]];
+                lookahead_accum_group(&fq, &bq, &mut acc);
+                g += 4;
+            }
+            acc
+        })
+        .reduce(|| [F256Unreduced::ZERO; 8], xor_acc8);
+    let (msg, la) = lookahead_finish(acc);
+    (nf, nb, msg, la)
+}
+
+/// Steady-state lookahead pass: fold TWO variables (`n → n/4`, challenges
+/// `r_a` then `r_b`) and return the message after both folds plus the next
+/// round's [`FoldLookahead`]. Values are bit-identical to two sequential
+/// [`fold_and_msg_lsb`] rounds, at ~55% of their memory traffic (the
+/// intermediate half-size arrays are never materialized).
+fn fold2_lookahead_lsb(
+    f: &[F128],
+    b: &[F128],
+    r_a: F128,
+    r_b: F128,
+) -> (Vec<F128>, Vec<F128>, SumcheckMessage, FoldLookahead) {
+    use rayon::prelude::*;
+    let n = f.len();
+    debug_assert_eq!(b.len(), n);
+    let quarter = n / 4;
+    assert!(
+        n.is_power_of_two() && quarter >= 4 && quarter.is_multiple_of(4),
+        "fold2_lookahead_lsb: need n ≥ 16"
+    );
+
+    const CHUNK: usize = 2048;
+    let mut nf = crate::scratch::take_f128(quarter);
+    let mut nb = crate::scratch::take_f128(quarter);
+    let acc = nf
+        .par_chunks_mut(CHUNK)
+        .zip(nb.par_chunks_mut(CHUNK))
+        .enumerate()
+        .map(|(ci, (fc, bc))| {
+            let base = ci * CHUNK;
+            let len = fc.len();
+            let mut acc = [F256Unreduced::ZERO; 8];
+            // Fold 4→1 (3 muls per output per array), 4 outputs per group.
+            let mut g = 0;
+            while g < len {
+                let glen = (len - g).min(4);
+                let mut fq = [F128::ZERO; 4];
+                let mut bq = [F128::ZERO; 4];
+                for t in 0..glen {
+                    let j = base + g + t;
+                    let i = 4 * j;
+                    let gf0 = f[i] + (f[i] + f[i + 1]) * r_a;
+                    let gf1 = f[i + 2] + (f[i + 2] + f[i + 3]) * r_a;
+                    let gb0 = b[i] + (b[i] + b[i + 1]) * r_a;
+                    let gb1 = b[i + 2] + (b[i + 2] + b[i + 3]) * r_a;
+                    let vf = gf0 + (gf0 + gf1) * r_b;
+                    let vb = gb0 + (gb0 + gb1) * r_b;
+                    fc[g + t] = vf;
+                    bc[g + t] = vb;
+                    fq[t] = vf;
+                    bq[t] = vb;
+                }
+                debug_assert_eq!(glen, 4);
+                lookahead_accum_group(&fq, &bq, &mut acc);
+                g += glen;
+            }
+            acc
+        })
+        .reduce(|| [F256Unreduced::ZERO; 8], xor_acc8);
+    let (msg, la) = lookahead_finish(acc);
+    (nf, nb, msg, la)
+}
+
+/// Fold both arrays by `r` with NO message computation (write-only drain for
+/// a pending lookahead challenge at the end of an odd-length schedule).
+fn fold_pair_no_msg(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+    let n = f.len();
+    debug_assert_eq!(b.len(), n);
+    let half = n / 2;
+    let mut nf = crate::scratch::take_f128(half);
+    let mut nb = crate::scratch::take_f128(half);
+    const CHUNK: usize = 2048;
+    nf.par_chunks_mut(CHUNK)
+        .zip(nb.par_chunks_mut(CHUNK))
+        .enumerate()
+        .for_each(|(ci, (fc, bc))| {
+            let base = ci * CHUNK;
+            for t in 0..fc.len() {
+                let j = base + t;
+                let f0 = f[2 * j];
+                let f1 = f[2 * j + 1];
+                let b0 = b[2 * j];
+                let b1 = b[2 * j + 1];
+                fc[t] = f0 + (f0 + f1) * r;
+                bc[t] = b0 + (b0 + b1) * r;
+            }
+        });
+    (nf, nb)
 }
 
 pub struct SumcheckProver {
@@ -2676,6 +2936,11 @@ pub struct SumcheckProver {
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
+    /// Lookahead bookkeeping: a fold challenge whose array fold is deferred
+    /// to the next lookahead pass (the round's message was already produced
+    /// by [`FoldLookahead::eval`]). Must be `None` (drained) before any
+    /// non-lookahead operation touches `f`/`combined_basis`.
+    pending_fold: Option<F128>,
 }
 
 impl SumcheckProver {
@@ -2687,6 +2952,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            pending_fold: None,
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
         inst.transcript.push(msg);
@@ -2711,38 +2977,79 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            pending_fold: None,
         };
         inst.transcript.push(first_msg);
         (inst, first_msg)
     }
 
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
+        debug_assert!(self.pending_fold.is_none(), "fold with pending lookahead");
         // Fused: fold f and combined_basis at r AND build the next-round
         // message in one parallel pass (was three passes). See
         // [`fold_and_msg_lsb`].
         let (nf, nb, msg) = fold_and_msg_lsb(&self.f, &self.combined_basis, r);
-        // On x86_64, recycle the just-consumed buffers into the scratch pool
-        // (same ownership as the Drop impl) so the next round's
-        // `fold_and_msg_lsb` takes resident pages. aarch64 measured slower with
-        // this pooling, so there we just move the new buffers in and drop the
-        // old ones.
-        #[cfg(target_arch = "x86_64")]
-        {
+        // Recycle the outgoing buffers (the round-0 pair is the 2^(m-7)
+        // packed witness + b_combined) instead of munmap-ing them.
+        crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
+        crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
+        self.transcript.push(msg);
+        msg
+    }
+
+    /// Lookahead entry: like [`Self::fold`] but also returns the next round's
+    /// message coefficients (see [`FoldLookahead`]). Same fold + message
+    /// values as `fold(r)`.
+    pub fn fold1_lookahead(&mut self, r: F128) -> (SumcheckMessage, FoldLookahead) {
+        debug_assert!(self.pending_fold.is_none(), "fold1 with pending lookahead");
+        let (nf, nb, msg, la) = fold1_lookahead_lsb(&self.f, &self.combined_basis, r);
+        crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
+        crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
+        self.transcript.push(msg);
+        (msg, la)
+    }
+
+    /// Lookahead skip round: produce this round's message by evaluating the
+    /// previous pass's coefficients at `r` — O(1), no array pass. The actual
+    /// fold by `r` is deferred to the next [`Self::fold2_lookahead`] (or
+    /// [`Self::drain_pending_fold`]). The message value is identical to
+    /// `fold(r)`'s by exact polynomial identity.
+    pub fn fold_skip(&mut self, la: &FoldLookahead, r: F128) -> SumcheckMessage {
+        debug_assert!(self.pending_fold.is_none(), "double lookahead skip");
+        let msg = la.eval(r);
+        self.pending_fold = Some(r);
+        self.transcript.push(msg);
+        msg
+    }
+
+    /// Lookahead steady state: fold the pending challenge AND `r` in one
+    /// 4→1 pass, returning the post-fold message + next coefficients.
+    pub fn fold2_lookahead(&mut self, r: F128) -> (SumcheckMessage, FoldLookahead) {
+        let r_a = self
+            .pending_fold
+            .take()
+            .expect("fold2_lookahead without pending challenge");
+        let (nf, nb, msg, la) = fold2_lookahead_lsb(&self.f, &self.combined_basis, r_a, r);
+        crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
+        crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
+        self.transcript.push(msg);
+        (msg, la)
+    }
+
+    /// Materialize a pending lookahead fold (message was already sent by
+    /// [`Self::fold_skip`]). No-op when nothing is pending.
+    pub fn drain_pending_fold(&mut self) {
+        if let Some(r) = self.pending_fold.take() {
+            let (nf, nb) = fold_pair_no_msg(&self.f, &self.combined_basis, r);
             crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
             crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            self.f = nf;
-            self.combined_basis = nb;
-        }
-        self.transcript.push(msg);
-        msg
     }
 
     /// Introduce a fresh basis poly with claimed sum `h_new`. Sends the
     /// (u_0, u_2) for `Σ_x f(x) · b_new(x)` at the current dim.
     pub fn introduce_new(&mut self, b_new: Vec<F128>, h_new: F128) -> SumcheckMessage {
+        debug_assert!(self.pending_fold.is_none(), "introduce with pending fold");
         assert_eq!(b_new.len(), self.f.len());
         let msg = round_msg_lsb(&self.f, &b_new);
         self.transcript.push(msg);
@@ -2757,6 +3064,7 @@ impl SumcheckProver {
     /// fold over `f`. Transcript-identical: the caller observes the returned
     /// `h_new` then `(u_0, u_2)`, exactly as the unfused path does.
     pub fn introduce_new_with_eval(&mut self, b_new: Vec<F128>) -> (SumcheckMessage, F128) {
+        debug_assert!(self.pending_fold.is_none(), "introduce with pending fold");
         assert_eq!(b_new.len(), self.f.len());
         let (msg, h_new) = round_msg_and_eval_lsb(&self.f, &b_new);
         self.transcript.push(msg);
@@ -2789,7 +3097,18 @@ impl SumcheckProver {
     }
 
     pub fn f(&self) -> &[F128] {
+        debug_assert!(self.pending_fold.is_none(), "f() with pending fold");
         &self.f
+    }
+
+    /// Current (materialized) array length; a pending lookahead fold is not
+    /// yet applied to it.
+    pub fn f_len(&self) -> usize {
+        self.f.len()
+    }
+
+    pub fn has_pending_fold(&self) -> bool {
+        self.pending_fold.is_some()
     }
 
     pub fn transcript(&self) -> &[SumcheckMessage] {
@@ -3018,6 +3337,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         l0_codeword,
         l0_tree,
         None,
+        None,
         challenger,
     )
 }
@@ -3036,6 +3356,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     round0_uv: (F128, F128),
+    round1_lookahead: Option<FoldLookahead>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     recursive_prover_with_basis_impl(
@@ -3049,6 +3370,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_0: round0_uv.0,
             u_2: round0_uv.1,
         }),
+        round1_lookahead,
         challenger,
     )
 }
@@ -3062,6 +3384,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     first_msg: Option<SumcheckMessage>,
+    round1_lookahead: Option<FoldLookahead>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -3129,7 +3452,31 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     challenger.observe_f128(start_msg.u_0);
     challenger.observe_f128(start_msg.u_2);
 
+    // Lane folds with two-rounds-per-pass lookahead: pass rounds alternate
+    // with O(1) "skip" rounds whose message is evaluated from quadratic
+    // coefficients accumulated in the preceding pass, and the deferred fold
+    // is absorbed by the next pass folding TWO challenges at once (4→1).
+    // Cuts the fold chain's memory traffic ~25% (the intermediate half-size
+    // arrays between paired rounds are never materialized) while producing a
+    // bit-identical transcript (exact polynomial identity — see
+    // [`FoldLookahead`]). LIG_LOOKAHEAD_DISABLE=1 restores the per-round
+    // fused folds (A/B toggle). Small instances (< 2^14, where pass shapes
+    // and scratch reuse don't pay) stay on the per-round path.
+    let use_lookahead = {
+        let n = sc_prover.f_len();
+        // Big enough to pay, and every pass keeps `quarter` a multiple of 4.
+        n >= (1 << 14) && (n >> initial_k) >= 16
+    } && std::env::var("LIG_LOOKAHEAD_DISABLE").is_err();
     let mut r_lane_fold = Vec::with_capacity(initial_k);
+    // Entry coefficients from the pcs combine (computed in the same pass as
+    // the round-0 prime) make round 0 itself a skip round: the full-size
+    // entry pass never runs and the first real pass folds two challenges
+    // straight off the original arrays.
+    let mut lookahead: Option<FoldLookahead> = if use_lookahead {
+        round1_lookahead
+    } else {
+        None
+    };
     for j in 0..initial_k {
         // Fold-challenge grinding: the L0 proximity-gap bad event lives on
         // each of these lane-fold challenges, so each one is individually
@@ -3145,11 +3492,28 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             fold_grinding_nonces.push(challenger.grind_pow(bits));
         }
         let r = challenger.sample_f128();
-        let msg = sc_prover.fold(r);
+        let msg = if !use_lookahead {
+            sc_prover.fold(r)
+        } else if let Some(la) = lookahead.take() {
+            // Skip round: message from coefficients, fold deferred.
+            sc_prover.fold_skip(&la, r)
+        } else if sc_prover.has_pending_fold() {
+            // Pass round: fold the deferred challenge + this one together.
+            let (msg, la) = sc_prover.fold2_lookahead(r);
+            lookahead = Some(la);
+            msg
+        } else {
+            // Entry pass (round 0): single fold + first coefficients.
+            let (msg, la) = sc_prover.fold1_lookahead(r);
+            lookahead = Some(la);
+            msg
+        };
         challenger.observe_f128(msg.u_0);
         challenger.observe_f128(msg.u_2);
         r_lane_fold.push(r);
     }
+    // Even initial_k ends on a skip round — materialize the deferred fold.
+    sc_prover.drain_pending_fold();
     if trace {
         t_init_sumcheck += _t.elapsed();
     }
@@ -4994,6 +5358,252 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lookahead fold state machine vs the plain per-round fused folds:
+    /// every round message AND the final arrays must be bit-identical
+    /// (exact polynomial identity). Covers even k (drain needed) and odd k.
+    #[test]
+    fn lookahead_folds_match_plain_folds() {
+        let mut s = 0xFACE_FEED_0123_4567u64;
+        let mut next = move || {
+            s = s.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+        let n = 1usize << 12;
+        let f: Vec<F128> = (0..n)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let b: Vec<F128> = (0..n)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let target = F128 {
+            lo: next(),
+            hi: next(),
+        };
+        let first = SumcheckMessage {
+            u_0: F128 {
+                lo: next(),
+                hi: next(),
+            },
+            u_2: F128 {
+                lo: next(),
+                hi: next(),
+            },
+        };
+        for k in [5usize, 6] {
+            let rs: Vec<F128> = (0..k)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+
+            let (mut plain, _) =
+                SumcheckProver::new_with_first_msg(f.clone(), b.clone(), target, first);
+            let plain_msgs: Vec<SumcheckMessage> = rs.iter().map(|&r| plain.fold(r)).collect();
+
+            let (mut la_prover, _) =
+                SumcheckProver::new_with_first_msg(f.clone(), b.clone(), target, first);
+            let mut lookahead: Option<FoldLookahead> = None;
+            let mut la_msgs = Vec::with_capacity(k);
+            for &r in &rs {
+                let msg = if let Some(la) = lookahead.take() {
+                    la_prover.fold_skip(&la, r)
+                } else if la_prover.has_pending_fold() {
+                    let (msg, la) = la_prover.fold2_lookahead(r);
+                    lookahead = Some(la);
+                    msg
+                } else {
+                    let (msg, la) = la_prover.fold1_lookahead(r);
+                    lookahead = Some(la);
+                    msg
+                };
+                la_msgs.push(msg);
+            }
+            la_prover.drain_pending_fold();
+
+            for (j, (pm, lm)) in plain_msgs.iter().zip(la_msgs.iter()).enumerate() {
+                assert_eq!(pm.u_0, lm.u_0, "k={k} round {j}: u_0 mismatch");
+                assert_eq!(pm.u_2, lm.u_2, "k={k} round {j}: u_2 mismatch");
+            }
+            assert_eq!(plain.f(), la_prover.f(), "k={k}: folded f mismatch");
+            assert_eq!(
+                plain.combined_basis, la_prover.combined_basis,
+                "k={k}: folded basis mismatch"
+            );
+        }
+    }
+
+    /// Same-process paired A/B: 6 plain fused folds vs the lookahead
+    /// schedule (P1 + skip + P2 + skip + P2 + skip + drain) at 2^23, order
+    /// swapped every rep. Run with:
+    ///   cargo test --release --lib lookahead_fold_ab_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual perf probe; run with --ignored --nocapture"]
+    fn lookahead_fold_ab_probe() {
+        use std::time::Instant;
+        let _ = crate::init_perf_thread_pool();
+        let n = 1usize << 23;
+        let k = 6usize;
+        let mut s = 0xA5A5_5A5A_1357_9BDFu64;
+        let mut next = move || {
+            s = s.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+        let f: Vec<F128> = (0..n)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let b: Vec<F128> = (0..n)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let rs: Vec<F128> = (0..k)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let target = F128::ZERO;
+        let first = SumcheckMessage {
+            u_0: F128::ZERO,
+            u_2: F128::ZERO,
+        };
+
+        let run_plain = |f: &[F128], b: &[F128]| -> (f64, SumcheckMessage) {
+            let (mut p, _) =
+                SumcheckProver::new_with_first_msg(f.to_vec(), b.to_vec(), target, first);
+            let t = Instant::now();
+            let mut last = first;
+            for &r in &rs {
+                last = p.fold(r);
+            }
+            (t.elapsed().as_secs_f64(), last)
+        };
+        let run_la = |f: &[F128], b: &[F128]| -> (f64, SumcheckMessage) {
+            let (mut p, _) =
+                SumcheckProver::new_with_first_msg(f.to_vec(), b.to_vec(), target, first);
+            let t = Instant::now();
+            let mut last = first;
+            let mut lookahead: Option<FoldLookahead> = None;
+            for &r in &rs {
+                last = if let Some(la) = lookahead.take() {
+                    p.fold_skip(&la, r)
+                } else if p.has_pending_fold() {
+                    let (msg, la) = p.fold2_lookahead(r);
+                    lookahead = Some(la);
+                    msg
+                } else {
+                    let (msg, la) = p.fold1_lookahead(r);
+                    lookahead = Some(la);
+                    msg
+                };
+            }
+            p.drain_pending_fold();
+            (t.elapsed().as_secs_f64(), last)
+        };
+
+        // Entry-skip variant (stage 2): round-1 coefficients precomputed
+        // outside the timed region (production fuses them into the pcs
+        // combine's block tail), so the schedule is skip + P2 + skip + P2 +
+        // skip + P2 — the full-size entry pass never runs.
+        let entry_coeffs = {
+            use rayon::prelude::*;
+            let acc = f
+                .par_chunks(4)
+                .zip(b.par_chunks(4))
+                .map(|(fc, bc)| {
+                    let mut acc = [F256Unreduced::ZERO; 8];
+                    lookahead_accum_group(
+                        &[fc[0], fc[1], fc[2], fc[3]],
+                        &[bc[0], bc[1], bc[2], bc[3]],
+                        &mut acc,
+                    );
+                    acc
+                })
+                .reduce(|| [F256Unreduced::ZERO; 8], xor_acc8);
+            lookahead_finish(acc).1
+        };
+        let run_la_entry = |f: &[F128], b: &[F128]| -> (f64, SumcheckMessage) {
+            let (mut p, _) =
+                SumcheckProver::new_with_first_msg(f.to_vec(), b.to_vec(), target, first);
+            let t = Instant::now();
+            let mut last = first;
+            let mut lookahead: Option<FoldLookahead> = Some(entry_coeffs);
+            for &r in &rs {
+                last = if let Some(la) = lookahead.take() {
+                    p.fold_skip(&la, r)
+                } else {
+                    let (msg, la) = p.fold2_lookahead(r);
+                    lookahead = Some(la);
+                    msg
+                };
+            }
+            p.drain_pending_fold();
+            (t.elapsed().as_secs_f64(), last)
+        };
+
+        const REPS: usize = 8;
+        let mut wins = 0;
+        let mut wins2 = 0;
+        let mut a_tot = 0.0;
+        let mut b_tot = 0.0;
+        let mut c_tot = 0.0;
+        for rep in 0..REPS {
+            let (ta, ma, tb, mb, tc, mc) = if rep % 2 == 0 {
+                let (ta, ma) = run_plain(&f, &b);
+                let (tb, mb) = run_la(&f, &b);
+                let (tc, mc) = run_la_entry(&f, &b);
+                (ta, ma, tb, mb, tc, mc)
+            } else {
+                let (tc, mc) = run_la_entry(&f, &b);
+                let (tb, mb) = run_la(&f, &b);
+                let (ta, ma) = run_plain(&f, &b);
+                (ta, ma, tb, mb, tc, mc)
+            };
+            assert_eq!(ma.u_0, mb.u_0);
+            assert_eq!(ma.u_2, mb.u_2);
+            assert_eq!(ma.u_0, mc.u_0);
+            assert_eq!(ma.u_2, mc.u_2);
+            if tb < ta {
+                wins += 1;
+            }
+            if tc < ta {
+                wins2 += 1;
+            }
+            a_tot += ta;
+            b_tot += tb;
+            c_tot += tc;
+            eprintln!(
+                "rep {rep}: plain {:7.2} ms   lookahead {:7.2} ms   entry-skip {:7.2} ms",
+                ta * 1e3,
+                tb * 1e3,
+                tc * 1e3,
+            );
+        }
+        eprintln!(
+            "avg: plain {:7.2} ms   lookahead {:7.2} ms ({wins}/{REPS})   entry-skip {:7.2} ms ({wins2}/{REPS})",
+            a_tot / REPS as f64 * 1e3,
+            b_tot / REPS as f64 * 1e3,
+            c_tot / REPS as f64 * 1e3
+        );
+    }
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the
