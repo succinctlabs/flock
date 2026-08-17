@@ -86,6 +86,15 @@ pub trait Challenger: Send {
     fn verify_pow(&mut self, _nonce: u64, _bits: u32) -> bool {
         true
     }
+
+    /// The hash backing this transcript, for protocol components that derive
+    /// auxiliary randomness outside the challenger itself (e.g. the AG-skip
+    /// `r₁` nonce-grind DRBG) and must follow the transcript's hash choice so
+    /// no second primitive enters the soundness argument. Default SHA-256
+    /// (`RandomChallenger` and legacy implementations inherit it).
+    fn hash_kind(&self) -> HashKind {
+        HashKind::Sha256
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +330,10 @@ impl FsChallenger {
 }
 
 impl Challenger for FsChallenger {
+    fn hash_kind(&self) -> HashKind {
+        FsChallenger::hash_kind(self)
+    }
+
     fn observe_label(&mut self, label: &[u8]) {
         self.absorb(&[OP_LABEL]);
         self.absorb(&(label.len() as u64).to_le_bytes());

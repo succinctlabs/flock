@@ -1457,6 +1457,94 @@ impl Blake3Setup {
             challenger,
         )
     }
+
+    /// AG-skip mirror of [`Self::prove_fast`]: round 1 of the zerocheck runs
+    /// on the genus-95 AG multiplication code instead of the RS additive-NTT
+    /// skip; everything else (witness gen, commit, lincheck, ring-switch open)
+    /// is shared. Witness generation dispatches on the r1cs's witness layout,
+    /// so both row-major and batch-major setups work. aarch64-only (NEON
+    /// round-1 kernel).
+    #[cfg(target_arch = "aarch64")]
+    pub fn prove_fast_ag<Ch: Challenger>(
+        &self,
+        blocks: &[Compression],
+        challenger: &mut Ch,
+    ) -> (
+        flock_core::proof::R1csProofLigeritoAg,
+        Commitment,
+        R1csClaim,
+    ) {
+        assert_eq!(blocks.len(), self.n_blocks);
+        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
+            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                self.generate_witness_ab(blocks)
+            });
+        let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        crate::prover::prove_fast_ligerito_ag_from_witness(
+            &self.r1cs,
+            &self.pcs_params,
+            z_packed,
+            a_packed_f128,
+            b_packed_f128,
+            z_packed_lincheck,
+            lc_circuit,
+            codeword,
+            challenger,
+        )
+    }
+
+    /// AG-skip mirror of [`Self::prove_fast_timed`]: per-phase prove
+    /// breakdown (witness / commit / AG zerocheck / lincheck / open).
+    /// Benchmark-only; aarch64.
+    #[cfg(target_arch = "aarch64")]
+    pub fn prove_fast_ag_timed<Ch: Challenger>(
+        &self,
+        blocks: &[Compression],
+        challenger: &mut Ch,
+    ) -> (
+        flock_core::proof::R1csProofLigeritoAg,
+        Commitment,
+        R1csClaim,
+        crate::prover::ProvePhaseTimings,
+    ) {
+        assert_eq!(blocks.len(), self.n_blocks);
+        let t0 = std::time::Instant::now();
+        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
+            self.generate_witness_ab(blocks);
+        let witness_s = t0.elapsed().as_secs_f64();
+        let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_ag_timed(
+            &self.r1cs,
+            &self.pcs_params,
+            z_packed,
+            a_packed_f128,
+            b_packed_f128,
+            z_packed_lincheck,
+            lc_circuit,
+            None,
+            challenger,
+        );
+        timings.witness_s = witness_s;
+        (proof, commitment, claim, timings)
+    }
+
+    /// AG-skip mirror of [`Self::verify`].
+    pub fn verify_ag<Ch: Challenger>(
+        &self,
+        commitment: &Commitment,
+        proof: &flock_core::proof::R1csProofLigeritoAg,
+        challenger: &mut Ch,
+    ) -> Result<R1csClaim, verifier::VerifyError> {
+        let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        verifier::verify_ligerito_ag(
+            &self.r1cs,
+            commitment,
+            proof,
+            lc_circuit,
+            &self.pcs_params,
+            challenger,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1816,6 +1904,78 @@ mod tests {
         assert!(
             setup.verify(&commitment, &bad, &mut ch).is_err(),
             "tampered batch-major proof accepted"
+        );
+    }
+
+    /// AG-skip e2e: prove_fast_ag → verify_ag roundtrip + tamper rejection,
+    /// through the full commit → AG zerocheck → lincheck → ring-switch
+    /// Ligerito open pipeline.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore] // Heavy — run with `cargo test prove_fast_ligerito_ag_roundtrip -- --ignored`
+    fn prove_fast_ligerito_ag_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        let setup = Blake3Setup::new(256);
+        let mut rng = Rng::new(0xb1a_3a9_211e);
+        let blocks: Vec<Compression> = (0..256)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, 0u64, 64u32, 11u32)
+            })
+            .collect();
+        let mut ch_p = FsChallenger::new(b"flock-blake3-ag-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast_ag(&blocks, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-blake3-ag-v0");
+        let claim_v = setup
+            .verify_ag(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("AG verify rejected honest blake3 proof: {e:?}"));
+        assert_eq!(claim_p, claim_v, "AG verifier claim != prover claim");
+
+        // Tampering an AG round-1 message must reject.
+        let mut bad = proof.clone();
+        bad.ag.round1_ab[0] += flock_core::field::F128::ONE;
+        let mut ch_b = FsChallenger::new(b"flock-blake3-ag-v0");
+        assert!(
+            setup.verify_ag(&commitment, &bad, &mut ch_b).is_err(),
+            "must reject a tampered AG proof"
+        );
+    }
+
+    /// Batch-major AG roundtrip: the AG claim points are built through the
+    /// layout-aware [`BlockR1cs`] constructors, so the batch-major witness
+    /// layout works unchanged (mirror of `batch_major_prove_fast_roundtrip`).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore] // Heavy — run with `cargo test batch_major_prove_fast_ag_roundtrip -- --ignored`
+    fn batch_major_prove_fast_ag_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+
+        let setup = Blake3Setup::new_batch_major(256);
+        let mut rng = Rng::new(0xBA7C_F013);
+        let inputs: Vec<Compression> = (0..256)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+                (cv, m, counter, 64u32, 11u32)
+            })
+            .collect();
+
+        let mut ch_p = FsChallenger::new(b"flock-ag-batch-major-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast_ag(&inputs, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-ag-batch-major-v0");
+        let claim_v = setup
+            .verify_ag(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("batch-major AG verifier rejected: {e:?}"));
+        assert_eq!(claim_p, claim_v);
+
+        let mut bad = proof.clone();
+        bad.ag.final_a_eval.lo ^= 1;
+        let mut ch = FsChallenger::new(b"flock-ag-batch-major-v0");
+        assert!(
+            setup.verify_ag(&commitment, &bad, &mut ch).is_err(),
+            "tampered batch-major AG proof accepted"
         );
     }
 

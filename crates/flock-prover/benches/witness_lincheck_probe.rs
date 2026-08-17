@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use flock_prover::challenger::FsChallenger;
 use flock_prover::field::F128;
-use flock_prover::lincheck::{QuirkyPoint, prove_padded_capture_z_vec};
+use flock_prover::lincheck::{QuirkyPoint, SkipPoint, prove_padded_capture_z_vec};
 use flock_prover::r1cs_hashes::blake3::{
     Blake3Setup, Compression, K_SKIP, generate_witness_with_ab_packed_and_lincheck,
     min_n_blocks_log,
@@ -94,7 +94,7 @@ fn main() {
 
     // Fixed claim point with the real blake3 dims.
     let x_ab = QuirkyPoint {
-        z_skip: rng.f128(),
+        z_skip: SkipPoint::Phi8(rng.f128()),
         x_inner_rest: (0..r1cs.k_log - K_SKIP).map(|_| rng.f128()).collect(),
         x_outer: (0..m - r1cs.k_log).map(|_| rng.f128()).collect(),
     };
@@ -164,7 +164,7 @@ fn main() {
         h.f128s(&[*m1, *mi]);
     }
     h.f128s(&lc_proof.z_partial);
-    h.f128s(&[lc_claim.r_inner_skip, lc_claim.w]);
+    h.f128s(&[lc_claim.r_inner_skip.phi8(), lc_claim.w]);
     h.f128s(&lc_claim.r_inner_rest);
     h.f128s(&z_vec_pre);
     println!("lc min: {lc_min:.2} ms  checksum_lc: {:016x}", h.0);

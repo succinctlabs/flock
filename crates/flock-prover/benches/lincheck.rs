@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use flock_prover::challenger::FsChallenger;
 use flock_prover::field::F128;
-use flock_prover::lincheck::{QuirkyPoint, SparseMatrixCircuit, prove};
+use flock_prover::lincheck::{QuirkyPoint, SkipPoint, SparseMatrixCircuit, prove};
 use flock_prover::r1cs::SparseBinaryMatrix;
 
 const K_LOG: usize = 11; // k = 2048
@@ -119,7 +119,7 @@ fn main() {
             let mut z_packed = vec![0u8; n_bytes];
             rng.fill_bytes(&mut z_packed);
             let x_ab = QuirkyPoint {
-                z_skip: rng.f128(),
+                z_skip: SkipPoint::Phi8(rng.f128()),
                 x_inner_rest: rng.f128_vec(K_LOG - K_SKIP),
                 x_outer: rng.f128_vec(m - K_LOG),
             };

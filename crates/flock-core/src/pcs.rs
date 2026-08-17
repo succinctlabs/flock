@@ -563,7 +563,7 @@ pub struct PackedDirectClaimRef<'a> {
 pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[F128],
-    z_skips: &[F128],
+    skip_weights: &[&[F128]],
     x_outers: &[&[F128]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     proof: &BatchOpeningProofLigerito,
@@ -572,7 +572,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
 ) -> Result<(), VerifyError> {
     let n_rs = claims.len();
     let n_pd = packed_direct.len();
-    assert_eq!(z_skips.len(), n_rs);
+    assert_eq!(skip_weights.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
     assert_eq!(proof.ring_switches.len(), n_rs);
     assert!(n_rs + n_pd > 0);
@@ -586,7 +586,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
     for i in 0..n_rs {
         let out = ring_switch::verify_succinct(
             claims[i],
-            z_skips[i],
+            skip_weights[i],
             x_outers[i],
             &proof.ring_switches[i],
             challenger,
@@ -827,7 +827,7 @@ mod tests {
         verify_opening_batch_ligerito_mixed(
             &commitment,
             &[rs_claim],
-            &[z_skip],
+            &[&lagrange_weights_naive(6, z_skip)],
             &[x_outer.as_slice()],
             &[],
             &proof,

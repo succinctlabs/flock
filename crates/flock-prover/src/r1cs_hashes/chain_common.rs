@@ -387,10 +387,12 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
         .ligerito_verifier_config()
         .expect("Ligerito default verifier config for chain verify");
 
+    let ab_skip_weights = ab.point.z_skip.weights(flock_core::pcs::LOG_PACKING - 1);
+    let c_skip_weights = c.point.z_skip.weights(flock_core::pcs::LOG_PACKING - 1);
     flock_core::pcs::verify_opening_batch_ligerito_mixed(
         commitment,
         &[ab.value, c.value],
-        &[ab.point.z_skip, c.point.z_skip],
+        &[&ab_skip_weights, &c_skip_weights],
         &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
         std::slice::from_ref(&pd_ref),
         &proof.pcs_open,

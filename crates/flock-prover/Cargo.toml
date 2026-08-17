@@ -30,6 +30,26 @@ keccak = { workspace = true }
 sha3 = { workspace = true }
 
 [[bench]]
+name = "blake3_rs_vs_ag"
+harness = false
+
+[[bench]]
+name = "ag_breakdown"
+harness = false
+
+[[bench]]
+name = "ag_round1_ab"
+harness = false
+
+[[bench]]
+name = "ag_e2e_zerocheck"
+harness = false
+
+[[bench]]
+name = "ag_lookahead_ab"
+harness = false
+
+[[bench]]
 name = "genus95_curve_code"
 harness = false
 

@@ -20,6 +20,12 @@ use crate::field::{F8, F128};
 use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 use serde::{Deserialize, Serialize};
 
+// The AG-skip prover half (round-1 kernel drivers, friendly-Horner tail,
+// r1 nonce grind) is only reachable from aarch64-gated entry points; the
+// verifier half is cross-arch. Silence the resulting dead-code cascade on
+// non-aarch64 lint legs at the module level — aarch64 keeps full detection.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub mod ag_skip;
 pub mod multilinear;
 pub mod univariate_skip;
 pub mod univariate_skip_deg4;

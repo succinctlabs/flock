@@ -1046,6 +1046,197 @@ fn uni_skip_fold_and_round_pair_optimized_packed_serial(
     (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf)
 }
 
+// ---------------------------------------------------------------------------
+// Sumcheck LOOKAHEAD (Rothblum): one pass accumulates the BIVARIATE
+//
+//   Q(X,Y) = Σ_u eq(rest,u) · â(X,Y,u) · b̂(X,Y,u)
+//
+// covering the next TWO rounds. The first round's message is the Y∈{0,1}
+// eq-weighted combination of Q's rows; once its challenge ρ arrives, the
+// second round's message is Q(ρ,·) — both O(1) from 8 accumulated sums, no
+// pass over the data. Each pass then folds TWO already-bound variables (4→1),
+// so per two rounds the traffic drops from (read 2n + write n) + (read n +
+// write n/2) to (read 2n + write n/2) — −44% in the tail's fully memory-bound
+// regime, where the extra multiplies hide (measured: fold-only == full).
+//
+// TRANSCRIPT-INVARIANT: exact field arithmetic means the derived messages
+// equal the classically computed ones bit-for-bit (see the parity test); only
+// the prover's evaluation strategy changes.
+//
+// The 8 sums (X kept in coefficient form — ρ is unknown at accumulation time;
+// the Y=0 column only ever feeds the first message at X∈{1,∞}, so it needs
+// just those two projections rather than 3 coefficients):
+//   s10   = Σ eq·A(1,0)B(1,0)                (col Y=0 @ X=1)
+//   sinf0 = Σ eq·ΔₓA(0)·ΔₓB(0)               (col Y=0, X-leading)
+//   s1    = X-coeffs of col Y=1  (accumulated as c0, value@X=1, c2)
+//   sinf  = X-coeffs of col Y=∞  (the Y-slope product column, same trick)
+// ---------------------------------------------------------------------------
+
+/// The reduced lookahead sums for one pass.
+#[derive(Clone, Copy, Debug)]
+pub struct LookaheadSums {
+    pub s10: F128,
+    pub sinf0: F128,
+    pub s1: [F128; 3],
+    pub sinf: [F128; 3],
+}
+
+/// First-message derivation (Convention A, the AG tail's `r_next[0] = ONE`):
+/// eq-weighted combination of the Y∈{0,1} rows, `r_y` = eq coord of Y.
+#[inline]
+pub fn lookahead_msg_first(q: &LookaheadSums, r_y: F128) -> (F128, F128) {
+    let om = F128::ONE + r_y; // 1−r_y in char 2
+    let col1_at1 = q.s1[0] + q.s1[1] + q.s1[2];
+    (om * q.s10 + r_y * col1_at1, om * q.sinf0 + r_y * q.s1[2])
+}
+
+/// Second-message derivation after the first variable binds to `rho`:
+/// evaluate the two column polynomials at `rho`. Zero passes.
+#[inline]
+pub fn lookahead_msg_second(q: &LookaheadSums, rho: F128) -> (F128, F128) {
+    let r2 = rho * rho;
+    (
+        q.s1[0] + rho * q.s1[1] + r2 * q.s1[2],
+        q.sinf[0] + rho * q.sinf[1] + r2 * q.sinf[2],
+    )
+}
+
+/// The 8 per-position Q products from the 4 folded values per witness
+/// (index = x + 2y): [s10, sinf0, c0, t11, c2, d0, dt, d2] — see the module
+/// comment for which sum each feeds.
+#[inline(always)]
+pub(crate) fn lookahead_products(ga: &[F128; 4], gb: &[F128; 4]) -> [F128; 8] {
+    let (ga00, ga10, ga01, ga11) = (ga[0], ga[1], ga[2], ga[3]);
+    let (gb00, gb10, gb01, gb11) = (gb[0], gb[1], gb[2], gb[3]);
+    let sxa0 = ga00 + ga10;
+    let sxb0 = gb00 + gb10;
+    let sxa1 = ga01 + ga11;
+    let sxb1 = gb01 + gb11;
+    let dca = ga00 + ga01;
+    let dcb = gb00 + gb01;
+    let dsa = sxa0 + sxa1;
+    let dsb = sxb0 + sxb1;
+    [
+        ga10 * gb10,               // s10
+        sxa0 * sxb0,               // sinf0
+        ga01 * gb01,               // col1 c0
+        ga11 * gb11,               // col1 @ X=1
+        sxa1 * sxb1,               // col1 c2
+        dca * dcb,                 // col∞ c0
+        (dca + dsa) * (dcb + dsb), // col∞ @ X=1
+        dsa * dsb,                 // col∞ c2
+    ]
+}
+
+/// Per-position Q contribution, eq-weighted into the 8 unreduced accumulators.
+#[inline(always)]
+fn lookahead_accum(ga: &[F128; 4], gb: &[F128; 4], eq: F128, acc: &mut [F256Unreduced; 8]) {
+    let p = lookahead_products(ga, gb);
+    for k in 0..8 {
+        acc[k] ^= eq.mul_unreduced(p[k]);
+    }
+}
+
+pub(crate) fn lookahead_finish(s: [F128; 8]) -> LookaheadSums {
+    let [s10, sinf0, c0, t11, c2, d0, dt, d2] = s;
+    LookaheadSums {
+        s10,
+        sinf0,
+        s1: [c0, t11 + c0 + c2, c2],
+        sinf: [d0, dt + d0 + d2, d2],
+    }
+}
+
+macro_rules! lookahead_pass {
+    ($name:ident, $per_u:expr, $fold:expr, $doc:literal) => {
+        #[doc = $doc]
+        /// Writes the folded arrays into `a_out`/`b_out` and returns the 8
+        /// lookahead sums over the next two variables. `r_y` is the eq coord of
+        /// the SECOND lookahead variable; `rest` the coords after it
+        /// (`rest.len() == log2(out_len/4)`). Parallel over the eq-hi chunks.
+        pub fn $name(
+            a: &[F128],
+            b: &[F128],
+            a_out: &mut [F128],
+            b_out: &mut [F128],
+            rhos: (F128, F128),
+            rest: &[F128],
+        ) -> LookaheadSums {
+            use rayon::prelude::*;
+            const PER_U: usize = $per_u;
+            let n_u = a.len() / PER_U;
+            assert_eq!(a.len(), b.len());
+            assert_eq!(a.len() % PER_U, 0);
+            assert_eq!(a_out.len(), 4 * n_u);
+            assert_eq!(b_out.len(), 4 * n_u);
+            assert_eq!(
+                1usize << rest.len(),
+                n_u,
+                "rest coords must cover log2(len/{PER_U})"
+            );
+            let n_lo = rest.len() / 2;
+            let eq_lo = build_eq(&rest[..n_lo]);
+            let eq_hi = build_eq(&rest[n_lo..]);
+            let lo_size = eq_lo.len();
+            let fold = $fold;
+            let sums = a_out
+                .par_chunks_mut(4 * lo_size)
+                .zip(b_out.par_chunks_mut(4 * lo_size))
+                .enumerate()
+                .map(|(u_hi, (ao, bo))| {
+                    let mut acc = [F256Unreduced::ZERO; 8];
+                    let base_u = u_hi * lo_size;
+                    for u_lo in 0..lo_size {
+                        let u = base_u + u_lo;
+                        let mut ga = [F128::ZERO; 4];
+                        let mut gb = [F128::ZERO; 4];
+                        for v in 0..4usize {
+                            let base = u * PER_U + v * (PER_U / 4);
+                            ga[v] = fold(&a[base..], rhos);
+                            gb[v] = fold(&b[base..], rhos);
+                            ao[4 * u_lo + v] = ga[v];
+                            bo[4 * u_lo + v] = gb[v];
+                        }
+                        lookahead_accum(&ga, &gb, eq_lo[u_lo], &mut acc);
+                    }
+                    let eh = eq_hi[u_hi];
+                    let mut out = [F128::ZERO; 8];
+                    for k in 0..8 {
+                        out[k] = eh * acc[k].reduce();
+                    }
+                    out
+                })
+                .reduce(
+                    || [F128::ZERO; 8],
+                    |mut p, q| {
+                        for k in 0..8 {
+                            p[k] += q[k];
+                        }
+                        p
+                    },
+                );
+            lookahead_finish(sums)
+        }
+    };
+}
+
+lookahead_pass!(
+    fold1_lookahead_into,
+    8,
+    |e: &[F128], r: (F128, F128)| e[0] + r.0 * (e[0] + e[1]),
+    "Entry lookahead pass: fold ONE pending variable (`rhos.0`; `rhos.1` unused), n → n/2."
+);
+lookahead_pass!(
+    fold2_lookahead_into,
+    16,
+    |e: &[F128], r: (F128, F128)| {
+        let x0 = e[0] + r.0 * (e[0] + e[1]);
+        let x1 = e[2] + r.0 * (e[2] + e[3]);
+        x0 + r.1 * (x0 + x1)
+    },
+    "Steady-state lookahead pass: fold TWO pending variables (4→1), n → n/4."
+);
+
 /// `&[bool]` convenience wrapper around
 /// [`uni_skip_fold_and_round_pair_optimized_packed`]. Packs internally, builds
 /// the fold table from `z`.

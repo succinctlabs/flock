@@ -27,8 +27,11 @@
 
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
+use flock_core::lincheck::SkipPoint;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
+#[cfg(target_arch = "aarch64")]
+use flock_core::proof::R1csProofLigeritoAg;
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
@@ -140,7 +143,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
     );
 
-    let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
@@ -160,7 +163,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: lc_claim.w,
     };
     let c = ZClaim {
-        point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+        point: r1cs.c_claim_point(SkipPoint::Phi8(zc_claim.z), &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
 
@@ -257,6 +260,300 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     };
     let claim = R1csClaim { ab, c };
     (proof, commitment, claim)
+}
+
+/// AG-skip mirror of [`prove_ligerito`]: same commit → bind → zerocheck →
+/// lincheck → ring-switch open pipeline, with round 1 of the zerocheck run on
+/// the genus-95 AG multiplication code. The `(ab, c)` claims carry AG
+/// base-code skip weights (`SkipPoint::Ag`) instead of φ₈ (`SkipPoint::Phi8`);
+/// the c-claim point is `(skip = r₁, rest = friendly ‖ outer)`. aarch64-only
+/// (the AG round-1 kernel is NEON).
+#[cfg(target_arch = "aarch64")]
+pub fn prove_ligerito_ag<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    z_packed: Vec<F128>,
+    pcs_params: &PcsParams,
+    challenger: &mut Ch,
+) -> (R1csProofLigeritoAg, Commitment, R1csClaim) {
+    assert_eq!(
+        r1cs.layout,
+        flock_core::r1cs::WitnessLayout::RowMajor,
+        "the generic matrix-driven provers assume the row-major layout"
+    );
+    assert_eq!(z_packed.len(), 1usize << (r1cs.m - 7));
+    assert_eq!(pcs_params.m, r1cs.m);
+    assert_eq!(
+        r1cs.k_skip,
+        zerocheck::ag_skip::K_SKIP,
+        "AG skip is k_skip=6"
+    );
+    assert!(
+        r1cs.c0_is_identity(),
+        "prove_ligerito_ag: C = I convention required (c aliases z)"
+    );
+
+    // a = A·z, b = B·z; for the C = I convention c aliases z (see `prove_ligerito`).
+    let a_packed_f128 = r1cs.apply_a_packed(&z_packed);
+    let b_packed_f128 = r1cs.apply_b_packed(&z_packed);
+    let z_packed_lincheck = lincheck::pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
+    let lc_circuit =
+        lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
+    prove_fast_ligerito_ag_from_witness(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        &lc_circuit,
+        None,
+        challenger,
+    )
+}
+
+/// AG-skip mirror of [`prove_fast_ligerito_from_witness`]: commit → bind →
+/// **AG zerocheck** ([`zerocheck::ag_skip`]) → lincheck → ring-switch Ligerito
+/// open. The zerocheck's `s_hat_v_c` capture and lincheck's `z_vec` capture
+/// feed the open exactly as in the RS path; claim points are built through the
+/// layout-aware [`BlockR1cs`] constructors, so both witness layouts work.
+/// aarch64-only (the AG round-1 kernel is NEON).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_ag_from_witness<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigeritoAg, Commitment, R1csClaim) {
+    assert_eq!(
+        r1cs.k_skip,
+        zerocheck::ag_skip::K_SKIP,
+        "AG skip is k_skip=6"
+    );
+    let lig_config = pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito default config; bump m for tiny instances");
+
+    let (commitment, prover_data) = match prefaulted_codeword {
+        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
+        None => pcs::commit(&z_packed, pcs_params),
+    };
+    bind_statement(challenger, r1cs, &commitment);
+
+    // ---- AG-skip zerocheck (round 1 = genus-95 AG code; tail = shared MLV).
+    // Capture s_hat_v_c so the open skips fold_1b_rows for the c-claim.
+    let (ag_proof, ag_claim, s_hat_v_c) = {
+        let cast = |v: &[F128]| -> &[u8] {
+            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+        };
+        zerocheck::ag_skip::prove_capture_s_hat_v_c(
+            cast(&a_packed_f128),
+            cast(&b_packed_f128),
+            cast(&z_packed),
+            r1cs.m,
+            challenger,
+        )
+    };
+    flock_core::scratch::give_f128(a_packed_f128);
+    flock_core::scratch::give_f128(b_packed_f128);
+
+    // ---- Translate AG zerocheck output → lincheck input. Structurally
+    // identical to the RS path (`mlv_challenges` binds the m−k_skip non-skip
+    // bits low→high, address-ordered), only the skip basis differs (Ag vs Phi8).
+    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Ag(ag_claim.r1), &ag_claim.mlv_challenges);
+
+    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+        &z_packed_lincheck,
+        r1cs.m,
+        r1cs.k_log,
+        r1cs.k_skip,
+        r1cs.useful_bits,
+        lincheck_circuit,
+        &x_ab,
+        challenger,
+    );
+    drop(z_packed_lincheck);
+
+    let ab = ZClaim {
+        point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
+        value: lc_claim.w,
+    };
+    // c-claim: ĉ = ẑ (C = I). Skip = r₁ (AG), rest = ag_claim.r_rest
+    // (friendly ‖ outer); value = ⟨base(r₁), w̄⟩ (κ already in w̄).
+    let c = ZClaim {
+        point: r1cs.c_claim_point(SkipPoint::Ag(ag_claim.r1), &ag_claim.r_rest),
+        value: ag_claim.c_eval,
+    };
+
+    // AB s_hat_v from lincheck's pre-sumcheck z_vec (basis-agnostic: it folds
+    // the witness bits, the skip weights enter only at claim_check). The c
+    // s_hat_v was captured during the AG round-1 c-scan.
+    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else {
+        None
+    };
+
+    let padding = r1cs.padding_spec();
+    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pcs_open = open_claims_with_precomputed_ligerito(
+        z_packed,
+        &prover_data,
+        &commitment,
+        &[ab.clone(), c.clone()],
+        &[pre_ab, pre_c],
+        &padding,
+        &lig_config,
+        challenger,
+    );
+
+    let proof = R1csProofLigeritoAg {
+        ag: ag_proof,
+        lincheck: lc_proof,
+        pcs_open,
+    };
+    let claim = R1csClaim { ab, c };
+    (proof, commitment, claim)
+}
+
+/// **AG-skip** mirror of [`prove_fast_ligerito_timed`]: per-phase timers around
+/// [`prove_fast_ligerito_ag_from_witness`]'s phases (commit / AG zerocheck /
+/// lincheck / open). `zerocheck_s` is the genus-95 AG round 1 + multilinear
+/// tail; everything else is the shared path. Benchmark-only; aarch64.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_ag_timed<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (
+    R1csProofLigeritoAg,
+    Commitment,
+    R1csClaim,
+    ProvePhaseTimings,
+) {
+    use std::time::Instant;
+    let mut t = ProvePhaseTimings::default();
+    assert_eq!(
+        r1cs.k_skip,
+        zerocheck::ag_skip::K_SKIP,
+        "AG skip is k_skip=6"
+    );
+
+    let lig_config = pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito default config; bump m for tiny instances");
+
+    // --- PCS commit ---
+    let t0 = Instant::now();
+    let (commitment, prover_data) = match prefaulted_codeword {
+        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
+        None => pcs::commit(&z_packed, pcs_params),
+    };
+    t.commit_s = t0.elapsed().as_secs_f64();
+    bind_statement(challenger, r1cs, &commitment);
+
+    // --- AG-skip zerocheck (capturing s_hat_v_c) ---
+    let t0 = Instant::now();
+    let (ag_proof, ag_claim, s_hat_v_c) = {
+        let a_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                a_packed_f128.as_ptr() as *const u8,
+                a_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let b_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                b_packed_f128.as_ptr() as *const u8,
+                b_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let c_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr() as *const u8,
+                z_packed.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        zerocheck::ag_skip::prove_capture_s_hat_v_c(
+            a_packed, b_packed, c_packed, r1cs.m, challenger,
+        )
+    };
+    t.zerocheck_s = t0.elapsed().as_secs_f64();
+    flock_core::scratch::give_f128(a_packed_f128);
+    flock_core::scratch::give_f128(b_packed_f128);
+
+    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Ag(ag_claim.r1), &ag_claim.mlv_challenges);
+
+    // --- lincheck + base-claim / s_hat_v setup ---
+    let t0 = Instant::now();
+    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+        &z_packed_lincheck,
+        r1cs.m,
+        r1cs.k_log,
+        r1cs.k_skip,
+        r1cs.useful_bits,
+        lincheck_circuit,
+        &x_ab,
+        challenger,
+    );
+    drop(z_packed_lincheck);
+    let ab = ZClaim {
+        point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
+        value: lc_claim.w,
+    };
+    let c = ZClaim {
+        point: r1cs.c_claim_point(SkipPoint::Ag(ag_claim.r1), &ag_claim.r_rest),
+        value: ag_claim.c_eval,
+    };
+    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else {
+        None
+    };
+    t.lincheck_s = t0.elapsed().as_secs_f64();
+
+    // --- Ligerito recursive PCS open ---
+    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let padding = r1cs.padding_spec();
+    let t0 = Instant::now();
+    let pcs_open = open_claims_with_precomputed_ligerito(
+        z_packed,
+        &prover_data,
+        &commitment,
+        &[ab.clone(), c.clone()],
+        &[pre_ab, pre_c],
+        &padding,
+        &lig_config,
+        challenger,
+    );
+    t.open_s = t0.elapsed().as_secs_f64();
+
+    let proof = R1csProofLigeritoAg {
+        ag: ag_proof,
+        lincheck: lc_proof,
+        pcs_open,
+    };
+    let claim = R1csClaim { ab, c };
+    (proof, commitment, claim, t)
 }
 
 /// Everything the prover produces *before* the PCS open: the zerocheck +
@@ -369,7 +666,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
-    let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
@@ -392,7 +689,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         value: lc_claim.w,
     };
     let c = ZClaim {
-        point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+        point: r1cs.c_claim_point(SkipPoint::Phi8(zc_claim.z), &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
 
@@ -502,7 +799,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
-    let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
@@ -522,7 +819,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         value: lc_claim.w,
     };
     let c = ZClaim {
-        point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+        point: r1cs.c_claim_point(SkipPoint::Phi8(zc_claim.z), &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
     let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {

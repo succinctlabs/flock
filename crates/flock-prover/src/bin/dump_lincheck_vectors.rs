@@ -47,7 +47,8 @@ use std::io::{BufWriter, Write};
 use flock_prover::challenger::{Challenger, FsChallenger};
 use flock_prover::field::F128;
 use flock_prover::lincheck::{
-    self, CscCircuit, LincheckCircuit, QuirkyPoint, build_eq_table, build_quirky_eq_table,
+    self, CscCircuit, LincheckCircuit, QuirkyPoint, SkipPoint, build_eq_table,
+    build_quirky_eq_table,
 };
 use flock_prover::r1cs::SparseBinaryMatrix;
 
@@ -175,7 +176,7 @@ fn main() -> std::io::Result<()> {
 
     // --- Quirky claim point.
     let x_ab = QuirkyPoint {
-        z_skip: rng.next_f128(),
+        z_skip: SkipPoint::Phi8(rng.next_f128()),
         x_inner_rest: (0..inner_rest_len).map(|_| rng.next_f128()).collect(),
         x_outer: (0..n_log).map(|_| rng.next_f128()).collect(),
     };
@@ -202,7 +203,7 @@ fn main() -> std::io::Result<()> {
     let mut ch2 = FsChallenger::new(DOMAIN);
     ch2.observe_label(b"flock-lincheck-v0");
     let alpha = ch2.sample_f128();
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    let eq_inner = build_quirky_eq_table(x_ab.z_skip.phi8(), &x_ab.x_inner_rest, k_skip);
     let comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
     assert_eq!(comb_vec.len(), k);
     // sanity: the public build_eq_table(x_outer) the prover folds against.
@@ -237,7 +238,7 @@ fn main() -> std::io::Result<()> {
         write_u32(&mut w, v)?;
     }
 
-    write_f128(&mut w, x_ab.z_skip)?;
+    write_f128(&mut w, x_ab.z_skip.phi8())?;
     for &x in &x_ab.x_inner_rest {
         write_f128(&mut w, x)?;
     }
@@ -261,7 +262,7 @@ fn main() -> std::io::Result<()> {
     for &x in &proof.z_partial {
         write_f128(&mut w, x)?;
     }
-    write_f128(&mut w, claim.r_inner_skip)?;
+    write_f128(&mut w, claim.r_inner_skip.phi8())?;
     write_f128(&mut w, claim.w)?;
     w.flush()?;
 

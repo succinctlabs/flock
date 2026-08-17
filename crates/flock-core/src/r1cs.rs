@@ -245,7 +245,7 @@ impl BlockR1cs {
     /// being `[dim6, chunk…]`.
     pub fn x_ab_from_mlv(
         &self,
-        z_skip: crate::field::F128,
+        z_skip: crate::lincheck::SkipPoint,
         mlv: &[crate::field::F128],
     ) -> crate::lincheck::QuirkyPoint {
         let inner_rest_len = self.k_log - self.k_skip;
@@ -279,7 +279,7 @@ impl BlockR1cs {
     /// See [`WitnessLayout`] for the BatchMajor point convention.
     pub fn ab_claim_point(
         &self,
-        r_inner_skip: crate::field::F128,
+        r_inner_skip: crate::lincheck::SkipPoint,
         r_inner_rest: &[crate::field::F128],
         x_outer: &[crate::field::F128],
     ) -> crate::lincheck::QuirkyPoint {
@@ -306,7 +306,7 @@ impl BlockR1cs {
     /// `r_rest` (which is address-ordered in both layouts).
     pub fn c_claim_point(
         &self,
-        z_skip: crate::field::F128,
+        z_skip: crate::lincheck::SkipPoint,
         r_rest: &[crate::field::F128],
     ) -> crate::lincheck::QuirkyPoint {
         let inner_rest_len = self.k_log - self.k_skip;
