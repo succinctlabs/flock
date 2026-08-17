@@ -403,3 +403,104 @@ pub fn partial_fold_packed_z_neon_oblock_padded(
     }
     out
 }
+
+/// All-core (P+E) sibling of [`partial_fold_packed_z_neon_oblock_padded`] —
+/// bit-identical result, run on [`crate::all_core_pool`] with **dynamic** tile
+/// assignment. oblock's static one-band-per-worker split assumes homogeneous
+/// workers; on a mixed P+E pool an E-core's band would straggle the join and
+/// erase the extra-core win. Here every worker pulls the next tile off a
+/// shared atomic counter (a tile is ~12 µs of P-core work at m=30, so the
+/// counter is uncontended and the tail ragged by at most one tile), builds
+/// that tile's sum-tables exactly once (oblock's key property, preserved),
+/// and folds into a private length-k partial; the ≤`p` partials XOR-reduce at
+/// the end. Output is exact regardless of which worker takes which tile:
+/// GF(2¹²⁸) add is XOR — associative + commutative.
+///
+/// # Safety / preconditions: identical to the oblock kernel.
+pub fn partial_fold_packed_z_neon_allcore_padded(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TILE_T: usize = NEON_TILE_T;
+    const BLOCK_K: usize = 8;
+
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_packed.len(), (1usize << m) / 8);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(
+        n_log >= 3 + TILE_T.trailing_zeros() as usize,
+        "need n_outer ≥ 8·TILE_T stripes"
+    );
+    assert!(k_log >= 3, "need k ≥ 8");
+    assert!(useful_bits <= k);
+    let n_stripes = n_outer / 8;
+    assert_eq!(n_stripes % TILE_T, 0);
+    assert_eq!(k % BLOCK_K, 0);
+    let n_tiles = n_stripes / TILE_T;
+
+    // Only i_inner < useful_bits can be nonzero (padded rows fold to 0). Rounded
+    // up to BLOCK_K; columns [useful, k) stay zero from the partial init.
+    let useful = (useful_bits.div_ceil(BLOCK_K) * BLOCK_K).min(k);
+    if useful == 0 {
+        return vec![F128::ZERO; k];
+    }
+
+    let pool = crate::all_core_pool();
+    let next_tile = AtomicUsize::new(0);
+    let partials: Vec<Vec<F128>> = pool.broadcast(|_| {
+        let mut partial = vec![F128::ZERO; k];
+        // TILE_T × 256 F128 = 32 KB tables, L1-resident, built once per tile.
+        let mut tables = vec![F128::ZERO; TILE_T * 256];
+        loop {
+            let tile = next_tile.fetch_add(1, Ordering::Relaxed);
+            if tile >= n_tiles {
+                break;
+            }
+            let stripe_base = tile * TILE_T;
+            for t in 0..TILE_T {
+                let eq_off = 8 * (stripe_base + t);
+                build_sum_table(
+                    &eq_outer[eq_off..eq_off + 8],
+                    &mut tables[t * 256..(t + 1) * 256],
+                );
+            }
+            let tables_ptr = tables.as_ptr() as *const u8;
+            let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
+            let mut bs = 0usize;
+            while bs < useful {
+                unsafe {
+                    process_block_neon_single(
+                        z_base,
+                        k,
+                        bs,
+                        tables_ptr,
+                        partial.as_mut_ptr().add(bs),
+                    );
+                }
+                bs += BLOCK_K;
+            }
+        }
+        partial
+    });
+
+    // XOR-reduce the per-worker partials: parallel over columns, sequential over
+    // workers so each partial is streamed once (cache-friendly, ≤ p·256 KB).
+    let mut iter = partials.into_iter();
+    let mut out = iter.next().expect("pool has ≥ 1 worker");
+    for chunk in iter {
+        pool.install(|| {
+            out.par_iter_mut()
+                .zip(chunk.par_iter())
+                .for_each(|(o, s)| *o += *s);
+        });
+    }
+    out
+}

@@ -60,11 +60,49 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     let n = perf_core_count();
     match rayon::ThreadPoolBuilder::new()
         .num_threads(n)
+        // 8 MB workers (default 2 MB): the prover's kernels carry large NEON
+        // frames (bitslice planes, encode/product scratch, unreduced
+        // accumulators), and rayon work-stealing NESTS such frames on one
+        // stack — marginal under LTO, sporadic overflow. Virtual reservation
+        // only; pages commit on touch.
+        .stack_size(8 << 20)
         .build_global()
     {
         Ok(()) => Some(n),
         Err(_) => None, // pool already built
     }
+}
+
+/// Dedicated all-core (P+E) rayon pool for flat, fine-grained parallel-for
+/// passes. The global pool deliberately excludes efficiency cores (see
+/// [`init_perf_thread_pool`]) because they straggle at the synchronization
+/// barriers of NTT-shaped phases. Passes with many small independent work
+/// items and a single join (e.g. the PCS combine's block fold: 4096 blocks of
+/// ~4 µs each) let the work-stealing scheduler drain around slow cores, and
+/// measurably gain from the extra E-core throughput (open_combine_probe:
+/// 18.0 → 12.8 ms, −29% at m=30 on 4P+4E).
+///
+/// Built lazily on first use. Respects `RAYON_NUM_THREADS` (so single-thread
+/// parity tests and ST bench conventions stay single-threaded).
+pub fn all_core_pool() -> &'static rayon::ThreadPool {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            });
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .stack_size(8 << 20)
+            .build()
+            .expect("all_core_pool: pool build failed")
+    })
 }
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
@@ -106,7 +144,6 @@ pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<crate::field::F128> {
 /// Cached [`perf_core_count`]. The uncached version may spawn `sysctl`; this
 /// memoizes it so hot paths can cheaply ask "is the current rayon pool the
 /// homogeneous P-core pool?" (i.e. `current_num_threads() <= this`).
-#[cfg(target_arch = "aarch64")]
 pub(crate) fn perf_core_count_cached() -> usize {
     use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
@@ -179,4 +216,48 @@ fn linux_physical_cores() -> Option<usize> {
         }
     }
     (!cores.is_empty()).then_some(cores.len())
+}
+
+/// Best-effort count of efficiency cores. On macOS, queries
+/// `hw.perflevel1.physicalcpu` (= E-core count on Apple silicon; the key is
+/// absent on Intel, yielding 0). Elsewhere, returns 0: heterogeneous-core
+/// detection is only wired up for Apple silicon, and on homogeneous machines
+/// the only extra threads the all-core pool could add are SMT siblings,
+/// which were never validated to help (the global pool is deliberately
+/// sized to physical cores — see [`init_perf_thread_pool`]).
+fn efficiency_core_count() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("sysctl")
+            .args(["-n", "hw.perflevel1.physicalcpu"])
+            .output()
+            && let Ok(s) = std::str::from_utf8(&out.stdout)
+            && let Ok(n) = s.trim().parse::<usize>()
+        {
+            return n;
+        }
+    }
+    0
+}
+
+/// True when the E-cluster is large enough relative to the P-cluster for the
+/// *marginal* all-core pool hops — lincheck's two prover passes and the PCS
+/// combine — to pay: E ≥ P/2. Measured (m=30 production shapes): on 4P+4E
+/// (M-series Air) those hops save 25–29%; on 10P+4E (M4 Max) the same hops
+/// are a wash (combine) to a ~13% loss (lincheck partial fold) — the
+/// E-cluster's shared L2 and lower clocks cost more than 4-extra-on-10 buys.
+/// Merkle leaf hashing and the NTT deep pass gain on both topologies (E-core
+/// SHA units / cache-resident compute scale with any extra core) and are NOT
+/// gated on this predicate.
+///
+/// `FLOCK_ALLCORE=1` forces the gated hops onto the all-core pool regardless
+/// of topology (for re-measurement on new machines; pair against the sites'
+/// `*_PCORES_ONLY` switches for A/B).
+pub(crate) fn ecore_rich_topology() -> bool {
+    use std::sync::OnceLock;
+    static B: OnceLock<bool> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("FLOCK_ALLCORE").is_ok()
+            || 2 * efficiency_core_count() >= perf_core_count_cached()
+    })
 }

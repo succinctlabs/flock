@@ -130,8 +130,9 @@ mod kernels;
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 #[cfg(target_arch = "aarch64")]
 pub use kernels::{
-    partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
-    partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
+    partial_fold_packed_z_neon_allcore_padded, partial_fold_packed_z_neon_iblock_padded,
+    partial_fold_packed_z_neon_oblock_padded, partial_fold_packed_z_neon_single,
+    partial_fold_packed_z_neon_single_padded,
 };
 
 /// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
@@ -142,6 +143,62 @@ pub use kernels::{
 /// builds each tile's sum-tables once instead of once per worker, scaling the fold
 /// ~8.5× vs iblock's ~6.5× on 10 P-cores at m=32. See `benches/lincheck.rs` (FOLD_AB=1).
 pub static FOLD_IBLOCK: AtomicBool = AtomicBool::new(false);
+
+/// A/B toggle: when set, lincheck's two heavy passes (the z partial fold and
+/// `fold_alpha_batched`) stay on the caller's (P-core) rayon pool instead of
+/// [`crate::all_core_pool`]. Both passes are flat parallel-fors with dynamic
+/// work assignment, so the work-stealing scheduler drains around the slower
+/// E-cores and the extra cores are a straight throughput win (same shape as
+/// the PCS combine's −29%). Thread count / pool choice cannot change output
+/// bits: the alpha fold writes every slot deterministically and the partial
+/// fold is an XOR reduction of per-worker partials. `LINCHECK_PCORES_ONLY=1`
+/// in the environment forces the same fallback (production kill-switch);
+/// the AtomicBool exists for paired within-process A/B (see
+/// `benches/lincheck.rs`, `ALLCORE_AB=1`).
+pub static LC_PCORES_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// True when lincheck's passes may hop to the all-core (P+E) pool at all:
+/// not disabled (atomic or env), and the all-core pool actually has more
+/// threads than the caller's pool (under `RAYON_NUM_THREADS=1` both are 1,
+/// so ST parity conventions hold automatically). The prover's partial fold
+/// additionally requires an E-rich topology (see [`lincheck_use_all_cores`]);
+/// the alpha fold does not — from the verify context the P-pool runs it at
+/// ~11 ms vs ~2.3 ms all-core on 4P+4E, and the same ~10.2 → ~2.9 ms verify
+/// win reproduces on 10P+4E, so the hop pays on every measured topology.
+fn lincheck_all_cores_enabled() -> bool {
+    !LC_PCORES_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+        && std::env::var("LINCHECK_PCORES_ONLY").is_err()
+        && crate::all_core_pool().current_num_threads() > rayon::current_num_threads()
+}
+
+/// [`lincheck_all_cores_enabled`] plus the E-rich topology requirement — the
+/// gate for the prover's z partial fold, where the hop measures as a win only
+/// with a large-enough E-cluster (see [`crate::ecore_rich_topology`] — on
+/// 10P+4E it is a ~13% LOSS, `FLOCK_ALLCORE=1` overrides).
+// Only consulted by the aarch64 partial-fold dispatch; dead elsewhere.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn lincheck_use_all_cores() -> bool {
+    lincheck_all_cores_enabled() && crate::ecore_rich_topology()
+}
+
+/// `circuit.fold_alpha_batched` on the all-core pool when profitable. The
+/// alpha fold is a flat per-column gather (cost ∝ NNZ, e.g. ~21M for BLAKE3)
+/// — the same drain-friendly shape as the partial fold. Only worth the pool
+/// hop when the column loop parallelizes at all; identical output either way
+/// (every slot written deterministically). Shared by prover and verifier —
+/// and deliberately NOT topology-gated: the verify-context win is large on
+/// both measured topologies (see [`lincheck_all_cores_enabled`]).
+fn fold_alpha_batched_pooled(
+    circuit: &dyn LincheckCircuit,
+    alpha: F128,
+    eq_inner: &[F128],
+) -> Vec<F128> {
+    if circuit.n_cols() >= SUMCHECK_PAR_THRESHOLD && lincheck_all_cores_enabled() {
+        crate::all_core_pool().install(|| circuit.fold_alpha_batched(alpha, eq_inner))
+    } else {
+        circuit.fold_alpha_batched(alpha, eq_inner)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LincheckCircuit: the per-block linear structure lincheck consumes
@@ -690,6 +747,17 @@ fn partial_fold_packed_z_best(
             let n_log = m - k_log;
             if n_log >= OBLOCK_MIN_N_LOG && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
             {
+                // Large folds additionally hop to the all-core (P+E) pool —
+                // dynamic tile assignment drains around the slower E-cores.
+                if lincheck_use_all_cores() {
+                    return partial_fold_packed_z_neon_allcore_padded(
+                        z_packed,
+                        m,
+                        k_log,
+                        useful_bits,
+                        eq_outer,
+                    );
+                }
                 return partial_fold_packed_z_neon_oblock_padded(
                     z_packed,
                     m,
@@ -1329,7 +1397,7 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         None
     };
-    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+    let mut comb_vec = fold_alpha_batched_pooled(circuit, alpha, &eq_inner);
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -1534,7 +1602,7 @@ pub fn verify<Ch: Challenger>(
         );
     }
     let t = std::time::Instant::now();
-    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+    let mut comb_vec = fold_alpha_batched_pooled(circuit, alpha, &eq_inner);
     if trace {
         eprintln!(
             "        [lcv] circuit.fold_alpha_batched: {}",

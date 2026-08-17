@@ -310,92 +310,109 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let use_fast =
         !rs_deferred.is_empty() && rs_deferred.len() == rs_results.len() && pd_dense.is_empty();
 
-    let (mut round0_u0, mut round0_u2) = if use_fast {
-        let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
-        debug_assert!(b >= 2 && b.is_multiple_of(2));
-        debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
-        b_combined
-            .par_chunks_mut(b)
-            .enumerate()
-            .map(|(hi, out_block)| {
-                // Accumulate each claim's block: first claim writes, rest add.
-                // `e_hi` is read once per claim per block, then swept over eq_lo.
-                for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
-                    let e_hi = eq_hi[hi];
-                    if ci == 0 {
-                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
-                        }
-                    } else {
-                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+    // The combine is a flat block-parallel pass that drains cleanly around
+    // slow cores — run it on the all-core (P+E) pool (−29% on the probe on
+    // 4P+4E; a wash-to-slight-loss on 10P+4E, so gated on
+    // [`crate::ecore_rich_topology`], `FLOCK_ALLCORE=1` overrides).
+    // PCS_COMBINE_PCORES_ONLY=1 keeps it on the caller's pool (A/B toggle).
+    // Thread count never changes the output bits: every slot is written
+    // deterministically and the prime is an XOR reduction (associative +
+    // commutative, exact).
+    let combine_all_cores =
+        std::env::var("PCS_COMBINE_PCORES_ONLY").is_err() && crate::ecore_rich_topology();
+    let mut combine = || {
+        if use_fast {
+            let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
+            debug_assert!(b >= 2 && b.is_multiple_of(2));
+            debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
+            b_combined
+                .par_chunks_mut(b)
+                .enumerate()
+                .map(|(hi, out_block)| {
+                    // Accumulate each claim's block: first claim writes, rest add.
+                    // `e_hi` is read once per claim per block, then swept over eq_lo.
+                    for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
+                        let e_hi = eq_hi[hi];
+                        if ci == 0 {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                            }
+                        } else {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                            }
                         }
                     }
-                }
-                // Round-0 prime over this block's pairs (b is even, base is even).
-                let base = hi * b;
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
-                for t in 0..(b / 2) {
-                    let s0 = out_block[2 * t];
-                    let s1 = out_block[2 * t + 1];
-                    let a0 = packed_witness[base + 2 * t];
-                    let a1 = packed_witness[base + 2 * t + 1];
-                    u0 += a0 * s0;
-                    u2 += (a0 + a1) * (s0 + s1);
-                }
-                (u0, u2)
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            )
-    } else {
-        // General path (mixed / sparse / packed-direct): materialize any
-        // deferred-dense claims (parallel block fold), then the per-element
-        // combine over all dense buffers + packed-direct, matching the
-        // original behavior.
-        let materialized: Vec<Vec<F128>> = rs_results
-            .iter()
-            .filter_map(|(_, o)| match &o.rs_eq_ind {
-                ring_switch::RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
-                _ => None,
-            })
-            .collect();
-        let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
-        rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
-        let prime = b_combined
-            .par_chunks_mut(2)
-            .enumerate()
-            .map(|(i, chunk)| {
-                let mut b0 = F128::ZERO;
-                let mut b1 = F128::ZERO;
-                for v in rs_dense_all.iter() {
-                    b0 += v[2 * i];
-                    b1 += v[2 * i + 1];
-                }
-                for (v, g) in pd_dense.iter() {
-                    b0 += *g * v[2 * i];
-                    b1 += *g * v[2 * i + 1];
-                }
-                chunk[0] = b0;
-                chunk[1] = b1;
-                let a0 = packed_witness[2 * i];
-                let a1 = packed_witness[2 * i + 1];
-                (a0 * b0, (a0 + a1) * (b0 + b1))
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            );
-        for v in materialized {
-            crate::scratch::give_f128(v);
+                    // Round-0 prime over this block's pairs (b is even, base is even).
+                    let base = hi * b;
+                    let mut u0 = F128::ZERO;
+                    let mut u2 = F128::ZERO;
+                    for t in 0..(b / 2) {
+                        let s0 = out_block[2 * t];
+                        let s1 = out_block[2 * t + 1];
+                        let a0 = packed_witness[base + 2 * t];
+                        let a1 = packed_witness[base + 2 * t + 1];
+                        u0 += a0 * s0;
+                        u2 += (a0 + a1) * (s0 + s1);
+                    }
+                    (u0, u2)
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+                )
+        } else {
+            // General path (mixed / sparse / packed-direct): materialize any
+            // deferred-dense claims (parallel block fold), then the per-element
+            // combine over all dense buffers + packed-direct, matching the
+            // original behavior.
+            let materialized: Vec<Vec<F128>> = rs_results
+                .iter()
+                .filter_map(|(_, o)| match &o.rs_eq_ind {
+                    ring_switch::RsEqInd::DeferredDense {
+                        eq_lo,
+                        eq_hi,
+                        table,
+                    } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
+                    _ => None,
+                })
+                .collect();
+            let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
+            rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
+            let prime = b_combined
+                .par_chunks_mut(2)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let mut b0 = F128::ZERO;
+                    let mut b1 = F128::ZERO;
+                    for v in rs_dense_all.iter() {
+                        b0 += v[2 * i];
+                        b1 += v[2 * i + 1];
+                    }
+                    for (v, g) in pd_dense.iter() {
+                        b0 += *g * v[2 * i];
+                        b1 += *g * v[2 * i + 1];
+                    }
+                    chunk[0] = b0;
+                    chunk[1] = b1;
+                    let a0 = packed_witness[2 * i];
+                    let a1 = packed_witness[2 * i + 1];
+                    (a0 * b0, (a0 + a1) * (b0 + b1))
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+                );
+            for v in materialized {
+                crate::scratch::give_f128(v);
+            }
+            prime
         }
-        prime
+    };
+    let (mut round0_u0, mut round0_u2) = if combine_all_cores {
+        crate::all_core_pool().install(combine)
+    } else {
+        combine()
     };
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
         let pair = idx / 2;
