@@ -20,6 +20,7 @@
 pub mod bits;
 pub mod challenger;
 pub mod field;
+pub mod genus95_curve_code;
 pub mod hash;
 pub mod lincheck;
 pub mod merkle;
@@ -29,6 +30,7 @@ pub mod permutation;
 pub mod proof;
 pub mod r1cs;
 pub mod scratch;
+pub mod suboptimal;
 pub mod verifier;
 pub mod zerocheck;
 

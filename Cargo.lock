@@ -155,6 +155,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "rand_core",
  "rayon",
  "serde",
  "serde_json",
@@ -254,6 +255,12 @@ checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "rand_core"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 
 [[package]]
 name = "rayon"

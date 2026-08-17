@@ -386,3 +386,20 @@ impl WideGhashX4 {
         }
     }
 }
+
+/// Dedicated square: carry-less squaring has no cross term (`(a+b)^2 = a^2 + b^2`
+/// over GF(2)), so only the two diagonal CLMULs are needed — half the CLMUL of
+/// a general multiply.
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
+/// attribute.
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_square_x86(a: F128) -> F128 {
+    // SAFETY: function carries the required target features.
+    unsafe {
+        let lo2 = pmull(a.lo, a.lo);
+        let hi2 = pmull(a.hi, a.hi);
+        ghash_reduce(lane0(lo2), lane1(lo2), lane0(hi2), lane1(hi2))
+    }
+}

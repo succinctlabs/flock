@@ -278,3 +278,24 @@ pub unsafe fn ghash_mul_unreduced_neon(a: F128, b: F128) -> F256Unreduced {
         }
     }
 }
+
+/// Dedicated square: carry-less squaring has no cross term (`(a+b)^2 = a^2 + b^2`
+/// over GF(2)), so squaring drops the cross PMULLs — half the PMULL of a
+/// general multiply.
+///
+/// # Safety
+/// Requires the `aes` target feature, as declared by the attribute.
+#[target_feature(enable = "aes")]
+pub unsafe fn ghash_square(a: F128) -> F128 {
+    // SAFETY: function carries the aes target feature.
+    unsafe {
+        let lo2 = pmull(a.lo, a.lo);
+        let hi2 = pmull(a.hi, a.hi);
+        ghash_reduce(
+            vgetq_lane_u64::<0>(lo2),
+            vgetq_lane_u64::<1>(lo2),
+            vgetq_lane_u64::<0>(hi2),
+            vgetq_lane_u64::<1>(hi2),
+        )
+    }
+}

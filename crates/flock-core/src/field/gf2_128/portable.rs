@@ -36,3 +36,10 @@ pub fn ghash_mul(a: F128, b: F128) -> F128 {
     let u = ghash_mul_unreduced(a, b);
     ghash_reduce(u.r0, u.r1, u.r2, u.r3)
 }
+
+/// Dedicated square: the two diagonal carry-less products then one reduction.
+pub fn ghash_square(a: F128) -> F128 {
+    let (r0, r1) = clmul64(a.lo, a.lo);
+    let (r2, r3) = clmul64(a.hi, a.hi);
+    ghash_reduce(r0, r1, r2, r3)
+}

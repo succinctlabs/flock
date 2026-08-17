@@ -30,6 +30,10 @@ keccak = { workspace = true }
 sha3 = { workspace = true }
 
 [[bench]]
+name = "genus95_curve_code"
+harness = false
+
+[[bench]]
 name = "ntt"
 harness = false
 

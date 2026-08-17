@@ -46,6 +46,16 @@ impl F128 {
         self.lo == 0 && self.hi == 0
     }
 
+    /// Square `self` in GF(2^128). Carry-less squaring has no cross terms —
+    /// `(a + b)^2 = a^2 + b^2` over GF(2) — so this needs only the two diagonal
+    /// carry-less products (`lo·lo`, `hi·hi`) plus one reduction, half the
+    /// PMULL/CLMUL of a general `Mul`. Hot in repeated-squaring paths
+    /// (e.g. the genus-95 samplers' x-power chains).
+    #[inline]
+    pub fn square(self) -> Self {
+        ghash_square(self)
+    }
+
     /// 256-bit unreduced product `(self · rhs)`. Caller XORs many of these into
     /// an `F256Unreduced` accumulator and calls `.reduce()` once at the end.
     /// Reduction commutes with XOR, so Σ (aᵢ·bᵢ) mod p = (Σ aᵢ·bᵢ) mod p.
@@ -256,6 +266,27 @@ fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
     )))]
     {
         software::ghash_mul_unreduced(a, b)
+    }
+}
+
+#[inline]
+fn ghash_square(a: F128) -> F128 {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: aes target feature is enabled at compile time.
+        unsafe { aarch64::ghash_square(a) }
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    {
+        // SAFETY: pclmulqdq target feature is enabled at compile time.
+        unsafe { x86_64::ghash_square_x86(a) }
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    )))]
+    {
+        software::ghash_square(a)
     }
 }
 
@@ -569,5 +600,16 @@ mod tests {
             assert_eq!(folded, scalar, "wide fold != scalar deferred accumulator");
             assert_eq!(folded.reduce(), scalar.reduce(), "reduced values differ");
         }
+    }
+
+    #[test]
+    fn square_matches_self_mul() {
+        let mut rng = Rng::new(0x5147);
+        for _ in 0..1000 {
+            let a = rng.next_f128();
+            assert_eq!(a.square(), a * a);
+        }
+        assert_eq!(F128::ZERO.square(), F128::ZERO);
+        assert_eq!(F128::ONE.square(), F128::ONE);
     }
 }

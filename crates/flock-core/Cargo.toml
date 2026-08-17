@@ -23,6 +23,7 @@ unsound-challenger = []
 [dependencies]
 rayon = { workspace = true }
 sha2 = { workspace = true }
+rand_core = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
