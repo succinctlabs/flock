@@ -465,19 +465,19 @@ alone: 23% clone-covered, ~2,970 of the recommended total.
 | # | Cluster | Dup lines | Consol. | Risk |
 | --- | --- | --- | --- | --- |
 | 1 | tower.rs Real/Child tape+region+node family (walkers share 76%, emitters 78%) | 2,488 | ~2,000 | **high** — transcript + byte pins; unify field-by-field, re-run pins |
-| 2 | LegacyPow payload-ordinal walkers ×4 (2 of 4 had the bug) | 40 | 40 | high value, mechanical: one `payload_ordinals()` iterator |
-| 3 | `GateType::witness()` 12-line body ×18 + `*256` twin gates | 420 | ~330 | low (witness) / medium (`*256` column order) |
-| 4 | tower native replicas (`sk_at_vks` ≡ `eval_sk_at_vks`, `frob_inv_native` ≡ jagged's) — export core fns instead | 700 | ~250 | low for replicas; do NOT merge the `check_*` validators (soundness backstop) |
+| 2 | LegacyPow payload-ordinal walkers ×4 (2 of 4 had the bug) | 40 | 40 | high value, mechanical: one `payload_ordinals()` iterator — **DONE 2026-08-29**: `TranscriptOp::carries_payload()` replaces the 5 inline `ObserveBytes|Pow|LegacyPow` patterns (child/real walkers, fold_region, query) |
+| 3 | `GateType::witness()` 12-line body ×18 + `*256` twin gates | 420 | ~330 | low (witness) / medium (`*256` column order) — **DONE 2026-08-29** (witness half): `SlotWitness::element_from_rows` replaces the 14 identical bodies; the `*256` twin gates are left as they are (column order is protocol) |
+| 4 | tower native replicas (`sk_at_vks` ≡ `eval_sk_at_vks`, `frob_inv_native` ≡ jagged's) — export core fns instead | 700 | ~250 | low for replicas; do NOT merge the `check_*` validators (soundness backstop) — **DONE 2026-08-29** for the replicas: `sk_at_vks` → `ligerito::eval_sk_at_vks`, `frob_inv_native` → `jagged::frob_inv` (now pub; `frob_inv_matches_127_squarings` pins the two derivations); the `check_*` validators untouched as recommended |
 | 5 | fold ↔ jagged-fold twin family ×5 | 251 | ~200 | high — transcript |
-| 6 | tower gates duplicated into test files (Blake3Gate, AssistLayerGate, MultGate; circuit_wiring↔kappa7 harness 219 exact) | 371 | ~150 | low — export as `pub(crate)` |
+| 6 | tower gates duplicated into test files (Blake3Gate, AssistLayerGate, MultGate; circuit_wiring↔kappa7 harness 219 exact) | 371 | ~150 | low — export as `pub(crate)` — **REJECTED 2026-08-29**: re-measured, the test copies of `Blake3Gate`/`AssistLayerGate` differ from the tower's (0.66/0.73 similarity, different unpack helpers) and the circuit_wiring↔kappa7 clone is 24 lines today, not 219; not worth exporting |
 | 7 | r1cs_hashes four-encoder family (Setup ctors byte-identical keccak↔keccak3; `accumulate_subkeccak` ≡ `fold_alpha_batched` 94 shared; keccak.rs:1234 re-implements the common driver) | 840 | ~640 | medium; leave the hot `bm_*`/`build_group_batch_major` loops |
 | 8 | **SplitMix64 RNG: 117 sites, 52 variant bodies, byte-identical groups mapped** | 2,072 | ~1,950 | low but byte-pinned — one `test_rng::Rng` (~45 lines); preserve per-site draw order verbatim (`f128()` order is load-bearing) — **DONE 2026-08-27** (`flock_core::test_rng::Rng`, 78 sites replaced; per-method equivalence classes verified before replacing; site-specific draws kept as local `RngExt` traits; 4 custom generators left alone: assist_blocked, virtual_b, jagged_fold, matrix_fold; all byte pins + tower tape pins held) |
 | 9 | Ligerito F256 transcript walk ×4 semantic copies (Rust prover/verifier + `.cuh` + host `.cpp`; `700cace` fixed 3, `ffabc07` the 4th) | ~1,500 sem. | ~180 | **maximum** — only unifiable artifact is a declarative op schedule + conformance vector; needs Blackwell CI |
-| 10 | bench boilerplate (keccak3 3-way ~90% clone-covered; native-chain pair has a 134-line exact clone) | 1,270 | ~1,270 | low |
+| 10 | bench boilerplate (keccak3 3-way ~90% clone-covered; native-chain pair has a 134-line exact clone) | 1,270 | ~1,270 | low — mostly RESOLVED by 2.1 (the keccak3 3-way and the native-chain pair were deleted) |
 | 11 | dump-bin frame | 270 | ~270 | byte-pinned draw order |
-| 12 | verifier/prover `_ag`/`_deferred`/`_timed`/`_jagged` twins | 425 | ~425 | `_timed` safe (timer sink); `_ag`/`_deferred` are protocol variants |
+| 12 | verifier/prover `_ag`/`_deferred`/`_timed`/`_jagged` twins | 425 | ~425 | `_timed` safe (timer sink); `_ag`/`_deferred` are protocol variants — `_timed` DONE (deleted with 2.1); `_ag`/`_deferred` stay (protocol variants) |
 | 13 | merkle_r1cs `*_chunk` twins | 180 | ~180 | follows Phase 2.2 — DONE 2026-08-27 (deleted with 2.2) |
-| 14 | merkle_glue gate-table boilerplate ×4 | 131 | ~130 | low — macro/blanket trait |
+| 14 | merkle_glue gate-table boilerplate ×4 | 131 | ~130 | low — macro/blanket trait — **REJECTED 2026-08-29**: the shared shape is ~10 lines per table split between associated fns and methods; a macro would cost more than it saves |
 | 15 | ligerito.rs test roundtrip boilerplate | 883 | ~440 | low — `roundtrip_case` helper |
 
 Also mapped for the Phase 3 tower.rs module split: the full region map

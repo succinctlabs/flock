@@ -580,7 +580,7 @@ pub(super) fn emit_residual_region(
 
 /// Check the residual region's published wires against a NATIVE replica:
 /// `induce_sumcheck_evaluate_at_residual` per level (sks replicated via
-/// `sk_at_vks` — the mvp7 discipline), then the close-out's gamma-weighted
+/// `eval_sk_at_vks` — the mvp7 discipline), then the close-out's gamma-weighted
 /// char-2 eq products and the yr dot. Walks `public` from `at` (the first
 /// accumulator, `levels × 2^yr` entries, then the inner), asserting each.
 /// Returns the native inner — the residual-side t_r — so the caller asserts
@@ -605,7 +605,7 @@ pub(super) fn check_residual_publics(
     for (li, lvl) in levels.iter().enumerate() {
         let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len() - 1).sum();
         let lmc = pl + yr_log;
-        let sks = sk_at_vks(lmc);
+        let sks = flock_core::pcs::ligerito::eval_sk_at_vks(lmc);
         let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
         let ris: Vec<F256> = levels[li + 1..]
             .iter()
@@ -845,10 +845,7 @@ pub(super) fn emit_recorded_pow_checks(
         if op.finalizes() {
             fin += 1;
         }
-        if matches!(
-            op,
-            Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. }
-        ) {
+        if op.carries_payload() {
             pay += 1;
         }
     }

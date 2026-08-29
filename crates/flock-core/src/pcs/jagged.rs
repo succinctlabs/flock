@@ -2282,8 +2282,11 @@ fn sqrt_basis() -> &'static [F128; 128] {
     })
 }
 
-/// `x^{2^{-1}}` via the basis-image table.
-fn frob_inv(x: F128) -> F128 {
+/// The inverse Frobenius `x ↦ x^{2^{-1}} = x^{2^127}` (the square root in
+/// F₂₁₂₈), via the basis-image table: 128 table adds instead of 127
+/// squarings. The recursion tower's walkers use it too; `frob_inv_matches_127_squarings`
+/// pins the two derivations equal.
+pub fn frob_inv(x: F128) -> F128 {
     let t = sqrt_basis();
     let mut acc = F128::ZERO;
     let mut lo = x.lo;
@@ -6451,5 +6454,21 @@ mod tests {
             verify(&params, &z_row, &z_col, v, &proof, &mut vch).is_none(),
             "verifier must reject a tampered q_eval"
         );
+    }
+
+    /// The table-based square root equals 127 squarings on random inputs —
+    /// the tower's walkers used the squaring form until 2026-08-29.
+    #[test]
+    fn frob_inv_matches_127_squarings() {
+        let mut rng = crate::test_rng::Rng::new(0xF0B_1A5);
+        for _ in 0..256 {
+            let x = rng.f128();
+            let mut y = x;
+            for _ in 0..127 {
+                y = y * y;
+            }
+            assert_eq!(frob_inv(x), y);
+            assert_eq!(frob_inv(x) * frob_inv(x), x, "sqrt squares back");
+        }
     }
 }
