@@ -88,8 +88,10 @@ make pruning safe here — a deletion that changes behavior fails loudly).
 
 **Phase 3 — duplication consolidation** (careful, byte-pinned). Unify the
 Child/Real tape-walker pairs; split tower.rs into a module tree (mechanical,
-behavior-free); extract encoder commonalities; one shared test Rng. After
-the deletions, so the surface being refactored is already smaller.
+behavior-free — **DONE 2026-08-27, PR #38**); extract encoder commonalities;
+one shared test Rng (**DONE 2026-08-27**: `flock_core::test_rng::Rng`, 78
+sites, every byte pin held). After the deletions, so the surface being
+refactored is already smaller.
 
 **Phase 4 — RS removal.** Gated on Phase F kernels; Phases 0–3 turn it into
 executing a list (the ledger will have mapped every RS-only item).

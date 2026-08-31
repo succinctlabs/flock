@@ -806,9 +806,10 @@ pub fn give_back_live_region(union: &UnionInstance<'_>, pa: Vec<F128>, pb: Vec<F
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
-    use crate::element_r1cs::tests::{Rng, mixed_gate, mixed_witness, mult_gate, mult_witness};
+    use crate::element_r1cs::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
     use crate::element_r1cs::{ElementTableBuilder, ElementTableType};
     use crate::schedule::{Registry, TableType};
+    use crate::test_rng::Rng;
     use crate::zerocheck::multilinear::{eq_eval, fold_in_place_single};
     use std::sync::Arc;
 

@@ -25,22 +25,7 @@ use flock_prover::zerocheck::univariate_skip::pack_bits;
 const DOMAIN: &[u8] = b"flock-zerocheck-full-test";
 const K_SKIP: usize = 6;
 
-struct Rng(u64);
-impl Rng {
-    fn new(s: u64) -> Self {
-        Self(s)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-    fn bit(&mut self) -> bool {
-        (self.next_u64() & 1) == 1
-    }
-}
+use flock_core::test_rng::Rng;
 
 fn wf(w: &mut impl Write, x: F128) -> std::io::Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;

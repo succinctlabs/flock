@@ -2300,32 +2300,7 @@ mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
 
-    /// SplitMix64 PRNG, deterministic.
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        }
-        fn f128(&mut self) -> F128 {
-            F128 {
-                lo: self.next_u64(),
-                hi: self.next_u64(),
-            }
-        }
-        fn f128_vec(&mut self, n: usize) -> Vec<F128> {
-            (0..n).map(|_| self.f128()).collect()
-        }
-        fn bits(&mut self, n: usize) -> Vec<bool> {
-            (0..n).map(|_| self.next_u64() & 1 == 1).collect()
-        }
-    }
+    use crate::test_rng::Rng;
 
     /// Naive MLE evaluation: `f̂(point) = Σ_i eq(point, i) · f[i]` where i ∈
     /// {0,1}^d and f[i] is given as a bool slice.

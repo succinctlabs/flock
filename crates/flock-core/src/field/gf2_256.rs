@@ -166,25 +166,7 @@ mod tests {
     use super::*;
     use crate::field::mul_by_x;
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-
-        fn f128(&mut self) -> F128 {
-            F128::new(self.next_u64(), self.next_u64())
-        }
-
-        fn f256(&mut self) -> F256 {
-            F256::new(self.f128(), self.f128())
-        }
-    }
+    use crate::test_rng::Rng;
 
     fn absolute_trace(mut a: F128) -> F128 {
         let mut out = F128::ZERO;

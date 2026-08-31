@@ -881,8 +881,9 @@ fn fold_low_out(src: &[F128], rho: F128, min_len: usize) -> Vec<F128> {
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
-    use crate::element_r1cs::tests::{Rng, mixed_gate, mixed_witness, mult_gate, mult_witness};
+    use crate::element_r1cs::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
     use crate::element_r1cs::{ElementTableType, broadcast_add};
+    use crate::test_rng::Rng;
     use crate::zerocheck::multilinear::eq_eval;
 
     /// Direct MLE evaluation of `table` at `point`, binding the low variable

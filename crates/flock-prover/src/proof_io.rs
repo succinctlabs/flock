@@ -444,29 +444,16 @@ mod tests {
     use crate::r1cs_hashes::blake3::{Blake3Setup, Compression, blake3_compress};
     use flock_core::challenger::FsChallenger;
 
-    /// SplitMix64.
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-        fn nx(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-    }
+    use flock_core::test_rng::Rng;
 
     /// Build a small honest BLAKE3 chain (n=8) for the bundle tests.
     fn honest_chain(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8]) {
         let mut rng = Rng::new(seed);
-        let mut cv: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
+        let mut cv: [u32; 8] = std::array::from_fn(|_| rng.next_u64() as u32);
         let cv0 = cv;
         let mut blocks = Vec::with_capacity(n);
         for _ in 0..n {
-            let m: [u32; 16] = std::array::from_fn(|_| rng.nx() as u32);
+            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
             let counter = 0u64;
             let block_len = 64u32;
             let flags = 0u32;
@@ -658,9 +645,9 @@ mod tests {
         ) -> Vec<crate::r1cs_hashes::blake3::Compression> {
             (0..n)
                 .map(|_| {
-                    let cv: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
-                    let m: [u32; 16] = std::array::from_fn(|_| rng.nx() as u32);
-                    (cv, m, rng.nx(), 64u32, 11u32)
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u64() as u32);
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
+                    (cv, m, rng.next_u64(), 64u32, 11u32)
                 })
                 .collect()
         }
@@ -672,8 +659,8 @@ mod tests {
             (0..n)
                 .map(|_| {
                     (
-                        std::array::from_fn(|_| rng.nx() as u32),
-                        std::array::from_fn(|_| rng.nx() as u32),
+                        std::array::from_fn(|_| rng.next_u64() as u32),
+                        std::array::from_fn(|_| rng.next_u64() as u32),
                     )
                 })
                 .collect()

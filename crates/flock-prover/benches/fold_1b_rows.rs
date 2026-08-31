@@ -17,25 +17,7 @@ use flock_prover::pcs::ring_switch::{
 use flock_prover::zerocheck::PaddingSpec;
 use flock_prover::zerocheck::univariate_skip::build_eq;
 
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-    fn next_f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
-        }
-    }
-}
+use flock_core::test_rng::Rng;
 
 fn bench_one(m: usize, n_runs: usize) {
     // packed_witness has 2^(m - LOG_PACKING) = 2^(m-7) F128 elements; the suffix
@@ -43,11 +25,11 @@ fn bench_one(m: usize, n_runs: usize) {
     let lbits = m - 7;
     let len = 1usize << lbits;
     let mut rng = Rng::new(0xF01D ^ m as u64);
-    let witness: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
+    let witness: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
     // t0 is a *real* eq tensor so the split factorization lines up with it.
-    let r: Vec<F128> = (0..lbits).map(|_| rng.next_f128()).collect();
+    let r: Vec<F128> = (0..lbits).map(|_| rng.f128()).collect();
     let t0: Vec<F128> = build_eq(&r);
-    let t1: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
+    let t1: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
     let padding = PaddingSpec::dense(m);
 
     let bench = |label: &str, f: &dyn Fn() -> f64| {
