@@ -2512,3 +2512,34 @@ cells (identical arms). ST/MT scaling ≈ 6.7× on 8 P-cores. Caveats:
 single cell per config, machine on 24% battery with interactive load;
 earlier trace-parse footgun fixed (open_batch/open_merged also print
 "TOTAL" — match "[prove_union] TOTAL").
+
+### Re-graft #1: zc compact-K + cascade wired onto the union grinding driver — 2026-08-31
+
+Ported the f035ddb round-2 branch (compact-K rounds 2..5 | integrated
+r2 lookahead | classic) and the 4→1 cascade tail into main's grinding
+driver: unified while-loop with `rho_prev`/`pending2` deferred-
+challenge state, one `sample_rho!` grind-or-sample per round message
+(nonce cadence identical on every route), two-challenge final binding.
+All kernels had survived in multilinear.rs; zerocheck.rs re-gains the
+two test oracles (ZC_COMPACT_K_DISABLE, RS_TAIL_LOOKAHEAD_DISABLE) and
+the three transcript-identity tests. New `PaddingSpec::
+effective_single_run()` — as_single_run modulo trailing all-zero runs
+(the fast path's implicit gap) — lets the single-type union's
+gap/useful/tail list serve the single-run kernels.
+
+**Measured verdict — sparse keeps the bench.** The union boolean
+region at m=32 is ~19% occupied (useful_cols/128), so main's
+support-proportional sparse path fires; with cascade priority forced,
+compact-K's producer pays a full-domain pass: r2+K+tail 145–190 ms vs
+sparse r2+tail 93–170 (K fold 31–48 + cascade tail 11–15 ARE cheaper
+than the sparse tail's 44–103, but the producer eats it). The old −5
+certification was on a ~fully-occupied witness; main's sparsity
+banked that win differently. Priority reverted: sparse dispatches
+first, the cascade serves dense single-run flows (where the sparse
+occupancy gate fails and the 2026-08-27 certification applies).
+Dispatch is visible under FLOCK_ZC_TIMING ("gates:" line).
+
+Suites: core 560 (3 new oracle tests), prover 76, all 13 proof pins
+UNCHANGED — transcript identity of every route, enforced. Takeaway
+for the queue: today's zc cost is round1 URM ~120 ms — stripe-C/
+AB-hoist (item #3) is the zc money now, not round 2/tail.
