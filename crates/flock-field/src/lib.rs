@@ -1,5 +1,6 @@
 //! Binary field arithmetic for Flock protocols.
 
+pub mod f128_slice;
 pub mod gf2_128;
 pub mod gf2_256;
 pub mod gf2_8;

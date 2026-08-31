@@ -9,7 +9,7 @@ description = "Protocol library and verifier for the Flock R1CS-over-GF(2) PIOP.
 [features]
 # Count hash invocations (Merkle leaf/pair compressions, FS transcript
 # absorption and squeezes, PoW evaluations) via global relaxed atomics. Counts
-# whichever hash each component is configured with — see `hash::HashKind`. Off
+# whichever hash each component is configured with. See `flock_hash::HashKind`. Off
 # by default; used by flock-prover's benches/verifier_hash_count.rs.
 hash-count = ["flock-merkle/hash-count", "flock-transcript/hash-count"]
 
@@ -22,8 +22,8 @@ mul-count = ["flock-field/mul-count"]
 
 # Compile the insecure `RandomChallenger` (no Fiat-Shamir binding) into a
 # non-test build. Off by default so real proofs *cannot* reference it — see
-# `src/challenger.rs`. This feature only exists for bench/example isolation (flock-prover enables
-# it dev-only). NEVER enable it for a build that produces real proofs.
+# `flock-transcript::challenger`. This feature supports benchmarks and examples only.
+# flock-prover enables it for development targets. Never use it for real proofs.
 unsound-challenger = ["flock-transcript/unsound-challenger"]
 
 [dependencies]
@@ -31,7 +31,8 @@ flock-field = { workspace = true }
 flock-merkle = { workspace = true }
 flock-transcript = { workspace = true }
 flock-hash = { workspace = true }
-flock-multilinear = { path = "../flock-multilinear" }
+flock-multilinear = { workspace = true }
+flock-parallel = { workspace = true }
 rayon = { workspace = true }
 sha2 = { workspace = true }
 rand_core = { workspace = true }
@@ -43,7 +44,7 @@ toml = { workspace = true }
 [dev-dependencies]
 # Used by `LigeritoSecurityConfig` serde round-trip tests.
 serde_json = { workspace = true }
-flock-transcript = {workspace = true, features = ["unsound-challenger"]}
+flock-transcript = { workspace = true, features = ["unsound-challenger"] }
 
 [lints]
 workspace = true

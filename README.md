@@ -12,20 +12,22 @@ compressions) and a recursion tower that folds proofs into proofs.
 
 The workspace contains these crates:
 
+- **`crates/flock-field`** — binary field types and architecture-specific field kernels.
+- **`crates/flock-hash`** — shared hash types and compression primitives.
+- **`crates/flock-transcript`** — Fiat-Shamir challengers and transcript recording.
+- **`crates/flock-merkle`** — generic Merkle construction and optimized hash kernels.
 - **`crates/flock-multilinear`** — field-generic multilinear evaluation,
   equality tables, and folds. Index order is an explicit API parameter.
-
-- **`crates/flock-core`** — the protocol library and verifier (field arithmetic,
-  NTT, zerocheck, lincheck, PCS, Merkle, R1CS). Carries everything needed to
-  verify; portable, with scalar fallbacks for the NEON kernels.
+- **`crates/flock-parallel`** — the shared all-core rayon pool.
+- **`crates/flock-core`** — the protocol library and verifier.
+  It contains the NTT, PIOPs, PCS, and R1CS machinery.
 - **`crates/flock-prover`** — the end-to-end prover: prove orchestration, the
   hash R1CS encoders, the Merkle-path statements, and the recursion tower.
   Depends on `flock-core` and re-exports it.
 - **`crates/flock-cuda-ffi`** — the optional interface to CUDA prover kernels.
 
-The heavy NEON kernels live in the shared `flock-core` layer, so the verifier
-runs on the same code as the prover; `flock-core` still compiles off-ARM via the
-scalar fallbacks.
+Architecture-specific field and Merkle kernels live in their owning crates.
+Other protocol kernels remain in `flock-core`. Portable fallbacks support other targets.
 
 ## Build
 
@@ -103,12 +105,12 @@ binary-tower field framework; the basis for our F₁₂₈ / ring-switch design.
 Dual-licensed Apache-2.0 OR MIT; Copyright 2025 The Binius Developers and
 Irreducible, Inc. Derived files:
 
-- `crates/flock-core/src/field/phi8.rs` — `PHI_8_TABLE`, a verbatim copy from
+- `crates/flock-field/src/phi8.rs` — `PHI_8_TABLE`, a verbatim copy from
   `crates/field/src/ghash.rs`.
-- `crates/flock-core/src/field/gf2_128.rs` — the default `Mul`
+- `crates/flock-field/src/gf2_128.rs` — the default `Mul`
   (`ghash_mul_binius`) ports `mul_clmul` from
   `crates/field/src/arch/shared/ghash.rs`.
-- `crates/flock-core/src/field/gf2_8.rs` — the NEON 16-wide multiplier
+- `crates/flock-field/src/gf2_8.rs` — the NEON 16-wide multiplier
   (`gf8_mul_vec16` / `gf8_reduce_vec16`) ports `packed_aes_16x8b_multiply` from
   `crates/field/src/arch/aarch64/simd_arithmetic.rs`.
 - `crates/flock-core/src/ntt/additive_ntt_f128.rs` — algorithm skeleton

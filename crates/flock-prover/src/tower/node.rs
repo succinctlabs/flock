@@ -1,11 +1,11 @@
 use super::*;
 use crate::prover::UnionElementSlotInput;
 use flock_core::aggregate;
-use flock_core::field::PHI_8_TABLE;
 use flock_core::matrix_fold::FoldProof;
-use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 use flock_core::zerocheck::K_SKIP;
 use flock_core::zerocheck::multilinear::subspace_denominator_pair;
+use flock_field::PHI_8_TABLE;
+use flock_transcript::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 use rayon::prelude::*;
 
 /// The PRODUCTION per-proof tape cost of one child: the recorded deferred
@@ -877,7 +877,7 @@ pub fn build_node_outer_app(
         );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
-            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+            if let flock_transcript::transcript_record::StreamWord::Value(vi) = *w {
                 if vmap.len() <= vi {
                     vmap.resize(vi + 1, None);
                 }
@@ -1673,7 +1673,7 @@ pub fn build_node_outer_app(
             );
             let mut lvmap: Vec<Option<usize>> = Vec::new();
             for (wi, w) in lstream.words.iter().enumerate() {
-                if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                if let flock_transcript::transcript_record::StreamWord::Value(vi) = *w {
                     if lvmap.len() <= vi {
                         lvmap.resize(vi + 1, None);
                     }

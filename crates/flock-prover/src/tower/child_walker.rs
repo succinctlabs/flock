@@ -1,10 +1,10 @@
 use super::*;
 use flock_core::pcs::ring_switch as rs;
-use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 use flock_core::zerocheck::univariate_skip::build_eq;
 use flock_core::zerocheck::univariate_skip_optimized::{
     medium_challenges_ghash, small_challenges_ghash,
 };
+use flock_transcript::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 
 /// One recorded child verification, parsed: the tape pinned op-for-op, every
 /// region located, and every native replica the emitter and checker consume.
@@ -20,7 +20,7 @@ pub(super) struct ChildTape<'p> {
     pub(super) cap_pays: Vec<usize>,
     // chain materials
     pub(super) trace: crate::r1cs_hashes::fs_chain::FsChainTrace,
-    pub(super) stream: flock_core::transcript_record::Stream,
+    pub(super) stream: flock_transcript::transcript_record::Stream,
     pub(super) bytes: Vec<u8>,
     /// The fork's four cross-link wires ([`MergedChain::cross`]).
     pub(super) cross: Vec<Option<(usize, usize)>>,
@@ -1919,7 +1919,7 @@ pub(super) fn emit_child_region(
     // ---- the WIRING GKR in-circuit ----
     let mut vmap: Vec<Option<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
-        if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+        if let flock_transcript::transcript_record::StreamWord::Value(vi) = *w {
             if vmap.len() <= vi {
                 vmap.resize(vi + 1, None);
             }
@@ -2814,7 +2814,7 @@ pub(super) fn emit_child_region(
                     .position(|w| {
                         matches!(
                             w,
-                            flock_core::transcript_record::StreamWord::Bytes { payload, word: 0 }
+                            flock_transcript::transcript_record::StreamWord::Bytes { payload, word: 0 }
                                 if *payload == *nonce_payload
                         )
                     })

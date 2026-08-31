@@ -32,12 +32,12 @@ use crate::union::UnionInstance;
 #[cfg(test)]
 use flock_core::circuit::builder::CircuitBuilder;
 use flock_core::circuit::builder::{GateType, ShapeBuilder, SlotWitness, Wire};
-use flock_core::field::{F128, F256};
 use flock_core::matrix_fold::{MatrixClaim, Weight};
-use flock_core::merkle::{self as core_merkle, HashKind};
 use flock_core::pcs::PcsParams;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::verifier;
+use flock_field::{F128, F256};
+use flock_merkle::{self as core_merkle, HashKind};
 
 mod chain;
 mod child_walker;

@@ -258,7 +258,7 @@ pub(super) fn build_mac256(
     rhs: [usize; 2],
 ) -> usize {
     let one = F128::ONE;
-    let nr = flock_core::field::gf2_256::QUADRATIC_NONRESIDUE;
+    let nr = flock_field::gf2_256::QUADRATIC_NONRESIDUE;
     b.mult(at, a[0], rhs[0]);
     b.mult(at + 1, a[1], rhs[1]);
     b.mult_lin(
@@ -295,7 +295,7 @@ impl LeafEvalGate256 {
                 let right = lay.prev_pair(l, 2 * i + 1);
                 let challenge = [lay.v + 2 * (l - 1), lay.v + 2 * (l - 1) + 1];
                 let at = lay.base(l) + 5 * i;
-                let nr = flock_core::field::gf2_256::QUADRATIC_NONRESIDUE;
+                let nr = flock_field::gf2_256::QUADRATIC_NONRESIDUE;
                 b.mult_lin(
                     at,
                     &[(left[0], one), (right[0], one)],

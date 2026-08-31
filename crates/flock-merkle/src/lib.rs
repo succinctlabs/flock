@@ -11,12 +11,12 @@ pub use hashing::{
 #[cfg(feature = "hash-count")]
 pub use hashing::hash_count;
 
+use flock_parallel::all_core_pool;
 #[cfg(test)]
 use hashing::{
     blake3_hash_many_leaves, blake3_hash_many_parents, blake3_leaf_cv,
     blake3_leaf_size_is_batchable, blake3_parent_cv,
 };
-use std::sync::OnceLock;
 
 /// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
 ///
@@ -24,11 +24,10 @@ use std::sync::OnceLock;
 /// `data.len()`. Returns the 32-byte root. The intermediate tree is allocated
 /// and dropped; if you need it for path opening, use [`merkle_tree`] instead.
 pub fn merkle_root(data: &[u8], num_leaves: usize, kind: HashKind) -> Hash {
-    let tree = match kind {
-        HashKind::Sha256 => merkle_tree_with::<Sha256MerkleHash>(data, num_leaves),
-        HashKind::Blake3 => merkle_tree_with::<Blake3MerkleHash>(data, num_leaves),
-    };
-    tree[tree.len() - 1]
+    match kind {
+        HashKind::Sha256 => merkle_root_with::<Sha256MerkleHash>(data, num_leaves),
+        HashKind::Blake3 => merkle_root_with::<Blake3MerkleHash>(data, num_leaves),
+    }
 }
 
 pub fn merkle_root_with<H: MerkleHash>(data: &[u8], num_leaves: usize) -> Hash {
@@ -51,26 +50,6 @@ fn merkle_use_all_cores(data_len: usize) -> bool {
     data_len >= MERKLE_ALLCORE_MIN_BYTES
         && std::env::var("MERKLE_PCORES_ONLY").is_err()
         && all_core_pool().current_num_threads() > rayon::current_num_threads()
-}
-
-fn all_core_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let threads = std::env::var("RAYON_NUM_THREADS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|value| value.get())
-                    .unwrap_or(1)
-            });
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .stack_size(8 << 20)
-            .build()
-            .expect("failed to build the Merkle thread pool")
-    })
 }
 
 /// Compute the full Merkle tree (flat layout, see module docs) for `data`

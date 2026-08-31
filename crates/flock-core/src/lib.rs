@@ -84,36 +84,7 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     }
 }
 
-/// Dedicated all-core (P+E) rayon pool for flat, fine-grained parallel-for
-/// passes. The global pool deliberately excludes efficiency cores (see
-/// [`init_perf_thread_pool`]) because they straggle at the synchronization
-/// barriers of NTT-shaped phases. Passes with many small independent work
-/// items and a single join (e.g. the PCS combine's block fold: 4096 blocks of
-/// ~4 µs each) let the work-stealing scheduler drain around slow cores, and
-/// measurably gain from the extra E-core throughput (open_combine_probe:
-/// 18.0 → 12.8 ms, −29% at m=30 on 4P+4E).
-///
-/// Built lazily on first use. Respects `RAYON_NUM_THREADS` (so single-thread
-/// parity tests and ST bench conventions stay single-threaded).
-pub fn all_core_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let n = std::env::var("RAYON_NUM_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            });
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .stack_size(8 << 20)
-            .build()
-            .expect("all_core_pool: pool build failed")
-    })
-}
+pub use flock_parallel::all_core_pool;
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.

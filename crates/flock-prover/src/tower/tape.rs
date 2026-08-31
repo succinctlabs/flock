@@ -1,5 +1,5 @@
 use super::*;
-use flock_core::transcript_record::TranscriptOp as Op;
+use flock_transcript::transcript_record::TranscriptOp as Op;
 
 /// One packed-direct claim on the tape: its absorbed VALUE and gamma. The
 /// POINT is not on the stream since merged-open v1 — it is transcript-derived
@@ -128,7 +128,7 @@ pub(super) struct InitialOodRec {
 /// not as a wrong wire.
 #[allow(clippy::type_complexity)]
 pub(super) fn parse_open_levels(
-    ops: &[flock_core::transcript_record::TranscriptOp],
+    ops: &[flock_transcript::transcript_record::TranscriptOp],
     cap0_bytes: usize,
     r: usize,
 ) -> (

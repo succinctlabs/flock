@@ -1,6 +1,6 @@
 use super::*;
 use flock_core::matrix_fold::{JaggedRowWeight, MatrixClaim, Weight};
-use flock_core::transcript_record::TranscriptOp as Op;
+use flock_transcript::transcript_record::TranscriptOp as Op;
 
 /// One absorbed claim's stream ordinals on a fold tape: the four weight
 /// slices and the value, in absorb order.
@@ -57,7 +57,7 @@ pub(super) struct FoldPub {
 pub(super) fn fold_region_ops(
     cfg: TowerConfig,
     fold_claims: &[Vec<flock_core::matrix_fold::MatrixClaim>],
-) -> Vec<flock_core::transcript_record::TranscriptOp> {
+) -> Vec<flock_transcript::transcript_record::TranscriptOp> {
     let mut want: Vec<Op> = Vec::new();
     let grinding = tower_fold_grinding(cfg);
     for cs in fold_claims {
@@ -226,7 +226,7 @@ pub(super) fn locate_and_pin_folds(
 /// offset that emitted it. Grinding adds finalizations without challenges,
 /// while vector squeezes emit several challenge words from one finalization.
 pub(super) fn challenge_word_locs(
-    ops: &[flock_core::transcript_record::TranscriptOp],
+    ops: &[flock_transcript::transcript_record::TranscriptOp],
 ) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut fin = 0usize;
@@ -756,7 +756,7 @@ pub(super) struct JaggedFoldLoc {
 pub(super) fn jagged_fold_region_ops(
     cfg: TowerConfig,
     keys: &[([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)],
-) -> Vec<flock_core::transcript_record::TranscriptOp> {
+) -> Vec<flock_transcript::transcript_record::TranscriptOp> {
     let mut want: Vec<Op> = Vec::new();
     let grinding = tower_fold_grinding(cfg);
     for (_, cs) in keys {
@@ -830,7 +830,7 @@ pub(super) fn jagged_fold_region_ops(
 /// particular label. `Pow` also contributes one payload (its nonce), so fixed
 /// payload offsets are invalid as soon as grinding is enabled.
 pub(super) fn labeled_bytes_payloads(
-    ops: &[flock_core::transcript_record::TranscriptOp],
+    ops: &[flock_transcript::transcript_record::TranscriptOp],
     label: &[u8],
 ) -> Vec<usize> {
     let mut out = Vec::new();

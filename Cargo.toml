@@ -6,6 +6,7 @@ members = [
     "crates/flock-hash",
     "crates/flock-merkle",
     "crates/flock-multilinear",
+    "crates/flock-parallel",
     "crates/flock-prover",
     "crates/flock-transcript",
 ]
@@ -21,6 +22,8 @@ authors = ["Succinct Labs", "Benedikt Bunz", "William Wang"]
 flock-field = { path = "crates/flock-field" }
 flock-hash = { path = "crates/flock-hash" }
 flock-merkle = { path = "crates/flock-merkle" }
+flock-multilinear = { path = "crates/flock-multilinear" }
+flock-parallel = { path = "crates/flock-parallel" }
 flock-transcript = { path = "crates/flock-transcript" }
 rayon = "1.10"
 sha2 = { version = "0.10", features = ["asm"] }

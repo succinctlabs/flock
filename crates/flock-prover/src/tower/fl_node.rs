@@ -1,11 +1,11 @@
 use super::*;
 use crate::prover::UnionElementSlotInput;
 use flock_core::aggregate;
-use flock_core::field::PHI_8_TABLE;
 use flock_core::matrix_fold::{FoldProof, MatrixClaim};
-use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 use flock_core::zerocheck::K_SKIP;
 use flock_core::zerocheck::multilinear::subspace_denominator_pair;
+use flock_field::PHI_8_TABLE;
+use flock_transcript::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// The first-level node as a BUILDER: [`build_fl_node`]'s output. `lo` is
@@ -451,7 +451,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
         );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
-            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+            if let flock_transcript::transcript_record::StreamWord::Value(vi) = *w {
                 if vmap.len() <= vi {
                     vmap.resize(vi + 1, None);
                 }

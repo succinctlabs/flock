@@ -37,7 +37,7 @@
 //! `CHUNK_END` on the last, chaining through `h_in`, counter 0), whose final
 //! chaining value seeds `prev` in place of the leaf-digest global. One row
 //! then verifies one PCS L0 opening — leaf hash AND path — under exactly
-//! `flock_core::merkle`'s BLAKE3 tree semantics (leaf = non-root chunk CV of
+//! `flock_merkle`'s BLAKE3 tree semantics (leaf = non-root chunk CV of
 //! the leaf bytes, node = non-root PARENT compression). Chunk blocks need no
 //! gadget columns at all: the base encoder's free message region IS the leaf
 //! data, and its chaining-value rows are witness-identical to the pin (block
@@ -134,7 +134,7 @@ pub const NODE_BLOCK_LEN: u32 = 64;
 /// `depth` copies of one base block; set [`HashSpec::flags`] if you need the
 /// bit-exact BLAKE3 tree.
 ///
-/// This IS the semantics of `flock_core::merkle`'s BLAKE3 mode: its
+/// This IS the semantics of `flock_merkle`'s BLAKE3 mode: its
 /// internal nodes are non-root PARENT-flagged chaining values
 /// (`hazmat::merge_subtrees_non_root`), so the node levels here match the
 /// PCS commitment bit-for-bit with no `flags` override.
@@ -276,7 +276,7 @@ impl MerkleTreeLayout {
     /// single BLAKE3 chunk (a chain of `leaf_bytes/64` compressions,
     /// `CHUNK_START` on the first block and `CHUNK_END` on the last, chaining
     /// through `h_in`), followed by `depth` PARENT-node levels with the swap
-    /// gadget. This is exactly `flock_core::merkle`'s BLAKE3 mode — leaf =
+    /// gadget. This is exactly `flock_merkle`'s BLAKE3 mode — leaf =
     /// non-root chaining value of the leaf bytes, node = non-root
     /// PARENT-flagged compression — so one row verifies one PCS L0 opening
     /// bit-for-bit.

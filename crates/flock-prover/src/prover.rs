@@ -25,8 +25,6 @@
 //!     R1csClaim { ab: z-claim from lincheck,  c: z-claim from extract_c }
 //! ```
 
-use flock_core::challenger::Challenger;
-use flock_core::field::F128;
 use flock_core::lincheck::SkipPoint;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
@@ -35,6 +33,8 @@ use flock_core::proof::R1csProofLigeritoAg;
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
+use flock_field::F128;
+use flock_transcript::challenger::Challenger;
 
 /// Construct a multilinear `x_outer_full` of length `m − k_skip` from a
 /// QuirkyPoint: concatenate `x_inner_rest` and `x_outer`. This is the format

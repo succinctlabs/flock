@@ -1,4 +1,4 @@
-//! Dump GF(2^256) arithmetic vectors from the real `flock_core::field::F256`
+//! Dump GF(2^256) arithmetic vectors from the real `flock_field::F256`
 //! (the quadratic extension the F256 fold ladder runs in), so the CUDA/host
 //! port (`cuda-ghash/f256.cuh` / `test_f256_host.cpp`) is validated
 //! bit-for-bit against the field the prover uses.
@@ -84,7 +84,7 @@ fn main() -> std::io::Result<()> {
 
     w.flush()?;
     eprintln!(
-        "wrote F256 oracle to {path}: {} muls, {} base muls, {} x-inv, {} u·B (from real flock_core::field::F256)",
+        "wrote F256 oracle to {path}: {} muls, {} base muls, {} x-inv, {} u·B (from real flock_field::F256)",
         muls.len(),
         bases.len(),
         xs.len(),

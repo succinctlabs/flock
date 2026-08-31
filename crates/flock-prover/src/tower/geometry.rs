@@ -1,6 +1,6 @@
 use super::*;
 use flock_core::lincheck::build_eq_table;
-use flock_core::transcript_record::StreamWord;
+use flock_transcript::transcript_record::StreamWord;
 
 /// The three slots a collapsed opening writes into, plus the fused PoW mask
 /// slot the grinding checks ride: one 4-word [`PowMaskTable`] row carries a
@@ -389,7 +389,9 @@ pub(super) fn observed_f256(values: &[F128], start: usize, len: usize) -> Vec<F2
 }
 
 /// Stream-word indices per `observe_bytes` payload, in payload-word order.
-pub(super) fn payload_words(stream: &flock_core::transcript_record::Stream) -> Vec<Vec<usize>> {
+pub(super) fn payload_words(
+    stream: &flock_transcript::transcript_record::Stream,
+) -> Vec<Vec<usize>> {
     let mut pay_words: Vec<Vec<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
         if let StreamWord::Bytes { payload, word } = *w {
@@ -418,7 +420,7 @@ pub(super) fn payload_words(stream: &flock_core::transcript_record::Stream) -> V
 /// in-circuit cap trees bind them (chain + root connects, nothing
 /// checker-read), their payloads demote to witness in `pub_payloads`.
 pub(super) fn cap_payloads(
-    stream: &flock_core::transcript_record::Stream,
+    stream: &flock_transcript::transcript_record::Stream,
     bytes: &[u8],
     lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
 ) -> Vec<usize> {
@@ -446,7 +448,7 @@ pub(super) fn cap_payloads(
 /// The absorbed caps' node wires: per level, `2^c` word-wire pairs in
 /// cap-layer order, read off the [`cap_payloads`]-located payloads.
 pub(super) fn cap_wires(
-    stream: &flock_core::transcript_record::Stream,
+    stream: &flock_transcript::transcript_record::Stream,
     word_wire: &[Option<Wire>],
     cap_pays: &[usize],
 ) -> Vec<Vec<[Wire; 2]>> {

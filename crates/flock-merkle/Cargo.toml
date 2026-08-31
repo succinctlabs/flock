@@ -11,6 +11,7 @@ hash-count = []
 
 [dependencies]
 flock-hash = { workspace = true }
+flock-parallel = { workspace = true }
 rayon = { workspace = true }
 sha2 = { workspace = true }
 blake3 = { workspace = true }

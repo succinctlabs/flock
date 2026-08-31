@@ -1,10 +1,10 @@
 use super::*;
 use flock_core::pcs::ring_switch as rsw;
-use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 use flock_core::zerocheck::univariate_skip::build_eq;
 use flock_core::zerocheck::univariate_skip_optimized::{
     medium_challenges_ghash, small_challenges_ghash,
 };
+use flock_transcript::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 use std::sync::OnceLock;
 
 /// One recorded REAL-child verification (the leaf outer as inner), parsed:
@@ -20,7 +20,7 @@ pub(super) struct RealTape<'p> {
     pub(super) cap_pays: Vec<usize>,
     // chain materials
     pub(super) trace: crate::r1cs_hashes::fs_chain::FsChainTrace,
-    pub(super) stream: flock_core::transcript_record::Stream,
+    pub(super) stream: flock_transcript::transcript_record::Stream,
     pub(super) bytes: Vec<u8>,
     /// The fork's four cross-link wires ([`MergedChain::cross`]).
     pub(super) cross: Vec<Option<(usize, usize)>>,
@@ -1673,7 +1673,7 @@ pub(super) fn emit_family_h(
         let p0 = sb.gate(macs, &[pair[0], kw, pair[1]])[0];
         vrs = sb.gate(macs, &[vrs, coeff_w[0][j], p0])[0];
         vrs = sb.gate(macs, &[vrs, coeff_w[1][j], pair[1]])[0];
-        k_j = k_j * k_j + flock_core::field::QUADRATIC_NONRESIDUE;
+        k_j = k_j * k_j + flock_field::QUADRATIC_NONRESIDUE;
     }
     (rs_half, vrs)
 }
@@ -1759,7 +1759,7 @@ pub(super) fn emit_real_child_region(
             .iter()
             .enumerate()
             .filter(|(wi, w)| {
-                matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. }
+                matches!(w, flock_transcript::transcript_record::StreamWord::Bytes { payload, .. }
                     if rt.pub_payloads[*payload])
                     && ww[*wi].is_some()
             })
@@ -1779,7 +1779,7 @@ pub(super) fn emit_real_child_region(
             let wi = stream
                 .words
                 .iter()
-                .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pay))
+                .position(|w| matches!(w, flock_transcript::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pay))
                 .expect("pow nonce stream word");
             let nw = ww[wi].expect("pow nonce wired");
             [outs[sq[0]][1], nw]
@@ -1845,7 +1845,7 @@ pub(super) fn emit_real_child_region(
     // ---- intake W-rounds, spine, residual ----
     let mut vmap: Vec<Option<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
-        if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+        if let flock_transcript::transcript_record::StreamWord::Value(vi) = *w {
             if vmap.len() <= vi {
                 vmap.resize(vi + 1, None);
             }
@@ -2790,7 +2790,7 @@ pub(super) fn emit_real_child_region(
                     .position(|w| {
                         matches!(
                             w,
-                            flock_core::transcript_record::StreamWord::Bytes { payload, word: 0 }
+                            flock_transcript::transcript_record::StreamWord::Bytes { payload, word: 0 }
                                 if *payload == *nonce_payload
                         )
                     })

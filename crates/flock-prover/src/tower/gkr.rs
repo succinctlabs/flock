@@ -1,8 +1,8 @@
 use super::*;
 use flock_core::circuit::CellSlot;
-use flock_core::field::PHI_8_TABLE;
 use flock_core::zerocheck::K_SKIP;
 use flock_core::zerocheck::univariate_skip::build_eq;
+use flock_field::PHI_8_TABLE;
 use flock_hash::blake3_compress;
 
 /// One wiring-GKR layer, located on the tape (the assembly's wire map).
@@ -427,7 +427,7 @@ pub(super) fn emit_ag_point_binding(
     assert_eq!(x_native, pt_n.x, "the XOF x is the point's x");
     if let Some(bits) = ag_r1_bits {
         assert!(
-            flock_core::challenger::has_leading_zero_bits(&ns_bytes[16..32], bits),
+            flock_transcript::challenger::has_leading_zero_bits(&ns_bytes[16..32], bits),
             "the honest nonce clears the fused target"
         );
     }

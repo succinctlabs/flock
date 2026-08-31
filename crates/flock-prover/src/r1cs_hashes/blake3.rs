@@ -101,13 +101,13 @@ use rayon::prelude::*;
 use super::common::{
     BitRecord, add_carry_parts, fused_add3_parts, or_bit_at, or_u32_at_bit, xor_dedup,
 };
-use flock_core::challenger::Challenger;
-use flock_core::field::F128;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::schedule::IoWord;
 use flock_core::verifier;
+use flock_field::F128;
+use flock_transcript::challenger::Challenger;
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -1431,9 +1431,9 @@ pub fn generate_witness_with_ab_packed(
     blocks: &[Compression],
     n_blocks_log: usize,
 ) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
+    Vec<flock_field::F128>,
+    Vec<flock_field::F128>,
+    Vec<flock_field::F128>,
 ) {
     let n_total = 1usize << n_blocks_log;
     let n_blocks = blocks.len();
@@ -1497,9 +1497,9 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     blocks: &[Compression],
     n_blocks_log: usize,
 ) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
+    Vec<flock_field::F128>,
+    Vec<flock_field::F128>,
+    Vec<flock_field::F128>,
     Vec<u8>,
 ) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
@@ -1543,9 +1543,9 @@ impl Blake3Setup {
         &self,
         blocks: &[Compression],
     ) -> (
-        Vec<flock_core::field::F128>,
-        Vec<flock_core::field::F128>,
-        Vec<flock_core::field::F128>,
+        Vec<flock_field::F128>,
+        Vec<flock_field::F128>,
+        Vec<flock_field::F128>,
         Vec<u8>,
     ) {
         match self.r1cs.layout {
@@ -2019,9 +2019,9 @@ pub fn generate_witness_batch_major(
     blocks: &[Compression],
     n_blocks_log: usize,
 ) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
+    Vec<flock_field::F128>,
+    Vec<flock_field::F128>,
+    Vec<flock_field::F128>,
     Vec<u8>,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
@@ -2045,9 +2045,9 @@ pub fn generate_witness_batch_major_partial(
     blocks: &[Compression],
     n_blocks_log: usize,
 ) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
+    Vec<flock_field::F128>,
+    Vec<flock_field::F128>,
+    Vec<flock_field::F128>,
     Vec<u8>,
 ) {
     super::common::drive_witness_batch_major_partial(
@@ -2191,8 +2191,8 @@ mod tests {
             assert_eq!(stripe_b, stripe_r, "stripe diverged (n_log={n_log})");
 
             let chunks_per_block = K / 128;
-            let transpose = |row: &[flock_core::field::F128]| {
-                let mut out = vec![flock_core::field::F128::ZERO; row.len()];
+            let transpose = |row: &[flock_field::F128]| {
+                let mut out = vec![flock_field::F128::ZERO; row.len()];
                 for o in 0..1usize << n_log {
                     for c in 0..chunks_per_block {
                         out[(c << n_log) + o] = row[o * chunks_per_block + c];
@@ -2213,8 +2213,8 @@ mod tests {
     /// group boundary, fully-dummy trailing groups, and the empty count.
     #[test]
     fn batch_major_partial_zeroes_dummy_rows() {
-        use flock_core::field::F128;
         use flock_core::lincheck::pack_z_lincheck_from_packed;
+        use flock_field::F128;
 
         let n_log = 4usize;
         let n_total = 1usize << n_log;
@@ -2273,7 +2273,7 @@ mod tests {
     #[test]
     #[ignore]
     fn batch_major_prove_fast_roundtrip() {
-        use flock_core::challenger::FsChallenger;
+        use flock_transcript::challenger::FsChallenger;
 
         let setup = Blake3Setup::new(256);
         let mut rng = Rng::new(0xBA7C_F013);
@@ -2312,7 +2312,7 @@ mod tests {
     // stranding (the AG/timed entry points commit the standard-pack witness,
     // so a union-shaped `pcs_params` panics them all).
     fn prove_fast_ligerito_ag_roundtrip() {
-        use flock_core::challenger::FsChallenger;
+        use flock_transcript::challenger::FsChallenger;
         let setup = Blake3Setup::new(256);
         let mut rng = Rng::new(0xb1a_3a9_211e);
         let blocks: Vec<Compression> = (0..256)
@@ -2332,7 +2332,7 @@ mod tests {
 
         // Tampering an AG round-1 message must reject.
         let mut bad = proof.clone();
-        bad.ag.round1_ab[0] += flock_core::field::F128::ONE;
+        bad.ag.round1_ab[0] += flock_field::F128::ONE;
         let mut ch_b = FsChallenger::new(b"flock-blake3-ag-v0");
         assert!(
             setup.verify_ag(&commitment, &bad, &mut ch_b).is_err(),
@@ -2347,7 +2347,7 @@ mod tests {
     #[test]
     #[ignore] // Heavy — run with `cargo test batch_major_prove_fast_ag_roundtrip -- --ignored`
     fn batch_major_prove_fast_ag_roundtrip() {
-        use flock_core::challenger::FsChallenger;
+        use flock_transcript::challenger::FsChallenger;
 
         let setup = Blake3Setup::new(256);
         let mut rng = Rng::new(0xBA7C_F013);
@@ -2386,7 +2386,7 @@ mod tests {
     #[test]
     #[ignore] // Heavy — run with `cargo test prove_fast_union_ag_roundtrip -- --ignored`
     fn prove_fast_union_ag_roundtrip() {
-        use flock_core::challenger::FsChallenger;
+        use flock_transcript::challenger::FsChallenger;
         let setup = Blake3Setup::new(256);
         let mut rng = Rng::new(0xA9_0110_4A6);
         let blocks: Vec<Compression> = (0..256)
@@ -2407,7 +2407,7 @@ mod tests {
 
         // Tampering an AG round-1 message must reject.
         let mut bad = proof.clone();
-        bad.boolean.ag.round1_ab[0] += flock_core::field::F128::ONE;
+        bad.boolean.ag.round1_ab[0] += flock_field::F128::ONE;
         let mut ch = FsChallenger::new(b"flock-union-ag-v0");
         assert!(
             setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
@@ -2471,7 +2471,7 @@ mod tests {
     #[test]
     #[ignore] // Heavy — run with `-- --ignored`.
     fn prove_fast_union_ag_partial_utilization_roundtrip() {
-        use flock_core::challenger::FsChallenger;
+        use flock_transcript::challenger::FsChallenger;
         let setup = Blake3Setup::new(200);
         let mut rng = Rng::new(0xA9_0110_4A7);
         let blocks: Vec<Compression> = (0..200)
@@ -2744,8 +2744,8 @@ mod tests {
     /// R1CS / ring-switch / recursive-sumcheck pipeline end to end.
     #[test]
     fn prove_verify_ligerito_all_profiles() {
-        use flock_core::challenger::FsChallenger;
         use flock_core::pcs::ligerito::LigeritoProfile;
+        use flock_transcript::challenger::FsChallenger;
         let blocks: Vec<Compression> = {
             let mut rng = Rng::new(0x9A11_0F11);
             (0..256)
@@ -2787,7 +2787,7 @@ mod tests {
     #[test]
     #[ignore]
     fn prove_fast_ligerito_roundtrip() {
-        use flock_core::challenger::FsChallenger;
+        use flock_transcript::challenger::FsChallenger;
         let setup = Blake3Setup::new(256);
         let mut rng = Rng::new(0xb1a_3211e);
         let blocks: Vec<Compression> = (0..256)
@@ -2814,7 +2814,7 @@ mod tests {
     #[test]
     #[ignore] // Heavier — Ligerito needs m=22; run with `cargo test const_pin_all_zero_rejected -- --ignored`
     fn const_pin_all_zero_rejected() {
-        use flock_core::challenger::FsChallenger;
+        use flock_transcript::challenger::FsChallenger;
 
         let n = 250; // 6 padding blocks at n_block_slots = 256 (m = 22)
         let setup = Blake3Setup::new(n);
@@ -2841,12 +2841,9 @@ mod tests {
         let zeros: Vec<Compression> = vec![([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32); n];
         let (mut z, mut a, mut b, mut zlc) =
             generate_witness_batch_major_partial(&zeros, setup.n_blocks_log());
-        z.iter_mut()
-            .for_each(|v| *v = flock_core::field::F128::ZERO);
-        a.iter_mut()
-            .for_each(|v| *v = flock_core::field::F128::ZERO);
-        b.iter_mut()
-            .for_each(|v| *v = flock_core::field::F128::ZERO);
+        z.iter_mut().for_each(|v| *v = flock_field::F128::ZERO);
+        a.iter_mut().for_each(|v| *v = flock_field::F128::ZERO);
+        b.iter_mut().for_each(|v| *v = flock_field::F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
         let union = flock_core::union::UnionInstance::new(&setup.registry, vec![n]);
         let slot = crate::prover::UnionSlotProverInput::new(

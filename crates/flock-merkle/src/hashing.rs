@@ -9,7 +9,25 @@ use std::sync::OnceLock;
 
 pub type Hash = flock_hash::Digest;
 
-pub use flock_hash::{BLAKE3_IV, HashKind, MerkleHash};
+pub use flock_hash::{BLAKE3_IV, HashKind};
+
+pub trait MerkleHash: Send + Sync + 'static {
+    fn hash_leaf(data: &[u8]) -> Hash;
+
+    fn hash_pair(left: &Hash, right: &Hash) -> Hash;
+
+    fn hash_leaves(data: &[u8], leaf_size: usize, output: &mut [Hash]) {
+        for (digest, leaf) in output.iter_mut().zip(data.chunks(leaf_size)) {
+            *digest = Self::hash_leaf(leaf);
+        }
+    }
+
+    fn hash_pairs(children: &[Hash], parents: &mut [Hash]) {
+        for (parent, pair) in parents.iter_mut().zip(children.as_chunks::<2>().0) {
+            *parent = Self::hash_pair(&pair[0], &pair[1]);
+        }
+    }
+}
 
 pub struct Sha256MerkleHash;
 

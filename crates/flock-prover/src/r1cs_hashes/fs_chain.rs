@@ -19,10 +19,10 @@
 //! could otherwise produce a self-consistent circuit for a transcript nobody
 //! computes.
 
-use flock_core::challenger::pow_squeeze_counter;
-use flock_core::field::F128;
-use flock_core::transcript_record::{Stream, TranscriptOp};
+use flock_field::F128;
 use flock_hash::blake3_compress;
+use flock_transcript::challenger::pow_squeeze_counter;
+use flock_transcript::transcript_record::{Stream, TranscriptOp};
 
 use super::blake3::Compression;
 
@@ -506,7 +506,7 @@ pub const CHAIN_ABSORB: u32 = 1 << 6;
 pub const CHAIN_SQUEEZE: u32 = 1 << 7;
 
 /// The SPONGE-CHAINED transcript trace builder (transcript-v3 DUPLEX):
-/// mirrors [`flock_core::challenger::FsChallenger::with_chained_blake3`]
+/// mirrors [`flock_transcript::challenger::FsChallenger::with_chained_blake3`]
 /// row for row — a sequential compression chain, no chunk tree, and
 /// squeezes that MUTATE the state. A squeeze's first row consumes the
 /// pending partial block as its message (`block_offsets = Some(..)` with a
@@ -761,15 +761,15 @@ mod tests {
     /// hashes.
     #[test]
     fn sponge_finalize_matches_the_chained_challenger() {
-        use flock_core::challenger::{Challenger, FsChallenger};
-        use flock_core::field::F128;
+        use flock_field::F128;
+        use flock_transcript::challenger::{Challenger, FsChallenger};
         // Drive both through the SAME op schedule via the recording layer:
         // absorb framed values exactly as the challenger frames them.
         let mut ch = FsChallenger::with_chained_blake3(b"sponge-diff");
         let rec_bytes: Vec<u8> = Vec::new();
         // Reproduce the challenger's framing byte-for-byte using the
         // recording of a twin transcript.
-        use flock_core::transcript_record::RecordingChallenger;
+        use flock_transcript::transcript_record::RecordingChallenger;
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(b"sponge-diff"));
         let mut squeezed_ch: Vec<Vec<u8>> = Vec::new();
         for i in 0..40u64 {
@@ -909,8 +909,8 @@ mod tests {
     /// computes.
     #[test]
     fn forked_chains_reproduce_the_native_transcript() {
-        use flock_core::challenger::{Challenger, FsChallenger};
-        use flock_core::transcript_record::RecordingChallenger;
+        use flock_transcript::challenger::{Challenger, FsChallenger};
+        use flock_transcript::transcript_record::RecordingChallenger;
 
         // Parent absorbs, forks, both sides run, merge, parent continues —
         // the union prover's one-sided wiring branch in miniature.
@@ -1015,8 +1015,8 @@ mod tests {
 
     #[test]
     fn fused_pow_squeeze_trace_matches_recorded_challenger() {
-        use flock_core::challenger::{Challenger, FsChallenger};
-        use flock_core::transcript_record::RecordingChallenger;
+        use flock_transcript::challenger::{Challenger, FsChallenger};
+        use flock_transcript::transcript_record::RecordingChallenger;
 
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(b"pow-trace"));
         rec.observe_f128_slice(&[
@@ -1079,7 +1079,7 @@ mod tests {
         let nonce_at = stream
             .words
             .iter()
-            .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if rec.payloads()[*payload] == nonce.to_le_bytes()))
+            .position(|w| matches!(w, flock_transcript::transcript_record::StreamWord::Bytes { payload, .. } if rec.payloads()[*payload] == nonce.to_le_bytes()))
             .expect("nonce word");
         assert_eq!(
             F128::new(

@@ -43,9 +43,9 @@
 
 use rayon::prelude::*;
 
-use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 use flock_core::schedule::IoWord;
+use flock_field::F128;
 
 use super::common::identity;
 use super::merkle_r1cs::SLOT_WORDS;
@@ -207,7 +207,7 @@ pub(crate) fn scatter_zab_into(
 /// ```
 ///
 /// `b = 0` puts the running digest LEFT (`left = prev`, `right = sib`), which
-/// is what `flock_core::merkle` means by an even node index — the same
+/// is what `flock_merkle` means by an even node index — the same
 /// polarity `57aeb48` gave the composite, so the table's bit and the tree's
 /// position are the same number and a Fiat–Shamir challenge wires straight in.
 ///

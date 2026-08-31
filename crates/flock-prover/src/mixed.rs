@@ -29,7 +29,6 @@
 //! new id byte. The id ↔ byte mapping below is explicit and stable — it is
 //! what [`crate::proof_io`] serializes.
 
-use flock_core::challenger::Challenger;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::pcs::{Commitment, PcsParams};
@@ -38,6 +37,7 @@ use flock_core::r1cs::BlockR1cs;
 use flock_core::schedule::{Registry, TableType};
 use flock_core::union::UnionInstance;
 use flock_core::verifier::{self, FlockVerifyError};
+use flock_transcript::challenger::Challenger;
 use serde::{Deserialize, Serialize};
 
 use crate::prover::{self, UnionSlotProverInput};

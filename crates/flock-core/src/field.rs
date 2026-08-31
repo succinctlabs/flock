@@ -5,6 +5,4 @@
 //! - [`F256`] — quadratic extension of F128 defined by u^2 + u + x^-1
 //! - [`F256Unreduced`] — 256-bit unreduced GHASH products, for deferred reduction
 
-pub(crate) mod f128_slice;
-
 pub use flock_field::*;

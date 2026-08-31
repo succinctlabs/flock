@@ -45,15 +45,12 @@ where
         .fold(one, |value, (&left, &right)| value * (one + left + right))
 }
 
-fn build_eq_table<T>(
-    coordinates: impl Iterator<Item = T>,
-    num_variables: usize,
-    one: T,
-    seed: T,
-) -> Vec<T>
+fn build_eq_table<T, I>(coordinates: I, num_variables: usize, one: T, seed: T) -> Vec<T>
 where
     T: Copy + Send + Sync + Add<Output = T> + Mul<Output = T>,
+    I: ExactSizeIterator<Item = T>,
 {
+    assert_eq!(coordinates.len(), num_variables, "equality point shape");
     let len = 1usize
         .checked_shl(num_variables.try_into().expect("point is too large"))
         .expect("equality table is too large");
@@ -192,6 +189,13 @@ mod tests {
                 assert_eq!(value, expected);
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "equality point shape")]
+    fn equality_table_builder_rejects_a_short_iterator() {
+        let coordinates = [F8(2), F8(3)];
+        let _ = build_eq_table(coordinates.into_iter().take(1), 2, ONE, ONE);
     }
 
     #[test]

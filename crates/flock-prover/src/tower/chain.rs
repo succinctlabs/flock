@@ -43,7 +43,7 @@ impl MixedProof {
     }
     /// The plain (assertions-discharged) circuit verify, flavor-dispatched.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn verify_circuit<Ch: flock_core::challenger::Challenger>(
+    pub(super) fn verify_circuit<Ch: flock_transcript::challenger::Challenger>(
         &self,
         union: &UnionInstance<'_>,
         circuit: &flock_core::circuit::Circuit,
@@ -65,7 +65,7 @@ impl MixedProof {
     /// The DEFERRED circuit verify (assertions returned, not discharged),
     /// flavor-dispatched — what the recursion tapes record.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn verify_circuit_deferred<Ch: flock_core::challenger::Challenger>(
+    pub(super) fn verify_circuit_deferred<Ch: flock_transcript::challenger::Challenger>(
         &self,
         union: &UnionInstance<'_>,
         circuit: &flock_core::circuit::Circuit,

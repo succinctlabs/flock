@@ -350,7 +350,7 @@ pub(super) struct ResidualPrefix3Gate256 {
 impl ResidualPrefix3Gate256 {
     pub(super) fn new() -> Self {
         let o = F128::ONE;
-        let nr = flock_core::field::QUADRATIC_NONRESIDUE;
+        let nr = flock_field::QUADRATIC_NONRESIDUE;
         // in: prefix pair, three challenge pairs, three base weights, one.
         let (n_in, one) = (12usize, 11usize);
         let mut b = ElementTableBuilder::new(6);
@@ -661,7 +661,7 @@ impl PrefixGate256 {
             let bs = 2 + 2 * pl + 2 * j;
             let factor0 = vec![(one, o), (a[0], o), (bs, o)];
             let factor1 = vec![(zero, o), (a[1], o), (bs + 1, o)];
-            let nr = flock_core::field::QUADRATIC_NONRESIDUE;
+            let nr = flock_field::QUADRATIC_NONRESIDUE;
             b.mult_lin(c, &[(pr[0], o)], &factor0);
             b.mult_lin(c + 1, &[(pr[1], o)], &factor1);
             b.mult_lin(

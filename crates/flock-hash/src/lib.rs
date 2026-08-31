@@ -7,24 +7,6 @@ use serde::{Deserialize, Serialize};
 pub type Digest = [u8; 32];
 
 /// A hash implementation for binary Merkle trees.
-pub trait MerkleHash: Send + Sync + 'static {
-    fn hash_leaf(data: &[u8]) -> Digest;
-
-    fn hash_pair(left: &Digest, right: &Digest) -> Digest;
-
-    fn hash_leaves(data: &[u8], leaf_size: usize, output: &mut [Digest]) {
-        for (digest, leaf) in output.iter_mut().zip(data.chunks(leaf_size)) {
-            *digest = Self::hash_leaf(leaf);
-        }
-    }
-
-    fn hash_pairs(children: &[Digest], parents: &mut [Digest]) {
-        for (parent, pair) in parents.iter_mut().zip(children.as_chunks::<2>().0) {
-            *parent = Self::hash_pair(&pair[0], &pair[1]);
-        }
-    }
-}
-
 /// A supported hash function.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

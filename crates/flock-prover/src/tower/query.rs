@@ -1,6 +1,6 @@
 use super::*;
 use flock_core::lincheck::build_eq_table;
-use flock_core::transcript_record::TranscriptOp as Op;
+use flock_transcript::transcript_record::TranscriptOp as Op;
 
 #[cfg(test)]
 use flock_hash::blake3_compress;
@@ -811,9 +811,9 @@ pub(super) fn emit_recorded_pow_checks(
     b3: flock_core::circuit::builder::SlotId,
     spread: flock_core::circuit::builder::SlotId,
     iv: [Wire; 2],
-    ops: &[flock_core::transcript_record::TranscriptOp],
+    ops: &[flock_transcript::transcript_record::TranscriptOp],
     trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
-    stream: &flock_core::transcript_record::Stream,
+    stream: &flock_transcript::transcript_record::Stream,
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
     vals: &mut Vec<F128>,
@@ -839,7 +839,7 @@ pub(super) fn emit_recorded_pow_checks(
             let wi = stream
                 .words
                 .iter()
-                .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pay))
+                .position(|w| matches!(w, flock_transcript::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pay))
                 .expect("pow nonce stream word");
             (
                 [outs[sq[0]][1], ww[wi].expect("pow nonce wired")],
@@ -868,7 +868,7 @@ pub(super) fn fused_pow_masks_match_raw_compression() {
                 let out = blake3_compress(
                     &cv,
                     &message,
-                    flock_core::challenger::pow_squeeze_counter(bits, pending_len + 16),
+                    flock_transcript::challenger::pow_squeeze_counter(bits, pending_len + 16),
                     64,
                     crate::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
                 );
@@ -933,7 +933,7 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
         blake3_compress(
             &cv,
             &message,
-            flock_core::challenger::pow_squeeze_counter(bits, 16),
+            flock_transcript::challenger::pow_squeeze_counter(bits, 16),
             64,
             crate::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
         )
@@ -981,7 +981,7 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
             &mut vals,
             &mut consts,
             pack_params(
-                flock_core::challenger::pow_squeeze_counter(circuit_bits, 16),
+                flock_transcript::challenger::pow_squeeze_counter(circuit_bits, 16),
                 64,
                 crate::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
             ),

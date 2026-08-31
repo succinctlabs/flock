@@ -159,6 +159,7 @@ dependencies = [
  "flock-hash",
  "flock-merkle",
  "flock-multilinear",
+ "flock-parallel",
  "flock-transcript",
  "rand_core",
  "rayon",
@@ -197,6 +198,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "flock-hash",
+ "flock-parallel",
  "rayon",
  "sha2",
 ]
@@ -209,14 +211,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "flock-parallel"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "flock-prover"
 version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
  "flock-core",
+ "flock-field",
  "flock-hash",
+ "flock-merkle",
  "flock-multilinear",
+ "flock-transcript",
  "rayon",
  "serde",
  "sha2",
