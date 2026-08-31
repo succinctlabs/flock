@@ -2798,3 +2798,58 @@ constant structure sits inside the live region). At ~2-3 ms, and
 needing the witness-safety apparatus (runtime compare + generic
 fallback) to be sound, it does not clear the bloat bar. Not built.
 Recorded so nobody re-derives it.
+
+### Fold fusion ("the swoop"): DEAD — the fold's writes are already free — 2026-08-31
+
+`mlv_tail_fs_resume` (ag_skip.rs:1518) carries a forward reference from
+main's own AG port to "the swoop's fold-level lookahead, which covers
+rounds 0–1 during the witness fold" — the fusion, with the resume entry
+already built for it. "swoop" appears nowhere else in the repo or its
+history, so it was designed and never implemented. Priced it before
+building.
+
+FIRST, the in-prove attribution (new `[ag-zc-timing]` fold/tail split,
+kept — the standalone `ag_breakdown` numbers overstate badly):
+
+| AG phase (m=32) | standalone | **in-prove, warm** |
+|---|---|---|
+| round-1 URM | 66.4 | 66.4 |
+| skip→mlv fold | 114.6 | **41–45** |
+| mlv tail (lookahead) | — | **~54** |
+| (classic tail, for scale) | — | ~174 |
+
+So the fold is 42 ms, not 115 — the standalone figure is cold-pool +
+2 GB allocation. AG zerocheck ≈ 66 + 42 + 54 ≈ 162 ms, matching the
+164 ms end-to-end.
+
+THEN three probes into `fold_block_at` (each applied, measured,
+reverted):
+
+| variant | fold ms | reading |
+|---|---|---|
+| baseline | 41–45 | — |
+| stores removed entirely | 55–58 | **slower** |
+| stores redirected to a stack buffer (2 GB DRAM traffic gone, store instructions kept) | 43–63 | **no gain** |
+| Horner message chain removed (byte-dots + stores kept) | 36–43 | −4…6 ms (~12%) |
+
+**The fold's 2 GB of state writes are free.** They hide behind the
+byte-dot work; removing them changes nothing, and removing the store
+instructions altogether makes it *slower* (the loop is then bound by
+the serial `shl2_xor` Horner dependency rather than overlapping with
+independent stores). The fold is bound by the byte-dot gathers:
+`n = 2^26` outputs × 8 table lookups × 2 operands ≈ 1.07e9 gathers
+≈ 36 of the 42 ms.
+
+**Therefore fusion cannot pay.** It would eliminate writes that cost
+nothing (and a 2 GB streaming read in the tail's first round) while
+adding a SECOND full byte-dot pass — the one part that is actually
+expensive. Materialize-vs-recompute is settled the other way here:
+`a_packed` is a 2× compression of `a_mlv`, but decompressing it costs
+~36 ms and storing it costs ~0. Not built.
+
+Residual idea if the fold is ever revisited: it is gather-bound, so
+the lever is the byte-dot table geometry (8 lookups/output from 8×256
+F128 = 32 KiB, L1-resident). A 16-bit-index table halves the gathers
+but needs 4 MiB, moving the working set to shared L2 — a real
+tradeoff, not an obvious win, and worth at most ~15 ms of a 42 ms
+phase that is ~5% of the prove.

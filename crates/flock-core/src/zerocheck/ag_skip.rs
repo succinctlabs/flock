@@ -1319,6 +1319,12 @@ fn prove_from_round1<C: Challenger>(
             && n_out >= 8
             && live_blocks * 128 * super::sparse_tail_gate() <= n_out
     });
+    // Phase split for FLOCK_ZC_TIMING: the standalone `ag_breakdown` kernel
+    // timings overstate the fold badly (cold pool + 2 GB alloc: 115 ms
+    // standalone vs ~42 ms in-prove), so the attribution has to come from
+    // inside the prove.
+    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    let t_fold = std::time::Instant::now();
     let (a_mlv, b_mlv, g1_0, ginf_0, store) = if sparse {
         let cov = coverage.expect("sparse implies coverage");
         let (a, b, g1, gi, st) = fold_and_first_round_sparse(a_packed, b_packed, &w, &r_rest, cov);
@@ -1330,6 +1336,15 @@ fn prove_from_round1<C: Challenger>(
         };
         (a, b, g1, gi, None)
     };
+    if zc_timing {
+        eprintln!(
+            "[ag-zc-timing] skip->mlv fold{}: {:.2} ms (out n={})",
+            if sparse { " (sparse)" } else { "" },
+            t_fold.elapsed().as_secs_f64() * 1e3,
+            a_mlv.len()
+        );
+    }
+    let t_mlv = std::time::Instant::now();
     let (rounds, rhos, a_eval, b_eval) = match grinding.multilinear_round_bits() {
         Some(bits) => {
             let mut gch = RoundGrindProver {
@@ -1341,6 +1356,12 @@ fn prove_from_round1<C: Challenger>(
         }
         None => mlv_tail_dispatch(a_mlv, b_mlv, g1_0, ginf_0, store, &r_rest, challenger),
     };
+    if zc_timing {
+        eprintln!(
+            "[ag-zc-timing] mlv tail: {:.2} ms",
+            t_mlv.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     let proof = AgProof {
         round1_ab: msg.ab_fresh,
