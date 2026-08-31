@@ -40,7 +40,8 @@
 use sha2::{Digest, Sha256};
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use flock_field::F128;
+use flock_hash::HashKind;
 
 /// One protocol-level transcript action, with values stripped.
 ///
@@ -779,7 +780,7 @@ impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
         self.inner.supports_fused_pow_squeeze()
     }
 
-    fn hash_kind(&self) -> crate::hash::HashKind {
+    fn hash_kind(&self) -> HashKind {
         // Forward — the trait default (SHA-256) would silently diverge any
         // out-of-sponge derivation (the AG-skip nonce decode) from the
         // inner transcript's hash during recording.
@@ -967,7 +968,7 @@ impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
-    use crate::hash::HashKind;
+    use flock_hash::{BLAKE3_IV, blake3_compress};
 
     /// Drive a challenger through one op of every kind, returning the
     /// challenges it produced. Shared so the bare and decorated runs are
@@ -1273,7 +1274,7 @@ mod tests {
         assert_eq!(stream.finalize_after.len(), fin_ops.len());
 
         // Local duplex replay over the same primitive.
-        let mut cv = crate::hash::BLAKE3_IV;
+        let mut cv = BLAKE3_IV;
         let mut pend: Vec<u8> = Vec::new();
         let drain = |cv: &mut [u32; 8], pend: &mut Vec<u8>| {
             while pend.len() >= 64 {
@@ -1281,7 +1282,7 @@ mod tests {
                 for (i, c) in pend[..64].chunks(4).enumerate() {
                     m[i] = u32::from_le_bytes(c.try_into().unwrap());
                 }
-                let out = crate::hash::blake3_compress(cv, &m, 0, 64, CHAIN_ABSORB);
+                let out = blake3_compress(cv, &m, 0, 64, CHAIN_ABSORB);
                 cv.copy_from_slice(&out[..8]);
                 pend.drain(..64);
             }
@@ -1303,7 +1304,7 @@ mod tests {
                         m[i] = u32::from_le_bytes(w);
                     }
                 }
-                let out = crate::hash::blake3_compress(&cv, &m, 0, blen, CHAIN_SQUEEZE);
+                let out = blake3_compress(&cv, &m, 0, blen, CHAIN_SQUEEZE);
                 cv.copy_from_slice(&out[..8]);
                 for w in out.iter() {
                     got.extend_from_slice(&w.to_le_bytes());

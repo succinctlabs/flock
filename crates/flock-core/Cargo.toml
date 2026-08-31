@@ -43,6 +43,7 @@ toml = { workspace = true }
 [dev-dependencies]
 # Used by `LigeritoSecurityConfig` serde round-trip tests.
 serde_json = { workspace = true }
+flock-transcript = {workspace = true, features = ["unsound-challenger"]}
 
 [lints]
 workspace = true

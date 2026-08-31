@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 pub type Hash = flock_hash::Digest;
 
-pub use flock_hash::{HashKind, MerkleHash};
+pub use flock_hash::{BLAKE3_IV, HashKind, MerkleHash};
 
 pub struct Sha256MerkleHash;
 
@@ -232,11 +232,6 @@ fn sha256_hash4(inputs: [&[u8]; 4], outs: &mut [Hash]) {
 // `blake3` update fails the suite rather than silently altering commitments,
 // and an API removal fails the build. Nothing here is reachable if the
 // equality does not hold.
-
-/// BLAKE3's IV — the key words for unkeyed hashing. Fixed by the spec.
-const BLAKE3_IV: [u32; 8] = [
-    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
-];
 
 /// BLAKE3 domain flags, fixed by the spec.
 const BLAKE3_CHUNK_START: u8 = 1;

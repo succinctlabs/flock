@@ -4,8 +4,8 @@
 //! [`FsChallenger`] supports SHA-256 and BLAKE3.
 //! `RandomChallenger` supports tests and benchmarks only.
 
-use crate::field::{F128, F256};
-use crate::hash::HashKind;
+use flock_field::{F128, F256};
+use flock_hash::{BLAKE3_IV, HashKind, blake3_compress};
 use sha2::{Digest, Sha256};
 
 /// Number of grinding bits needed to turn a Schwartz--Zippel event of
@@ -386,7 +386,7 @@ pub const fn pow_squeeze_counter(bits: u32, message_len: usize) -> u64 {
 impl B3Chain {
     fn new() -> Self {
         Self {
-            cv: crate::hash::BLAKE3_IV,
+            cv: BLAKE3_IV,
             buf: Vec::with_capacity(64),
         }
     }
@@ -409,7 +409,7 @@ impl B3Chain {
         self.buf.extend_from_slice(bytes);
         while self.buf.len() >= 64 {
             let m = Self::block_words(&self.buf[..64]);
-            let out = crate::hash::blake3_compress(&self.cv, &m, 0, 64, CHAIN_ABSORB);
+            let out = blake3_compress(&self.cv, &m, 0, 64, CHAIN_ABSORB);
             self.cv = out[..8].try_into().expect("8 words");
             self.buf.drain(..64);
         }
@@ -427,7 +427,7 @@ impl B3Chain {
             } else {
                 ([0u32; 16], 0u32)
             };
-            let ob = crate::hash::blake3_compress(&self.cv, &m, 0, blen, CHAIN_SQUEEZE);
+            let ob = blake3_compress(&self.cv, &m, 0, blen, CHAIN_SQUEEZE);
             self.cv = ob[..8].try_into().expect("8 words");
             let mut bytes = [0u8; 64];
             for (i, w) in ob.iter().enumerate() {
@@ -457,7 +457,7 @@ impl B3Chain {
     fn pow_candidate_output(&self, nonce: u64, bits: u32) -> [u32; 16] {
         let block = self.pow_block(nonce);
         let m = Self::block_words(&block);
-        crate::hash::blake3_compress(
+        blake3_compress(
             &self.cv,
             &m,
             pow_squeeze_counter(bits, self.buf.len() + 16),
@@ -516,7 +516,7 @@ impl B3Chain {
             }
         }
         while off < out.len() {
-            let ob = crate::hash::blake3_compress(&self.cv, &[0u32; 16], 0, 0, CHAIN_SQUEEZE);
+            let ob = blake3_compress(&self.cv, &[0u32; 16], 0, 0, CHAIN_SQUEEZE);
             self.cv = ob[..8].try_into().expect("8 words");
             let mut bytes = [0u8; 64];
             for (i, w) in ob.iter().enumerate() {
