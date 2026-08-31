@@ -455,7 +455,8 @@ mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
     use crate::element_r1cs::broadcast_add;
-    use crate::element_r1cs::tests::{Rng, mixed_gate, mixed_witness, mult_gate, mult_witness};
+    use crate::element_r1cs::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
+    use crate::test_rng::Rng;
     use crate::zerocheck::multilinear::eq_eval;
 
     /// Direct MLE evaluation at `point`, binding the low variable first.

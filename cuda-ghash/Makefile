@@ -317,8 +317,6 @@ ligerito_f256_host: test_ligerito_f256_host ligerito_f256_vectors
 	./test_ligerito_f256_host ligerito_f256_vectors.bin
 
 # Full Ligerito open prover benchmark (prove-only, no oracle).
-bench_keccak3_gpu: bench_keccak3_gpu.cu keccak3_witness.cuh zerocheck_round1_cpustyle.cuh zerocheck_round1.cuh ntt_f128.cuh merkle.cuh merkle_open.hpp induce_sumcheck.cuh introduce_glue.cuh sumcheck_ab.cuh challenger.hpp f128.cuh
-	$(NVCC) $(NVCCFLAGS) bench_keccak3_gpu.cu -o $@
 bench_ligerito: bench_ligerito.cu zerocheck_round1_cpustyle.cuh zerocheck_round1.cuh zerocheck_round2.cuh zerocheck_tail.cuh zc_challenger_device.cuh sha256.cuh ntt_f128.cuh merkle.cuh merkle_open.hpp induce_sumcheck.cuh introduce_glue.cuh sumcheck_ab.cuh lincheck.cuh blake3_witness.cuh challenger.hpp f128.cuh
 	$(NVCC) $(NVCCFLAGS) bench_ligerito.cu -o $@
 

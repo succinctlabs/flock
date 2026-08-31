@@ -40,6 +40,7 @@ pub mod r1cs;
 pub mod schedule;
 pub mod scratch;
 pub mod suboptimal;
+pub mod test_rng;
 pub mod transcript_record;
 pub mod union;
 pub mod verifier;

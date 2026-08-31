@@ -39,9 +39,6 @@ run; the first run of each competitor therefore includes a one-time clone+build
 - **Cooldowns.** Pass `--cooldown N` (or `COOLDOWN=N`) to sleep N seconds between
   benchmarks so thermal throttling doesn't bias later (especially ST) runs.
   **~20 s is recommended**; default is off.
-- **Flock = the 3-wide keccak encoder (`keccak3`).** At a `2^h` keccak target it
-  proves `N = 3·2^(h-1)` permutations (= 1.5× `2^h`) at the same committed size.
-  So a "2^14 keccak" point means `KECCAK3_KS=24576` (`3·2^13`).
 
 All `cargo bench` commands below run against the local Flock prover and need no
 competitor setup; the `benchmarks/` orchestrators are only needed for the
@@ -51,7 +48,7 @@ cross-prover comparison tables.
 
 ## README hash throughput matrix
 
-Regenerate the README table across SHA-256, BLAKE3, and Keccak-f[1600], at
+Regenerate the README table across SHA-256 and BLAKE3, at
 multiple batch sizes, using one
 thread and the machine's physical-core count:
 
@@ -76,41 +73,12 @@ cargo bench --bench native_hash
 ```
 
 Read the per-core ops/s:
-- `keccak-f[1600]   (scalar)` → ≈ 7.5 M/s
 - `SHA-256 compress (scalar)` → ≈ 7.0 M/s
 - `BLAKE3 compress  (scalar)` → ≈ 18 M/s
 
 ---
 
-## 2. Keccak-f[1600] throughput
-
-Max throughput per prover, single- and multi-threaded, for Flock, Hashcaster,
-Binius64, Plonky3.
-
-```bash
-cd benchmarks
-./bench_keccak.sh --cooldown 20            # all provers; MT pass then ST pass
-```
-
-The script prints two summary tables (MT, ST) and caches every row. To find each
-prover's **optimal** (max) throughput you must sweep enough sizes to cover the
-peak — set the per-prover size lists (`{FLOCK,B64,P3,HC}_{MT,ST}_SIZES`) wide
-enough, then take the max row. On the reference machine the optima land at:
-
-| prover | ST opt | MT opt |
-|---|---|---|
-| Flock | 2¹³ | 2¹⁴ |
-| Hashcaster | 2¹¹ | 2¹⁹ |
-| Binius64 | 2¹¹ | 2¹⁴ |
-| Plonky3 | 2⁸ | 2¹² |
-
-Flock's keccak numbers can also be taken directly from its bench (no competitors):
-`KECCAK3_KS="<counts>" cargo bench --bench keccak3_proof` (each count = `3·2^(h-1)`),
-single-threaded with `RAYON_NUM_THREADS=1`.
-
----
-
-## 3. SHA-256 throughput
+## 2. SHA-256 throughput
 
 Flock vs Binius64 (Plonky3/Hashcaster have no SHA-256 circuit).
 
@@ -126,7 +94,7 @@ for the ST pass, with per-prover `*_MAX_LOG2` caps. Flock alone:
 
 ---
 
-## 4. BLAKE3 throughput
+## 3. BLAKE3 throughput
 
 Flock vs Binius64 vs Plonky3 (no Hashcaster BLAKE3 circuit).
 
@@ -141,33 +109,7 @@ Flock alone:
 
 ---
 
-## 5. Keccak 2¹⁴ fixed-point profile
-
-Per-system profile (throughput, proof size, verify time, peak memory) at a fixed
-2¹⁴ keccak batch, multi-threaded: Flock-fast, Flock-slim, Hashcaster, Binius64,
-Plonky3.
-
-```bash
-cd benchmarks
-./bench_keccak_14.sh --cooldown 20         # every system at 2^14, MT
-```
-
-It prints a consolidated results table (throughput / prove / verify / proof /
-peak) and refreshes the `bench-keccak-cache/<system>_2^14_t8` rows.
-
-The two Flock rows can also be measured directly (proof size and verify are
-thread-independent):
-
-```bash
-KECCAK3_KS=24576 cargo bench --bench keccak3_proof        # Flock (fast)
-KECCAK3_KS=24576 cargo bench --bench keccak3_slim_proof   # Flock (slim)
-```
-
-Read `best prove_fast`, `peak memory`, `verify`, and `proof size` from the output.
-
----
-
-## 6. Per-phase prover breakdown
+## 4. Per-phase prover breakdown
 
 Decomposition of Flock's fast prover into its five phases (witness gen, PCS
 commit, zerocheck, lincheck, recursive PCS open) at 2¹⁴, as a percentage, for
@@ -189,7 +131,7 @@ for i in 1 2 3; do ./breakdown.sh 2>/dev/null | sed -n '/phase/,/breakdown total
 
 ---
 
-## 7. BLAKE3 throughput scaling
+## 5. BLAKE3 throughput scaling
 
 Flock's BLAKE3 throughput vs batch size at 2¹⁰/2¹²/2¹⁴/2¹⁶/2¹⁸, single- and
 multi-threaded, with the MT/ST speedup at each point.

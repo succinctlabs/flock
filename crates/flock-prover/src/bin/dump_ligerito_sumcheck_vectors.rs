@@ -26,26 +26,7 @@ use std::io::{BufWriter, Write};
 use flock_prover::field::F128;
 use flock_prover::pcs::ligerito::SumcheckProver;
 
-/// SplitMix64 — same constants as the other `dump_*_vectors` bins.
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-    fn next_f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
-        }
-    }
-}
+use flock_core::test_rng::Rng;
 
 fn write_f128(w: &mut impl Write, x: F128) -> std::io::Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
@@ -63,8 +44,8 @@ fn main() -> std::io::Result<()> {
     let init_len = 1usize << log_len;
 
     let mut rng = Rng::new(0xC0FFEE);
-    let f: Vec<F128> = (0..init_len).map(|_| rng.next_f128()).collect();
-    let basis: Vec<F128> = (0..init_len).map(|_| rng.next_f128()).collect();
+    let f: Vec<F128> = (0..init_len).map(|_| rng.f128()).collect();
+    let basis: Vec<F128> = (0..init_len).map(|_| rng.f128()).collect();
 
     // The real Ligerito sumcheck prover. h1 (initial claim) does not affect the
     // fold/message values; pass the honest sum for realism.
@@ -91,7 +72,7 @@ fn main() -> std::io::Result<()> {
     // `bcur` with the SAME r to recover final_b for the CUDA test's final check.
     let mut bcur = basis.clone();
     for _k in 0..log_len {
-        let r = rng.next_f128();
+        let r = rng.f128();
         write_f128(&mut w, r)?;
         write_f128(&mut w, msg.u_0)?;
         write_f128(&mut w, msg.u_2)?;

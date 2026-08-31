@@ -17,27 +17,7 @@ use flock_core::field::F128;
 use flock_core::matrix_fold::{self, DenseMatrix, MatrixClaim, Weight};
 use flock_core::product_gkr::{build_s_sigma_vec, prove_batched, verify_batched};
 
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-    fn permutation(&mut self, n: usize) -> Vec<usize> {
-        let mut p: Vec<usize> = (0..n).collect();
-        for i in (1..n).rev() {
-            let j = (self.next_u64() % (i as u64 + 1)) as usize;
-            p.swap(i, j);
-        }
-        p
-    }
-}
+use flock_core::test_rng::Rng;
 
 /// One trusting-verified GKR over a constant witness (every permutation is
 /// honest on a constant `f = g`, so sigma is unconstrained and exercises a

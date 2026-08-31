@@ -802,9 +802,10 @@ mod tests {
     use super::test_support::{region_comb_at, region_comb_at_oracle};
     use super::*;
     use crate::challenger::FsChallenger;
-    use crate::element_r1cs::tests::{Rng, mixed_gate, mixed_witness, mult_gate, mult_witness};
+    use crate::element_r1cs::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
     use crate::element_r1cs::{ElementTableBuilder, ElementTableType};
     use crate::schedule::{Registry, TableType};
+    use crate::test_rng::Rng;
     use crate::zerocheck::multilinear::eq_eval;
     use std::sync::Arc;
 

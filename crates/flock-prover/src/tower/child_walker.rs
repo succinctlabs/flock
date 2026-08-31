@@ -1016,17 +1016,8 @@ impl<'p> ChildTape<'p> {
         // map onto the same walk — the merge node's connects consume them.
         // Byte-payload ordinal of the op at `end` (ObserveBytes and Pow
         // share the payload counter — see [`bytes_payload_mask`]).
-        let payload_at = |end: usize| -> usize {
-            ops[..end]
-                .iter()
-                .filter(|o| {
-                    matches!(
-                        o,
-                        Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. }
-                    )
-                })
-                .count()
-        };
+        let payload_at =
+            |end: usize| -> usize { ops[..end].iter().filter(|o| o.carries_payload()).count() };
         let (
             zc_rounds_b,
             zskip,
@@ -1361,7 +1352,7 @@ impl<'p> ChildTape<'p> {
                 for (j, &gp) in gpow_n.iter().enumerate().take(128) {
                     if j > 0 {
                         for x in rinv.iter_mut() {
-                            *x = frob_inv_native(*x);
+                            *x = flock_core::pcs::jagged::frob_inv(*x);
                         }
                     }
                     let mut prod = gp;
@@ -2441,7 +2432,7 @@ pub(super) fn emit_child_region(
         if j > 0 {
             let mut lvl_w = Vec::with_capacity(m_mp2);
             for t2 in 0..m_mp2 {
-                let y = frob_inv_native(rinv_n2[t2]);
+                let y = flock_core::pcs::jagged::frob_inv(rinv_n2[t2]);
                 rinv_n2[t2] = y;
                 vals.push(y);
                 let yw = sb.input();

@@ -35,14 +35,14 @@ impl TowerConfig {
     pub fn leaf_profile(self) -> LigeritoProfile {
         match self {
             TowerConfig::Chain100 => LigeritoProfile::Fast100,
-            TowerConfig::Chain128 => LigeritoProfile::Fast128,
+            TowerConfig::Chain128 => LigeritoProfile::Fast,
         }
     }
     /// The recursion-path OUTER profile (rate 1/4, envelope-ON).
     pub fn outer_profile(self) -> LigeritoProfile {
         match self {
             TowerConfig::Chain100 => LigeritoProfile::Slim100,
-            TowerConfig::Chain128 => LigeritoProfile::Slim128,
+            TowerConfig::Chain128 => LigeritoProfile::Slim,
         }
     }
 }

@@ -8,6 +8,19 @@
 > `chain_tower_e2e_with_lane` (`cargo test --release -p flock-prover --lib
 > tower:: -- --ignored`). Commands are kept verbatim as an audit record.
 
+> **Profile-consolidation note (2026-08-27, proof-IO v22):** the grind-free
+> `Fast`/`Slim` audited below were deleted; the `Fast128`/`Slim128`
+> schedules (audited under those names in the 08-13/08-14 passes: aggressive
+> +2/level ladder, 16-bit query PoW at every level, larger deep-level batch
+> grinding) now carry the `Fast`/`Slim` names. Where this document says
+> "Fast uses `lambda_query = 0`" or tabulates Fast `Q` at 279/136/91/…, it
+> describes the deleted profile; today's `Fast` grinds 16 bits per level
+> like Slim (query term ≥ 112 bits, work-normalized ≥ 128) and its ladder
+> rates are 1,3,5,7,9,11 rather than 1..6. `Fast100`/`Slim100` are
+> unchanged. The component floors (`validate()`) are profile-independent
+> and still hold; the per-profile derivation is in
+> `LigeritoSecurityConfig::derive_profile_ladder`.
+
 Status: implementation audit and independent re-review of the current
 `min/recursion-128bit` working tree. The non-Ligerito audit was completed on
 2026-08-11; Ligerito two-point OOD binding, the Flock paper's Appendix C.3

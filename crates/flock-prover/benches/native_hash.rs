@@ -1,18 +1,17 @@
 //! Native single-threaded throughput of the hash primitives Flock proves —
-//! keccak-f[1600] permutations, SHA-256 compressions, BLAKE3 compressions — to
+//! SHA-256 compressions and BLAKE3 compressions — to
 //! contextualize the prover's per-core overhead.
 //!
 //! Constraint: NO dedicated hardware crypto-extension instructions (ARMv8-SHA2 /
 //! ARMv8.2-SHA3), since a SNARK can't use those — it has to evaluate the bit/word
 //! operations.
 //!
-//!   - keccak-f[1600]:   `keccak` crate — scalar (no SHA3 extension).
 //!   - SHA-256 compress: Flock's scalar `sha256_compress` (no SHA2 extension; the
 //!                       `sha2` crate's "asm"/intrinsic path WOULD use it).
 //!   - BLAKE3 compress:  Flock's scalar `blake3_compress`.
 //!
 //! Single-threaded (rayon unused). Compare against Flock's single-threaded prover
-//! throughput (bench_keccak.sh / bench_sha256.sh, RAYON_NUM_THREADS=1).
+//! throughput (bench_sha256.sh / bench_blake3.sh, RAYON_NUM_THREADS=1).
 //!
 //! Run: `cargo bench --bench native_hash`
 
@@ -50,18 +49,6 @@ fn main() {
         "Native single-threaded primitive throughput (scalar software, NO crypto-\n\
          extension instructions). cf. Flock's single-threaded prover.\n"
     );
-
-    // keccak-f[1600] — scalar software permutation (no ARMv8.2-SHA3).
-    {
-        let mut st = [0u64; 25];
-        for (i, w) in st.iter_mut().enumerate() {
-            *w = 0x0123_4567_89ab_cdefu64.wrapping_mul(i as u64 + 1);
-        }
-        bench("keccak-f[1600]   (scalar)", 1.0, || {
-            keccak::f1600(&mut st);
-            black_box(&st);
-        });
-    }
 
     // SHA-256 compression — Flock's scalar software (no ARMv8-SHA2).
     {

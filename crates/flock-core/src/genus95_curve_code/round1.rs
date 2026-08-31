@@ -1132,16 +1132,7 @@ fn bitslice_block_into(
 mod tests {
     use super::*;
 
-    struct Rng(u64);
-    impl Rng {
-        fn n(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        }
-    }
+    use crate::test_rng::Rng;
 
     /// Derive the by-point fresh encode `M` from the M2 evaluator's OWN extension
     /// (`extended_base_product_message`), so the kernel speaks the evaluator's
@@ -1169,8 +1160,8 @@ mod tests {
 
         let mut rng = Rng(0xD00D_F00D_0000_0001);
         for _ in 0..4096 {
-            let a = rng.n();
-            let b = rng.n();
+            let a = rng.next_u64();
+            let b = rng.next_u64();
             let mut af = [false; 160];
             let mut bf = [false; 160];
             for s in 0..160 {
@@ -1210,7 +1201,7 @@ mod tests {
             let mk = |rng: &mut Rng| -> Vec<u8> {
                 let mut p = vec![0u8; n * 1024];
                 for x in p.iter_mut() {
-                    *x = rng.n() as u8;
+                    *x = rng.next_u64() as u8;
                 }
                 p
             };
@@ -1219,8 +1210,8 @@ mod tests {
             let c = mk(&mut rng);
             let eq: Vec<F128> = (0..n)
                 .map(|_| F128 {
-                    lo: rng.n(),
-                    hi: rng.n(),
+                    lo: rng.next_u64(),
+                    hi: rng.next_u64(),
                 })
                 .collect();
 
@@ -1246,7 +1237,7 @@ mod tests {
             let mk = |rng: &mut Rng| -> Vec<u8> {
                 let mut p = vec![0u8; n * 1024];
                 for x in p.iter_mut() {
-                    *x = rng.n() as u8;
+                    *x = rng.next_u64() as u8;
                 }
                 p
             };
@@ -1255,8 +1246,8 @@ mod tests {
             let c = mk(&mut rng);
             let eq: Vec<F128> = (0..n)
                 .map(|_| F128 {
-                    lo: rng.n(),
-                    hi: rng.n(),
+                    lo: rng.next_u64(),
+                    hi: rng.next_u64(),
                 })
                 .collect();
 
@@ -1284,7 +1275,7 @@ mod tests {
             let mk = |rng: &mut Rng| -> Vec<u8> {
                 let mut p = vec![0u8; n * 1024];
                 for x in p.iter_mut() {
-                    *x = rng.n() as u8;
+                    *x = rng.next_u64() as u8;
                 }
                 p
             };
@@ -1293,8 +1284,8 @@ mod tests {
             let c = mk(&mut rng);
             let eq: Vec<F128> = (0..n)
                 .map(|_| F128 {
-                    lo: rng.n(),
-                    hi: rng.n(),
+                    lo: rng.next_u64(),
+                    hi: rng.next_u64(),
                 })
                 .collect();
 

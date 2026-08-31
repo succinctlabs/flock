@@ -168,13 +168,7 @@ impl GateType for LeafEvalGate {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (c, &v) in row.iter().enumerate() {
-                z[(c << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -392,12 +386,6 @@ impl GateType for LeafEvalGate256 {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (c, &v) in row.iter().enumerate() {
-                z[(c << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }

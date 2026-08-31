@@ -35,19 +35,7 @@ use flock_prover::schedule::{Registry, TableType};
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier;
 
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u32(&mut self) -> u32 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        (z ^ (z >> 31)) as u32
-    }
-}
+use flock_core::test_rng::Rng;
 
 const DOMAIN: &[u8] = b"flock-mixed-e2e-v0";
 

@@ -5,9 +5,8 @@ R1CS-over-GF(2) statements, built on a zerocheck + lincheck PIOP with a
 multilinear PCS (Ligerito) over the binary field F₂₁₂₈. Tuned for
 Apple silicon (M-series) and AVX-512-capable x86-64 CPUs.
 
-It ships end-to-end provers for batched hash statements (BLAKE3, SHA-256, and
-Keccak-f[1600] compressions), Merkle-path statements, and a recursion tower
-that folds proofs into proofs.
+It ships end-to-end provers for batched hash statements (BLAKE3 and SHA-256
+compressions) and a recursion tower that folds proofs into proofs.
 
 ## Layout
 
@@ -61,19 +60,13 @@ Throughput in thousands of hashes per second (`k hashes/s`; higher is better):
 | BLAKE3 | 16384 | 62.7 | 411.7 |
 | BLAKE3 | 65536 | 64.8 | 540.4 |
 | BLAKE3 | 262144 | 64.8 | 629.8 |
-| Keccak-f[1600] | 1024 | 19.2 | 54.9 |
-| Keccak-f[1600] | 4096 | 19.9 | 106.9 |
-| Keccak-f[1600] | 16384 | 19.0 | 141.6 |
-| Keccak-f[1600] | 65536 | 18.6 | 164.1 |
-| Keccak-f[1600] | 262144 | 17.6 | 164.3 |
 
 The figures measure the full default Ligerito `prove_fast` path, including
 witness generation and proof construction. SHA-256 and BLAKE3 count compression
-functions; Keccak counts Keccak-f[1600] permutations. “Batch” is the number of
+functions. “Batch” is the number of
 independent hash operations proved together. Each value is the best of three
 measured proofs after one untimed warm-up; the warm-up proof is also verified.
-The Keccak rows use the single-permutation encoder; the separate 3-wide Keccak
-benchmark remains available for maximum Keccak throughput. The SHA-256 and
+The SHA-256 and
 BLAKE3 encoders have shrunk substantially since this table was measured
 (2026-08-14 zk.golf-derived fused adders), so current numbers run higher —
 regenerate before quoting.

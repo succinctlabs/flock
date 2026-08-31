@@ -30,19 +30,7 @@ use flock_prover::merkle::merkle_tree;
 mod merkle_octopus;
 use merkle_octopus::merkle_multi_proof;
 
-struct Rng(u64);
-impl Rng {
-    fn new(s: u64) -> Self {
-        Self(s)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-}
+use flock_core::test_rng::Rng;
 
 fn main() -> std::io::Result<()> {
     let path = env::args()

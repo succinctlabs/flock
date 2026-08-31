@@ -77,6 +77,21 @@ pub enum SlotWitness {
     DeferredToRows,
 }
 
+impl SlotWitness {
+    /// The element-slot witness of per-row words: `word[(col << nu) + row]`
+    /// over a `width << nu` buffer, rows in declaration order. Every
+    /// element gate's `witness()` is this call.
+    pub fn element_from_rows<R: AsRef<[F128]>>(width: usize, nu: usize, rows: &[R]) -> Self {
+        let mut z = crate::alloc_zeroed_vec::<F128>(width << nu);
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.as_ref().iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
 /// A gate type: its constraint system and its native evaluation, together.
 ///
 /// The pairing is the whole point. A type that could describe its constraints

@@ -26,10 +26,6 @@ bincode = { workspace = true }
 # flock-core behind its `unsound-challenger` feature. Enabling it dev-only makes
 # it available to test/bench/example builds without leaking into normal builds.
 flock-core = { path = "../flock-core", features = ["unsound-challenger"] }
-# Scalar (no ARMv8.2-SHA3) keccak-f[1600] for the native_hash baseline bench.
-keccak = { workspace = true }
-# Software Keccak-256 baseline for keccak_native_chain.
-sha3 = { workspace = true }
 
 [[bench]]
 name = "ag_breakdown"
@@ -84,22 +80,6 @@ name = "lincheck"
 harness = false
 
 [[bench]]
-name = "keccak3_proof"
-harness = false
-
-[[bench]]
-name = "keccak3_profiles"
-harness = false
-
-[[bench]]
-name = "keccak3_slim_proof"
-harness = false
-
-[[bench]]
-name = "keccak3_secure_proof"
-harness = false
-
-[[bench]]
 name = "blake3_proof"
 harness = false
 
@@ -116,15 +96,7 @@ name = "sha2_proof"
 harness = false
 
 [[bench]]
-name = "sha2_merkle_proof"
-harness = false
-
-[[bench]]
 name = "lincheck_verify"
-harness = false
-
-[[bench]]
-name = "keccak_native_chain"
 harness = false
 
 [[bench]]
@@ -160,10 +132,6 @@ required-features = ["hash-count"]
 name = "verifier_mul_count"
 harness = false
 required-features = ["mul-count"]
-
-[[bench]]
-name = "merkle_vs_plain_blake3"
-harness = false
 
 [lints]
 workspace = true

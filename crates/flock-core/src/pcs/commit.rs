@@ -78,9 +78,7 @@ impl PcsParams {
     pub fn zerocheck_grinding(&self) -> crate::zerocheck::ZerocheckGrinding {
         match self.profile {
             crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast128
             | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Slim128
             | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::zerocheck::ZerocheckGrinding::per_challenge_128()
             }
@@ -100,9 +98,7 @@ impl PcsParams {
     pub fn lincheck_grinding(&self) -> crate::lincheck::LincheckGrinding {
         match self.profile {
             crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast128
             | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Slim128
             | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::lincheck::LincheckGrinding::per_challenge_128()
             }
@@ -117,9 +113,7 @@ impl PcsParams {
     pub fn element_grinding(&self) -> crate::element_r1cs::Grinding {
         match self.profile {
             crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast128
             | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Slim128
             | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::element_r1cs::Grinding::per_challenge_128()
             }
@@ -139,9 +133,7 @@ impl PcsParams {
     pub fn opening_grinding(&self) -> crate::pcs::OpeningGrinding {
         match self.profile {
             crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast128
             | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Slim128
             | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::pcs::OpeningGrinding::per_challenge_128()
             }
@@ -156,9 +148,7 @@ impl PcsParams {
     pub fn product_gkr_grinding(&self) -> crate::product_gkr::BatchedGrinding {
         match self.profile {
             crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast128
             | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Slim128
             | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::product_gkr::BatchedGrinding::per_challenge_128()
             }
@@ -173,9 +163,7 @@ impl PcsParams {
     pub fn matrix_fold_grinding(&self) -> crate::matrix_fold::FoldGrinding {
         match self.profile {
             crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast128
             | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Slim128
             | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::matrix_fold::FoldGrinding::per_challenge_128()
             }
@@ -695,31 +683,7 @@ pub fn prefault_codeword_during<R>(
 mod tests {
     use super::*;
 
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        }
-        fn bits(&mut self, n: usize) -> Vec<bool> {
-            (0..n).map(|_| self.next_u64() & 1 == 1).collect()
-        }
-        fn f128(&mut self) -> F128 {
-            F128 {
-                lo: self.next_u64(),
-                hi: self.next_u64(),
-            }
-        }
-        fn f128_vec(&mut self, n: usize) -> Vec<F128> {
-            (0..n).map(|_| self.f128()).collect()
-        }
-    }
+    use crate::test_rng::Rng;
 
     /// The Ligerito configs derived from `PcsParams` must carry the params'
     /// Merkle hash, not the embedded security config's `hash` field. If they

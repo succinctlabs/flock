@@ -370,31 +370,13 @@ fn ghash_square(a: F128) -> F128 {
 mod tests {
     use super::*;
 
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        }
-        fn next_f128(&mut self) -> F128 {
-            F128 {
-                lo: self.next_u64(),
-                hi: self.next_u64(),
-            }
-        }
-    }
+    use crate::test_rng::Rng;
 
     #[test]
     fn add_identities() {
         let mut rng = Rng::new(1);
         for _ in 0..64 {
-            let a = rng.next_f128();
+            let a = rng.f128();
             assert_eq!(a + F128::ZERO, a);
             assert_eq!(a + a, F128::ZERO);
         }
@@ -423,7 +405,7 @@ mod tests {
     fn mul_identities() {
         let mut rng = Rng::new(2);
         for _ in 0..64 {
-            let a = rng.next_f128();
+            let a = rng.f128();
             assert_eq!(a * F128::ZERO, F128::ZERO);
             assert_eq!(a * F128::ONE, a);
         }
@@ -433,7 +415,7 @@ mod tests {
     fn mul_by_x_matches_mul_by_gen() {
         let mut rng = Rng::new(3);
         for _ in 0..256 {
-            let a = rng.next_f128();
+            let a = rng.f128();
             assert_eq!(mul_by_x(a), a * F128::generator());
         }
     }
@@ -442,8 +424,8 @@ mod tests {
     fn deferred_reduction_matches_direct() {
         let mut rng = Rng::new(4);
         for _ in 0..64 {
-            let a = rng.next_f128();
-            let b = rng.next_f128();
+            let a = rng.f128();
+            let b = rng.f128();
             let direct = a * b;
             let deferred = a.mul_unreduced(b).reduce();
             assert_eq!(direct, deferred);
@@ -455,7 +437,7 @@ mod tests {
         // Σ aᵢ·bᵢ in F128 must equal reduce(XOR-sum of unreduced products).
         let mut rng = Rng::new(5);
         let n = 16;
-        let pairs: Vec<(F128, F128)> = (0..n).map(|_| (rng.next_f128(), rng.next_f128())).collect();
+        let pairs: Vec<(F128, F128)> = (0..n).map(|_| (rng.f128(), rng.f128())).collect();
 
         let direct: F128 = pairs.iter().fold(F128::ZERO, |acc, (a, b)| acc + *a * *b);
 
@@ -470,7 +452,7 @@ mod tests {
     fn inverse_roundtrip() {
         let mut rng = Rng::new(6);
         for _ in 0..16 {
-            let a = rng.next_f128();
+            let a = rng.f128();
             if a.is_zero() {
                 continue;
             }
@@ -482,9 +464,9 @@ mod tests {
     fn associativity_random() {
         let mut rng = Rng::new(7);
         for _ in 0..64 {
-            let a = rng.next_f128();
-            let b = rng.next_f128();
-            let c = rng.next_f128();
+            let a = rng.f128();
+            let b = rng.f128();
+            let c = rng.f128();
             assert_eq!((a * b) * c, a * (b * c));
             assert_eq!(a * (b + c), a * b + a * c);
         }
@@ -494,8 +476,8 @@ mod tests {
     fn mul_commutativity() {
         let mut rng = Rng::new(91);
         for _ in 0..256 {
-            let a = rng.next_f128();
-            let b = rng.next_f128();
+            let a = rng.f128();
+            let b = rng.f128();
             assert_eq!(a * b, b * a);
         }
     }
@@ -558,10 +540,10 @@ mod tests {
     fn neon_mul_vec2_matches_scalar() {
         let mut rng = Rng::new(11);
         for _ in 0..128 {
-            let a0 = rng.next_f128();
-            let a1 = rng.next_f128();
-            let b0 = rng.next_f128();
-            let b1 = rng.next_f128();
+            let a0 = rng.f128();
+            let a1 = rng.f128();
+            let b0 = rng.f128();
+            let b1 = rng.f128();
             let expected = [a0 * b0, a1 * b1];
             let result = unsafe { aarch64::ghash_mul_vec2_neon([a0, a1], [b0, b1]) };
             assert_eq!(result[0], expected[0], "lane 0");
@@ -574,8 +556,8 @@ mod tests {
     fn all_neon_variants_agree() {
         let mut rng = Rng::new(8);
         for _ in 0..128 {
-            let a = rng.next_f128();
-            let b = rng.next_f128();
+            let a = rng.f128();
+            let b = rng.f128();
             let sw = software::ghash_mul(a, b);
             let sb = unsafe { aarch64::ghash_mul_schoolbook(a, b) };
             let ka = unsafe { aarch64::ghash_mul_karatsuba(a, b) };
@@ -593,8 +575,8 @@ mod tests {
     fn all_x86_variants_agree() {
         let mut rng = Rng::new(8);
         for _ in 0..128 {
-            let a = rng.next_f128();
-            let b = rng.next_f128();
+            let a = rng.f128();
+            let b = rng.f128();
             let sw = software::ghash_mul(a, b);
             let sb = unsafe { x86_64::ghash_mul_schoolbook(a, b) };
             let ka = unsafe { x86_64::ghash_mul_karatsuba(a, b) };
@@ -623,18 +605,8 @@ mod tests {
         use core::arch::x86_64::*;
         let mut rng = Rng::new(0x4A4_C0DE);
         for _ in 0..256 {
-            let xs = [
-                rng.next_f128(),
-                rng.next_f128(),
-                rng.next_f128(),
-                rng.next_f128(),
-            ];
-            let ys = [
-                rng.next_f128(),
-                rng.next_f128(),
-                rng.next_f128(),
-                rng.next_f128(),
-            ];
+            let xs = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+            let ys = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
             // SAFETY: vpclmulqdq+avx512f enabled at compile time (cfg gate).
             let got: [F128; 4] = unsafe {
                 let x = _mm512_loadu_si512(xs.as_ptr() as *const __m512i);
@@ -669,18 +641,8 @@ mod tests {
             let mut wide = unsafe { x86_64::WideGhashX4::zero() };
             let mut scalar = F256Unreduced::ZERO;
             for _ in 0..5 {
-                let xs = [
-                    rng.next_f128(),
-                    rng.next_f128(),
-                    rng.next_f128(),
-                    rng.next_f128(),
-                ];
-                let ys = [
-                    rng.next_f128(),
-                    rng.next_f128(),
-                    rng.next_f128(),
-                    rng.next_f128(),
-                ];
+                let xs = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+                let ys = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
                 // xs via contiguous load, ys via scalar set — exercises both.
                 unsafe {
                     let xv = x86_64::f128x4_loadu(xs.as_ptr());
@@ -701,7 +663,7 @@ mod tests {
     fn square_matches_self_mul() {
         let mut rng = Rng::new(0x5147);
         for _ in 0..1000 {
-            let a = rng.next_f128();
+            let a = rng.f128();
             assert_eq!(a.square(), a * a);
         }
         assert_eq!(F128::ZERO.square(), F128::ZERO);

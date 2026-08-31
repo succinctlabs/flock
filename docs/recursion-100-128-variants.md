@@ -26,6 +26,17 @@ against your unmodified tip, none introduced by our commits.
 
 ## The variants
 
+> **Consolidation note (2026-08-27, bloat ledger §C, proof-IO v22):** the
+> grind-free `Fast`/`Slim` with the +1/level ladder were deleted and the
+> `Fast128`/`Slim128` schedules took their names. Strict `Fast`/`Slim` now
+> mean: aggressive ladder (rate +2/level), 16-bit query PoW at every level
+> (query term 112 bits + PoW, work-normalized to 128), larger deep-level
+> batch grinding. `Fast100`/`Slim100` are unchanged and frozen at their
+> historical schedules, so they now differ from the strict profiles in
+> ladder, PoW and target — the "only the query target differs" statements
+> below describe the pre-consolidation code and are kept as the record of
+> how the 100-bit variants were derived.
+
 | | 100-bit | 128-bit |
 | --- | --- | --- |
 | leaf/node track (mvp) | `TOWER_PROFILE=fast100` | default `TOWER_PROFILE=fast` |
@@ -46,8 +57,9 @@ instead of `LIST_DECODING_QUERY_TARGET_BITS`. The Johnson query floor in
 `LigeritoSecurityConfig::validate` is keyed off `analysis_version`
 (`query128` vs `query100`), so each config family validates against its own
 target; a boundary test pins the `Fast100` floor and the schedule equality.
-Both variants live in one binary. Proof format v20 (head is v21 as of
-2026-08-14, `6988b62` — the union-only batch consolidation) additionally makes the
+Both variants live in one binary. Proof format v20 (head is v22 as of
+2026-08-27 — the profile consolidation; v21 on 2026-08-14, `6988b62`, was the
+union-only batch consolidation) additionally makes the
 non-Ligerito policy distinction explicit: strict `Fast`/`Slim` enable all
 algebraic grinding families, whereas `Fast100`/`Slim100` intentionally keep
 those families disabled. Their public Ligerito query schedules also remain

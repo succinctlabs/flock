@@ -114,7 +114,7 @@ pub enum TableClass {
 ///
 /// For a boolean type the matrices are `2^k_log × 2^k_log` sparse boolean in
 /// circuit form (`C_0 = I`); like `BlockR1cs`, walker-based encoders
-/// (Keccak) may carry empty stubs here and supply their own
+/// (the tower's stub gates) may carry empty stubs here and supply their own
 /// `LincheckCircuit`.
 #[derive(Clone, Debug)]
 pub struct TableType {
@@ -817,20 +817,7 @@ mod tests {
         TableType::element(Arc::new(b.build().expect("free-wire block is valid")))
     }
 
-    /// SplitMix64 PRNG, deterministic.
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        }
-    }
+    use crate::test_rng::Rng;
 
     /// Offset/prefix/alignment arithmetic on the doc's 3-type shape
     /// (κ = 16/15/14, ν = 10), fed in shuffled order to exercise the sort.

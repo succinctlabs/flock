@@ -82,13 +82,7 @@ impl GateType for SpineGate {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -214,13 +208,7 @@ impl GateType for SpineGate256 {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -296,7 +284,9 @@ impl ResidualWeightsGate256 {
 
     pub(super) fn new() -> Self {
         let o = F128::ONE;
-        let sks = sk_at_vks(Self::N_WEIGHTS);
+        // The subspace-polynomial chain constants `s_k(v_k)`, straight from
+        // ligerito (the residual boundary check pins the spine against them).
+        let sks = flock_core::pcs::ligerito::eval_sk_at_vks(Self::N_WEIGHTS);
         let coeffs: Vec<F128> = (0..Self::N_WEIGHTS - 1)
             .map(|k| {
                 assert_ne!(sks[k + 1], F128::ZERO, "novel-basis normalizer is nonzero");
@@ -343,13 +333,7 @@ impl GateType for ResidualWeightsGate256 {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -439,13 +423,7 @@ impl GateType for ResidualPrefix3Gate256 {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -558,13 +536,7 @@ impl GateType for ResidualAccGate256 {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -586,32 +558,6 @@ pub(super) fn live_element_input_from_rows(
             }
         }
     })
-}
-
-/// `s_{k+1}(x) = s_k(x)^2 + s_k(v_k) s_k(x)` — the subspace-polynomial chain,
-/// and its `s_k(v_k)` constants (a replica of ligerito's pub(crate)
-/// `eval_sk_at_vks`, pinned by the residual boundary check below).
-pub(super) fn sk_at_vks(log_n: usize) -> Vec<F128> {
-    let next = |s: F128, c: F128| s * s + c * s;
-    let mut sks = vec![F128::ZERO; log_n + 1];
-    sks[0] = F128::ONE;
-    if log_n == 0 {
-        return sks;
-    }
-    let mut layer: Vec<F128> = (1..=log_n).map(|i| F128::new(1u64 << i, 0)).collect();
-    let mut cur = log_n;
-    for i in 0..log_n {
-        for j in 0..cur {
-            let v = next(layer[j], sks[i]);
-            if j == 0 {
-                sks[i + 1] = v;
-            } else {
-                layer[j - 1] = v;
-            }
-        }
-        cur -= 1;
-    }
-    sks
 }
 
 /// 2b stage 2: PrefixGate computes `seed * prod_j (1 + a_j + b_j)` — the
@@ -682,13 +628,7 @@ impl GateType for PrefixGate {
         z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -787,13 +727,7 @@ impl GateType for PrefixGate256 {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -842,13 +776,7 @@ impl GateType for MergedRoundGate {
         z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -892,13 +820,7 @@ impl GateType for MacGate {
         z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -949,13 +871,7 @@ impl GateType for MacGate256 {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -1071,13 +987,7 @@ impl GateType for AssistLayerGate {
         z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
 
@@ -1137,12 +1047,6 @@ impl GateType for ZcRoundGate {
         z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
