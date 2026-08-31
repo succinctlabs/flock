@@ -2757,3 +2757,44 @@ BLAKE3 circuit regardless of witness). It is a property of the R1CS,
 not of RS vs AG, so it should apply to `encode_slp_derived(bp, bf)`
 and simplify `product_fold_bs` terms. Premise NOT yet verified against
 our BLAKE3 R1CS — measure before building.
+
+### Static-B census on OUR BLAKE3 R1CS — idea transfers, prize is ~12%, under the bar — 2026-08-31
+
+Measured before building (temporary structural probe over `b_0.rows`,
+K = 2^14, then reverted). Counts a row as structurally constant when
+it is empty (→ 0) or references only the const-wire pin (→ 1):
+
+| matrix | constant rows | of K |
+|---|---|---|
+| B_0 | 6086 (4677 empty + 1409 pin-only) | 37.15% |
+| A_0 | 4678 | 28.55% |
+
+**But the 4677 empty B rows are EXACTLY the padding tail**
+(K − USEFUL_BITS = 16384 − 11707 = 4677), which the run-list/coverage
+machinery already skips. The genuinely new structure is the 1409
+pin-only rows: **12.04% of the useful prefix**.
+
+Clustering (a bitsliced kernel cannot skip individual bits, only whole
+planes — this is what decides exploitability):
+
+| group | all-constant groups | starting inside USEFUL |
+|---|---|---|
+| 64 | 95 of 256 | 22 |
+| 128 (= one bitsliced plane) | 47 of 128 | **11** |
+| 512 (their b_med window) | 11 of 32 | 2 |
+| 8192 (one block) | 0 of 2 | 0 |
+
+The 1409 constant useful rows are almost perfectly aligned: 11 whole
+128-row groups = 1408 rows. So in AG terms, **11 of the ~92 useful
+128-bit B planes are constant across every block and every instance**,
+making their `encode_slp_derived` output hoistable — ~12% of the
+B-side plane work, i.e. low single-digit ms against round 1's 66.7 ms.
+
+VERDICT: the idea DOES transfer to AG (it is a property of the R1CS,
+not of the code) — but our circuit yields 12%, not the challenge
+tree's ~31.6% (their `useful_bits` is 15_409 of 16_384, a different
+BLAKE3 encoding with a much smaller padding tail, so more of their
+constant structure sits inside the live region). At ~2-3 ms, and
+needing the witness-safety apparatus (runtime compare + generic
+fallback) to be sound, it does not clear the bloat bar. Not built.
+Recorded so nobody re-derives it.
