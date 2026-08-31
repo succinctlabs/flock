@@ -286,7 +286,12 @@ fn element_only_transcript_shape_is_pinned() {
     // moved each level's Pow bits. Measured: the digest at 700cace~1 was a
     // third value, neither the old nor the new pin. Two deterministic print
     // runs agreed.
-    const EXPECTED: &str = "e7a0b59f43903cf62f46ed0d58eeeec5ec5156cf5fc959f508a291ba2250ecd6";
+    // Re-pinned 2026-08-27 for the profile consolidation (proof-IO v22,
+    // bloat ledger §C): `Fast` now carries the former Fast128 schedule —
+    // aggressive +2/level ladder and 16-bit query PoW at every level — so
+    // the per-level query counts, caps and Pow bits all move. Two
+    // deterministic print runs agreed.
+    const EXPECTED: &str = "46b9b760ea72bcc0e549196bb31401e88993767d71636614de61270fd4cfdee3";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
 

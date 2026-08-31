@@ -268,7 +268,16 @@ GPU roundtrip alone.
 
 **Directed (Ron, 2026-08-27): consolidate the profile matrix — delete the
 grind-free `Fast` and `Slim` bases and keep the `*128` schedules as THE
-strict profiles.**
+strict profiles.** **EXECUTED 2026-08-27** (branch `bloat-phase2-profiles`):
+`Fast128`/`Slim128` renamed to `Fast`/`Slim`, the grind-free variants and
+their 28 TOMLs deleted (98 → 70 embedded configs); `gen_ligerito_configs`
+regenerates the renamed set byte-identically, so the derivation and the
+embedded files agree. Proof-IO v22. Re-pinned (two deterministic print runs
+each): `union_m6_fixtures` (6), `union_element` (7), `transcript_shape` (1).
+Tower pins hold — `Chain128` already ran on the `*128` twins. The CUDA
+host-only ladder replay (`make ligerito_f256_host`, m22 fast) matches the
+F256 driver on every proof field; the Blackwell GPU run needs the runner
+back. `Fast100`/`Slim100` unchanged (frozen historical schedules).
 
 *Premise correction (PR #37 review).* An earlier draft of this item said the
 `*128` twins "differ from their bases only in the per-level rate ladder".

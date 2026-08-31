@@ -8,7 +8,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 21)
+//!   byte  5       VERSION                  (currently 22)
 //!   bytes 6..7    flavor: 2 = R1cs, 4 = Mixed
 //!                 (0/1 reserved: legacy BaseFold; 3 was the retired chain)
 //!   bytes 7..     bincode-serialized payload
@@ -137,7 +137,15 @@ const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 // proof — the standalone hash setups prove over the single-slot union
 // commit now (dense stack + integer lanes); the padded-commit
 // R1csProofLigerito payload is gone from this flavor.
-const VERSION: u8 = 21;
+// v22 (2026-08-27): the profile consolidation (bloat ledger §C). The
+// grind-free `fast`/`slim` (+1 rate/level ladder) were deleted and the
+// `fast128`/`slim128` schedules took their names: aggressive +2/level
+// ladder, 16-bit query PoW per level, larger deep-level batch grinding. No
+// payload field changed, but a v21 proof made under `fast`/`slim` carries a
+// different query/rate/PoW schedule than this build derives for those
+// names, so it cannot be interpreted safely. `fast100`/`slim100`/`secure`
+// are byte-for-byte unchanged.
+const VERSION: u8 = 22;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see

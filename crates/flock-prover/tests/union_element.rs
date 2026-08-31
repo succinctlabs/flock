@@ -1317,6 +1317,11 @@ fn bundle_digest_merged(
 // mix-128-128 and mix-0-90 moved under both. The empty-instance fixture
 // elem-merged-nu12-0 held throughout. union_m6_fixtures was re-pinned with
 // 700cace but this file was missed. Two deterministic print runs agreed.
+// Re-pinned 2026-08-27 for the profile consolidation (proof-IO v22, bloat
+// ledger §C): `Fast` now carries the former Fast128 schedule (aggressive
+// +2/level ladder, 16-bit query PoW every level), so every fixture moved,
+// including the empty-instance one (the ladder itself changed, not just
+// the grinding). Two deterministic print runs agreed.
 // Runs by default since 2026-08-27: CI never passes `--ignored`, which is
 // how the 700cace sweep missed this pin. Same policy as `union_m6_fixtures`.
 #[test]
@@ -1325,39 +1330,39 @@ fn mixed_class_merged_proof_bytes_pinned() {
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "affa7c153342f4fa0a02ee2b08367a0b0dc1885c175e9f09eef9b643ce421777",
+            "43e3c8b0de3a1fbd682ee1a07d78c4bdfce0de49a25fa237648eaef113f90532",
         ),
         (
             "elem-merged-nu12-2731",
             2731,
-            "a66cd908ede6e07bc4d48a80187a88bec41ca821598374e017966ff85a23a996",
+            "fc293680f649aecf034122cb391b1ff35e49240b494d261dde3f4ed35d1bd685",
         ),
         (
             "elem-merged-nu12-0",
             0,
-            "edc111d3a23eea1218973cc1a4382663684df8e066d54d9eef61e5b0613d9d81",
+            "ebb1dd96ef1a5a381f2b9f47f3d194d0505b39370f581c648a064ced08065a1b",
         ),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "f8a60a912f301b1094540cb163fb6cd547297bf869293c62fc989ff14adb1b05",
+            "1d0f6680e46c7254447cf2b2e37a6b7f06213d6a1fea17fcce9cd8f857a24ee7",
         ),
         (
             "mix-merged-nu7-100-90",
             [100, 90],
-            "cbf7812593e950e3a0185e7f0881352e6619538587477f61db1fb5d227c96f0b",
+            "84456fa03bd629fd217a21fda86b8d3527ea5819a6971988a6aa68bd119efca8",
         ),
         (
             "mix-merged-nu7-0-90",
             [0, 90],
-            "83f53efdb502655e3b956c6384d377d57641052639159cc21e79d553c2964c39",
+            "1e5a3c409edf63ded8fb863d74c090598725267e048a84646ebc2fa69cb99398",
         ),
         (
             "mix-merged-nu7-100-0",
             [100, 0],
-            "4516541821be3a8c7c29d60980e67b3c01d35f7788a70a1630b104d85c090f0b",
+            "bee4a92a2b0fec998aeae218a29608c1a0512d2e9dc7e161aff44950ed564b65",
         ),
     ];
 

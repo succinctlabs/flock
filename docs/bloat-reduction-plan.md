@@ -69,6 +69,9 @@ Batched commits; full suite + byte pins after each batch (the pins are what
 make pruning safe here — a deletion that changes behavior fails loudly).
 
 **Phase 2 — decommission decisions** (Ron's calls, then 1–2 sessions each):
+0. **Profile consolidation — EXECUTED 2026-08-27** (ledger §C): the
+   grind-free `Fast`/`Slim` are gone, `Fast128`/`Slim128` took their names,
+   `Fast100`/`Slim100` frozen; 98 → 70 embedded TOMLs; proof-IO v22.
 1. **keccak3** — retirement was declined 2026-08-15; does the reason hold?
 2. **Merkle-path shift product** — still a product, or a leftover now that
    the tower verifies Merkle in-circuit? Retiring ≈ 6k lines + removes a
