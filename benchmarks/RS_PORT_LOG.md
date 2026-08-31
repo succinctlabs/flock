@@ -2567,3 +2567,28 @@ prover for challenge-independent prep to hide in; a future hoist only
 pays off if some phase leaves cores (not bandwidth) idle. Reverted
 per the measured-revert rule; suites stayed green throughout and the
 transcript never moved (prep is bit-identical by construction).
+
+### Re-graft #2: lane-major streaming commit — UNCERTIFIED, parked — 2026-08-31
+
+Ported the leaf pipeline to the union's integer-lane commit: factored
+`commit_into_pipelined`'s queue/helper engine into `leaf_pipeline_run`,
+added a lane-major variant (staged transpose fill, then the live-lane
+NTT deep pass publishing whole-position blocks — non-pow2 lane counts
+align by construction, so the pow2 gate is not needed there), plus a
+staged-vs-pipelined byte-identity oracle at non-pow2 t. Mechanically
+correct: merkle-top 116 → 0.2 ms, smoke commit 239–249 vs staged
+~250–270.
+
+**12 paired A/B vs 9c119e5, two rounds: commit bucket 6/12 med +2 ms,
+totals 6/12 med +3 — consistent with zero.** Round 1's apparent zclc
++19 side effect vanished in round 2 (machine texture, not the change).
+Reading: the queue fills and most leaf hashing lands inline on the
+publisher anyway — the work relocates into the NTT window; the real
+saving is only the codeword's DRAM re-read (~25 ms theoretical at
+m=32) and pipeline overhead eats most of it. Conditions were the worst
+of the day (19% battery, net-draining on AC, interactive load).
+
+PARKED on branch `regraft-2-lane-pipeline` (pushed) with the oracle
+test — re-run the A/B on a quiet charged machine, and at m=30/34
+where the codeword (and the re-read) is larger. Not merged: does not
+earn its ~120 lines on this evidence.
