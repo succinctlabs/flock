@@ -3,7 +3,7 @@
 //! Computes `H^T(x) = H(H(...H(x)...))` (T iterations) on a 32-byte input
 //! using the `blake3` crate. Reports hashes/sec.
 //!
-//! Mirrors [`keccak_native_chain`] exactly. Two scenarios:
+//! Two scenarios:
 //!
 //! 1. **Single chain (sequential)**: a hash chain has a strict data dependency
 //!    (output of step i is input of step i+1), so it can't be parallelized.

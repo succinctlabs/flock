@@ -25,7 +25,7 @@ By prefix rather than per file (the directory is ~70 files):
 | Prefix / file | Purpose |
 |------|---------|
 | `f128.cuh`, `f256.cuh`, `phi8_table.cuh` | field arithmetic (four F128 multiply strategies; F256 tower) |
-| `*_witness.cuh`, `sha256.cuh` | on-device witness generation (BLAKE3 is the prove path; `keccak3_witness.cuh` is bench-only) |
+| `*_witness.cuh`, `sha256.cuh` | on-device witness generation (BLAKE3 is the prove path) |
 | `ntt_*.cuh`, `merkle*.cuh/hpp`, `challenger.hpp`, `zc_challenger_device.cuh`, `pow_grind.cuh` | commit NTT, Merkle trees/openings, FS challenger, PoW |
 | `zerocheck_*.cuh`, `lincheck.cuh`, `sumcheck_ab.cuh`, `induce_sumcheck.cuh`, `introduce_glue.cuh`, `ligerito_f256.cuh` | the PIOP + Ligerito recursion kernels |
 | `prove_ffi.cu` | the `extern "C"` prove entry consumed by `crates/flock-cuda-ffi` |

@@ -72,7 +72,8 @@ pub struct BlockR1cs {
     /// Column of a constant-one wire to pin to 1 across all blocks, or `None`.
     /// Drives the lincheck constant-wire pin for matrix-based encoders whose
     /// circuit is built from these matrices (BLAKE3, SHA-2 via
-    /// [`Self::csc_lincheck_circuit`]). Walker-based encoders (Keccak) set this
+    /// [`Self::csc_lincheck_circuit`]). Walker-based encoders (none in-tree
+    /// since 2026-08-27; the tower's stub gates) set this
     /// `None` and carry the pin on their own `LincheckCircuit`. See
     /// `docs/const-wire-pin.md`.
     pub const_pin: Option<usize>,
@@ -153,7 +154,7 @@ impl BlockR1cs {
     /// (gather per column instead of scatter per row). Built lazily on first
     /// access and cached; call once at setup to keep the build cost (one pass
     /// over the nonzeros) out of the prove path. NOT meaningful for setups
-    /// whose `BlockR1cs` carries empty matrix stubs (e.g. Keccak) — those
+    /// whose `BlockR1cs` carries empty matrix stubs (the tower's stub gates) — those
     /// must keep their circuit walkers.
     pub fn csc_lincheck_circuit(&self) -> &crate::lincheck::CscCircuit {
         self.csc_cache.get_or_init(|| {

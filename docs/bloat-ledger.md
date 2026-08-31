@@ -191,7 +191,7 @@ These have zero production callers and no oracle/API role — verified:
 | blake3.rs direct/AG A/B entry cluster (`prove_fast_ag{,_timed}`, `verify_ag`, `prove_fast_union_ag`, `verify_union_ag`, `prove_fast_timed`, `direct_pcs_params`) | ~190 | sole caller `benches/blake3_rs_vs_ag.rs` (itself superseded, §F). Salvage the union+AG arm into `blake3_proof` or `ag_e2e_zerocheck` first. |
 | prover.rs bench-only `*_timed` chain (`prove_fast_ligerito_timed` :1992, `prove_fast_ligerito_ag_timed` :1674, `ProvePhaseTimings` :1973) | ~280 | reached only via the blake3/keccak3 `*_timed` wrappers → benches. **Phase 1 removed the blake3 wrapper only; `prove_fast_ligerito_timed` + `ProvePhaseTimings` survive via keccak3 and go with the §2.1 keccak decision.** |
 | A/B toggle statics + dead arms (`ROUND1_UNFUSED`, `LOOKAHEAD_DISABLE`, `NXT_ZEROFILL`, `DISABLE_FRIENDLY_HORNER` + the unfused segment driver `ag_skip.rs:1389-1439`) | ~150 | **Correction (PR #37 review): `LOOKAHEAD_DISABLE` is still flipped by the retained `benches/ag_breakdown.rs:106-116` — not dead, do not delete.** `DISABLE_FRIENDLY_HORNER`, `NXT_ZEROFILL` and `LOOKAHEAD_FRIENDLY` lost their only writers with the `blake3_rs_vs_ag` / `ag_lookahead_ab` deletions and are now unflippable in-tree — deleted 2026-08-27 (Ron's call) together with `lookahead_friendly_pass`, `shl_xor_generic` and the `prove_tail` A/B arms; `LOOKAHEAD_DISABLE` stays (`ag_breakdown` + `lookahead_matches_classic` need it); the answers are recorded in `ag_skip.rs:44-56` doc comments and `docs/ag-recursion-plan.md`. |
-| `with_blake3_chunk_leaf` + chunk-leaf remnants (merkle_r1cs.rs:459 + `*_chunk` reachability) | ~42 direct | L0-table revert leftover (`4e96d23`); remaining callers are `tests/merkle_glue.rs:129`, `benches/merkle_l0_opening.rs`, `tower.rs:1047` (cfg(test)). Dies with the `merkle_l0_opening` bench; the `*_chunk` witness family (~500 lines, §G cluster 13) follows the Phase 2.2 decision. |
+| `with_blake3_chunk_leaf` + chunk-leaf remnants (merkle_r1cs.rs:459 + `*_chunk` reachability) | ~42 direct | L0-table revert leftover (`4e96d23`); remaining callers are `tests/merkle_glue.rs:129`, `benches/merkle_l0_opening.rs`, `tower.rs:1047` (cfg(test)). Dies with the `merkle_l0_opening` bench; the `*_chunk` witness family (~500 lines, §G cluster 13) follows the Phase 2.2 decision. **2026-08-27: resolved by 2.2 — the chunk-leaf layout is the tower's test-oracle geometry and stays; the `*_chunk` witness family was deleted.** |
 
 **Test-only-but-keep** (explicitly not Phase 1 targets): `RandomChallenger`
 (test infra, ~80 call sites), `merkle_tree_sequential` (oracle),
@@ -228,7 +228,12 @@ docstring's "the production shape" is now literally true).
 
 ## C. Decision-gated inventory (Phase 2 — Ron's three calls, corrected numbers)
 
-**2.1 keccak retirement.** The census corrects the scope: **`keccak.rs`
+**2.1 keccak retirement — EXECUTED 2026-08-27** (Ron's call; branch
+`bloat-phase2-retire`): keccak.rs, keccak3.rs, their five benches, the
+`keccak`/`sha3` deps, the bench-only `prove_fast_ligerito_timed` chain, the
+CUDA `bench_keccak3_gpu` target and the `bench_keccak*.sh` orchestrators are
+gone; README/BENCHMARKS Keccak rows removed. Competitor harnesses untouched.
+The census text follows.** The census corrects the scope: **`keccak.rs`
 (1,693 lines) has no production caller either** — `KeccakSetup` (union path)
 is constructed only by `hash_throughput` and the keccak3 benches. keccak3.rs
 (960 lines, padded commit, self-documented "next candidate for
@@ -239,7 +244,26 @@ lines)**; keeping keccak-as-product but retiring the 3-wide keccak3 frees
 ~1,250. The GPU is NOT an obstacle: `keccak3_witness.cuh` is included only by
 `bench_keccak3_gpu.cu` (bench-side, not the roundtrip harness).
 
-**2.2 Merkle-path product.** The "~6k lines" estimate splits into:
+**2.2 Merkle-path product — EXECUTED 2026-08-27** (Ron: "retire the old I/O
+Merkle tree and chain mechanisms"): the shift protocol (`merkle_path.rs`,
+`merkle_path_common.rs`, sha2's four `*_merkle_path*` entries + its
+padded-commit params, `benches/sha2_merkle_proof`), the monolithic Merkle
+block product (`MerkleWalkerCircuit`, `PathInput`, `reference_root`, the
+walker-only `MerkleTreeLayout` methods and `HashSpec` fields, the
+`merkle26+blake3@nu3/nu7` registry tiers — wire codes 3/4 retired, never
+reused — `tests/merkle_r1cs.rs`, `tests/merkle_union.rs`,
+`benches/merkle_vs_plain_blake3`, `docs/merkle-r1cs-notes.md`) are gone.
+KEPT: `merkle_glue.rs` (production tower gates) and a trimmed
+`merkle_r1cs.rs` = `SLOT_WORDS` (the only production-reachable item, as the
+census said) + `MerkleTreeLayout::with_blake3_chunk_leaf` / `root_chunk` /
+`build_block_r1cs_stub` / `io_schema`, `HashSpec`/`blake3_spec`,
+`ChunkPathInput` — the geometry of the tower's `cfg(test)` differential
+Merkle gate and of `tests/merkle_glue.rs`. Measured by narrowing every `pub`
+to `pub(crate)` and iterating rustc's dead-code lint (3 passes). The
+direct-path seam (`prove_fast_ligerito_from_witness`, `ProveCore`,
+`prove_fast_core*`) is deliberately left although it now has zero callers:
+Ron deferred the CPU direct path until the GPU moves to multitable+AG-skip.
+The census text follows.** The "~6k lines" estimate splits into:
 - the shift protocol proper: `merkle_path.rs` 1,015 + `merkle_path_common.rs`
   574 + sha2.rs merkle section ~220 = **~1,809**, whose only entry points are
   four `Sha256HybridSetup::*_merkle_path*` methods called only from
@@ -452,7 +476,7 @@ alone: 23% clone-covered, ~2,970 of the recommended total.
 | 10 | bench boilerplate (keccak3 3-way ~90% clone-covered; native-chain pair has a 134-line exact clone) | 1,270 | ~1,270 | low |
 | 11 | dump-bin frame | 270 | ~270 | byte-pinned draw order |
 | 12 | verifier/prover `_ag`/`_deferred`/`_timed`/`_jagged` twins | 425 | ~425 | `_timed` safe (timer sink); `_ag`/`_deferred` are protocol variants |
-| 13 | merkle_r1cs `*_chunk` twins | 180 | ~180 | follows Phase 2.2 |
+| 13 | merkle_r1cs `*_chunk` twins | 180 | ~180 | follows Phase 2.2 — DONE 2026-08-27 (deleted with 2.2) |
 | 14 | merkle_glue gate-table boilerplate ×4 | 131 | ~130 | low — macro/blanket trait |
 | 15 | ligerito.rs test roundtrip boilerplate | 883 | ~440 | low — `roundtrip_case` helper |
 

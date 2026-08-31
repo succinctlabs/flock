@@ -73,14 +73,18 @@ make pruning safe here — a deletion that changes behavior fails loudly).
    grind-free `Fast`/`Slim` are gone, `Fast128`/`Slim128` took their names,
    `Fast100`/`Slim100` frozen; 98 → 70 embedded TOMLs; proof-IO v22.
 1. **keccak3** — retirement was declined 2026-08-15; does the reason hold?
+   **EXECUTED 2026-08-27** (Ron): keccak and keccak3 both retired.
 2. **Merkle-path shift product** — still a product, or a leftover now that
    the tower verifies Merkle in-circuit? Retiring ≈ 6k lines + removes a
-   padded-commit consumer.
+   padded-commit consumer. **EXECUTED 2026-08-27** (Ron): shift protocol +
+   monolithic Merkle block product retired; `merkle_glue` and the tower's
+   test-oracle layout kept (ledger §C 2.2).
 3. **Direct path / GPU** — the padded-commit direct path can't die while the
    GPU prover speaks it. Either port the GPU prover to the union transport
    (could fold into the Phase F CUDA-AG work as one "GPU catches up" effort)
    or keep direct GPU-only for an interim and delete its CPU-side non-GPU
-   consumers.
+   consumers. **Ron, 2026-08-27: wait — keep the CPU direct path until the
+   GPU is ported to multitable + AG-skip.**
 
 **Phase 3 — duplication consolidation** (careful, byte-pinned). Unify the
 Child/Real tape-walker pairs; split tower.rs into a module tree (mechanical,

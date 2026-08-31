@@ -133,7 +133,7 @@ pub enum TableClass {
 ///
 /// For a boolean type the matrices are `2^k_log × 2^k_log` sparse boolean in
 /// circuit form (`C_0 = I`); like `BlockR1cs`, walker-based encoders
-/// (Keccak) may carry empty stubs here and supply their own
+/// (the tower's stub gates) may carry empty stubs here and supply their own
 /// `LincheckCircuit`.
 #[derive(Clone, Debug)]
 pub struct TableType {

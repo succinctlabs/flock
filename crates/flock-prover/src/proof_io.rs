@@ -144,7 +144,9 @@ const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 // payload field changed, but a v21 proof made under `fast`/`slim` carries a
 // different query/rate/PoW schedule than this build derives for those
 // names, so it cannot be interpreted safely. `fast100`/`slim100`/`secure`
-// are byte-for-byte unchanged.
+// are byte-for-byte unchanged. In the same v22 window the mixed registry
+// codes 3 and 4 (`merkle26+blake3@nu3/nu7`) were retired with the
+// Merkle-path product; they are never reused.
 const VERSION: u8 = 22;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of

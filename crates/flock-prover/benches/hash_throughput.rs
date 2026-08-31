@@ -1,7 +1,6 @@
 //! Reproducible headline proving-throughput matrix for the README.
 //!
-//! Measures SHA-256 compressions, BLAKE3 compressions, and Keccak-f[1600]
-//! permutations. Thread count is controlled through
+//! Measures SHA-256 compressions and BLAKE3 compressions. Thread count is controlled through
 //! `RAYON_NUM_THREADS`; `benchmarks/bench_hash_throughput.sh` runs the complete
 //! single- and multi-threaded matrix and renders it as Markdown.
 
@@ -10,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use flock_prover::challenger::FsChallenger;
 use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression};
-use flock_prover::r1cs_hashes::keccak::{KeccakSetup, STATE_BITS, State};
 use flock_prover::r1cs_hashes::sha2::Sha256HybridSetup;
 
 struct Rng(u64);
@@ -48,17 +46,6 @@ fn random_blake3_input(rng: &mut Rng) -> Compression {
         64,
         11,
     )
-}
-
-fn random_keccak_state(rng: &mut Rng) -> State {
-    let mut state = [false; STATE_BITS];
-    for chunk in state.chunks_mut(64) {
-        let word = rng.next_u64();
-        for (bit, value) in chunk.iter_mut().enumerate() {
-            *value = (word >> bit) & 1 == 1;
-        }
-    }
-    state
 }
 
 fn best_of<T, F, O>(inputs: &[T], runs: usize, mut prove: F) -> Duration
@@ -141,31 +128,6 @@ fn bench_blake3(batch: usize, runs: usize) {
     report("blake3", batch, best);
 }
 
-fn bench_keccak(batch: usize, runs: usize) {
-    eprintln!("  Keccak-f[1600], batch {batch}");
-    let setup = KeccakSetup::new(batch);
-    let input_sets: Vec<Vec<_>> = (0..=runs)
-        .map(|run| {
-            let mut rng = Rng::new(0xAECC_A000 ^ batch as u64 ^ run as u64);
-            (0..batch).map(|_| random_keccak_state(&mut rng)).collect()
-        })
-        .collect();
-
-    let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
-    let (proof, commitment, _) = setup.prove_fast(&input_sets[0], &mut challenger);
-    let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
-    setup
-        .verify(&commitment, &proof, &mut challenger)
-        .expect("Keccak warm-up proof failed verification");
-    black_box(proof);
-
-    let best = best_of(&input_sets, runs, |inputs| {
-        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
-        setup.prove_fast(inputs, &mut challenger)
-    });
-    report("keccak", batch, best);
-}
-
 fn parse_log2_batches() -> Vec<u32> {
     let value = std::env::var("HASH_BENCH_LOG2S").unwrap_or_else(|_| "10 12 14 16 18".to_owned());
     let batches: Vec<u32> = value
@@ -230,8 +192,5 @@ fn main() {
     }
     for &log2 in &batches {
         bench_blake3(1usize << log2, runs);
-    }
-    for &log2 in &batches {
-        bench_keccak(1usize << log2, runs);
     }
 }

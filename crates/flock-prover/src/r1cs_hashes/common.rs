@@ -1,5 +1,5 @@
 //! Bit-packing and R1CS-row helpers shared by the monolithic hash R1CS
-//! modules (`sha2`, `blake3`, `keccak`). The shared `prove_fast`
+//! modules (`sha2`, `blake3`). The shared `prove_fast`
 //! orchestration lives in [`crate::prover::prove_fast_ligerito_union`].
 
 use std::sync::OnceLock;
@@ -214,7 +214,8 @@ pub(crate) fn const_add_parts(k: u32, y: u32) -> (u32, u32, u32, u32) {
 //
 // The K_LOG=16 hash encoders all use empty A_0/B_0 matrices (constraint
 // definition lives in their LincheckCircuit walkers) and C_0 = I_K. These
-// three helpers were duplicated across keccak.rs, blake3.rs, sha2.rs.
+// three helpers were duplicated across the hash encoders (blake3.rs, sha2.rs
+// and the since-retired keccak.rs).
 // ---------------------------------------------------------------------------
 
 /// K × K sparse matrix with no nonzero entries. Used as an `a_0`/`b_0` stub
@@ -234,29 +235,6 @@ pub(crate) fn identity(k: usize) -> SparseBinaryMatrix {
         num_cols: k,
         rows: (0..k).map(|i| vec![i]).collect(),
     }
-}
-
-/// Build a `BlockR1cs` shell with empty A_0, B_0 stubs and C_0 = I_K. The
-/// constraint definition lives in a per-hash `LincheckCircuit` walker. Used
-/// by Keccak.
-pub(crate) fn build_block_r1cs_empty_stub(
-    n_blocks_log: usize,
-    k_log: usize,
-    k_skip: usize,
-    useful_bits: usize,
-) -> BlockR1cs {
-    let k = 1usize << k_log;
-    // Empty-stub R1CS carry their constraints (and constant-wire pin) on a
-    // per-hash `LincheckCircuit` walker, so no R1CS-level `const_pin` here.
-    build_block_r1cs_with_matrices(
-        n_blocks_log,
-        k_log,
-        k_skip,
-        useful_bits,
-        empty_matrix(k),
-        empty_matrix(k),
-        None,
-    )
 }
 
 /// Build a `BlockR1cs` with caller-supplied A_0, B_0 sparse matrices and
@@ -308,7 +286,7 @@ pub(crate) fn build_block_r1cs_with_matrices(
 // ---------------------------------------------------------------------------
 // Generic witness packing driver.
 //
-// All three hash encoders (keccak, blake3, sha2) had identical chunked
+// The hash encoders (blake3, sha2, the retired keccak) had identical chunked
 // parallel iteration + bit-transpose-to-stripe boilerplate around their
 // per-block witness builder. This driver captures that shape; each hash
 // passes its `per_block` closure that fills 3 length-`U64_PER_BLOCK`
@@ -329,8 +307,7 @@ pub(crate) fn build_block_r1cs_with_matrices(
 /// - `None` — leave them all-zero (trivial constraint satisfaction).
 /// - `Some(p)` — build a real block from `p` in every padding slot. Encoders
 ///   that pin a constant wire need this so the constant column is all-ones
-///   across *every* batched instance (see `docs/const-wire-pin.md`); for keccak
-///   the padding input is the all-zero state, whose witness is `keccak_f(0)`.
+///   across *every* batched instance (see `docs/const-wire-pin.md`).
 pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
     initial_states: &[S],
     padding: Option<&S>,
