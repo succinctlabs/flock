@@ -2691,3 +2691,69 @@ ceil(11707/128) = 92 of 128; 376,832 of 524,288 windows live). The
 "~19%" in zerocheck.rs and two log entries above is wrong by ~3.8x.
 Round 1 DOES scale with this fraction — the AB prep, the C transpose
 and the drain all sit behind one `continue` on `n_b_med == 0`.
+
+### AG vs RS: the bench measures the wrong path, and ab_eq_fold has no AG landing spot — 2026-08-31
+
+**`Blake3Setup::prove_fast` (what blake3_proof benches, and every
+zerocheck number in this log today) takes the RS union path.** The AG
+path is a separate entry, `prove_fast_union_ag` →
+`prove_fast_ligerito_union_ag` → `BooleanZcKind::Ag`
+(blake3.rs:1726, prover.rs:675/770). Main is actively developing AG
+(38468bc, 4aef9ad, e661940 on origin/main).
+
+**AG's zerocheck is already ahead of RS's.** `ag_breakdown` at m=32,
+3 reps, 10 threads (medians):
+
+| AG phase | ms |
+|---|---|
+| round-1 URM (banks fused) | 66.7 |
+| skip→mlv fold (byte-dot u64) | 115.4 |
+| TOTAL prove (lookahead) | **164.2** |
+| [classic tail, no lookahead] | [283.5] |
+
+versus the RS path's ~206 ms of zerocheck at the same m (round1 117.6
++ r2 43.4 + tail 44.9, measured in the gate A/B above). **AG round 1
+is 43% cheaper than RS round 1**, and inside AG the *fold*, not round
+1, is the dominant phase.
+
+**AG already implements the sparse→cascade hybrid** this log proposed
+as "the win neither tree has": `mlv_tail_fs_sparse` (ag_skip.rs:1417)
+runs the support-proportional rounds "while the live set clears the
+gate and the domain keeps the fused threshold, then expands to dense
+ONCE and resumes the lookahead tail mid-stream"
+(`mlv_tail_fs_resume`, :1501). That gap is RS-driver-only; AG is the
+reference implementation. Retarget the hybrid item accordingly.
+
+**ab_eq_fold does not transfer — two independent reasons.**
+1. *AG round 1 is not table-driven.* The RS mechanism works because
+   the RS drain's per-chunk contribution is a convert-TABLE lookup
+   indexed by a byte (256 possible values), so `eq_top` can be
+   pre-multiplied into table copies once and the per-chunk multiply
+   disappears. AG round 1 computes `pr = (af&bx) ^ (ax&bf)` fresh per
+   block and folds it with `mul_acc_unred(res[p], eq, pr)`
+   (round1.rs:259-293, 592-610) — 160 AB + 128 C = **288 multiplies
+   by the same `eq_o` per block**, on full-rank 128-bit data. There is
+   no table whose scaling could absorb the weight; building a
+   per-block multiply table would cost ~4096 ops to save 288.
+2. *The AG fold, which IS table-driven (`build_w_tables`), already
+   applies eq once per block to a REDUCED SCALAR* — `let e = eo *
+   d1_inv; (e * s1.reduce(), e * s_inf.reduce())` (ag_skip.rs:296-300).
+   Two multiplies per block, not per lane. Nothing to fold away.
+
+**What the fold's 115 ms actually is: bandwidth.** It reads 512 MB of
+`a_packed` + 512 MB of `b_packed` and writes `a_mlv`/`b_mlv` at
+`n = 2^26` F128 each = **2 GB written** (each witness bit becomes a
+16-byte field element). ~3 GB of traffic ≈ 100 ms at this machine's
+achievable bandwidth — it is DRAM-bound, not multiply-bound. The
+transferable IDEA here is compact-K's principle, not ab_eq_fold's:
+**fuse the first mlv round(s) into the fold so the full-width
+intermediate is never materialized** (the code already fuses the first
+*message* accumulation — "no read-back of the folded array" — but
+still writes both full arrays). That targets the largest AG phase.
+
+Round-1 candidate that IS coding-scheme-independent: the challenge
+tree's static-B sniffing (~31.6% of B byte positions fixed by the
+BLAKE3 circuit regardless of witness). It is a property of the R1CS,
+not of RS vs AG, so it should apply to `encode_slp_derived(bp, bf)`
+and simplify `product_fold_bs` terms. Premise NOT yet verified against
+our BLAKE3 R1CS — measure before building.
