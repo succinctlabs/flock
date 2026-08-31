@@ -2592,3 +2592,44 @@ PARKED on branch `regraft-2-lane-pipeline` (pushed) with the oracle
 test — re-run the A/B on a quiet charged machine, and at m=30/34
 where the codeword (and the re-read) is larger. Not merged: does not
 earn its ~120 lines on this evidence.
+
+### Zerocheck route A/B: sparse vs compact-K+cascade, SAME BINARY — 2026-08-31
+
+`FLOCK_SPARSE_GATE` (the existing env override on `SPARSE_TAIL_GATE`)
+makes the round-2 dispatch a same-binary A/B: gate=1 (default) takes
+main's sparse route, gate=huge forces the dense route, which now fires
+the re-grafted compact-K + cascade. 8 pairs, alternating, min-of-5 per
+invocation, m=32 grind-free blake3. ms:
+
+| bucket        | sparse | dense/cascade | sign |
+|---------------|--------|---------------|------|
+| round1 URM    | 117.6  | 118.0         | 5/8 (unaffected — same code) |
+| round 2       |  43.4  | 101.7         | 8/8 sparse |
+| compact-K fold|   —    |  30.3         | — |
+| rounds 3+ tail|  44.9  |  10.6         | **0/8 sparse — cascade 4.2× faster** |
+| r2+K+tail     |  89.3  | 142.7         | 8/8 sparse |
+| zc+lincheck   | 239.3  | 288.7         | 8/8 sparse |
+
+**Both halves are 8/8 disjoint, in OPPOSITE directions.** Sparse owns
+round 2 (−58 ms: it never materializes the dead region the compact
+producer sweeps); the cascade owns the tail (−34 ms: one 4→1 pass
+serves two rounds, and our dispatch currently forces an UNFUSED tail
+whenever round 2 went sparse — `tail_cascade` requires
+`dense_single_run`, zerocheck.rs:842). Neither route is optimal. A
+hybrid — sparse (or sparse-compact) round 2 handing a compacted state
+to a SPARSE 4→1 lookahead kernel — targets ~54 ms where we now pay
+89.3, i.e. ~−35 ms on the zc bucket. That kernel does not exist in
+either tree: main has sparsity without fusion, the challenge tree has
+fusion without sparsity. This is the one genuine "port the idea, not
+the code" item the zerocheck has left.
+
+CORRECTION to the re-graft #1 entry above: its "~19% occupancy" figure
+was asserted from a misread of `boolean_padding_spec` and is
+WITHDRAWN — the sparse route engages at this shape because
+`SPARSE_TAIL_GATE = 1` makes the gate `live ≤ n` (always true), not
+because the witness is very sparse. The gate's own doc describes the
+intended crossover as half utilization (`live·2 > n` stays dense), so
+the constant and the doc disagree; at 8/8 for sparse on round 2 the
+constant is right for round 2 and wrong for the tail. Re-graft #1's
+verdict (sparse keeps the bench) stands on the measurement, but its
+stated cause was wrong.
