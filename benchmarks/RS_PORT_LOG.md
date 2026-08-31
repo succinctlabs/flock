@@ -2906,3 +2906,47 @@ time. At m=32 the recursive commits cost ≈ 30 ms encode + 21 ms merkle
 (log_cols=16) alone ≈ 27 ms. So ~150 ms of the open's "inner ligerito"
 is NOT commits — it is the recursive sumcheck/query/induce work, and
 that is the largest unexamined block in the prover.
+
+### Current throughput, and what the surviving wins are worth — 2026-08-31 (quiet window)
+
+**Throughput now (production, grinding ON, verify passing):** best
+prove_fast **900.62 ms = 291,072 compressions/sec** at m=32 (2^18
+compressions, 8 P-cores, blake3 merkle + FS). Proof 449.76 KiB, verify
+6.59 ms, peak 8.52 GB. Grind-free reads 906.73 ms / 289,110 c/s — i.e.
+**grinding is now free** (main's per-challenge schedule is 2–16 bits),
+so the FLOCK_NO_GRIND measurement family is nearly redundant on this
+protocol; keep it only for comparability with the campaign's archive.
+
+Phase split (PCS_TRACE, total ~833–839 ms): zc+lincheck 300, open 273,
+commit 252, witgen/compact/claim-assembly ≈ 0. Three roughly equal
+blocks; witness generation is genuinely free (PooledZeroed + aliased
+compaction).
+
+**What the kept optimizations are worth: −2.7%, 8/8.** Branch vs a
+worktree at origin/main (8a36c91), PRODUCTION settings, blake3 pinned
+on BOTH arms so the default-hash flip is not confounded, 8 alternating
+pairs in a charging, quiet window:
+
+| | best | median |
+|---|---|---|
+| branch | 894.5 ms | 904.4 ms |
+| origin/main | 918.4 ms | 940.0 ms |
+
+median Δ −25.3 ms, median ratio 0.9729, **8/8 branch**; best-vs-best
+894.5 vs 918.4 = 1.027×. Throughput 293.1k vs 285.4k c/s. Per-pair Δ:
+−17 −37 −21 −44 −20 −45 −15 −30 (arm order alternating; no order bias).
+
+This supersedes the midday phase table (−3.6% MT / −4.8% ST, measured
+at 19% battery under foreign load) and agrees with it in sign and rough
+magnitude. Attribution is unchanged: essentially all of it is the
+lincheck NEON block kernel (zc+lincheck −12% MT / −11% ST), with
+commit and open at parity.
+
+**Perspective.** The campaign's headline was 1.59× MT on the OLD
+protocol (723.9 → 454.7 ms). After the main merge, the surviving,
+still-live wins are worth 1.027×. The rest died structurally, each
+verified this session: direct open (f256 split replaced the basis
+open), stripe-C (batch-major layout), AB hoist (no GPU to free the
+cores), compact-K/cascade (sparse wins on RS; AG already has the
+hybrid), recursive fill fusion (wrong rate regime). That is the honest
+accounting of the port campaign against today's protocol.
