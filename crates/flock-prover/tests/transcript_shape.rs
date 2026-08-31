@@ -39,22 +39,7 @@ use std::sync::Arc;
 
 const DOMAIN: &[u8] = b"flock-union-element-v0";
 
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn f128(&mut self) -> F128 {
-        F128::new(self.next_u64(), self.next_u64())
-    }
-}
+use flock_core::test_rng::Rng;
 
 /// Same element gate block `union_element.rs` uses: two free wires, a product,
 /// a linear pin, zero padding above.
@@ -286,7 +271,12 @@ fn element_only_transcript_shape_is_pinned() {
     // moved each level's Pow bits. Measured: the digest at 700cace~1 was a
     // third value, neither the old nor the new pin. Two deterministic print
     // runs agreed.
-    const EXPECTED: &str = "e7a0b59f43903cf62f46ed0d58eeeec5ec5156cf5fc959f508a291ba2250ecd6";
+    // Re-pinned 2026-08-27 for the profile consolidation (proof-IO v22,
+    // bloat ledger §C): `Fast` now carries the former Fast128 schedule —
+    // aggressive +2/level ladder and 16-bit query PoW at every level — so
+    // the per-level query counts, caps and Pow bits all move. Two
+    // deterministic print runs agreed.
+    const EXPECTED: &str = "46b9b760ea72bcc0e549196bb31401e88993767d71636614de61270fd4cfdee3";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
 

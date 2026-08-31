@@ -23,15 +23,14 @@ fn cv(h: &[u32; 8], m: &[u32; 16], flags: u32) -> [u32; SLOT_WORDS] {
     out[..SLOT_WORDS].try_into().unwrap()
 }
 
-struct Rng(u64);
-impl Rng {
-    fn next_u32(&mut self) -> u32 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        (z ^ (z >> 31)) as u32
-    }
+use flock_core::test_rng::Rng;
+
+/// Site-specific draws kept verbatim from this file's former local `Rng`.
+trait RngExt {
+    fn digest(&mut self) -> [u32; SLOT_WORDS];
+    fn word(&mut self) -> u128;
+}
+impl RngExt for Rng {
     fn digest(&mut self) -> [u32; SLOT_WORDS] {
         std::array::from_fn(|_| self.next_u32())
     }

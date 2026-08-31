@@ -8,7 +8,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 21)
+//!   byte  5       VERSION                  (currently 22)
 //!   bytes 6..7    flavor: 2 = R1cs, 4 = Mixed
 //!                 (0/1 reserved: legacy BaseFold; 3 was the retired chain)
 //!   bytes 7..     bincode-serialized payload
@@ -137,7 +137,17 @@ const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 // proof — the standalone hash setups prove over the single-slot union
 // commit now (dense stack + integer lanes); the padded-commit
 // R1csProofLigerito payload is gone from this flavor.
-const VERSION: u8 = 21;
+// v22 (2026-08-27): the profile consolidation (bloat ledger §C). The
+// grind-free `fast`/`slim` (+1 rate/level ladder) were deleted and the
+// `fast128`/`slim128` schedules took their names: aggressive +2/level
+// ladder, 16-bit query PoW per level, larger deep-level batch grinding. No
+// payload field changed, but a v21 proof made under `fast`/`slim` carries a
+// different query/rate/PoW schedule than this build derives for those
+// names, so it cannot be interpreted safely. `fast100`/`slim100`/`secure`
+// are byte-for-byte unchanged. In the same v22 window the mixed registry
+// codes 3 and 4 (`merkle26+blake3@nu3/nu7`) were retired with the
+// Merkle-path product; they are never reused.
+const VERSION: u8 = 22;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see
@@ -434,29 +444,16 @@ mod tests {
     use crate::r1cs_hashes::blake3::{Blake3Setup, Compression, blake3_compress};
     use flock_core::challenger::FsChallenger;
 
-    /// SplitMix64.
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-        fn nx(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-    }
+    use flock_core::test_rng::Rng;
 
     /// Build a small honest BLAKE3 chain (n=8) for the bundle tests.
     fn honest_chain(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8]) {
         let mut rng = Rng::new(seed);
-        let mut cv: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
+        let mut cv: [u32; 8] = std::array::from_fn(|_| rng.next_u64() as u32);
         let cv0 = cv;
         let mut blocks = Vec::with_capacity(n);
         for _ in 0..n {
-            let m: [u32; 16] = std::array::from_fn(|_| rng.nx() as u32);
+            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
             let counter = 0u64;
             let block_len = 64u32;
             let flags = 0u32;
@@ -648,9 +645,9 @@ mod tests {
         ) -> Vec<crate::r1cs_hashes::blake3::Compression> {
             (0..n)
                 .map(|_| {
-                    let cv: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
-                    let m: [u32; 16] = std::array::from_fn(|_| rng.nx() as u32);
-                    (cv, m, rng.nx(), 64u32, 11u32)
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u64() as u32);
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
+                    (cv, m, rng.next_u64(), 64u32, 11u32)
                 })
                 .collect()
         }
@@ -662,8 +659,8 @@ mod tests {
             (0..n)
                 .map(|_| {
                     (
-                        std::array::from_fn(|_| rng.nx() as u32),
-                        std::array::from_fn(|_| rng.nx() as u32),
+                        std::array::from_fn(|_| rng.next_u64() as u32),
+                        std::array::from_fn(|_| rng.next_u64() as u32),
                     )
                 })
                 .collect()

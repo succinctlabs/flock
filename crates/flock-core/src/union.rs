@@ -1144,29 +1144,7 @@ mod tests {
         }
     }
 
-    /// SplitMix64 PRNG, deterministic.
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        }
-        fn next_f128(&mut self) -> F128 {
-            F128 {
-                lo: self.next_u64(),
-                hi: self.next_u64(),
-            }
-        }
-        fn f128_vec(&mut self, n: usize) -> Vec<F128> {
-            (0..n).map(|_| self.next_f128()).collect()
-        }
-    }
+    use crate::test_rng::Rng;
 
     /// A single-slot union at full utilization declares the same jagged grid
     /// as today's `BlockR1cs::jagged_heights` — on the BLAKE3 and SHA-256
@@ -1200,13 +1178,13 @@ mod tests {
         let mut rng = Rng::new(0x0C1A_11A5);
 
         for _ in 0..16 {
-            let z_skip = rng.next_f128();
+            let z_skip = rng.f128();
             let mlv = rng.f128_vec(m - K_SKIP);
             let x_ab_union = union.x_ab_from_mlv(SkipPoint::Phi8(z_skip), &mlv);
             let x_ab_r1cs = r1cs.x_ab_from_mlv(SkipPoint::Phi8(z_skip), &mlv);
             assert_eq!(x_ab_union, x_ab_r1cs, "x_ab_from_mlv diverged");
 
-            let r_inner_skip = rng.next_f128();
+            let r_inner_skip = rng.f128();
             let r_inner_rest = rng.f128_vec(k_log - K_SKIP);
             assert_eq!(
                 union.ab_claim_point(
@@ -2021,7 +1999,7 @@ mod tests {
         let mut rng = Rng::new(0xE1E_C7);
 
         let mlv = rng.f128_vec(m_bool - K_SKIP);
-        let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(rng.next_f128()), &mlv);
+        let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(rng.f128()), &mlv);
         assert_eq!(x_ab.x_outer.len(), union.n_log());
         assert_eq!(
             x_ab.x_inner_rest.len(),
@@ -2030,11 +2008,7 @@ mod tests {
         );
 
         let r_inner_rest = rng.f128_vec(1 + union.boolean_col_log());
-        let ab = union.ab_claim_point(
-            SkipPoint::Phi8(rng.next_f128()),
-            &r_inner_rest,
-            &x_ab.x_outer,
-        );
+        let ab = union.ab_claim_point(SkipPoint::Phi8(rng.f128()), &r_inner_rest, &x_ab.x_outer);
         let full = ab.x_inner_rest.len() + ab.x_outer.len();
         assert_eq!(full, m - K_SKIP, "the point must address the UNION space");
         assert!(
@@ -2050,7 +2024,7 @@ mod tests {
         );
 
         let r_rest = rng.f128_vec(m_bool - K_SKIP);
-        let c = union.c_claim_point(SkipPoint::Phi8(rng.next_f128()), &r_rest);
+        let c = union.c_claim_point(SkipPoint::Phi8(rng.f128()), &r_rest);
         assert_eq!(c.x_inner_rest.len() + c.x_outer.len(), m - K_SKIP);
         assert_eq!(&c.x_outer[..r_rest.len() - 1], &r_rest[1..]);
         assert!(

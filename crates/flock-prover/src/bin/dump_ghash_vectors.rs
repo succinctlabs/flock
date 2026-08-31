@@ -17,27 +17,7 @@ use std::io::{BufWriter, Write};
 
 use flock_prover::field::F128;
 
-/// SplitMix64 — same constants as the `gf2_128::tests::Rng`, so vectors are
-/// reproducible and line up with the in-tree unit tests.
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-    fn next_f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
-        }
-    }
-}
+use flock_core::test_rng::Rng;
 
 fn main() -> std::io::Result<()> {
     let path = env::args()
@@ -87,7 +67,7 @@ fn main() -> std::io::Result<()> {
         let (a, b) = if i < edges.len() {
             edges[i]
         } else {
-            (rng.next_f128(), rng.next_f128())
+            (rng.f128(), rng.f128())
         };
         let p = a * b; // the canonical flock product
         for v in [a.lo, a.hi, b.lo, b.hi, p.lo, p.hi] {

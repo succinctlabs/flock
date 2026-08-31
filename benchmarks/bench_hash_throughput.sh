@@ -69,7 +69,7 @@ echo
 echo "Throughput in thousands of hashes per second (k hashes/s; higher is better)."
 echo "| Hash | Batch | 1T | ${MT_THREADS}T |"
 echo "|---|---:|---:|---:|"
-for hash_spec in "sha2:SHA-256" "blake3:BLAKE3" "keccak:Keccak-f[1600]"; do
+for hash_spec in "sha2:SHA-256" "blake3:BLAKE3"; do
 	hash="${hash_spec%%:*}"
 	label="${hash_spec#*:}"
 	for log2 in $LOG2S; do

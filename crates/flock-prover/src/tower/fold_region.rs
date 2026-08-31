@@ -855,10 +855,7 @@ pub(super) fn labeled_bytes_payloads(
         {
             out.push(payload);
         }
-        if matches!(
-            op,
-            Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. }
-        ) {
+        if op.carries_payload() {
             payload += 1;
         }
     }

@@ -39,22 +39,14 @@ use std::io::{BufWriter, Write};
 use flock_prover::hash::HashKind;
 use flock_prover::pcs::{PcsParams, commit, pack_witness};
 
-/// SplitMix64 — same constants as `dump_ghash_vectors` / the in-tree unit
-/// tests, so the witness is reproducible and stable across runs.
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-    /// `n` reproducible witness bits.
-    fn bits(&mut self, n: usize) -> Vec<bool> {
+use flock_core::test_rng::Rng;
+
+/// Site-specific draws kept verbatim from this file's former local `Rng`.
+trait RngExt {
+    fn bits_packed(&mut self, n: usize) -> Vec<bool>;
+}
+impl RngExt for Rng {
+    fn bits_packed(&mut self, n: usize) -> Vec<bool> {
         let mut out = Vec::with_capacity(n);
         let mut word = 0u64;
         for i in 0..n {
@@ -92,7 +84,7 @@ fn main() -> std::io::Result<()> {
 
     // Reproducible Boolean witness → packed F128 message, then the real commit.
     let mut rng = Rng::new(0xC0FFEE);
-    let z = rng.bits(1usize << m);
+    let z = rng.bits_packed(1usize << m);
     let z_packed = pack_witness(&z, m);
     assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
 

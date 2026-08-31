@@ -54,19 +54,14 @@ mod aarch64_only {
     const K_SKIP: usize = 6;
     const N_INNER: usize = 7;
 
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        }
-        fn fill_bytes(&mut self, buf: &mut [u8]) {
+    use flock_core::test_rng::Rng;
+
+    /// Site-specific draws kept verbatim from this file's former local `Rng`.
+    trait RngExt {
+        fn fill_bytes_words(&mut self, buf: &mut [u8]);
+    }
+    impl RngExt for Rng {
+        fn fill_bytes_words(&mut self, buf: &mut [u8]) {
             let mut i = 0;
             while i + 8 <= buf.len() {
                 buf[i..i + 8].copy_from_slice(&self.next_u64().to_le_bytes());
@@ -401,9 +396,9 @@ mod aarch64_only {
             );
             let mut rng = Rng::new(0xABCD_0000 + m as u64);
             let mut a = vec![0u8; n_bytes];
-            rng.fill_bytes(&mut a);
+            rng.fill_bytes_words(&mut a);
             let mut b = vec![0u8; n_bytes];
-            rng.fill_bytes(&mut b);
+            rng.fill_bytes_words(&mut b);
             let c: Vec<u8> = a.iter().zip(&b).map(|(x, y)| x & y).collect();
 
             // warm caches (LUT/SLP/eval OnceLocks, NTT tables).

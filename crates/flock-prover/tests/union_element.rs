@@ -43,26 +43,7 @@ use std::sync::Arc;
 
 const DOMAIN: &[u8] = b"flock-union-element-v0";
 
-/// SplitMix64 PRNG, the repo's test RNG convention.
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn next_u32(&mut self) -> u32 {
-        self.next_u64() as u32
-    }
-    fn f128(&mut self) -> F128 {
-        F128::new(self.next_u64(), self.next_u64())
-    }
-}
+use flock_core::test_rng::Rng;
 
 // ---------------------------------------------------------------------------
 // The test element block: every row encoding the class supports.
@@ -1317,50 +1298,58 @@ fn bundle_digest_merged(
 // mix-128-128 and mix-0-90 moved under both. The empty-instance fixture
 // elem-merged-nu12-0 held throughout. union_m6_fixtures was re-pinned with
 // 700cace but this file was missed. Two deterministic print runs agreed.
+// Re-pinned 2026-08-27 for the profile consolidation (proof-IO v22, bloat
+// ledger §C): `Fast` now carries the former Fast128 schedule (aggressive
+// +2/level ladder, 16-bit query PoW every level), so every fixture moved,
+// including the empty-instance one (the ladder itself changed, not just
+// the grinding). Two deterministic print runs agreed.
 // Runs by default since 2026-08-27: CI never passes `--ignored`, which is
 // how the 700cace sweep missed this pin. Same policy as `union_m6_fixtures`.
 // Re-pinned 2026-08-28: repo default hash flipped to BLAKE3 (HashKind
 // default + config generator + embedded TOMLs) — every default-constructed
 // transcript moves by design. Two deterministic print runs agreed.
+// Re-pinned 2026-08-31: merged main's profile consolidation (proof-IO v22,
+// Fast = former Fast128 schedule) on top of the BLAKE3 default — both
+// sides' pins were stale. Two deterministic print runs agreed.
 #[test]
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "d4298d909353b5655d37c5ef0405a4c0a8e8711a8eb40fe3b725d4a6d9c5c45b",
+            "f3245ccbba7ab820b1013a56499dbf8a76a64b87268ef37a04ba450670bd36f5",
         ),
         (
             "elem-merged-nu12-2731",
             2731,
-            "d1b7e85b261a9d799514479430409b8387426b9284994d88ff0dcf64a6a91f45",
+            "ad0497a7863b73cda94d3ca7463d0b91359262fc962ce8c9f12f19e69ed753d9",
         ),
         (
             "elem-merged-nu12-0",
             0,
-            "9f9d6c46dec3f65e41f6dbf59af7707da348f5aabb1c54389577dd0c226f3924",
+            "92e265b26dd16b274c0f4d985449efaad0020a9deb1d283cdf1cda2d2c29f813",
         ),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "8e0d6a3c842dccd47664e26607512c64ced059fca46d7c40ad05a43895201a46",
+            "a7df4157d729a14cebd2953784a87bb299244bb7204988eb6710d2a21e9447f6",
         ),
         (
             "mix-merged-nu7-100-90",
             [100, 90],
-            "16cb3ee7707fa47f0789e2609382c7a38b94e8bd9281cb68f75cee71de8c63d4",
+            "ecbfcfd4d98318e537b0b5090b3b9306ea142a2d88a5bb48f89498fdf3bbfff6",
         ),
         (
             "mix-merged-nu7-0-90",
             [0, 90],
-            "00493ec2f276bf7d427692ed4fb92896228063fb3a91d4da938329c6afb3f7d6",
+            "4fbd01dfdb65e0be475acef7dc8a728ba68af08f22a48c1ecc8599f12704dd57",
         ),
         (
             "mix-merged-nu7-100-0",
             [100, 0],
-            "8c745c7daa73ed2bda64e7dff29d7a869121511f249449ce06be8bce29879a2e",
+            "bd1ed5ee049132b7950b8dedb667475d19d5f6fc977eab8b65b7774875c7719d",
         ),
     ];
 

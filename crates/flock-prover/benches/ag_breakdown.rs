@@ -31,22 +31,7 @@ mod aarch64_only {
         prove_capture_s_hat_v_c,
     };
 
-    struct Rng(u64);
-    impl Rng {
-        fn n(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        }
-        fn f(&mut self) -> F128 {
-            F128 {
-                lo: self.n(),
-                hi: self.n(),
-            }
-        }
-    }
+    use flock_core::test_rng::Rng;
 
     pub(super) fn run() {
         let m: usize = std::env::args()
@@ -62,18 +47,18 @@ mod aarch64_only {
         let mut a = vec![0u8; bytes];
         let mut b = vec![0u8; bytes];
         for x in a.iter_mut() {
-            *x = rng.n() as u8;
+            *x = rng.next_u64() as u8;
         }
         for x in b.iter_mut() {
-            *x = rng.n() as u8;
+            *x = rng.next_u64() as u8;
         }
         let c: Vec<u8> = a.iter().zip(&b).map(|(&x, &y)| x & y).collect();
         let n_blocks = bytes / 1024;
-        let eq: Vec<F128> = (0..n_blocks).map(|_| rng.f()).collect();
-        let w: Vec<F128> = (0..64).map(|_| rng.f()).collect();
+        let eq: Vec<F128> = (0..n_blocks).map(|_| rng.f128()).collect();
+        let w: Vec<F128> = (0..64).map(|_| rng.f128()).collect();
         let mut r_rest = friendly_challenges().to_vec();
         for _ in 0..(m - 6 - N_INNER) {
-            r_rest.push(rng.f());
+            r_rest.push(rng.f128());
         }
 
         eprintln!(

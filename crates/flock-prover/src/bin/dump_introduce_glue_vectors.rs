@@ -27,25 +27,7 @@ use std::io::{BufWriter, Write};
 use flock_prover::field::F128;
 use flock_prover::pcs::ligerito::SumcheckProver;
 
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-    fn next_f128(&mut self) -> F128 {
-        F128 {
-            lo: self.next_u64(),
-            hi: self.next_u64(),
-        }
-    }
-}
+use flock_core::test_rng::Rng;
 
 fn write_f128(w: &mut impl Write, x: F128) -> std::io::Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
@@ -63,9 +45,9 @@ fn main() -> std::io::Result<()> {
     let len = 1usize << log_len;
 
     let mut rng = Rng::new(0xC0FFEE);
-    let f: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
-    let b1: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
-    let b_new: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
+    let f: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
+    let b1: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
+    let b_new: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
 
     let h1 = f
         .iter()
@@ -76,7 +58,7 @@ fn main() -> std::io::Result<()> {
     // Real introduce: message {u_0,u_2} + h_new = Σ f·b_new.
     let (msg, h_new) = sc.introduce_new_with_eval(b_new.clone());
 
-    let beta = rng.next_f128();
+    let beta = rng.f128();
     // glue(β): combined_basis = b1 + β·b_new (no folds happened, so cb == b1).
     let glued_cb: Vec<F128> = b1
         .iter()

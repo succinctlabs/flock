@@ -191,7 +191,7 @@ These have zero production callers and no oracle/API role — verified:
 | blake3.rs direct/AG A/B entry cluster (`prove_fast_ag{,_timed}`, `verify_ag`, `prove_fast_union_ag`, `verify_union_ag`, `prove_fast_timed`, `direct_pcs_params`) | ~190 | sole caller `benches/blake3_rs_vs_ag.rs` (itself superseded, §F). Salvage the union+AG arm into `blake3_proof` or `ag_e2e_zerocheck` first. |
 | prover.rs bench-only `*_timed` chain (`prove_fast_ligerito_timed` :1992, `prove_fast_ligerito_ag_timed` :1674, `ProvePhaseTimings` :1973) | ~280 | reached only via the blake3/keccak3 `*_timed` wrappers → benches. **Phase 1 removed the blake3 wrapper only; `prove_fast_ligerito_timed` + `ProvePhaseTimings` survive via keccak3 and go with the §2.1 keccak decision.** |
 | A/B toggle statics + dead arms (`ROUND1_UNFUSED`, `LOOKAHEAD_DISABLE`, `NXT_ZEROFILL`, `DISABLE_FRIENDLY_HORNER` + the unfused segment driver `ag_skip.rs:1389-1439`) | ~150 | **Correction (PR #37 review): `LOOKAHEAD_DISABLE` is still flipped by the retained `benches/ag_breakdown.rs:106-116` — not dead, do not delete.** `DISABLE_FRIENDLY_HORNER`, `NXT_ZEROFILL` and `LOOKAHEAD_FRIENDLY` lost their only writers with the `blake3_rs_vs_ag` / `ag_lookahead_ab` deletions and are now unflippable in-tree — deleted 2026-08-27 (Ron's call) together with `lookahead_friendly_pass`, `shl_xor_generic` and the `prove_tail` A/B arms; `LOOKAHEAD_DISABLE` stays (`ag_breakdown` + `lookahead_matches_classic` need it); the answers are recorded in `ag_skip.rs:44-56` doc comments and `docs/ag-recursion-plan.md`. |
-| `with_blake3_chunk_leaf` + chunk-leaf remnants (merkle_r1cs.rs:459 + `*_chunk` reachability) | ~42 direct | L0-table revert leftover (`4e96d23`); remaining callers are `tests/merkle_glue.rs:129`, `benches/merkle_l0_opening.rs`, `tower.rs:1047` (cfg(test)). Dies with the `merkle_l0_opening` bench; the `*_chunk` witness family (~500 lines, §G cluster 13) follows the Phase 2.2 decision. |
+| `with_blake3_chunk_leaf` + chunk-leaf remnants (merkle_r1cs.rs:459 + `*_chunk` reachability) | ~42 direct | L0-table revert leftover (`4e96d23`); remaining callers are `tests/merkle_glue.rs:129`, `benches/merkle_l0_opening.rs`, `tower.rs:1047` (cfg(test)). Dies with the `merkle_l0_opening` bench; the `*_chunk` witness family (~500 lines, §G cluster 13) follows the Phase 2.2 decision. **2026-08-27: resolved by 2.2 — the chunk-leaf layout is the tower's test-oracle geometry and stays; the `*_chunk` witness family was deleted.** |
 
 **Test-only-but-keep** (explicitly not Phase 1 targets): `RandomChallenger`
 (test infra, ~80 call sites), `merkle_tree_sequential` (oracle),
@@ -228,7 +228,12 @@ docstring's "the production shape" is now literally true).
 
 ## C. Decision-gated inventory (Phase 2 — Ron's three calls, corrected numbers)
 
-**2.1 keccak retirement.** The census corrects the scope: **`keccak.rs`
+**2.1 keccak retirement — EXECUTED 2026-08-27** (Ron's call; branch
+`bloat-phase2-retire`): keccak.rs, keccak3.rs, their five benches, the
+`keccak`/`sha3` deps, the bench-only `prove_fast_ligerito_timed` chain, the
+CUDA `bench_keccak3_gpu` target and the `bench_keccak*.sh` orchestrators are
+gone; README/BENCHMARKS Keccak rows removed. Competitor harnesses untouched.
+The census text follows.** The census corrects the scope: **`keccak.rs`
 (1,693 lines) has no production caller either** — `KeccakSetup` (union path)
 is constructed only by `hash_throughput` and the keccak3 benches. keccak3.rs
 (960 lines, padded commit, self-documented "next candidate for
@@ -239,7 +244,26 @@ lines)**; keeping keccak-as-product but retiring the 3-wide keccak3 frees
 ~1,250. The GPU is NOT an obstacle: `keccak3_witness.cuh` is included only by
 `bench_keccak3_gpu.cu` (bench-side, not the roundtrip harness).
 
-**2.2 Merkle-path product.** The "~6k lines" estimate splits into:
+**2.2 Merkle-path product — EXECUTED 2026-08-27** (Ron: "retire the old I/O
+Merkle tree and chain mechanisms"): the shift protocol (`merkle_path.rs`,
+`merkle_path_common.rs`, sha2's four `*_merkle_path*` entries + its
+padded-commit params, `benches/sha2_merkle_proof`), the monolithic Merkle
+block product (`MerkleWalkerCircuit`, `PathInput`, `reference_root`, the
+walker-only `MerkleTreeLayout` methods and `HashSpec` fields, the
+`merkle26+blake3@nu3/nu7` registry tiers — wire codes 3/4 retired, never
+reused — `tests/merkle_r1cs.rs`, `tests/merkle_union.rs`,
+`benches/merkle_vs_plain_blake3`, `docs/merkle-r1cs-notes.md`) are gone.
+KEPT: `merkle_glue.rs` (production tower gates) and a trimmed
+`merkle_r1cs.rs` = `SLOT_WORDS` (the only production-reachable item, as the
+census said) + `MerkleTreeLayout::with_blake3_chunk_leaf` / `root_chunk` /
+`build_block_r1cs_stub` / `io_schema`, `HashSpec`/`blake3_spec`,
+`ChunkPathInput` — the geometry of the tower's `cfg(test)` differential
+Merkle gate and of `tests/merkle_glue.rs`. Measured by narrowing every `pub`
+to `pub(crate)` and iterating rustc's dead-code lint (3 passes). The
+direct-path seam (`prove_fast_ligerito_from_witness`, `ProveCore`,
+`prove_fast_core*`) is deliberately left although it now has zero callers:
+Ron deferred the CPU direct path until the GPU moves to multitable+AG-skip.
+The census text follows.** The "~6k lines" estimate splits into:
 - the shift protocol proper: `merkle_path.rs` 1,015 + `merkle_path_common.rs`
   574 + sha2.rs merkle section ~220 = **~1,809**, whose only entry points are
   four `Sha256HybridSetup::*_merkle_path*` methods called only from
@@ -268,7 +292,16 @@ GPU roundtrip alone.
 
 **Directed (Ron, 2026-08-27): consolidate the profile matrix — delete the
 grind-free `Fast` and `Slim` bases and keep the `*128` schedules as THE
-strict profiles.**
+strict profiles.** **EXECUTED 2026-08-27** (branch `bloat-phase2-profiles`):
+`Fast128`/`Slim128` renamed to `Fast`/`Slim`, the grind-free variants and
+their 28 TOMLs deleted (98 → 70 embedded configs); `gen_ligerito_configs`
+regenerates the renamed set byte-identically, so the derivation and the
+embedded files agree. Proof-IO v22. Re-pinned (two deterministic print runs
+each): `union_m6_fixtures` (6), `union_element` (7), `transcript_shape` (1).
+Tower pins hold — `Chain128` already ran on the `*128` twins. The CUDA
+host-only ladder replay (`make ligerito_f256_host`, m22 fast) matches the
+F256 driver on every proof field; the Blackwell GPU run needs the runner
+back. `Fast100`/`Slim100` unchanged (frozen historical schedules).
 
 *Premise correction (PR #37 review).* An earlier draft of this item said the
 `*128` twins "differ from their bases only in the per-level rate ladder".
@@ -432,19 +465,19 @@ alone: 23% clone-covered, ~2,970 of the recommended total.
 | # | Cluster | Dup lines | Consol. | Risk |
 | --- | --- | --- | --- | --- |
 | 1 | tower.rs Real/Child tape+region+node family (walkers share 76%, emitters 78%) | 2,488 | ~2,000 | **high** — transcript + byte pins; unify field-by-field, re-run pins |
-| 2 | LegacyPow payload-ordinal walkers ×4 (2 of 4 had the bug) | 40 | 40 | high value, mechanical: one `payload_ordinals()` iterator |
-| 3 | `GateType::witness()` 12-line body ×18 + `*256` twin gates | 420 | ~330 | low (witness) / medium (`*256` column order) |
-| 4 | tower native replicas (`sk_at_vks` ≡ `eval_sk_at_vks`, `frob_inv_native` ≡ jagged's) — export core fns instead | 700 | ~250 | low for replicas; do NOT merge the `check_*` validators (soundness backstop) |
+| 2 | LegacyPow payload-ordinal walkers ×4 (2 of 4 had the bug) | 40 | 40 | high value, mechanical: one `payload_ordinals()` iterator — **DONE 2026-08-29**: `TranscriptOp::carries_payload()` replaces the 5 inline `ObserveBytes|Pow|LegacyPow` patterns (child/real walkers, fold_region, query) |
+| 3 | `GateType::witness()` 12-line body ×18 + `*256` twin gates | 420 | ~330 | low (witness) / medium (`*256` column order) — **DONE 2026-08-29** (witness half): `SlotWitness::element_from_rows` replaces the 14 identical bodies; the `*256` twin gates are left as they are (column order is protocol) |
+| 4 | tower native replicas (`sk_at_vks` ≡ `eval_sk_at_vks`, `frob_inv_native` ≡ jagged's) — export core fns instead | 700 | ~250 | low for replicas; do NOT merge the `check_*` validators (soundness backstop) — **DONE 2026-08-29** for the replicas: `sk_at_vks` → `ligerito::eval_sk_at_vks`, `frob_inv_native` → `jagged::frob_inv` (now pub; `frob_inv_matches_127_squarings` pins the two derivations); the `check_*` validators untouched as recommended |
 | 5 | fold ↔ jagged-fold twin family ×5 | 251 | ~200 | high — transcript |
-| 6 | tower gates duplicated into test files (Blake3Gate, AssistLayerGate, MultGate; circuit_wiring↔kappa7 harness 219 exact) | 371 | ~150 | low — export as `pub(crate)` |
+| 6 | tower gates duplicated into test files (Blake3Gate, AssistLayerGate, MultGate; circuit_wiring↔kappa7 harness 219 exact) | 371 | ~150 | low — export as `pub(crate)` — **REJECTED 2026-08-29**: re-measured, the test copies of `Blake3Gate`/`AssistLayerGate` differ from the tower's (0.66/0.73 similarity, different unpack helpers) and the circuit_wiring↔kappa7 clone is 24 lines today, not 219; not worth exporting |
 | 7 | r1cs_hashes four-encoder family (Setup ctors byte-identical keccak↔keccak3; `accumulate_subkeccak` ≡ `fold_alpha_batched` 94 shared; keccak.rs:1234 re-implements the common driver) | 840 | ~640 | medium; leave the hot `bm_*`/`build_group_batch_major` loops |
-| 8 | **SplitMix64 RNG: 117 sites, 52 variant bodies, byte-identical groups mapped** | 2,072 | ~1,950 | low but byte-pinned — one `test_rng::Rng` (~45 lines); preserve per-site draw order verbatim (`f128()` order is load-bearing) |
+| 8 | **SplitMix64 RNG: 117 sites, 52 variant bodies, byte-identical groups mapped** | 2,072 | ~1,950 | low but byte-pinned — one `test_rng::Rng` (~45 lines); preserve per-site draw order verbatim (`f128()` order is load-bearing) — **DONE 2026-08-27** (`flock_core::test_rng::Rng`, 78 sites replaced; per-method equivalence classes verified before replacing; site-specific draws kept as local `RngExt` traits; 4 custom generators left alone: assist_blocked, virtual_b, jagged_fold, matrix_fold; all byte pins + tower tape pins held) |
 | 9 | Ligerito F256 transcript walk ×4 semantic copies (Rust prover/verifier + `.cuh` + host `.cpp`; `700cace` fixed 3, `ffabc07` the 4th) | ~1,500 sem. | ~180 | **maximum** — only unifiable artifact is a declarative op schedule + conformance vector; needs Blackwell CI |
-| 10 | bench boilerplate (keccak3 3-way ~90% clone-covered; native-chain pair has a 134-line exact clone) | 1,270 | ~1,270 | low |
+| 10 | bench boilerplate (keccak3 3-way ~90% clone-covered; native-chain pair has a 134-line exact clone) | 1,270 | ~1,270 | low — mostly RESOLVED by 2.1 (the keccak3 3-way and the native-chain pair were deleted) |
 | 11 | dump-bin frame | 270 | ~270 | byte-pinned draw order |
-| 12 | verifier/prover `_ag`/`_deferred`/`_timed`/`_jagged` twins | 425 | ~425 | `_timed` safe (timer sink); `_ag`/`_deferred` are protocol variants |
-| 13 | merkle_r1cs `*_chunk` twins | 180 | ~180 | follows Phase 2.2 |
-| 14 | merkle_glue gate-table boilerplate ×4 | 131 | ~130 | low — macro/blanket trait |
+| 12 | verifier/prover `_ag`/`_deferred`/`_timed`/`_jagged` twins | 425 | ~425 | `_timed` safe (timer sink); `_ag`/`_deferred` are protocol variants — `_timed` DONE (deleted with 2.1); `_ag`/`_deferred` stay (protocol variants) |
+| 13 | merkle_r1cs `*_chunk` twins | 180 | ~180 | follows Phase 2.2 — DONE 2026-08-27 (deleted with 2.2) |
+| 14 | merkle_glue gate-table boilerplate ×4 | 131 | ~130 | low — macro/blanket trait — **REJECTED 2026-08-29**: the shared shape is ~10 lines per table split between associated fns and methods; a macro would cost more than it saves |
 | 15 | ligerito.rs test roundtrip boilerplate | 883 | ~440 | low — `roundtrip_case` helper |
 
 Also mapped for the Phase 3 tower.rs module split: the full region map

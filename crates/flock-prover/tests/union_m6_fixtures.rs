@@ -1,4 +1,4 @@
-//! Byte-identity anchors for the MERGED transport — currently proof-IO v21.
+//! Byte-identity anchors for the MERGED transport — currently proof-IO v22.
 //! An optimization must produce byte-identical proofs; only a
 //! deliberate protocol change may move these digests, and it must re-pin
 //! them with a history entry below.
@@ -82,6 +82,12 @@
 //! and the nu10 full-utilization fixture move (their levels' bits differ);
 //! the three small nu10 shapes hold (adjacent bits equal). Roundtrip
 //! suites green; digests stable across two print runs.
+//! Re-pinned 2026-08-27: the profile consolidation (proof-IO v22, bloat
+//! ledger §C). The grind-free `Fast`/`Slim` were deleted and `Fast` now
+//! carries the former Fast128 schedule: aggressive +2/level ladder and
+//! 16-bit query PoW at every level. All six digests move (every level's
+//! rate, query count, cap and PoW change). Full workspace suite green;
+//! digests stable across two print runs.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
@@ -97,20 +103,7 @@ use sha2_hash::Digest as _;
 
 const DOMAIN: &[u8] = b"flock-m6-fixture-v0";
 
-/// SplitMix64 PRNG, deterministic.
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u32(&mut self) -> u32 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        (z ^ (z >> 31)) as u32
-    }
-}
+use flock_core::test_rng::Rng;
 
 fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
     (0..n)
@@ -193,27 +186,30 @@ fn merged_bundle_digest(
 #[test]
 // Default-run (~2 s for both anchors): these pins are what makes the
 // "fixture anchors byte-stable" claim enforceable in CI.
+// Re-pinned 2026-08-31: main's profile consolidation (proof-IO v22) merged
+// on top of the BLAKE3 default — both sides' pins were stale. Two
+// deterministic print runs agreed.
 fn m6_merged_union_proof_bytes_pinned() {
     const FIXTURES: [(&str, [usize; 2], &str); 4] = [
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "7d096201bbf5be642208917f69dca3fe17f4c5e54b485602c69c352b43c36b15",
+            "c3d7b17119826833b218d05b2684f1b2a9c1a99c91507861a6bdf61834408ff9",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "af270ab4b75dd0f3ab9402f7eb6dfce1cbae1bc6b54b2d242fac9f0a14462b59",
+            "0f15486ead29dbb3c27222522fa68dc4c24d240a688e2391dc0f4477ee4e0e8a",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "e8e9b412285c22bce8ab44e72e15f57c24ecb2f661c831d4fe1c643d4ab12db1",
+            "16773ba2aece640a77de8712a2c0004bd0f0acfee548a1ff6ec56c436047cb96",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "e6ece310adbf892432534ae568b299b4aad4d8671842eb541d1b6bce1db073e3",
+            "e0e6e9cdfc8dc7834b81bd3ad758630cc1a6e622835f3ec7c25ac81e66e1cb74",
         ),
     ];
 
@@ -289,7 +285,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "c30333ca15d9c4940c11e18ec22f46959e8ce8e0c362250e04bfebe26eb35a96";
+        const EXPECTED: &str = "ae19c381659e84562c829383f6b01137741b4e2ed29890daa555c332199d2f72";
         let n_blocks = 256usize;
         // The setup API IS the shipped single-slot union path since the
         // 2026-08-14 consolidation — the anchor pins it directly.
@@ -307,7 +303,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "9dbc2e5e4c8c6528d7c29c0b16d5d6b0e8a2041d98d2ef09fbe3aa98bdf1880c";
+        const EXPECTED: &str = "3bddd36713d2b607a662ff96ad2ef4ace93fd91f0014e7f7b2ab1f44c668338c";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

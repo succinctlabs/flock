@@ -755,11 +755,3 @@ pub(super) struct ElPiopRec {
     pub(super) alpha_ch: usize,
     pub(super) lc_rounds: Vec<(usize, usize, usize)>,
 }
-
-pub(super) fn frob_inv_native(x: F128) -> F128 {
-    let mut y = x;
-    for _ in 0..127 {
-        y = y * y;
-    }
-    y
-}

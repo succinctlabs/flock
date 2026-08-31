@@ -3,7 +3,7 @@
 //! Computes `H^T(x) = H(H(...H(x)...))` (T iterations) on a 32-byte input
 //! using the `blake3` crate. Reports hashes/sec.
 //!
-//! Mirrors [`keccak_native_chain`] exactly. Two scenarios:
+//! Two scenarios:
 //!
 //! 1. **Single chain (sequential)**: a hash chain has a strict data dependency
 //!    (output of step i is input of step i+1), so it can't be parallelized.
@@ -21,31 +21,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-    fn fill_bytes(&mut self, buf: &mut [u8]) {
-        let mut i = 0;
-        while i + 8 <= buf.len() {
-            buf[i..i + 8].copy_from_slice(&self.next_u64().to_le_bytes());
-            i += 8;
-        }
-        if i < buf.len() {
-            let v = self.next_u64().to_le_bytes();
-            let tail = buf.len() - i;
-            buf[i..].copy_from_slice(&v[..tail]);
-        }
-    }
-}
+use flock_core::test_rng::Rng;
 
 /// Compute H^T(x) where H = BLAKE3 (32-byte output) and `x` is a 32-byte input.
 /// The chain has a strict data dependency — no parallelism inside.

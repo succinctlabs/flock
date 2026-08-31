@@ -69,20 +69,29 @@ Batched commits; full suite + byte pins after each batch (the pins are what
 make pruning safe here — a deletion that changes behavior fails loudly).
 
 **Phase 2 — decommission decisions** (Ron's calls, then 1–2 sessions each):
+0. **Profile consolidation — EXECUTED 2026-08-27** (ledger §C): the
+   grind-free `Fast`/`Slim` are gone, `Fast128`/`Slim128` took their names,
+   `Fast100`/`Slim100` frozen; 98 → 70 embedded TOMLs; proof-IO v22.
 1. **keccak3** — retirement was declined 2026-08-15; does the reason hold?
+   **EXECUTED 2026-08-27** (Ron): keccak and keccak3 both retired.
 2. **Merkle-path shift product** — still a product, or a leftover now that
    the tower verifies Merkle in-circuit? Retiring ≈ 6k lines + removes a
-   padded-commit consumer.
+   padded-commit consumer. **EXECUTED 2026-08-27** (Ron): shift protocol +
+   monolithic Merkle block product retired; `merkle_glue` and the tower's
+   test-oracle layout kept (ledger §C 2.2).
 3. **Direct path / GPU** — the padded-commit direct path can't die while the
    GPU prover speaks it. Either port the GPU prover to the union transport
    (could fold into the Phase F CUDA-AG work as one "GPU catches up" effort)
    or keep direct GPU-only for an interim and delete its CPU-side non-GPU
-   consumers.
+   consumers. **Ron, 2026-08-27: wait — keep the CPU direct path until the
+   GPU is ported to multitable + AG-skip.**
 
 **Phase 3 — duplication consolidation** (careful, byte-pinned). Unify the
 Child/Real tape-walker pairs; split tower.rs into a module tree (mechanical,
-behavior-free); extract encoder commonalities; one shared test Rng. After
-the deletions, so the surface being refactored is already smaller.
+behavior-free — **DONE 2026-08-27, PR #38**); extract encoder commonalities;
+one shared test Rng (**DONE 2026-08-27**: `flock_core::test_rng::Rng`, 78
+sites, every byte pin held). After the deletions, so the surface being
+refactored is already smaller.
 
 **Phase 4 — RS removal.** Gated on Phase F kernels; Phases 0–3 turn it into
 executing a list (the ledger will have mapped every RS-only item).

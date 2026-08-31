@@ -205,24 +205,13 @@ fn square_transpose(elems: &mut [F128]) {
 mod tests {
     use super::*;
 
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-        fn nx(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        }
-        fn f128(&mut self) -> F128 {
-            F128 {
-                lo: self.nx(),
-                hi: self.nx(),
-            }
-        }
+    use crate::test_rng::Rng;
+
+    /// Site-specific draws kept verbatim from this file's former local `Rng`.
+    trait RngExt {
+        fn ta(&mut self) -> TensorAlgebra;
+    }
+    impl RngExt for Rng {
         fn ta(&mut self) -> TensorAlgebra {
             let elems = (0..DEGREE).map(|_| self.f128()).collect();
             TensorAlgebra { elems }
