@@ -2455,3 +2455,36 @@ Suites green (core 545, prover 124) + ignored roundtrips green with
 grinding on. Bench sanity: defaults print blake3/blake3 with no env;
 times in the machine's current paging-degraded band, hash config
 identical to prior runs.
+
+### Merge step 8: bloat-phase2/3 (8a36c91) + first branch-vs-main A/B — 2026-08-31
+
+Main moved 10 commits past b310f35; merged cleanly on top of the
+blake3 flip. Resolutions: the 28 retired `*_fast128`/`*_slim128`
+TOMLs deleted (main's rename — Fast/Slim now CARRY the 128 schedules,
+proof-IO v22; our `hash = "blake3"` line auto-merged into the
+surviving files), gf2_128 wide-NEON tests moved to the shared
+`test_rng::Rng` (`next_f128` → `f128`), 13 proof-byte pins
+regenerated (both sides stale: v22 × blake3 default; two agreeing
+deterministic print runs each). Suites green (core 557, prover
+green). merge-base == origin/main tip again.
+
+**Branch-vs-main paired A/B (m=32, grind-free, blake3/blake3 pinned
+via env on BOTH arms; mainline worktree carries two measurement-only
+patches: the FLOCK_NO_GRIND knob in grind_pow and the bench
+verify-skip).** Totals run (8 pairs, alternating): 5/8 branch, but
+the run split early-late (pairs 1–5 all branch −20..−140 ms, pairs
+6–8 all main +40..+83) with mediaanalysisd at 64% CPU and the battery
+fast-charging at 25–29% while DRAINING under load — both named
+hazards; unadjudicable. Phase-paired run (6 pairs, PCS_TRACE
+min-per-phase): commit 2/4 med +10 ms, zc+lincheck 4/2 med −7 ms
+(pair swings ±150 ms — foreign load), open 3/3 med 0, total 4/2 med
+−2 ms. **Verdict: no bucket certifies a difference; branch ≈ main
+end-to-end within today's noise.** Consistent with the liveness
+audit: the live survivors (blake3 hash8 leaf kernel, lincheck NEON
+rewrite, round1 E-core drain) are tens-of-ms items under a
+±50–150 ms floor; every big-ticket optimization (compact-K/cascade
+zc, streaming pipelined commit, stripe-C/AB-hoist, streamed witness
+builder) is present but DORMANT — no driver calls. Re-certify on a
+quiet, charged machine; the real move is the re-graft queue.
+Trace note: `bind statement` is ~815 ms on the first prove only
+(cached after) — cold totals ~2.4 s are not a regression signal.
