@@ -622,6 +622,28 @@ impl AdditiveNttF128 {
         self.interleaved_parallel_live_from_layer(data, num_ntts, num_ntts, start_layer, on_sub);
     }
 
+    /// [`Self::forward_transform_interleaved_live_from_layer`] with the
+    /// per-sub-group hook of
+    /// [`Self::forward_transform_interleaved_parallel_from_layer_with`].
+    /// Every hook range starts at a multiple of `num_ntts` and covers a
+    /// power-of-two count of whole positions (the deep pass splits by
+    /// position blocks), which is what the leaf pipeline's job alignment
+    /// relies on.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    pub fn forward_transform_interleaved_live_from_layer_with(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        live: usize,
+        start_layer: usize,
+        on_sub: Option<&(dyn Fn(usize, &[F128]) + Sync)>,
+    ) {
+        self.interleaved_parallel_live_from_layer(data, num_ntts, live, start_layer, on_sub);
+    }
+
     /// Parallel interleaved forward NTT over the first `live` lanes (dead
     /// lanes stay untouched — they must be zero, see
     /// [`Self::forward_transform_interleaved_live_from_layer`]), with the

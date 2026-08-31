@@ -443,6 +443,30 @@ fn commit_into_pipelined(
     params: &PcsParams,
     mut codeword: Vec<F128>,
 ) -> (Commitment, ProverData) {
+    let num_ntts = params.num_ntts();
+    let (tree, local_parent_levels) = leaf_pipeline_run(&mut codeword, params, |cw, on_sub| {
+        // Fill fused into the first top pass (from-message): the prep
+        // arm overlaps the ENTIRE encode+leaves window instead of a
+        // standalone replicate stage burning the overlap budget first —
+        // this, not E-core count, is where the challenge tree's commit
+        // wall comes from.
+        let ntt = AdditiveNttF128::standard(params.k_code());
+        ntt.forward_transform_interleaved_from_message_with(cw, z_packed, num_ntts, Some(on_sub));
+    });
+    finish_pipelined(codeword, tree, local_parent_levels, params)
+}
+
+/// Engine shared by the streaming commits: allocate the tree, spawn the
+/// utility-QoS leaf helpers and the bounded job queue, hand `run_ntt` the
+/// codeword and the `on_sub` publisher, then drain the tail. Returns the
+/// tree with its leaf level and per-job local parent subtrees written
+/// (finish with [`merkle::merkle_tree_from_prehashed_level`] via
+/// [`finish_pipelined`]).
+fn leaf_pipeline_run(
+    codeword: &mut Vec<F128>,
+    params: &PcsParams,
+    run_ntt: impl FnOnce(&mut [F128], &(dyn Fn(usize, &[F128]) + Sync)),
+) -> (Vec<Hash>, usize) {
     use crate::merkle;
     use std::sync::Mutex;
     use std::sync::mpsc::{TrySendError, sync_channel};
@@ -502,8 +526,8 @@ fn commit_into_pipelined(
         };
 
         // Two helpers = this host's E-core count (M1 Max); utility QoS steers
-        // them off the P-cores the transform (and the AB-prep join partner)
-        // occupy. Queue depth 2× helpers bounds the unhashed window.
+        // them off the P-cores the transform occupies. Queue depth 2× helpers
+        // bounds the unhashed window.
         const N_HELPERS: usize = 2;
         // Shallow queue: bounds the unhashed (cache-warm) window; a full
         // queue makes the publisher hash inline on the transform worker.
@@ -528,6 +552,10 @@ fn commit_into_pipelined(
             let on_sub = |start_elem: usize, sub: &[F128]| {
                 let base = start_elem / num_ntts;
                 let total = sub.len() / num_ntts;
+                debug_assert!(
+                    total < job_leaves || base.is_multiple_of(job_leaves),
+                    "sub-group leaf ranges must align to whole jobs"
+                );
                 let mut off = 0usize;
                 while off < total {
                     let len = job_leaves.min(total - off);
@@ -538,18 +566,7 @@ fn commit_into_pipelined(
                     off += len;
                 }
             };
-            // Fill fused into the first top pass (from-message): the prep
-            // arm overlaps the ENTIRE encode+leaves window instead of a
-            // standalone replicate stage burning the overlap budget first —
-            // this, not E-core count, is where the challenge tree's commit
-            // wall comes from.
-            let ntt = AdditiveNttF128::standard(params.k_code());
-            ntt.forward_transform_interleaved_from_message_with(
-                &mut codeword,
-                z_packed,
-                num_ntts,
-                Some(&on_sub),
-            );
+            run_ntt(codeword, &on_sub);
             drop(sender);
             // No more jobs can arrive; pull the queued tail onto the main
             // pool while already-claimed helper jobs complete concurrently.
@@ -570,14 +587,27 @@ fn commit_into_pipelined(
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
+    (tree, local_parent_levels)
+}
+
+/// Shared tail of the streaming commits: hash the Merkle levels above the
+/// jobs' local subtrees, take the cap, assemble.
+fn finish_pipelined(
+    codeword: Vec<F128>,
+    tree: Vec<Hash>,
+    local_parent_levels: usize,
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
+    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let n_leaves = params.n_leaves();
     let t_parents = std::time::Instant::now();
-    let merkle_tree = merkle::merkle_tree_from_prehashed_level(
+    let merkle_tree = crate::merkle::merkle_tree_from_prehashed_level(
         tree,
         n_leaves,
         params.merkle_hash,
         local_parent_levels,
     );
-    let cap = merkle::cap_layer(&merkle_tree, n_leaves, params.l0_cap_depth()).to_vec();
+    let cap = crate::merkle::cap_layer(&merkle_tree, n_leaves, params.l0_cap_depth()).to_vec();
     if timing {
         eprintln!(
             "[commit-timing] merkle top: {:.2} ms",
@@ -673,6 +703,20 @@ pub fn lane_grid_from_lane_major(q: &[F128], log_batch_size: usize) -> Vec<F128>
 /// message `extract[p·t + l] = q[l·D + p]`, but the transpose happens inside
 /// the codeword fill, so it costs no extra pass and no intermediate buffer.
 pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverData) {
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    if lane_leaf_pipeline_enabled(params) {
+        return commit_lane_major_pipelined(q, params);
+    }
+    let (codeword, live) = lane_major_scan_and_fill(q, params);
+    finalize_commit(codeword, live, params)
+}
+
+/// Shared stage 1 of the lane-major commits: validate, run the dead-lane
+/// scan, and transpose-fill the replicated codeword.
+fn lane_major_scan_and_fill(q: &[F128], params: &PcsParams) -> (Vec<F128>, usize) {
     params.validate();
     let lanes = 1usize << params.log_batch_size;
     let t = params.num_ntts();
@@ -707,7 +751,54 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
     let codeword_len = params.n_positions() * t;
     let mut codeword = crate::scratch::take_f128(codeword_len);
     replicate_lane_major_fill(&mut codeword, q, t, d);
-    finalize_commit(codeword, live, params)
+    (codeword, live)
+}
+
+/// Gate for the lane-major streaming commit: BLAKE3 leaves (the serial leaf
+/// hasher's fast path), a codeword big enough that the deep NTT pass is the
+/// wall (>= 64 MB), and a parallel pool for the utility-QoS helpers to ride
+/// beside. Unlike [`commit_leaf_pipeline_shape`] there is NO power-of-two
+/// lane requirement: the deep pass publishes whole-position blocks, so any
+/// integer lane count keeps leaf jobs aligned (see
+/// [`AdditiveNttF128::forward_transform_interleaved_live_from_layer_with`]).
+fn lane_leaf_pipeline_enabled(params: &PcsParams) -> bool {
+    params.merkle_hash == crate::merkle::HashKind::Blake3
+        && params.n_positions() * params.num_ntts() >= (1 << 22)
+        && rayon::current_num_threads() > 1
+}
+
+/// [`commit_lane_major`] with the leaf + local-subtree hashing fused into
+/// the NTT deep pass ([`leaf_pipeline_run`]) — deletes the finished
+/// codeword's DRAM round trip between encode and Merkle. The transpose fill
+/// stays a separate stage (it is write-saturated; fusing helpers beside it
+/// measured as a pure loss). Commitment and tree are bit-identical to the
+/// staged path.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+fn commit_lane_major_pipelined(q: &[F128], params: &PcsParams) -> (Commitment, ProverData) {
+    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let t_fill = std::time::Instant::now();
+    let (mut codeword, live) = lane_major_scan_and_fill(q, params);
+    if timing {
+        eprintln!(
+            "[commit-timing] lane fill: {:.2} ms",
+            t_fill.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let num_ntts = params.num_ntts();
+    let (tree, local_parent_levels) = leaf_pipeline_run(&mut codeword, params, |cw, on_sub| {
+        let ntt = AdditiveNttF128::standard(params.k_code());
+        ntt.forward_transform_interleaved_live_from_layer_with(
+            cw,
+            num_ntts,
+            live,
+            params.log_inv_rate,
+            Some(on_sub),
+        );
+    });
+    finish_pipelined(codeword, tree, local_parent_levels, params)
 }
 
 /// [`replicate_message_fill`] for a lane-major message: fill `codeword` with
@@ -1176,6 +1267,51 @@ mod tests {
                 );
                 assert_eq!(
                     pd_skip.merkle_tree, pd_ref.merkle_tree,
+                    "tree (m={m}, t={t}, c={c})"
+                );
+            }
+        }
+    }
+
+    /// The lane-major streaming commit (leaf pipeline fused into the NTT)
+    /// is byte-identical to the staged path — cap, codeword, and full tree —
+    /// at NON-power-of-two lane counts, live-lane skip engaged, under BLAKE3
+    /// (the pipeline's hash gate). Calls the pipelined fn directly (the size
+    /// gate never fires at test scale).
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    #[test]
+    fn commit_lane_major_pipelined_byte_identical() {
+        let mut rng = Rng::new(0x1A6E_51DE);
+        for (m, log_inv_rate, log_batch_size) in [(14, 2, 3), (16, 1, 4)] {
+            let full = 1usize << log_batch_size;
+            let log_dim = (m - LOG_PACKING) - log_batch_size;
+            let d = 1usize << log_dim;
+            for (t, c) in [(full - 1, full / 2), (full / 2 + 1, full / 2 + 1)] {
+                let params = PcsParams {
+                    m,
+                    log_inv_rate,
+                    log_batch_size,
+                    profile: Default::default(),
+                    num_lanes: Some(t),
+                    merkle_hash: crate::merkle::HashKind::Blake3,
+                };
+                let mut q = vec![F128::ZERO; 1usize << (m - LOG_PACKING)];
+                let content = rng.f128_vec(c * d);
+                q[..c * d].copy_from_slice(&content);
+
+                let (codeword, live) = lane_major_scan_and_fill(&q, &params);
+                let (c_ref, pd_ref) = finalize_commit(codeword, live, &params);
+                let (c_pipe, pd_pipe) = commit_lane_major_pipelined(&q, &params);
+                assert_eq!(c_pipe.cap, c_ref.cap, "cap (m={m}, t={t}, c={c})");
+                assert_eq!(
+                    pd_pipe.codeword, pd_ref.codeword,
+                    "codeword (m={m}, t={t}, c={c})"
+                );
+                assert_eq!(
+                    pd_pipe.merkle_tree, pd_ref.merkle_tree,
                     "tree (m={m}, t={t}, c={c})"
                 );
             }
