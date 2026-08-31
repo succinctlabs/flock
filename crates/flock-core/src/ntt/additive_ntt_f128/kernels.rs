@@ -7,9 +7,14 @@ use crate::field::F128;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use self::aarch64::{butterfly_block, butterfly_block_pair};
+use self::portable::butterfly_fused_3layer as butterfly_fused_3layer_portable;
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
 use self::portable::{
     butterfly_fused_2layer as butterfly_fused_2layer_portable,
-    butterfly_fused_3layer as butterfly_fused_3layer_portable,
     butterfly_fused_4layer_row as butterfly_fused_4layer_row_portable,
     butterfly_row_pair as butterfly_row_pair_portable,
 };

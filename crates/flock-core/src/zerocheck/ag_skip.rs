@@ -17,6 +17,7 @@
 //!     cryptographic primitive enters the soundness argument.
 
 use super::BlockCoverage;
+#[cfg(target_arch = "aarch64")]
 use super::PaddingSpec;
 use super::ZerocheckGrinding;
 use super::cleanse_block;
@@ -26,16 +27,22 @@ use super::univariate_skip::build_eq;
 use crate::genus95_curve_code::SAMPLE_ATTEMPT_BUDGET;
 use crate::genus95_curve_code::evaluation_point_from_nonce;
 use crate::genus95_curve_code::evaluation_point_from_nonce_pow;
+#[cfg(target_arch = "aarch64")]
 use crate::genus95_curve_code::round1::round1_slp_packed;
+#[cfg(target_arch = "aarch64")]
 use crate::genus95_curve_code::round1::round1_slp_packed_banks_fused;
+#[cfg(target_arch = "aarch64")]
 use crate::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded;
 use crate::merkle::HashKind;
+#[cfg(target_arch = "aarch64")]
 use crate::pcs::LOG_PACKING;
 use crate::scratch::give_f128;
 use crate::scratch::take_f128;
 use rayon::prelude::*;
+#[cfg(target_arch = "aarch64")]
 use std::env::var_os;
 use std::mem::swap;
+#[cfg(target_arch = "aarch64")]
 use std::time::Instant;
 
 use super::multilinear::{
@@ -1791,23 +1798,32 @@ pub fn verify_with_grinding<C: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_arch = "aarch64")]
     use crate::alloc_uninit_f128_vec;
+    #[cfg(target_arch = "aarch64")]
     use crate::challenger::FsChallenger;
     use crate::genus95_curve_code::BASE_MESSAGE_BITS;
     use crate::genus95_curve_code::BASE_Y_DEGREE;
     use crate::genus95_curve_code::PRODUCT_MESSAGE_BITS;
+    #[cfg(target_arch = "aarch64")]
     use crate::genus95_curve_code::SAMPLE_ATTEMPT_BUDGET;
+    #[cfg(target_arch = "aarch64")]
     use crate::genus95_curve_code::{
         BaseMessage, base_evaluation_functional, evaluate_base_functional,
     };
     use crate::genus95_curve_code::{RngCore, Sha256Rng, sample_random_evaluation_point};
     use crate::genus95_curve_code::{evaluation_point_from_nonce, evaluation_point_from_nonce_pow};
     use crate::lincheck::AG_LINCHECK_SKIP_POW_BITS;
+    #[cfg(target_arch = "aarch64")]
     use crate::pcs::pack::pack_witness;
+    #[cfg(target_arch = "aarch64")]
     use crate::pcs::ring_switch::{build_claim_weights_from_skip, claim_check, fold_1b_rows_naive};
     use crate::zerocheck::ZerocheckGrinding;
+    #[cfg(target_arch = "aarch64")]
     use crate::zerocheck::univariate_skip::SplitEqGhash;
+    #[cfg(target_arch = "aarch64")]
     use crate::zerocheck::univariate_skip::build_eq;
+    #[cfg(target_arch = "aarch64")]
     use crate::zerocheck::{PaddingRun, PaddingSpec};
     use flock_hash::HashKind;
 

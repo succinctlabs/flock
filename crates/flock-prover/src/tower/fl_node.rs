@@ -21,6 +21,7 @@ use flock_core::{
 use flock_field::PHI_8_TABLE;
 use flock_transcript::transcript_record::{RecordingChallenger, StreamWord, TranscriptOp as Op};
 use prover::prove_fast_ligerito_union_circuit;
+#[cfg(target_arch = "aarch64")]
 use prover::prove_fast_ligerito_union_circuit_ag;
 use std::any::Any;
 #[cfg(test)]

@@ -16,6 +16,7 @@ use flock_prover::init_perf_thread_pool;
 use std::hint::black_box;
 use std::time::Instant;
 
+#[cfg(target_arch = "aarch64")]
 use flock_prover::field::gf2_8::neon::gf8_mul_vec16;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use flock_prover::field::gf2_128::aarch64::{

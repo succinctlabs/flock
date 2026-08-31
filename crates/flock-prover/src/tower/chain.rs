@@ -3,6 +3,7 @@ use crate::r1cs_hashes::blake3::generate_witness_batch_major_partial;
 use crate::r1cs_hashes::blake3::{Compression, build_block_r1cs};
 use flock_hash::blake3_compress;
 use prover::prove_fast_ligerito_union_circuit;
+#[cfg(target_arch = "aarch64")]
 use prover::prove_fast_ligerito_union_circuit_ag;
 #[cfg(test)]
 use std::any::Any;

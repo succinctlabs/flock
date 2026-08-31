@@ -30,7 +30,9 @@ use std::env::var;
 use std::fs::read_dir;
 #[cfg(target_os = "linux")]
 use std::fs::read_to_string;
+#[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
 use std::str::from_utf8;
 use std::sync::OnceLock;
 use std::thread::available_parallelism;

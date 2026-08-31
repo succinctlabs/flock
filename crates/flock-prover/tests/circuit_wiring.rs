@@ -61,6 +61,7 @@ use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::pcs::ligerito::embedded_initial_k_or_default;
 use flock_core::product_gkr::{ProductGkrError, prove_batched, verify_batched_with_sigma};
 use flock_core::proof::R1csProofCircuitMerged;
+#[cfg(target_arch = "aarch64")]
 use flock_core::proof::R1csProofCircuitMergedAg;
 use flock_core::r1cs::BlockR1cs;
 use flock_prover::challenger::FsChallenger;
@@ -71,6 +72,7 @@ use flock_prover::schedule::{IoWord, Registry, TableType};
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier::{self, FlockVerifyError};
 use prover::prove_fast_ligerito_union_circuit;
+#[cfg(target_arch = "aarch64")]
 use prover::prove_fast_ligerito_union_circuit_ag;
 use sha2::SHA256_IV;
 use sha2::build_block_r1cs;
@@ -79,7 +81,9 @@ use sha2::sha256_compress;
 use std::array::from_fn;
 use std::sync::Arc;
 use verifier::verify_ligerito_union_circuit;
+#[cfg(target_arch = "aarch64")]
 use verifier::verify_ligerito_union_circuit_ag;
+#[cfg(target_arch = "aarch64")]
 use verifier::verify_ligerito_union_circuit_ag_deferred;
 use verifier::verify_ligerito_union_circuit_deferred;
 

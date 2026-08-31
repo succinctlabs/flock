@@ -35,6 +35,11 @@
 
 use crate::alloc_uninit_f128_vec;
 use crate::bits::lowest_one;
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
 use crate::field::f128_slice::fold_pairs;
 use crate::scratch::take_f128;
 use crate::zerocheck::PaddingRun;

@@ -1,6 +1,8 @@
-use super::portable::butterfly_fused_2layer;
 use super::portable::butterfly_fused_4layer;
-use super::portable::butterfly_row_pair;
+use super::portable::{
+    butterfly_fused_2layer as butterfly_fused_2layer_portable,
+    butterfly_row_pair as butterfly_row_pair_portable,
+};
 use core::arch::x86_64::*;
 
 use crate::field::F128;
@@ -23,7 +25,7 @@ pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twid
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, new_bot);
             i += 4;
         }
-        butterfly_row_pair(&mut top[i..], &mut bot[i..], twiddle);
+        butterfly_row_pair_portable(&mut top[i..], &mut bot[i..], twiddle);
     }
 }
 
@@ -73,7 +75,7 @@ pub(super) unsafe fn butterfly_fused_2layer(
             _mm512_storeu_si512(d.as_mut_ptr().add(i) as *mut __m512i, vd);
             i += 4;
         }
-        butterfly_fused_2layer(
+        butterfly_fused_2layer_portable(
             &mut a[i..],
             &mut b[i..],
             &mut c[i..],

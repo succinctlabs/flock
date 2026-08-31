@@ -41,12 +41,15 @@ use flock_core::lincheck::SkipPoint;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::BooleanPiopProof;
+#[cfg(target_arch = "aarch64")]
 use flock_core::proof::BooleanPiopProofAg;
 use flock_core::proof::R1csProofCircuitMerged;
+#[cfg(target_arch = "aarch64")]
 use flock_core::proof::R1csProofCircuitMergedAg;
 #[cfg(target_arch = "aarch64")]
 use flock_core::proof::R1csProofLigeritoAg;
 use flock_core::proof::R1csProofMergedLigerito;
+#[cfg(target_arch = "aarch64")]
 use flock_core::proof::R1csProofMergedLigeritoAg;
 use flock_core::proof::R1csProofMixedClassMerged;
 use flock_core::proof::UnionClassClaims;
@@ -60,6 +63,7 @@ use flock_core::union::SlotWitnessDest;
 use flock_core::union::UnionInstance;
 use flock_core::union::WitnessBufMode;
 use flock_core::zerocheck;
+#[cfg(target_arch = "aarch64")]
 use flock_core::zerocheck::ag_skip::AgProof;
 use flock_field::F128;
 use flock_transcript::challenger::Challenger;
@@ -67,6 +71,7 @@ use lincheck::LincheckCircuit;
 use lincheck::LincheckProof;
 use lincheck::SparseMatrixCircuit;
 use lincheck::UnionLincheckSlot;
+#[cfg(target_arch = "aarch64")]
 use lincheck::prove_padded_capture_z_vec;
 use lincheck::prove_padded_capture_z_vec_with_grinding;
 use lincheck::prove_union_capture_z_vec_with_grinding;
@@ -92,8 +97,11 @@ use std::sync::Arc;
 use std::time::Instant;
 use zerocheck::PaddingSpec;
 use zerocheck::ZerocheckProof;
+#[cfg(target_arch = "aarch64")]
 use zerocheck::ag_skip::K_SKIP;
+#[cfg(target_arch = "aarch64")]
 use zerocheck::ag_skip::prove_capture_s_hat_v_c;
+#[cfg(target_arch = "aarch64")]
 use zerocheck::ag_skip::prove_capture_s_hat_v_c_with_grinding;
 use zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding;
 

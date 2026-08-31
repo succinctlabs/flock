@@ -15,10 +15,13 @@ use flock_prover::zerocheck::{K_SKIP, ZerocheckError};
 use pcs::pack_witness;
 use std::sync::OnceLock;
 use verifier::verify_ligerito;
+#[cfg(target_arch = "aarch64")]
 use verifier::verify_ligerito_ag;
 
 use flock_core::test_rng::Rng;
+#[cfg(target_arch = "aarch64")]
 use flock_prover::field::F128;
+#[cfg(target_arch = "aarch64")]
 use flock_prover::prover::prove_ligerito_ag;
 
 fn identity(k: usize) -> SparseBinaryMatrix {

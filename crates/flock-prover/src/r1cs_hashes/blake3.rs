@@ -103,13 +103,16 @@ use super::common::drive_witness_batch_major_partial;
 use super::common::drive_witness_batch_major_partial_into;
 use super::common::drive_witness_packed_and_lincheck;
 use crate::prover::UnionSlotProverInput;
+#[cfg(target_arch = "aarch64")]
 use crate::prover::prove_fast_ligerito_ag_from_witness;
 use crate::prover::prove_fast_ligerito_union;
+#[cfg(target_arch = "aarch64")]
 use crate::prover::prove_fast_ligerito_union_ag;
 use crate::schedule::{Registry, TableType};
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::pcs::ligerito::embedded_initial_k_or_default;
+#[cfg(target_arch = "aarch64")]
 use flock_core::pcs::prefault_codeword_during;
 use flock_core::proof::R1csProofLigeritoAg;
 use flock_core::proof::R1csProofMergedLigerito;
