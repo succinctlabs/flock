@@ -8,6 +8,7 @@
 
 use flock_core::r1cs::BlockR1cs;
 use flock_core::schedule::{IoDirection, IoWord};
+use flock_hash::blake3_compress;
 use flock_prover::r1cs_hashes::blake3;
 use flock_prover::r1cs_hashes::merkle_glue::{
     BitSpreadInput, BitSpreadTable, PowMaskInput, PowMaskTable, SwapInput, SwapTable,
@@ -19,7 +20,7 @@ use flock_prover::r1cs_hashes::merkle_r1cs::{
 
 /// One compression's output chaining value.
 fn cv(h: &[u32; 8], m: &[u32; 16], flags: u32) -> [u32; SLOT_WORDS] {
-    let out = blake3::blake3_compress(h, m, NODE_COUNTER, NODE_BLOCK_LEN, flags);
+    let out = blake3_compress(h, m, NODE_COUNTER, NODE_BLOCK_LEN, flags);
     out[..SLOT_WORDS].try_into().unwrap()
 }
 

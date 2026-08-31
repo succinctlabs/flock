@@ -336,21 +336,6 @@ fn out_hi_bit(w: usize, b: usize) -> usize {
 // the `blake3` crate in tests.
 // ---------------------------------------------------------------------------
 
-/// BLAKE3 compression function. Returns the full 16-word output state
-/// (post-finalization XOR). For chaining, the new CV is `out[0..8]`.
-#[inline]
-pub fn blake3_compress(
-    cv: &[u32; 8],
-    block_words: &[u32; 16],
-    counter: u64,
-    block_len: u32,
-    flags: u32,
-) -> [u32; 16] {
-    // Canonical copy lives in flock-core (the sponge-chained challenger
-    // builds on the same primitive this table proves) — one implementation.
-    flock_core::hash::blake3_compress(cv, block_words, counter, block_len, flags)
-}
-
 /// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
 /// — i.e., `PERM^r [G_MSG_IDX[g]]`.
 fn per_round_msg_idx() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
@@ -2113,6 +2098,8 @@ pub fn generate_witness_batch_major_partial_into(
 
 #[cfg(test)]
 mod tests {
+    use flock_hash::blake3_compress;
+
     use super::*;
 
     /// The walker's constant-wire pin must equal the pin the R1CS itself

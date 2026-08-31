@@ -108,6 +108,7 @@
 //! public values.
 
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
+use flock_hash::blake3_compress;
 
 use super::blake3;
 use super::common::{empty_matrix, identity};
@@ -213,7 +214,7 @@ fn blake3_compress_cv(
     block_len: u32,
     flags: u32,
 ) -> [u32; SLOT_WORDS] {
-    let out = blake3::blake3_compress(cv, m, counter, block_len, flags);
+    let out = blake3_compress(cv, m, counter, block_len, flags);
     out[..SLOT_WORDS].try_into().expect("SLOT_WORDS ≤ 16")
 }
 

@@ -36,7 +36,7 @@ use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-use flock_prover::hash::HashKind;
+use flock_hash::HashKind;
 use flock_prover::pcs::{PcsParams, commit, pack_witness};
 
 use flock_core::test_rng::Rng;

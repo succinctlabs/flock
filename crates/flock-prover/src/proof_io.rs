@@ -344,8 +344,9 @@ impl std::error::Error for BundleReadError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r1cs_hashes::blake3::{Blake3Setup, Compression, blake3_compress};
+    use crate::r1cs_hashes::blake3::{Blake3Setup, Compression};
     use flock_core::challenger::FsChallenger;
+    use flock_hash::blake3_compress;
 
     use flock_core::test_rng::Rng;
 

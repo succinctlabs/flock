@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use flock_core::challenger::{Challenger, FsChallenger};
 use flock_core::field::F128;
-use flock_core::hash::HashKind;
+use flock_hash::HashKind;
 use sha2::{Digest, Sha256};
 
 const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];

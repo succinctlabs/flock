@@ -28,6 +28,7 @@ use crate::field::{F128, F256Unreduced, mul_by_x};
 use crate::genus95_curve_code::{
     EvaluationPoint, base_evaluation_functional, product_evaluation_functional,
 };
+
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1794,6 +1795,7 @@ pub fn verify_with_grinding<C: Challenger>(
 mod tests {
     use super::*;
     use crate::genus95_curve_code::{RngCore, Sha256Rng, sample_random_evaluation_point};
+    use flock_hash::HashKind;
 
     /// The pinned friendly challenges reproduce the geometric eq weight
     /// `eq(r_inner, b) = γ^{int(b)} / D` for every inner index `b ∈ [0, 128)`.
@@ -2206,7 +2208,6 @@ mod tests {
     #[test]
     fn prove_verify_roundtrip_blake3_fs() {
         use crate::challenger::FsChallenger;
-        use crate::hash::HashKind;
         let m = 14usize;
         let (a, b, c) = random_witness(m, 91);
         let mk = |kind| FsChallenger::with_hash(b"flock-ag-skip-b3", kind);
@@ -2490,7 +2491,6 @@ mod tests {
         use crate::genus95_curve_code::{
             evaluation_point_from_nonce, evaluation_point_from_nonce_pow,
         };
-        use crate::hash::HashKind;
         let seed = [5u8; 32];
         let n = (0..20_000u32)
             .find(|&n| evaluation_point_from_nonce(&seed, n, HashKind::Sha256).is_some())
@@ -2582,11 +2582,7 @@ mod tests {
         let seed = [3u8; 32];
         let pt = (0..u32::MAX)
             .find_map(|n| {
-                crate::genus95_curve_code::evaluation_point_from_nonce(
-                    &seed,
-                    n,
-                    crate::hash::HashKind::Sha256,
-                )
+                crate::genus95_curve_code::evaluation_point_from_nonce(&seed, n, HashKind::Sha256)
             })
             .expect("a decodable nonce exists");
         let w: Vec<F128> = base_evaluation_functional(&pt)

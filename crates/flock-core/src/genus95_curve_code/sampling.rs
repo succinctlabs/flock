@@ -5,6 +5,7 @@ use super::field::{F128, F128Ext};
 #[cfg(test)]
 use super::tables::RationalMask;
 use super::tables::TABLES;
+use flock_hash::HashKind;
 use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 
@@ -32,16 +33,16 @@ pub fn sample_random_evaluation_point(
 
 /// The per-nonce DRBG seed `H(seed ‖ LE32(nonce))`, where `H` follows the
 /// transcript hash `kind`. Shared by the plain and PoW-fused nonce attempts.
-fn nonce_seed(seed: &[u8; 32], nonce: u32, kind: crate::hash::HashKind) -> [u8; 32] {
+fn nonce_seed(seed: &[u8; 32], nonce: u32, kind: HashKind) -> [u8; 32] {
     let mut nonce_seed = [0u8; 32];
     match kind {
-        crate::hash::HashKind::Sha256 => {
+        HashKind::Sha256 => {
             let mut h = Sha256::new();
             h.update(seed);
             h.update(nonce.to_le_bytes());
             nonce_seed.copy_from_slice(&h.finalize());
         }
-        crate::hash::HashKind::Blake3 => {
+        HashKind::Blake3 => {
             let mut h = blake3::Hasher::new();
             h.update(seed);
             h.update(&nonce.to_le_bytes());
@@ -60,7 +61,7 @@ fn nonce_seed(seed: &[u8; 32], nonce: u32, kind: crate::hash::HashKind) -> [u8; 
 pub fn evaluation_point_from_nonce(
     seed: &[u8; 32],
     nonce: u32,
-    kind: crate::hash::HashKind,
+    kind: HashKind,
 ) -> Option<EvaluationPoint> {
     try_evaluation_point(&mut super::rng::FsRng::new(
         kind,
@@ -92,7 +93,7 @@ pub fn evaluation_point_from_nonce(
 pub fn evaluation_point_from_nonce_pow(
     seed: &[u8; 32],
     nonce: u32,
-    kind: crate::hash::HashKind,
+    kind: HashKind,
     pow_bits: u32,
 ) -> Option<EvaluationPoint> {
     debug_assert!(pow_bits <= 64);

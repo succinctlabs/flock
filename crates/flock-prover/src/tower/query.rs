@@ -2,6 +2,9 @@ use super::*;
 use flock_core::lincheck::build_eq_table;
 use flock_core::transcript_record::TranscriptOp as Op;
 
+#[cfg(test)]
+use flock_hash::blake3_compress;
+
 /// Emit the whole QUERY PHASE — every level's Merkle openings against the
 /// absorbed caps, plus the leaf-eval accumulators — as circuit rows.
 ///
@@ -862,7 +865,7 @@ pub(super) fn fused_pow_masks_match_raw_compression() {
                 let message: [u32; 16] = std::array::from_fn(|i| {
                     u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap())
                 });
-                let out = blake3::blake3_compress(
+                let out = blake3_compress(
                     &cv,
                     &message,
                     flock_core::challenger::pow_squeeze_counter(bits, pending_len + 16),
@@ -927,7 +930,7 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
         let message: [u32; 16] = std::array::from_fn(|i| {
             u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap())
         });
-        blake3::blake3_compress(
+        blake3_compress(
             &cv,
             &message,
             flock_core::challenger::pow_squeeze_counter(bits, 16),

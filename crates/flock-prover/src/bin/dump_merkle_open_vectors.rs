@@ -21,7 +21,7 @@ use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-use flock_prover::hash::HashKind;
+use flock_hash::HashKind;
 use flock_prover::merkle::merkle_tree;
 
 // The multi-proof left the live protocol (cap layers replaced it); the CUDA

@@ -96,6 +96,7 @@ fn b3_round(state: &mut [u32; 16], block: &[u32; 16]) {
 
 /// BLAKE3 compression. Returns the full 16-word output state
 /// (post-finalization XOR); the chaining CV is `out[0..8]`.
+#[inline]
 pub fn blake3_compress(
     cv: &[u32; 8],
     block_words: &[u32; 16],

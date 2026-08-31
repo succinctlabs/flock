@@ -18,7 +18,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flock_prover::r1cs_hashes::blake3::blake3_compress;
+use flock_hash::blake3_compress;
 use flock_prover::r1cs_hashes::sha2::sha256_compress;
 
 /// Warm up ~0.2 s, then run `f` for ~`secs` and report ops/sec + ns/op.

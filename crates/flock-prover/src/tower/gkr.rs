@@ -1,9 +1,9 @@
 use super::*;
-use crate::r1cs_hashes::blake3 as b3m;
 use flock_core::circuit::CellSlot;
 use flock_core::field::PHI_8_TABLE;
 use flock_core::zerocheck::K_SKIP;
 use flock_core::zerocheck::univariate_skip::build_eq;
+use flock_hash::blake3_compress;
 
 /// One wiring-GKR layer, located on the tape (the assembly's wire map).
 pub(super) struct GkrLayerRec {
@@ -413,13 +413,13 @@ pub(super) fn emit_ag_point_binding(
     block36[32..36].copy_from_slice(&nonce_n.to_le_bytes());
     let words36: [u32; 16] =
         std::array::from_fn(|i| u32::from_le_bytes(block36[4 * i..4 * i + 4].try_into().unwrap()));
-    let ns16 = b3m::blake3_compress(&IV, &words36, 0, 36, flags);
+    let ns16 = blake3_compress(&IV, &words36, 0, 36, flags);
     let ns_bytes: [u8; 32] = std::array::from_fn(|i| (ns16[i / 4] >> (8 * (i % 4))) as u8);
     let mut block32 = [0u8; 64];
     block32[..32].copy_from_slice(&ns_bytes);
     let words32: [u32; 16] =
         std::array::from_fn(|i| u32::from_le_bytes(block32[4 * i..4 * i + 4].try_into().unwrap()));
-    let xof16 = b3m::blake3_compress(&IV, &words32, 0, 32, flags);
+    let xof16 = blake3_compress(&IV, &words32, 0, 32, flags);
     let x_native = F128::new(
         u64::from(xof16[0]) | (u64::from(xof16[1]) << 32),
         u64::from(xof16[2]) | (u64::from(xof16[3]) << 32),

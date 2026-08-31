@@ -5,6 +5,7 @@
 //! genus-95 tests — keeps the only cryptographic assumption SHA-256 (no separate
 //! stream-cipher RNG).
 
+use flock_hash::HashKind;
 use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 
@@ -122,10 +123,10 @@ pub enum FsRng {
 }
 
 impl FsRng {
-    pub fn new(kind: crate::hash::HashKind, seed: [u8; 32]) -> Self {
+    pub fn new(kind: HashKind, seed: [u8; 32]) -> Self {
         match kind {
-            crate::hash::HashKind::Sha256 => FsRng::Sha256(Sha256Rng::new(seed)),
-            crate::hash::HashKind::Blake3 => FsRng::Blake3(Blake3Rng::new(seed)),
+            HashKind::Sha256 => FsRng::Sha256(Sha256Rng::new(seed)),
+            HashKind::Blake3 => FsRng::Blake3(Blake3Rng::new(seed)),
         }
     }
 }

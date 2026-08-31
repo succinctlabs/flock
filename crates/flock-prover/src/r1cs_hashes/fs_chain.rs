@@ -22,8 +22,9 @@
 use flock_core::challenger::pow_squeeze_counter;
 use flock_core::field::F128;
 use flock_core::transcript_record::{Stream, TranscriptOp};
+use flock_hash::blake3_compress;
 
-use super::blake3::{Compression, blake3_compress};
+use super::blake3::Compression;
 
 /// One forked child chain: its own trace plus the four cross-chain links
 /// that connect it to its parent. The child is an INDEPENDENT chain (own

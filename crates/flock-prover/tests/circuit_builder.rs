@@ -22,9 +22,9 @@
 
 use flock_core::circuit::builder::{CircuitBuilder, GateType, SlotWitness, Wire};
 use flock_core::field::F128;
-use flock_core::hash::HashKind;
 use flock_core::pcs::PcsParams;
 use flock_core::pcs::ligerito::LigeritoProfile;
+use flock_hash::{HashKind, blake3_compress};
 use flock_prover::challenger::FsChallenger;
 use flock_prover::prover::{self, UnionSlotProverInput};
 use flock_prover::r1cs_hashes::blake3;
@@ -114,7 +114,7 @@ impl GateType for Blake3Gate {
             }
             let (counter, block_len, flags) = unpack_params(inputs[6]);
 
-            let out = blake3::blake3_compress(&cv, &m, counter, block_len, flags);
+            let out = blake3_compress(&cv, &m, counter, block_len, flags);
             let out_lo: [u32; 8] = out[0..8].try_into().unwrap();
             let out_hi: [u32; 8] = out[8..16].try_into().unwrap();
             let (lo, hi) = (pack8(&out_lo), pack8(&out_hi));
@@ -199,7 +199,7 @@ fn blake3_chunk_chain_through_the_builder() {
             flags |= CHUNK_END;
         }
         assert_eq!(rows[i], (want_cv, *m, 0u64, 64u32, flags), "row {i}");
-        let out = blake3::blake3_compress(&want_cv, m, 0, 64, flags);
+        let out = blake3_compress(&want_cv, m, 0, 64, flags);
         want_cv = out[0..8].try_into().unwrap();
     }
     // ...and the published result is that chunk's chaining value.

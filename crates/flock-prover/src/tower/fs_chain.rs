@@ -1,6 +1,7 @@
 use super::*;
 use crate::r1cs_hashes::fs_chain::{CvSource, Link, trace_duplex_forked};
 use flock_core::transcript_record::{StreamWord, TranscriptOp as Op};
+use flock_hash::blake3_compress;
 
 /// A shared-constant public: one public input PER DISTINCT VALUE, wired to
 /// every use through copy constraints — the `zw`/`ow` pattern generalized.
@@ -482,7 +483,7 @@ pub(super) fn merge_chain(
             panic!("cross-link word {wi} is not an observed value");
         };
         let (cv, m, counter, blen, flags) = rows[row];
-        let out = crate::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
+        let out = blake3_compress(&cv, &m, counter, blen, flags);
         let mut b = [0u8; 16];
         for (i, w) in out[..4].iter().enumerate() {
             b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -558,7 +559,7 @@ pub(super) fn assert_chain_replays(
         for j in 0..n {
             let (row, word) = trace.squeeze_words[fin][j];
             let (cv, m, counter, blen, flags) = trace.rows[row];
-            let out = crate::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
+            let out = blake3_compress(&cv, &m, counter, blen, flags);
             let mut b = [0u8; 16];
             for (i, w) in out[word * 4..word * 4 + 4].iter().enumerate() {
                 b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());

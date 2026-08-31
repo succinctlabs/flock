@@ -19,9 +19,9 @@ use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
+use flock_hash::HashKind;
 use flock_prover::challenger::{Challenger, FsChallenger};
 use flock_prover::field::F128;
-use flock_prover::hash::HashKind;
 use flock_prover::lincheck::build_eq_table;
 use flock_prover::ntt::AdditiveNttF128;
 use flock_prover::pcs::ligerito::{

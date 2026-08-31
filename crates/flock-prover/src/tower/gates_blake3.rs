@@ -1,3 +1,5 @@
+use flock_hash::blake3_compress;
+
 use super::*;
 
 pub(super) const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
@@ -119,7 +121,7 @@ impl GateType for Blake3Gate {
             m[4 * i..4 * i + 4].copy_from_slice(&unpack4(inputs[2 + i]));
         }
         let (counter, block_len, flags) = unpack_params(inputs[6]);
-        let out = blake3::blake3_compress(&cv, &m, counter, block_len, flags);
+        let out = blake3_compress(&cv, &m, counter, block_len, flags);
         let lo = pack8(&out[0..8].try_into().unwrap());
         let hi = pack8(&out[8..16].try_into().unwrap());
         outputs.extend_from_slice(&[lo[0], lo[1], hi[0], hi[1]]);

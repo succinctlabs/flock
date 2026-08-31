@@ -14,6 +14,7 @@ unsound-challenger = ["flock-core/unsound-challenger"]
 
 [dependencies]
 flock-core = { path = "../flock-core" }
+flock-hash = {workspace = true}
 flock-multilinear = { path = "../flock-multilinear" }
 rayon = { workspace = true }
 sha2 = { workspace = true }

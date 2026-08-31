@@ -22,8 +22,7 @@ mul-count = ["flock-field/mul-count"]
 
 # Compile the insecure `RandomChallenger` (no Fiat-Shamir binding) into a
 # non-test build. Off by default so real proofs *cannot* reference it — see
-# `src/challenger.rs`. The crate's own `#[cfg(test)]` code gets it for free;
-# this feature only exists for bench/example isolation (flock-prover enables
+# `src/challenger.rs`. This feature only exists for bench/example isolation (flock-prover enables
 # it dev-only). NEVER enable it for a build that produces real proofs.
 unsound-challenger = ["flock-transcript/unsound-challenger"]
 
@@ -31,6 +30,7 @@ unsound-challenger = ["flock-transcript/unsound-challenger"]
 flock-field = { workspace = true }
 flock-merkle = { workspace = true }
 flock-transcript = { workspace = true }
+flock-hash = { workspace = true }
 flock-multilinear = { path = "../flock-multilinear" }
 rayon = { workspace = true }
 sha2 = { workspace = true }

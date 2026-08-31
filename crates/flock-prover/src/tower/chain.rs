@@ -1,3 +1,5 @@
+use flock_hash::blake3_compress;
+
 use super::*;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -240,7 +242,7 @@ pub(super) const CHAIN_FLAGS: u32 = CHUNK_START | CHUNK_END | ROOT;
 pub(super) fn native_chain(h_start: &[u32; 16], n_blocks: usize) -> [u32; 16] {
     let mut h = *h_start;
     for _ in 0..n_blocks {
-        h = blake3::blake3_compress(&IV, &h, 0, 64, CHAIN_FLAGS);
+        h = blake3_compress(&IV, &h, 0, 64, CHAIN_FLAGS);
     }
     h
 }
