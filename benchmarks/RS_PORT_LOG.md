@@ -2543,3 +2543,27 @@ Suites: core 560 (3 new oracle tests), prover 76, all 13 proof pins
 UNCHANGED — transcript identity of every route, enforced. Takeaway
 for the queue: today's zc cost is round1 URM ~120 ms — stripe-C/
 AB-hoist (item #3) is the zc money now, not round 2/tail.
+
+### Re-graft #3 attempt: round-1 AB hoist onto the union commit — NULL, reverted — 2026-08-31
+
+Wired the certified 2026-08-27 join (prep beside commit on the
+all-core pool; `Round1AbPre` threaded through
+`prove_packed_padded_capture_s_hat_v_c_with_grinding`) onto the union
+driver. Mechanism buckets moved exactly as designed — round1 URM
+120 → 53–56 ms (6/6, −61 median), zc+lincheck −60 (6/6) — but the
+commit wall paid +52 (0/6): **net total 5/6 at only −3..−11 ms, a
+wash.** Second variant split `commit_lane_major` into fill/finalize
+and joined the prep beside NTT+Merkle only (the fill is the
+streamed-prep null's write-saturated phase): the fill ran clean
+(82 → 24 ms) but the NTT absorbed the same contention (90 → 150–160)
+— identical wall.
+
+The arithmetic says why, and it generalizes: the prep is ~480
+thread-ms; the union commit window is ALREADY all-core dense (the
+deep NTT pass recruits the E-cores itself, unlike the 2026-08-27
+tree), so overlap is zero-sum — wall grows by work/threads ≈ 48 ms
+for the 60 the zerocheck saves. There is no idle-slack window in this
+prover for challenge-independent prep to hide in; a future hoist only
+pays off if some phase leaves cores (not bandwidth) idle. Reverted
+per the measured-revert rule; suites stayed green throughout and the
+transcript never moved (prep is bit-identical by construction).
