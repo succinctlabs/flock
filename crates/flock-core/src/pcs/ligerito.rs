@@ -3059,15 +3059,23 @@ pub fn ligero_commit(
 
     // LSB-lane layout: input matches the SoA layout `data[pos * num_interleaved + lane]`
     // directly. The first `log_inv_rate` NTT layers on the zero-padded
-    // coefficients are pure copies, so fill the matrix with 2^log_inv_rate
-    // replicas of `poly` (same write cost as copy + zero-fill) and start the
-    // transform past those layers — see `pcs::commit::replicate_message_fill`.
+    // coefficients are pure copies, so the encode starts past those layers
+    // with `poly` replicated `2^log_inv_rate` times.
+    //
+    // Fill fusion (`from_message`, which sources the first pass's rows from
+    // `poly` and skips the replicate write) was tried here and measured
+    // SLOWER — see the 2026-08-31 log entry. These levels run at rate 1/8
+    // .. 1/2048, where the replicate is a cheap 1->2^r broadcast, unlike the
+    // rate-1/2 L0 shape the fused pass is tuned for.
     let codeword_len = block_len * num_interleaved;
     let mut mat = crate::scratch::take_f128(codeword_len);
-    super::commit::replicate_message_fill(&mut mat, poly);
 
     // RS-encode every lane in one call (each lane is one independent NTT).
+    let lig_timing = std::env::var_os("FLOCK_LIG_TIMING").is_some();
+    let t_enc = std::time::Instant::now();
+    super::commit::replicate_message_fill(&mut mat, poly);
     ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+    let t_enc = t_enc.elapsed();
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
@@ -3078,7 +3086,16 @@ pub fn ligero_commit(
         )
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
+    let t_mk = std::time::Instant::now();
     let tree = merkle::merkle_tree(data_bytes, block_len, kind);
+    if lig_timing {
+        eprintln!(
+            "[lig-timing] ligero_commit log_cols={log_msg_cols} lanes={num_interleaved} rate=1/{}: encode {:.2} ms + merkle {:.2} ms",
+            1usize << log_inv_rate,
+            t_enc.as_secs_f64() * 1e3,
+            t_mk.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     LigeroWitness {
         mat,

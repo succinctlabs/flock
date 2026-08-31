@@ -2853,3 +2853,56 @@ F128 = 32 KiB, L1-resident). A 16-bit-index table halves the gathers
 but needs 4 MiB, moving the working set to shared L2 — a real
 tradeoff, not an obvious win, and worth at most ~15 ms of a 42 ms
 phase that is ~5% of the prove.
+
+### Tex/memory sweep for portable ideas; recursive-commit fill fusion NULL — 2026-08-31
+
+Swept `docs/zerocheck-optimizations.tex` (21 documented wins) and the
+campaign memory against the current tree. Status of every entry:
+
+LIVE ALREADY: §blake3neon (merkle +41% GB/s), §lcfold (lincheck fold
+−32%), §pmull/§twolane/§zeroskip (round-1 kernel work, in the aarch64
+kernels main took), round-1 E-core hetero drain.
+
+DEAD BY PROTOCOL CHANGE (verified earlier today): §directopen +
+§directopenrefine (f256 split replaced the basis open), §stripe
+(batch-major), §composedfold / §inducetrunc / §lazyood / §boundaryjoin
+/ §blockedtranspose (all target the old open's basis-combine and
+sparse-prefix induce machinery — `sparse_prefix` no longer exists, and
+`ood_samples` dropped 5 → 1, shrinking §lazyood's prize 5×).
+§streamwit is moot (union witgen ≈ 0 ms). §compactk/§cascade landed but
+sparse wins on RS and AG already has the hybrid. §streamcommit parked.
+
+**§recursivefill: the one entry with a live target — TRIED, NULL,
+REVERTED.** `ligero_commit` (ligerito.rs:3045) still does
+`replicate_message_fill` + `from_layer`, and our dormant
+`from_message` machinery survives, so the swap is two lines and
+byte-identical (all 13 proof pins held). Measured:
+
+- open bucket A/B, 8 pairs: candidate won 2/8, **median +3.9 ms**
+  (commit, an unaffected control phase, drifted +1.7 — so the real
+  differential is ≈ +2 ms, i.e. slower).
+- New `[lig-timing]` per-level line (kept) gives the mechanism
+  directly — encode ms, candidate vs control:
+
+| level (log_cols / rate) | from_message | replicate+from_layer |
+|---|---|---|
+| 16, 1/8 | 17.79 / 18.12 | **16.00 / 14.96** |
+| 13, 1/32 | 7.10 / 6.95 | **6.63 / 6.61** |
+| 10, 1/128 | 3.22 / 3.85 | 3.83 / 2.88 |
+| 7, 1/512 | 1.36 | **1.29** |
+| 4, 1/2048 | 0.58 | **0.39** |
+
+Cause: **the recursive levels run at rate 1/8 … 1/2048**, not the
+rate-1/2 L0 shape the fused pass is built for. At `reps ≥ 8` the
+replicate is a cheap 1→2^r broadcast and the fused first pass re-reads
+`poly` per replica instead; the tex's −1.5 ms was measured on the OLD
+open's recursive geometry, which the f256 split changed. Third
+confirmation today of the same law: **deleting memory traffic is not a
+speedup unless the traffic was on the critical path.**
+
+USEFUL BYPRODUCT — the open's internals are now visible for the first
+time. At m=32 the recursive commits cost ≈ 30 ms encode + 21 ms merkle
+≈ **51 ms of the 264 ms open**, with the first recursive level
+(log_cols=16) alone ≈ 27 ms. So ~150 ms of the open's "inner ligerito"
+is NOT commits — it is the recursive sumcheck/query/induce work, and
+that is the largest unexamined block in the prover.
