@@ -2633,3 +2633,61 @@ the constant and the doc disagree; at 8/8 for sparse on round 2 the
 constant is right for round 2 and wrong for the tail. Re-graft #1's
 verdict (sparse keeps the bench) stands on the measurement, but its
 stated cause was wrong.
+
+### Zerocheck structural audit vs the challenge tree (Yukon) — 2026-08-31
+
+Consulted the Yukon benchmark `eigenlabs/flock-challenge` (public notes
++ the local checkout at /Users/buenz/flock-snark-fast-mac, which IS the
+challenge tree) to settle what of its zerocheck can still transfer.
+
+**Top-level: not the same statement.** Their m32_fast.toml is
+`field = "f128"`, analysis `johnson_ood_row_union_over_bchks25...`,
+queries 218, fold_grinding 19. Ours is `f256`, `f256_split_johnson_
+two_point_ood_query128_c3_...`, queries 244, claim-batch grinding.
+Their zerocheck has ZERO grinding, ZERO sparsity, ZERO union, and a
+Metal GPU commit (gpu_commit.rs, epool.rs). Scores are not comparable.
+
+STRUCTURALLY NON-TRANSFERABLE (with their own code as evidence):
+- **Everything paid for by GPU idleness.** Their AB precompute IS the
+  commit window's binding arm (58.2 ms arm ≈ 58.3 ms window, GPU graph
+  done 41–53 ms, 0.00 ms host wait). Their NT stores are justified
+  verbatim by "the streamed GPU commit is saturating the same memory
+  system"; the compact store "pays as contention relief on the commit
+  arm"; their hetero P+E AB drain records itself as measured DEAD in
+  the GPU-bound regime — which is ours. Matches our 0f1b5e6 null.
+- **GPU-native**: round-1 C-fold GPU prefix, ZC-window GPU idle fill,
+  and `stage_commit_tail_fill` (forked challenger starts work before
+  the transcript confirms it, byte-inert on mismatch). CPU-only rules.
+- **Shape/machine hardcodes**: the whole cascade family is gated
+  `(m == 32 || cfg!(test))` (their zerocheck.rs:783); the fastest
+  round-1 arm additionally requires k_log=14, useful=15_409,
+  n_chunks=2^19, main_threads==10, helper_threads==4.
+- **Their C fold4/fold8 tensor** feeds the direct fold4 open; our f256
+  split opening has no such consumer.
+- NOT a blocker: grinding. Our per-round zerocheck PoW is 2 bits
+  (`multilinear_round_bits` = bits_for(2)); compact-K + cascade landed
+  transcript-identical under it (9c119e5).
+
+**STRIPE-C: attempted, REVERTED — blocked by BATCH-MAJOR layout.**
+Agent tracing showed stripe-C was lost in the PR #26 merge (wired at
+7b2287b, gone at 8567563) and is complete + bit-identity-tested, so it
+looked like a free re-graft: C is the whole per-window bit transpose
+plus 32 of the drain's 48 gathers per lane (docs/zerocheck-
+optimizations.tex:311), previously −5.7% on round 1, 8/8. Wired it on
+the union path (single boolean slot, `c` aliases `z`, length-checked)
+— `prove_verify_ligerito_all_profiles` failed with
+`Zerocheck(SumcheckFinalFailed)`. Cause: the union commits BATCH-MAJOR
+(`blake3.rs:1621`, `union.rs:1140`, `schedule.rs:903`) while the
+stripe fold assumes the ROW-MAJOR stripe↔witness index relation — the
+challenge tree gates the same mechanism on `layout == RowMajor` for
+exactly this reason. The two padding models also disagree (union: whole
+dead chunk-COLUMNS; type: dead row prefix per 2^14 block). Adapting it
+means deriving a batch-major stripe fold, not porting one. Reverted;
+suites green.
+
+CORRECTED OCCUPANCY: the union boolean region at m=32 is **71.875%**
+useful (useful_bits = 11_707, k_log = 14, nu = 18 ⇒ useful_cols =
+ceil(11707/128) = 92 of 128; 376,832 of 524,288 windows live). The
+"~19%" in zerocheck.rs and two log entries above is wrong by ~3.8x.
+Round 1 DOES scale with this fraction — the AB prep, the C transpose
+and the drain all sit behind one `continue` on `n_b_med == 0`.
