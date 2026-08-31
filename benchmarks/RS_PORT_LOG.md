@@ -2488,3 +2488,27 @@ builder) is present but DORMANT — no driver calls. Re-certify on a
 quiet, charged machine; the real move is the re-graft queue.
 Trace note: `bind statement` is ~815 ms on the first prove only
 (cached after) — cold totals ~2.4 s are not a regression signal.
+
+### ST/MT phase table, branch vs main — 2026-08-31
+
+m=32 grind-free blake3 both arms, one invocation per cell (min per
+phase over 5 proves; ST = RAYON_NUM_THREADS=1). ms:
+
+| phase   | br MT | mn MT | ratio | br ST  | mn ST  | ratio |
+|---------|-------|-------|-------|--------|--------|-------|
+| commit  | 232.0 | 227.6 | 1.019 | 1690.1 | 1718.9 | 0.983 |
+| zc+linc | 226.7 | 257.7 | 0.880 | 1556.7 | 1745.7 | 0.892 |
+| open    | 264.0 | 264.7 | 0.997 | 1582.2 | 1606.2 | 0.985 |
+| sum     | 722.7 | 750.0 | 0.964 | 4829.0 | 5070.8 | 0.952 |
+
+witgen/compact 0.0 everywhere (pooled-zeroed / aliased). The ONE
+surviving live win that resolves: **zc+lincheck −12% MT / −11% ST** —
+the ST agreement pins it on the lincheck NEON block-kernel rewrite
+(load-port fix), not scheduling; the round1 E-drain adds little
+beyond it at MT. commit and open are parity (hash8 leaf kernel gain
+is inside the ±2% floor here). Sum-of-buckets ≈ prove TOTAL −~12 ms
+unlabeled residue. `bind statement` one-time ~790 ms in all four
+cells (identical arms). ST/MT scaling ≈ 6.7× on 8 P-cores. Caveats:
+single cell per config, machine on 24% battery with interactive load;
+earlier trace-parse footgun fixed (open_batch/open_merged also print
+"TOTAL" — match "[prove_union] TOTAL").
