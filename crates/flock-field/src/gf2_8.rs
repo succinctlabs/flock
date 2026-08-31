@@ -13,6 +13,12 @@
 //! Reduction: x^8 ≡ x^4 + x^3 + x + 1, so the upper byte h folds back as
 //!   h ^ (h<<1) ^ (h<<3) ^ (h<<4).
 
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+use self::software::clmul8 as clmul8_software;
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
+#[cfg(all(test, target_arch = "aarch64"))]
+use core::mem::transmute;
 use core::ops::{Add, AddAssign, Mul, MulAssign};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -82,7 +88,7 @@ fn clmul8(a: u8, b: u8) -> u16 {
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
     {
-        software::clmul8(a, b)
+        clmul8_software(a, b)
     }
 }
 
@@ -90,7 +96,6 @@ fn clmul8(a: u8, b: u8) -> u16 {
 #[target_feature(enable = "aes")]
 #[inline]
 unsafe fn clmul8_neon(a: u8, b: u8) -> u16 {
-    use core::arch::aarch64::*;
     let va = vdup_n_p8(a);
     let vb = vdup_n_p8(b);
     let prod = vmull_p8(va, vb);
@@ -210,6 +215,9 @@ pub mod neon {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "aarch64")]
+    use super::neon::gf8_mul_vec16;
+    use super::software::clmul8 as clmul8_software;
     use super::*;
 
     use crate::test_rng::Rng;
@@ -257,7 +265,7 @@ mod tests {
         for _ in 0..1024 {
             let a = (rng.next_u64() & 0xff) as u8;
             let b = (rng.next_u64() & 0xff) as u8;
-            assert_eq!(clmul8(a, b), software::clmul8(a, b));
+            assert_eq!(clmul8(a, b), clmul8_software(a, b));
         }
     }
 
@@ -308,9 +316,6 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_gf8_mul_vec16_matches_scalar() {
-        use core::arch::aarch64::*;
-        use core::mem::transmute;
-
         let mut rng = Rng::new(0xBADC0FFEE);
         for _ in 0..256 {
             let mut a_arr = [0u8; 16];
@@ -328,7 +333,7 @@ mod tests {
             let result_vec = unsafe {
                 let a_v = vld1q_u8(a_arr.as_ptr());
                 let b_v = vld1q_u8(b_arr.as_ptr());
-                neon::gf8_mul_vec16(a_v, b_v)
+                gf8_mul_vec16(a_v, b_v)
             };
             let result: [u8; 16] = unsafe { transmute(result_vec) };
             assert_eq!(result, expected, "a={:02x?}, b={:02x?}", a_arr, b_arr);

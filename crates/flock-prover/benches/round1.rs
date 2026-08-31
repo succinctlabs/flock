@@ -7,6 +7,8 @@
 //! and in any real prover). The naive variant only runs at m ≤ 20 — beyond
 //! that it's many seconds and uninformative.
 
+use flock_prover::init_perf_thread_pool;
+use flock_prover::zerocheck::PaddingSpec;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -18,9 +20,8 @@ use flock_prover::zerocheck::univariate_skip_optimized::{
     round1_shift_reduce_extract_c_packed_padded_with_s_hat_v, small_challenges_ghash,
 };
 
-const N_INNER: usize = 7;
-
 use flock_core::test_rng::Rng;
+const N_INNER: usize = 7;
 
 fn build_protocol_r(m: usize, outer: &[F128]) -> Vec<F128> {
     assert_eq!(outer.len(), m - K_SKIP - N_INNER);
@@ -55,7 +56,7 @@ fn unpack_to_bool(packed: &[u8], n_bits: usize) -> Vec<bool> {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — NEON path active)");
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
@@ -185,7 +186,7 @@ fn main() {
             K_SKIP,
             &r,
             &table,
-            &flock_prover::zerocheck::PaddingSpec::dense(m),
+            &PaddingSpec::dense(m),
         );
         let mut best_fusion_ms = f64::INFINITY;
         for run in 0..n_runs {
@@ -203,7 +204,7 @@ fn main() {
                 K_SKIP,
                 &r,
                 &table,
-                &flock_prover::zerocheck::PaddingSpec::dense(m),
+                &PaddingSpec::dense(m),
             );
             let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
             println!("  {:<40} {:>10.2} ms", label, elapsed);

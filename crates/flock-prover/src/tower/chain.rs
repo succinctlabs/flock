@@ -1,33 +1,62 @@
+use crate::r1cs_hashes::blake3::generate_witness_batch_major_partial;
+#[cfg(test)]
+use crate::r1cs_hashes::blake3::{Compression, build_block_r1cs};
 use flock_hash::blake3_compress;
+use prover::prove_fast_ligerito_union_circuit;
+use prover::prove_fast_ligerito_union_circuit_ag;
+#[cfg(test)]
+use std::any::Any;
+#[cfg(test)]
+use std::array::from_fn;
+use std::time::Instant;
+use verifier::verify_ligerito_union_circuit;
+use verifier::verify_ligerito_union_circuit_ag;
+use verifier::verify_ligerito_union_circuit_ag_deferred;
+use verifier::verify_ligerito_union_circuit_deferred;
 
 use super::*;
+use flock_core::{
+    circuit::{
+        Circuit, SigmaAssertion, WiringProof,
+        builder::{BuiltCircuit, CircuitShape, SlotId},
+    },
+    element_r1cs::union::Proof as ElementProof,
+    lincheck::{LincheckCircuit, LincheckProof},
+    pcs::{MergedOpenProof, commit::Commitment},
+    proof::{R1csProofCircuitMerged, R1csProofCircuitMergedAg, UnionClassClaims},
+    verifier::{DeferredMatrixWork, FlockVerifyError},
+};
+use flock_transcript::challenger::Challenger;
 use std::sync::{Arc, Mutex, OnceLock};
+
+#[cfg(test)]
+use flock_core::{circuit::WiringError, product_gkr::ProductGkrError};
 
 /// A circuit-union proof by boolean-zerocheck FLAVOR — parallel arms so
 /// the chain leaf and envelope outers. Both forms share all other regions.
 #[derive(serde::Serialize)]
 pub(super) enum MixedProof {
-    Rs(flock_core::proof::R1csProofCircuitMerged),
+    Rs(R1csProofCircuitMerged),
     /// Constructed only where the AG round-1 prover kernel exists
     /// (aarch64); the consuming arms are arch-independent.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    Ag(flock_core::proof::R1csProofCircuitMergedAg),
+    Ag(R1csProofCircuitMergedAg),
 }
 
 impl MixedProof {
-    pub(super) fn wiring(&self) -> &flock_core::circuit::WiringProof {
+    pub(super) fn wiring(&self) -> &WiringProof {
         match self {
             MixedProof::Rs(p) => &p.wiring,
             MixedProof::Ag(p) => &p.wiring,
         }
     }
-    pub(super) fn pcs_open(&self) -> &flock_core::pcs::MergedOpenProof {
+    pub(super) fn pcs_open(&self) -> &MergedOpenProof {
         match self {
             MixedProof::Rs(p) => &p.pcs_open,
             MixedProof::Ag(p) => &p.pcs_open,
         }
     }
-    pub(super) fn element(&self) -> Option<&flock_core::element_r1cs::union::Proof> {
+    pub(super) fn element(&self) -> Option<&ElementProof> {
         match self {
             MixedProof::Rs(p) => p.element.as_ref(),
             MixedProof::Ag(p) => p.element.as_ref(),
@@ -35,7 +64,7 @@ impl MixedProof {
     }
     /// The boolean LINCHECK sub-proof — flavor-shared (both boolean proof
     /// structs carry it verbatim; only round 1 differs).
-    pub(super) fn boolean_lincheck(&self) -> &flock_core::lincheck::LincheckProof {
+    pub(super) fn boolean_lincheck(&self) -> &LincheckProof {
         match self {
             MixedProof::Rs(p) => &p.boolean.as_ref().expect("boolean side present").lincheck,
             MixedProof::Ag(p) => &p.boolean.as_ref().expect("boolean side present").lincheck,
@@ -43,21 +72,21 @@ impl MixedProof {
     }
     /// The plain (assertions-discharged) circuit verify, flavor-dispatched.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn verify_circuit<Ch: flock_transcript::challenger::Challenger>(
+    pub(super) fn verify_circuit<Ch: Challenger>(
         &self,
         union: &UnionInstance<'_>,
-        circuit: &flock_core::circuit::Circuit,
+        circuit: &Circuit,
         public: &[F128],
-        lcs: &[&dyn flock_core::lincheck::LincheckCircuit],
-        commitment: &flock_core::pcs::commit::Commitment,
+        lcs: &[&dyn LincheckCircuit],
+        commitment: &Commitment,
         pcs: &PcsParams,
         ch: &mut Ch,
-    ) -> Result<flock_core::proof::UnionClassClaims, flock_core::verifier::FlockVerifyError> {
+    ) -> Result<UnionClassClaims, FlockVerifyError> {
         match self {
-            MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit(
-                union, circuit, public, lcs, commitment, p, pcs, ch,
-            ),
-            MixedProof::Ag(p) => verifier::verify_ligerito_union_circuit_ag(
+            MixedProof::Rs(p) => {
+                verify_ligerito_union_circuit(union, circuit, public, lcs, commitment, p, pcs, ch)
+            }
+            MixedProof::Ag(p) => verify_ligerito_union_circuit_ag(
                 union, circuit, public, lcs, commitment, p, pcs, ch,
             ),
         }
@@ -65,28 +94,21 @@ impl MixedProof {
     /// The DEFERRED circuit verify (assertions returned, not discharged),
     /// flavor-dispatched — what the recursion tapes record.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn verify_circuit_deferred<Ch: flock_transcript::challenger::Challenger>(
+    pub(super) fn verify_circuit_deferred<Ch: Challenger>(
         &self,
         union: &UnionInstance<'_>,
-        circuit: &flock_core::circuit::Circuit,
+        circuit: &Circuit,
         public: &[F128],
-        lcs: &[&dyn flock_core::lincheck::LincheckCircuit],
-        commitment: &flock_core::pcs::commit::Commitment,
+        lcs: &[&dyn LincheckCircuit],
+        commitment: &Commitment,
         pcs: &PcsParams,
         ch: &mut Ch,
-    ) -> Result<
-        (
-            flock_core::proof::UnionClassClaims,
-            flock_core::verifier::DeferredMatrixWork,
-            flock_core::circuit::SigmaAssertion,
-        ),
-        flock_core::verifier::FlockVerifyError,
-    > {
+    ) -> Result<(UnionClassClaims, DeferredMatrixWork, SigmaAssertion), FlockVerifyError> {
         match self {
-            MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit_deferred(
+            MixedProof::Rs(p) => verify_ligerito_union_circuit_deferred(
                 union, circuit, public, lcs, commitment, p, pcs, ch,
             ),
-            MixedProof::Ag(p) => verifier::verify_ligerito_union_circuit_ag_deferred(
+            MixedProof::Ag(p) => verify_ligerito_union_circuit_ag_deferred(
                 union, circuit, public, lcs, commitment, p, pcs, ch,
             ),
         }
@@ -96,12 +118,12 @@ impl MixedProof {
 /// A mixed circuit proof and its deferred verification data.
 pub(super) struct MixedInner {
     pub(super) nu: usize,
-    pub(super) built: flock_core::circuit::builder::BuiltCircuit,
+    pub(super) built: BuiltCircuit,
     pub(super) proof: MixedProof,
-    pub(super) commitment: flock_core::pcs::commit::Commitment,
+    pub(super) commitment: Commitment,
     pub(super) pcs: PcsParams,
-    pub(super) work: flock_core::verifier::DeferredMatrixWork,
-    pub(super) sigma: flock_core::circuit::SigmaAssertion,
+    pub(super) work: DeferredMatrixWork,
+    pub(super) sigma: SigmaAssertion,
 }
 
 /// Check a single-slot Boolean union whose rows form a BLAKE3 hash chain.
@@ -116,7 +138,7 @@ pub(super) fn chain_probe_boolean_only_wired_union() {
     let iv = pack8(&IV);
     let mut cv = [b.public_value(iv[0]), b.public_value(iv[1])];
     for i in 0..n_blocks {
-        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+        let m: [u32; 16] = from_fn(|_| rng.next_u32());
         let mut hash_in = vec![cv[0], cv[1]];
         for j in 0..4 {
             hash_in.push(b.public_value(pack4(m[4 * j..4 * j + 4].try_into().unwrap())));
@@ -146,17 +168,17 @@ pub(super) fn chain_probe_boolean_only_wired_union() {
         num_lanes: union.commit_lanes(pcs_batch_for(&union, LigeritoProfile::Fast)),
         merkle_hash: HashKind::Blake3,
     };
-    let blake_r1cs = blake3::build_block_r1cs(nu);
+    let blake_r1cs = build_block_r1cs(nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let prove = |rows: &[blake3::Compression]| {
+    let prove = |rows: &[Compression]| {
         let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-        prover::prove_fast_ligerito_union_circuit(
+        prove_fast_ligerito_union_circuit(
             &union,
             &built.shape.circuit,
             &built.witness.public,
             &pcs_params,
             vec![UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(rows, nu),
+                generate_witness_batch_major_partial(rows, nu),
                 blake_lc,
             )],
             Vec::new(),
@@ -166,9 +188,9 @@ pub(super) fn chain_probe_boolean_only_wired_union() {
     let (proof, commitment, _) = prove(built.rows::<Blake3Gate>(hash));
 
     // The deferred verify — what a first-level node runs per chain child.
-    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let lcs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
     let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-    let (_claims, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
+    let (_claims, work, sigma) = verify_ligerito_union_circuit_deferred(
         &union,
         &built.shape.circuit,
         &built.witness.public,
@@ -195,13 +217,13 @@ pub(super) fn chain_probe_boolean_only_wired_union() {
     // Every gate still satisfies the b3 relation on its own row; only the
     // copy constraints around row 17 break — the wiring product must be
     // what catches it.
-    let mut bad: Vec<blake3::Compression> = built.rows::<Blake3Gate>(hash).to_vec();
+    let mut bad: Vec<Compression> = built.rows::<Blake3Gate>(hash).to_vec();
     bad[17].0[0] ^= 1;
     let (p, cm, _) = prove(&bad);
     let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
     assert!(
         matches!(
-            verifier::verify_ligerito_union_circuit(
+            verify_ligerito_union_circuit(
                 &union,
                 &built.shape.circuit,
                 &built.witness.public,
@@ -211,11 +233,9 @@ pub(super) fn chain_probe_boolean_only_wired_union() {
                 &pcs_params,
                 &mut ch,
             ),
-            Err(flock_core::verifier::FlockVerifyError::Wiring(
-                flock_core::circuit::WiringError::Gkr(
-                    flock_core::product_gkr::ProductGkrError::ProductMismatch
-                )
-            ))
+            Err(FlockVerifyError::Wiring(WiringError::Gkr(
+                ProductGkrError::ProductMismatch
+            )))
         ),
         "a broken chain link must die on the wiring product"
     );
@@ -257,8 +277,8 @@ pub(super) fn native_chain(h_start: &[u32; 16], n_blocks: usize) -> [u32; 16] {
 /// materialises the rows), the shape is not.
 #[derive(Clone)]
 pub(super) struct ChainShape {
-    pub(super) shape: flock_core::circuit::builder::CircuitShape,
-    pub(super) hash: flock_core::circuit::builder::SlotId,
+    pub(super) shape: CircuitShape,
+    pub(super) hash: SlotId,
     pub(super) nu: usize,
 }
 
@@ -267,7 +287,7 @@ pub(super) struct ChainShape {
 /// the tower's material proofs CLONE the cached shape (Registry + Circuit
 /// memcpy, ~an order of magnitude cheaper) instead of re-emitting it.
 /// `build_chain_proof`'s setup_ms honestly reflects whichever it paid.
-pub(super) fn chain_shape_cached(n_blocks: usize) -> std::sync::Arc<ChainShape> {
+pub(super) fn chain_shape_cached(n_blocks: usize) -> Arc<ChainShape> {
     type Cache = Mutex<Vec<(usize, Arc<ChainShape>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
@@ -317,17 +337,11 @@ pub(super) fn chain_vals(h_start: &[u32; 16]) -> Vec<F128> {
 }
 
 #[cfg(test)]
-pub(super) fn build_chain_circuit(
-    h_start: &[u32; 16],
-    n_blocks: usize,
-) -> (
-    flock_core::circuit::builder::BuiltCircuit,
-    flock_core::circuit::builder::SlotId,
-) {
+pub(super) fn build_chain_circuit(h_start: &[u32; 16], n_blocks: usize) -> (BuiltCircuit, SlotId) {
     let cs = build_chain_shape(n_blocks);
     let witness = cs.shape.run(&chain_vals(h_start), &[]);
     (
-        flock_core::circuit::builder::BuiltCircuit {
+        BuiltCircuit {
             shape: cs.shape,
             witness,
         },
@@ -359,11 +373,11 @@ pub struct ChainProof {
 /// — the digest pin), the WALK is per-statement and is the chain compute
 /// itself, so it is reported apart from the proving phases.
 pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) -> ChainProof {
-    let t_shape = std::time::Instant::now();
+    let t_shape = Instant::now();
     let cs: ChainShape = chain_shape_cached(n_blocks).as_ref().clone();
     let shape_ms = t_shape.elapsed().as_secs_f64() * 1e3;
     let (nu, hash) = (cs.nu, cs.hash);
-    let t_setup = std::time::Instant::now();
+    let t_setup = Instant::now();
     let blake_r1cs = chain_blake_r1cs(nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let setup_ms = shape_ms + t_setup.elapsed().as_secs_f64() * 1e3;
@@ -375,7 +389,7 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
     let mut onlines: Vec<Online> = Vec::with_capacity(reps);
     let mut fin = None;
     for _ in 0..reps {
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let witness = cs.shape.run(&chain_vals(&h_start), &[]);
         let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
         let union = UnionInstance::new(&cs.shape.registry, cs.shape.counts.clone());
@@ -393,16 +407,15 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
             num_lanes: union.commit_lanes(pcs_batch_for(&union, cfg.leaf_profile())),
             merkle_hash: HashKind::Blake3,
         };
-        let t1 = std::time::Instant::now();
-        let wit =
-            blake3::generate_witness_batch_major_partial(witness.rows::<Blake3Gate>(hash), nu);
+        let t1 = Instant::now();
+        let wit = generate_witness_batch_major_partial(witness.rows::<Blake3Gate>(hash), nu);
         let witgen_ms = t1.elapsed().as_secs_f64() * 1e3;
-        let t2 = std::time::Instant::now();
+        let t2 = Instant::now();
         let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
         let (proof, commitment) = if leaf_zc_ag() {
             #[cfg(target_arch = "aarch64")]
             {
-                let (p, c, _) = prover::prove_fast_ligerito_union_circuit_ag(
+                let (p, c, _) = prove_fast_ligerito_union_circuit_ag(
                     &union,
                     &cs.shape.circuit,
                     &witness.public,
@@ -416,7 +429,7 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
             #[cfg(not(target_arch = "aarch64"))]
             unreachable!("leaf_zc_ag() is false off aarch64")
         } else {
-            let (p, c, _) = prover::prove_fast_ligerito_union_circuit(
+            let (p, c, _) = prove_fast_ligerito_union_circuit(
                 &union,
                 &cs.shape.circuit,
                 &witness.public,
@@ -443,16 +456,16 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
         fin = Some((witness, proof, commitment, pcs_params));
     }
     let (witness, proof, commitment, pcs_params) = fin.expect("one online iteration at least");
-    let built = flock_core::circuit::builder::BuiltCircuit {
+    let built = BuiltCircuit {
         shape: cs.shape,
         witness,
     };
     let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
 
-    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let lcs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
     let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
     let (_claims, work, sigma) = match &proof {
-        MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit_deferred(
+        MixedProof::Rs(p) => verify_ligerito_union_circuit_deferred(
             &union,
             &built.shape.circuit,
             &built.witness.public,
@@ -462,7 +475,7 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
             &pcs_params,
             &mut ch,
         ),
-        MixedProof::Ag(p) => verifier::verify_ligerito_union_circuit_ag_deferred(
+        MixedProof::Ag(p) => verify_ligerito_union_circuit_ag_deferred(
             &union,
             &built.shape.circuit,
             &built.witness.public,
@@ -534,7 +547,7 @@ pub(super) fn chain_leaf_ag_roundtrip() {
     let cfg = test_config();
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_00A6);
-    let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
 
     let cs: ChainShape = chain_shape_cached(n_blocks).as_ref().clone();
     let (nu, hash) = (cs.nu, cs.hash);
@@ -555,15 +568,15 @@ pub(super) fn chain_leaf_ag_roundtrip() {
     let wit_rows = witness.rows::<Blake3Gate>(hash);
 
     // Same-shape RS baseline (the flavor delta, not a cross-shape number).
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-    let (_rs_proof, _, _) = prover::prove_fast_ligerito_union_circuit(
+    let (_rs_proof, _, _) = prove_fast_ligerito_union_circuit(
         &union,
         &cs.shape.circuit,
         &witness.public,
         &pcs_params,
         vec![UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major_partial(wit_rows, nu),
+            generate_witness_batch_major_partial(wit_rows, nu),
             blake_lc,
         )],
         Vec::new(),
@@ -571,15 +584,15 @@ pub(super) fn chain_leaf_ag_roundtrip() {
     );
     let rs_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_ag(
+    let (proof, commitment, _) = prove_fast_ligerito_union_circuit_ag(
         &union,
         &cs.shape.circuit,
         &witness.public,
         &pcs_params,
         vec![UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major_partial(wit_rows, nu),
+            generate_witness_batch_major_partial(wit_rows, nu),
             blake_lc,
         )],
         Vec::new(),
@@ -591,10 +604,10 @@ pub(super) fn chain_leaf_ag_roundtrip() {
         union.dense_m()
     );
 
-    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
-    let verify = |p: &flock_core::proof::R1csProofCircuitMergedAg| {
+    let lcs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
+    let verify = |p: &R1csProofCircuitMergedAg| {
         let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-        verifier::verify_ligerito_union_circuit_ag_deferred(
+        verify_ligerito_union_circuit_ag_deferred(
             &union,
             &cs.shape.circuit,
             &witness.public,
@@ -648,7 +661,7 @@ pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
     let cfg = test_config();
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_0002);
-    let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
 
     // Honest: build_chain_proof internally deferred-verifies, discharges
     // both assertion families and cross-checks h_end against the native
@@ -662,28 +675,28 @@ pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
     // modified), against the PLAIN verifier so every check is in force.
     let (built, hash) = build_chain_circuit(&h_start, n_blocks);
     let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
-    let blake_r1cs = blake3::build_block_r1cs(cp.inner.nu);
+    let blake_r1cs = build_block_r1cs(cp.inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
-    let prove = |rows: &[blake3::Compression], public: &[F128]| {
+    let lcs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
+    let prove = |rows: &[Compression], public: &[F128]| {
         let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-        prover::prove_fast_ligerito_union_circuit(
+        prove_fast_ligerito_union_circuit(
             &union,
             &built.shape.circuit,
             public,
             &cp.inner.pcs,
             vec![UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(rows, cp.inner.nu),
+                generate_witness_batch_major_partial(rows, cp.inner.nu),
                 blake_lc,
             )],
             Vec::new(),
             &mut ch,
         )
     };
-    let verify = |public: &[F128], cm: &flock_core::pcs::commit::Commitment, p: &MixedProof| {
+    let verify = |public: &[F128], cm: &Commitment, p: &MixedProof| {
         let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
         match p {
-            MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit(
+            MixedProof::Rs(p) => verify_ligerito_union_circuit(
                 &union,
                 &built.shape.circuit,
                 public,
@@ -693,7 +706,7 @@ pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
                 &cp.inner.pcs,
                 &mut ch,
             ),
-            MixedProof::Ag(p) => verifier::verify_ligerito_union_circuit_ag(
+            MixedProof::Ag(p) => verify_ligerito_union_circuit_ag(
                 &union,
                 &built.shape.circuit,
                 public,
@@ -710,17 +723,15 @@ pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
     //     off. Its own b3 relation holds; the copy constraint out(99) ==
     //     m(100) breaks, and the wiring product is what must catch it.
     {
-        let mut bad: Vec<blake3::Compression> = built.rows::<Blake3Gate>(hash).to_vec();
+        let mut bad: Vec<Compression> = built.rows::<Blake3Gate>(hash).to_vec();
         bad[100].1[0] ^= 1;
         let (p, cm, _) = prove(&bad, &built.witness.public);
         assert!(
             matches!(
                 verify(&built.witness.public, &cm, &MixedProof::Rs(p)),
-                Err(flock_core::verifier::FlockVerifyError::Wiring(
-                    flock_core::circuit::WiringError::Gkr(
-                        flock_core::product_gkr::ProductGkrError::ProductMismatch
-                    )
-                ))
+                Err(FlockVerifyError::Wiring(WiringError::Gkr(
+                    ProductGkrError::ProductMismatch
+                )))
             ),
             "a broken chain link must die on the wiring product"
         );
@@ -755,7 +766,7 @@ pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
         built.shape.circuit.digest(),
         "two builds from the same h_start agree"
     );
-    let other_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let other_start: [u32; 16] = from_fn(|_| rng.next_u32());
     let (other, _) = build_chain_circuit(&other_start, n_blocks);
     assert_eq!(
         cp.inner.built.shape.circuit.digest(),
@@ -790,7 +801,7 @@ pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
 pub(super) fn chain_tape_regions_pinned() {
     let cfg = test_config();
     let mut rng = Rng(0xC4A1_0003);
-    let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
     let n_blocks = 256usize;
     let cp = build_chain_proof(cfg, h_start, n_blocks);
     let ct = ChildTape::new(&cp.inner, DOMAIN);
@@ -840,7 +851,7 @@ pub(super) fn chain_tape_regions_pinned() {
 pub(super) fn chain_child_region_emits_alone() {
     let cfg = test_config();
     let mut rng = Rng(0xC4A1_0005);
-    let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp = build_chain_proof(cfg, h_start, 256);
     let ct = ChildTape::new(&cp.inner, DOMAIN);
     let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
@@ -860,10 +871,7 @@ pub(super) fn chain_child_region_emits_alone() {
         &mut consts,
     );
     let shape2 = sb.finish().expect("the chain child circuit builds");
-    let hint_refs: Vec<&(dyn std::any::Any + Sync)> = hints
-        .iter()
-        .map(|h| h as &(dyn std::any::Any + Sync))
-        .collect();
+    let hint_refs: Vec<&(dyn Any + Sync)> = hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
     let built2 = shape2.run(&vals, &hint_refs);
     let consumed = check_child_region(&built2.public, &ct, &region);
     assert_eq!(

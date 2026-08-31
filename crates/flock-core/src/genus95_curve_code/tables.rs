@@ -1,3 +1,7 @@
+#[cfg(test)]
+use super::evaluator::eval_poly_mask;
+#[cfg(test)]
+use super::sage_data::ARTIN_SCHREIER_RHS;
 use std::sync::LazyLock;
 
 use super::artin_schreier::ArtinSchreierSolver;
@@ -29,11 +33,11 @@ pub(crate) struct RationalMask {
 #[cfg(test)]
 impl RationalMask {
     pub(crate) fn eval<const N: usize>(self, x_powers: &[F128; N]) -> Option<F128> {
-        let numerator = super::evaluator::eval_poly_mask(self.numerator, x_powers);
+        let numerator = eval_poly_mask(self.numerator, x_powers);
         if self.denominator == 1 {
             return Some(numerator);
         }
-        let denominator = super::evaluator::eval_poly_mask(self.denominator, x_powers);
+        let denominator = eval_poly_mask(self.denominator, x_powers);
         Some(numerator * denominator.inverse()?)
     }
 }
@@ -41,7 +45,7 @@ impl RationalMask {
 #[cfg(test)]
 fn artin_schreier_rhs() -> [[RationalMask; BASE_Y_DEGREE]; 3] {
     let mut out = [[RationalMask::default(); BASE_Y_DEGREE]; 3];
-    for (i, row) in super::sage_data::ARTIN_SCHREIER_RHS.iter().enumerate() {
+    for (i, row) in ARTIN_SCHREIER_RHS.iter().enumerate() {
         for (j, &(numerator, denominator)) in row.iter().enumerate() {
             out[i][j] = RationalMask {
                 numerator,

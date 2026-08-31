@@ -9,6 +9,11 @@
 //!
 //! Run: `cargo bench --bench blake3_fast_vs_slim`  (ST: RAYON_NUM_THREADS=1)
 
+use flock_prover::init_perf_thread_pool;
+use flock_prover::proof_io::R1csProofBundleLigerito;
+use rayon::current_num_threads;
+use std::array::from_fn;
+use std::env::var;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -16,10 +21,11 @@ use flock_prover::challenger::FsChallenger;
 use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log};
 
 use flock_core::test_rng::Rng;
+use flock_prover::pcs::ligerito::LigeritoProfile;
 
 fn random_compression(rng: &mut Rng) -> Compression {
-    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+    let m: [u32; 16] = from_fn(|_| rng.next_u32());
     (cv, m, rng.next_u32() as u64, 64u32, 11u32)
 }
 
@@ -34,12 +40,7 @@ fn fmt_kb(b: usize) -> String {
     }
 }
 
-fn bench_mode(
-    n_blocks: usize,
-    profile: flock_prover::pcs::ligerito::LigeritoProfile,
-    n_runs: usize,
-    label: &str,
-) {
+fn bench_mode(n_blocks: usize, profile: LigeritoProfile, n_runs: usize, label: &str) {
     let setup = Blake3Setup::with_profile(n_blocks, profile);
     let mut rng = Rng::new(0xB1A_3_511_3E ^ (label.len() as u64));
     let blocks: Vec<Compression> = (0..n_blocks)
@@ -73,7 +74,7 @@ fn bench_mode(
         verify_t = verify_t.min(t0.elapsed().as_secs_f64());
     }
 
-    let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
+    let bundle = R1csProofBundleLigerito { commitment, proof };
     let size = bundle.to_bytes().len();
     black_box(&bundle);
 
@@ -86,21 +87,21 @@ fn bench_mode(
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
-    let threads = rayon::current_num_threads();
+    let _ = init_perf_thread_pool();
+    let threads = current_num_threads();
     let label = if threads == 1 {
         "ST".to_string()
     } else {
         format!("MT, {threads} threads")
     };
 
-    let n_blocks: usize = std::env::var("BLAKE3_K")
+    let n_blocks: usize = var("BLAKE3_K")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(65536);
     let n_log = min_n_blocks_log(n_blocks);
     let m = K_LOG + n_log;
-    let n_runs: usize = std::env::var("FLOCK_BENCH_RUNS")
+    let n_runs: usize = var("FLOCK_BENCH_RUNS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
@@ -109,7 +110,6 @@ fn main() {
     println!("(target: aarch64 + aes)");
     println!("BLAKE3 Ligerito fast vs slim — K = {n_blocks} (m = {m}, {label})\n");
 
-    use flock_prover::pcs::ligerito::LigeritoProfile;
     bench_mode(n_blocks, LigeritoProfile::Fast, n_runs, "fast");
     bench_mode(n_blocks, LigeritoProfile::Slim, n_runs, "slim");
     bench_mode(n_blocks, LigeritoProfile::Secure, n_runs, "secure");

@@ -5,6 +5,7 @@
 //! Witnesses are generated directly as packed bytes to avoid allocating
 //! 3 × 512 MB of `&[bool]` at m=29.
 
+use flock_prover::init_perf_thread_pool;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -14,7 +15,7 @@ use flock_prover::zerocheck::prove_packed;
 use flock_core::test_rng::Rng;
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — NEON path active)");
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]

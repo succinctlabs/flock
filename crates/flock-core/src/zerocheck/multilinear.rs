@@ -33,7 +33,18 @@
 //! Verifier reconstructs `G(0)` from the running claim via
 //! `current_claim = (1+r_now)·G(0) + r_now·G(1)`.
 
+use crate::alloc_uninit_f128_vec;
+use crate::bits::lowest_one;
+use crate::field::f128_slice::fold_pairs;
+use crate::scratch::take_f128;
+use crate::zerocheck::PaddingRun;
+use flock_multilinear::eq_eval as multilinear_eq_eval;
+use flock_multilinear::fold_low;
+use rayon::current_num_threads;
 use rayon::prelude::*;
+use std::array::from_fn;
+use std::mem::take;
+use std::ops::Range;
 use std::sync::OnceLock;
 
 #[cfg(all(
@@ -46,8 +57,6 @@ use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
-mod kernels;
-
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(all(
@@ -56,6 +65,7 @@ use kernels::aarch64::fold_one_row_neon_unchecked_8;
     target_feature = "vpclmulqdq"
 ))]
 use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecked_8};
+mod kernels;
 
 /// Returns `(pair_in_block_mask, useful_pairs_inclusive)` for the round-2
 /// fused-fold kernel, from a **single-run** padding spec (the multi-run case
@@ -70,7 +80,7 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 /// when `useful_bits` is odd in chunk units) is INSIDE the useful range and
 /// processed normally — its padding side has value 0 so the message
 /// contribution is naturally correct.
-fn round2_pair_skip(run: &crate::zerocheck::PaddingRun, k_skip: usize) -> (usize, usize) {
+fn round2_pair_skip(run: &PaddingRun, k_skip: usize) -> (usize, usize) {
     if run.k_log <= k_skip + 1 {
         return (0, usize::MAX);
     }
@@ -118,7 +128,7 @@ fn round2_pair_skip(run: &crate::zerocheck::PaddingRun, k_skip: usize) -> (usize
 pub fn subspace_denominator_pair(dim: usize) -> (F128, F128) {
     static CACHE: OnceLock<[(F128, F128); 9]> = OnceLock::new();
     let table = CACHE.get_or_init(|| {
-        std::array::from_fn(|d| {
+        from_fn(|d| {
             let den = (1..(1usize << d)).fold(F128::ONE, |acc, i| acc * PHI_8_TABLE[i]);
             (den, den.inv())
         })
@@ -269,7 +279,7 @@ pub fn interpolate_at_z_combined(values_on_lambda: &[F128], k_skip: usize, z: F1
 /// Evaluate the multilinear eq polynomial at a point: `eq(r, x) = Π_i (1 + r_i + x_i)`
 /// for `r, x ∈ F_{2^128}^n` (char-2 simplification of `(1-r)(1-x) + r·x`).
 pub fn eq_eval(r: &[F128], x: &[F128]) -> F128 {
-    flock_multilinear::eq_eval(r, x, F128::ONE)
+    multilinear_eq_eval(r, x, F128::ONE)
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +442,7 @@ impl UniSkipFoldTable {
                 if (v & (v - 1)) == 0 {
                     continue; // skip powers of 2 (already written)
                 }
-                let lo_bit = crate::bits::lowest_one(v);
+                let lo_bit = lowest_one(v);
                 let parent = v ^ lo_bit;
                 data[j * 256 + v] = data[j * 256 + parent] + data[j * 256 + lo_bit];
             }
@@ -557,7 +567,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 pub(crate) fn balanced_interval_tasks(
     live: &[(usize, usize)],
     target: usize,
-) -> (Vec<(usize, usize)>, Vec<std::ops::Range<usize>>) {
+) -> (Vec<(usize, usize)>, Vec<Range<usize>>) {
     debug_assert!(target > 0);
     let mut pieces: Vec<(usize, usize)> = Vec::with_capacity(live.len());
     for &(s, e) in live {
@@ -568,7 +578,7 @@ pub(crate) fn balanced_interval_tasks(
             c = next;
         }
     }
-    let mut tasks: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut tasks: Vec<Range<usize>> = Vec::new();
     let (mut start, mut acc) = (0usize, 0usize);
     for (i, &(s, e)) in pieces.iter().enumerate() {
         acc += e - s;
@@ -861,8 +871,8 @@ where
         Some(iv) => 2 * iv.iter().map(|&(s, e)| e - s).sum::<usize>(),
         None => n_out,
     };
-    let mut a_folded: Vec<F128> = crate::scratch::take_f128(out_len);
-    let mut b_folded: Vec<F128> = crate::scratch::take_f128(out_len);
+    let mut a_folded: Vec<F128> = take_f128(out_len);
+    let mut b_folded: Vec<F128> = take_f128(out_len);
 
     let eq = SplitEqGhash::new(&mlv_challenges[1..]);
     let lo_size = 1usize << eq.n_lo;
@@ -898,7 +908,7 @@ where
         // never values.
         const LIVE_PAIRS_PER_TASK: usize = 1 << 16;
         let live_total: usize = iv.iter().map(|&(s, e)| e - s).sum();
-        let threads = rayon::current_num_threads().max(1);
+        let threads = current_num_threads().max(1);
         let target = (live_total / (4 * threads)).clamp(1 << 10, LIVE_PAIRS_PER_TASK);
         let (pieces, tasks) = balanced_interval_tasks(iv, target);
 
@@ -913,9 +923,9 @@ where
                 (&mut a_folded[..], &mut b_folded[..]);
             for t in &tasks {
                 let span: usize = pieces[t.clone()].iter().map(|&(s, e)| 2 * (e - s)).sum();
-                let (a_task, rest) = std::mem::take(&mut a_rem).split_at_mut(span);
+                let (a_task, rest) = take(&mut a_rem).split_at_mut(span);
                 a_rem = rest;
-                let (b_task, rest) = std::mem::take(&mut b_rem).split_at_mut(span);
+                let (b_task, rest) = take(&mut b_rem).split_at_mut(span);
                 b_rem = rest;
                 work.push((&pieces[t.clone()], a_task, b_task));
             }
@@ -1122,7 +1132,7 @@ pub fn uni_skip_fold_and_round_pair_runs_sparse(
 /// Pairs `(a[2x], a[2x+1])` collapse to `a[x] = a[2x] + challenge · (a[2x+1] + a[2x])`.
 /// After the call, `a.len()` is halved.
 pub fn fold_in_place_single(a: &mut Vec<F128>, challenge: F128) {
-    flock_multilinear::fold_low(a, challenge);
+    fold_low(a, challenge);
 }
 
 /// In-place fold of a pair `(a, b)` of multilinear polynomial tables at
@@ -1167,8 +1177,8 @@ pub fn fold_and_compute_round_pair_optimized(
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
     let half = a.len() / 2;
     // Uninit alloc — `_into` writes every slot of a_new/b_new.
-    let mut a_new = crate::alloc_uninit_f128_vec(half);
-    let mut b_new = crate::alloc_uninit_f128_vec(half);
+    let mut a_new = alloc_uninit_f128_vec(half);
+    let mut b_new = alloc_uninit_f128_vec(half);
     let (m1, mi) = fold_and_compute_round_pair_into(a, b, &mut a_new, &mut b_new, r_fold, r_next);
     (a_new, b_new, m1, mi)
 }
@@ -1237,8 +1247,8 @@ pub fn fold_and_compute_round_pair_into(
                 // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
                 // selects the architecture kernel; this loop only consumes
                 // the resulting values to build the message.
-                crate::field::f128_slice::fold_pairs(a_in, 0, a_out, r_fold);
-                crate::field::f128_slice::fold_pairs(b_in, 0, b_out, r_fold);
+                fold_pairs(a_in, 0, a_out, r_fold);
+                fold_pairs(b_in, 0, b_out, r_fold);
 
                 let mut p1_acc = F256Unreduced::ZERO;
                 let mut pinf_acc = F256Unreduced::ZERO;
@@ -1574,7 +1584,7 @@ pub fn fold_and_round_pair_sparse_into(
     // moves work between tasks, never values.
     const CHUNK: usize = 1 << 12;
     let live_total: usize = pair_cover.iter().map(|&(s, e)| e - s).sum();
-    let threads = rayon::current_num_threads().max(1);
+    let threads = current_num_threads().max(1);
     let target = (live_total / (4 * threads)).clamp(1 << 8, CHUNK);
     let (pieces, tasks) = balanced_interval_tasks(&pair_cover, target);
     let mut work: Vec<(&[(usize, usize)], &mut [F128], &mut [F128])> =
@@ -1584,9 +1594,9 @@ pub fn fold_and_round_pair_sparse_into(
         let mut b_rem: &mut [F128] = &mut b_out[..store_out.len()];
         for t in &tasks {
             let span: usize = pieces[t.clone()].iter().map(|&(s, e)| 2 * (e - s)).sum();
-            let (a_task, rest) = std::mem::take(&mut a_rem).split_at_mut(span);
+            let (a_task, rest) = take(&mut a_rem).split_at_mut(span);
             a_rem = rest;
-            let (b_task, rest) = std::mem::take(&mut b_rem).split_at_mut(span);
+            let (b_task, rest) = take(&mut b_rem).split_at_mut(span);
             b_rem = rest;
             work.push((&pieces[t.clone()], a_task, b_task));
         }
@@ -1702,7 +1712,7 @@ pub fn fold_and_round_pair_sparse_into(
 /// (`SPARSE_TAIL_GATE > 1`, or the domain drops below the fused threshold).
 pub fn expand_to_dense(compact: &[F128], store: &LiveLayout, domain: usize) -> Vec<F128> {
     debug_assert_eq!(compact.len(), store.len());
-    let mut out = crate::scratch::take_f128(domain);
+    let mut out = take_f128(domain);
     out.fill(F128::ZERO);
     for (i, &(s, e)) in store.intervals().iter().enumerate() {
         let off = store.offset_of(i);
@@ -1880,7 +1890,6 @@ macro_rules! lookahead_pass {
             rhos: (F128, F128),
             rest: &[F128],
         ) -> LookaheadSums {
-            use rayon::prelude::*;
             const PER_U: usize = $per_u;
             let n_u = a.len() / PER_U;
             assert_eq!(a.len(), b.len());
@@ -1989,6 +1998,14 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 mod tests {
     use super::*;
 
+    use crate::field::F8;
+    use crate::field::PHI_8_TABLE;
+    use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
+    use crate::test_rng::Rng;
+    use crate::zerocheck::univariate_skip_optimized::{
+        c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed,
+        small_challenges_ghash,
+    };
     /// The closed-form Lagrange weights agree with the textbook `O(ell²)`
     /// product, at every `k_skip` the protocol can use, on random points AND
     /// on the degenerate points the closed form has to special-case (`z`
@@ -2121,8 +2138,6 @@ mod tests {
     /// any code that could be reviewed for it.
     #[test]
     fn phi8_node_sets_have_linearized_vanishing_polynomials() {
-        use crate::field::PHI_8_TABLE;
-
         // Z_V(x) = Π_{s ∈ V} (x + s) over the first 2^m table entries.
         let z_v = |m: usize, x: F128| -> F128 {
             (0..(1usize << m)).fold(F128::ONE, |acc, i| acc * (x + PHI_8_TABLE[i]))
@@ -2281,8 +2296,6 @@ mod tests {
             }
         }
     }
-
-    use crate::test_rng::Rng;
 
     // ----------------------------------------------------------------------
     // Lagrange weights — algebraic properties.
@@ -2521,13 +2534,6 @@ mod tests {
     /// prover skip per-round c tracking entirely.
     #[test]
     fn c_eval_from_round1_c_matches_direct_fold() {
-        use crate::field::F8;
-        use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
-        use crate::zerocheck::univariate_skip_optimized::{
-            c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed,
-            small_challenges_ghash,
-        };
-
         const K_SKIP: usize = 6;
         const N_INNER: usize = 7;
 

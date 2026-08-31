@@ -5,6 +5,8 @@
 //!
 //!   cargo +1.95.0 bench --bench ag_breakdown -- [m] [reps]   (default 30, 5)
 
+#[cfg(target_arch = "aarch64")]
+use aarch64_only::run;
 // The AG round-1 kernel (and the ag_skip prover entry points this bench
 // drives) are aarch64-only; on other arches the bench is a no-op stub.
 #[cfg(not(target_arch = "aarch64"))]
@@ -14,11 +16,12 @@ fn main() {
 
 #[cfg(target_arch = "aarch64")]
 fn main() {
-    aarch64_only::run()
+    run()
 }
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64_only {
+    use std::env::args;
     use std::hint::black_box;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
@@ -30,18 +33,13 @@ mod aarch64_only {
         LOOKAHEAD_DISABLE, N_INNER, fold_and_first_round, friendly_challenges,
         prove_capture_s_hat_v_c,
     };
+    use rayon::current_num_threads;
 
     use flock_core::test_rng::Rng;
 
     pub(super) fn run() {
-        let m: usize = std::env::args()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30);
-        let reps: usize = std::env::args()
-            .nth(2)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
+        let m: usize = args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);
+        let reps: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(5);
         let bytes = (1usize << m) / 8;
         let mut rng = Rng(0xB0EA_D000 ^ m as u64);
         let mut a = vec![0u8; bytes];
@@ -65,7 +63,7 @@ mod aarch64_only {
             "m={m} ({} MB/witness), {} reps, {} threads",
             bytes >> 20,
             reps,
-            rayon::current_num_threads()
+            current_num_threads()
         );
         let med = |mut v: Vec<f64>| -> f64 {
             v.sort_by(|x, y| x.partial_cmp(y).unwrap());

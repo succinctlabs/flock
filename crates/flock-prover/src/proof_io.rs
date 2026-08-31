@@ -30,7 +30,22 @@
 //! // Then call e.g. `setup.verify(&bundle.commitment, &bundle.proof, ...)`.
 //! ```
 
-use std::io::{self, Read};
+use crate::mixed::MixedRegistryId;
+use bincode::DefaultOptions;
+use bincode::Error as BincodeError;
+use bincode::serialize_into;
+use flock_core::proof::R1csProofMergedLigerito;
+use serde::de::DeserializeOwned;
+use std::error::Error;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::fs::File;
+use std::fs::rename;
+use std::fs::write;
+use std::io::Read;
+use std::io::Result as IoResult;
+use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 use std::path::Path;
 
 use bincode::Options;
@@ -114,11 +129,11 @@ pub enum DeserializeError {
     /// load a `MixedProofBundleLigerito` from an R1CS bundle file).
     FlavorMismatch { expected: u8, found: u8 },
     /// The bincode-deserialization step failed (corrupted payload, etc.).
-    Bincode(bincode::Error),
+    Bincode(BincodeError),
 }
 
-impl std::fmt::Display for DeserializeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for DeserializeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::BadMagic => write!(f, "bad magic: not a FLOCK proof file"),
             Self::UnsupportedVersion(v) => {
@@ -137,10 +152,10 @@ impl std::fmt::Display for DeserializeError {
     }
 }
 
-impl std::error::Error for DeserializeError {}
+impl Error for DeserializeError {}
 
-impl From<bincode::Error> for DeserializeError {
-    fn from(e: bincode::Error) -> Self {
+impl From<BincodeError> for DeserializeError {
+    fn from(e: BincodeError) -> Self {
         Self::Bincode(e)
     }
 }
@@ -152,14 +167,14 @@ impl From<bincode::Error> for DeserializeError {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct R1csProofBundleLigerito {
     pub commitment: Commitment,
-    pub proof: flock_core::proof::R1csProofMergedLigerito,
+    pub proof: R1csProofMergedLigerito,
 }
 
 impl R1csProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + 1024);
         write_header(&mut out, FLAVOR_R1CS_LIGERITO);
-        bincode::serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
+        serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
         out
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
@@ -178,19 +193,18 @@ impl R1csProofBundleLigerito {
 /// — no per-invocation I/O binding.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MixedProofBundleLigerito {
-    pub registry_id: crate::mixed::MixedRegistryId,
+    pub registry_id: MixedRegistryId,
     /// Declared invocation counts, in the registry's slot order.
     pub counts: Vec<u64>,
     pub commitment: Commitment,
-    pub proof: flock_core::proof::R1csProofMergedLigerito,
+    pub proof: R1csProofMergedLigerito,
 }
 
 impl MixedProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + 1024);
         write_header(&mut out, FLAVOR_MIXED_LIGERITO);
-        bincode::serialize_into(&mut out, self)
-            .expect("bincode serialize MixedProofBundleLigerito");
+        serialize_into(&mut out, self).expect("bincode serialize MixedProofBundleLigerito");
         out
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
@@ -203,7 +217,7 @@ impl MixedProofBundleLigerito {
 pub fn write_mixed_bundle_ligerito_to_file<P: AsRef<Path>>(
     path: P,
     bundle: &MixedProofBundleLigerito,
-) -> io::Result<()> {
+) -> IoResult<()> {
     write_bytes_to_file(path, &bundle.to_bytes())
 }
 
@@ -261,10 +275,8 @@ fn check_bundle_size(len: usize) -> Result<(), DeserializeError> {
     }
 }
 
-fn deserialize_payload<T: serde::de::DeserializeOwned>(
-    payload: &[u8],
-) -> Result<T, DeserializeError> {
-    Ok(bincode::DefaultOptions::new()
+fn deserialize_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T, DeserializeError> {
+    Ok(DefaultOptions::new()
         // Preserve the wire encoding used by bincode's top-level helpers.
         .with_fixint_encoding()
         .with_limit((MAX_BUNDLE_BYTES - HEADER_LEN) as u64)
@@ -278,7 +290,7 @@ fn deserialize_payload<T: serde::de::DeserializeOwned>(
 
 /// Atomically write `bytes` to `path` (write-then-rename via the
 /// stdlib — best-effort; on error the rename may leave a temp file behind).
-pub fn write_bytes_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<()> {
+pub fn write_bytes_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> IoResult<()> {
     let path = path.as_ref();
     let tmp = match path.parent() {
         Some(dir) => dir.join(format!(
@@ -289,19 +301,19 @@ pub fn write_bytes_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<
         )),
         None => Path::new(".flock-proof.tmp").to_path_buf(),
     };
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    write(&tmp, bytes)?;
+    rename(&tmp, path)
 }
 
 /// Read proof bytes from a file without ever buffering more than
 /// [`MAX_BUNDLE_BYTES`]. The `take` guard also handles a file growing between
 /// its metadata check and the read.
-pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)?;
+pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> IoResult<Vec<u8>> {
+    let mut file = File::open(path)?;
     let declared_len = file.metadata()?.len();
     if declared_len > MAX_BUNDLE_BYTES as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        return Err(IoError::new(
+            IoErrorKind::InvalidData,
             format!("proof bundle is {declared_len} bytes; maximum is {MAX_BUNDLE_BYTES}"),
         ));
     }
@@ -310,8 +322,8 @@ pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
         .take(MAX_BUNDLE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_BUNDLE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        return Err(IoError::new(
+            IoErrorKind::InvalidData,
             format!("proof bundle exceeded the {MAX_BUNDLE_BYTES}-byte maximum while reading"),
         ));
     }
@@ -322,12 +334,12 @@ pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 /// bytes weren't a valid bundle.
 #[derive(Debug)]
 pub enum BundleReadError {
-    Io(io::Error),
+    Io(IoError),
     Deserialize(DeserializeError),
 }
 
-impl std::fmt::Display for BundleReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for BundleReadError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Deserialize(e) => write!(f, "deserialize error: {e}"),
@@ -335,7 +347,7 @@ impl std::fmt::Display for BundleReadError {
     }
 }
 
-impl std::error::Error for BundleReadError {}
+impl Error for BundleReadError {}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -345,19 +357,26 @@ impl std::error::Error for BundleReadError {}
 mod tests {
     use super::*;
     use crate::r1cs_hashes::blake3::{Blake3Setup, Compression};
+    use bincode::serialize;
     use flock_hash::blake3_compress;
     use flock_transcript::challenger::FsChallenger;
+    use std::array::from_fn;
+    use std::env::temp_dir;
+    use std::fs::remove_file;
 
+    use crate::mixed::{MixedCounts, MixedRegistryId, MixedSetup};
+    use flock_core::pcs::ligerito::LigeritoProfile;
     use flock_core::test_rng::Rng;
+    use flock_prover_test_inputs::{random_blake3_inputs, random_sha2_inputs};
 
     /// Build a small honest BLAKE3 chain (n=8) for the bundle tests.
     fn honest_chain(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8]) {
         let mut rng = Rng::new(seed);
-        let mut cv: [u32; 8] = std::array::from_fn(|_| rng.next_u64() as u32);
+        let mut cv: [u32; 8] = from_fn(|_| rng.next_u64() as u32);
         let cv0 = cv;
         let mut blocks = Vec::with_capacity(n);
         for _ in 0..n {
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
+            let m: [u32; 16] = from_fn(|_| rng.next_u64() as u32);
             let counter = 0u64;
             let block_len = 64u32;
             let flags = 0u32;
@@ -412,10 +431,10 @@ mod tests {
         }
 
         // File roundtrip.
-        let path = std::env::temp_dir().join("flock-proofio-roundtrip.bin");
+        let path = temp_dir().join("flock-proofio-roundtrip.bin");
         write_bytes_to_file(&path, &bytes).expect("write");
         let read_back = read_bytes_from_file(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
+        let _ = remove_file(&path);
         let bundle4 = R1csProofBundleLigerito::from_bytes(&read_back).expect("file round-trip");
         let mut chv = FsChallenger::new(b"flock-proofio-lig");
         setup
@@ -437,9 +456,6 @@ mod tests {
     #[test]
     #[ignore] // Heavier — run with `cargo test mixed_bundle_roundtrip -- --ignored`
     fn mixed_bundle_roundtrip_and_verify() {
-        use crate::mixed::{MixedCounts, MixedRegistryId, MixedSetup};
-        use flock_prover_test_inputs::{random_blake3_inputs, random_sha2_inputs};
-
         let setup = MixedSetup::new(MixedRegistryId::Blake3Sha2Nu7);
         let mut rng = Rng::new(0x0511_31ED);
         let sha2_inputs = random_sha2_inputs(&mut rng, 100);
@@ -497,7 +513,7 @@ mod tests {
             setup2
                 .verify(
                     counts,
-                    flock_core::pcs::ligerito::LigeritoProfile::Fast100,
+                    LigeritoProfile::Fast100,
                     &bundle2.commitment,
                     &bundle2.proof,
                     &mut chv,
@@ -525,10 +541,10 @@ mod tests {
         );
 
         // File roundtrip.
-        let path = std::env::temp_dir().join("flock-proofio-mixed-roundtrip.bin");
+        let path = temp_dir().join("flock-proofio-mixed-roundtrip.bin");
         write_mixed_bundle_ligerito_to_file(&path, &bundle).expect("write");
         let bundle3 = read_mixed_bundle_ligerito_from_file(&path).expect("file round-trip");
-        let _ = std::fs::remove_file(&path);
+        let _ = remove_file(&path);
         assert_eq!(bundle3.counts, bundle.counts);
 
         eprintln!(
@@ -542,29 +558,26 @@ mod tests {
     /// Deterministic input generators shared with the mixed bundle test.
     mod flock_prover_test_inputs {
         use super::Rng;
+        use crate::r1cs_hashes::blake3::Compression as Blake3Compression;
+        use crate::r1cs_hashes::sha2::Compression as Sha2Compression;
+        use std::array::from_fn;
 
-        pub fn random_blake3_inputs(
-            rng: &mut Rng,
-            n: usize,
-        ) -> Vec<crate::r1cs_hashes::blake3::Compression> {
+        pub fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<Blake3Compression> {
             (0..n)
                 .map(|_| {
-                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u64() as u32);
-                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
+                    let cv: [u32; 8] = from_fn(|_| rng.next_u64() as u32);
+                    let m: [u32; 16] = from_fn(|_| rng.next_u64() as u32);
                     (cv, m, rng.next_u64(), 64u32, 11u32)
                 })
                 .collect()
         }
 
-        pub fn random_sha2_inputs(
-            rng: &mut Rng,
-            n: usize,
-        ) -> Vec<crate::r1cs_hashes::sha2::Compression> {
+        pub fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<Sha2Compression> {
             (0..n)
                 .map(|_| {
                     (
-                        std::array::from_fn(|_| rng.next_u64() as u32),
-                        std::array::from_fn(|_| rng.next_u64() as u32),
+                        from_fn(|_| rng.next_u64() as u32),
+                        from_fn(|_| rng.next_u64() as u32),
                     )
                 })
                 .collect()
@@ -669,7 +682,7 @@ mod tests {
 
     #[test]
     fn bounded_decoder_rejects_trailing_bytes() {
-        let mut payload = bincode::serialize(&0x1280_u64).expect("serialize test value");
+        let mut payload = serialize(&0x1280_u64).expect("serialize test value");
         payload.push(0);
         assert!(deserialize_payload::<u64>(&payload).is_err());
     }

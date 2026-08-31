@@ -1,3 +1,5 @@
+use core::arch::aarch64::*;
+
 use crate::field::F128;
 
 /// NEON one-row fold: 8 aligned 16-byte loads + 8 XORs, hand-unrolled for
@@ -15,7 +17,6 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     table_data: *const u8,
     bytes_ptr: *const u8,
 ) -> F128 {
-    use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
         let mut acc = vld1q_u8(table_data.add((*bytes_ptr) as usize * 16));

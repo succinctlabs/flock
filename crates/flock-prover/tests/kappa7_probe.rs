@@ -11,7 +11,18 @@
 //! schema words at columns >= 64, the wired circuit path, and the
 //! cross-class crossing. All small shapes — they run un-ignored.
 
+use flock_core::element_r1cs::ElementTableType;
+use flock_core::pcs::ligerito::LigeritoProfile;
+use prover::prove_fast_ligerito_union_circuit;
+use prover::prove_fast_ligerito_union_mixed_class;
+use sha2::SHA256_IV;
+use sha2::build_block_r1cs;
+use sha2::generate_witness_batch_major_partial;
+use sha2::sha256_compress;
+use std::array::from_fn;
 use std::sync::Arc;
+use verifier::verify_ligerito_union_circuit;
+use verifier::verify_ligerito_union_mixed_class;
 
 use flock_core::circuit::{Cell, Circuit};
 use flock_core::element_r1cs::ElementTableBuilder;
@@ -24,9 +35,10 @@ use flock_prover::schedule::{Registry, TableType};
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier;
 
-const DOMAIN: &[u8] = b"flock-kappa7-probe";
-
 use flock_core::test_rng::Rng;
+use flock_prover::prover::UnionSlotProverInput;
+use flock_prover::r1cs_hashes::sha2;
+const DOMAIN: &[u8] = b"flock-kappa7-probe";
 
 const EL_A: usize = 0;
 const EL_B: usize = 1;
@@ -44,7 +56,7 @@ fn mult_ty(kappa: usize) -> TableType {
 
 /// A WIDE kappa=7 gate — `used` live columns (the residual gates' shape:
 /// c approaches the column budget), a running product down the row.
-fn wide_ty(kappa: usize, used: usize) -> Arc<flock_core::element_r1cs::ElementTableType> {
+fn wide_ty(kappa: usize, used: usize) -> Arc<ElementTableType> {
     assert!(used >= 3 && used <= 1 << kappa);
     let mut b = ElementTableBuilder::new(kappa);
     b.free_wire(0).free_wire(1);
@@ -85,13 +97,13 @@ fn kappa7_wide_gate_union() {
             m: union.dense_m(),
             log_inv_rate: 1,
             log_batch_size: 6,
-            profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+            profile: LigeritoProfile::Fast,
             num_lanes: union.commit_lanes(6),
             merkle_hash: Default::default(),
         };
         let zc = z.clone();
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, _) = prover::prove_fast_ligerito_union_mixed_class(
+        let (proof, commitment, _) = prove_fast_ligerito_union_mixed_class(
             &union,
             &pcs_params,
             Vec::new(),
@@ -101,15 +113,8 @@ fn kappa7_wide_gate_union() {
             &mut ch,
         );
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union_mixed_class(
-            &union,
-            &[],
-            &commitment,
-            &proof,
-            &pcs_params,
-            &mut ch,
-        )
-        .unwrap_or_else(|e| panic!("kappa=7 used={used} rejected: {e:?}"));
+        verify_ligerito_union_mixed_class(&union, &[], &commitment, &proof, &pcs_params, &mut ch)
+            .unwrap_or_else(|e| panic!("kappa=7 used={used} rejected: {e:?}"));
     }
 }
 
@@ -164,7 +169,7 @@ fn kappa7_high_column_schema_circuit() {
         m: union.dense_m(),
         log_inv_rate: 1,
         log_batch_size: 6,
-        profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+        profile: LigeritoProfile::Fast,
         num_lanes: union.commit_lanes(6),
         merkle_hash: Default::default(),
     };
@@ -172,7 +177,7 @@ fn kappa7_high_column_schema_circuit() {
 
     let zc = z.clone();
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+    let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
         &union,
         &circuit,
         &public,
@@ -184,7 +189,7 @@ fn kappa7_high_column_schema_circuit() {
         &mut ch,
     );
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit(
+    verify_ligerito_union_circuit(
         &union,
         &circuit,
         &public,
@@ -201,9 +206,6 @@ fn kappa7_high_column_schema_circuit() {
 /// gate, mirroring `cross_class_hash_into_mult` at the packed-word width.
 #[test]
 fn kappa7_cross_class_circuit() {
-    use flock_prover::prover::UnionSlotProverInput;
-    use flock_prover::r1cs_hashes::sha2;
-
     fn pack_u32_words(u32s: &[u32]) -> Vec<F128> {
         u32s.chunks(4)
             .map(|c| {
@@ -233,7 +235,7 @@ fn kappa7_cross_class_circuit() {
     const SHA_O1: usize = 7;
 
     let (nu, kappa) = (7usize, 7usize);
-    let r1cs = sha2::build_block_r1cs(nu);
+    let r1cs = build_block_r1cs(nu);
     let registry = Registry::new(
         vec![
             mult_ty(kappa),
@@ -245,12 +247,12 @@ fn kappa7_cross_class_circuit() {
     assert!(registry.types()[1].is_element());
 
     let mut rng = Rng::new(0xC205_0007);
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
-    let h_out = sha2::sha256_compress(&sha2::SHA256_IV, &m);
+    let m: [u32; 16] = from_fn(|_| rng.next_u64() as u32);
+    let h_out = sha256_compress(&SHA256_IV, &m);
     let out_words = pack_u32_words(&h_out);
     let (o0, o1) = (out_words[0], out_words[1]);
 
-    let mut public = pack_u32_words(&sha2::SHA256_IV);
+    let mut public = pack_u32_words(&SHA256_IV);
     public.extend(pack_u32_words(&m));
     public.push(o0 * o1);
 
@@ -274,7 +276,7 @@ fn kappa7_cross_class_circuit() {
         m: union.dense_m(),
         log_inv_rate: 1,
         log_batch_size: 6,
-        profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+        profile: LigeritoProfile::Fast,
         num_lanes: union.commit_lanes(6),
         merkle_hash: Default::default(),
     };
@@ -288,13 +290,13 @@ fn kappa7_cross_class_circuit() {
     let circuit_lc = r1cs.csc_lincheck_circuit();
 
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, claims) = prover::prove_fast_ligerito_union_circuit(
+    let (proof, commitment, claims) = prove_fast_ligerito_union_circuit(
         &union,
         &circuit,
         &public,
         &pcs_params,
         vec![UnionSlotProverInput::new(
-            sha2::generate_witness_batch_major_partial(&[(sha2::SHA256_IV, m)], nu),
+            generate_witness_batch_major_partial(&[(SHA256_IV, m)], nu),
             circuit_lc,
         )],
         vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
@@ -304,7 +306,7 @@ fn kappa7_cross_class_circuit() {
     );
     assert!(claims.boolean.is_some() && claims.element.is_some());
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit(
+    verify_ligerito_union_circuit(
         &union,
         &circuit,
         &public,
@@ -358,7 +360,7 @@ fn kappa7_element_chain_circuit() {
         m: union.dense_m(),
         log_inv_rate: 1,
         log_batch_size: 6,
-        profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+        profile: LigeritoProfile::Fast,
         num_lanes: union.commit_lanes(6),
         merkle_hash: Default::default(),
     };
@@ -366,7 +368,7 @@ fn kappa7_element_chain_circuit() {
 
     let zc = z.clone();
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+    let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
         &union,
         &circuit,
         &public,
@@ -378,7 +380,7 @@ fn kappa7_element_chain_circuit() {
         &mut ch,
     );
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit(
+    verify_ligerito_union_circuit(
         &union,
         &circuit,
         &public,

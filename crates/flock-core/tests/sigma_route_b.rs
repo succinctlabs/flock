@@ -14,7 +14,9 @@
 
 use flock_core::challenger::FsChallenger;
 use flock_core::field::F128;
-use flock_core::matrix_fold::{self, DenseMatrix, MatrixClaim, Weight};
+use flock_core::matrix_fold::{
+    DenseMatrix, FoldMatrix, MatrixClaim, Weight, bilinear, prove_fold, verify_fold,
+};
 use flock_core::product_gkr::{build_s_sigma_vec, prove_batched, verify_batched};
 
 use flock_core::test_rng::Rng;
@@ -51,7 +53,7 @@ fn sigma_claims_fold_and_discharge() {
     // reshaped bilinear — pinning the reshape convention.
     let c1 = sigma_claim(mu, nu, &sigma, b"sigma-route-b-1");
     assert_eq!(
-        matrix_fold::bilinear(&c1.row, &c1.col, &m),
+        bilinear(&c1.row, &c1.col, &m),
         c1.value,
         "the emitted sigma claim discharges against the reshaped table"
     );
@@ -67,16 +69,15 @@ fn sigma_claims_fold_and_discharge() {
     let n_cols = 1usize << (mu - nu);
     let combs: Vec<Vec<F128>> = claims
         .iter()
-        .map(|c| matrix_fold::FoldMatrix::col_marginal(&m, &c.row.materialize(), n_cols))
+        .map(|c| FoldMatrix::col_marginal(&m, &c.row.materialize(), n_cols))
         .collect();
     let mut chp = FsChallenger::new(b"sigma-route-b-fold");
-    let (fproof, folded_p) = matrix_fold::prove_fold(&m, &combs, &claims, &mut chp);
+    let (fproof, folded_p) = prove_fold(&m, &combs, &claims, &mut chp);
     let mut chv = FsChallenger::new(b"sigma-route-b-fold");
-    let folded_v =
-        matrix_fold::verify_fold(&claims, &fproof, &mut chv).expect("the sigma fold verifies");
+    let folded_v = verify_fold(&claims, &fproof, &mut chv).expect("the sigma fold verifies");
     assert_eq!(folded_p, folded_v, "prover and verifier agree on the fold");
     assert_eq!(
-        matrix_fold::bilinear(&folded_v.row, &folded_v.col, &m),
+        bilinear(&folded_v.row, &folded_v.col, &m),
         folded_v.value,
         "the folded sigma claim discharges — the root evaluation"
     );
@@ -85,7 +86,7 @@ fn sigma_claims_fold_and_discharge() {
     let mut bad = folded_v;
     bad.value += F128::ONE;
     assert_ne!(
-        matrix_fold::bilinear(&bad.row, &bad.col, &m),
+        bilinear(&bad.row, &bad.col, &m),
         bad.value,
         "a tampered sigma claim fails the discharge"
     );

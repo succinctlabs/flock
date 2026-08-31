@@ -63,12 +63,7 @@
 //! Fiat–Shamir order: commit → bind statement → τ → zerocheck rounds → α →
 //! lincheck rounds → γ-batched opening.
 
-pub mod lincheck;
-pub mod union;
-pub mod zerocheck;
-
-use std::sync::OnceLock;
-
+use crate::alloc_uninit_vec;
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::merkle::Hash;
@@ -79,8 +74,30 @@ use crate::pcs::{
     commit,
 };
 use crate::zerocheck::PaddingSpec;
+use crate::zerocheck::univariate_skip::build_eq;
+use blake3::Hasher;
+use lincheck::ElementLincheckError;
+use lincheck::Proof as LincheckProof;
+use lincheck::prove_with_grinding as prove_lincheck_with_grinding;
+use lincheck::verify_with_grinding as verify_lincheck_with_grinding;
+use pcs::BatchOpeningProofLigerito;
+use pcs::PcsError;
+use pcs::ligerito::LigeritoProfile;
+use pcs::ligerito::default_config;
+use pcs::ligerito::default_verifier_config;
+use pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding;
+use pcs::verify_opening_batch_ligerito_mixed_with_grinding;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+use zerocheck::Claim;
+use zerocheck::ElementZerocheckError;
+use zerocheck::Proof as ZerocheckProof;
+use zerocheck::prove_with_grinding as prove_zerocheck_with_grinding;
+use zerocheck::verify_with_grinding as verify_zerocheck_with_grinding;
+pub mod lincheck;
+pub mod union;
+pub mod zerocheck;
 
 /// Statement-binding domain label. Absorbed before any challenge is squeezed.
 const DOMAIN: &[u8] = b"flock-element-r1cs-v0";
@@ -157,7 +174,7 @@ impl SparseF128Matrix {
     /// Absorb the matrix into a statement digest, length-prefixed per row so no
     /// two distinct matrices share an encoding. Mirrors
     /// `crate::r1cs::absorb_matrix` with F128 coefficients appended.
-    fn absorb(&self, h: &mut blake3::Hasher) {
+    fn absorb(&self, h: &mut Hasher) {
         h.update(&(self.num_rows as u64).to_le_bytes());
         h.update(&(self.num_cols as u64).to_le_bytes());
         for row in &self.rows {
@@ -341,7 +358,7 @@ impl ElementTableType {
     /// length-prefixed. Lazily cached.
     pub fn digest(&self) -> [u8; 32] {
         *self.digest_cache.get_or_init(|| {
-            let mut h = blake3::Hasher::new();
+            let mut h = Hasher::new();
             h.update(b"flock-element-type-v0");
             h.update(&[0u8]);
             h.update(&(self.kappa as u32).to_le_bytes());
@@ -369,8 +386,8 @@ impl ElementTableType {
         assert_eq!(z.len(), self.width() << n_log, "witness length");
         // `gather_into` seeds every slot before accumulating, so uninitialized
         // is fine here — no memset tax.
-        let mut az = crate::alloc_uninit_vec::<F128>(z.len());
-        let mut bz = crate::alloc_uninit_vec::<F128>(z.len());
+        let mut az = alloc_uninit_vec::<F128>(z.len());
+        let mut bz = alloc_uninit_vec::<F128>(z.len());
         gather_into(&self.a_0, z, n_log, None, None, &mut az);
         gather_into(&self.b_0, z, n_log, None, None, &mut bz);
         (az, bz)
@@ -657,7 +674,7 @@ fn pcs_params(m_words: usize, grinding: Grinding) -> PcsParams {
         log_inv_rate: PCS_LOG_INV_RATE,
         log_batch_size: PCS_LOG_BATCH_SIZE,
         profile: if grinding.enabled {
-            pcs::ligerito::LigeritoProfile::Secure
+            LigeritoProfile::Secure
         } else {
             Default::default()
         },
@@ -675,12 +692,12 @@ fn pcs_params(m_words: usize, grinding: Grinding) -> PcsParams {
 pub const MIN_M_WORDS: usize = 8;
 
 fn ligerito_prover_config(m_words: usize) -> ProverConfig {
-    pcs::ligerito::default_config(m_words, PCS_LOG_BATCH_SIZE, PCS_LOG_INV_RATE)
+    default_config(m_words, PCS_LOG_BATCH_SIZE, PCS_LOG_INV_RATE)
         .expect("Ligerito config for the element witness; requires m_words >= MIN_M_WORDS")
 }
 
 fn ligerito_verifier_config(m_words: usize) -> VerifierConfig {
-    pcs::ligerito::default_verifier_config(m_words, PCS_LOG_BATCH_SIZE, PCS_LOG_INV_RATE)
+    default_verifier_config(m_words, PCS_LOG_BATCH_SIZE, PCS_LOG_INV_RATE)
         .expect("Ligerito verifier config for the element witness; requires m_words >= MIN_M_WORDS")
 }
 
@@ -738,11 +755,11 @@ impl Grinding {
 pub struct ElementProof {
     /// Merkle cap layer of the committed witness words (the commitment).
     pub cap: Vec<Hash>,
-    pub zerocheck: zerocheck::Proof,
-    pub lincheck: lincheck::Proof,
+    pub zerocheck: ZerocheckProof,
+    pub lincheck: LincheckProof,
     /// Packed-direct opening of `ec = ẑ(r)` and `ẑ(r')` — the mixed open with
     /// zero ring-switched claims.
-    pub open: pcs::BatchOpeningProofLigerito,
+    pub open: BatchOpeningProofLigerito,
 }
 
 /// Why an element proof was rejected.
@@ -758,10 +775,10 @@ pub enum ElementR1csError {
         n: usize,
         n_log: usize,
     },
-    Zerocheck(zerocheck::ElementZerocheckError),
-    Lincheck(lincheck::ElementLincheckError),
+    Zerocheck(ElementZerocheckError),
+    Lincheck(ElementLincheckError),
     /// The packed-direct opening rejected.
-    Open(pcs::PcsError),
+    Open(PcsError),
 }
 
 /// The claims a verified element proof leaves behind: the two witness
@@ -823,7 +840,7 @@ pub fn prove_with_grinding<C: Challenger>(
     let (mut pa, mut pb) = stmt.ty.apply(z, stmt.n_log);
     broadcast_add(&mut pa, stmt.ty.a_const(), stmt.n_log);
     broadcast_add(&mut pb, stmt.ty.b_const(), stmt.n_log);
-    let (zc_proof, zc_claim) = zerocheck::prove_with_grinding(pa, pb, z, m_words, grinding, ch);
+    let (zc_proof, zc_claim) = prove_zerocheck_with_grinding(pa, pb, z, m_words, grinding, ch);
 
     // ---- 3. Phase 2: batched lincheck. ----
     //
@@ -833,11 +850,11 @@ pub fn prove_with_grinding<C: Challenger>(
     // `Âz(r)` / `B̂z(r)` claims the lincheck reduces.
     let (va, vb) = strip_constants(stmt.ty, &zc_claim);
     let (lc_proof, lc_claim) =
-        lincheck::prove_with_grinding(stmt.ty, z, stmt.n_log, &zc_claim.r, va, vb, grinding, ch);
+        prove_lincheck_with_grinding(stmt.ty, z, stmt.n_log, &zc_claim.r, va, vb, grinding, ch);
 
     // ---- 4. Open both witness claims, packed-direct, no ring-switch. ----
     let claims = packed_direct_claims(&zc_claim.r, zc_claim.ec, &lc_claim.r_prime, lc_claim.z_eval);
-    let open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
+    let open = open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
         z.to_vec(),
         &pdata,
         &commitment,
@@ -905,10 +922,10 @@ pub fn verify_with_grinding<C: Challenger>(
     };
     stmt.bind(&commitment.cap, ch);
 
-    let zc_claim = zerocheck::verify_with_grinding(m_words, &proof.zerocheck, grinding, ch)
+    let zc_claim = verify_zerocheck_with_grinding(m_words, &proof.zerocheck, grinding, ch)
         .map_err(ElementR1csError::Zerocheck)?;
     let (va, vb) = strip_constants(stmt.ty, &zc_claim);
-    let lc_claim = lincheck::verify_with_grinding(
+    let lc_claim = verify_lincheck_with_grinding(
         stmt.ty,
         stmt.n_log,
         &zc_claim.r,
@@ -927,7 +944,7 @@ pub fn verify_with_grinding<C: Challenger>(
         .zip(values)
         .map(|(point, value)| PackedDirectClaimRef { point, value })
         .collect();
-    pcs::verify_opening_batch_ligerito_mixed_with_grinding(
+    verify_opening_batch_ligerito_mixed_with_grinding(
         &commitment,
         &[],
         &[],
@@ -990,9 +1007,9 @@ fn broadcast_add(v: &mut [F128], c: &[F128], n_log: usize) {
 /// `x ↦ a_const[x_con]` is uniform in `x_row`, so its MLE is
 /// `â_const_base(r_con)` — no row dependence, no count dependence (partition of
 /// unity over the row block). `O(2^kappa)` for the verifier.
-fn strip_constants(ty: &ElementTableType, zc: &zerocheck::Claim) -> (F128, F128) {
+fn strip_constants(ty: &ElementTableType, zc: &Claim) -> (F128, F128) {
     let r_con = &zc.r[zc.r.len() - ty.kappa()..];
-    let eq_con = crate::zerocheck::univariate_skip::build_eq(r_con);
+    let eq_con = build_eq(r_con);
     let dot = |c: &[F128]| -> F128 {
         eq_con
             .iter()
@@ -1296,7 +1313,12 @@ mod e2e_tests {
     use super::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
     use super::*;
     use crate::challenger::FsChallenger;
+    use crate::element_r1cs::lincheck::prove as prove_lincheck;
+    use crate::element_r1cs::zerocheck::prove as prove_zerocheck;
     use crate::test_rng::Rng;
+    use bincode::deserialize;
+    use bincode::serialize;
+    use std::time::Instant;
 
     const TRANSCRIPT: &[u8] = b"flock-element-e2e";
 
@@ -1353,7 +1375,7 @@ mod e2e_tests {
         assert!(matches!(
             verify_with_grinding(&stmt, &missing_zc, grinding, &mut ch_v),
             Err(ElementR1csError::Zerocheck(
-                zerocheck::ElementZerocheckError::BadGrindingNonceCount { .. }
+                ElementZerocheckError::BadGrindingNonceCount { .. }
             ))
         ));
 
@@ -1376,7 +1398,7 @@ mod e2e_tests {
             if matches!(
                 verify_with_grinding(&stmt, &bad, grinding, &mut ch_v),
                 Err(ElementR1csError::Zerocheck(
-                    zerocheck::ElementZerocheckError::InvalidGrindingNonce { which: "initial" }
+                    ElementZerocheckError::InvalidGrindingNonce { which: "initial" }
                 ))
             ) {
                 rejected_bad_nonce = true;
@@ -1394,7 +1416,7 @@ mod e2e_tests {
         assert!(matches!(
             verify_with_grinding(&stmt, &missing_lc, grinding, &mut ch_v),
             Err(ElementR1csError::Lincheck(
-                lincheck::ElementLincheckError::BadGrindingNonceCount { .. }
+                ElementLincheckError::BadGrindingNonceCount { .. }
             ))
         ));
     }
@@ -1470,7 +1492,7 @@ mod e2e_tests {
             assert_eq!(
                 run_verify(&stmt, &proof),
                 Err(ElementR1csError::Zerocheck(
-                    zerocheck::ElementZerocheckError::SumcheckFinalFailed
+                    ElementZerocheckError::SumcheckFinalFailed
                 )),
                 "row {bad_row}"
             );
@@ -1544,7 +1566,7 @@ mod e2e_tests {
         assert_eq!(
             run_verify(&stmt, &bad_ec),
             Err(ElementR1csError::Zerocheck(
-                zerocheck::ElementZerocheckError::SumcheckFinalFailed
+                ElementZerocheckError::SumcheckFinalFailed
             )),
             "wrong ec"
         );
@@ -1554,7 +1576,7 @@ mod e2e_tests {
         assert_eq!(
             run_verify(&stmt, &bad_z),
             Err(ElementR1csError::Lincheck(
-                lincheck::ElementLincheckError::SumcheckFinalFailed
+                ElementLincheckError::SumcheckFinalFailed
             )),
             "wrong z_eval"
         );
@@ -1645,16 +1667,16 @@ mod e2e_tests {
         let z = mult_witness(&ty, n_log, n, &mut rng);
         let stmt = ElementStatement { ty: &ty, n_log, n };
         let (proof, _) = run_prove(&stmt, &z);
-        let bytes = bincode::serialize(&proof).expect("serialize");
+        let bytes = serialize(&proof).expect("serialize");
         // The honest bytes round-trip and verify.
-        let decoded: ElementProof = bincode::deserialize(&bytes).expect("deserialize");
+        let decoded: ElementProof = deserialize(&bytes).expect("deserialize");
         assert_eq!(decoded, proof);
         assert!(run_verify(&stmt, &decoded).is_ok());
 
         // Truncation at several depths.
         for frac in [1usize, 2, 4, 8] {
             let cut = bytes.len() - bytes.len() / frac;
-            match bincode::deserialize::<ElementProof>(&bytes[..cut]) {
+            match deserialize::<ElementProof>(&bytes[..cut]) {
                 Err(_) => {}
                 Ok(p) => assert!(
                     run_verify(&stmt, &p).is_err(),
@@ -1670,7 +1692,7 @@ mod e2e_tests {
             let pos = i * (bytes.len() / n_flips);
             let mut bad = bytes.clone();
             bad[pos] ^= 1 << (i % 8);
-            match bincode::deserialize::<ElementProof>(&bad) {
+            match deserialize::<ElementProof>(&bad) {
                 Err(_) => {}
                 Ok(p) => assert!(
                     run_verify(&stmt, &p).is_err(),
@@ -1704,20 +1726,20 @@ mod e2e_tests {
         let n = (1usize << n_log) - 3; // non-trivial, near-full utilization
         let z = mult_witness(&ty, n_log, n, &mut Rng::new(7));
 
-        let t_wit = std::time::Instant::now();
+        let t_wit = Instant::now();
         let (mut pa, mut pb) = ty.apply(&z, n_log);
         broadcast_add(&mut pa, ty.a_const(), n_log);
         broadcast_add(&mut pb, ty.b_const(), n_log);
         let wit_ms = t_wit.elapsed().as_secs_f64() * 1e3;
 
         let mut ch = FsChallenger::new(b"element-smoke");
-        let t_zc = std::time::Instant::now();
-        let (_zc_proof, zc_claim) = zerocheck::prove(pa, pb, &z, n_log + kappa, &mut ch);
+        let t_zc = Instant::now();
+        let (_zc_proof, zc_claim) = prove_zerocheck(pa, pb, &z, n_log + kappa, &mut ch);
         let zc_ms = t_zc.elapsed().as_secs_f64() * 1e3;
 
         let (va, vb) = strip_constants(&ty, &zc_claim);
-        let t_lc = std::time::Instant::now();
-        let (_lc_proof, lc_claim) = lincheck::prove(&ty, &z, n_log, &zc_claim.r, va, vb, &mut ch);
+        let t_lc = Instant::now();
+        let (_lc_proof, lc_claim) = prove_lincheck(&ty, &z, n_log, &zc_claim.r, va, vb, &mut ch);
         let lc_ms = t_lc.elapsed().as_secs_f64() * 1e3;
 
         eprintln!(

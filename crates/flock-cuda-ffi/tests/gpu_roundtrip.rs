@@ -9,6 +9,23 @@
 //! n_blocks_log, gated on a Ligerito config existing for that m.
 #![cfg(feature = "gpu")]
 
+use b3::build_block_r1cs;
+use flock_cuda_ffi::gpu::device_count;
+use flock_prover::prover::prove_ligerito;
+use flock_prover::r1cs::BlockR1cs;
+use lincheck::SparseMatrixCircuit;
+use std::ffi::CString;
+use std::ffi::c_char;
+use std::fmt::Debug;
+use std::fs::read;
+use std::ptr::null;
+use std::ptr::null_mut;
+use std::slice::from_raw_parts;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::time::Instant;
+use verifier::verify_ligerito;
+
 use flock_prover::challenger::FsChallenger;
 use flock_prover::field::{F8, F128, F256};
 use flock_prover::lincheck::{self, LincheckProof};
@@ -23,8 +40,8 @@ use flock_prover::verifier;
 use flock_prover::zerocheck::{K_SKIP, ZerocheckProof};
 
 const DOMAIN: &[u8] = b"flock-lig-r1cs-v0";
-static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static BLAKE3_CSC_MATRICES: std::sync::OnceLock<CscMatrices> = std::sync::OnceLock::new();
+static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+static BLAKE3_CSC_MATRICES: OnceLock<CscMatrices> = OnceLock::new();
 
 struct CscMatrices {
     a_col_ptr: Vec<u32>,
@@ -69,7 +86,7 @@ struct ProveParams {
     lc_skip_bits: i32,
     rs_bits: i32,
     gamma_bits: i32,
-    dump_z_path: *const std::ffi::c_char,
+    dump_z_path: *const c_char,
 }
 
 unsafe extern "C" {
@@ -84,7 +101,7 @@ unsafe extern "C" {
 #[test]
 #[ignore] // needs an sm_120 GPU; run explicitly with --ignored
 fn gpu_link_smoke() {
-    let n = flock_cuda_ffi::gpu::device_count();
+    let n = device_count();
     assert!(n > 0, "no CUDA device visible (got {n})");
 }
 
@@ -180,7 +197,7 @@ impl<'a> Reader<'a> {
 }
 
 struct GpuArtifacts {
-    r1cs: flock_prover::r1cs::BlockR1cs,
+    r1cs: BlockR1cs,
     pcs_params: PcsParams,
     proof: R1csProofLigerito,
     commitment: Commitment,
@@ -190,7 +207,7 @@ struct GpuArtifacts {
 /// Prove on the GPU at `m = 14 + n_blocks_log`, parse the flat stream into the
 /// typed proof. `dump_z` optionally writes the packed witness for host replay.
 fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
-    let r1cs = b3::build_block_r1cs(n_blocks_log);
+    let r1cs = build_block_r1cs(n_blocks_log);
     let m = r1cs.m;
     let pcs_params = PcsParams {
         m,
@@ -237,7 +254,7 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
     let og = pcs_params.opening_grinding();
     let opt = |b: Option<u32>| b.map_or(0, |x| x as i32);
 
-    let dump_c = dump_z.map(|p| std::ffi::CString::new(p).unwrap());
+    let dump_c = dump_z.map(|p| CString::new(p).unwrap());
     let params = ProveParams {
         m: m as i32,
         statement_digest: digest.as_ptr(),
@@ -273,15 +290,15 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
         lc_skip_bits: opt(lc.skip_bits(K_SKIP)),
         rs_bits: og.ring_switch_bits as i32,
         gamma_bits: og.claim_batch_bits as i32, // 2 claims > 1 → the batch grinds
-        dump_z_path: dump_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+        dump_z_path: dump_c.as_ref().map_or(null(), |c| c.as_ptr()),
     };
 
-    let t0 = std::time::Instant::now();
-    let mut out: *mut u8 = std::ptr::null_mut();
+    let t0 = Instant::now();
+    let mut out: *mut u8 = null_mut();
     let mut out_len: usize = 0;
     let rc = unsafe { flock_cuda_prove_blake3(&params, &mut out, &mut out_len) };
     assert_eq!(rc, 0, "CUDA prover returned error {rc} at m={m}");
-    let bytes = unsafe { std::slice::from_raw_parts(out, out_len) }.to_vec();
+    let bytes = unsafe { from_raw_parts(out, out_len) }.to_vec();
     unsafe { flock_cuda_free(out) };
     let t_prove = t0.elapsed();
 
@@ -416,11 +433,10 @@ fn roundtrip<const N_BLOCKS_LOG: usize, const TAMPER: bool>() {
         prove_secs,
     } = gpu_prove(N_BLOCKS_LOG, None);
     let m = r1cs.m;
-    let lc_circuit =
-        lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
-    let t1 = std::time::Instant::now();
+    let lc_circuit = SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
+    let t1 = Instant::now();
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim = verifier::verify_ligerito(
+    let claim = verify_ligerito(
         &r1cs,
         &commitment,
         &proof,
@@ -444,7 +460,7 @@ fn roundtrip<const N_BLOCKS_LOG: usize, const TAMPER: bool>() {
         bad.pcs_open.ligerito.final_proof.yr[0].lo ^= 1;
         let mut ch_t = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito(
+            verify_ligerito(
                 &r1cs,
                 &commitment,
                 &bad,
@@ -460,7 +476,7 @@ fn roundtrip<const N_BLOCKS_LOG: usize, const TAMPER: bool>() {
         bad.zerocheck.multilinear_rounds[0].0.hi ^= 1;
         let mut ch_t = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito(
+            verify_ligerito(
                 &r1cs,
                 &commitment,
                 &bad,
@@ -527,7 +543,7 @@ fn gpu_debug_diff<const M: usize>() {
     let m = M;
     let zpath = format!("/tmp/ffi_z_m{m}.bin");
     let art = gpu_prove(m - 14, Some(&zpath));
-    let zb = std::fs::read(&zpath).expect("witness dump missing");
+    let zb = read(&zpath).expect("witness dump missing");
     assert_eq!(zb.len(), (1usize << (m - 7)) * 16, "witness dump size");
     let z: Vec<F128> = zb
         .chunks_exact(16)
@@ -538,11 +554,10 @@ fn gpu_debug_diff<const M: usize>() {
         .collect();
 
     let mut ch = FsChallenger::new(DOMAIN);
-    let (rp, rcomm, _claim) =
-        flock_prover::prover::prove_ligerito(&art.r1cs, z, &art.pcs_params, &mut ch);
+    let (rp, rcomm, _claim) = prove_ligerito(&art.r1cs, z, &art.pcs_params, &mut ch);
     let gp = &art.proof;
 
-    fn first_diff<T: PartialEq + std::fmt::Debug>(name: &str, r: &[T], g: &[T]) {
+    fn first_diff<T: PartialEq + Debug>(name: &str, r: &[T], g: &[T]) {
         if r.len() != g.len() {
             panic!("{name}: len rust {} vs gpu {}", r.len(), g.len());
         }

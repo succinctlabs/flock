@@ -1,6 +1,13 @@
 use super::*;
-use flock_core::element_r1cs::ElementTableBuilder;
+use crate::prover::UnionElementSlotInput;
 use flock_core::schedule::IoWord;
+use flock_core::{
+    circuit::builder::SlotId,
+    element_r1cs::{ElementTableBuilder, ElementTableType},
+    pcs::{jagged::assist_sparse_transitions, ligerito::eval_sk_at_vks},
+};
+use flock_field::QUADRATIC_NONRESIDUE;
+use std::sync::Arc;
 
 /// The sumcheck-spine gate: one fold-and-eval step of the verifier's running
 /// quadratic, `RoundQuad` in circuit form (char-2, so `u1 = t + u0` is the
@@ -14,7 +21,7 @@ use flock_core::schedule::IoWord;
 /// EVAL a held quad (beta = 0; only t' consumed), and INTRO-FOLD an OOD or
 /// enforced-sum claim (consume c', b', a', tr'; t' unwired).
 pub(super) struct SpineGate {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
 }
 
 pub(super) const SP_IN: usize = 9; // c b a tr u0 u2 y beta r
@@ -43,7 +50,7 @@ impl SpineGate {
             .mult(m2, r2, ao)
             .linear(to, &[(co, one), (m1, one), (m2, one)]);
         Self {
-            ty: std::sync::Arc::new(bld.build().expect("spine gate is valid")),
+            ty: Arc::new(bld.build().expect("spine gate is valid")),
         }
     }
 }
@@ -90,7 +97,7 @@ impl GateType for SpineGate {
 /// remains a base-field scalar, while the quadratic, messages, fold
 /// challenge, running target, and outputs are pairs of base-field wires.
 pub(super) struct SpineGate256 {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
 }
 
 pub(super) const SP256_IN: usize = 17;
@@ -141,7 +148,7 @@ impl SpineGate256 {
         b.linear(48, &[(co[0], one), (rb[0], one), (ra[0], one)]);
         b.linear(49, &[(co[1], one), (rb[1], one), (ra[1], one)]);
         Self {
-            ty: std::sync::Arc::new(b.build().expect("extension spine gate is valid")),
+            ty: Arc::new(b.build().expect("extension spine gate is valid")),
         }
     }
 }
@@ -214,7 +221,7 @@ impl GateType for SpineGate256 {
 
 pub(super) fn emit_spine256(
     sb: &mut ShapeBuilder,
-    slot: flock_core::circuit::builder::SlotId,
+    slot: SlotId,
     c: [Wire; 2],
     b: [Wire; 2],
     a: [Wire; 2],
@@ -270,7 +277,7 @@ pub(super) fn gate_kappa(c_need: usize) -> usize {
 /// products involving later fold challenges and the running accumulators
 /// need two limbs.
 pub(super) struct ResidualWeightsGate256 {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
     pub(super) coeffs: Vec<F128>,
 }
 
@@ -286,7 +293,7 @@ impl ResidualWeightsGate256 {
         let o = F128::ONE;
         // The subspace-polynomial chain constants `s_k(v_k)`, straight from
         // ligerito (the residual boundary check pins the spine against them).
-        let sks = flock_core::pcs::ligerito::eval_sk_at_vks(Self::N_WEIGHTS);
+        let sks = eval_sk_at_vks(Self::N_WEIGHTS);
         let coeffs: Vec<F128> = (0..Self::N_WEIGHTS - 1)
             .map(|k| {
                 assert_ne!(sks[k + 1], F128::ZERO, "novel-basis normalizer is nonzero");
@@ -303,7 +310,7 @@ impl ResidualWeightsGate256 {
             prev = out;
         }
         Self {
-            ty: std::sync::Arc::new(b.build().expect("normalized residual weights gate")),
+            ty: Arc::new(b.build().expect("normalized residual weights gate")),
             coeffs,
         }
     }
@@ -343,14 +350,14 @@ impl GateType for ResidualWeightsGate256 {
 ///
 /// `P' = P product_i (1 + R_i (1 + W_i))`, for `i=0,1,2`.
 pub(super) struct ResidualPrefix3Gate256 {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
     out: [usize; 2],
 }
 
 impl ResidualPrefix3Gate256 {
     pub(super) fn new() -> Self {
         let o = F128::ONE;
-        let nr = flock_field::QUADRATIC_NONRESIDUE;
+        let nr = QUADRATIC_NONRESIDUE;
         // in: prefix pair, three challenge pairs, three base weights, one.
         let (n_in, one) = (12usize, 11usize);
         let mut b = ElementTableBuilder::new(6);
@@ -380,7 +387,7 @@ impl ResidualPrefix3Gate256 {
         }
         assert_eq!(c, 33, "three residual-prefix factors use 33 columns");
         Self {
-            ty: std::sync::Arc::new(b.build().expect("three-factor residual prefix gate")),
+            ty: Arc::new(b.build().expect("three-factor residual prefix gate")),
             out: pr,
         }
     }
@@ -430,7 +437,7 @@ impl GateType for ResidualPrefix3Gate256 {
 /// Add one residual query to all eight low-coordinate accumulators:
 /// `acc_y' = acc_y + aw * prefix * product_{j:y_j=1} W_j`.
 pub(super) struct ResidualAccGate256 {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
     acc_out: [[usize; 2]; 8],
 }
 
@@ -476,7 +483,7 @@ impl ResidualAccGate256 {
         }
         assert_eq!(c, 58, "the residual accumulator uses 58 columns");
         Self {
-            ty: std::sync::Arc::new(b.build().expect("residual accumulator gate")),
+            ty: Arc::new(b.build().expect("residual accumulator gate")),
             acc_out,
         }
     }
@@ -549,8 +556,8 @@ impl GateType for ResidualAccGate256 {
 pub(super) fn live_element_input_from_rows(
     rows: Vec<Vec<F128>>,
     nu: usize,
-) -> crate::prover::UnionElementSlotInput<'static> {
-    crate::prover::UnionElementSlotInput::new(move |dst: &mut [F128]| {
+) -> UnionElementSlotInput<'static> {
+    UnionElementSlotInput::new(move |dst: &mut [F128]| {
         debug_assert!(rows.len() <= 1usize << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
@@ -570,7 +577,7 @@ pub(super) fn live_element_input_from_rows(
 /// MacGate — 51 schema words (each a cell slot AND a gather claim) for
 /// ~30 rows of work became ~250 cheap rows and zero types.
 pub(super) struct PrefixGate {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
     pub(super) pl: usize,
     pub(super) n_in: usize,
     pub(super) k: usize,
@@ -598,7 +605,7 @@ impl PrefixGate {
         }
         assert_eq!(c, c_need, "the prefix column count is the counted one");
         Self {
-            ty: std::sync::Arc::new(bl.build().expect("prefix gate")),
+            ty: Arc::new(bl.build().expect("prefix gate")),
             pl,
             n_in,
             k: c,
@@ -637,7 +644,7 @@ impl GateType for PrefixGate {
 /// the constant extension element `(1, 0)` explicit and preserve the
 /// all-zero padding-row convention.
 pub(super) struct PrefixGate256 {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
     pub(super) pl: usize,
     pub(super) n_in: usize,
     out: [usize; 2],
@@ -661,7 +668,7 @@ impl PrefixGate256 {
             let bs = 2 + 2 * pl + 2 * j;
             let factor0 = vec![(one, o), (a[0], o), (bs, o)];
             let factor1 = vec![(zero, o), (a[1], o), (bs + 1, o)];
-            let nr = flock_field::QUADRATIC_NONRESIDUE;
+            let nr = QUADRATIC_NONRESIDUE;
             b.mult_lin(c, &[(pr[0], o)], &factor0);
             b.mult_lin(c + 1, &[(pr[1], o)], &factor1);
             b.mult_lin(
@@ -682,7 +689,7 @@ impl PrefixGate256 {
             c += 5;
         }
         Self {
-            ty: std::sync::Arc::new(b.build().expect("extension prefix gate")),
+            ty: Arc::new(b.build().expect("extension prefix gate")),
             pl,
             n_in,
             out: pr,
@@ -736,7 +743,7 @@ impl GateType for PrefixGate256 {
 /// from the absorbed stream, `r` from the chain squeeze; the chain of these
 /// binds rho and carries the outer gamma-combination down to `running`.
 pub(super) struct MergedRoundGate {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
 }
 
 impl MergedRoundGate {
@@ -752,7 +759,7 @@ impl MergedRoundGate {
         b.mult(6, 5, 2); // gi r^2
         b.linear(7, &[(0, o), (1, o), (4, o), (6, o)]);
         Self {
-            ty: std::sync::Arc::new(b.build().expect("merged round gate")),
+            ty: Arc::new(b.build().expect("merged round gate")),
         }
     }
 }
@@ -784,7 +791,7 @@ impl GateType for MergedRoundGate {
 /// intake (gamma-power chains, the `T0`/`V` sums, and zero-delta joins:
 /// `mac(a, b, one) = a + b` is the char-2 equality delta).
 pub(super) struct MacGate {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
 }
 
 impl MacGate {
@@ -798,7 +805,7 @@ impl MacGate {
         b.mult(3, 1, 2);
         b.linear(4, &[(0, o), (3, o)]);
         Self {
-            ty: std::sync::Arc::new(b.build().expect("mac gate")),
+            ty: Arc::new(b.build().expect("mac gate")),
         }
     }
 }
@@ -826,7 +833,7 @@ impl GateType for MacGate {
 
 /// Extension-field multiply-accumulate `out = acc + x*y`.
 pub(super) struct MacGate256 {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
 }
 
 impl MacGate256 {
@@ -837,7 +844,7 @@ impl MacGate256 {
         }
         build_mac256(&mut b, 6, Some([0, 1]), [2, 3], [4, 5]);
         Self {
-            ty: std::sync::Arc::new(b.build().expect("extension mac gate")),
+            ty: Arc::new(b.build().expect("extension mac gate")),
         }
     }
 }
@@ -877,7 +884,7 @@ impl GateType for MacGate256 {
 
 pub(super) fn emit_mac256(
     sb: &mut ShapeBuilder,
-    slot: flock_core::circuit::builder::SlotId,
+    slot: SlotId,
     acc: [Wire; 2],
     x: [Wire; 2],
     y: [Wire; 2],
@@ -888,7 +895,7 @@ pub(super) fn emit_mac256(
 
 /// One layer of the multipoint anchor's four-state boundary computation.
 pub(super) struct AssistLayerGate {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
 }
 
 pub(super) const AL_IN: usize = 9; // g0..g3, za, rb, rc, rd, one
@@ -897,7 +904,7 @@ pub(super) const AL_OUT0: usize = 49;
 impl AssistLayerGate {
     pub(super) fn new() -> Self {
         let one = F128::ONE;
-        let sparse = flock_core::pcs::jagged::assist_sparse_transitions();
+        let sparse = assist_sparse_transitions();
         let mut b = ElementTableBuilder::new(6);
         for w in 0..AL_IN {
             b.free_wire(w);
@@ -935,7 +942,7 @@ impl AssistLayerGate {
             );
         }
         Self {
-            ty: std::sync::Arc::new(b.build().expect("assist layer gate")),
+            ty: Arc::new(b.build().expect("assist layer gate")),
         }
     }
 }
@@ -951,7 +958,7 @@ impl GateType for AssistLayerGate {
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
     fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
-        let sparse = flock_core::pcs::jagged::assist_sparse_transitions();
+        let sparse = assist_sparse_transitions();
         let mut z = vec![F128::ZERO; 53];
         z[..AL_IN].copy_from_slice(&inputs[..AL_IN]);
         // z[8] is the ONE input wire the table's linear rows read — eval
@@ -998,7 +1005,7 @@ impl GateType for AssistLayerGate {
 ///   delta = g0 (1+t) + running + t g1          (must be 0)
 ///   running' = g0 (1+rho) + g1 rho + g_inf rho (1+rho)
 pub(super) struct ZcRoundGate {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
 }
 
 impl ZcRoundGate {
@@ -1018,7 +1025,7 @@ impl ZcRoundGate {
         b.mult(13, 2, 12); // gi rho(1+rho)
         b.linear(14, &[(10, o), (11, o), (13, o)]);
         Self {
-            ty: std::sync::Arc::new(b.build().expect("zc round gate")),
+            ty: Arc::new(b.build().expect("zc round gate")),
         }
     }
 }

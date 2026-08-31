@@ -55,6 +55,7 @@
 //! Rounds bind the **top** remaining variable, so the challenge list reversed is
 //! the column point LSB-first — matching the rows-low witness layout.
 
+use crate::pcs::ring_switch::build_eq_parallel;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -438,7 +439,7 @@ fn comb_vector(ty: &ElementTableType, alpha: F128, eq_con: &[F128]) -> Vec<F128>
 /// reducing per-column accumulators is the thing to try. Left simple: the
 /// milestone is 3× inside its target.
 fn partial_fold_rows(z: &[F128], r_row: &[F128]) -> Vec<F128> {
-    let eq_row = crate::pcs::ring_switch::build_eq_parallel(r_row);
+    let eq_row = build_eq_parallel(r_row);
     let rows = eq_row.len();
     debug_assert_eq!(z.len() % rows, 0);
     z.par_chunks(rows)
@@ -454,14 +455,17 @@ fn partial_fold_rows(z: &[F128], r_row: &[F128]) -> Vec<F128> {
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+    use crate::element_r1cs::ElementTableBuilder;
     use crate::element_r1cs::broadcast_add;
     use crate::element_r1cs::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
     use crate::test_rng::Rng;
     use crate::zerocheck::multilinear::eq_eval;
+    use flock_multilinear::IndexOrder;
+    use flock_multilinear::evaluate;
 
     /// Direct MLE evaluation at `point`, binding the low variable first.
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
-        flock_multilinear::evaluate(table, point, flock_multilinear::IndexOrder::LowToHigh)
+        evaluate(table, point, IndexOrder::LowToHigh)
     }
 
     /// `(Âz(r), B̂z(r))` straight from the matrices — the claims the lincheck is
@@ -690,7 +694,7 @@ mod tests {
     fn kappa_one_roundtrips() {
         let mut rng = Rng::new(31337);
         // kappa = 1: one column, a free wire (tautology row).
-        let mut b = crate::element_r1cs::ElementTableBuilder::new(1);
+        let mut b = ElementTableBuilder::new(1);
         b.free_wire(0);
         let ty = b.build().expect("free wire is valid");
         let n_log = 4usize;

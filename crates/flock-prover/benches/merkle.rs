@@ -20,6 +20,9 @@
 //!
 //! Run: `cargo bench --bench merkle`
 
+use blake3::hash;
+use flock_prover::init_perf_thread_pool;
+use std::hint::black_box;
 use std::time::Instant;
 
 use flock_prover::merkle::{HashKind, hash_leaf, merkle_tree};
@@ -90,7 +93,7 @@ fn bench_streaming(bytes: usize, kind: HashKind) {
     let once = |d: &[u8]| -> [u8; 32] {
         match kind {
             HashKind::Sha256 => Sha256::digest(d).into(),
-            HashKind::Blake3 => *blake3::hash(d).as_bytes(),
+            HashKind::Blake3 => *hash(d).as_bytes(),
         }
     };
     // Warm-up.
@@ -163,7 +166,7 @@ fn bench_merkle_tree(num_leaves: usize, leaf_size: usize, kind: HashKind) -> f64
         let t0 = Instant::now();
         let tree = merkle_tree(&data, num_leaves, kind);
         best = best.min(t0.elapsed().as_secs_f64());
-        std::hint::black_box(&tree);
+        black_box(&tree);
     }
     // Tree work = leaves + internal nodes; internal = num_leaves - 1 hashes.
     let total_hashes = (2 * num_leaves - 1) as u64;
@@ -182,7 +185,7 @@ fn bench_merkle_tree(num_leaves: usize, leaf_size: usize, kind: HashKind) -> f64
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
     println!("(target: aarch64 + sha2 — four-way HW SHA-256 path active)");
     #[cfg(all(target_arch = "x86_64", target_feature = "sha"))]

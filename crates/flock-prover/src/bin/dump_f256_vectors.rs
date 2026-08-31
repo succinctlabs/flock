@@ -12,26 +12,29 @@
 //!
 //! Run:  cargo run --release --bin dump_f256_vectors -- cuda-ghash/f256_vectors.bin
 
+use env::args;
 use std::env;
 use std::fs::File;
+use std::io::Result;
 use std::io::{BufWriter, Write};
+use std::iter::once;
 
 use flock_prover::field::{F128, F256, mul_by_x_inv};
 
 use flock_core::test_rng::Rng;
 
-fn w128(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn w128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
 
-fn w256(w: &mut impl Write, x: F256) -> std::io::Result<()> {
+fn w256(w: &mut impl Write, x: F256) -> Result<()> {
     w128(w, x.c0)?;
     w128(w, x.c1)
 }
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "f256_vectors.bin".to_string());
     let mut rng = Rng::new(0xF256_F256);
@@ -65,9 +68,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // x⁻¹ shift-and-fold.
-    let xs: Vec<F128> = std::iter::once(F128::ONE)
-        .chain((0..32).map(|_| rng.f128()))
-        .collect();
+    let xs: Vec<F128> = once(F128::ONE).chain((0..32).map(|_| rng.f128())).collect();
     w.write_all(&(xs.len() as u32).to_le_bytes())?;
     for &z in &xs {
         w128(&mut w, z)?;

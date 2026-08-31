@@ -5,13 +5,21 @@
 //! `flock_core::verifier`'s in-crate test module when the crates were split.
 
 use flock_prover::challenger::FsChallenger;
+use flock_prover::lincheck::LincheckError;
 use flock_prover::pcs::ligerito::LigeritoProfile;
 use flock_prover::pcs::{self, PcsParams};
 use flock_prover::prover::prove_ligerito;
 use flock_prover::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 use flock_prover::verifier::{self, FlockVerifyError};
+use flock_prover::zerocheck::{K_SKIP, ZerocheckError};
+use pcs::pack_witness;
+use std::sync::OnceLock;
+use verifier::verify_ligerito;
+use verifier::verify_ligerito_ag;
 
 use flock_core::test_rng::Rng;
+use flock_prover::field::F128;
+use flock_prover::prover::prove_ligerito_ag;
 
 fn identity(k: usize) -> SparseBinaryMatrix {
     SparseBinaryMatrix {
@@ -33,8 +41,8 @@ fn identity_r1cs(m: usize, k_log: usize, k_skip: usize, useful_bits: usize) -> B
         c_0: identity(1 << k_log),
         layout: WitnessLayout::RowMajor,
         const_pin: None,
-        digest_cache: std::sync::OnceLock::new(),
-        csc_cache: std::sync::OnceLock::new(),
+        digest_cache: OnceLock::new(),
+        csc_cache: OnceLock::new(),
     }
 }
 
@@ -63,12 +71,12 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
         merkle_hash: Default::default(),
     };
     let mut ch_p = FsChallenger::new(b"flock-lig-r1cs-v0");
-    let z_packed = pcs::pack_witness(&z, r1cs.m);
+    let z_packed = pack_witness(&z, r1cs.m);
     let (proof, commitment, claim_p) = prove_ligerito(&r1cs, z_packed, &pcs_params, &mut ch_p);
 
     let mut ch_v = FsChallenger::new(b"flock-lig-r1cs-v0");
     let lc_circuit = r1cs.sparse_lincheck_circuit();
-    let claim_v = verifier::verify_ligerito(
+    let claim_v = verify_ligerito(
         &r1cs,
         &commitment,
         &proof,
@@ -84,8 +92,7 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
         let mut bad = proof.clone();
         bad.lincheck.z_partial[0].lo ^= 1;
         let mut ch = FsChallenger::new(b"flock-lig-r1cs-v0");
-        let res =
-            verifier::verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch);
+        let res = verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch);
         assert!(matches!(res, Err(FlockVerifyError::Lincheck(_))));
     }
 
@@ -94,8 +101,7 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
         let mut bad = proof.clone();
         bad.pcs_open.ring_switches[0].s_hat_v[0].lo ^= 1;
         let mut ch = FsChallenger::new(b"flock-lig-r1cs-v0");
-        let res =
-            verifier::verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch);
+        let res = verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch);
         assert!(matches!(res, Err(FlockVerifyError::PcsAb(_))));
     }
 }
@@ -123,10 +129,10 @@ fn strict_fast_profile_grinds_boolean_piops() {
 
     let mut ch_p = FsChallenger::new(b"flock-strict-zc-grinding-v0");
     let (proof, commitment, claim_p) =
-        prove_ligerito(&r1cs, pcs::pack_witness(&z, r1cs.m), &pcs_params, &mut ch_p);
+        prove_ligerito(&r1cs, pack_witness(&z, r1cs.m), &pcs_params, &mut ch_p);
     assert_eq!(
         proof.zerocheck.grinding_nonces.len(),
-        2 + m - flock_prover::zerocheck::K_SKIP,
+        2 + m - K_SKIP,
         "initial + skip + every tail-round nonce"
     );
     assert_eq!(
@@ -137,7 +143,7 @@ fn strict_fast_profile_grinds_boolean_piops() {
 
     let lc_circuit = r1cs.sparse_lincheck_circuit();
     let mut ch_v = FsChallenger::new(b"flock-strict-zc-grinding-v0");
-    let claim_v = verifier::verify_ligerito(
+    let claim_v = verify_ligerito(
         &r1cs,
         &commitment,
         &proof,
@@ -152,7 +158,7 @@ fn strict_fast_profile_grinds_boolean_piops() {
     missing_nonce.zerocheck.grinding_nonces.pop();
     let mut ch_bad = FsChallenger::new(b"flock-strict-zc-grinding-v0");
     assert!(matches!(
-        verifier::verify_ligerito(
+        verify_ligerito(
             &r1cs,
             &commitment,
             &missing_nonce,
@@ -161,7 +167,7 @@ fn strict_fast_profile_grinds_boolean_piops() {
             &mut ch_bad,
         ),
         Err(FlockVerifyError::Zerocheck(
-            flock_prover::zerocheck::ZerocheckError::BadGrindingNonceCount { .. }
+            ZerocheckError::BadGrindingNonceCount { .. }
         ))
     ));
 
@@ -169,7 +175,7 @@ fn strict_fast_profile_grinds_boolean_piops() {
     missing_lincheck_nonce.lincheck.grinding_nonces.pop();
     let mut ch_bad = FsChallenger::new(b"flock-strict-zc-grinding-v0");
     assert!(matches!(
-        verifier::verify_ligerito(
+        verify_ligerito(
             &r1cs,
             &commitment,
             &missing_lincheck_nonce,
@@ -178,7 +184,7 @@ fn strict_fast_profile_grinds_boolean_piops() {
             &mut ch_bad,
         ),
         Err(FlockVerifyError::Lincheck(
-            flock_prover::lincheck::LincheckError::BadGrindingNonceCount { .. }
+            LincheckError::BadGrindingNonceCount { .. }
         ))
     ));
 }
@@ -191,9 +197,6 @@ fn strict_fast_profile_grinds_boolean_piops() {
 #[test]
 #[ignore] // Heavier — run with `cargo test r1cs_prove_verify_roundtrip_ligerito_ag -- --ignored --nocapture`
 fn r1cs_prove_verify_roundtrip_ligerito_ag() {
-    use flock_prover::field::F128;
-    use flock_prover::prover::prove_ligerito_ag;
-
     let m = 22;
     let k_log = 16;
     let k_skip = 6;
@@ -213,7 +216,7 @@ fn r1cs_prove_verify_roundtrip_ligerito_ag() {
         num_lanes: None,
         merkle_hash: Default::default(),
     };
-    let z_packed = pcs::pack_witness(&z, r1cs.m);
+    let z_packed = pack_witness(&z, r1cs.m);
     let lc_circuit = r1cs.sparse_lincheck_circuit();
 
     // Honest: prover and verifier with matching transcripts.
@@ -221,7 +224,7 @@ fn r1cs_prove_verify_roundtrip_ligerito_ag() {
     let (proof, commitment, claim_p) = prove_ligerito_ag(&r1cs, z_packed, &pcs_params, &mut ch_p);
 
     let mut ch_v = FsChallenger::new(b"flock-ag-r1cs-v0");
-    let claim_v = verifier::verify_ligerito_ag(
+    let claim_v = verify_ligerito_ag(
         &r1cs,
         &commitment,
         &proof,
@@ -238,15 +241,8 @@ fn r1cs_prove_verify_roundtrip_ligerito_ag() {
         bad.ag.multilinear_rounds[0].0 += F128::ONE;
         let mut ch = FsChallenger::new(b"flock-ag-r1cs-v0");
         assert!(
-            verifier::verify_ligerito_ag(
-                &r1cs,
-                &commitment,
-                &bad,
-                &lc_circuit,
-                &pcs_params,
-                &mut ch
-            )
-            .is_err(),
+            verify_ligerito_ag(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch)
+                .is_err(),
             "must reject a tampered AG round message"
         );
     }
@@ -258,14 +254,7 @@ fn r1cs_prove_verify_roundtrip_ligerito_ag() {
         let mut ch = FsChallenger::new(b"flock-ag-r1cs-v0");
         assert!(
             matches!(
-                verifier::verify_ligerito_ag(
-                    &r1cs,
-                    &commitment,
-                    &bad,
-                    &lc_circuit,
-                    &pcs_params,
-                    &mut ch
-                ),
+                verify_ligerito_ag(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch),
                 Err(FlockVerifyError::Ag(_))
             ),
             "must reject a tampered c-eval"
@@ -278,15 +267,8 @@ fn r1cs_prove_verify_roundtrip_ligerito_ag() {
         bad.ag.r1_nonce += 1;
         let mut ch = FsChallenger::new(b"flock-ag-r1cs-v0");
         assert!(
-            verifier::verify_ligerito_ag(
-                &r1cs,
-                &commitment,
-                &bad,
-                &lc_circuit,
-                &pcs_params,
-                &mut ch
-            )
-            .is_err(),
+            verify_ligerito_ag(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch)
+                .is_err(),
             "must reject a tampered r1 nonce"
         );
     }
@@ -298,15 +280,8 @@ fn r1cs_prove_verify_roundtrip_ligerito_ag() {
         bad.pcs_open.ring_switches[0].s_hat_v[0].lo ^= 1;
         let mut ch = FsChallenger::new(b"flock-ag-r1cs-v0");
         assert!(
-            verifier::verify_ligerito_ag(
-                &r1cs,
-                &commitment,
-                &bad,
-                &lc_circuit,
-                &pcs_params,
-                &mut ch
-            )
-            .is_err(),
+            verify_ligerito_ag(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch)
+                .is_err(),
             "must reject a tampered ring-switch s_hat_v"
         );
     }

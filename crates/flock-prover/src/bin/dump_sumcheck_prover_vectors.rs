@@ -25,8 +25,10 @@
 //! Run:
 //!   cargo run --release --bin dump_sumcheck_prover_vectors -- cuda-ghash/sumcheck_prover_vectors.bin 14
 
+use env::args;
 use std::env;
 use std::fs::File;
+use std::io::Result;
 use std::io::{BufWriter, Write};
 
 use flock_prover::field::F128;
@@ -34,7 +36,7 @@ use flock_prover::pcs::ligerito::SumcheckProver;
 
 use flock_core::test_rng::Rng;
 
-fn wf(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn wf(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
@@ -44,14 +46,11 @@ enum Op {
     IntroGlue,
 }
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "sumcheck_prover_vectors.bin".to_string());
-    let log_len: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(14);
+    let log_len: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(14);
     let len = 1usize << log_len;
 
     let mut rng = Rng::new(0xC0FFEE);

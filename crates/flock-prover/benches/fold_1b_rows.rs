@@ -6,6 +6,7 @@
 //! multi-MB suffix tensor is never streamed. Sweeps the split width `n_lo`.
 //! Best-of-N to isolate from pipeline thermal load. Honors RAYON_NUM_THREADS.
 
+use flock_prover::init_perf_thread_pool;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -110,7 +111,7 @@ fn bench_one(m: usize, n_runs: usize) {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     for &m in &[29usize, 30] {
         bench_one(m, 12);
     }

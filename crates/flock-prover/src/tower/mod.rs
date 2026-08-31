@@ -23,7 +23,6 @@
 
 use crate::challenger::FsChallenger;
 use crate::prover::{self, UnionSlotProverInput};
-use crate::r1cs_hashes::blake3;
 use crate::r1cs_hashes::merkle_r1cs::SLOT_WORDS;
 #[cfg(test)]
 use crate::r1cs_hashes::merkle_r1cs::{ChunkPathInput, MerkleTreeLayout, blake3_spec};
@@ -38,27 +37,6 @@ use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::verifier;
 use flock_field::{F128, F256};
 use flock_merkle::{self as core_merkle, HashKind};
-
-mod chain;
-mod child_walker;
-mod config;
-#[cfg(test)]
-mod e2e_tests;
-mod envelope;
-mod fl_node;
-mod fold_region;
-mod fs_chain;
-mod gates_blake3;
-mod gates_glue;
-mod gates_leaf;
-mod gates_spine;
-mod geometry;
-mod gkr;
-mod node;
-mod online;
-mod query;
-mod real_walker;
-mod tape;
 
 pub use chain::*;
 use child_walker::*;
@@ -79,3 +57,23 @@ use online::*;
 pub use query::*;
 use real_walker::*;
 use tape::*;
+mod chain;
+mod child_walker;
+mod config;
+#[cfg(test)]
+mod e2e_tests;
+mod envelope;
+mod fl_node;
+mod fold_region;
+mod fs_chain;
+mod gates_blake3;
+mod gates_glue;
+mod gates_leaf;
+mod gates_spine;
+mod geometry;
+mod gkr;
+mod node;
+mod online;
+mod query;
+mod real_walker;
+mod tape;

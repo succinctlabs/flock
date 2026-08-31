@@ -16,7 +16,9 @@
 //!
 //! Plus an end-to-end `prove_packed` run for cross-check.
 
+use flock_prover::init_perf_thread_pool;
 use std::hint::black_box;
+use std::mem::swap;
 use std::time::Instant;
 
 use flock_prover::challenger::{Challenger, FsChallenger};
@@ -31,10 +33,9 @@ use flock_prover::zerocheck::univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed, small_challenges_ghash,
 };
 
+use flock_core::test_rng::Rng;
 const K_SKIP: usize = 6;
 const N_INNER: usize = 7;
-
-use flock_core::test_rng::Rng;
 
 fn time_phase<R>(label: &str, total_ms: &mut f64, f: impl FnOnce() -> R) -> R {
     let t0 = Instant::now();
@@ -169,8 +170,8 @@ fn prove_with_phase_timing(
                         rho_prev,
                         &r_next,
                     );
-                    std::mem::swap(&mut a_mlv, &mut a_nxt);
-                    std::mem::swap(&mut b_mlv, &mut b_nxt);
+                    swap(&mut a_mlv, &mut a_nxt);
+                    swap(&mut b_mlv, &mut b_nxt);
                     a_mlv.truncate(half);
                     b_mlv.truncate(half);
                     fused_ms += t.elapsed().as_secs_f64() * 1000.0;
@@ -205,7 +206,7 @@ fn prove_with_phase_timing(
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — NEON path active)");
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]

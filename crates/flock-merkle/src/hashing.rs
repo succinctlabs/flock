@@ -3,13 +3,30 @@
 //! [`MerkleHash`] selects the hash implementation. [`HashKind`] supports runtime selection.
 //! BLAKE3 separates leaf and parent inputs. The current SHA-256 format does not.
 
+use blake3::Hasher;
+use blake3::IncrementCounter;
+use blake3::hazmat::Mode;
+use blake3::hazmat::merge_subtrees_non_root;
+use blake3::platform::Platform;
+use core::slice::from_raw_parts;
+use core::slice::from_raw_parts_mut;
+use flock_hash::Digest as HashDigest;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "sha2"),
+    all(target_arch = "x86_64", target_feature = "sha")
+))]
+use sha256x4::hash4_equal_len;
 use std::sync::OnceLock;
 
-pub type Hash = flock_hash::Digest;
-
+#[cfg(feature = "hash-count")]
+use self::hash_count::{LEAF_CALLS, LEAF_COMPRESSIONS, PAIR_CALLS, blocks};
+use blake3::hazmat::HasherExt;
 pub use flock_hash::{BLAKE3_IV, HashKind};
+#[cfg(feature = "hash-count")]
+use std::sync::atomic::Ordering::Relaxed;
+pub type Hash = HashDigest;
 
 pub trait MerkleHash: Send + Sync + 'static {
     fn hash_leaf(data: &[u8]) -> Hash;
@@ -170,14 +187,13 @@ pub mod hash_count {
 /// Non-root chaining value of one BLAKE3 leaf, of any length.
 #[inline]
 pub(crate) fn blake3_leaf_cv(data: &[u8]) -> Hash {
-    use blake3::hazmat::HasherExt;
-    blake3::Hasher::new().update(data).finalize_non_root()
+    Hasher::new().update(data).finalize_non_root()
 }
 
 /// BLAKE3 parent-node chaining value of two children.
 #[inline]
 pub(crate) fn blake3_parent_cv(left: &Hash, right: &Hash) -> Hash {
-    blake3::hazmat::merge_subtrees_non_root(left, right, blake3::hazmat::Mode::Hash)
+    merge_subtrees_non_root(left, right, Mode::Hash)
 }
 
 /// Hash one leaf of arbitrary byte length.
@@ -185,9 +201,8 @@ pub(crate) fn blake3_parent_cv(left: &Hash, right: &Hash) -> Hash {
 pub fn hash_leaf(data: &[u8], kind: HashKind) -> Hash {
     #[cfg(feature = "hash-count")]
     {
-        use std::sync::atomic::Ordering::Relaxed;
-        hash_count::LEAF_CALLS.fetch_add(1, Relaxed);
-        hash_count::LEAF_COMPRESSIONS.fetch_add(hash_count::blocks(kind, data.len()), Relaxed);
+        LEAF_CALLS.fetch_add(1, Relaxed);
+        LEAF_COMPRESSIONS.fetch_add(blocks(kind, data.len()), Relaxed);
     }
     match kind {
         HashKind::Sha256 => Sha256::digest(data).into(),
@@ -199,7 +214,7 @@ pub fn hash_leaf(data: &[u8], kind: HashKind) -> Hash {
 #[inline]
 pub fn hash_pair(left: &Hash, right: &Hash, kind: HashKind) -> Hash {
     #[cfg(feature = "hash-count")]
-    hash_count::PAIR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PAIR_CALLS.fetch_add(1, Relaxed);
     match kind {
         HashKind::Sha256 => {
             let mut h = Sha256::new();
@@ -222,7 +237,7 @@ pub fn hash_pair(left: &Hash, right: &Hash, kind: HashKind) -> Hash {
 ))]
 #[inline]
 fn sha256_hash4(inputs: [&[u8]; 4], outs: &mut [Hash]) {
-    sha256x4::hash4_equal_len(inputs, outs);
+    hash4_equal_len(inputs, outs);
 }
 
 #[cfg(not(any(
@@ -258,9 +273,9 @@ const BLAKE3_PARENT: u8 = 4;
 
 /// Cached SIMD platform. `Platform::detect()` is cheap but not free, and the
 /// tree build reaches the batched path once per [`BLAKE3_BATCH`] nodes.
-fn blake3_platform() -> blake3::platform::Platform {
-    static PLATFORM: OnceLock<blake3::platform::Platform> = OnceLock::new();
-    *PLATFORM.get_or_init(blake3::platform::Platform::detect)
+fn blake3_platform() -> Platform {
+    static PLATFORM: OnceLock<Platform> = OnceLock::new();
+    *PLATFORM.get_or_init(Platform::detect)
 }
 
 /// Inputs handed to `hash_many` per call.
@@ -307,12 +322,12 @@ fn blake3_hash_many<const N: usize>(
         // initialized, contiguous, unpadded storage — the amount `hash_many`
         // writes for `n` inputs.
         let out_bytes: &mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
+            unsafe { from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
         plat.hash_many(
             &inputs[..n],
             &BLAKE3_IV,
             0,
-            blake3::IncrementCounter::No,
+            IncrementCounter::No,
             flags,
             flags_start,
             flags_end,
@@ -371,12 +386,8 @@ pub(crate) fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
 fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     {
-        use std::sync::atomic::Ordering::Relaxed;
-        hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
-        hash_count::LEAF_COMPRESSIONS.fetch_add(
-            out.len() as u64 * hash_count::blocks(kind, leaf_size),
-            Relaxed,
-        );
+        LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
+        LEAF_COMPRESSIONS.fetch_add(out.len() as u64 * blocks(kind, leaf_size), Relaxed);
     }
     match kind {
         HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
@@ -427,11 +438,10 @@ const BLAKE3_GROUP: usize = 1024;
 /// wide lower levels fan out.
 fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
-    hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    PAIR_CALLS.fetch_add(write.len() as u64, Relaxed);
     // SAFETY: `Hash` is `[u8; 32]`, so a slice of `n` hashes is exactly `32n`
     // initialized bytes with no padding.
-    let read_bytes: &[u8] =
-        unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
+    let read_bytes: &[u8] = unsafe { from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
     const SERIAL_LEVEL_NODES: usize = 1024;
     let serial = write.len() <= SERIAL_LEVEL_NODES;
 

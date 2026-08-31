@@ -17,10 +17,25 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+use crate::field::F128;
+use rayon::ThreadPoolBuilder;
+use rayon::current_num_threads;
+use std::alloc::Layout;
+use std::alloc::alloc_zeroed;
+use std::alloc::handle_alloc_error;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
+use std::env::var;
+#[cfg(target_os = "linux")]
+use std::fs::read_dir;
+#[cfg(target_os = "linux")]
+use std::fs::read_to_string;
+use std::process::Command;
+use std::str::from_utf8;
 use std::sync::OnceLock;
+use std::thread::available_parallelism;
 
+pub use flock_parallel::all_core_pool;
 pub mod aggregate;
 pub mod bits;
 pub mod challenger;
@@ -65,11 +80,11 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
-    if std::env::var("RAYON_NUM_THREADS").is_ok() {
+    if var("RAYON_NUM_THREADS").is_ok() {
         return None;
     }
     let n = perf_core_count();
-    match rayon::ThreadPoolBuilder::new()
+    match ThreadPoolBuilder::new()
         .num_threads(n)
         // 8 MB workers (default 2 MB): the prover's kernels carry large NEON
         // frames (bitslice planes, encode/product scratch, unreduced
@@ -83,8 +98,6 @@ pub fn init_perf_thread_pool() -> Option<usize> {
         Err(_) => None, // pool already built
     }
 }
-
-pub use flock_parallel::all_core_pool;
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
@@ -118,8 +131,8 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
 }
 
 /// Compatibility shim — same as `alloc_uninit_vec::<F128>(n)`.
-pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<crate::field::F128> {
-    alloc_uninit_vec::<crate::field::F128>(n)
+pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<F128> {
+    alloc_uninit_vec::<F128>(n)
 }
 
 /// At/above this round width (in summed elements) a sumcheck round uses the full
@@ -135,7 +148,7 @@ pub(crate) const SUMCHECK_PAR_THRESHOLD: usize = 1 << 12;
 /// 8-P-core M-series; the √-shape is machine-independent, only the constant
 /// shifts, so it degrades gracefully.
 pub(crate) fn round_fanout(pairs: usize) -> usize {
-    (pairs / 128).isqrt().clamp(1, rayon::current_num_threads())
+    (pairs / 128).isqrt().clamp(1, current_num_threads())
 }
 
 /// Rayon `with_min_len` value for parallelising a sumcheck round of `pairs`
@@ -165,9 +178,9 @@ pub(crate) fn sumcheck_round_min_len(pairs: usize, n_blocks: usize) -> Option<us
 pub(crate) const FOLD_PAR_THRESHOLD_DEFAULT: usize = 1 << 16;
 
 pub(crate) fn fold_par_threshold() -> usize {
-    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static GATE: OnceLock<usize> = OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("FLOCK_FOLD_GATE")
+        var("FLOCK_FOLD_GATE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(FOLD_PAR_THRESHOLD_DEFAULT)
@@ -185,7 +198,7 @@ pub(crate) fn fold_min_len(half: usize) -> Option<usize> {
     if half >= fold_par_threshold() {
         Some(1)
     } else if fold_sqrt_rule() {
-        match (half / 1024).isqrt().clamp(1, rayon::current_num_threads()) {
+        match (half / 1024).isqrt().clamp(1, current_num_threads()) {
             0 | 1 => None,
             t => Some(half.div_ceil(t)),
         }
@@ -201,8 +214,8 @@ pub(crate) fn fold_min_len(half: usize) -> Option<usize> {
 /// Serial execution reduced the fold phase from about 5.0 ms to 4.6 ms at
 /// μ=20 on an M4 Max. The option remains available for machine-specific tuning.
 pub(crate) fn fold_sqrt_rule() -> bool {
-    static RULE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *RULE.get_or_init(|| std::env::var("FLOCK_FOLD_RULE").is_ok_and(|v| v == "sqrt"))
+    static RULE: OnceLock<bool> = OnceLock::new();
+    *RULE.get_or_init(|| var("FLOCK_FOLD_RULE").is_ok_and(|v| v == "sqrt"))
 }
 
 /// Types whose all-zero bit pattern is a valid, initialized value.
@@ -222,7 +235,7 @@ unsafe impl Zeroable for u16 {}
 unsafe impl Zeroable for u32 {}
 unsafe impl Zeroable for u64 {}
 unsafe impl Zeroable for usize {}
-unsafe impl Zeroable for field::F128 {}
+unsafe impl Zeroable for F128 {}
 unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
 
 /// A length-`n` all-zero vector from `alloc_zeroed` — LAZY zero pages from
@@ -235,16 +248,16 @@ pub fn alloc_zeroed_vec<T: Zeroable>(n: usize) -> Vec<T> {
     if n == 0 {
         return Vec::new();
     }
-    let layout = std::alloc::Layout::array::<T>(n).expect("allocation size overflows");
+    let layout = Layout::array::<T>(n).expect("allocation size overflows");
     // SAFETY:
     // - `alloc_zeroed` returns `n * size_of::<T>()` zeroed bytes with the
     //   layout's alignment (or null, handled below).
     // - T: Copy (no Drop), and `T: Zeroable` certifies the all-zero bit
     //   pattern is a valid T.
     unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
+        let ptr = alloc_zeroed(layout) as *mut T;
         if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
+            handle_alloc_error(layout);
         }
         Vec::from_raw_parts(ptr, n, n)
     }
@@ -271,10 +284,10 @@ pub(crate) fn perf_core_count_cached() -> usize {
 fn perf_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("sysctl")
+        if let Ok(out) = Command::new("sysctl")
             .args(["-n", "hw.perflevel0.physicalcpu"])
             .output()
-            && let Ok(s) = std::str::from_utf8(&out.stdout)
+            && let Ok(s) = from_utf8(&out.stdout)
             && let Ok(n) = s.trim().parse::<usize>()
             && n > 0
         {
@@ -286,15 +299,11 @@ fn perf_core_count() -> usize {
         if let Some(n) = linux_physical_cores()
             && n > 0
         {
-            let available = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
+            let available = available_parallelism().map(|n| n.get()).unwrap_or(1);
             return n.min(available);
         }
     }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 /// Count distinct physical cores via `/sys` topology: one entry per unique
@@ -303,7 +312,7 @@ fn perf_core_count() -> usize {
 #[cfg(target_os = "linux")]
 fn linux_physical_cores() -> Option<usize> {
     let mut cores: HashSet<(String, String)> = HashSet::new();
-    for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()? {
+    for entry in read_dir("/sys/devices/system/cpu").ok()? {
         let Ok(entry) = entry else {
             continue;
         };
@@ -316,8 +325,8 @@ fn linux_physical_cores() -> Option<usize> {
             continue; // skip "cpufreq", "cpuidle", etc.
         }
         let topo = path.join("topology");
-        let core_id = std::fs::read_to_string(topo.join("core_id")).ok();
-        let pkg = std::fs::read_to_string(topo.join("physical_package_id")).ok();
+        let core_id = read_to_string(topo.join("core_id")).ok();
+        let pkg = read_to_string(topo.join("physical_package_id")).ok();
         if let (Some(c), Some(p)) = (core_id, pkg) {
             cores.insert((p.trim().to_owned(), c.trim().to_owned()));
         }
@@ -335,10 +344,10 @@ fn linux_physical_cores() -> Option<usize> {
 fn efficiency_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("sysctl")
+        if let Ok(out) = Command::new("sysctl")
             .args(["-n", "hw.perflevel1.physicalcpu"])
             .output()
-            && let Ok(s) = std::str::from_utf8(&out.stdout)
+            && let Ok(s) = from_utf8(&out.stdout)
             && let Ok(n) = s.trim().parse::<usize>()
         {
             return n;
@@ -363,7 +372,6 @@ fn efficiency_core_count() -> usize {
 pub(crate) fn ecore_rich_topology() -> bool {
     static B: OnceLock<bool> = OnceLock::new();
     *B.get_or_init(|| {
-        std::env::var("FLOCK_ALLCORE").is_ok()
-            || 2 * efficiency_core_count() >= perf_core_count_cached()
+        var("FLOCK_ALLCORE").is_ok() || 2 * efficiency_core_count() >= perf_core_count_cached()
     })
 }

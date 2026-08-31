@@ -13,6 +13,9 @@
 //! systematic "value" coordinates are the raw witness product; the verifier
 //! reconstructs them from the zerocheck identity, so they are not emitted here.
 
+use super::slp_derived::encode_slp_derived;
+use crate::zerocheck::cleanse_block;
+use rayon::current_num_threads;
 use rayon::prelude::*;
 
 use crate::field::{F128, F256Unreduced};
@@ -21,6 +24,7 @@ use std::sync::OnceLock;
 
 use super::messages::BaseMessage;
 use super::product::extended_base_product_message;
+use crate::zerocheck::BlockCoverage;
 
 #[inline(always)]
 unsafe fn product_bs(
@@ -464,7 +468,7 @@ pub fn round1_slp_packed(
     crate::suboptimal_path!("unfused SLP round-1", "round1_slp_packed_banks_fused");
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
-    let nthreads = rayon::current_num_threads().max(1);
+    let nthreads = current_num_threads().max(1);
     let chunk0 = n.div_ceil(8 * nthreads).max(1); // ~8 chunks/thread
     let chunk = chunk0 + (chunk0 & 1); // even, so the block-pair loop tiles each chunk exactly
     let nchunks = n.div_ceil(chunk);
@@ -576,8 +580,8 @@ unsafe fn process_block(
     let ap: &[uint8x16_t; 64] = (&pab[0..64]).try_into().unwrap();
     let bp: &[uint8x16_t; 64] = (&pab[64..128]).try_into().unwrap();
     unsafe {
-        super::slp_derived::encode_slp_derived(ap, af);
-        super::slp_derived::encode_slp_derived(bp, bf);
+        encode_slp_derived(ap, af);
+        encode_slp_derived(bp, bf);
         product_bs(af, bf, ap, bp, prod);
         fold_bs(prod, eq_o, res);
         fold_c(cp, eq_o, wbar);
@@ -602,8 +606,8 @@ unsafe fn process_block_fused(
     let ap: &[uint8x16_t; 64] = (&pab[0..64]).try_into().unwrap();
     let bp: &[uint8x16_t; 64] = (&pab[64..128]).try_into().unwrap();
     unsafe {
-        super::slp_derived::encode_slp_derived(ap, af);
-        super::slp_derived::encode_slp_derived(bp, bf);
+        encode_slp_derived(ap, af);
+        encode_slp_derived(bp, bf);
         product_fold_bs(af, bf, ap, bp, eq_o, res);
     }
 }
@@ -662,8 +666,8 @@ unsafe fn process_block_banks(
     let ap: &[uint8x16_t; 64] = (&pab[0..64]).try_into().unwrap();
     let bp: &[uint8x16_t; 64] = (&pab[64..128]).try_into().unwrap();
     unsafe {
-        super::slp_derived::encode_slp_derived(ap, af);
-        super::slp_derived::encode_slp_derived(bp, bf);
+        encode_slp_derived(ap, af);
+        encode_slp_derived(bp, bf);
         product_bs(af, bf, ap, bp, prod);
         fold_bs(prod, eq_o, res);
         fold_c_banks(cp, eq_o, bank0, bank1);
@@ -684,7 +688,7 @@ pub fn round1_slp_packed_banks(
     crate::suboptimal_path!("unfused banks round-1", "round1_slp_packed_banks_fused");
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
-    let nthreads = rayon::current_num_threads().max(1);
+    let nthreads = current_num_threads().max(1);
     let chunk0 = n.div_ceil(8 * nthreads).max(1);
     let chunk = chunk0 + (chunk0 & 1);
     let nchunks = n.div_ceil(chunk);
@@ -844,7 +848,7 @@ pub fn round1_slp_packed_banks_fused(
 ) -> ([F128; 160], [F128; 64], [F128; 64]) {
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
-    let nthreads = rayon::current_num_threads().max(1);
+    let nthreads = current_num_threads().max(1);
     let chunk0 = n.div_ceil(8 * nthreads).max(1);
     let chunk = chunk0 + (chunk0 & 1);
     let nchunks = n.div_ceil(chunk);
@@ -956,9 +960,8 @@ pub fn round1_slp_packed_banks_fused_padded(
     b_packed: &[u8],
     c_packed: &[u8],
     eq: &[F128],
-    coverage: &[crate::zerocheck::BlockCoverage],
+    coverage: &[BlockCoverage],
 ) -> ([F128; 160], [F128; 64], [F128; 64]) {
-    use crate::zerocheck::BlockCoverage;
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
     assert_eq!(coverage.len(), n, "one coverage entry per block");
@@ -967,7 +970,7 @@ pub fn round1_slp_packed_banks_fused_padded(
         .map(|o| o as u32)
         .collect();
     let nl = live.len();
-    let nthreads = rayon::current_num_threads().max(1);
+    let nthreads = current_num_threads().max(1);
     let chunk0 = nl.div_ceil(8 * nthreads).max(1);
     let chunk = chunk0 + (chunk0 & 1);
     let nchunks = nl.div_ceil(chunk);
@@ -1074,9 +1077,9 @@ pub fn round1_slp_packed_banks_fused_padded(
                         let mut a_buf = [0u8; 1024];
                         let mut b_buf = [0u8; 1024];
                         let mut c_buf = [0u8; 1024];
-                        crate::zerocheck::cleanse_block(a_packed, o * 1024, ranges, &mut a_buf);
-                        crate::zerocheck::cleanse_block(b_packed, o * 1024, ranges, &mut b_buf);
-                        crate::zerocheck::cleanse_block(c_packed, o * 1024, ranges, &mut c_buf);
+                        cleanse_block(a_packed, o * 1024, ranges, &mut a_buf);
+                        cleanse_block(b_packed, o * 1024, ranges, &mut b_buf);
+                        cleanse_block(c_packed, o * 1024, ranges, &mut c_buf);
                         single(
                             &a_buf, &b_buf, &c_buf, 0, eq[o], &mut af, &mut bf, &mut pab, &mut res,
                             &mut bank0, &mut bank1,
@@ -1131,8 +1134,12 @@ fn bitslice_block_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::write;
 
+    use crate::genus95_curve_code::product::extended_base_product_message;
+    use crate::genus95_curve_code::{BaseMessage, product_code_message};
     use crate::test_rng::Rng;
+    use std::collections::{BTreeSet, HashMap};
 
     /// Derive the by-point fresh encode `M` from the M2 evaluator's OWN extension
     /// (`extended_base_product_message`), so the kernel speaks the evaluator's
@@ -1145,9 +1152,6 @@ mod tests {
     /// evaluator reconciles them.
     #[test]
     fn m_derived_from_evaluator_is_identity_bridge() {
-        use crate::genus95_curve_code::product::extended_base_product_message;
-        use crate::genus95_curve_code::{BaseMessage, product_code_message};
-
         let mut m_eval = [0u64; 160];
         for j in 0..64 {
             let ext = extended_base_product_message(BaseMessage(1u64 << j));
@@ -1305,7 +1309,6 @@ mod tests {
     #[ignore]
     #[test]
     fn _generate_slp_derived() {
-        use std::collections::{BTreeSet, HashMap};
         let m = derived_m();
         // Rows over signals; signals 0..64 are the inputs. Paar repeatedly pulls
         // out the most-common co-occurring pair into a new signal (one XOR gate).
@@ -1400,7 +1403,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/src/genus95_curve_code/slp_derived.rs"
         );
-        std::fs::write(path, src).expect("write slp_derived.rs");
+        write(path, src).expect("write slp_derived.rs");
         eprintln!("wrote {path}");
     }
 }

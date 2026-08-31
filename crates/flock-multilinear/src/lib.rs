@@ -2,6 +2,7 @@
 
 use rayon::prelude::*;
 use std::mem::MaybeUninit;
+use std::mem::forget;
 use std::ops::{Add, Mul};
 
 /// Maps point coordinates to bits in a multilinear table index.
@@ -86,7 +87,7 @@ where
         let pointer = table.as_mut_ptr().cast::<T>();
         let len = table.len();
         let capacity = table.capacity();
-        std::mem::forget(table);
+        forget(table);
         Vec::from_raw_parts(pointer, len, capacity)
     }
 }
@@ -135,6 +136,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::array::from_fn;
     use std::ops::{Add, Mul};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,7 +240,7 @@ mod tests {
         let point = [F8(2), F8(3), F8(5)];
         let table = eq_table(&point, ONE, IndexOrder::LowToHigh);
         for index in 0..table.len() {
-            let index_point: [F8; 3] = std::array::from_fn(|bit| F8(((index >> bit) & 1) as u8));
+            let index_point: [F8; 3] = from_fn(|bit| F8(((index >> bit) & 1) as u8));
             assert_eq!(eq_eval(&point, &index_point, ONE), table[index]);
         }
     }

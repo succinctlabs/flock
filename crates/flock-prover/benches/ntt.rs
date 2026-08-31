@@ -13,6 +13,7 @@
 //!
 //! Run: `cargo bench --bench ntt`
 
+use flock_prover::init_perf_thread_pool;
 use std::time::Instant;
 
 use flock_prover::field::F128;
@@ -158,7 +159,7 @@ fn header(name: &str) {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — PMULL path active)");
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]

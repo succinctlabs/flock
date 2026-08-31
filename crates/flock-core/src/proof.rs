@@ -5,20 +5,28 @@
 //! produces these structs; the verifier consumes them.
 
 use crate::challenger::Challenger;
+use crate::circuit::WiringProof;
+use crate::element_r1cs::union::Claims;
+use crate::element_r1cs::union::Proof;
 use crate::field::F128;
 use crate::lincheck::{self, QuirkyPoint};
 use crate::pcs::{self, Commitment};
 use crate::r1cs::BlockR1cs;
 use crate::zerocheck;
+use lincheck::LincheckProof;
+use pcs::BatchOpeningProofLigerito;
+use pcs::MergedOpenProof;
 use serde::{Deserialize, Serialize};
+use zerocheck::ZerocheckProof;
+use zerocheck::ag_skip::AgProof;
 
 /// Top-level R1CS proof: zerocheck + lincheck transcripts, plus one batched
 /// Ligerito PCS opening covering both the `ab` and `c` z-claims.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct R1csProofLigerito {
-    pub zerocheck: zerocheck::ZerocheckProof,
-    pub lincheck: lincheck::LincheckProof,
-    pub pcs_open: pcs::BatchOpeningProofLigerito,
+    pub zerocheck: ZerocheckProof,
+    pub lincheck: LincheckProof,
+    pub pcs_open: BatchOpeningProofLigerito,
 }
 
 /// Top-level R1CS proof with the **AG-skip** zerocheck + Ligerito PCS backend.
@@ -30,9 +38,9 @@ pub struct R1csProofLigerito {
 /// via the unchanged RS path with AG base-code skip weights.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct R1csProofLigeritoAg {
-    pub ag: zerocheck::ag_skip::AgProof,
-    pub lincheck: lincheck::LincheckProof,
-    pub pcs_open: pcs::BatchOpeningProofLigerito,
+    pub ag: AgProof,
+    pub lincheck: LincheckProof,
+    pub pcs_open: BatchOpeningProofLigerito,
 }
 
 /// R1CS proof with a merged jagged and ring-switch opening.
@@ -40,9 +48,9 @@ pub struct R1csProofLigeritoAg {
 /// The PIOP subproofs match [`R1csProofLigerito`]. The opening transport differs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csProofMergedLigerito {
-    pub zerocheck: zerocheck::ZerocheckProof,
-    pub lincheck: lincheck::LincheckProof,
-    pub pcs_open: pcs::MergedOpenProof,
+    pub zerocheck: ZerocheckProof,
+    pub lincheck: LincheckProof,
+    pub pcs_open: MergedOpenProof,
 }
 
 /// A **mixed-class** union proof over the MERGED (Frobenius) transport: the
@@ -59,8 +67,8 @@ pub struct R1csProofMixedClassMerged {
     /// Boolean zerocheck + lincheck over the `M_bool` prefix subcube.
     pub boolean: Option<BooleanPiopProof>,
     /// The element-region zerocheck + lincheck.
-    pub element: Option<crate::element_r1cs::union::Proof>,
-    pub pcs_open: pcs::MergedOpenProof,
+    pub element: Option<Proof>,
+    pub pcs_open: MergedOpenProof,
 }
 
 /// A **circuit** proof over the MERGED (Frobenius) transport — a
@@ -75,17 +83,17 @@ pub struct R1csProofMixedClassMerged {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csProofCircuitMerged {
     pub boolean: Option<BooleanPiopProof>,
-    pub element: Option<crate::element_r1cs::union::Proof>,
-    pub wiring: crate::circuit::WiringProof,
-    pub pcs_open: pcs::MergedOpenProof,
+    pub element: Option<Proof>,
+    pub wiring: WiringProof,
+    pub pcs_open: MergedOpenProof,
 }
 
 /// The boolean class's two PIOP sub-proofs, as they appear inside
 /// [`R1csProofMixedClassMerged`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BooleanPiopProof {
-    pub zerocheck: zerocheck::ZerocheckProof,
-    pub lincheck: lincheck::LincheckProof,
+    pub zerocheck: ZerocheckProof,
+    pub lincheck: LincheckProof,
 }
 
 /// [`BooleanPiopProof`] with the **AG-skip** zerocheck: the genus-95 AG
@@ -101,8 +109,8 @@ pub struct BooleanPiopProof {
 /// full region and need honestly zero padding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BooleanPiopProofAg {
-    pub ag: zerocheck::ag_skip::AgProof,
-    pub lincheck: lincheck::LincheckProof,
+    pub ag: AgProof,
+    pub lincheck: LincheckProof,
 }
 
 /// [`R1csProofMergedLigerito`] with the **AG-skip** boolean zerocheck — the
@@ -112,7 +120,7 @@ pub struct BooleanPiopProofAg {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csProofMergedLigeritoAg {
     pub boolean: BooleanPiopProofAg,
-    pub pcs_open: pcs::MergedOpenProof,
+    pub pcs_open: MergedOpenProof,
 }
 
 /// [`R1csProofCircuitMerged`] with the **AG-skip** boolean zerocheck — the
@@ -124,9 +132,9 @@ pub struct R1csProofMergedLigeritoAg {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csProofCircuitMergedAg {
     pub boolean: Option<BooleanPiopProofAg>,
-    pub element: Option<crate::element_r1cs::union::Proof>,
-    pub wiring: crate::circuit::WiringProof,
-    pub pcs_open: pcs::MergedOpenProof,
+    pub element: Option<Proof>,
+    pub wiring: WiringProof,
+    pub pcs_open: MergedOpenProof,
 }
 
 /// The claims a verified mixed-class union proof leaves behind, per class.
@@ -136,7 +144,7 @@ pub struct UnionClassClaims {
     pub boolean: Option<R1csClaim>,
     /// Element C + LC, in union word coordinates — `None` when the registry
     /// has no element types.
-    pub element: Option<crate::element_r1cs::union::Claims>,
+    pub element: Option<Claims>,
 }
 
 /// A claim of the form `ẑ(point) = value` for the witness `z`.

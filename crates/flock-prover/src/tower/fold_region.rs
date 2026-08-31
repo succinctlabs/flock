@@ -1,6 +1,13 @@
 use super::*;
-use flock_core::matrix_fold::{JaggedRowWeight, MatrixClaim, Weight};
-use flock_transcript::transcript_record::TranscriptOp as Op;
+use crate::r1cs_hashes::fs_chain::FsChainTrace;
+use flock_core::{
+    circuit::builder::SlotId,
+    genus95_curve_code::{EvaluationPoint, SAMPLE_ATTEMPT_BUDGET, base_evaluation_functional},
+    matrix_fold::{FoldProof, JaggedClaim, JaggedRowWeight, MatrixClaim, Weight},
+    zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET,
+};
+use flock_transcript::transcript_record::{TranscriptOp, TranscriptOp as Op};
+use std::iter::repeat_n;
 
 /// One absorbed claim's stream ordinals on a fold tape: the four weight
 /// slices and the value, in absorb order.
@@ -56,8 +63,8 @@ pub(super) struct FoldPub {
 /// Width-driven, so mixed low widths and any claim count pin themselves.
 pub(super) fn fold_region_ops(
     cfg: TowerConfig,
-    fold_claims: &[Vec<flock_core::matrix_fold::MatrixClaim>],
-) -> Vec<flock_transcript::transcript_record::TranscriptOp> {
+    fold_claims: &[Vec<MatrixClaim>],
+) -> Vec<TranscriptOp> {
     let mut want: Vec<Op> = Vec::new();
     let grinding = tower_fold_grinding(cfg);
     for cs in fold_claims {
@@ -117,8 +124,8 @@ pub(super) fn fold_region_ops(
 /// jagged groups assert exhaustion themselves via
 /// [`assert_fold_tape_exhausted`].
 pub(super) fn locate_and_pin_folds(
-    fold_claims: &[Vec<flock_core::matrix_fold::MatrixClaim>],
-    fold_proofs: &[&flock_core::matrix_fold::FoldProof],
+    fold_claims: &[Vec<MatrixClaim>],
+    fold_proofs: &[&FoldProof],
     vals_rec: &[F128],
     _chals: &[F128],
 ) -> (Vec<FoldLoc>, usize, usize) {
@@ -225,9 +232,7 @@ pub(super) fn locate_and_pin_folds(
 /// Map every challenge ordinal to the transcript finalization and output-word
 /// offset that emitted it. Grinding adds finalizations without challenges,
 /// while vector squeezes emit several challenge words from one finalization.
-pub(super) fn challenge_word_locs(
-    ops: &[flock_transcript::transcript_record::TranscriptOp],
-) -> Vec<(usize, usize)> {
+pub(super) fn challenge_word_locs(ops: &[TranscriptOp]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut fin = 0usize;
     for op in ops {
@@ -251,7 +256,7 @@ pub(super) fn replay_fold_endpoints(
     locs: &[FoldLoc],
     vals_rec: &[F128],
     chals: &[F128],
-) -> Vec<flock_core::matrix_fold::MatrixClaim> {
+) -> Vec<MatrixClaim> {
     let replay_rounds = |target: F128, base: usize, ch0: usize, n: usize| -> (F128, Vec<F128>) {
         let mut run = target;
         let mut rho = Vec::with_capacity(n);
@@ -330,13 +335,13 @@ pub(super) fn replay_fold_endpoints(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_fold_region(
     sb: &mut ShapeBuilder,
-    macs: flock_core::circuit::builder::SlotId,
-    mrs: flock_core::circuit::builder::SlotId,
-    pfslot: flock_core::circuit::builder::SlotId,
+    macs: SlotId,
+    mrs: SlotId,
+    pfslot: SlotId,
     pf_w: usize,
-    leslot: flock_core::circuit::builder::SlotId,
+    leslot: SlotId,
     locs: &[FoldLoc],
-    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &FsChainTrace,
     challenge_locs: &[(usize, usize)],
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
@@ -361,11 +366,11 @@ pub(super) fn emit_fold_region(
             for (a, _) in chunk {
                 g_in.push(*a);
             }
-            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
             for (_, b) in chunk {
                 g_in.push(*b);
             }
-            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
             g_in.push(ow);
             s = sb.gate(pfslot, &g_in)[0];
         }
@@ -536,7 +541,7 @@ pub(super) fn read_acc_entry(
     keyed: bool,
     k_col: usize,
     k_row: usize,
-) -> ([F128; 2], flock_core::matrix_fold::MatrixClaim) {
+) -> ([F128; 2], MatrixClaim) {
     let key = if keyed {
         *p += 2;
         [public[*p - 2], public[*p - 1]]
@@ -580,83 +585,26 @@ pub(super) fn check_ag_skip_publics(
     let nonce_word = public[base + 2];
     assert_eq!(nonce_word.hi, 0, "the nonce word's high half is zero");
     let budget = match ag_r1_bits {
-        Some(_) => flock_core::zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET,
-        None => flock_core::genus95_curve_code::SAMPLE_ATTEMPT_BUDGET,
+        Some(_) => R1_FUSED_ATTEMPT_BUDGET,
+        None => SAMPLE_ATTEMPT_BUDGET,
     };
     assert!(
         nonce_word.lo < u64::from(budget),
         "the nonce is inside the schedule's scan budget"
     );
-    let pt = flock_core::genus95_curve_code::EvaluationPoint {
+    let pt = EvaluationPoint {
         x: public[base + 3],
         y: public[base + 4],
         z1: public[base + 5],
         z2: public[base + 6],
         z3: public[base + 7],
     };
-    let bf = flock_core::genus95_curve_code::base_evaluation_functional(&pt)
-        .expect("the base functional exists at a decoded point");
+    let bf =
+        base_evaluation_functional(&pt).expect("the base functional exists at a decoded point");
     for j in 0..64 {
         assert_eq!(public[base + 8 + j], bf[j], "published AG row low {j}");
     }
     72
-}
-
-/// The checker rejects every surface its two items cover: a non-native
-/// nonce word (high half set, or low half past the scan budget), a
-/// tampered point coordinate, and a tampered row low. The honest block
-/// passes and consumes exactly 72 words. (Seed and decode tampers are
-/// IN-CIRCUIT since phase D — `emit_ag_point_binding` — and are outside
-/// this checker's coverage by design.)
-#[test]
-pub(super) fn ag_skip_publics_checker_rejects_tampers() {
-    use flock_core::genus95_curve_code::{
-        base_evaluation_functional, evaluation_point_from_nonce_pow,
-    };
-    use flock_core::zerocheck::ag_skip::{R1_FUSED_ATTEMPT_BUDGET, R1_POW_BITS};
-    let (s0, s1) = (F128::new(0xA6, 0x51), F128::new(0x1F, 0xB3));
-    let seed = ag_seed_bytes(s0, s1);
-    let (nonce, pt) = (0..R1_FUSED_ATTEMPT_BUDGET)
-        .find_map(|n| {
-            evaluation_point_from_nonce_pow(&seed, n, HashKind::Blake3, R1_POW_BITS).map(|p| (n, p))
-        })
-        .expect("a valid fused nonce exists in the budget");
-    let bf = base_evaluation_functional(&pt).expect("the functional exists at a sampled point");
-    let base = 3usize; // the checker walks from an arbitrary base
-    let mut public = vec![F128::ZERO; base];
-    public.extend([s0, s1, F128::new(u64::from(nonce), 0)]);
-    public.extend([pt.x, pt.y, pt.z1, pt.z2, pt.z3]);
-    public.extend((0..64).map(|j| bf[j]));
-    assert_eq!(
-        check_ag_skip_publics(&public, base, Some(R1_POW_BITS)),
-        72,
-        "the honest block passes"
-    );
-
-    let rejects = |mutate: &dyn Fn(&mut [F128])| -> bool {
-        let mut bad = public.clone();
-        mutate(&mut bad);
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            check_ag_skip_publics(&bad, base, Some(R1_POW_BITS))
-        }))
-        .is_err()
-    };
-    assert!(
-        rejects(&|p| p[base + 2] = F128::new(u64::from(nonce), 1)),
-        "a set nonce high half is rejected"
-    );
-    assert!(
-        rejects(&|p| p[base + 2] = F128::new(u64::from(R1_FUSED_ATTEMPT_BUDGET), 0)),
-        "an out-of-budget nonce is rejected"
-    );
-    assert!(
-        rejects(&|p| p[base + 4] += F128::ONE),
-        "tampered point coord"
-    );
-    assert!(
-        rejects(&|p| p[base + 8 + 17] += F128::ONE),
-        "tampered row low"
-    );
 }
 
 /// Walk the published fold blocks from `tail0`: both endpoint deltas zero
@@ -671,11 +619,7 @@ pub(super) fn check_fold_publics(
     locs: &[FoldLoc],
     alpha_recs: &[AlphaRec],
     keyed_from: usize,
-) -> (
-    Vec<flock_core::matrix_fold::MatrixClaim>,
-    Vec<[F128; 2]>,
-    usize,
-) {
+) -> (Vec<MatrixClaim>, Vec<[F128; 2]>, usize) {
     let width = |i: usize, l: &FoldLoc| 2 + l.k_col + l.k_row + if i >= keyed_from { 2 } else { 0 };
     let mut p = tail0;
     let mut rebuilt: Vec<MatrixClaim> = Vec::new();
@@ -755,8 +699,8 @@ pub(super) struct JaggedFoldLoc {
 /// variable-width claim blocks, and the two sumchecks. Width-driven.
 pub(super) fn jagged_fold_region_ops(
     cfg: TowerConfig,
-    keys: &[([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)],
-) -> Vec<flock_transcript::transcript_record::TranscriptOp> {
+    keys: &[([u8; 32], Vec<JaggedClaim>)],
+) -> Vec<TranscriptOp> {
     let mut want: Vec<Op> = Vec::new();
     let grinding = tower_fold_grinding(cfg);
     for (_, cs) in keys {
@@ -805,7 +749,7 @@ pub(super) fn jagged_fold_region_ops(
             }
             want.push(Op::SqueezeScalar);
         }
-        want.extend(std::iter::repeat_n(Op::ObserveScalar, cs.len()));
+        want.extend(repeat_n(Op::ObserveScalar, cs.len()));
         if grinding.combination_bits != 0 {
             want.push(Op::Pow {
                 bits: grinding.combination_bits,
@@ -829,10 +773,7 @@ pub(super) fn jagged_fold_region_ops(
 /// Payload ordinals of `ObserveBytes` operations immediately following a
 /// particular label. `Pow` also contributes one payload (its nonce), so fixed
 /// payload offsets are invalid as soon as grinding is enabled.
-pub(super) fn labeled_bytes_payloads(
-    ops: &[flock_transcript::transcript_record::TranscriptOp],
-    label: &[u8],
-) -> Vec<usize> {
+pub(super) fn labeled_bytes_payloads(ops: &[TranscriptOp], label: &[u8]) -> Vec<usize> {
     let mut out = Vec::new();
     let mut payload = 0usize;
     for (i, op) in ops.iter().enumerate() {
@@ -857,8 +798,8 @@ pub(super) fn labeled_bytes_payloads(
 /// their registry constants), col points, values, rounds, bridge, output.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn locate_and_pin_jagged_folds(
-    keys: &[([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)],
-    fps: &[&flock_core::matrix_fold::FoldProof],
+    keys: &[([u8; 32], Vec<JaggedClaim>)],
+    fps: &[&FoldProof],
     vals_rec: &[F128],
     chals: &[F128],
     payloads: &[Vec<u8>],
@@ -1012,7 +953,7 @@ pub(super) fn replay_jagged_fold_endpoints(
     locs: &[JaggedFoldLoc],
     vals_rec: &[F128],
     chals: &[F128],
-) -> Vec<flock_core::matrix_fold::MatrixClaim> {
+) -> Vec<MatrixClaim> {
     let replay_rounds = |target: F128, base: usize, ch0: usize, n: usize| -> (F128, Vec<F128>) {
         let mut run = target;
         let mut rho = Vec::with_capacity(n);
@@ -1102,12 +1043,12 @@ pub(super) fn replay_jagged_fold_endpoints(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_jagged_fold_region(
     sb: &mut ShapeBuilder,
-    macs: flock_core::circuit::builder::SlotId,
-    mrs: flock_core::circuit::builder::SlotId,
-    pfslot: flock_core::circuit::builder::SlotId,
+    macs: SlotId,
+    mrs: SlotId,
+    pfslot: SlotId,
     pf_w: usize,
     locs: &[JaggedFoldLoc],
-    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &FsChainTrace,
     challenge_locs: &[(usize, usize)],
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
@@ -1129,11 +1070,11 @@ pub(super) fn emit_jagged_fold_region(
             for (a, _) in chunk {
                 g_in.push(*a);
             }
-            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
             for (_, b) in chunk {
                 g_in.push(*b);
             }
-            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
             g_in.push(ow);
             s = sb.gate(pfslot, &g_in)[0];
         }
@@ -1240,11 +1181,7 @@ pub(super) fn check_jagged_fold_publics(
     at: usize,
     locs: &[JaggedFoldLoc],
     keyed: bool,
-) -> (
-    Vec<flock_core::matrix_fold::MatrixClaim>,
-    Vec<[F128; 2]>,
-    usize,
-) {
+) -> (Vec<MatrixClaim>, Vec<[F128; 2]>, usize) {
     let mut p = at;
     let mut out = Vec::with_capacity(locs.len());
     let mut keys = Vec::new();
@@ -1256,4 +1193,68 @@ pub(super) fn check_jagged_fold_publics(
         out.push(c);
     }
     (out, keys, p)
+}
+
+/// The checker rejects every surface its two items cover: a non-native
+/// nonce word (high half set, or low half past the scan budget), a
+/// tampered point coordinate, and a tampered row low. The honest block
+/// passes and consumes exactly 72 words. (Seed and decode tampers are
+/// IN-CIRCUIT since phase D — `emit_ag_point_binding` — and are outside
+/// this checker's coverage by design.)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flock_core::{
+        genus95_curve_code::evaluation_point_from_nonce_pow, zerocheck::ag_skip::R1_POW_BITS,
+    };
+    use std::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
+
+    #[test]
+    fn ag_skip_publics_checker_rejects_tampers() {
+        let (s0, s1) = (F128::new(0xA6, 0x51), F128::new(0x1F, 0xB3));
+        let seed = ag_seed_bytes(s0, s1);
+        let (nonce, pt) = (0..R1_FUSED_ATTEMPT_BUDGET)
+            .find_map(|n| {
+                evaluation_point_from_nonce_pow(&seed, n, HashKind::Blake3, R1_POW_BITS)
+                    .map(|p| (n, p))
+            })
+            .expect("a valid fused nonce exists in the budget");
+        let bf = base_evaluation_functional(&pt).expect("the functional exists at a sampled point");
+        let base = 3usize;
+        let mut public = vec![F128::ZERO; base];
+        public.extend([s0, s1, F128::new(u64::from(nonce), 0)]);
+        public.extend([pt.x, pt.y, pt.z1, pt.z2, pt.z3]);
+        public.extend((0..64).map(|j| bf[j]));
+        assert_eq!(
+            check_ag_skip_publics(&public, base, Some(R1_POW_BITS)),
+            72,
+            "the honest block passes"
+        );
+
+        let rejects = |mutate: &dyn Fn(&mut [F128])| -> bool {
+            let mut bad = public.clone();
+            mutate(&mut bad);
+            catch_unwind(AssertUnwindSafe(|| {
+                check_ag_skip_publics(&bad, base, Some(R1_POW_BITS))
+            }))
+            .is_err()
+        };
+        assert!(
+            rejects(&|p| p[base + 2] = F128::new(u64::from(nonce), 1)),
+            "a set nonce high half is rejected"
+        );
+        assert!(
+            rejects(&|p| p[base + 2] = F128::new(u64::from(R1_FUSED_ATTEMPT_BUDGET), 0)),
+            "an out-of-budget nonce is rejected"
+        );
+        assert!(
+            rejects(&|p| p[base + 4] += F128::ONE),
+            "tampered point coord"
+        );
+        assert!(
+            rejects(&|p| p[base + 8 + 17] += F128::ONE),
+            "tampered row low"
+        );
+    }
 }

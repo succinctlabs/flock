@@ -1,5 +1,7 @@
 use super::constants::{PRODUCT_LIMBS, PRODUCT_MESSAGE_BITS};
 use rand_core::RngCore;
+use std::ops::BitXor;
+use std::ops::BitXorAssign;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BaseMessage(pub u64);
@@ -64,7 +66,7 @@ pub(crate) struct ExtendedMessage {
     pub(crate) order3: u32,
 }
 
-impl std::ops::BitXor for ExtendedMessage {
+impl BitXor for ExtendedMessage {
     type Output = Self;
 
     #[inline(always)]
@@ -77,7 +79,7 @@ impl std::ops::BitXor for ExtendedMessage {
     }
 }
 
-impl std::ops::BitXorAssign for ExtendedMessage {
+impl BitXorAssign for ExtendedMessage {
     #[inline(always)]
     fn bitxor_assign(&mut self, rhs: Self) {
         *self = *self ^ rhs;

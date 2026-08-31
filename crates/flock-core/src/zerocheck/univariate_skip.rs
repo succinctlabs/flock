@@ -18,6 +18,8 @@
 //! [`super::univariate_skip_optimized`] drops a constant F₈ factor
 //! `C_s = φ₈(0x1C)` from the eq-on-S weights; this one keeps it.
 
+use flock_multilinear::IndexOrder;
+use flock_multilinear::eq_table;
 use rayon::prelude::*;
 
 use crate::field::{F8, F128, mul_by_x, phi8};
@@ -31,7 +33,7 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
-    flock_multilinear::eq_table(r, F128::ONE, flock_multilinear::IndexOrder::LowToHigh)
+    eq_table(r, F128::ONE, IndexOrder::LowToHigh)
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +534,8 @@ pub fn round1_evals_on_s(
 mod tests {
     use super::*;
 
+    use crate::pcs::pack::pack_witness;
+    use crate::pcs::ring_switch::fold_1b_rows_naive;
     use crate::test_rng::Rng;
 
     #[test]
@@ -736,8 +740,6 @@ mod tests {
     /// suffix `r[k_skip + 1 ..]` (everything past `prefix0 = r[k_skip]`).
     #[test]
     fn extract_c_with_s_hat_v_matches_fold_1b_rows() {
-        use crate::pcs::pack::pack_witness;
-        use crate::pcs::ring_switch::fold_1b_rows_naive;
         // K_SKIP = 6 is the production setup (LOG_PACKING = 7, so 2 · 2^K_SKIP
         // = 128 matches s_hat_v's length). The kernel needs m >= K_SKIP + 1 =
         // 7 for pack_witness, plus the SplitEqGhash's n_lo + n_hi machinery

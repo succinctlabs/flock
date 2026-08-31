@@ -40,8 +40,12 @@
 //! Run:
 //!   cargo run --release --bin dump_lincheck_vectors -- cuda-ghash/lincheck_vectors.bin 10 4 2 16
 
+use env::args;
+use lincheck::pack_z_lincheck;
+use lincheck::prove_padded_capture_z_vec;
 use std::env;
 use std::fs::File;
+use std::io::Result;
 use std::io::{BufWriter, Write};
 
 use flock_prover::challenger::{Challenger, FsChallenger};
@@ -52,15 +56,14 @@ use flock_prover::lincheck::{
 };
 use flock_prover::r1cs::SparseBinaryMatrix;
 
+use flock_core::test_rng::Rng;
 const DOMAIN: &[u8] = b"flock-lincheck-test";
 
-use flock_core::test_rng::Rng;
-
-fn write_f128(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn write_f128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
-fn write_u32(w: &mut impl Write, v: u32) -> std::io::Result<()> {
+fn write_u32(w: &mut impl Write, v: u32) -> Result<()> {
     w.write_all(&v.to_le_bytes())
 }
 
@@ -110,18 +113,15 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     (col_ptr, rows_flat)
 }
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "lincheck_vectors.bin".to_string());
-    let m: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let k_log: usize = env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(4);
-    let k_skip: usize = env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(2);
+    let m: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let k_log: usize = args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(4);
+    let k_skip: usize = args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(2);
     let k = 1usize << k_log;
-    let useful_bits: usize = env::args().nth(5).and_then(|s| s.parse().ok()).unwrap_or(k);
+    let useful_bits: usize = args().nth(5).and_then(|s| s.parse().ok()).unwrap_or(k);
 
     assert!(m >= k_log, "need m >= k_log");
     assert!(k_skip <= k_log, "need k_skip <= k_log");
@@ -146,7 +146,7 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
-    let z_packed = lincheck::pack_z_lincheck(&z_logical, m, k_log);
+    let z_packed = pack_z_lincheck(&z_logical, m, k_log);
 
     // --- Base matrices + CSC flatten.
     let a_0 = random_matrix(k, 3, &mut rng);
@@ -164,7 +164,7 @@ fn main() -> std::io::Result<()> {
 
     // --- Run the REAL prover (captures the exact pre-sumcheck z_vec).
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+    let (proof, claim, z_vec_pre) = prove_padded_capture_z_vec(
         &z_packed,
         m,
         k_log,

@@ -10,6 +10,8 @@
 //! `x^-1` is one, so the quadratic is irreducible. Multiplication uses three
 //! base-field products; multiplication by `x^-1` is a linear shift-and-fold.
 
+use core::mem::align_of;
+use core::mem::size_of;
 use core::ops::{Add, AddAssign, Mul, MulAssign};
 
 use serde::{Deserialize, Serialize};
@@ -158,8 +160,8 @@ impl Mul<F256> for F128 {
     }
 }
 
-const _: [(); 32] = [(); core::mem::size_of::<F256>()];
-const _: [(); 16] = [(); core::mem::align_of::<F256>()];
+const _: [(); 32] = [(); size_of::<F256>()];
+const _: [(); 16] = [(); align_of::<F256>()];
 
 #[cfg(test)]
 mod tests {

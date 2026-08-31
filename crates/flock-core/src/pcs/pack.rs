@@ -20,6 +20,7 @@
 //!
 //! [DP24]: https://eprint.iacr.org/2024/504
 
+use core::slice::from_raw_parts;
 use rayon::prelude::*;
 
 use crate::field::F128;
@@ -52,7 +53,7 @@ pub fn pack_witness(z: &[bool], m: usize) -> Vec<F128> {
     // byte 7 of `x * 0x0102040810204080` is Σ_r b_r·2^r (each lower product
     // byte sums distinct powers of two ≤ 0xFE — no carry into byte 7).
     // SAFETY: same length, and any &[bool] is a valid &[u8].
-    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(z.as_ptr() as *const u8, z.len()) };
+    let bytes: &[u8] = unsafe { from_raw_parts(z.as_ptr() as *const u8, z.len()) };
     #[inline]
     fn pack64(b: &[u8]) -> u64 {
         let mut w = 0u64;

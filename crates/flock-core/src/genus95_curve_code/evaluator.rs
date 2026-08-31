@@ -1,5 +1,6 @@
 use std::mem::MaybeUninit;
 use std::ops::Index;
+use std::slice::Iter;
 use std::sync::OnceLock;
 
 use super::constants::{
@@ -33,7 +34,7 @@ impl ProductFunctional {
     }
 
     #[inline(always)]
-    pub fn iter(&self) -> std::slice::Iter<'_, F128> {
+    pub fn iter(&self) -> Iter<'_, F128> {
         self.coordinates.iter()
     }
 

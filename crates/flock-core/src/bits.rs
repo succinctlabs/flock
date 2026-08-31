@@ -1,5 +1,7 @@
 //! Small bit-manipulation primitives shared across modules.
 
+use crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes;
+
 /// Lowest set bit of `x`, or 0 if `x == 0` — i.e. `usize::isolate_lowest_one`.
 ///
 /// Written out rather than calling the standard-library method on purpose.
@@ -51,12 +53,13 @@ pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
     // SAFETY: [u64; 8] is 64 bytes with no padding; u8 has weaker alignment.
     let input: &[u8; 64] = unsafe { &*(lanes.as_ptr() as *const [u8; 64]) };
     let out64: &mut [u8; 64] = out.try_into().expect("64-byte stripe slice");
-    crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes(input, out64);
+    bit_transpose_64bytes(input, out64);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::array::from_fn;
 
     /// [`lowest_one`] against an independent `trailing_zeros` reference. Not
     /// against `usize::isolate_lowest_one`: the whole point of the helper is
@@ -110,7 +113,7 @@ mod tests {
             z ^ (z >> 31)
         };
         for _ in 0..100 {
-            let lanes: [u64; 8] = std::array::from_fn(|_| next());
+            let lanes: [u64; 8] = from_fn(|_| next());
             let mut fast = [0u8; 64];
             let mut oracle = [0u8; 64];
             transpose_8_u64s_to_64_bytes(&lanes, &mut fast);
@@ -118,7 +121,7 @@ mod tests {
             assert_eq!(fast, oracle);
         }
         // Edge patterns.
-        for lanes in [[0u64; 8], [u64::MAX; 8], std::array::from_fn(|i| 1u64 << i)] {
+        for lanes in [[0u64; 8], [u64::MAX; 8], from_fn(|i| 1u64 << i)] {
             let mut fast = [0u8; 64];
             let mut oracle = [0u8; 64];
             transpose_8_u64s_to_64_bytes(&lanes, &mut fast);

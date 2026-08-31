@@ -76,11 +76,26 @@
 //! `(G(1), G(∞))` encoding (SP1's `{0, ½, 1}` interpolation needs `2⁻¹`, which
 //! does not exist in `F128`).
 
+use crate::alloc_uninit_f128_vec;
+use crate::bits::lowest_one;
 use crate::challenger::Challenger;
+use crate::challenger::grinding_bits_for_degree;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
+use crate::pcs::ring_switch::fold_one_slot;
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::env::var;
+use std::env::var_os;
+use std::mem::replace;
+use std::mem::swap;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 /// Configuration of a jagged function: the (zero-padded to `2^k`) column
 /// heights, summarized as the cumulative-height prefix sums.
@@ -302,7 +317,7 @@ fn generate_f_and_claim(
     let eq_row = build_eq_table(z_row);
     let eq_col = build_eq_table(z_col);
     let prefix = &params.col_prefix_sums;
-    let mut b = crate::alloc_uninit_f128_vec(len);
+    let mut b = alloc_uninit_f128_vec(len);
 
     if len == 1 {
         // m = 0: single element, no sumcheck rounds (and no pairs).
@@ -451,10 +466,10 @@ pub(crate) fn prove_main<C: Challenger>(
     // (len/2 buffers) — the write always fits the smaller of the pair. F128
     // addition is XOR, so the parallel tree reduction is bit-identical to a
     // serial fold.
-    let mut sa = crate::alloc_uninit_f128_vec(len / 2);
-    let mut sb = crate::alloc_uninit_f128_vec(len / 2);
-    let mut a = crate::alloc_uninit_f128_vec(len / 4);
-    let mut bb = crate::alloc_uninit_f128_vec(len / 4);
+    let mut sa = alloc_uninit_f128_vec(len / 2);
+    let mut sb = alloc_uninit_f128_vec(len / 2);
+    let mut a = alloc_uninit_f128_vec(len / 4);
+    let mut bb = alloc_uninit_f128_vec(len / 4);
     let mut cur = len;
     let mut rounds = Vec::with_capacity(m);
     let mut point = Vec::with_capacity(m);
@@ -483,8 +498,8 @@ pub(crate) fn prove_main<C: Challenger>(
                 &mut sb[..half],
             );
         }
-        std::mem::swap(&mut a, &mut sa);
-        std::mem::swap(&mut bb, &mut sb);
+        swap(&mut a, &mut sa);
+        swap(&mut bb, &mut sb);
         cur = half;
     }
 
@@ -1046,7 +1061,7 @@ fn fold_partials(
             gather(b, slot);
         }
     }
-    std::mem::swap(p, out);
+    swap(p, out);
     debug_assert_eq!(p.len(), blocks.n_blocks(layer + 1));
 }
 
@@ -1287,6 +1302,7 @@ pub fn prove_assist<C: Challenger>(
 #[cfg(test)]
 mod assist_test_support {
     use super::*;
+    use std::cmp::Ordering::*;
 
     /// Evaluates the dense assist weight multilinear.
     pub(super) fn assist_w_at(cols: &[(F128, u64, u64)], rho: &[F128], m: usize) -> F128 {
@@ -1357,7 +1373,6 @@ mod assist_test_support {
         z_index: &[F128],
         challenger: &mut C,
     ) -> JaggedAssistProof {
-        use rayon::prelude::*;
         let m = params.m;
         assert_eq!(z_row.len(), params.n);
         assert_eq!(z_col.len(), params.k);
@@ -1390,14 +1405,11 @@ mod assist_test_support {
                 .zip(prefix_eq.par_iter())
                 .map(|(&(w, t_c, t_next), &e)| {
                     let eval = |x: F128| {
-                        g_hat_eval_cd(z_row, z_index, m, |l| {
-                            use std::cmp::Ordering::*;
-                            match l.cmp(&layer) {
-                                Less => (rho[2 * l], rho[2 * l + 1]),
-                                Equal if bind_c => (x, int_bit(t_next, l)),
-                                Equal => (rho[2 * l], x),
-                                Greater => (int_bit(t_c, l), int_bit(t_next, l)),
-                            }
+                        g_hat_eval_cd(z_row, z_index, m, |l| match l.cmp(&layer) {
+                            Less => (rho[2 * l], rho[2 * l + 1]),
+                            Equal if bind_c => (x, int_bit(t_next, l)),
+                            Equal => (rho[2 * l], x),
+                            Greater => (int_bit(t_c, l), int_bit(t_next, l)),
                         })
                     };
                     let g0 = eval(F128::ZERO);
@@ -1532,7 +1544,7 @@ pub(crate) fn build_merged_weight_and_prime(
         })
         .collect();
     assert_eq!(q.len(), n_total);
-    let mut w = crate::scratch::take_f128(n_total);
+    let mut w = take_f128(n_total);
     // Segmented fill (the JaggedWeight lesson): per chunk, ONE cursor into
     // `col_prefix_sums`, then per column segment a claim-OUTER sweep — the
     // column factor hoisted, rows read sequentially, and one claim's 64 KB
@@ -1587,13 +1599,11 @@ pub(crate) fn build_merged_weight_and_prime(
                             let c_hoist = eq_c[col];
                             if first_claim {
                                 for (slot, &r) in dst.iter_mut().zip(rows) {
-                                    *slot =
-                                        crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                                    *slot = fold_one_slot(r * c_hoist, tab);
                                 }
                             } else {
                                 for (slot, &r) in dst.iter_mut().zip(rows) {
-                                    *slot +=
-                                        crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                                    *slot += fold_one_slot(r * c_hoist, tab);
                                 }
                             }
                         }
@@ -1851,8 +1861,8 @@ pub fn prove_frobenius_assist_with_grinding<C: Challenger>(
 ) -> FrobeniusAssistProof {
     let m = params.m;
     assert_eq!(rho.len(), m);
-    let trace = std::env::var("PCS_TRACE").is_ok();
-    let t = std::time::Instant::now();
+    let trace = var("PCS_TRACE").is_ok();
+    let t = Instant::now();
     let sparse = assist_sparse_transitions();
     let bounds = assist_boundaries(params);
     let blocks = AssistBlocks::new(&bounds, m);
@@ -1880,7 +1890,7 @@ pub fn prove_frobenius_assist_with_grinding<C: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t = std::time::Instant::now();
+    let t = Instant::now();
 
     let v = sts
         .par_iter()
@@ -2074,7 +2084,7 @@ fn verify_frobenius_assist_core<C: Challenger>(
     // verify, so its three phases are worth separating: the transcript replay,
     // building the 128·K statements (a `2^k`-column `eq` table each), and the
     // per-statement `W(σ)` walk + boundary DP.
-    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let trace = var("VERIFY_TRACE").is_ok();
     let tfmt = |s: f64| -> String {
         let ms = s * 1000.0;
         if ms < 1.0 {
@@ -2086,7 +2096,7 @@ fn verify_frobenius_assist_core<C: Challenger>(
     challenger.observe_label(b"flock-frobenius-assist-v0");
     challenger.observe_f128(proof.v);
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut claim = proof.v;
     let mut sigma = Vec::with_capacity(2 * (m + 1));
     for (round, &(g_one, g_inf)) in proof.rounds.iter().enumerate() {
@@ -2111,7 +2121,7 @@ fn verify_frobenius_assist_core<C: Challenger>(
 
     let bounds = assist_boundaries(params);
     let blocks = AssistBlocks::new(&bounds, m);
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let sts = frobenius_statements(params, claims, groups, rho, &bounds, None);
     if trace {
         eprintln!(
@@ -2125,7 +2135,7 @@ fn verify_frobenius_assist_core<C: Challenger>(
     // tree descent shared by all statements; each statement then pays a
     // plain weighted dot. Same field products as the per-statement ascent
     // ([`assist_w_at_blocked`]), reassociated, so `w` is bit-identical.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let eq_cols = assist_eq_at_blocked(&blocks, &sigma, m);
     if trace {
         eprintln!(
@@ -2135,7 +2145,7 @@ fn verify_frobenius_assist_core<C: Challenger>(
             tfmt(t.elapsed().as_secs_f64())
         );
     }
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     // Per statement: (contribution, w) — `w` is the count-dependent factor
     // the deferred path exports; the sequential re-sum is the same XOR fold
     // the parallel reduce performed, so the check is value-identical.
@@ -2246,7 +2256,7 @@ pub fn verify_with_assist<C: Challenger>(
 /// Images of the `F₂`-basis under square root (`x ↦ x^{2^127}`, the inverse
 /// Frobenius) — square root is `F₂`-linear, so this table defines the map.
 fn sqrt_basis() -> &'static [F128; 128] {
-    static T: std::sync::OnceLock<[F128; 128]> = std::sync::OnceLock::new();
+    static T: OnceLock<[F128; 128]> = OnceLock::new();
     T.get_or_init(|| {
         let mut t = [F128::ZERO; 128];
         for (b, slot) in t.iter_mut().enumerate() {
@@ -2323,7 +2333,7 @@ fn eq_at(a: &[F128], b: &[F128]) -> F128 {
 
 /// Basis images of `x ↦ x^{2^{-j}}` for every `j` (level 0 = identity).
 fn inv_frob_basis() -> &'static Vec<[F128; 128]> {
-    static T: std::sync::OnceLock<Vec<[F128; 128]>> = std::sync::OnceLock::new();
+    static T: OnceLock<Vec<[F128; 128]>> = OnceLock::new();
     T.get_or_init(|| {
         let mut levels: Vec<[F128; 128]> = Vec::with_capacity(128);
         let mut cur = [F128::ZERO; 128];
@@ -2352,7 +2362,7 @@ fn linear_byte_tables(images: &[F128; 128]) -> Vec<[F128; 256]> {
     let mut tables = vec![[F128::ZERO; 256]; 16];
     for (k, table) in tables.iter_mut().enumerate() {
         for v in 1usize..256 {
-            let low = crate::bits::lowest_one(v);
+            let low = lowest_one(v);
             table[v] = table[v ^ low] + images[8 * k + low.trailing_zeros() as usize];
         }
     }
@@ -2827,8 +2837,7 @@ impl MultipointGrinding {
             .and_then(|n| n.checked_add(n_groups))
             .and_then(|k| k.checked_sub(1))
             .expect("multipoint batch size must be nonzero and fit usize");
-        self.gamma_bits
-            .max(crate::challenger::grinding_bits_for_degree(degree))
+        self.gamma_bits.max(grinding_bits_for_degree(degree))
     }
 }
 
@@ -2886,9 +2895,9 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
     let n_rs = claims.len();
     let n_g = groups.len();
     assert!(n_rs + n_g > 0, "multipoint over zero claims");
-    let trace = std::env::var("PCS_TRACE").is_ok();
+    let trace = var("PCS_TRACE").is_ok();
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     // The inverse-Frobenius points exist only for the twisted (RS) side.
     let rho_pows = (n_rs > 0).then(|| rho_inverse_powers(rho));
     let values = match &rho_pows {
@@ -2933,7 +2942,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
     // messages evaluate them pointwise from √n split-eq tables. Only the
     // combined jagged weights (no tensor structure) get buffers, and those
     // fold on the area-trimmed live prefix.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let eq0 = SplitEq::new(rho);
     let area = params.area() as usize;
     let mut pairs: Vec<Pair> = Vec::with_capacity(2);
@@ -3019,7 +3028,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
         // generalizes to this shape at all.
         let pfx = &params.col_prefix_sums;
         let full = 1u64 << params.n;
-        let mut hist: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+        let mut hist: BTreeMap<u64, usize> = BTreeMap::new();
         for y in 0..pfx.len() - 1 {
             let h = pfx[y + 1] - pfx[y];
             if h > 0 {
@@ -3141,7 +3150,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
     // and summed across the active products. The final fold never runs —
     // nothing reads the folded scalars; the anchor assist reproves the
     // endpoint.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut rounds = Vec::with_capacity(m);
     let mut round_grinding_nonces = Vec::with_capacity((grinding.round_bits != 0) as usize * m);
     let mut point = Vec::with_capacity(m);
@@ -3150,7 +3159,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
     // a TWISTED partner (a linearized-map application per element), the group
     // side a sparse support against a scaled `eq` — so the aggregate hides
     // which one any optimisation would actually reach.
-    let mut per_pair = vec![std::time::Duration::ZERO; pairs.len()];
+    let mut per_pair = vec![Duration::ZERO; pairs.len()];
     let (mut g_one, mut g_inf) = msg0;
     let mut cur = 1usize << m;
     for i in 0..m {
@@ -3175,7 +3184,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
         // attribution.
         let mut nxt = (F128::ZERO, F128::ZERO);
         for (pi, pair) in pairs.iter_mut().enumerate() {
-            let t_pair = trace.then(std::time::Instant::now);
+            let t_pair = trace.then(Instant::now);
             let msg = pair.fold_round(cur, r);
             if let Some(t0) = t_pair {
                 per_pair[pi] += t0.elapsed();
@@ -3214,7 +3223,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
     // baked into the coefficients (RS claim i: γ^{128 i}·ĝ(ρ''); group k:
     // γ^{128 R + k}·eq(ρ,ρ'')), so the accept check is a plain equality
     // against the running claim and no extra scalar travels.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let g_at = match &rho_pows {
         Some(rp) => twisted_eq_at(&gpow, rp, &point),
         None => F128::ZERO,
@@ -3303,7 +3312,7 @@ impl VirtualPair {
         // Dirty scratch half: each round fully writes its live prefix and
         // zeroes the guard slots before the next round reads them.
         Self {
-            sx: crate::scratch::take_f128(n / 2),
+            sx: take_f128(n / 2),
             live: live.next_multiple_of(4).clamp(4, n),
             x,
             flip: false,
@@ -3355,8 +3364,8 @@ impl VirtualPair {
 
     /// Return both buffers to the scratch pool.
     fn reclaim(self) {
-        crate::scratch::give_f128(self.x);
-        crate::scratch::give_f128(self.sx);
+        give_f128(self.x);
+        give_f128(self.sx);
     }
 }
 
@@ -3575,8 +3584,8 @@ impl ClosedRs {
 /// evaluation per position) — the certification knob for the byte-identity
 /// A/B, since the two paths must produce the same field elements.
 fn closed_rs_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_CLOSED_RS").is_none())
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| var_os("FLOCK_NO_CLOSED_RS").is_none())
 }
 
 struct AlignedRsPair {
@@ -3598,7 +3607,6 @@ impl AlignedRsPair {
     /// The round-0 message — the weight-pass replacement: no fill, no
     /// 2^m buffer, pure closed-form evaluation against the partner.
     fn round0_msg(&self, eq0: &SplitEq) -> (F128, F128) {
-        use rayon::prelude::*;
         debug_assert_eq!(self.round, 0);
         if let Some(c) = &self.closed {
             return c.msg(0, &self.rows);
@@ -3626,7 +3634,6 @@ impl AlignedRsPair {
     /// round's message. Only called while `round + 1 < nu` — the dispatch
     /// densifies before the last row fold.
     fn fold_round(&mut self, cur: usize, r: F128) -> (F128, F128) {
-        use rayon::prelude::*;
         debug_assert_eq!(cur, 1usize << (self.rho.len() - self.round));
         self.partner.advance(self.rho[self.round], r);
         for (z, s) in self.rows.iter_mut() {
@@ -3822,7 +3829,6 @@ impl SparseGroupPair {
         eq0: &SplitEq,
         rho: &[F128],
     ) -> (Self, (F128, F128)) {
-        use rayon::prelude::*;
         let pfx = &params.col_prefix_sums;
         let n_cols = pfx.len() - 1;
         // Even-extended [start, end) ranges of the support columns; touching
@@ -3973,7 +3979,6 @@ impl SparseGroupPair {
         let folded: Vec<(SparseSeg, F128, F128)> = if this.stored() < SPARSE_SERIAL_WORDS {
             this.segs.iter().map(fold_one).collect()
         } else {
-            use rayon::prelude::*;
             this.segs.par_iter().map(fold_one).collect()
         };
         // Boundary padding can make neighbors overlap by up to two entries:
@@ -4061,13 +4066,13 @@ const LAZY_RS_MAX_SIDES: usize = 8;
 /// In-process override for the lazy (virtual-ā) dense RS pair: 0 = env
 /// (`FLOCK_NO_VIRTUAL_A` disables), 1 = force on, 2 = force off — the
 /// alternating-arm contract of [`crate::pcs::VIRTUAL_B_OVERRIDE`].
-pub static VIRTUAL_A_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub static VIRTUAL_A_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
 fn virtual_a_on() -> bool {
-    match VIRTUAL_A_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+    match VIRTUAL_A_OVERRIDE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => std::env::var_os("FLOCK_NO_VIRTUAL_A").is_none(),
+        _ => var_os("FLOCK_NO_VIRTUAL_A").is_none(),
     }
 }
 
@@ -4163,7 +4168,6 @@ impl LazyRsPair {
     /// the area) contribute nothing and are skipped; an odd area's last
     /// pair carries a zero odd member, exactly as the calloc tail did.
     fn round0_msg(&self, eq: &SplitEq) -> (F128, F128) {
-        use rayon::prelude::*;
         const CH: u64 = 1 << 14;
         let n_chunks = self.area.div_ceil(CH) as usize;
         (0..n_chunks)
@@ -4203,12 +4207,11 @@ impl LazyRsPair {
     /// [`VirtualPair`] — its `fold_round` contract, without the full-size
     /// vector ever existing.
     fn fold0(&mut self, cur: usize, r: F128) -> (VirtualPair, (F128, F128)) {
-        use rayon::prelude::*;
         debug_assert_eq!(cur, 1usize << self.rho.len());
         let half = cur / 2;
         self.partner.advance(self.rho[0], r);
         let eq = SplitEq::new(&self.rho[1..]);
-        let mut out = crate::scratch::take_f128(half);
+        let mut out = take_f128(half);
         let written = (self.area as usize).div_ceil(2).min(half);
         const CO: usize = 1 << 13;
         let msg = out[..written]
@@ -4262,7 +4265,7 @@ impl LazyRsPair {
         for slot in &mut out[written..live_end] {
             *slot = F128::ZERO;
         }
-        let partner = std::mem::replace(&mut self.partner, Partner::Scaled { s: F128::ZERO });
+        let partner = replace(&mut self.partner, Partner::Scaled { s: F128::ZERO });
         (VirtualPair::new(out, partner, &self.rho, 1, written), msg)
     }
 }
@@ -4650,7 +4653,6 @@ mod round_test_support {
     /// `a[2*x]`. This removes per-element bounds checks. Runtime benchmarks
     /// use this helper; production fuses round 1 into [`generate_f_and_claim`].
     pub(super) fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
-        use rayon::prelude::*;
         const C: usize = 1 << 14;
         a.par_chunks(C)
             .zip(b.par_chunks(C))
@@ -4740,7 +4742,24 @@ mod tests {
     use super::round_test_support::{fold_and_round_fused, round_msg, round_msg_par};
     use super::*;
     use crate::challenger::{FsChallenger, RandomChallenger};
+    use crate::init_perf_thread_pool;
+    use crate::pcs::ring_switch;
+    use crate::test_rng::Rng;
     use crate::zerocheck::multilinear::fold_in_place_pair;
+    use flock_multilinear::IndexOrder;
+    use flock_multilinear::evaluate;
+    use rayon::current_num_threads;
+    use ring_switch::build_fold_byte_table;
+    use ring_switch::fold_one_slot;
+    use ring_switch::linearized_coefficients;
+    use std::env::var;
+    use std::hint::black_box;
+    use std::iter::repeat_n;
+    use std::mem::size_of;
+    use std::mem::swap;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
 
     fn sample_vec(ch: &mut RandomChallenger, n: usize) -> Vec<F128> {
         (0..n).map(|_| ch.sample_f128()).collect()
@@ -4767,7 +4786,7 @@ mod tests {
 
     /// `q̂(point)` directly = ⟨q, eq(point, ·)⟩.
     fn mle_eval(q: &[F128], point: &[F128]) -> F128 {
-        flock_multilinear::evaluate(q, point, flock_multilinear::IndexOrder::LowToHigh)
+        evaluate(q, point, IndexOrder::LowToHigh)
     }
 
     /// A small random jagged config + dense data, with total area < 2^m.
@@ -4806,7 +4825,6 @@ mod tests {
     /// merged-cols scalar group; random non-power-of-two heights.
     #[test]
     fn frobenius_assist_roundtrip_and_tamper() {
-        use crate::pcs::ring_switch;
         let mut ch = RandomChallenger::new(0xF12B_A551);
         for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7)] {
             let (params, _q) = random_instance(&mut ch, n, k, m);
@@ -4815,8 +4833,8 @@ mod tests {
                     let zr = sample_vec(&mut ch, n);
                     let zc = sample_vec(&mut ch, k);
                     let eq_r: Vec<F128> = (0..128).map(|_| ch.sample_f128()).collect();
-                    let table = ring_switch::build_fold_byte_table(&eq_r);
-                    let coeffs = ring_switch::linearized_coefficients(&table);
+                    let table = build_fold_byte_table(&eq_r);
+                    let coeffs = linearized_coefficients(&table);
                     (zr, zc, table, coeffs)
                 })
                 .collect();
@@ -4831,8 +4849,8 @@ mod tests {
                 let eq_col = build_eq_table(&cd.1);
                 for e in 0..params.area() {
                     let (row, col) = params.unrank(e);
-                    v_expect += eq_idx[e as usize]
-                        * ring_switch::fold_one_slot(eq_row[row] * eq_col[col], &cd.2);
+                    v_expect +=
+                        eq_idx[e as usize] * fold_one_slot(eq_row[row] * eq_col[col], &cd.2);
                 }
             }
             let g_eq_row = build_eq_table(&g_zr);
@@ -5315,7 +5333,6 @@ mod tests {
     /// [`VIRTUAL_A_OVERRIDE`], the alternating in-process pattern.
     #[test]
     fn virtual_a_dense_rs_byte_oracle() {
-        use std::sync::atomic::Ordering;
         let mut ch = RandomChallenger::new(0xA11A_5EED);
         for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (5, 2, 8), (2, 4, 6)] {
             for rep in 0..3 {
@@ -5379,8 +5396,7 @@ mod tests {
     #[test]
     #[ignore] // Benchmark + oracle at real scale — run with --nocapture.
     fn virtual_a_node_shape_bench() {
-        use std::sync::atomic::Ordering;
-        let runs: usize = std::env::var("MICRO_RUNS")
+        let runs: usize = var("MICRO_RUNS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5);
@@ -5395,7 +5411,7 @@ mod tests {
             (2706, 26),
             (2582, 29),
         ] {
-            heights.extend(std::iter::repeat_n(h, c));
+            heights.extend(repeat_n(h, c));
         }
         while heights.len() < 687 {
             heights.push(341);
@@ -5449,7 +5465,7 @@ mod tests {
         for _ in 0..runs {
             for (slot, force) in [(0usize, 2u8), (1, 1)] {
                 VIRTUAL_A_OVERRIDE.store(force, Ordering::Relaxed);
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 let mut chp = FsChallenger::new(b"virtual-a-bench");
                 let proof = prove_multipoint_twisted(&params, &claims, &groups, &rho, &mut chp);
                 times[slot].push(t.elapsed().as_secs_f64() * 1e3);
@@ -6056,10 +6072,8 @@ mod tests {
     #[test]
     #[ignore = "heavy benchmark; run explicitly with --release --ignored --nocapture"]
     fn runtime_m25() {
-        use std::time::Instant;
-
         // Match the full-prover profile (P-core pool) for an apples-to-apples ratio.
-        let _ = crate::init_perf_thread_pool();
+        let _ = init_perf_thread_pool();
         let (n, k, m) = (13usize, 12usize, 25usize); // 2^25 dense F128 elements
         let cols = 1usize << k;
         let height = (1u64 << m) / cols as u64; // uniform; total area = 2^m
@@ -6079,14 +6093,14 @@ mod tests {
         let z_row = sample_vec(&mut rc, n);
         let z_col = sample_vec(&mut rc, k);
 
-        let mb = (len * std::mem::size_of::<F128>()) as f64 / (1024.0 * 1024.0);
+        let mb = (len * size_of::<F128>()) as f64 / (1024.0 * 1024.0);
         eprintln!("\n[jagged runtime] m={m} ({len} F128 = {mb:.0} MB), n={n}, k={k}, cols={cols}");
 
         const REPS: usize = 3;
 
         // --- Phase 1: B-vector + claim generation, serial vs parallel-fused. ---
-        let mut t_gen_ser = std::time::Duration::MAX;
-        let mut t_gen_par = std::time::Duration::MAX;
+        let mut t_gen_ser = Duration::MAX;
+        let mut t_gen_par = Duration::MAX;
         let (mut b, mut v) = (Vec::new(), F128::ZERO);
         for _ in 0..REPS {
             // Serial reference: column-major build + separate v reduction.
@@ -6107,7 +6121,7 @@ mod tests {
                 vs += *qi * *bi;
             }
             t_gen_ser = t_gen_ser.min(t0.elapsed());
-            std::hint::black_box(&bs);
+            black_box(&bs);
 
             // Parallel fused helper (the production path; also emits round 1's
             // message, so it does slightly more work than the serial baseline).
@@ -6124,7 +6138,7 @@ mod tests {
         // min over REPS to suppress thermal / allocator variance. ---
 
         // Serial: in-place fold; unfused = msg pass + fold pass, fused = both in one.
-        let run_serial = |fused: bool| -> std::time::Duration {
+        let run_serial = |fused: bool| -> Duration {
             let mut a = q.clone();
             let mut bb = b.clone();
             let mut ch = FsChallenger::new(b"flock-jagged-bench");
@@ -6151,12 +6165,12 @@ mod tests {
                     fold_in_place_pair(&mut a, &mut bb, r);
                 }
             }
-            std::hint::black_box(a[0]);
+            black_box(a[0]);
             t.elapsed()
         };
 
         // Parallel: rayon kernels, ping-pong between two out-of-place buffers.
-        let run_par = |fused: bool| -> std::time::Duration {
+        let run_par = |fused: bool| -> Duration {
             let mut a = q.clone(); // len N
             let mut bb = b.clone();
             let mut sa = vec![F128::ZERO; len / 2];
@@ -6193,18 +6207,18 @@ mod tests {
                 } else {
                     fold_oop_par(&a[..cur], &bb[..cur], r, &mut sa[..half], &mut sb[..half]);
                 }
-                std::mem::swap(&mut a, &mut sa);
-                std::mem::swap(&mut bb, &mut sb);
+                swap(&mut a, &mut sa);
+                swap(&mut bb, &mut sb);
                 cur = half;
             }
-            std::hint::black_box(a[0]);
+            black_box(a[0]);
             t.elapsed()
         };
 
-        let mut s_unf = std::time::Duration::MAX;
-        let mut s_fus = std::time::Duration::MAX;
-        let mut p_unf = std::time::Duration::MAX;
-        let mut p_fus = std::time::Duration::MAX;
+        let mut s_unf = Duration::MAX;
+        let mut s_fus = Duration::MAX;
+        let mut p_unf = Duration::MAX;
+        let mut p_fus = Duration::MAX;
         for _ in 0..REPS {
             s_unf = s_unf.min(run_serial(false));
             s_fus = s_fus.min(run_serial(true));
@@ -6216,13 +6230,11 @@ mod tests {
         let point: Vec<F128> = (0..m).map(|_| rc.sample_f128()).collect();
         let t2 = Instant::now();
         let beta = f_hat_t(&params, &z_row, &z_col, &point);
-        std::hint::black_box(beta);
+        black_box(beta);
         let t_ver = t2.elapsed();
 
-        let ratio = |unf: std::time::Duration, fus: std::time::Duration| {
-            unf.as_secs_f64() / fus.as_secs_f64()
-        };
-        eprintln!("  threads: {}", rayon::current_num_threads());
+        let ratio = |unf: Duration, fus: Duration| unf.as_secs_f64() / fus.as_secs_f64();
+        eprintln!("  threads: {}", current_num_threads());
         eprintln!(
             "  f̂_t-gen (B + claim) serial {:>8.1?} → parallel {:>8.1?}   ({:.2}x)",
             t_gen_ser,
@@ -6262,9 +6274,7 @@ mod tests {
     #[test]
     #[ignore = "heavy benchmark; run explicitly with --release --ignored --nocapture"]
     fn runtime_bits30() {
-        use std::time::Instant;
-
-        let _ = crate::init_perf_thread_pool();
+        let _ = init_perf_thread_pool();
         let (n, k, m) = (11usize, 12usize, 23usize); // 2^30 bits / 128 = 2^23 elems
         let cols = 1usize << k;
         let height = (1u64 << m) / cols as u64;
@@ -6283,7 +6293,7 @@ mod tests {
         let z_row = sample_vec(&mut rc, n);
         let z_col = sample_vec(&mut rc, k);
 
-        let best3 = |f: &mut dyn FnMut() -> std::time::Duration| (0..3).map(|_| f()).min().unwrap();
+        let best3 = |f: &mut dyn FnMut() -> Duration| (0..3).map(|_| f()).min().unwrap();
 
         // Warm-up (thread pool + page faults).
         let mut ch = FsChallenger::new(b"flock-jagged-bits30");
@@ -6293,12 +6303,12 @@ mod tests {
         let t_prove = best3(&mut || {
             let mut ch = FsChallenger::new(b"flock-jagged-bits30");
             let t = Instant::now();
-            std::hint::black_box(prove(&params, &q, &z_row, &z_col, &mut ch));
+            black_box(prove(&params, &q, &z_row, &z_col, &mut ch));
             t.elapsed()
         });
 
         // Main + assist, and keep one transcript for the verifier runs.
-        let mut t_both = std::time::Duration::MAX;
+        let mut t_both = Duration::MAX;
         let mut kept = None;
         for _ in 0..3 {
             let mut ch = FsChallenger::new(b"flock-jagged-bits30");
@@ -6313,9 +6323,7 @@ mod tests {
         let t_verify_direct = best3(&mut || {
             let mut ch = FsChallenger::new(b"flock-jagged-bits30");
             let t = Instant::now();
-            std::hint::black_box(
-                verify(&params, &z_row, &z_col, v, &proof, &mut ch).expect("verify"),
-            );
+            black_box(verify(&params, &z_row, &z_col, v, &proof, &mut ch).expect("verify"));
             t.elapsed()
         });
 
@@ -6323,7 +6331,7 @@ mod tests {
         let t_verify_assist = best3(&mut || {
             let mut ch = FsChallenger::new(b"flock-jagged-bits30");
             let t = Instant::now();
-            std::hint::black_box(
+            black_box(
                 verify_with_assist(&params, &z_row, &z_col, v, &proof, &assist, &mut ch)
                     .expect("verify_with_assist"),
             );
@@ -6332,7 +6340,7 @@ mod tests {
 
         let main_bytes = (2 * proof.rounds.len() + 1) * 16;
         let assist_bytes = (2 * assist.rounds.len() + 1) * 16;
-        eprintln!("  threads: {}", rayon::current_num_threads());
+        eprintln!("  threads: {}", current_num_threads());
         eprintln!(
             "  witness: 2^{m} F128 = {} MiB (2^30 bits packed)",
             (len * 16) >> 20
@@ -6363,9 +6371,7 @@ mod tests {
     #[test]
     #[ignore = "heavy benchmark; run explicitly with --release --ignored --nocapture"]
     fn runtime_assist_m25() {
-        use std::time::Instant;
-
-        let _ = crate::init_perf_thread_pool();
+        let _ = init_perf_thread_pool();
         let (n, k, m) = (13usize, 12usize, 25usize);
         let cols = 1usize << k;
         let height = (1u64 << m) / cols as u64;
@@ -6399,7 +6405,7 @@ mod tests {
         let t_verify = t2.elapsed();
         assert_eq!(beta, direct);
 
-        eprintln!("  threads: {}", rayon::current_num_threads());
+        eprintln!("  threads: {}", current_num_threads());
         eprintln!("  verifier, direct f̂_t (2^{k} BP evals): {t_direct:>9.3?}");
         eprintln!(
             "  assist prover, streamed ({} rounds)   : {t_prove:>9.3?}  (naive: {t_prove_naive:.3?}, {:.1}x)",
@@ -6436,7 +6442,7 @@ mod tests {
     /// the tower's walkers used the squaring form until 2026-08-29.
     #[test]
     fn frob_inv_matches_127_squarings() {
-        let mut rng = crate::test_rng::Rng::new(0xF0B_1A5);
+        let mut rng = Rng::new(0xF0B_1A5);
         for _ in 0..256 {
             let x = rng.f128();
             let mut y = x;

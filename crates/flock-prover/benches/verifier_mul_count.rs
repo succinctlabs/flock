@@ -21,20 +21,29 @@
 
 use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::field::F128;
-use flock_core::field::gf2_128::op_count::{self, Snapshot};
+use flock_core::field::gf2_128::op_count::{Snapshot, measure};
 use flock_core::pcs::ligerito::LigeritoProfile;
+use flock_core::schedule::TableClass;
 use flock_prover::challenger::FsChallenger;
+use flock_prover::init_perf_thread_pool;
 use flock_prover::pcs::PcsParams;
 use flock_prover::prover::{self, UnionElementSlotInput};
 use flock_prover::schedule::{Registry, TableType};
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier;
+use prover::prove_fast_ligerito_union_mixed_class;
+use std::array::from_fn;
 use std::sync::Arc;
-
-const DOMAIN: &[u8] = b"flock-union-element-v0";
-const K_SKIP: usize = 6;
+use verifier::verify_ligerito_union_mixed_class;
+use verifier::verify_ligerito_union_mixed_class_deferred;
 
 use flock_core::test_rng::Rng;
+use flock_core::zerocheck::multilinear::{
+    interpolate_at_z_combined, interpolate_at_z_on_lambda, lagrange_weights_naive,
+};
+use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression};
+const DOMAIN: &[u8] = b"flock-union-element-v0";
+const K_SKIP: usize = 6;
 
 fn gate_block(kappa: usize, w0: F128, w1: F128) -> Arc<ElementTableType> {
     let mut b = ElementTableBuilder::new(kappa);
@@ -104,7 +113,7 @@ fn measure_whole_verify() -> (Snapshot, Snapshot) {
         .element_types()
         .iter()
         .map(|t| match &t.class {
-            flock_core::schedule::TableClass::LargeField(e) => e.clone(),
+            TableClass::LargeField(e) => e.clone(),
             _ => unreachable!(),
         })
         .collect();
@@ -129,7 +138,7 @@ fn measure_whole_verify() -> (Snapshot, Snapshot) {
         .collect();
 
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_mixed_class(
+    let (proof, commitment, _) = prove_fast_ligerito_union_mixed_class(
         &union,
         &pcs_params,
         Vec::new(),
@@ -138,16 +147,9 @@ fn measure_whole_verify() -> (Snapshot, Snapshot) {
     );
 
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let (_, full) = op_count::measure(|| {
-        verifier::verify_ligerito_union_mixed_class(
-            &union,
-            &[],
-            &commitment,
-            &proof,
-            &pcs_params,
-            &mut ch_v,
-        )
-        .expect("honest proof verifies")
+    let (_, full) = measure(|| {
+        verify_ligerito_union_mixed_class(&union, &[], &commitment, &proof, &pcs_params, &mut ch_v)
+            .expect("honest proof verifies")
     });
 
     // The SAME proof through the deferred entry — the one a recursion circuit
@@ -155,8 +157,8 @@ fn measure_whole_verify() -> (Snapshot, Snapshot) {
     // difference is exactly the O(nnz) matrix work that folding removes, and
     // it is the reason a whole-verify number overstates what recursion pays.
     let mut ch_d = FsChallenger::new(DOMAIN);
-    let (_, deferred) = op_count::measure(|| {
-        verifier::verify_ligerito_union_mixed_class_deferred(
+    let (_, deferred) = measure(|| {
+        verify_ligerito_union_mixed_class_deferred(
             &union,
             &[],
             &commitment,
@@ -175,13 +177,12 @@ fn measure_whole_verify() -> (Snapshot, Snapshot) {
 /// measuring only element-only would attribute the skip's cost to a verify
 /// that does not pay it.
 fn measure_boolean_verify(n_blocks: usize) -> Snapshot {
-    use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression};
     let setup = Blake3Setup::with_log_inv_rate(n_blocks, 1);
     let mut rng = Rng::new(0xC057_0003);
     let blocks: Vec<Compression> = (0..n_blocks)
         .map(|_| {
-            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u64() as u32);
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
+            let cv: [u32; 8] = from_fn(|_| rng.next_u64() as u32);
+            let m: [u32; 16] = from_fn(|_| rng.next_u64() as u32);
             (cv, m, rng.next_u64(), 64u32, 11u32)
         })
         .collect();
@@ -190,7 +191,7 @@ fn measure_boolean_verify(n_blocks: usize) -> Snapshot {
     let (proof, commitment, _) = setup.prove_fast(&blocks, &mut ch_p);
 
     let mut ch_v = FsChallenger::new(b"flock-mul-count");
-    let (_, snap) = op_count::measure(|| {
+    let (_, snap) = measure(|| {
         setup
             .verify(&commitment, &proof, &mut ch_v)
             .expect("honest proof verifies")
@@ -199,10 +200,7 @@ fn measure_boolean_verify(n_blocks: usize) -> Snapshot {
 }
 
 fn main() {
-    use flock_core::zerocheck::multilinear::{
-        interpolate_at_z_combined, interpolate_at_z_on_lambda, lagrange_weights_naive,
-    };
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
 
     println!("\n=== whole verify ===");
     header();
@@ -239,16 +237,16 @@ fn main() {
     let ell = 1usize << K_SKIP;
     let values: Vec<F128> = (0..ell).map(|_| rng.f128()).collect();
 
-    let (_, s) = op_count::measure(|| lagrange_weights_naive(K_SKIP, z));
+    let (_, s) = measure(|| lagrange_weights_naive(K_SKIP, z));
     row("lagrange_weights_naive", s, Some(denom));
-    let (_, s) = op_count::measure(|| interpolate_at_z_on_lambda(&values, K_SKIP, z));
+    let (_, s) = measure(|| interpolate_at_z_on_lambda(&values, K_SKIP, z));
     row("interpolate_at_z_on_lambda", s, Some(denom));
-    let (_, s) = op_count::measure(|| interpolate_at_z_combined(&values, K_SKIP, z));
+    let (_, s) = measure(|| interpolate_at_z_combined(&values, K_SKIP, z));
     row("interpolate_at_z_combined", s, Some(denom));
 
-    let (_, a) = op_count::measure(|| interpolate_at_z_on_lambda(&values, K_SKIP, z));
-    let (_, b) = op_count::measure(|| interpolate_at_z_combined(&values, K_SKIP, z));
-    let (_, c) = op_count::measure(|| lagrange_weights_naive(K_SKIP, z));
+    let (_, a) = measure(|| interpolate_at_z_on_lambda(&values, K_SKIP, z));
+    let (_, b) = measure(|| interpolate_at_z_combined(&values, K_SKIP, z));
+    let (_, c) = measure(|| lagrange_weights_naive(K_SKIP, z));
     let round1 = a.circuit_constraints() + b.circuit_constraints() + c.circuit_constraints();
     println!(
         "\n  zerocheck round 1 + the lincheck's skip weights = {round1} constraints \

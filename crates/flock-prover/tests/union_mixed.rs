@@ -20,22 +20,53 @@
 //! byte-identity differentials against the direct jagged path lived in
 //! `tests/union_roundtrip.rs` on the harness binding.
 
+use bincode::deserialize;
+use bincode::serialize;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
+use flock_core::lincheck::LincheckError;
+use flock_core::pcs::commit;
+use flock_core::pcs::commit_lane_major;
 use flock_core::pcs::ligerito::LigeritoProfile;
+use flock_core::pcs::ligerito::embedded_initial_k_or_default;
 use flock_core::pcs::{PcsOpenError, PcsParams};
 use flock_core::proof::R1csProofMergedLigerito;
 use flock_core::r1cs::BlockR1cs;
+use flock_core::scratch::give_f128;
+use flock_core::scratch::give_u8;
+use flock_core::scratch::prewarm_prover;
 use flock_core::union::SlotWitness;
 use flock_core::verifier::FlockVerifyError;
 use flock_prover::challenger::FsChallenger;
 use flock_prover::prover::{self, UnionSlotProverInput};
-use flock_prover::r1cs_hashes::{blake3, sha2};
+use flock_prover::r1cs_hashes::blake3::{
+    Blake3Setup, Compression as Blake3Compression, K_LOG as BLAKE3_K_LOG,
+    build_block_r1cs as build_blake3_block_r1cs,
+    generate_witness_batch_major as generate_blake3_witness_batch_major,
+    generate_witness_batch_major_partial as generate_blake3_witness_batch_major_partial,
+    generate_witness_batch_major_partial_into as generate_blake3_witness_batch_major_partial_into,
+};
+use flock_prover::r1cs_hashes::sha2::{
+    Compression as Sha2Compression, K_LOG as SHA2_K_LOG, Sha256HybridSetup,
+    build_block_r1cs as build_sha2_block_r1cs,
+    generate_witness_batch_major as generate_sha2_witness_batch_major,
+    generate_witness_batch_major_partial as generate_sha2_witness_batch_major_partial,
+    generate_witness_batch_major_partial_into as generate_sha2_witness_batch_major_partial_into,
+};
 use flock_prover::schedule::{Registry, TableType};
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier;
+use prover::prove_fast_ligerito_union;
+use prover::prove_fast_ligerito_union_mixed_class;
+use std::array::from_fn;
+use std::env::var;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use verifier::verify_ligerito_union;
+use verifier::verify_ligerito_union_mixed_class;
 
 use flock_core::test_rng::Rng;
+use std::time::Instant;
 
 const DOMAIN: &[u8] = b"flock-mixed-e2e-v0";
 
@@ -44,30 +75,25 @@ const DOMAIN: &[u8] = b"flock-mixed-e2e-v0";
 /// wall-clock reading (a single-shot arm measured 3x its quiet value) and
 /// occasionally trips the loose timing gates. Correctness tests stay
 /// parallel; only tests that assert or print wall times take this lock.
-fn timing_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn timing_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
+fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<Blake3Compression> {
     (0..n)
         .map(|_| {
-            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = from_fn(|_| rng.next_u32());
             let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
             (cv, m, counter, 64u32, 11u32)
         })
         .collect()
 }
 
-fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
+fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<Sha2Compression> {
     (0..n)
-        .map(|_| {
-            (
-                std::array::from_fn(|_| rng.next_u32()),
-                std::array::from_fn(|_| rng.next_u32()),
-            )
-        })
+        .map(|_| (from_fn(|_| rng.next_u32()), from_fn(|_| rng.next_u32())))
         .collect()
 }
 
@@ -78,8 +104,8 @@ fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
 /// under uniform capacity simply κ descending — is SHA-256 then BLAKE3,
 /// and M = ν + 16.
 fn mixed_registry(nu: usize) -> (Registry, BlockR1cs, BlockR1cs) {
-    let sha2_r1cs = sha2::build_block_r1cs(nu);
-    let blake3_r1cs = blake3::build_block_r1cs(nu);
+    let sha2_r1cs = build_sha2_block_r1cs(nu);
+    let blake3_r1cs = build_blake3_block_r1cs(nu);
     let registry = Registry::new(
         vec![
             TableType::from_block_r1cs(&blake3_r1cs),
@@ -89,10 +115,10 @@ fn mixed_registry(nu: usize) -> (Registry, BlockR1cs, BlockR1cs) {
     );
     assert_eq!(
         registry.types()[0].k_log,
-        sha2::K_LOG,
+        SHA2_K_LOG,
         "slot order: SHA-256 (wider) first"
     );
-    assert_eq!(registry.types()[1].k_log, blake3::K_LOG);
+    assert_eq!(registry.types()[1].k_log, BLAKE3_K_LOG);
     assert_eq!(registry.m_total(), nu + 16);
     (registry, sha2_r1cs, blake3_r1cs)
 }
@@ -108,14 +134,11 @@ fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
     PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
-            union.dense_m(),
-            LigeritoProfile::Fast,
-        ),
+        log_batch_size: embedded_initial_k_or_default(union.dense_m(), LigeritoProfile::Fast),
         profile: LigeritoProfile::Fast,
         // Integer-lane commit: skip the encode + hash of the whole zero lanes
         // the power-of-two rounding of the dense stack leaves behind.
-        num_lanes: union.commit_lanes(flock_core::pcs::ligerito::embedded_initial_k_or_default(
+        num_lanes: union.commit_lanes(embedded_initial_k_or_default(
             union.dense_m(),
             LigeritoProfile::Fast,
         )),
@@ -158,25 +181,25 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     // ---- Prove: per-slot inputs in slot order (SHA-256 first).
     let slots = vec![
         UnionSlotProverInput::new(
-            sha2::generate_witness_batch_major(&sha2_inputs, nu),
+            generate_sha2_witness_batch_major(&sha2_inputs, nu),
             sha2_circuit,
         ),
         UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major(&blake3_inputs, nu),
+            generate_blake3_witness_batch_major(&blake3_inputs, nu),
             blake3_circuit,
         ),
     ];
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (proof, commitment, claim) =
-        prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
+        prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
 
     // ---- The commitment is a commitment to the COMPACTED union buffer
     // (the M4 dense stack): regenerate the witnesses, assemble them
     // independently, compact, commit directly, and compare roots. Also pin
     // that the compaction genuinely moved data: q differs from the padded
     // buffer's prefix (BLAKE3's slot stacks 10 columns lower).
-    let (z_s, a_s, b_s, _) = sha2::generate_witness_batch_major(&sha2_inputs, nu);
-    let (z_b, a_b, b_b, _) = blake3::generate_witness_batch_major(&blake3_inputs, nu);
+    let (z_s, a_s, b_s, _) = generate_sha2_witness_batch_major(&sha2_inputs, nu);
+    let (z_b, a_b, b_b, _) = generate_blake3_witness_batch_major(&blake3_inputs, nu);
     let (z_union, _, _) = union.assemble_witness(vec![
         SlotWitness {
             z_packed: z_s,
@@ -199,9 +222,9 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     // Mirrors the prover's dispatch: the integer-lane commit encodes only the
     // dense stack's nonzero high-bit lanes (`UnionInstance::commit_lanes`).
     let (comm_direct, _prover_data) = if pcs_params.num_lanes.is_some() {
-        flock_core::pcs::commit_lane_major(&q, &pcs_params)
+        commit_lane_major(&q, &pcs_params)
     } else {
-        flock_core::pcs::commit(&q, &pcs_params)
+        commit(&q, &pcs_params)
     };
     assert_eq!(
         commitment.cap, comm_direct.cap,
@@ -212,14 +235,7 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     let circuits: [&dyn LincheckCircuit; 2] = [sha2_circuit, blake3_circuit];
     let verify = |union: &UnionInstance<'_>, proof: &R1csProofMergedLigerito| {
         let mut ch_v = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union(
-            union,
-            &circuits,
-            &commitment,
-            proof,
-            &pcs_params,
-            &mut ch_v,
-        )
+        verify_ligerito_union(union, &circuits, &commitment, proof, &pcs_params, &mut ch_v)
     };
     let claim_v = verify(&union, &proof)
         .unwrap_or_else(|e| panic!("mixed verifier rejected honest proof: {e:?}"));
@@ -285,7 +301,7 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
             bad_comm.params.num_lanes = bad_lanes;
             let mut ch_v = FsChallenger::new(DOMAIN);
             assert!(
-                verifier::verify_ligerito_union(
+                verify_ligerito_union(
                     &union,
                     &circuits,
                     &bad_comm,
@@ -305,9 +321,7 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
         let mut bad = proof.clone();
         bad.lincheck.rounds[0].0.lo ^= 1;
         match verify(&union, &bad) {
-            Err(FlockVerifyError::Lincheck(
-                flock_core::lincheck::LincheckError::ConsistencyFailed { .. },
-            )) => {}
+            Err(FlockVerifyError::Lincheck(LincheckError::ConsistencyFailed { .. })) => {}
             other => panic!(
                 "tampered lincheck round: expected Lincheck(ConsistencyFailed), got {other:?}"
             ),
@@ -341,8 +355,6 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
 #[test]
 #[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
 fn mixed_partial_counts_roundtrip_and_tamper() {
-    use std::time::Instant;
-
     let nu = 6usize; // capacity 64 per type; M = 22 (m22 Ligerito config)
     let capacity = 1usize << nu;
     let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
@@ -369,21 +381,21 @@ fn mixed_partial_counts_roundtrip_and_tamper() {
 
         let slots = vec![
             UnionSlotProverInput::new(
-                sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                generate_sha2_witness_batch_major_partial(&sha2_inputs, nu),
                 sha2_circuit,
             ),
             UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                generate_blake3_witness_batch_major_partial(&blake3_inputs, nu),
                 blake3_circuit,
             ),
         ];
         let mut ch_p = FsChallenger::new(DOMAIN);
         let (proof, commitment, claim) =
-            prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
+            prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
 
         let verify = |union: &UnionInstance<'_>| {
             let mut ch_v = FsChallenger::new(DOMAIN);
-            verifier::verify_ligerito_union(
+            verify_ligerito_union(
                 union,
                 &circuits,
                 &commitment,
@@ -445,11 +457,11 @@ fn dense_floor_roundtrip_and_statement_binding() {
     let slots = || {
         vec![
             UnionSlotProverInput::new(
-                sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                generate_sha2_witness_batch_major_partial(&sha2_inputs, nu),
                 sha2_circuit,
             ),
             UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                generate_blake3_witness_batch_major_partial(&blake3_inputs, nu),
                 blake3_circuit,
             ),
         ]
@@ -487,9 +499,9 @@ fn dense_floor_roundtrip_and_statement_binding() {
     // The floored proof roundtrips at the pinned size.
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (proof_f, commitment_f, claim_f) =
-        prover::prove_fast_ligerito_union(&floored, &params_f, slots(), &mut ch_p);
+        prove_fast_ligerito_union(&floored, &params_f, slots(), &mut ch_p);
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim_v = verifier::verify_ligerito_union(
+    let claim_v = verify_ligerito_union(
         &floored,
         &circuits,
         &commitment_f,
@@ -505,9 +517,9 @@ fn dense_floor_roundtrip_and_statement_binding() {
     assert_eq!(params_n.m, 22);
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (proof_n, commitment_n, _) =
-        prover::prove_fast_ligerito_union(&natural, &params_n, slots(), &mut ch_p);
+        prove_fast_ligerito_union(&natural, &params_n, slots(), &mut ch_p);
     let mut ch_v = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union(
+    verify_ligerito_union(
         &natural,
         &circuits,
         &commitment_n,
@@ -521,7 +533,7 @@ fn dense_floor_roundtrip_and_statement_binding() {
     // against the m23 proof — reject, never accept-with-different-statement.
     let mut ch_v = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union(
+        verify_ligerito_union(
             &natural,
             &circuits,
             &commitment_f,
@@ -571,17 +583,17 @@ fn mixed_area_saving_roundtrip() {
 
     let slots = vec![
         UnionSlotProverInput::new(
-            sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+            generate_sha2_witness_batch_major_partial(&sha2_inputs, nu),
             sha2_circuit,
         ),
         UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+            generate_blake3_witness_batch_major_partial(&blake3_inputs, nu),
             blake3_circuit,
         ),
     ];
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (proof, commitment, claim) =
-        prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
+        prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
     assert_eq!(
         commitment.params.m, 22,
         "the produced commitment must be to the 2^15-word dense stack"
@@ -590,7 +602,7 @@ fn mixed_area_saving_roundtrip() {
     let circuits: [&dyn LincheckCircuit; 2] = [sha2_circuit, blake3_circuit];
     let verify = |union: &UnionInstance<'_>| {
         let mut ch_v = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union(
+        verify_ligerito_union(
             union,
             &circuits,
             &commitment,
@@ -630,16 +642,16 @@ fn mixed_prove_rejects_swapped_slot_order() {
     // WRONG order: BLAKE3 (κ = 14) first, SHA-256 (κ = 15) second.
     let slots = vec![
         UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major(&blake3_inputs, nu),
+            generate_blake3_witness_batch_major(&blake3_inputs, nu),
             blake3_r1cs.csc_lincheck_circuit(),
         ),
         UnionSlotProverInput::new(
-            sha2::generate_witness_batch_major(&sha2_inputs, nu),
+            generate_sha2_witness_batch_major(&sha2_inputs, nu),
             sha2_r1cs.csc_lincheck_circuit(),
         ),
     ];
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let _ = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
+    let _ = prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
 }
 
 /// A single-type instance through the NEW binding roundtrips. The proof is
@@ -654,7 +666,7 @@ fn mixed_prove_rejects_swapped_slot_order() {
 #[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
 fn blake3_single_type_roundtrip_under_mixed_binding() {
     let n_blocks = 256usize;
-    let setup = blake3::Blake3Setup::new(n_blocks);
+    let setup = Blake3Setup::new(n_blocks);
     let mut rng = Rng::new(0x03_31_00_B3);
     let inputs = random_blake3_inputs(&mut rng, n_blocks);
     let lc_circuit = setup.r1cs.csc_lincheck_circuit();
@@ -665,15 +677,15 @@ fn blake3_single_type_roundtrip_under_mixed_binding() {
     );
     let union = UnionInstance::new(&registry, vec![n_blocks]);
     let slot = UnionSlotProverInput::new(
-        blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log()),
+        generate_blake3_witness_batch_major(&inputs, setup.n_blocks_log()),
         lc_circuit,
     );
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (proof, commitment, claim) =
-        prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch_p);
+        prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch_p);
 
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim_v = verifier::verify_ligerito_union(
+    let claim_v = verify_ligerito_union(
         &union,
         &[lc_circuit],
         &commitment,
@@ -695,7 +707,7 @@ fn blake3_single_type_roundtrip_under_mixed_binding() {
 #[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
 fn identity_compaction_roundtrips_over_the_merged_transport() {
     let n_blocks = 256usize;
-    let setup = blake3::Blake3Setup::new(n_blocks);
+    let setup = Blake3Setup::new(n_blocks);
     let mut rng = Rng::new(0x03_31_1D_B3);
     let inputs = random_blake3_inputs(&mut rng, n_blocks);
     let lc_circuit = setup.r1cs.csc_lincheck_circuit();
@@ -710,11 +722,11 @@ fn identity_compaction_roundtrips_over_the_merged_transport() {
         "single slot at full utilization must be the identity compaction"
     );
     let slot = UnionSlotProverInput::new(
-        blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log()),
+        generate_blake3_witness_batch_major(&inputs, setup.n_blocks_log()),
         lc_circuit,
     );
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof, commitment, claims) = prover::prove_fast_ligerito_union_mixed_class(
+    let (proof, commitment, claims) = prove_fast_ligerito_union_mixed_class(
         &union,
         &setup.pcs_params,
         vec![slot],
@@ -722,7 +734,7 @@ fn identity_compaction_roundtrips_over_the_merged_transport() {
         &mut ch_p,
     );
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claims_v = verifier::verify_ligerito_union_mixed_class(
+    let claims_v = verify_ligerito_union_mixed_class(
         &union,
         &[lc_circuit],
         &commitment,
@@ -750,14 +762,13 @@ fn identity_compaction_roundtrips_over_the_merged_transport() {
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn mixed_low_utilization_smoke() {
     let _quiet = timing_lock();
-    use std::time::Instant;
 
     let nu = 10usize;
     let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
     let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
     let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
     let mut rng = Rng::new(0x05_31_77_77);
-    flock_core::scratch::prewarm_prover(registry.m_total());
+    prewarm_prover(registry.m_total());
 
     let mut results = Vec::new();
     for counts in [[8usize, 8usize], [1024, 1024]] {
@@ -774,24 +785,24 @@ fn mixed_low_utilization_smoke() {
         for timed in [false, true, true, true] {
             let slots = vec![
                 UnionSlotProverInput::new(
-                    sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                    generate_sha2_witness_batch_major_partial(&sha2_inputs, nu),
                     s2_circuit,
                 ),
                 UnionSlotProverInput::new(
-                    blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                    generate_blake3_witness_batch_major_partial(&blake3_inputs, nu),
                     b3_circuit,
                 ),
             ];
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
             let (proof, commitment, claim) =
-                prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
+                prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
             if timed {
                 prove_ms = prove_ms.min(t.elapsed().as_secs_f64() * 1e3);
                 // Roundtrip while we're here.
                 let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
                 let mut ch_v = FsChallenger::new(DOMAIN);
-                let claim_v = verifier::verify_ligerito_union(
+                let claim_v = verify_ligerito_union(
                     &union,
                     &circuits,
                     &commitment,
@@ -861,19 +872,19 @@ fn merged_transport_roundtrip_and_tamper() {
         let blake3_inputs = random_blake3_inputs(&mut rng, counts[1]);
         let slots = vec![
             UnionSlotProverInput::new(
-                sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                generate_sha2_witness_batch_major_partial(&sha2_inputs, nu),
                 s2_circuit,
             ),
             UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                generate_blake3_witness_batch_major_partial(&blake3_inputs, nu),
                 b3_circuit,
             ),
         ];
         let mut ch = FsChallenger::new(DOMAIN);
         let (proof, commitment, claim) =
-            prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
+            prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
         let mut ch_v = FsChallenger::new(DOMAIN);
-        let claim_v = verifier::verify_ligerito_union(
+        let claim_v = verify_ligerito_union(
             &union,
             &circuits,
             &commitment,
@@ -885,18 +896,11 @@ fn merged_transport_roundtrip_and_tamper() {
         assert_eq!(claim_v, claim);
 
         // Tamper matrix over the transport's new pieces + one PIOP field.
-        let reject = |p: &flock_core::proof::R1csProofMergedLigerito, what: &str| {
+        let reject = |p: &R1csProofMergedLigerito, what: &str| {
             let mut ch_v = FsChallenger::new(DOMAIN);
             assert!(
-                verifier::verify_ligerito_union(
-                    &union,
-                    &circuits,
-                    &commitment,
-                    p,
-                    &pcs_params,
-                    &mut ch_v,
-                )
-                .is_err(),
+                verify_ligerito_union(&union, &circuits, &commitment, p, &pcs_params, &mut ch_v,)
+                    .is_err(),
                 "tampered proof ({what}) must be rejected at counts {counts:?}"
             );
         };
@@ -943,7 +947,7 @@ fn merged_transport_roundtrip_and_tamper() {
             let union_bad = UnionInstance::new(&registry, vec![counts[0], counts[1] - 1]);
             let mut ch_v = FsChallenger::new(DOMAIN);
             assert!(
-                verifier::verify_ligerito_union(
+                verify_ligerito_union(
                     &union_bad,
                     &circuits,
                     &commitment,
@@ -969,7 +973,7 @@ fn merged_transport_roundtrip_and_tamper() {
             assert_eq!(union.jagged_heights(), union_bad.jagged_heights());
             let mut ch_v = FsChallenger::new(DOMAIN);
             assert!(
-                verifier::verify_ligerito_union(
+                verify_ligerito_union(
                     &union_bad,
                     &circuits,
                     &commitment,
@@ -995,7 +999,7 @@ fn merged_transport_roundtrip_and_tamper() {
         };
         let mut ch_v = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito_union(
+            verify_ligerito_union(
                 &union,
                 &circuits,
                 &bad_commitment,
@@ -1010,7 +1014,7 @@ fn merged_transport_roundtrip_and_tamper() {
         bad_commitment.params.log_inv_rate += 1;
         let mut ch_v = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito_union(
+            verify_ligerito_union(
                 &union,
                 &circuits,
                 &bad_commitment,
@@ -1035,12 +1039,12 @@ fn merged_transport_roundtrip_and_tamper() {
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn merged_transport_m30_probe() {
     let _quiet = timing_lock();
-    use std::time::Instant;
+
     const COUNTS: [usize; 2] = [16384, 16384];
     const NUS: [usize; 3] = [14, 15, 16];
 
     let cfgs: Vec<_> = NUS.iter().map(|&nu| mixed_registry(nu)).collect();
-    flock_core::scratch::prewarm_prover(cfgs.last().unwrap().0.m_total());
+    prewarm_prover(cfgs.last().unwrap().0.m_total());
     let mut rng = Rng::new(0x_4E_26_ED_30);
     let sha2_inputs = random_sha2_inputs(&mut rng, COUNTS[0]);
     let blake3_inputs = random_blake3_inputs(&mut rng, COUNTS[1]);
@@ -1055,13 +1059,11 @@ fn merged_transport_m30_probe() {
             let union = UnionInstance::new(registry, COUNTS.to_vec());
             let slots = vec![
                 UnionSlotProverInput::in_place(
-                    |dst| sha2::generate_witness_batch_major_partial_into(&sha2_inputs, nu, dst),
+                    |dst| generate_sha2_witness_batch_major_partial_into(&sha2_inputs, nu, dst),
                     s2_circuit,
                 ),
                 UnionSlotProverInput::in_place(
-                    |dst| {
-                        blake3::generate_witness_batch_major_partial_into(&blake3_inputs, nu, dst)
-                    },
+                    |dst| generate_blake3_witness_batch_major_partial_into(&blake3_inputs, nu, dst),
                     b3_circuit,
                 ),
             ];
@@ -1069,11 +1071,11 @@ fn merged_transport_m30_probe() {
             let t = Instant::now();
             let pcs_params = union_pcs_params(&union);
             let (proof, commitment, claim) =
-                prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
+                prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
             let ms = t.elapsed().as_secs_f64() * 1e3;
             if pass == 0 {
                 let mut ch_v = FsChallenger::new(DOMAIN);
-                let claim_v = verifier::verify_ligerito_union(
+                let claim_v = verify_ligerito_union(
                     &union,
                     &circuits,
                     &commitment,
@@ -1132,26 +1134,26 @@ fn merged_padding_unread_poison_pool() {
         let prove = || {
             let slots = vec![
                 UnionSlotProverInput::in_place(
-                    |dst| sha2::generate_witness_batch_major_partial_into(&sha2_inputs, 7, dst),
+                    |dst| generate_sha2_witness_batch_major_partial_into(&sha2_inputs, 7, dst),
                     s2_circuit,
                 ),
                 UnionSlotProverInput::in_place(
-                    |dst| blake3::generate_witness_batch_major_partial_into(&blake3_inputs, 7, dst),
+                    |dst| generate_blake3_witness_batch_major_partial_into(&blake3_inputs, 7, dst),
                     b3_circuit,
                 ),
             ];
             let mut ch = FsChallenger::new(DOMAIN);
-            prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch)
+            prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch)
         };
         let (p1, c1, cl1) = prove();
         // Poison the pools with exact-size buffers so `take` hands them out.
         let len = union.packed_len();
         let poison = F128::new(0xDEAD_BEEF_DEAD_BEEF, 0xDEAD_BEEF_DEAD_BEEF);
         for _ in 0..6 {
-            flock_core::scratch::give_f128(vec![poison; len]);
+            give_f128(vec![poison; len]);
         }
         for _ in 0..4 {
-            flock_core::scratch::give_u8(vec![0xAD; 1 << 20]);
+            give_u8(vec![0xAD; 1 << 20]);
         }
         let (p2, c2, cl2) = prove();
         assert_eq!(c1.cap, c2.cap, "commitment must ignore dropped words");
@@ -1159,7 +1161,7 @@ fn merged_padding_unread_poison_pool() {
         assert_eq!(cl1, cl2);
         let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
         let mut chv = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union(&union, &circuits, &c2, &p2, &pcs_params, &mut chv)
+        verify_ligerito_union(&union, &circuits, &c2, &p2, &pcs_params, &mut chv)
             .expect("poison-pool proof verifies");
     }
 }
@@ -1193,30 +1195,27 @@ fn in_place_generation_matches_prebuilt_byte_identical() {
         let prove = |slots: Vec<UnionSlotProverInput<'_>>| {
             let mut ch = FsChallenger::new(DOMAIN);
             let (proof, commitment, _claim) =
-                prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
-            (
-                bincode::serialize(&proof).expect("proof serializes"),
-                commitment,
-            )
+                prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
+            (serialize(&proof).expect("proof serializes"), commitment)
         };
 
         let (prebuilt_bytes, prebuilt_comm) = prove(vec![
             UnionSlotProverInput::new(
-                sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                generate_sha2_witness_batch_major_partial(&sha2_inputs, nu),
                 sha2_circuit,
             ),
             UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                generate_blake3_witness_batch_major_partial(&blake3_inputs, nu),
                 blake3_circuit,
             ),
         ]);
         let (in_place_bytes, in_place_comm) = prove(vec![
             UnionSlotProverInput::in_place(
-                |dst| sha2::generate_witness_batch_major_partial_into(&sha2_inputs, nu, dst),
+                |dst| generate_sha2_witness_batch_major_partial_into(&sha2_inputs, nu, dst),
                 sha2_circuit,
             ),
             UnionSlotProverInput::in_place(
-                |dst| blake3::generate_witness_batch_major_partial_into(&blake3_inputs, nu, dst),
+                |dst| generate_blake3_witness_batch_major_partial_into(&blake3_inputs, nu, dst),
                 blake3_circuit,
             ),
         ]);
@@ -1233,8 +1232,8 @@ fn in_place_generation_matches_prebuilt_byte_identical() {
         // ...and the in-place proof really verifies (not just "same bytes").
         let mut ch = FsChallenger::new(DOMAIN);
         let proof: R1csProofMergedLigerito =
-            bincode::deserialize(&in_place_bytes).expect("proof deserializes");
-        verifier::verify_ligerito_union(
+            deserialize(&in_place_bytes).expect("proof deserializes");
+        verify_ligerito_union(
             &union,
             &circuits,
             &in_place_comm,
@@ -1267,17 +1266,16 @@ fn in_place_generation_matches_prebuilt_byte_identical() {
 #[ignore] // Heavy (M = 30, ~2 GB) + informational — run explicitly with --ignored --nocapture
 fn mixed_m30_throughput() {
     let _quiet = timing_lock();
-    use std::time::Instant;
 
     // Timed runs after one warm-up; best reported. `MIXED_ITERS` overrides
     // (phase-median A/Bs want 5+).
-    let iters: usize = std::env::var("MIXED_ITERS")
+    let iters: usize = var("MIXED_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
     // M = nu + 16; full utilization = 2^nu invocations per type. Default
     // nu 14 (M = 30); `MIXED_NU=16` benches the M = 32 point.
-    let nu: usize = std::env::var("MIXED_NU")
+    let nu: usize = var("MIXED_NU")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(14);
@@ -1290,30 +1288,28 @@ fn mixed_m30_throughput() {
     // One untimed warm-up (hot scratch pool), then best-of-ITERS timed. The
     // setup and its buffers drop at the end of the block.
     let (b3_ms, b3_m) = {
-        let setup = blake3::Blake3Setup::new(n_per_type);
+        let setup = Blake3Setup::new(n_per_type);
         assert_eq!(setup.n_blocks_log(), nu);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let registry = Registry::new(vec![TableType::from_block_r1cs(&setup.r1cs)], nu);
         let union = UnionInstance::new(&registry, vec![n_per_type]);
         {
             let slot = UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major(&blake3_inputs, nu),
+                generate_blake3_witness_batch_major(&blake3_inputs, nu),
                 circuit,
             );
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ =
-                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
+            let _ = prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         }
         let mut best = f64::INFINITY;
         for _ in 0..iters {
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
             let slot = UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major(&blake3_inputs, nu),
+                generate_blake3_witness_batch_major(&blake3_inputs, nu),
                 circuit,
             );
-            let _ =
-                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
+            let _ = prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
         }
         (best, setup.m())
@@ -1322,30 +1318,28 @@ fn mixed_m30_throughput() {
     // ---- Single-type SHA-256 baseline as a single-slot merged union
     // (m = 29).
     let (s2_ms, s2_m) = {
-        let setup = sha2::Sha256HybridSetup::new(n_per_type);
+        let setup = Sha256HybridSetup::new(n_per_type);
         assert_eq!(setup.n_blocks_log(), nu);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let registry = Registry::new(vec![TableType::from_block_r1cs(&setup.r1cs)], nu);
         let union = UnionInstance::new(&registry, vec![n_per_type]);
         {
             let slot = UnionSlotProverInput::new(
-                sha2::generate_witness_batch_major(&sha2_inputs, nu),
+                generate_sha2_witness_batch_major(&sha2_inputs, nu),
                 circuit,
             );
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ =
-                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
+            let _ = prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         }
         let mut best = f64::INFINITY;
         for _ in 0..iters {
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
             let slot = UnionSlotProverInput::new(
-                sha2::generate_witness_batch_major(&sha2_inputs, nu),
+                generate_sha2_witness_batch_major(&sha2_inputs, nu),
                 circuit,
             );
-            let _ =
-                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
+            let _ = prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
         }
         (best, setup.m())
@@ -1365,39 +1359,39 @@ fn mixed_m30_throughput() {
     assert_eq!(union.dense_m(), nu + 16);
     assert_eq!(union.committed_words(), union.packed_len());
     assert_eq!(pcs_params.m, nu + 16);
-    flock_core::scratch::prewarm_prover(registry.m_total());
+    prewarm_prover(registry.m_total());
     let s2_mix_circuit = sha2_r1cs.csc_lincheck_circuit();
     let b3_mix_circuit = blake3_r1cs.csc_lincheck_circuit();
     {
         let slots = vec![
             UnionSlotProverInput::new(
-                sha2::generate_witness_batch_major(&sha2_inputs, nu),
+                generate_sha2_witness_batch_major(&sha2_inputs, nu),
                 s2_mix_circuit,
             ),
             UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major(&blake3_inputs, nu),
+                generate_blake3_witness_batch_major(&blake3_inputs, nu),
                 b3_mix_circuit,
             ),
         ];
         let mut ch = FsChallenger::new(DOMAIN);
-        let _ = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
+        let _ = prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
     }
     let mut mixed_ms = f64::INFINITY;
     let mut mixed_out = None;
     for _ in 0..iters {
         let slots = vec![
             UnionSlotProverInput::new(
-                sha2::generate_witness_batch_major(&sha2_inputs, nu),
+                generate_sha2_witness_batch_major(&sha2_inputs, nu),
                 s2_mix_circuit,
             ),
             UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major(&blake3_inputs, nu),
+                generate_blake3_witness_batch_major(&blake3_inputs, nu),
                 b3_mix_circuit,
             ),
         ];
         let mut ch = FsChallenger::new(DOMAIN);
         let t = Instant::now();
-        let out = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
+        let out = prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
         mixed_ms = mixed_ms.min(t.elapsed().as_secs_f64() * 1e3);
         mixed_out = Some(out);
     }
@@ -1407,7 +1401,7 @@ fn mixed_m30_throughput() {
     let circuits: [&dyn LincheckCircuit; 2] = [s2_mix_circuit, b3_mix_circuit];
     let t = Instant::now();
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim_v = verifier::verify_ligerito_union(
+    let claim_v = verify_ligerito_union(
         &union,
         &circuits,
         &commitment,
@@ -1418,7 +1412,7 @@ fn mixed_m30_throughput() {
     .unwrap_or_else(|e| panic!("mixed m=30 verifier rejected honest proof: {e:?}"));
     let verify_ms = t.elapsed().as_secs_f64() * 1e3;
     assert_eq!(claim_v, claim);
-    let proof_bytes = bincode::serialize(&proof).unwrap().len();
+    let proof_bytes = serialize(&proof).unwrap().len();
 
     // ---- Report.
     let singles = b3_ms + s2_ms;

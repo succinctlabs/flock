@@ -57,8 +57,12 @@
 //! `(q(1), q(∞))` with `q(0)` re-derived from the running claim, and each
 //! round binds the LOW remaining variable.
 
+use crate::element_r1cs::SparseF128Matrix;
+use crate::pcs::jagged::JaggedParams;
+use crate::pcs::jagged::assist_boundaries;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::challenger::Challenger;
 use crate::field::F128;
@@ -592,7 +596,7 @@ impl FoldMatrix for SparseBinaryMatrix {
     }
 }
 
-impl FoldMatrix for crate::element_r1cs::SparseF128Matrix {
+impl FoldMatrix for SparseF128Matrix {
     fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
         let mut out = vec![F128::ZERO; n_rows];
         out.par_chunks_mut(G_ROW_CHUNK)
@@ -828,8 +832,8 @@ pub struct JaggedTable {
 impl JaggedTable {
     /// The table of a concrete layout. Everything is derived from
     /// `col_prefix_sums`, the same source the assist verifier reads.
-    pub fn from_params(params: &crate::pcs::jagged::JaggedParams) -> Self {
-        let bounds = crate::pcs::jagged::assist_boundaries(params);
+    pub fn from_params(params: &JaggedParams) -> Self {
+        let bounds = assist_boundaries(params);
         let covered: u64 = bounds.iter().map(|&(_, _, run)| run as u64).sum();
         assert_eq!(covered, 1u64 << params.k, "runs must cover every column");
         Self {
@@ -1054,7 +1058,7 @@ impl JaggedAssertion {
     }
 
     /// Root discharge: every claim against the real layout.
-    pub fn check(&self, params: &crate::pcs::jagged::JaggedParams) -> bool {
+    pub fn check(&self, params: &JaggedParams) -> bool {
         let t = JaggedTable::from_params(params);
         t.k == self.k && t.m == self.m && self.claims().into_iter().all(|c| c.check_direct(&t))
     }
@@ -1206,8 +1210,7 @@ pub fn prove_fold_jagged_with_grinding<Ch: Challenger>(
         for (st, c) in states.iter_mut().zip(claims) {
             let p_j = c.col[j];
             st.cur *= p_j * r + (F128::ONE + p_j) * (F128::ONE + r);
-            let mut merged: std::collections::BTreeMap<u64, F128> =
-                std::collections::BTreeMap::new();
+            let mut merged: BTreeMap<u64, F128> = BTreeMap::new();
             for &(idx, v) in &st.entries {
                 let f = if idx & 1 == 1 { r } else { F128::ONE + r };
                 *merged.entry(idx >> 1).or_insert(F128::ZERO) += v * f;
@@ -1398,6 +1401,7 @@ pub fn verify_fold_jagged_with_grinding<Ch: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+    use crate::pcs::jagged::JaggedParams;
 
     const D: &[u8] = b"matrix-fold-test";
 
@@ -1585,7 +1589,7 @@ mod tests {
 
     #[test]
     fn jagged_grinding_roundtrip_and_rejects_bad_nonce_shape() {
-        let params = crate::pcs::jagged::JaggedParams::from_heights(&[2, 3, 1, 2], 2, 4);
+        let params = JaggedParams::from_heights(&[2, 3, 1, 2], 2, 4);
         let table = JaggedTable::from_params(&params);
         let mut rng = Rng(0x1280_1A66);
         let claims = vec![

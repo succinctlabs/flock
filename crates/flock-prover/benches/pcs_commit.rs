@@ -8,6 +8,10 @@
 //!
 //! Run: `cargo bench --bench pcs_commit`
 
+use core::mem::size_of;
+use core::slice::from_raw_parts;
+use flock_prover::init_perf_thread_pool;
+use merkle::merkle_tree;
 use std::time::Instant;
 
 use flock_prover::field::F128;
@@ -128,8 +132,7 @@ fn bench_commit_breakdown(m: usize) {
 
     // ---- 5. Merkle tree (leaves of num_ntts × 16 bytes).
     let t0 = Instant::now();
-    let merkle_tree =
-        merkle::merkle_tree(&codeword_bytes, params.n_positions(), params.merkle_hash);
+    let merkle_tree = merkle_tree(&codeword_bytes, params.n_positions(), params.merkle_hash);
     let secs_merkle = t0.elapsed().as_secs_f64();
     let _root = merkle_tree.last().unwrap();
     let leaf_bytes = params.leaf_size_bytes();
@@ -170,7 +173,7 @@ fn bench_commit_breakdown(m: usize) {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — NEON + parallel NTT path active)");
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
@@ -308,15 +311,15 @@ fn bench_commit_packed_breakdown(m: usize) {
 
     // ---- 3. Cast codeword bytes (zero-copy — same as pcs::commit).
     let codeword_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
+        from_raw_parts(
             codeword.as_ptr() as *const u8,
-            codeword.len() * core::mem::size_of::<F128>(),
+            codeword.len() * size_of::<F128>(),
         )
     };
 
     // ---- 4. Merkle tree.
     let t0 = Instant::now();
-    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_positions(), params.merkle_hash);
+    let merkle_tree = merkle_tree(codeword_bytes, params.n_positions(), params.merkle_hash);
     let secs_merkle = t0.elapsed().as_secs_f64();
     let _root = merkle_tree.last().unwrap();
 

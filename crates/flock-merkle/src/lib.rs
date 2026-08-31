@@ -2,21 +2,21 @@
 //!
 //! [`MerkleHash`] selects the hash implementation. [`HashKind`] supports runtime selection.
 
-mod hashing;
-
+use flock_parallel::all_core_pool;
+#[cfg(feature = "hash-count")]
+pub use hashing::hash_count;
 pub use hashing::{
     Blake3MerkleHash, Hash, HashKind, MerkleHash, Sha256MerkleHash, hash_leaf, hash_pair,
 };
-
-#[cfg(feature = "hash-count")]
-pub use hashing::hash_count;
-
-use flock_parallel::all_core_pool;
 #[cfg(test)]
 use hashing::{
     blake3_hash_many_leaves, blake3_hash_many_parents, blake3_leaf_cv,
     blake3_leaf_size_is_batchable, blake3_parent_cv,
 };
+use rayon::current_num_threads;
+use std::env::var;
+use std::slice::from_ref;
+mod hashing;
 
 /// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
 ///
@@ -48,8 +48,8 @@ const MERKLE_ALLCORE_MIN_BYTES: usize = 8 << 20;
 // choice cannot change output bits — every node is written deterministically.
 fn merkle_use_all_cores(data_len: usize) -> bool {
     data_len >= MERKLE_ALLCORE_MIN_BYTES
-        && std::env::var("MERKLE_PCORES_ONLY").is_err()
-        && all_core_pool().current_num_threads() > rayon::current_num_threads()
+        && var("MERKLE_PCORES_ONLY").is_err()
+        && all_core_pool().current_num_threads() > current_num_threads()
 }
 
 /// Compute the full Merkle tree (flat layout, see module docs) for `data`
@@ -315,7 +315,7 @@ pub fn verify_merkle_proof_with<H: MerkleHash>(
     proof: &[Hash],
 ) -> bool {
     verify_merkle_proof_capped_with::<H>(
-        std::slice::from_ref(root),
+        from_ref(root),
         1usize << proof.len(),
         leaf_hash,
         index,
@@ -326,6 +326,8 @@ pub fn verify_merkle_proof_with<H: MerkleHash>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blake3::hazmat::{HasherExt, Mode, merge_subtrees_non_root};
+    use blake3::{Hasher, hash};
     use sha2::{Digest, Sha256};
 
     /// Every structural test runs against both hashes: the tree and path
@@ -369,7 +371,6 @@ mod tests {
     /// rather than merely to themselves.
     #[test]
     fn primitives_match_reference_implementations() {
-        use blake3::hazmat::HasherExt;
         let data: Vec<u8> = (0..=255u8).cycle().take(3000).collect();
 
         // SHA-256: a plain one-shot digest.
@@ -388,17 +389,17 @@ mod tests {
         // BLAKE3: non-root chaining values, per BLAKE3's own tree semantics.
         assert_eq!(
             hash_leaf(&data, HashKind::Blake3),
-            blake3::Hasher::new().update(&data).finalize_non_root()
+            Hasher::new().update(&data).finalize_non_root()
         );
         assert_eq!(
             hash_pair(&l, &r, HashKind::Blake3),
-            blake3::hazmat::merge_subtrees_non_root(&l, &r, blake3::hazmat::Mode::Hash)
+            merge_subtrees_non_root(&l, &r, Mode::Hash)
         );
         // Deliberately NOT `blake3::hash` — that is the root finalization, and
         // interior tree nodes must not be root hashes.
         assert_ne!(
             hash_leaf(&data, HashKind::Blake3),
-            *blake3::hash(&data).as_bytes(),
+            *hash(&data).as_bytes(),
             "leaf CVs must be non-root"
         );
     }

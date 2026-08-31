@@ -16,6 +16,7 @@
 //!
 //! Used by the verifier's polylog `eval_rs_eq` (DP24 §1.3, Figure 3).
 
+use crate::field::QUADRATIC_NONRESIDUE;
 use crate::field::{F128, F256};
 use core::ops::{Add, AddAssign};
 
@@ -144,9 +145,7 @@ impl TensorAlgebra256 {
         let p1 = self.c1.scale_horizontal(scalar.c1);
         let p2 = sum.scale_horizontal(scalar.c0 + scalar.c1);
         let mut c0 = p0.clone();
-        c0 += &p1
-            .clone()
-            .scale_horizontal(crate::field::QUADRATIC_NONRESIDUE);
+        c0 += &p1.clone().scale_horizontal(QUADRATIC_NONRESIDUE);
         let mut c1 = p2;
         c1 += &p0;
         Self { c0, c1 }

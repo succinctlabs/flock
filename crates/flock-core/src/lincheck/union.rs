@@ -65,6 +65,8 @@ use crate::matrix_fold::{MatrixClaim, Weight};
 use crate::schedule::Registry;
 use crate::union::UnionInstance;
 use crate::zerocheck::K_SKIP;
+use std::env::var;
+use std::time::Instant;
 
 use super::{
     LincheckCircuit, LincheckClaim, LincheckError, LincheckGrinding, LincheckProof, QuirkyPoint,
@@ -239,7 +241,7 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     }
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let trace = var("LINCHECK_TRACE").is_ok();
     let mut grinding_nonces = Vec::with_capacity(
         grinding.nonce_count(
             inner_rest_len,
@@ -273,11 +275,7 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     // slot to FILL the boolean region — true for every single-type registry,
     // and for no multi-slot one.
     let single = registry.num_boolean() == 1 && registry.slots()[0].m_slot == registry.m_bool();
-    let t_comb = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t_comb = if trace { Some(Instant::now()) } else { None };
     let mut comb_vec: Vec<F128> = if single {
         Vec::new()
     } else {
@@ -347,11 +345,7 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     //    single partial fold. Dummy rows are honest zeros, so folding only
     //    the DECLARED rows equals the full-capacity fold byte for byte —
     //    the row-aware dispatch makes the fold count-proportional (M6).
-    let t_fold = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t_fold = if trace { Some(Instant::now()) } else { None };
     let eq_x_outer = build_eq_table(&x_ab.x_outer);
     let mut z_vec: Vec<F128> = if single {
         Vec::new()

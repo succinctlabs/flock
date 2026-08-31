@@ -13,6 +13,7 @@
 //! Off by default (a single cached-bool check per instrumented call), so A/B
 //! benches that exercise the old paths on purpose stay silent unless asked.
 
+use std::env::var_os;
 use std::sync::OnceLock;
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -20,7 +21,7 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 /// True when `FLOCK_WARN_SUBOPTIMAL` is set to anything but `0`.
 #[inline]
 pub fn warnings_enabled() -> bool {
-    *ENABLED.get_or_init(|| std::env::var_os("FLOCK_WARN_SUBOPTIMAL").is_some_and(|v| v != *"0"))
+    *ENABLED.get_or_init(|| var_os("FLOCK_WARN_SUBOPTIMAL").is_some_and(|v| v != *"0"))
 }
 
 /// Emit the warning line. Not called directly — use [`suboptimal_path!`],

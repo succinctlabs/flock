@@ -1,6 +1,8 @@
 use super::artin_schreier::ArtinSchreierSolver;
 use super::base_evaluator::{base_evaluation_functional, evaluate_base_functional};
 use super::constants::PRODUCT_MESSAGE_BITS;
+use super::constants::{BASE_X_POWER_COUNT, FOUR_RUSSIANS_BLOCK_BITS};
+use super::constants::{GAMMA_GROUP_COUNT, MAX_X_DEGREE, X_POWER_COUNT};
 use super::evaluator::{
     EvaluationPoint, eval_poly_mask, evaluate_product_functional, product_evaluation_functional,
     x_powers, y_powers,
@@ -8,9 +10,12 @@ use super::evaluator::{
 use super::field::{F128, F128Ext};
 use super::messages::{BaseMessage, ProductMessage};
 use super::product::{extended_base_product_message, product_code_message};
+use super::sage_data::{ARTIN_SCHREIER_RHS, GAMMA_SLOT_MASKS, PRODUCT_DENOMINATOR};
 use super::sampling::{eval_base_rational_function, sample_random_evaluation_point};
 use super::tables::TABLES;
+use super::try_evaluation_point;
 use super::{RngCore, Sha256Rng};
+use std::collections::HashSet;
 
 #[test]
 fn product_message_has_expected_prefix() {
@@ -275,9 +280,6 @@ fn product_evaluation_functionals_have_full_rank_222() {
 /// distance inequality -- would change here.
 #[test]
 fn baked_degrees_match_minimum_distance_constants() {
-    use super::constants::{GAMMA_GROUP_COUNT, MAX_X_DEGREE, X_POWER_COUNT};
-    use super::sage_data::{ARTIN_SCHREIER_RHS, GAMMA_SLOT_MASKS, PRODUCT_DENOMINATOR};
-
     // (1) Max x-degree of any gamma numerator, read straight off the per-slot
     // masks: slot `s` carries x-degree `s % X_POWER_COUNT` of gamma group
     // `s / X_POWER_COUNT`. This is the "x-degree at most 49" input to the bound.
@@ -369,11 +371,11 @@ fn gf128_row_rank(mut rows: Vec<[F128; PRODUCT_MESSAGE_BITS]>) -> usize {
 /// σ ≈ 4·10⁻⁴; the asserted window is ±8σ around 1/32.
 #[test]
 fn acceptance_rate_is_one_in_32() {
-    let mut rng = super::Sha256Rng::new([0xACu8; 32]);
+    let mut rng = Sha256Rng::new([0xACu8; 32]);
     let n: u32 = 200_000;
     let mut ok: u32 = 0;
     for _ in 0..n {
-        if super::try_evaluation_point(&mut rng).is_some() {
+        if try_evaluation_point(&mut rng).is_some() {
             ok += 1;
         }
     }
@@ -389,8 +391,6 @@ fn acceptance_rate_is_one_in_32() {
 /// across the 64 coordinate masks, and the x-power ladder length.
 #[test]
 fn base_functional_circuit_census() {
-    use super::constants::{BASE_X_POWER_COUNT, FOUR_RUSSIANS_BLOCK_BITS};
-    use super::tables::TABLES;
     let l = &TABLES.base_layout;
     let mut xor_terms = 0usize;
     for (blk, masks) in l.block_masks.iter().enumerate() {
@@ -419,7 +419,7 @@ fn base_functional_circuit_census() {
             l.block_coordinate_offsets[blk],
             l.block_coordinate_offsets[blk + 1],
         );
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for &coord in &l.block_coordinates[s..e] {
             let m = masks[coord as usize];
             pairs += 1;

@@ -68,20 +68,34 @@
 //! 4. the returned gather claims reach the PCS opening, which is what binds
 //!    them to the commitment (and observes their values before `γ`).
 
-pub mod builder;
-
-use std::sync::OnceLock;
-
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-
 use crate::challenger::Challenger;
 use crate::field::F128;
+use crate::matrix_fold::FoldMatrix;
+use crate::matrix_fold::MatrixClaim;
+use crate::matrix_fold::Weight;
+use crate::matrix_fold::bilinear;
 use crate::pcs::{DirectEqInd, PackedDirectClaim};
 use crate::product_gkr;
 use crate::schedule::{IoDirection, IoWord, Registry};
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
 use crate::union::UnionInstance;
 use crate::zerocheck::univariate_skip::build_eq;
+use blake3::hash;
+use product_gkr::BatchedGrinding;
+use product_gkr::LiveMask;
+use product_gkr::ProductGkrBatchedProof;
+use product_gkr::ProductGkrError;
+use product_gkr::prove_batched_with_grinding;
+use product_gkr::s_id_basis;
+use product_gkr::verify_batched_with_grinding;
+use product_gkr::verify_batched_with_sigma_and_grinding;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::env::var;
+use std::sync::OnceLock;
+use std::time::Instant;
+pub mod builder;
 
 /// Domain label of the circuit digest — versioned, since the digest covers the
 /// whole circuit encoding (cell-slot enumeration, counts, wiring, public
@@ -533,8 +547,8 @@ impl Circuit {
     /// public length are part of the circuit encoding), shared by prover,
     /// verifier, the in-circuit transcription's checker, and the sigma
     /// discharge, so the mask cannot drift between them.
-    pub fn live_mask(&self) -> product_gkr::LiveMask {
-        product_gkr::LiveMask {
+    pub fn live_mask(&self) -> LiveMask {
+        LiveMask {
             nu: self.cells.nu(),
             counts: self.cells.live_counts(&self.counts, self.num_public),
         }
@@ -634,7 +648,7 @@ impl Circuit {
                     buf.extend_from_slice(&(idx as u64).to_le_bytes());
                 }
             }
-            *blake3::hash(&buf).as_bytes()
+            *hash(&buf).as_bytes()
         })
     }
 
@@ -671,7 +685,7 @@ impl Circuit {
 /// The gather claims' POINTS are transcript-derived, so only the values ride.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WiringProof {
-    pub gkr: product_gkr::ProductGkrBatchedProof,
+    pub gkr: ProductGkrBatchedProof,
     pub gather: Vec<F128>,
 }
 
@@ -681,7 +695,7 @@ pub enum WiringError {
     /// Wrong number of gather values for this circuit's cell space.
     MalformedProof,
     /// The product-GKR rejected (products differ, layer check, input check).
-    Gkr(product_gkr::ProductGkrError),
+    Gkr(ProductGkrError),
     /// The gather values do not recombine to `ŵ(ρ)` — the gather
     /// factorization's check, which is what binds the GKR's `f`-side input to
     /// the committed witness and the public words.
@@ -707,13 +721,7 @@ pub fn prove_wiring<C: Challenger>(
     public: &[F128],
     ch: &mut C,
 ) -> (WiringProof, Vec<PackedDirectClaim>) {
-    prove_wiring_with_grinding(
-        circuit,
-        packed,
-        public,
-        product_gkr::BatchedGrinding::disabled(),
-        ch,
-    )
+    prove_wiring_with_grinding(circuit, packed, public, BatchedGrinding::disabled(), ch)
 }
 
 /// [`prove_wiring`] with explicit Product-GKR Fiat--Shamir grinding.
@@ -721,7 +729,7 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
     circuit: &Circuit,
     packed: &[F128],
     public: &[F128],
-    grinding: product_gkr::BatchedGrinding,
+    grinding: BatchedGrinding,
     ch: &mut C,
 ) -> (WiringProof, Vec<PackedDirectClaim>) {
     assert_eq!(
@@ -735,8 +743,8 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
     // Phase trace, `WIRING_TRACE=1` — the module's counterpart of `PCS_TRACE` /
     // `GKR_TRACE`, so the wiring overhead can be attributed (build w vs the
     // grand product vs the gather folds) without instrumenting the caller.
-    let trace = std::env::var("WIRING_TRACE").is_ok();
-    let t = std::time::Instant::now();
+    let trace = var("WIRING_TRACE").is_ok();
+    let t = Instant::now();
 
     // ---- w over the cell space. Gate cells read the committed buffer; public
     // cells take the statement words; dummy cells are zero (pooled buffers come
@@ -747,7 +755,7 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
     // rows are honest zeros; the buffer's are simply never read). This
     // makes the w materialization live-proportional.
     let mask = circuit.live_mask();
-    let mut w = crate::scratch::take_f128(1usize << mu);
+    let mut w = take_f128(1usize << mu);
     w.par_chunks_mut(rows).enumerate().for_each(|(iota, dst)| {
         let live = mask.counts[iota];
         match cells.slots()[iota] {
@@ -771,16 +779,10 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
     }
 
     // ---- One grand-product permutation check at f = g = w.
-    let t = std::time::Instant::now();
-    let (gkr, claim) = product_gkr::prove_batched_with_grinding(
-        &w,
-        &w,
-        circuit.sigma(),
-        Some(&mask),
-        grinding,
-        ch,
-    );
-    crate::scratch::give_f128(w);
+    let t = Instant::now();
+    let (gkr, claim) =
+        prove_batched_with_grinding(&w, &w, circuit.sigma(), Some(&mask), grinding, ch);
+    give_f128(w);
     if trace {
         eprintln!(
             "  [wiring] product GKR (μ = {mu}): {:7.2} ms",
@@ -790,7 +792,7 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
 
     // ---- The gather: one eq-weighted row fold per gate cell-slot, O(2^ν)
     // each, producing packed-direct claims.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let eq_row = build_eq(&claim.rho[..nu]);
     let mut gather = Vec::with_capacity(cells.num_gate_slots());
     let mut claims = Vec::with_capacity(cells.num_gate_slots());
@@ -875,7 +877,7 @@ impl SigmaAssertion {
     const ELEMENT_B_PLANE: usize = 4;
     const BOOLEAN_PIN_PLANE: usize = 5;
 
-    fn plane_claim(&self, plane: usize, value: F128) -> crate::matrix_fold::MatrixClaim {
+    fn plane_claim(&self, plane: usize, value: F128) -> MatrixClaim {
         let selector = [
             F128::new((plane & 1) as u64, 0),
             F128::new(((plane >> 1) & 1) as u64, 0),
@@ -884,9 +886,9 @@ impl SigmaAssertion {
         let mut col_point = self.rho[self.nu..].to_vec();
         col_point.resize(self.base_bits, F128::ZERO);
         col_point.extend_from_slice(&selector);
-        crate::matrix_fold::MatrixClaim {
-            row: crate::matrix_fold::Weight::eq(self.rho[..self.nu].to_vec()),
-            col: crate::matrix_fold::Weight::eq(col_point),
+        MatrixClaim {
+            row: Weight::eq(self.rho[..self.nu].to_vec()),
+            col: Weight::eq(col_point),
             value,
         }
     }
@@ -895,14 +897,14 @@ impl SigmaAssertion {
     /// structure table. Kept as a convenience for callers that need only the
     /// sigma member; aggregation must use [`Self::claims`] so the Product-GKR
     /// helper evaluations are bound as well.
-    pub fn claim(&self) -> crate::matrix_fold::MatrixClaim {
+    pub fn claim(&self) -> MatrixClaim {
         self.plane_claim(Self::SIGMA_PLANE, self.value)
     }
 
     /// All digest-keyed circuit-structure evaluations, in canonical order:
     /// Product-GKR's `(live*s_id, live, live*s_sigma)`, then Boolean
     /// constant-pin prefixes, then the element affine `A`/`B` constants.
-    pub fn claims(&self) -> Vec<crate::matrix_fold::MatrixClaim> {
+    pub fn claims(&self) -> Vec<MatrixClaim> {
         let mut claims = vec![
             self.plane_claim(Self::MASKED_ID_PLANE, self.masked_id_value),
             self.plane_claim(Self::LIVE_PLANE, self.live_value),
@@ -914,9 +916,9 @@ impl SigmaAssertion {
                 .map(|j| F128::new(((type_index >> j) & 1) as u64, 0))
                 .collect::<Vec<_>>();
             col.extend_from_slice(&[F128::ONE, F128::ZERO, F128::ONE]); // plane 5
-            claims.push(crate::matrix_fold::MatrixClaim {
-                row: crate::matrix_fold::Weight::eq(point.clone()),
-                col: crate::matrix_fold::Weight::eq(col),
+            claims.push(MatrixClaim {
+                row: Weight::eq(point.clone()),
+                col: Weight::eq(col),
                 value: *value,
             });
         }
@@ -927,11 +929,11 @@ impl SigmaAssertion {
             for (plane, value) in [(Self::ELEMENT_A_PLANE, *a), (Self::ELEMENT_B_PLANE, *b)] {
                 let mut col = base.clone();
                 col.extend((0..3).map(|j| F128::new(((plane >> j) & 1) as u64, 0)));
-                claims.push(crate::matrix_fold::MatrixClaim {
+                claims.push(MatrixClaim {
                     // The affine vectors are row-independent, so a fixed
                     // zero row point gives a canonical claim identity.
-                    row: crate::matrix_fold::Weight::eq(vec![F128::ZERO; self.nu]),
-                    col: crate::matrix_fold::Weight::eq(col),
+                    row: Weight::eq(vec![F128::ZERO; self.nu]),
+                    col: Weight::eq(col),
                     value,
                 });
             }
@@ -960,7 +962,7 @@ impl SigmaAssertion {
         let m = Self::matrix(circuit);
         self.claims()
             .iter()
-            .all(|c| crate::matrix_fold::bilinear(&c.row, &c.col, &m) == c.value)
+            .all(|c| bilinear(&c.row, &c.col, &m) == c.value)
     }
 }
 
@@ -972,7 +974,7 @@ impl SigmaAssertion {
 /// fold/root discharge needs just these two streaming passes.
 pub struct CircuitStructureMatrix<'a> {
     circuit: &'a Circuit,
-    mask: product_gkr::LiveMask,
+    mask: LiveMask,
     base_cols: usize,
 }
 
@@ -1058,7 +1060,7 @@ impl<'a> CircuitStructureMatrix<'a> {
     }
 }
 
-impl crate::matrix_fold::FoldMatrix for CircuitStructureMatrix<'_> {
+impl FoldMatrix for CircuitStructureMatrix<'_> {
     fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
         assert_eq!(n_rows, self.n_rows());
         assert_eq!(w.len(), self.n_cols());
@@ -1107,13 +1109,7 @@ pub fn verify_wiring_deferred<C: Challenger>(
     proof: &WiringProof,
     ch: &mut C,
 ) -> Result<(Vec<(Vec<F128>, F128)>, SigmaAssertion), WiringError> {
-    verify_wiring_deferred_with_grinding(
-        circuit,
-        public,
-        proof,
-        product_gkr::BatchedGrinding::disabled(),
-        ch,
-    )
+    verify_wiring_deferred_with_grinding(circuit, public, proof, BatchedGrinding::disabled(), ch)
 }
 
 /// [`verify_wiring_deferred`] with explicit Product-GKR grinding.
@@ -1121,7 +1117,7 @@ pub fn verify_wiring_deferred_with_grinding<C: Challenger>(
     circuit: &Circuit,
     public: &[F128],
     proof: &WiringProof,
-    grinding: product_gkr::BatchedGrinding,
+    grinding: BatchedGrinding,
     ch: &mut C,
 ) -> Result<(Vec<(Vec<F128>, F128)>, SigmaAssertion), WiringError> {
     verify_wiring_core(circuit, public, proof, true, grinding, ch)
@@ -1133,13 +1129,7 @@ pub fn verify_wiring<C: Challenger>(
     proof: &WiringProof,
     ch: &mut C,
 ) -> Result<Vec<(Vec<F128>, F128)>, WiringError> {
-    verify_wiring_with_grinding(
-        circuit,
-        public,
-        proof,
-        product_gkr::BatchedGrinding::disabled(),
-        ch,
-    )
+    verify_wiring_with_grinding(circuit, public, proof, BatchedGrinding::disabled(), ch)
 }
 
 /// [`verify_wiring`] with explicit Product-GKR grinding.
@@ -1147,7 +1137,7 @@ pub fn verify_wiring_with_grinding<C: Challenger>(
     circuit: &Circuit,
     public: &[F128],
     proof: &WiringProof,
-    grinding: product_gkr::BatchedGrinding,
+    grinding: BatchedGrinding,
     ch: &mut C,
 ) -> Result<Vec<(Vec<F128>, F128)>, WiringError> {
     verify_wiring_core(circuit, public, proof, false, grinding, ch).map(|(g, _)| g)
@@ -1158,7 +1148,7 @@ fn verify_wiring_core<C: Challenger>(
     public: &[F128],
     proof: &WiringProof,
     defer_sigma: bool,
-    grinding: product_gkr::BatchedGrinding,
+    grinding: BatchedGrinding,
     ch: &mut C,
 ) -> Result<(Vec<(Vec<F128>, F128)>, SigmaAssertion), WiringError> {
     if public.len() != circuit.num_public() {
@@ -1172,9 +1162,9 @@ fn verify_wiring_core<C: Challenger>(
 
     let mask = circuit.live_mask();
     let claim = if defer_sigma {
-        product_gkr::verify_batched_with_grinding(mu, &proof.gkr, Some(&mask), grinding, ch)
+        verify_batched_with_grinding(mu, &proof.gkr, Some(&mask), grinding, ch)
     } else {
-        product_gkr::verify_batched_with_sigma_and_grinding(
+        verify_batched_with_sigma_and_grinding(
             mu,
             &proof.gkr,
             circuit.sigma(),
@@ -1216,7 +1206,7 @@ fn verify_wiring_core<C: Challenger>(
         base_bits: CircuitStructureMatrix::new(circuit)
             .base_cols()
             .trailing_zeros() as usize,
-        masked_id_value: mask.masked_id_eval(&product_gkr::s_id_basis(mu), &claim.rho),
+        masked_id_value: mask.masked_id_eval(&s_id_basis(mu), &claim.rho),
         live_value: mask.live_eval(&claim.rho),
         value: claim.s_sigma_eval,
         boolean_pins: Vec::new(),
@@ -1242,6 +1232,7 @@ mod tests {
     use crate::element_r1cs::ElementTableBuilder;
     use crate::r1cs::SparseBinaryMatrix;
     use crate::schedule::{TableClass, TableType};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use crate::test_rng::Rng;
@@ -1470,8 +1461,7 @@ mod tests {
         let sigma = circuit.sigma();
         let cells = circuit.cells();
         assert_eq!(sigma.len(), 1 << cells.mu());
-        let wired: std::collections::BTreeSet<usize> =
-            circuit.wires().iter().flatten().copied().collect();
+        let wired: BTreeSet<usize> = circuit.wires().iter().flatten().copied().collect();
         for (x, &sx) in sigma.iter().enumerate() {
             if !wired.contains(&x) {
                 assert_eq!(sx, x, "unwired cells are fixed points");
@@ -1680,9 +1670,7 @@ mod tests {
         bad[cells.gate_word_addr(0, 1)] += F128::ONE;
         assert_eq!(
             roundtrip(&circuit, &bad, &public),
-            Err(WiringError::Gkr(
-                product_gkr::ProductGkrError::ProductMismatch
-            ))
+            Err(WiringError::Gkr(ProductGkrError::ProductMismatch))
         );
         // Break a WIRED public word instead (public slot 0, row 4 — the cell
         // `Cell::new(8, 4)` above). An unwired public word is unconstrained by
@@ -1691,9 +1679,7 @@ mod tests {
         bad_public[4] += F128::ONE;
         assert_eq!(
             roundtrip(&circuit, &packed, &bad_public),
-            Err(WiringError::Gkr(
-                product_gkr::ProductGkrError::ProductMismatch
-            ))
+            Err(WiringError::Gkr(ProductGkrError::ProductMismatch))
         );
     }
 
@@ -1739,7 +1725,7 @@ mod tests {
         let mc = assertion.claim();
         let m = SigmaAssertion::matrix(&circuit);
         assert_eq!(
-            crate::matrix_fold::bilinear(&mc.row, &mc.col, &m),
+            bilinear(&mc.row, &mc.col, &m),
             mc.value,
             "the MatrixClaim form discharges — the accumulator's path"
         );

@@ -17,33 +17,29 @@
 //!
 //! Run:  cargo run --release --bin dump_merkle_open_vectors -- cuda-ghash/merkle_open_vectors.bin 14 50
 
+use env::args;
+use std::collections::HashSet;
 use std::env;
 use std::fs::File;
+use std::io::Result;
 use std::io::{BufWriter, Write};
 
 use flock_hash::HashKind;
 use flock_prover::merkle::merkle_tree;
 
+use flock_core::test_rng::Rng;
+use merkle_octopus::merkle_multi_proof;
 // The multi-proof left the live protocol (cap layers replaced it); the CUDA
 // oracle pair keeps a frozen copy.
 #[path = "dump_common/merkle_octopus.rs"]
 mod merkle_octopus;
-use merkle_octopus::merkle_multi_proof;
 
-use flock_core::test_rng::Rng;
-
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "merkle_open_vectors.bin".to_string());
-    let log_leaves: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(14);
-    let n_queries: usize = env::args()
-        .nth(3)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let log_leaves: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(14);
+    let n_queries: usize = args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(50);
     let num_leaves = 1usize << log_leaves;
     let leaf_size = 64usize; // bytes per leaf (e.g. num_interleaved * 16); value-irrelevant
 
@@ -60,7 +56,7 @@ fn main() -> std::io::Result<()> {
     // Distinct query positions, deliberately unsorted (tests the C++ sort/dedup).
     let mut positions: Vec<usize> = Vec::with_capacity(n_queries);
     {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         while positions.len() < n_queries {
             let q = (rng.next_u64() as usize) % num_leaves;
             if seen.insert(q) {

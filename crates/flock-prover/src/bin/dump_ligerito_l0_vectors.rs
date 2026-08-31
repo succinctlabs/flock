@@ -15,8 +15,12 @@
 //! Run:  cargo run --release --bin dump_ligerito_l0_vectors -- \
 //!         cuda-ghash/ligerito_l0_vectors.bin 14 4 0 3 1 2 1 40 0
 
+use env::args;
+use flock_prover::merkle::Hash;
+use std::collections::HashSet;
 use std::env;
 use std::fs::File;
+use std::io::Result;
 use std::io::{BufWriter, Write};
 
 use flock_hash::HashKind;
@@ -28,21 +32,20 @@ use flock_prover::pcs::ligerito::{
     LigeroWitness, SumcheckProver, eval_sk_at_vks, induce_sumcheck_poly, ligero_commit,
 };
 
+use flock_core::test_rng::Rng;
+use merkle_octopus::merkle_multi_proof;
 // The multi-proof left the live protocol (cap layers replaced it); the CUDA
 // oracle pair keeps a frozen copy. Same story for the single-root absorb:
 // `LigeroWitness::root()` was retired with the cap-layer switch, but this
 // replay pins the transcript shape the CUDA kernels implement.
 #[path = "dump_common/merkle_octopus.rs"]
 mod merkle_octopus;
-use merkle_octopus::merkle_multi_proof;
 
-fn wtns_root(w: &LigeroWitness) -> flock_prover::merkle::Hash {
+fn wtns_root(w: &LigeroWitness) -> Hash {
     w.tree[w.tree.len() - 1]
 }
 
 const PROVER_LABEL: &[u8] = b"flock-ligerito-basis-v0";
-
-use flock_core::test_rng::Rng;
 
 fn ceil_log2(n: usize) -> usize {
     if n <= 1 {
@@ -59,7 +62,7 @@ fn sample_distinct_queries<Ch: Challenger>(
     block_len: usize,
     count: usize,
 ) -> Vec<usize> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(count);
     while out.len() < count {
         let v = ch.sample_f128();
@@ -72,13 +75,13 @@ fn sample_distinct_queries<Ch: Challenger>(
     out
 }
 
-fn wf(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn wf(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
 
-fn main() -> std::io::Result<()> {
-    let a: Vec<String> = env::args().collect();
+fn main() -> Result<()> {
+    let a: Vec<String> = args().collect();
     let arg = |i: usize, d: usize| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
     let path = a
         .get(1)

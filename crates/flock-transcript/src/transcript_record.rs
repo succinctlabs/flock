@@ -40,6 +40,9 @@
 use sha2::{Digest, Sha256};
 
 use crate::challenger::Challenger;
+use crate::challenger::{
+    KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE, OP_SQUEEZE,
+};
 use flock_field::F128;
 use flock_hash::HashKind;
 
@@ -499,10 +502,6 @@ impl TranscriptShape {
         values: &mut usize,
         payloads: &mut usize,
     ) -> Stream {
-        use crate::challenger::{
-            KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE,
-            OP_SQUEEZE,
-        };
         let header = |op: u8, kind: u8, len: u64| {
             StreamWord::Const(F128::new(op as u64 | ((kind as u64) << 8), len))
         };
@@ -968,6 +967,7 @@ impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+    use blake3::Hasher;
     use flock_hash::{BLAKE3_IV, blake3_compress};
 
     /// Drive a challenger through one op of every kind, returning the
@@ -1208,7 +1208,7 @@ mod tests {
         assert_eq!(rec.challenges(), &[got], "recorder captured the challenge");
 
         // `sample_f128` absorbs its header, then finalizes and takes 16 bytes.
-        let mut h = ::blake3::Hasher::new();
+        let mut h = Hasher::new();
         h.update(&bytes);
         let mut buf = [0u8; 16];
         h.finalize_xof().fill(&mut buf);

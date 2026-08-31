@@ -3,6 +3,9 @@
 //! Each protocol component selects its hash independently. The default is SHA-256.
 
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
 
 pub type Digest = [u8; 32];
 
@@ -41,8 +44,8 @@ impl HashKind {
     }
 }
 
-impl std::fmt::Display for HashKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for HashKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str(self.as_str())
     }
 }
@@ -125,6 +128,7 @@ pub fn blake3_compress(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{from_str, to_string};
 
     /// Every variant, for tests that sweep both.
     pub(crate) const ALL: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
@@ -147,13 +151,9 @@ mod tests {
     #[test]
     fn serde_uses_config_spellings() {
         for kind in ALL {
-            let json = serde_json::to_string(&kind).unwrap();
+            let json = to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{}\"", kind.as_str()));
-            assert_eq!(
-                serde_json::from_str::<HashKind>(&json).unwrap(),
-                kind,
-                "{kind}"
-            );
+            assert_eq!(from_str::<HashKind>(&json).unwrap(), kind, "{kind}");
         }
     }
 }

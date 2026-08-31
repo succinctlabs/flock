@@ -1,3 +1,5 @@
+use core::arch::x86_64::*;
+
 use rayon::prelude::*;
 
 use super::super::{F128, build_sum_table};
@@ -21,7 +23,6 @@ unsafe fn process_block_x86(
     tables_ptr: *const u8,
     out_ptr: *mut F128,
 ) {
-    use core::arch::x86_64::*;
     const TILE_T: usize = 8;
     // SAFETY: caller upholds the pointer/length contract documented above; SSE2
     // is baseline on x86_64.

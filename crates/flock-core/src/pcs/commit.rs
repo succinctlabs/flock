@@ -14,7 +14,34 @@
 //! The codeword is a flat sequence of `2^k_code` F_{2^128} elements. Each
 //! Merkle leaf is **one** F_{2^128} element = 16 bytes.
 
+use crate::alloc_uninit_f128_vec;
+use crate::element_r1cs::Grinding;
+use crate::lincheck::LincheckGrinding;
+use crate::matrix_fold::FoldGrinding;
+use crate::pcs::OpeningGrinding;
+use crate::pcs::ligerito::LigeritoProfile;
+use crate::pcs::ligerito::ProverConfig;
+use crate::pcs::ligerito::VerifierConfig;
+use crate::pcs::ligerito::prover_config_for;
+use crate::pcs::ligerito::udr_queries;
+use crate::pcs::ligerito::verifier_config_for;
+use crate::pcs::stratified::LevelSchedule;
+use crate::product_gkr::BatchedGrinding;
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
+use crate::scratch::try_take_f128;
+use crate::zerocheck::ZerocheckGrinding;
+use core::mem::size_of;
+use core::slice::from_raw_parts;
+use merkle::cap_layer;
+use merkle::merkle_tree;
+use rayon::current_num_threads;
 use rayon::prelude::*;
+use std::env::var_os;
+use std::mem::take;
+use std::ptr::write_bytes;
+use std::thread::scope;
+use std::time::Instant;
 
 use crate::field::F128;
 use crate::merkle::{self, Hash, HashKind};
@@ -41,7 +68,7 @@ pub struct PcsParams {
     /// PCS opening; must agree with `log_inv_rate`
     /// (`profile.log_inv_rate() == log_inv_rate`). Defaults to `Fast`.
     #[serde(default)]
-    pub profile: crate::pcs::ligerito::LigeritoProfile,
+    pub profile: LigeritoProfile,
     /// **Integer-lane commit** (optional). `None` (the default) commits the
     /// full `2^log_batch_size` interleaved lanes — today's power-of-two
     /// scheme. `Some(t)` with `1 ≤ t ≤ 2^log_batch_size` commits exactly `t`
@@ -75,17 +102,12 @@ impl PcsParams {
     /// Boolean, element, and PCS-transport policies are selected independently
     /// because they protect Fiat--Shamir challenges with different degree
     /// bounds. Ligerito derives its own schedule from the selected profile.
-    pub fn zerocheck_grinding(&self) -> crate::zerocheck::ZerocheckGrinding {
+    pub fn zerocheck_grinding(&self) -> ZerocheckGrinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Secure => {
-                crate::zerocheck::ZerocheckGrinding::per_challenge_128()
+            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
+                ZerocheckGrinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
-                crate::zerocheck::ZerocheckGrinding::disabled()
-            }
+            LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => ZerocheckGrinding::disabled(),
         }
     }
 
@@ -95,32 +117,22 @@ impl PcsParams {
     /// protocols have different challenge degrees and therefore different
     /// schedules. `Fast`, `Slim`, and `Secure` enable both; the `*100`
     /// profiles retain their legacy transcript shape.
-    pub fn lincheck_grinding(&self) -> crate::lincheck::LincheckGrinding {
+    pub fn lincheck_grinding(&self) -> LincheckGrinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Secure => {
-                crate::lincheck::LincheckGrinding::per_challenge_128()
+            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
+                LincheckGrinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
-                crate::lincheck::LincheckGrinding::disabled()
-            }
+            LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => LincheckGrinding::disabled(),
         }
     }
 
     /// Grinding policy for the large-field element/dense PIOP.
-    pub fn element_grinding(&self) -> crate::element_r1cs::Grinding {
+    pub fn element_grinding(&self) -> Grinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Secure => {
-                crate::element_r1cs::Grinding::per_challenge_128()
+            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
+                Grinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
-                crate::element_r1cs::Grinding::disabled()
-            }
+            LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => Grinding::disabled(),
         }
     }
 
@@ -130,47 +142,32 @@ impl PcsParams {
     /// policy: the challenges here are sampled before the recursive PCS is
     /// entered, and their algebraic degrees come from the ring-switch and
     /// jagged reductions rather than the proximity protocol.
-    pub fn opening_grinding(&self) -> crate::pcs::OpeningGrinding {
+    pub fn opening_grinding(&self) -> OpeningGrinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Secure => {
-                crate::pcs::OpeningGrinding::per_challenge_128()
+            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
+                OpeningGrinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
-                crate::pcs::OpeningGrinding::disabled()
-            }
+            LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => OpeningGrinding::disabled(),
         }
     }
 
     /// Grinding policy for the circuit-wiring Product-GKR permutation check.
-    pub fn product_gkr_grinding(&self) -> crate::product_gkr::BatchedGrinding {
+    pub fn product_gkr_grinding(&self) -> BatchedGrinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Secure => {
-                crate::product_gkr::BatchedGrinding::per_challenge_128()
+            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
+                BatchedGrinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
-                crate::product_gkr::BatchedGrinding::disabled()
-            }
+            LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => BatchedGrinding::disabled(),
         }
     }
 
     /// Grinding policy for recursive dense/sigma/jagged accumulation folds.
-    pub fn matrix_fold_grinding(&self) -> crate::matrix_fold::FoldGrinding {
+    pub fn matrix_fold_grinding(&self) -> FoldGrinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Slim
-            | crate::pcs::ligerito::LigeritoProfile::Secure => {
-                crate::matrix_fold::FoldGrinding::per_challenge_128()
+            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
+                FoldGrinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
-                crate::matrix_fold::FoldGrinding::disabled()
-            }
+            LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => FoldGrinding::disabled(),
         }
     }
 
@@ -214,7 +211,7 @@ impl PcsParams {
     }
     /// Merkle leaf size in bytes = `num_ntts() * 16`.
     pub fn leaf_size_bytes(&self) -> usize {
-        self.num_ntts() * core::mem::size_of::<F128>()
+        self.num_ntts() * size_of::<F128>()
     }
 
     /// Ligerito prover config for these params.
@@ -226,24 +223,16 @@ impl PcsParams {
     /// recursive level cannot end up on different hashes.
     ///
     /// [`ligerito::prover_config_for`]: crate::pcs::ligerito::prover_config_for
-    pub fn ligerito_prover_config(&self) -> Result<crate::pcs::ligerito::ProverConfig, String> {
-        let mut cfg = crate::pcs::ligerito::prover_config_for(
-            self.log_msg_len(),
-            self.log_batch_size,
-            self.profile,
-        )?;
+    pub fn ligerito_prover_config(&self) -> Result<ProverConfig, String> {
+        let mut cfg = prover_config_for(self.log_msg_len(), self.log_batch_size, self.profile)?;
         cfg.merkle_hash = self.merkle_hash;
         Ok(cfg)
     }
 
     /// Verifier-side counterpart to [`Self::ligerito_prover_config`], stamped
     /// with the same Merkle hash for the same reason.
-    pub fn ligerito_verifier_config(&self) -> Result<crate::pcs::ligerito::VerifierConfig, String> {
-        let mut cfg = crate::pcs::ligerito::verifier_config_for(
-            self.log_msg_len(),
-            self.log_batch_size,
-            self.profile,
-        )?;
+    pub fn ligerito_verifier_config(&self) -> Result<VerifierConfig, String> {
+        let mut cfg = verifier_config_for(self.log_msg_len(), self.log_batch_size, self.profile)?;
         cfg.merkle_hash = self.merkle_hash;
         Ok(cfg)
     }
@@ -258,11 +247,9 @@ impl PcsParams {
             Ok(cfg) => cfg.l0_cap_depth(),
             // The fallback mirrors `default_config`, which is stratified
             // since the flip: the schedule of the udr count.
-            Err(_) => crate::pcs::stratified::LevelSchedule::decompose(
-                crate::pcs::ligerito::udr_queries(self.log_inv_rate),
-                self.k_code(),
-            )
-            .cap_depth(),
+            Err(_) => {
+                LevelSchedule::decompose(udr_queries(self.log_inv_rate), self.k_code()).cap_depth()
+            }
         }
     }
 
@@ -313,7 +300,7 @@ pub struct ProverData {
 // 128 MB at m = 29) through the scratch pool instead of unmapping it.
 impl Drop for ProverData {
     fn drop(&mut self) {
-        crate::scratch::give_f128(std::mem::take(&mut self.codeword));
+        give_f128(take(&mut self.codeword));
     }
 }
 
@@ -350,7 +337,7 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     // `z_packed` into the lower half, and zero-fill JUST the upper half (the
     // RS-encoding zero coefficients that the NTT's first-layer butterfly will
     // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
-    let codeword = crate::scratch::take_f128(codeword_len);
+    let codeword = take_f128(codeword_len);
     commit_into(z_packed, params, codeword)
 }
 
@@ -433,7 +420,7 @@ pub fn lane_grid_from_lane_major(q: &[F128], log_batch_size: usize) -> Vec<F128>
     let lanes = 1usize << log_batch_size;
     assert!(q.len().is_multiple_of(lanes), "dense stack must fill lanes");
     let d = q.len() >> log_batch_size;
-    let mut grid = crate::scratch::take_f128(q.len());
+    let mut grid = take_f128(q.len());
     const TILE: usize = 64; // positions per tile
     grid.par_chunks_mut(TILE * lanes)
         .enumerate()
@@ -486,13 +473,13 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
     // CERTIFICATION knob for alternating A/B benches; the byte-identity
     // oracles pin that both settings produce the same commitment.
     let mut live = t;
-    if std::env::var_os("FLOCK_NTT_NO_SKIP").is_none() {
+    if var_os("FLOCK_NTT_NO_SKIP").is_none() {
         while live > 0 && q[(live - 1) * d..live * d].iter().all(|w| w.is_zero()) {
             live -= 1;
         }
     }
     let codeword_len = params.n_positions() * t;
-    let mut codeword = crate::scratch::take_f128(codeword_len);
+    let mut codeword = take_f128(codeword_len);
     replicate_lane_major_fill(&mut codeword, q, t, d);
     finalize_commit(codeword, live, params)
 }
@@ -559,8 +546,8 @@ fn finalize_commit(
     live_lanes: usize,
     params: &PcsParams,
 ) -> (Commitment, ProverData) {
-    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
-    let t_ntt = std::time::Instant::now();
+    let timing = var_os("FLOCK_COMMIT_TIMING").is_some();
+    let t_ntt = Instant::now();
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
     // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
     // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
@@ -581,23 +568,23 @@ fn finalize_commit(
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t_merkle = std::time::Instant::now();
+    let t_merkle = Instant::now();
 
     // ---- Merkle commitment: one leaf per codeword position = num_ntts F128.
     // Zero-copy: cast the codeword Vec<F128> directly to &[u8]. F128 is
     // repr(C, align(16)) with two u64s laid out little-endian — same bytes
     // as the explicit lo.to_le_bytes() + hi.to_le_bytes() serialization.
     let codeword_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
+        from_raw_parts(
             codeword.as_ptr() as *const u8,
-            codeword.len() * core::mem::size_of::<F128>(),
+            codeword.len() * size_of::<F128>(),
         )
     };
     // Initial tree: one leaf per codeword position, each containing the
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
     // Ligerito's L0 commitment.
-    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
-    let cap = merkle::cap_layer(&merkle_tree, params.n_leaves(), params.l0_cap_depth()).to_vec();
+    let merkle_tree = merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
+    let cap = cap_layer(&merkle_tree, params.n_leaves(), params.l0_cap_depth()).to_vec();
     if timing {
         eprintln!(
             "[commit-timing] merkle: {:.2} ms",
@@ -650,7 +637,7 @@ pub fn prefault_codeword_during<R>(
     params: &PcsParams,
     generate: impl FnOnce() -> R,
 ) -> (Option<Vec<F128>>, R) {
-    if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
+    if current_num_threads() <= 1 || var_os("FLOCK_NO_PREFAULT").is_some() {
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.
@@ -659,18 +646,18 @@ pub fn prefault_codeword_during<R>(
     let codeword_len = params.n_positions() * params.num_ntts();
     // Warm path: a pooled buffer is already resident — there is nothing to
     // pre-fault, and commit_into writes every slot itself. Skip the thread.
-    if let Some(buf) = crate::scratch::try_take_f128(codeword_len) {
+    if let Some(buf) = try_take_f128(codeword_len) {
         return (Some(buf), generate());
     }
     // Cold path: allocate + first-touch on a background-QoS thread, hidden
     // under witness generation. (commit_into rewrites all slots, so the
     // zero values themselves don't matter — the page faults do.)
-    std::thread::scope(|s| {
+    scope(|s| {
         let h = s.spawn(move || {
             set_background_qos();
-            let mut buf: Vec<F128> = crate::alloc_uninit_f128_vec(codeword_len);
+            let mut buf: Vec<F128> = alloc_uninit_f128_vec(codeword_len);
             unsafe {
-                std::ptr::write_bytes(buf.as_mut_ptr(), 0u8, codeword_len);
+                write_bytes(buf.as_mut_ptr(), 0u8, codeword_len);
             }
             buf
         });
@@ -681,8 +668,15 @@ pub fn prefault_codeword_during<R>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::pack::pack_witness;
     use super::*;
+    use crate::merkle::cap_layer;
+    use crate::merkle::merkle_tree;
+    use crate::scratch::take_f128;
+    use core::slice::from_raw_parts;
 
+    use crate::ntt::AdditiveNttF128;
+    use crate::pcs::ligerito::LigeritoProfile;
     use crate::test_rng::Rng;
 
     /// The Ligerito configs derived from `PcsParams` must carry the params'
@@ -727,8 +721,6 @@ mod tests {
 
     #[test]
     fn fast_slim_and_secure_enable_every_non_ligerito_grinding_family() {
-        use crate::pcs::ligerito::LigeritoProfile;
-
         for profile in [
             LigeritoProfile::Fast,
             LigeritoProfile::Slim,
@@ -738,62 +730,39 @@ mod tests {
             params.profile = profile;
             assert_eq!(
                 params.zerocheck_grinding(),
-                crate::zerocheck::ZerocheckGrinding::per_challenge_128()
+                ZerocheckGrinding::per_challenge_128()
             );
             assert_eq!(
                 params.lincheck_grinding(),
-                crate::lincheck::LincheckGrinding::per_challenge_128()
+                LincheckGrinding::per_challenge_128()
             );
-            assert_eq!(
-                params.element_grinding(),
-                crate::element_r1cs::Grinding::per_challenge_128()
-            );
+            assert_eq!(params.element_grinding(), Grinding::per_challenge_128());
             assert_eq!(
                 params.opening_grinding(),
-                crate::pcs::OpeningGrinding::per_challenge_128()
+                OpeningGrinding::per_challenge_128()
             );
             assert_eq!(
                 params.product_gkr_grinding(),
-                crate::product_gkr::BatchedGrinding::per_challenge_128()
+                BatchedGrinding::per_challenge_128()
             );
             assert_eq!(
                 params.matrix_fold_grinding(),
-                crate::matrix_fold::FoldGrinding::per_challenge_128()
+                FoldGrinding::per_challenge_128()
             );
         }
     }
 
     #[test]
     fn hundred_bit_profiles_keep_non_ligerito_grinding_disabled() {
-        use crate::pcs::ligerito::LigeritoProfile;
-
         for profile in [LigeritoProfile::Fast100, LigeritoProfile::Slim100] {
             let mut params = default_params(22);
             params.profile = profile;
-            assert_eq!(
-                params.zerocheck_grinding(),
-                crate::zerocheck::ZerocheckGrinding::disabled()
-            );
-            assert_eq!(
-                params.lincheck_grinding(),
-                crate::lincheck::LincheckGrinding::disabled()
-            );
-            assert_eq!(
-                params.element_grinding(),
-                crate::element_r1cs::Grinding::disabled()
-            );
-            assert_eq!(
-                params.opening_grinding(),
-                crate::pcs::OpeningGrinding::disabled()
-            );
-            assert_eq!(
-                params.product_gkr_grinding(),
-                crate::product_gkr::BatchedGrinding::disabled()
-            );
-            assert_eq!(
-                params.matrix_fold_grinding(),
-                crate::matrix_fold::FoldGrinding::disabled()
-            );
+            assert_eq!(params.zerocheck_grinding(), ZerocheckGrinding::disabled());
+            assert_eq!(params.lincheck_grinding(), LincheckGrinding::disabled());
+            assert_eq!(params.element_grinding(), Grinding::disabled());
+            assert_eq!(params.opening_grinding(), OpeningGrinding::disabled());
+            assert_eq!(params.product_gkr_grinding(), BatchedGrinding::disabled());
+            assert_eq!(params.matrix_fold_grinding(), FoldGrinding::disabled());
         }
     }
 
@@ -803,7 +772,6 @@ mod tests {
     /// interleaving widths.
     #[test]
     fn commit_matches_full_ntt_oracle() {
-        use crate::ntt::AdditiveNttF128;
         let mut rng = Rng::new(0xFEED);
         for (m, log_inv_rate, log_batch_size) in [(10, 1, 1), (12, 1, 2), (12, 2, 1), (14, 2, 3)] {
             let params = PcsParams {
@@ -815,7 +783,7 @@ mod tests {
                 merkle_hash: Default::default(),
             };
             let z = rng.bits(1 << m);
-            let z_packed = super::super::pack::pack_witness(&z, m);
+            let z_packed = pack_witness(&z, m);
 
             let (commitment, pd) = commit(&z_packed, &params);
 
@@ -829,13 +797,10 @@ mod tests {
                 pd.codeword, oracle,
                 "codeword mismatch at m={m} r={log_inv_rate}"
             );
-            let oracle_bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(oracle.as_ptr() as *const u8, oracle.len() * 16)
-            };
-            let oracle_tree =
-                crate::merkle::merkle_tree(oracle_bytes, params.n_leaves(), params.merkle_hash);
-            let oracle_cap =
-                crate::merkle::cap_layer(&oracle_tree, params.n_leaves(), params.l0_cap_depth());
+            let oracle_bytes: &[u8] =
+                unsafe { from_raw_parts(oracle.as_ptr() as *const u8, oracle.len() * 16) };
+            let oracle_tree = merkle_tree(oracle_bytes, params.n_leaves(), params.merkle_hash);
+            let oracle_cap = cap_layer(&oracle_tree, params.n_leaves(), params.l0_cap_depth());
             assert_eq!(
                 commitment.cap, oracle_cap,
                 "cap mismatch at m={m} r={log_inv_rate}"
@@ -866,7 +831,7 @@ mod tests {
                 ..base.clone()
             };
             let z = rng.bits(1 << m);
-            let z_packed = super::super::pack::pack_witness(&z, m);
+            let z_packed = pack_witness(&z, m);
             let (c_none, pd_none) = commit(&z_packed, &base);
             let (c_full, pd_full) = commit(&z_packed, &explicit);
             assert_eq!(c_none.cap, c_full.cap, "cap diverged (m={m})");
@@ -911,7 +876,7 @@ mod tests {
 
                 let (c_skip, pd_skip) = commit_lane_major(&q, &params);
                 // The full-transform reference: the same fill, live = t.
-                let mut codeword = crate::scratch::take_f128(params.codeword_len_f128());
+                let mut codeword = take_f128(params.codeword_len_f128());
                 replicate_lane_major_fill(&mut codeword, &q, t, d);
                 let (c_ref, pd_ref) = finalize_commit(codeword, t, &params);
                 assert_eq!(c_skip.cap, c_ref.cap, "cap (m={m}, t={t}, c={c})");
@@ -993,15 +958,13 @@ mod tests {
 
                 // Root is the Merkle tree over t-wide leaves of pd_t.codeword.
                 let bytes: &[u8] = unsafe {
-                    core::slice::from_raw_parts(
+                    from_raw_parts(
                         pd_t.codeword.as_ptr() as *const u8,
                         pd_t.codeword.len() * 16,
                     )
                 };
-                let tree =
-                    crate::merkle::merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash);
-                let cap =
-                    crate::merkle::cap_layer(&tree, t_params.n_leaves(), t_params.l0_cap_depth());
+                let tree = merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash);
+                let cap = cap_layer(&tree, t_params.n_leaves(), t_params.l0_cap_depth());
                 assert_eq!(cap, _c_t.cap, "cap must be over t-wide leaves");
             }
         }
@@ -1078,12 +1041,12 @@ mod tests {
         let mut rng = Rng::new(42);
         for m in [8usize, 10, 12] {
             let z = rng.bits(1 << m);
-            let z_packed = super::super::pack::pack_witness(&z, m);
+            let z_packed = pack_witness(&z, m);
             let params = default_params(m);
             let (commitment, prover_data) = commit(&z_packed, &params);
             assert_eq!(prover_data.codeword.len(), params.codeword_len_f128());
             assert_eq!(
-                crate::merkle::cap_layer(
+                cap_layer(
                     &prover_data.merkle_tree,
                     params.n_leaves(),
                     params.l0_cap_depth(),
@@ -1099,7 +1062,7 @@ mod tests {
         let mut rng = Rng::new(7);
         let m = 10;
         let z = rng.bits(1 << m);
-        let z_packed = super::super::pack::pack_witness(&z, m);
+        let z_packed = pack_witness(&z, m);
         let params = default_params(m);
         let (c1, _) = commit(&z_packed, &params);
         let (c2, _) = commit(&z_packed, &params);
@@ -1112,9 +1075,9 @@ mod tests {
         let m = 10;
         let mut z = rng.bits(1 << m);
         let params = default_params(m);
-        let (c1, _) = commit(&super::super::pack::pack_witness(&z, m), &params);
+        let (c1, _) = commit(&pack_witness(&z, m), &params);
         z[7] ^= true;
-        let (c2, _) = commit(&super::super::pack::pack_witness(&z, m), &params);
+        let (c2, _) = commit(&pack_witness(&z, m), &params);
         assert_ne!(c1.cap, c2.cap);
     }
 
@@ -1126,7 +1089,7 @@ mod tests {
         let z1 = rng.bits(1 << m);
         let z2 = rng.bits(1 << m);
         let z_xor: Vec<bool> = z1.iter().zip(&z2).map(|(a, b)| a ^ b).collect();
-        let pack = |z: &[bool]| super::super::pack::pack_witness(z, m);
+        let pack = |z: &[bool]| pack_witness(z, m);
         let (_, pd1) = commit(&pack(&z1), &params);
         let (_, pd2) = commit(&pack(&z2), &params);
         let (_, pd_x) = commit(&pack(&z_xor), &params);
@@ -1141,7 +1104,7 @@ mod tests {
         let m = 10;
         let params = default_params(m);
         let z = rng.bits(1 << m);
-        let z_packed = super::super::pack::pack_witness(&z, m);
+        let z_packed = pack_witness(&z, m);
         let (_, pd) = commit(&z_packed, &params);
         assert_eq!(pd.codeword.len(), 2 * z_packed.len());
     }

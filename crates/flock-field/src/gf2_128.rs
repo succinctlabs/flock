@@ -15,7 +15,36 @@
 //! (4 PMULL schoolbook + 2-stage recursive reduction, 2 extra PMULL), which
 //! benchmarked as the fastest of four variants tried.
 
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use self::aarch64::{
+    ghash_mul_binius as ghash_mul_binius_aarch64,
+    ghash_mul_unreduced_neon as ghash_mul_unreduced_aarch64, ghash_square as ghash_square_aarch64,
+};
+#[cfg(feature = "mul-count")]
+use self::op_count::{INVS, MULS};
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq")
+)))]
+use self::software::{
+    ghash_mul as ghash_mul_software, ghash_mul_unreduced as ghash_mul_unreduced_software,
+    ghash_square as ghash_square_software,
+};
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+use self::x86_64::{
+    ghash_mul_karatsuba_barrett as ghash_mul_x86_64,
+    ghash_mul_unreduced_x86 as ghash_mul_unreduced_x86_64, ghash_square_x86 as ghash_square_x86_64,
+};
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+use core::arch::x86_64::*;
 use core::ops::{Add, AddAssign, BitXor, BitXorAssign, Mul, MulAssign};
+#[cfg(feature = "mul-count")]
+use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
 
@@ -68,7 +97,7 @@ impl F128 {
     /// Used in one-time setup (Lagrange weight computation), not in hot paths.
     pub fn inv(self) -> Self {
         #[cfg(feature = "mul-count")]
-        op_count::INVS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        INVS.fetch_add(1, Ordering::Relaxed);
         // x^{2^128 - 2} = ∏_{i=1..127} x^{2^i}
         let mut r = Self::ONE;
         let mut cur = self * self; // x^2
@@ -176,11 +205,11 @@ impl Mul for F128 {
     #[inline]
     fn mul(self, rhs: Self) -> Self {
         #[cfg(feature = "mul-count")]
-        op_count::MULS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MULS.fetch_add(1, Ordering::Relaxed);
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
             // SAFETY: aes target feature is enabled at compile time.
-            unsafe { aarch64::ghash_mul_binius(self, rhs) }
+            unsafe { ghash_mul_binius_aarch64(self, rhs) }
         }
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
@@ -188,14 +217,14 @@ impl Mul for F128 {
             // On Zen4, karatsuba+barrett is ~17% faster in throughput (the
             // dominant mode for the bulk parallel F128 work) than binius, which
             // only wins the latency microbench. (M-series picked binius.)
-            unsafe { x86_64::ghash_mul_karatsuba_barrett(self, rhs) }
+            unsafe { ghash_mul_x86_64(self, rhs) }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         )))]
         {
-            software::ghash_mul(self, rhs)
+            ghash_mul_software(self, rhs)
         }
     }
 }
@@ -329,19 +358,19 @@ fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     {
         // SAFETY: aes target feature is enabled at compile time.
-        unsafe { aarch64::ghash_mul_unreduced_neon(a, b) }
+        unsafe { ghash_mul_unreduced_aarch64(a, b) }
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     {
         // SAFETY: pclmulqdq target feature is enabled at compile time.
-        unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }
+        unsafe { ghash_mul_unreduced_x86_64(a, b) }
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
     )))]
     {
-        software::ghash_mul_unreduced(a, b)
+        ghash_mul_unreduced_software(a, b)
     }
 }
 
@@ -350,24 +379,48 @@ fn ghash_square(a: F128) -> F128 {
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     {
         // SAFETY: aes target feature is enabled at compile time.
-        unsafe { aarch64::ghash_square(a) }
+        unsafe { ghash_square_aarch64(a) }
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     {
         // SAFETY: pclmulqdq target feature is enabled at compile time.
-        unsafe { x86_64::ghash_square_x86(a) }
+        unsafe { ghash_square_x86_64(a) }
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
     )))]
     {
-        software::ghash_square(a)
+        ghash_square_software(a)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    use super::aarch64::{
+        ghash_mul_binius as ghash_mul_binius_aarch64,
+        ghash_mul_karatsuba as ghash_mul_karatsuba_aarch64,
+        ghash_mul_karatsuba_barrett as ghash_mul_karatsuba_barrett_aarch64,
+        ghash_mul_schoolbook as ghash_mul_schoolbook_aarch64, ghash_mul_vec2_neon,
+    };
+    #[cfg(feature = "mul-count")]
+    use super::op_count::{MULS_PER_INV, measure};
+    use super::software::ghash_mul as ghash_mul_software;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    use super::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    use super::x86_64::{
+        ghash_mul_binius as ghash_mul_binius_x86_64,
+        ghash_mul_karatsuba as ghash_mul_karatsuba_x86_64,
+        ghash_mul_karatsuba_barrett as ghash_mul_karatsuba_barrett_x86_64,
+        ghash_mul_schoolbook as ghash_mul_schoolbook_x86_64,
+        ghash_mul_unreduced_x86 as ghash_mul_unreduced_x86_64,
+    };
     use super::*;
 
     use crate::test_rng::Rng;
@@ -382,19 +435,17 @@ mod tests {
         }
     }
 
-    /// `op_count::MULS_PER_INV` is what separates an algorithm's real
+    /// `MULS_PER_INV` is what separates an algorithm's real
     /// multiplication count from the ones buried inside `inv`, so the whole
     /// attribution in `benches/verifier_mul_count.rs` rests on it. Pinned
     /// against the live `inv`, which is where it would silently drift.
     #[cfg(feature = "mul-count")]
     #[test]
     fn inv_mul_cost_is_stable() {
-        let (_, s) =
-            op_count::measure(|| F128::new(0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321).inv());
+        let (_, s) = measure(|| F128::new(0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321).inv());
         assert_eq!(s.invs, 1);
         assert_eq!(
-            s.native_muls,
-            op_count::MULS_PER_INV,
+            s.native_muls, MULS_PER_INV,
             "inv's multiplication count moved; MULS_PER_INV is now wrong"
         );
         assert_eq!(s.muls_excluding_inv(), 0);
@@ -545,7 +596,7 @@ mod tests {
             let b0 = rng.f128();
             let b1 = rng.f128();
             let expected = [a0 * b0, a1 * b1];
-            let result = unsafe { aarch64::ghash_mul_vec2_neon([a0, a1], [b0, b1]) };
+            let result = unsafe { ghash_mul_vec2_neon([a0, a1], [b0, b1]) };
             assert_eq!(result[0], expected[0], "lane 0");
             assert_eq!(result[1], expected[1], "lane 1");
         }
@@ -558,11 +609,11 @@ mod tests {
         for _ in 0..128 {
             let a = rng.f128();
             let b = rng.f128();
-            let sw = software::ghash_mul(a, b);
-            let sb = unsafe { aarch64::ghash_mul_schoolbook(a, b) };
-            let ka = unsafe { aarch64::ghash_mul_karatsuba(a, b) };
-            let kb = unsafe { aarch64::ghash_mul_karatsuba_barrett(a, b) };
-            let bi = unsafe { aarch64::ghash_mul_binius(a, b) };
+            let sw = ghash_mul_software(a, b);
+            let sb = unsafe { ghash_mul_schoolbook_aarch64(a, b) };
+            let ka = unsafe { ghash_mul_karatsuba_aarch64(a, b) };
+            let kb = unsafe { ghash_mul_karatsuba_barrett_aarch64(a, b) };
+            let bi = unsafe { ghash_mul_binius_aarch64(a, b) };
             assert_eq!(sw, sb);
             assert_eq!(sw, ka);
             assert_eq!(sw, kb);
@@ -577,13 +628,13 @@ mod tests {
         for _ in 0..128 {
             let a = rng.f128();
             let b = rng.f128();
-            let sw = software::ghash_mul(a, b);
-            let sb = unsafe { x86_64::ghash_mul_schoolbook(a, b) };
-            let ka = unsafe { x86_64::ghash_mul_karatsuba(a, b) };
-            let kb = unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) };
-            let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
+            let sw = ghash_mul_software(a, b);
+            let sb = unsafe { ghash_mul_schoolbook_x86_64(a, b) };
+            let ka = unsafe { ghash_mul_karatsuba_x86_64(a, b) };
+            let kb = unsafe { ghash_mul_karatsuba_barrett_x86_64(a, b) };
+            let bi = unsafe { ghash_mul_binius_x86_64(a, b) };
             // Unreduced + deferred reduce must match the direct software product.
-            let un = unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }.reduce();
+            let un = unsafe { ghash_mul_unreduced_x86_64(a, b) }.reduce();
             assert_eq!(sw, sb, "schoolbook");
             assert_eq!(sw, ka, "karatsuba");
             assert_eq!(sw, kb, "karatsuba_barrett");
@@ -602,7 +653,6 @@ mod tests {
     ))]
     #[test]
     fn ghash_mul_x4_matches_scalar() {
-        use core::arch::x86_64::*;
         let mut rng = Rng::new(0x4A4_C0DE);
         for _ in 0..256 {
             let xs = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
@@ -611,7 +661,7 @@ mod tests {
             let got: [F128; 4] = unsafe {
                 let x = _mm512_loadu_si512(xs.as_ptr() as *const __m512i);
                 let y = _mm512_loadu_si512(ys.as_ptr() as *const __m512i);
-                let r = x86_64::ghash_mul_x4(x, y);
+                let r = ghash_mul_x4(x, y);
                 let mut out = [F128::ZERO; 4];
                 _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, r);
                 out
@@ -638,15 +688,15 @@ mod tests {
         let mut rng = Rng::new(0xDEF_E44);
         for _ in 0..128 {
             // SAFETY: vpclmulqdq+avx512f+sse4.1 enabled at compile time.
-            let mut wide = unsafe { x86_64::WideGhashX4::zero() };
+            let mut wide = unsafe { WideGhashX4::zero() };
             let mut scalar = F256Unreduced::ZERO;
             for _ in 0..5 {
                 let xs = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
                 let ys = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
                 // xs via contiguous load, ys via scalar set — exercises both.
                 unsafe {
-                    let xv = x86_64::f128x4_loadu(xs.as_ptr());
-                    let yv = x86_64::f128x4_set(ys[0], ys[1], ys[2], ys[3]);
+                    let xv = f128x4_loadu(xs.as_ptr());
+                    let yv = f128x4_set(ys[0], ys[1], ys[2], ys[3]);
                     wide.mul_acc(xv, yv);
                 }
                 for i in 0..4 {

@@ -1,6 +1,8 @@
 use super::*;
-use flock_core::element_r1cs::ElementTableBuilder;
+use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::schedule::IoWord;
+use flock_field::gf2_256::QUADRATIC_NONRESIDUE;
+use std::sync::Arc;
 
 /// What the verifier actually computes from the opened leaves, at one level:
 ///
@@ -44,7 +46,7 @@ use flock_core::schedule::IoWord;
 /// rows that grow to 127 terms at the last level. Left for later on purpose:
 /// this is the MVP.
 pub(super) struct LeafEvalGate {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
     lay: LeafLayout,
 }
 
@@ -132,7 +134,7 @@ impl LeafEvalGate {
         b.mult(lay.t, lay.alpha, lay.y());
         b.linear(lay.acc, &[(lay.prev, one), (lay.t, one)]);
         Self {
-            ty: std::sync::Arc::new(b.build().expect("leaf-eval block is valid")),
+            ty: Arc::new(b.build().expect("leaf-eval block is valid")),
             lay,
         }
     }
@@ -184,7 +186,7 @@ impl GateType for LeafEvalGate {
 /// products. L0 words enter as `(word, 0)`, while recursive commitment rows
 /// already contain adjacent `(c0, c1)` words.
 pub(super) struct LeafEvalGate256 {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pub(super) ty: Arc<ElementTableType>,
     lay: LeafLayout256,
 }
 
@@ -251,14 +253,14 @@ impl LeafLayout256 {
 /// Emit `out = add + a*b` over F256, returning the next unused column.
 /// The five emitted columns are the three Karatsuba products and two limbs.
 pub(super) fn build_mac256(
-    b: &mut flock_core::element_r1cs::ElementTableBuilder,
+    b: &mut ElementTableBuilder,
     at: usize,
     add: Option<[usize; 2]>,
     a: [usize; 2],
     rhs: [usize; 2],
 ) -> usize {
     let one = F128::ONE;
-    let nr = flock_field::gf2_256::QUADRATIC_NONRESIDUE;
+    let nr = QUADRATIC_NONRESIDUE;
     b.mult(at, a[0], rhs[0]);
     b.mult(at + 1, a[1], rhs[1]);
     b.mult_lin(
@@ -295,7 +297,7 @@ impl LeafEvalGate256 {
                 let right = lay.prev_pair(l, 2 * i + 1);
                 let challenge = [lay.v + 2 * (l - 1), lay.v + 2 * (l - 1) + 1];
                 let at = lay.base(l) + 5 * i;
-                let nr = flock_field::gf2_256::QUADRATIC_NONRESIDUE;
+                let nr = QUADRATIC_NONRESIDUE;
                 b.mult_lin(
                     at,
                     &[(left[0], one), (right[0], one)],
@@ -328,7 +330,7 @@ impl LeafEvalGate256 {
             lay.y(),
         );
         Self {
-            ty: std::sync::Arc::new(b.build().expect("extension leaf-eval block is valid")),
+            ty: Arc::new(b.build().expect("extension leaf-eval block is valid")),
             lay,
         }
     }

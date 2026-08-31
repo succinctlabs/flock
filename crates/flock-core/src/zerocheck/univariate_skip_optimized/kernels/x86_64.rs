@@ -1,7 +1,10 @@
+use core::arch::x86_64::*;
+
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 use super::super::{ELL, F128, N_MEDIUM};
 #[cfg(target_feature = "gfni")]
 use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
+use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
 
 /// AVX-512 (VBMI) 64-byte bit-transpose — direct port of the NEON two-stage
 /// algorithm. `_mm512_permutexvar_epi8` does the byte-gather (NEON `vqtbl4q`)
@@ -18,7 +21,6 @@ use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
 ))]
 #[target_feature(enable = "avx512vbmi,avx512bw,avx512f")]
 pub(crate) unsafe fn bit_transpose_64bytes_avx512(input: &[u8; 64], output: &mut [u8; 64]) {
-    use core::arch::x86_64::*;
     // Gather index = NEON IDX0 ++ IDX1 ++ IDX2 ++ IDX3 (the 8×8 byte transpose).
     #[rustfmt::skip]
     const IDX: [i8; 64] = [
@@ -64,7 +66,6 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
     a_col: &mut [F8],
     b_col: &mut [F8],
 ) {
-    use core::arch::x86_64::*;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
 
     // SAFETY: function carries gfni+sse2; raw loads/stores stay within the
@@ -113,7 +114,6 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     b_med: usize,
     out: &mut [u8; 64],
 ) {
-    use core::arch::x86_64::*;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
 
     // SAFETY: the caller's packed-input bounds guarantee 8 readable bytes at
@@ -158,8 +158,6 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
     partial_c_0: &mut [F128; ELL],
     partial_c_1: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
-    use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert_eq!(ELL % 4, 0);
 

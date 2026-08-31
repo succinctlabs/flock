@@ -4,9 +4,19 @@
 //! [`FsChallenger`] supports SHA-256 and BLAKE3.
 //! `RandomChallenger` supports tests and benchmarks only.
 
+#[cfg(feature = "hash-count")]
+use self::fs_count::{POW_SHA256, SQUEEZED_BYTES, SQUEEZES};
+use blake3::Hasher;
+use blake3::IncrementCounter;
+use blake3::hash;
+use blake3::platform::Platform;
 use flock_field::{F128, F256};
 use flock_hash::{BLAKE3_IV, HashKind, blake3_compress};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::array::from_fn;
+#[cfg(feature = "hash-count")]
+use std::sync::atomic::Ordering;
 
 /// Number of grinding bits needed to turn a Schwartz--Zippel event of
 /// degree at most `degree` over `F_{2^128}` into a *strictly* sub-`2^-128`
@@ -332,7 +342,7 @@ pub mod fs_count {
 #[derive(Clone)]
 enum FsState {
     Sha256(Sha256),
-    Blake3(Box<blake3::Hasher>),
+    Blake3(Box<Hasher>),
     /// The sponge-chained BLAKE3 discipline (transcript-v2): a sequential
     /// compression chain — no chunk tree, no per-squeeze root forks. A
     /// recursion circuit replays one row per 64-byte block plus ~two per
@@ -485,10 +495,9 @@ impl B3Chain {
         // grind side's failed attempts are counted inside the scan itself).
         #[cfg(feature = "hash-count")]
         {
-            fs_count::POW_SHA256.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            fs_count::SQUEEZED_BYTES
-                .fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            POW_SHA256.fetch_add(1, Ordering::Relaxed);
+            SQUEEZES.fetch_add(1, Ordering::Relaxed);
+            SQUEEZED_BYTES.fetch_add(out.len() as u64, Ordering::Relaxed);
         }
         let ob = self.pow_candidate_output(nonce, bits);
         let mut first = [0u8; 64];
@@ -549,7 +558,6 @@ impl B3Chain {
                 start = start.saturating_add(GRIND_CHUNK);
             }
         } else {
-            use rayon::prelude::*;
             let block = 1u64 << (bits.min(24) + 1);
             let n_chunks = block.div_ceil(GRIND_CHUNK);
             let mut start = 0u64;
@@ -608,7 +616,7 @@ impl FsChallenger {
         let mut c = Self {
             state: match kind {
                 HashKind::Sha256 => FsState::Sha256(Sha256::new()),
-                HashKind::Blake3 => FsState::Blake3(Box::new(blake3::Hasher::new())),
+                HashKind::Blake3 => FsState::Blake3(Box::new(Hasher::new())),
             },
             #[cfg(feature = "hash-count")]
             n_absorbed: 0,
@@ -749,8 +757,8 @@ impl FsChallenger {
     fn state_digest(&mut self) -> [u8; 32] {
         #[cfg(feature = "hash-count")]
         {
-            fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            fs_count::SQUEEZED_BYTES.fetch_add(32, std::sync::atomic::Ordering::Relaxed);
+            SQUEEZES.fetch_add(1, Ordering::Relaxed);
+            SQUEEZED_BYTES.fetch_add(32, Ordering::Relaxed);
         }
         match &mut self.state {
             FsState::Sha256(h) => h.clone().finalize().into(),
@@ -806,8 +814,8 @@ impl Challenger for FsChallenger {
     fn sample_f128(&mut self) -> F128 {
         #[cfg(feature = "hash-count")]
         {
-            fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            fs_count::SQUEEZED_BYTES.fetch_add(16, std::sync::atomic::Ordering::Relaxed);
+            SQUEEZES.fetch_add(1, Ordering::Relaxed);
+            SQUEEZED_BYTES.fetch_add(16, Ordering::Relaxed);
         }
         // The duplex chain drops the OP_SQUEEZE header: its squeeze itself
         // advances the state, so the header's only job (separating
@@ -840,9 +848,8 @@ impl Challenger for FsChallenger {
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         #[cfg(feature = "hash-count")]
         {
-            fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            fs_count::SQUEEZED_BYTES
-                .fetch_add((n * 16) as u64, std::sync::atomic::Ordering::Relaxed);
+            SQUEEZES.fetch_add(1, Ordering::Relaxed);
+            SQUEEZED_BYTES.fetch_add((n * 16) as u64, Ordering::Relaxed);
         }
         if !matches!(self.state, FsState::Blake3Chain(_)) {
             self.absorb_header(OP_SQUEEZE, KIND_SLICE, n as u64);
@@ -893,14 +900,7 @@ impl Challenger for FsChallenger {
                 start = start.saturating_add(GRIND_CHUNK);
             }
         } else {
-            // Block-parallel search. Blocks are scanned in order and each task
-            // returns the smallest match within its chunk, so the result is
-            // deterministic (the globally smallest satisfying nonce).
-            // Block ≈ 2× the expected attempts: large enough that the match
-            // usually falls inside one block (so all threads do useful
-            // pre-match work), small enough to avoid the 4× over-scan the old
-            // `+2` block caused (which left ~¾ of threads doing cancelled work).
-            use rayon::prelude::*;
+            // Search ordered blocks in parallel and return the first match.
             let block: u64 = 1 << (bits.min(24) + 1);
             let n_chunks = block.div_ceil(GRIND_CHUNK);
             let mut start: u64 = 0;
@@ -1103,7 +1103,7 @@ pub fn pow_has_leading_zero_bits(
     kind: HashKind,
 ) -> bool {
     #[cfg(feature = "hash-count")]
-    fs_count::POW_SHA256.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    POW_SHA256.fetch_add(1, Ordering::Relaxed);
     match kind {
         HashKind::Sha256 => {
             let mut pre = [0u8; 40];
@@ -1113,7 +1113,7 @@ pub fn pow_has_leading_zero_bits(
             has_leading_zero_bits(&h, bits)
         }
         HashKind::Blake3 => {
-            let h = blake3::hash(&blake3_pow_preimage(state_digest, nonce));
+            let h = hash(&blake3_pow_preimage(state_digest, nonce));
             has_leading_zero_bits(h.as_bytes(), bits)
         }
     }
@@ -1137,7 +1137,6 @@ const BLAKE3_POW_BATCH: usize = 32;
 /// agrees with `blake3::hash` on every nonce, which
 /// `blake3_batched_pow_matches_scalar` asserts.
 fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
-    use blake3::platform::Platform;
     // BLAKE3 constants, fixed by the spec.
     const IV: [u32; 8] = [
         0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
@@ -1164,13 +1163,13 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
             p[32..40].copy_from_slice(&(base + i as u64).to_le_bytes());
         }
         #[cfg(feature = "hash-count")]
-        fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        let inputs: [&[u8; 64]; BLAKE3_POW_BATCH] = std::array::from_fn(|i| &pre[i]);
+        POW_SHA256.fetch_add(n as u64, Ordering::Relaxed);
+        let inputs: [&[u8; 64]; BLAKE3_POW_BATCH] = from_fn(|i| &pre[i]);
         plat.hash_many(
             &inputs[..n],
             &IV,
             0,
-            blake3::IncrementCounter::No,
+            IncrementCounter::No,
             0,
             CHUNK_START,
             CHUNK_END | ROOT,
@@ -1196,7 +1195,6 @@ fn blake3_chain_pow_scan(
     len: u64,
     bits: u32,
 ) -> Option<u64> {
-    use blake3::platform::Platform;
     assert!(pending.len() + 16 <= 64, "one aligned nonce word must fit");
     let counter = pow_squeeze_counter(bits, pending.len() + 16);
     let nonce_at = pending.len();
@@ -1214,13 +1212,13 @@ fn blake3_chain_pow_scan(
             p[nonce_at..nonce_at + 8].copy_from_slice(&(base + i as u64).to_le_bytes());
         }
         #[cfg(feature = "hash-count")]
-        fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        let inputs: [&[u8; 64]; BLAKE3_POW_BATCH] = std::array::from_fn(|i| &pre[i]);
+        POW_SHA256.fetch_add(n as u64, Ordering::Relaxed);
+        let inputs: [&[u8; 64]; BLAKE3_POW_BATCH] = from_fn(|i| &pre[i]);
         plat.hash_many(
             &inputs[..n],
             cv,
             counter,
-            blake3::IncrementCounter::No,
+            IncrementCounter::No,
             CHAIN_SQUEEZE as u8,
             0,
             0,
@@ -1258,6 +1256,7 @@ fn pow_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     /// Every FsChallenger property must hold under both transcript hashes:
     /// the tagging, absorption order and duplex structure are shared, and
@@ -1404,7 +1403,7 @@ mod tests {
             // catches a counter that fails to advance, or an XOF read that
             // restarts per block.
             let vals = FsChallenger::with_hash(b"d", kind).sample_f128_vec(16);
-            let unique: std::collections::HashSet<_> = vals.iter().collect();
+            let unique: HashSet<_> = vals.iter().collect();
             assert_eq!(unique.len(), vals.len(), "{kind}: squeeze stream repeats");
         }
     }

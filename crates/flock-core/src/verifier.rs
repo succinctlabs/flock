@@ -1,36 +1,94 @@
 //! Top-level R1CS verifier: walks the challenger in lockstep with the
-//! prover, runs `zerocheck::verify` and `lincheck::verify`, derives the two
+//! prover, runs `zerocheck::verify` and `verify_lincheck`, derives the two
 //! ZClaims, and verifies the PCS openings at those points against the
 //! witness commitment.
 
 use crate::challenger::Challenger;
+use crate::circuit::Circuit;
+use crate::circuit::SigmaAssertion;
+use crate::circuit::WiringError;
+use crate::circuit::WiringProof;
+use crate::circuit::verify_wiring_deferred_with_grinding;
+use crate::circuit::verify_wiring_with_grinding;
+use crate::element_r1cs::union::Claims;
+use crate::element_r1cs::union::ElementAssertion;
+use crate::element_r1cs::union::ElementUnionError;
+use crate::element_r1cs::union::Proof;
+use crate::element_r1cs::union::verify_deferred_with_grinding;
 use crate::field::F128;
+#[cfg(feature = "mul-count")]
+use crate::field::gf2_128::op_count::MULS_PER_INV;
+#[cfg(feature = "mul-count")]
+use crate::field::gf2_128::op_count::snapshot;
 use crate::lincheck;
 use crate::lincheck::SkipPoint;
+use crate::matrix_fold::JaggedAssertion;
+use crate::pcs::MergedOpenProof;
+use crate::pcs::PcsOpenError;
+use crate::pcs::PcsParams;
 use crate::pcs::{self, Commitment};
+use crate::proof::BooleanPiopProof;
+use crate::proof::BooleanPiopProofAg;
+use crate::proof::R1csProofCircuitMerged;
+use crate::proof::R1csProofCircuitMergedAg;
+use crate::proof::R1csProofLigeritoAg;
+use crate::proof::R1csProofMergedLigerito;
+use crate::proof::R1csProofMergedLigeritoAg;
+use crate::proof::R1csProofMixedClassMerged;
+use crate::proof::UnionClassClaims;
+use crate::proof::bind_statement;
 use crate::proof::{R1csClaim, R1csProofLigerito, ZClaim};
 use crate::r1cs::BlockR1cs;
+use crate::union::UnionInstance;
 use crate::zerocheck;
+use lincheck::LincheckCircuit;
+use lincheck::LincheckError;
+use lincheck::LincheckGrinding;
+use lincheck::LincheckProof;
+use lincheck::MatrixAssertion;
+use lincheck::verify as verify_lincheck;
+use lincheck::verify_union_deferred_with_grinding;
+use lincheck::verify_with_grinding as verify_lincheck_with_grinding;
+use pcs::BatchOpeningProofLigerito;
+use pcs::LOG_PACKING;
+use pcs::PackedDirectClaimRef;
+use pcs::PcsError;
+use pcs::verify_batch_merged;
+use pcs::verify_batch_merged_deferred;
+use pcs::verify_opening_batch_ligerito_mixed_with_grinding;
+use rayon::ThreadPool;
+use rayon::ThreadPoolBuilder;
+use std::env::var;
 use std::sync::OnceLock;
+use std::time::Instant;
+use zerocheck::ZerocheckError;
+use zerocheck::ZerocheckGrinding;
+use zerocheck::ZerocheckProof;
+use zerocheck::ag_skip::AgProof;
+use zerocheck::ag_skip::AgVerifyError;
+use zerocheck::ag_skip::K_SKIP;
+use zerocheck::ag_skip::verify as verify_ag;
+use zerocheck::ag_skip::verify_with_grinding as verify_ag_with_grinding;
+use zerocheck::verify_with_grinding as verify_zerocheck_with_grinding;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FlockVerifyError {
-    Zerocheck(zerocheck::ZerocheckError),
+    Zerocheck(ZerocheckError),
     /// AG-skip zerocheck round replay failed (`verify_core_ag`).
-    Ag(zerocheck::ag_skip::AgVerifyError),
-    Lincheck(lincheck::LincheckError),
-    PcsAb(pcs::PcsError),
-    PcsC(pcs::PcsError),
+    Ag(AgVerifyError),
+    Lincheck(LincheckError),
+    PcsAb(PcsError),
+    PcsC(PcsError),
     /// The jagged-path batched opening rejected (see [`verify_ligerito_jagged`]).
-    PcsOpen(pcs::PcsOpenError),
+    PcsOpen(PcsOpenError),
     /// The element-region PIOP rejected.
-    Element(crate::element_r1cs::union::ElementUnionError),
+    Element(ElementUnionError),
     /// A mixed-class proof carries a class sub-proof the registry has no type
     /// for, or omits one it does — the statement and the proof disagree on
     /// which PIOPs ran.
     ClassMismatch,
     /// The wiring (copy-constraint) argument rejected.
-    Wiring(crate::circuit::WiringError),
+    Wiring(WiringError),
     /// The circuit and the union instance are not the same statement: a
     /// different registry, or gate counts that are not the union's declared
     /// counts. A rejection, not a panic — both come from the caller.
@@ -64,7 +122,7 @@ pub enum FlockVerifyError {
 fn verifier_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("FLOCK_VERIFY_THREADS")
+        var("FLOCK_VERIFY_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
@@ -72,10 +130,10 @@ fn verifier_threads() -> usize {
     })
 }
 
-fn verifier_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+fn verifier_pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
+        ThreadPoolBuilder::new()
             .num_threads(verifier_threads())
             // The whole verify body runs on this worker — including the deep
             // recursive Ligerito verifier — so give it an ample stack. A rayon
@@ -92,10 +150,7 @@ fn verifier_pool() -> &'static rayon::ThreadPool {
 /// inputs. Compare every serialized parameter before accepting an opening so
 /// a commitment cannot downgrade the requested profile or redirect Merkle
 /// verification.
-fn commitment_params_match_expected(
-    commitment: &Commitment,
-    expected: &crate::pcs::PcsParams,
-) -> bool {
+fn commitment_params_match_expected(commitment: &Commitment, expected: &PcsParams) -> bool {
     &commitment.params == expected
 }
 
@@ -105,8 +160,8 @@ pub fn verify_ligerito<Ch: Challenger>(
     r1cs: &BlockR1cs,
     commitment: &Commitment,
     proof: &R1csProofLigerito,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    pcs_params: &crate::pcs::PcsParams,
+    lincheck_circuit: &dyn LincheckCircuit,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, FlockVerifyError> {
     let (ab, c) = verify_core_with_grinding(
@@ -141,7 +196,7 @@ enum UnionVerifyBinding<'a> {
     /// The circuit binding: [`UnionVerifyBinding::Mixed`] plus the circuit
     /// digest and the public words.
     Circuit {
-        circuit: &'a crate::circuit::Circuit,
+        circuit: &'a Circuit,
         public: &'a [F128],
     },
 }
@@ -153,11 +208,11 @@ enum UnionVerifyBinding<'a> {
 /// on `commitment.params.num_lanes`, which the shared body's
 /// params-equality check pins to the count-derived value).
 pub fn verify_ligerito_union<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuits: &[&dyn lincheck::LincheckCircuit],
+    union: &UnionInstance<'_>,
+    circuits: &[&dyn LincheckCircuit],
     commitment: &Commitment,
-    proof: &crate::proof::R1csProofMergedLigerito,
-    pcs_params: &crate::pcs::PcsParams,
+    proof: &R1csProofMergedLigerito,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, FlockVerifyError> {
     // Mirror of the prove-side guard: this entry consumes `R1csClaim` —
@@ -170,8 +225,8 @@ pub fn verify_ligerito_union<Ch: Challenger>(
     // Repackage as a boolean-only mixed-class proof and run the one shared
     // verify body (the two-body split died with the jagged transport). The
     // clone is a few hundred KB against a multi-ms verify.
-    let mixed = crate::proof::R1csProofMixedClassMerged {
-        boolean: Some(crate::proof::BooleanPiopProof {
+    let mixed = R1csProofMixedClassMerged {
+        boolean: Some(BooleanPiopProof {
             zerocheck: proof.zerocheck.clone(),
             lincheck: proof.lincheck.clone(),
         }),
@@ -189,11 +244,11 @@ pub fn verify_ligerito_union<Ch: Challenger>(
 /// statement binding, lincheck, and merged opening; only the zerocheck's
 /// round-1 replay differs (and the claim points ride [`SkipPoint::Ag`]).
 pub fn verify_ligerito_union_ag<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuits: &[&dyn lincheck::LincheckCircuit],
+    union: &UnionInstance<'_>,
+    circuits: &[&dyn LincheckCircuit],
     commitment: &Commitment,
-    proof: &crate::proof::R1csProofMergedLigeritoAg,
-    pcs_params: &crate::pcs::PcsParams,
+    proof: &R1csProofMergedLigeritoAg,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, FlockVerifyError> {
     assert!(
@@ -245,15 +300,15 @@ pub fn verify_ligerito_union_ag<Ch: Challenger>(
 /// transport carries the same way it carries the element class's.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_ligerito_union_circuit<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuit: &crate::circuit::Circuit,
+    union: &UnionInstance<'_>,
+    circuit: &Circuit,
     public: &[F128],
-    circuits: &[&dyn lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     commitment: &Commitment,
-    proof: &crate::proof::R1csProofCircuitMerged,
-    pcs_params: &crate::pcs::PcsParams,
+    proof: &R1csProofCircuitMerged,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
-) -> Result<crate::proof::UnionClassClaims, FlockVerifyError> {
+) -> Result<UnionClassClaims, FlockVerifyError> {
     if !circuit.check_instance(union) || !circuit.check_public(public) {
         return Err(FlockVerifyError::CircuitMismatch);
     }
@@ -315,22 +370,15 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
 /// accumulating must use [`verify_ligerito_union_circuit`].
 #[allow(clippy::too_many_arguments)]
 pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuit: &crate::circuit::Circuit,
+    union: &UnionInstance<'_>,
+    circuit: &Circuit,
     public: &[F128],
-    circuits: &[&dyn lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     commitment: &Commitment,
-    proof: &crate::proof::R1csProofCircuitMerged,
-    pcs_params: &crate::pcs::PcsParams,
+    proof: &R1csProofCircuitMerged,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
-) -> Result<
-    (
-        crate::proof::UnionClassClaims,
-        DeferredMatrixWork,
-        crate::circuit::SigmaAssertion,
-    ),
-    FlockVerifyError,
-> {
+) -> Result<(UnionClassClaims, DeferredMatrixWork, SigmaAssertion), FlockVerifyError> {
     if !circuit.check_instance(union) || !circuit.check_public(public) {
         return Err(FlockVerifyError::CircuitMismatch);
     }
@@ -378,15 +426,15 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
 /// Same replay; only the boolean zerocheck's round 1 differs.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_ligerito_union_circuit_ag<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuit: &crate::circuit::Circuit,
+    union: &UnionInstance<'_>,
+    circuit: &Circuit,
     public: &[F128],
-    circuits: &[&dyn lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     commitment: &Commitment,
-    proof: &crate::proof::R1csProofCircuitMergedAg,
-    pcs_params: &crate::pcs::PcsParams,
+    proof: &R1csProofCircuitMergedAg,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
-) -> Result<crate::proof::UnionClassClaims, FlockVerifyError> {
+) -> Result<UnionClassClaims, FlockVerifyError> {
     if !circuit.check_instance(union) || !circuit.check_public(public) {
         return Err(FlockVerifyError::CircuitMismatch);
     }
@@ -431,22 +479,15 @@ pub fn verify_ligerito_union_circuit_ag<Ch: Challenger>(
 /// AG-flavored children. Same conditional-claims contract as the RS twin.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_ligerito_union_circuit_ag_deferred<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuit: &crate::circuit::Circuit,
+    union: &UnionInstance<'_>,
+    circuit: &Circuit,
     public: &[F128],
-    circuits: &[&dyn lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     commitment: &Commitment,
-    proof: &crate::proof::R1csProofCircuitMergedAg,
-    pcs_params: &crate::pcs::PcsParams,
+    proof: &R1csProofCircuitMergedAg,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
-) -> Result<
-    (
-        crate::proof::UnionClassClaims,
-        DeferredMatrixWork,
-        crate::circuit::SigmaAssertion,
-    ),
-    FlockVerifyError,
-> {
+) -> Result<(UnionClassClaims, DeferredMatrixWork, SigmaAssertion), FlockVerifyError> {
     if !circuit.check_instance(union) || !circuit.check_public(public) {
         return Err(FlockVerifyError::CircuitMismatch);
     }
@@ -492,15 +533,15 @@ pub fn verify_ligerito_union_circuit_ag_deferred<Ch: Challenger>(
 /// The merged transport's verification, shared by the mixed-class and circuit
 /// entries: the boolean pair ring-switched, everything else packed-direct.
 fn verify_merged_opening<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
+    union: &UnionInstance<'_>,
     commitment: &Commitment,
-    claims: &crate::proof::UnionClassClaims,
+    claims: &UnionClassClaims,
     packed_direct_points: &[(Vec<F128>, F128)],
-    pcs_open: &crate::pcs::MergedOpenProof,
-    pcs_params: &crate::pcs::PcsParams,
+    pcs_open: &MergedOpenProof,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
-    defer: Option<&mut Option<crate::matrix_fold::JaggedAssertion>>,
-) -> Result<crate::proof::UnionClassClaims, FlockVerifyError> {
+    defer: Option<&mut Option<JaggedAssertion>>,
+) -> Result<UnionClassClaims, FlockVerifyError> {
     let cl: Vec<ZClaim> = match &claims.boolean {
         Some(c) => vec![c.ab.clone(), c.c.clone()],
         None => Vec::new(),
@@ -516,9 +557,9 @@ fn verify_merged_opening<Ch: Challenger>(
         })
         .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    let pd: Vec<pcs::PackedDirectClaimRef<'_>> = packed_direct_points
+    let pd: Vec<PackedDirectClaimRef<'_>> = packed_direct_points
         .iter()
-        .map(|(point, value)| pcs::PackedDirectClaimRef {
+        .map(|(point, value)| PackedDirectClaimRef {
             point,
             value: *value,
         })
@@ -528,7 +569,7 @@ fn verify_merged_opening<Ch: Challenger>(
         .expect("Ligerito default verifier config");
     verifier_pool()
         .install(|| match defer {
-            Some(out) => pcs::verify_batch_merged_deferred(
+            Some(out) => verify_batch_merged_deferred(
                 commitment,
                 &values,
                 &z_skips,
@@ -542,7 +583,7 @@ fn verify_merged_opening<Ch: Challenger>(
                 challenger,
             )
             .map(|a| *out = Some(a)),
-            None => pcs::verify_batch_merged(
+            None => verify_batch_merged(
                 commitment,
                 &values,
                 &z_skips,
@@ -568,13 +609,13 @@ fn verify_merged_opening<Ch: Challenger>(
 /// `x ↦ γ·x` — indistinguishable, to its per-claim weight builder, from a
 /// ring-switched claim's Φ-fold.
 pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuits: &[&dyn lincheck::LincheckCircuit],
+    union: &UnionInstance<'_>,
+    circuits: &[&dyn LincheckCircuit],
     commitment: &Commitment,
-    proof: &crate::proof::R1csProofMixedClassMerged,
-    pcs_params: &crate::pcs::PcsParams,
+    proof: &R1csProofMixedClassMerged,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
-) -> Result<crate::proof::UnionClassClaims, FlockVerifyError> {
+) -> Result<UnionClassClaims, FlockVerifyError> {
     if proof.boolean.is_some() != (union.num_boolean() > 0)
         || proof.element.is_some() != union.has_element()
     {
@@ -623,9 +664,9 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
         })
         .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    let pd: Vec<pcs::PackedDirectClaimRef<'_>> = packed_direct_points
+    let pd: Vec<PackedDirectClaimRef<'_>> = packed_direct_points
         .iter()
-        .map(|(point, value)| pcs::PackedDirectClaimRef {
+        .map(|(point, value)| PackedDirectClaimRef {
             point,
             value: *value,
         })
@@ -635,7 +676,7 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
         .expect("Ligerito default verifier config");
     verifier_pool()
         .install(|| {
-            pcs::verify_batch_merged(
+            verify_batch_merged(
                 commitment,
                 &values,
                 &z_skips,
@@ -664,13 +705,13 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
 /// lincheck is simply wrong still returns `Ok` here, so a caller that is not
 /// accumulating must use [`verify_ligerito_union_mixed_class`].
 pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuits: &[&dyn lincheck::LincheckCircuit],
+    union: &UnionInstance<'_>,
+    circuits: &[&dyn LincheckCircuit],
     commitment: &Commitment,
-    proof: &crate::proof::R1csProofMixedClassMerged,
-    pcs_params: &crate::pcs::PcsParams,
+    proof: &R1csProofMixedClassMerged,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
-) -> Result<(crate::proof::UnionClassClaims, DeferredMatrixWork), FlockVerifyError> {
+) -> Result<(UnionClassClaims, DeferredMatrixWork), FlockVerifyError> {
     if proof.boolean.is_some() != (union.num_boolean() > 0)
         || proof.element.is_some() != union.has_element()
     {
@@ -706,9 +747,9 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
         })
         .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    let pd: Vec<pcs::PackedDirectClaimRef<'_>> = packed_direct_points
+    let pd: Vec<PackedDirectClaimRef<'_>> = packed_direct_points
         .iter()
-        .map(|(point, value)| pcs::PackedDirectClaimRef {
+        .map(|(point, value)| PackedDirectClaimRef {
             point,
             value: *value,
         })
@@ -722,7 +763,7 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
     // assertions.
     let jagged = verifier_pool()
         .install(|| {
-            pcs::verify_batch_merged_deferred(
+            verify_batch_merged_deferred(
                 commitment,
                 &values,
                 &z_skips,
@@ -752,8 +793,8 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
 /// lincheck and both claim points are generic over [`SkipPoint`]).
 #[derive(Clone, Copy)]
 enum BooleanPiopRef<'a> {
-    Rs(&'a crate::proof::BooleanPiopProof),
-    Ag(&'a crate::proof::BooleanPiopProofAg),
+    Rs(&'a BooleanPiopProof),
+    Ag(&'a BooleanPiopProofAg),
 }
 
 /// Shared PIOP replay for both union verify shapes: statement binding, the
@@ -764,15 +805,15 @@ enum BooleanPiopRef<'a> {
 /// Runs on the 1-thread verifier pool, like every other verify core.
 #[allow(clippy::too_many_arguments)]
 fn verify_union_piops<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
+    union: &UnionInstance<'_>,
     binding: UnionVerifyBinding<'_>,
-    circuits: &[&dyn lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     commitment: &Commitment,
     boolean: Option<BooleanPiopRef<'_>>,
-    element: Option<&crate::element_r1cs::union::Proof>,
-    wiring: Option<&crate::circuit::WiringProof>,
+    element: Option<&Proof>,
+    wiring: Option<&WiringProof>,
     defer_sigma: bool,
-    pcs_params: &crate::pcs::PcsParams,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> Result<UnionPiopOut, FlockVerifyError> {
     // The commitment is to the DENSE stack q (M4/M5): PcsParams.m is the
@@ -791,9 +832,7 @@ fn verify_union_piops<Ch: Challenger>(
     // (`UnionInstance::commit_lanes`, like `dense_m`), so require the
     // commitment to carry exactly it; a mismatch is a rejection, not a panic.
     if !commitment_params_match_expected(commitment, pcs_params) {
-        return Err(FlockVerifyError::PcsOpen(
-            crate::pcs::PcsOpenError::Ligerito,
-        ));
+        return Err(FlockVerifyError::PcsOpen(PcsOpenError::Ligerito));
     }
     // Verification is single-threaded; run the PIOP replay on the dedicated
     // 1-thread pool (verify_claims_jagged_ligerito installs it itself).
@@ -805,8 +844,8 @@ fn verify_union_piops<Ch: Challenger>(
             }
         }
 
-        let mut matrix: Option<lincheck::MatrixAssertion> = None;
-        let mut el_matrix: Option<crate::element_r1cs::union::ElementAssertion> = None;
+        let mut matrix: Option<MatrixAssertion> = None;
+        let mut el_matrix: Option<ElementAssertion> = None;
         // Mirror the prover's FORK/JOIN transcript, which every circuit
         // binding uses: the wiring replays on a domain-separated child, run
         // before the element class so its closing digest merges at the
@@ -828,7 +867,7 @@ fn verify_union_piops<Ch: Challenger>(
                 let (z_skip, mlv_challenges, a_eval, b_eval, c_eval, r_rest, lincheck_proof) =
                     match piop {
                         BooleanPiopRef::Rs(p) => {
-                            let zc = zerocheck::verify_with_grinding(
+                            let zc = verify_zerocheck_with_grinding(
                                 union.m_bool(),
                                 &p.zerocheck,
                                 pcs_params.zerocheck_grinding(),
@@ -846,7 +885,7 @@ fn verify_union_piops<Ch: Challenger>(
                             )
                         }
                         BooleanPiopRef::Ag(p) => {
-                            let ag = zerocheck::ag_skip::verify_with_grinding(
+                            let ag = verify_ag_with_grinding(
                                 union.m_bool(),
                                 &p.ag,
                                 pcs_params.zerocheck_grinding(),
@@ -871,7 +910,7 @@ fn verify_union_piops<Ch: Challenger>(
                 // DEFERRED: the matrix work leaves as an assertion instead of
                 // being discharged here. Callers that are not accumulating get
                 // it discharged for them by the wrappers below.
-                let (lc_claim, assertion) = lincheck::verify_union_deferred_with_grinding(
+                let (lc_claim, assertion) = verify_union_deferred_with_grinding(
                     union,
                     circuits,
                     &x_ab,
@@ -908,7 +947,7 @@ fn verify_union_piops<Ch: Challenger>(
         // sequential position below, so the packed-direct order is
         // unchanged.
         let mut par_gather: Option<Vec<(Vec<F128>, F128)>> = None;
-        let mut sigma: Option<crate::circuit::SigmaAssertion> = None;
+        let mut sigma: Option<SigmaAssertion> = None;
         if par_transcript {
             let UnionVerifyBinding::Circuit { circuit, public } = binding else {
                 unreachable!("par_transcript requires a circuit binding");
@@ -916,7 +955,7 @@ fn verify_union_piops<Ch: Challenger>(
             let proof = wiring.ok_or(FlockVerifyError::CircuitMismatch)?;
             let ch = ch_w.as_mut().expect("forked above");
             let gather = if defer_sigma {
-                let (gather, sig) = crate::circuit::verify_wiring_deferred_with_grinding(
+                let (gather, sig) = verify_wiring_deferred_with_grinding(
                     circuit,
                     public,
                     proof,
@@ -927,7 +966,7 @@ fn verify_union_piops<Ch: Challenger>(
                 sigma = Some(sig);
                 gather
             } else {
-                crate::circuit::verify_wiring_with_grinding(
+                verify_wiring_with_grinding(
                     circuit,
                     public,
                     proof,
@@ -945,7 +984,7 @@ fn verify_union_piops<Ch: Challenger>(
         // `*_deferred` entry really does defer BOTH classes.
         let el_claim = match element {
             Some(p) => {
-                let (c, a) = crate::element_r1cs::union::verify_deferred_with_grinding(
+                let (c, a) = verify_deferred_with_grinding(
                     union,
                     p,
                     pcs_params.element_grinding(),
@@ -959,7 +998,7 @@ fn verify_union_piops<Ch: Challenger>(
         };
         let mut packed_direct = el_claim
             .as_ref()
-            .map(|c: &crate::element_r1cs::union::Claims| {
+            .map(|c: &Claims| {
                 vec![
                     (c.c_point.clone(), c.c_value),
                     (c.lc_point.clone(), c.lc_value),
@@ -977,9 +1016,9 @@ fn verify_union_piops<Ch: Challenger>(
         } else if let UnionVerifyBinding::Circuit { circuit, public } = binding {
             let proof = wiring.ok_or(FlockVerifyError::CircuitMismatch)?;
             #[cfg(feature = "mul-count")]
-            let wiring_start = crate::field::gf2_128::op_count::snapshot();
+            let wiring_start = snapshot();
             let gather = if defer_sigma {
-                let (gather, sig) = crate::circuit::verify_wiring_deferred_with_grinding(
+                let (gather, sig) = verify_wiring_deferred_with_grinding(
                     circuit,
                     public,
                     proof,
@@ -990,7 +1029,7 @@ fn verify_union_piops<Ch: Challenger>(
                 sigma = Some(sig);
                 gather
             } else {
-                crate::circuit::verify_wiring_with_grinding(
+                verify_wiring_with_grinding(
                     circuit,
                     public,
                     proof,
@@ -1000,11 +1039,11 @@ fn verify_union_piops<Ch: Challenger>(
                 .map_err(FlockVerifyError::Wiring)?
             };
             #[cfg(feature = "mul-count")]
-            if std::env::var("MUL_TRACE").is_ok() {
-                let e = crate::field::gf2_128::op_count::snapshot();
+            if var("MUL_TRACE").is_ok() {
+                let e = snapshot();
                 let invs = e.invs - wiring_start.invs;
-                let muls = (e.native_muls - wiring_start.native_muls)
-                    .saturating_sub(invs * crate::field::gf2_128::op_count::MULS_PER_INV);
+                let muls =
+                    (e.native_muls - wiring_start.native_muls).saturating_sub(invs * MULS_PER_INV);
                 println!(
                     "  [mul] wiring GKR (grand product + sigma):             \
                      {muls:>8} muls {invs:>5} invs = {:>8} constraints",
@@ -1034,7 +1073,7 @@ fn verify_union_piops<Ch: Challenger>(
         }
 
         Ok((
-            crate::proof::UnionClassClaims {
+            UnionClassClaims {
                 boolean: bool_claim,
                 element: el_claim,
             },
@@ -1051,37 +1090,37 @@ fn verify_union_piops<Ch: Challenger>(
 /// ran — the [`lincheck::MatrixAssertion`] carrying its undischarged matrix
 /// work.
 type UnionPiopOut = (
-    crate::proof::UnionClassClaims,
+    UnionClassClaims,
     Vec<(Vec<F128>, F128)>,
-    Option<lincheck::MatrixAssertion>,
-    Option<crate::element_r1cs::union::ElementAssertion>,
-    Option<crate::circuit::SigmaAssertion>,
+    Option<MatrixAssertion>,
+    Option<ElementAssertion>,
+    Option<SigmaAssertion>,
 );
 
 /// Both classes' undischarged matrix work, as a `*_deferred` entry returns
 /// it. Either half is `None` when that class has no types in the registry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeferredMatrixWork {
-    pub boolean: Option<lincheck::MatrixAssertion>,
-    pub element: Option<crate::element_r1cs::union::ElementAssertion>,
+    pub boolean: Option<MatrixAssertion>,
+    pub element: Option<ElementAssertion>,
     /// The layout's count-dependent `W`-values as raw foldable claims on the
     /// jagged table (the count win). Always present — every merged opening
     /// runs the multipoint anchor — and tied to the verifier's own expect by
     /// the export's exact recombination assert.
-    pub jagged: crate::matrix_fold::JaggedAssertion,
+    pub jagged: JaggedAssertion,
 }
 
 /// AG-skip mirror of [`verify_ligerito`]: replays the AG zerocheck
-/// ([`zerocheck::ag_skip::verify`], including the single-attempt r₁ nonce
+/// ([`verify_ag`], including the single-attempt r₁ nonce
 /// re-derivation) + lincheck → base claims, then the standard ring-switch
 /// Ligerito open with AG base-code skip weights. Counterpart of
 /// `flock_prover::prover::prove_fast_ligerito_ag_from_witness`.
 pub fn verify_ligerito_ag<Ch: Challenger>(
     r1cs: &BlockR1cs,
     commitment: &Commitment,
-    proof: &crate::proof::R1csProofLigeritoAg,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    pcs_params: &crate::pcs::PcsParams,
+    proof: &R1csProofLigeritoAg,
+    lincheck_circuit: &dyn LincheckCircuit,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, FlockVerifyError> {
     let (ab, c) = verify_core_ag(
@@ -1107,10 +1146,10 @@ pub fn verify_ligerito_ag<Ch: Challenger>(
 /// and reconstruct the two base z-claims, stopping before the PCS open.
 pub fn verify_core_ag<Ch: Challenger>(
     r1cs: &BlockR1cs,
-    ag_proof: &zerocheck::ag_skip::AgProof,
-    lincheck_proof: &lincheck::LincheckProof,
+    ag_proof: &AgProof,
+    lincheck_proof: &LincheckProof,
     commitment: &Commitment,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    lincheck_circuit: &dyn LincheckCircuit,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), FlockVerifyError> {
     verifier_pool().install(move || {
@@ -1127,32 +1166,27 @@ pub fn verify_core_ag<Ch: Challenger>(
 
 fn verify_core_ag_inner<Ch: Challenger>(
     r1cs: &BlockR1cs,
-    ag_proof: &zerocheck::ag_skip::AgProof,
-    lincheck_proof: &lincheck::LincheckProof,
+    ag_proof: &AgProof,
+    lincheck_proof: &LincheckProof,
     commitment: &Commitment,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    lincheck_circuit: &dyn LincheckCircuit,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), FlockVerifyError> {
-    assert_eq!(
-        r1cs.k_skip,
-        zerocheck::ag_skip::K_SKIP,
-        "AG skip is k_skip=6"
-    );
+    assert_eq!(r1cs.k_skip, K_SKIP, "AG skip is k_skip=6");
     // The c-claim below is a direct z-claim (ĉ = ẑ) — sound only for C = I.
     if !r1cs.c0_is_identity() {
         return Err(FlockVerifyError::NonIdentityC);
     }
 
     // ---- Bind FS transcript to the statement (mirrors the AG prover).
-    crate::proof::bind_statement(challenger, r1cs, commitment);
+    bind_statement(challenger, r1cs, commitment);
 
     // ---- Replay the AG-skip zerocheck rounds.
-    let ag_claim =
-        zerocheck::ag_skip::verify(r1cs.m, ag_proof, challenger).map_err(FlockVerifyError::Ag)?;
+    let ag_claim = verify_ag(r1cs.m, ag_proof, challenger).map_err(FlockVerifyError::Ag)?;
 
     // ---- Lincheck on the AG quirky point (layout-aware constructors).
     let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Ag(ag_claim.r1), &ag_claim.mlv_challenges);
-    let lc_claim = lincheck::verify(
+    let lc_claim = verify_lincheck(
         r1cs.m,
         r1cs.k_log,
         r1cs.k_skip,
@@ -1184,10 +1218,10 @@ fn verify_core_ag_inner<Ch: Challenger>(
 pub fn verify_claims_ligerito<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[ZClaim],
-    pcs_open: &pcs::BatchOpeningProofLigerito,
-    pcs_params: &crate::pcs::PcsParams,
+    pcs_open: &BatchOpeningProofLigerito,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
-) -> Result<(), pcs::PcsError> {
+) -> Result<(), PcsError> {
     // Verification is single-threaded; run the body on the dedicated 1-thread pool.
     verifier_pool().install(move || {
         verify_claims_ligerito_inner(commitment, claims, pcs_open, pcs_params, challenger)
@@ -1197,16 +1231,16 @@ pub fn verify_claims_ligerito<Ch: Challenger>(
 fn verify_claims_ligerito_inner<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[ZClaim],
-    pcs_open: &pcs::BatchOpeningProofLigerito,
-    pcs_params: &crate::pcs::PcsParams,
+    pcs_open: &BatchOpeningProofLigerito,
+    pcs_params: &PcsParams,
     challenger: &mut Ch,
-) -> Result<(), pcs::PcsError> {
+) -> Result<(), PcsError> {
     if !commitment_params_match_expected(commitment, pcs_params) {
-        return Err(pcs::PcsError::Ligerito);
+        return Err(PcsError::Ligerito);
     }
     let skip_weight_vecs: Vec<Vec<F128>> = claims
         .iter()
-        .map(|c| c.point.z_skip.weights(pcs::LOG_PACKING - 1))
+        .map(|c| c.point.z_skip.weights(LOG_PACKING - 1))
         .collect();
     let skip_weights: Vec<&[F128]> = skip_weight_vecs.iter().map(|v| v.as_slice()).collect();
     let values: Vec<F128> = claims.iter().map(|c| c.value).collect();
@@ -1222,7 +1256,7 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
     let lig_v_config = pcs_params
         .ligerito_verifier_config()
         .expect("Ligerito default verifier config");
-    pcs::verify_opening_batch_ligerito_mixed_with_grinding(
+    verify_opening_batch_ligerito_mixed_with_grinding(
         commitment,
         &values,
         &skip_weights,
@@ -1241,10 +1275,10 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
 /// [`verify_claims_ligerito`] over `[ab, c, …]`.
 pub fn verify_core<Ch: Challenger>(
     r1cs: &BlockR1cs,
-    zerocheck_proof: &zerocheck::ZerocheckProof,
-    lincheck_proof: &lincheck::LincheckProof,
+    zerocheck_proof: &ZerocheckProof,
+    lincheck_proof: &LincheckProof,
     commitment: &Commitment,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    lincheck_circuit: &dyn LincheckCircuit,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), FlockVerifyError> {
     verify_core_with_grinding(
@@ -1253,8 +1287,8 @@ pub fn verify_core<Ch: Challenger>(
         lincheck_proof,
         commitment,
         lincheck_circuit,
-        zerocheck::ZerocheckGrinding::disabled(),
-        lincheck::LincheckGrinding::disabled(),
+        ZerocheckGrinding::disabled(),
+        LincheckGrinding::disabled(),
         challenger,
     )
 }
@@ -1267,12 +1301,12 @@ pub fn verify_core<Ch: Challenger>(
 /// policy selected by their PCS profile.
 pub fn verify_core_with_grinding<Ch: Challenger>(
     r1cs: &BlockR1cs,
-    zerocheck_proof: &zerocheck::ZerocheckProof,
-    lincheck_proof: &lincheck::LincheckProof,
+    zerocheck_proof: &ZerocheckProof,
+    lincheck_proof: &LincheckProof,
     commitment: &Commitment,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    zerocheck_grinding: zerocheck::ZerocheckGrinding,
-    lincheck_grinding: lincheck::LincheckGrinding,
+    lincheck_circuit: &dyn LincheckCircuit,
+    zerocheck_grinding: ZerocheckGrinding,
+    lincheck_grinding: LincheckGrinding,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), FlockVerifyError> {
     // Verification is single-threaded; run the body on the dedicated 1-thread pool.
@@ -1292,19 +1326,19 @@ pub fn verify_core_with_grinding<Ch: Challenger>(
 
 fn verify_core_inner<Ch: Challenger>(
     r1cs: &BlockR1cs,
-    zerocheck_proof: &zerocheck::ZerocheckProof,
-    lincheck_proof: &lincheck::LincheckProof,
+    zerocheck_proof: &ZerocheckProof,
+    lincheck_proof: &LincheckProof,
     commitment: &Commitment,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    zerocheck_grinding: zerocheck::ZerocheckGrinding,
-    lincheck_grinding: lincheck::LincheckGrinding,
+    lincheck_circuit: &dyn LincheckCircuit,
+    zerocheck_grinding: ZerocheckGrinding,
+    lincheck_grinding: LincheckGrinding,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), FlockVerifyError> {
     // The c-claim below is a direct z-claim (ĉ = ẑ) — sound only for C = I.
     if !r1cs.c0_is_identity() {
         return Err(FlockVerifyError::NonIdentityC);
     }
-    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let trace = var("VERIFY_TRACE").is_ok();
     let fmt = |s: f64| -> String {
         let ms = s * 1000.0;
         if ms < 1.0 {
@@ -1315,8 +1349,8 @@ fn verify_core_inner<Ch: Challenger>(
     };
 
     // ---- Bind FS transcript to the statement (mirrors prover::prove).
-    let t = std::time::Instant::now();
-    crate::proof::bind_statement(challenger, r1cs, commitment);
+    let t = Instant::now();
+    bind_statement(challenger, r1cs, commitment);
     if trace {
         eprintln!(
             "      [vco] bind_statement: {}",
@@ -1325,9 +1359,9 @@ fn verify_core_inner<Ch: Challenger>(
     }
 
     // ---- Zerocheck.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let zc_claim =
-        zerocheck::verify_with_grinding(r1cs.m, zerocheck_proof, zerocheck_grinding, challenger)
+        verify_zerocheck_with_grinding(r1cs.m, zerocheck_proof, zerocheck_grinding, challenger)
             .map_err(FlockVerifyError::Zerocheck)?;
     if trace {
         eprintln!(
@@ -1341,8 +1375,8 @@ fn verify_core_inner<Ch: Challenger>(
     let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 
     // ---- Lincheck. v_a, v_b come from the zerocheck's final â, b̂ evals.
-    let t = std::time::Instant::now();
-    let lc_claim = lincheck::verify_with_grinding(
+    let t = Instant::now();
+    let lc_claim = verify_lincheck_with_grinding(
         r1cs.m,
         r1cs.k_log,
         r1cs.k_skip,
@@ -1357,7 +1391,7 @@ fn verify_core_inner<Ch: Challenger>(
     .map_err(FlockVerifyError::Lincheck)?;
     if trace {
         eprintln!(
-            "      [vco] lincheck::verify: {}",
+            "      [vco] verify_lincheck: {}",
             fmt(t.elapsed().as_secs_f64())
         );
     }
@@ -1379,9 +1413,22 @@ fn verify_core_inner<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        FlockVerifyError, commitment_params_match_expected, verifier_pool, verify_core,
+        verify_core_ag,
+    };
+    use crate::challenger::FsChallenger;
+    use crate::field::F128;
+    use crate::lincheck::LincheckProof;
     use crate::merkle::HashKind;
     use crate::pcs::ligerito::LigeritoProfile;
     use crate::pcs::{Commitment, PcsParams};
+    use crate::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
+    use crate::zerocheck::ZerocheckProof;
+    use crate::zerocheck::ag_skip::AgProof;
+    use crate::zerocheck::ag_skip::K_SKIP;
+    use rayon::current_num_threads;
+    use std::sync::OnceLock;
 
     /// The verifier is intentionally single-threaded: every `par_*` reached
     /// from a verify core must collapse onto the one-thread `verifier_pool`.
@@ -1393,7 +1440,7 @@ mod tests {
     /// prove path.)
     #[test]
     fn verifier_pool_is_single_threaded() {
-        let n = super::verifier_pool().install(rayon::current_num_threads);
+        let n = verifier_pool().install(current_num_threads);
         assert_eq!(n, 1, "verifier_pool must have exactly one worker thread");
     }
 
@@ -1411,22 +1458,13 @@ mod tests {
             cap: Vec::new(),
             params: expected.clone(),
         };
-        assert!(super::commitment_params_match_expected(
-            &commitment,
-            &expected
-        ));
+        assert!(commitment_params_match_expected(&commitment, &expected));
 
         commitment.params.profile = LigeritoProfile::Fast100;
-        assert!(!super::commitment_params_match_expected(
-            &commitment,
-            &expected
-        ));
+        assert!(!commitment_params_match_expected(&commitment, &expected));
         commitment.params.profile = expected.profile;
         commitment.params.merkle_hash = HashKind::Blake3;
-        assert!(!super::commitment_params_match_expected(
-            &commitment,
-            &expected
-        ));
+        assert!(!commitment_params_match_expected(&commitment, &expected));
     }
 
     /// Both single-table entries build the c-claim as a direct z-claim, which
@@ -1435,9 +1473,6 @@ mod tests {
     /// any proof inspection, so empty proofs suffice.
     #[test]
     fn non_identity_c_is_rejected_by_both_single_table_entries() {
-        use crate::challenger::FsChallenger;
-        use crate::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
-
         let k_log = 6;
         let k = 1usize << k_log;
         let identity = SparseBinaryMatrix {
@@ -1454,15 +1489,15 @@ mod tests {
         let r1cs = BlockR1cs {
             m: 12,
             k_log,
-            k_skip: crate::zerocheck::ag_skip::K_SKIP,
+            k_skip: K_SKIP,
             useful_bits: k,
             a_0: identity.clone(),
             b_0: identity.clone(),
             c_0: shifted,
             layout: WitnessLayout::RowMajor,
             const_pin: None,
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         };
         let commitment = Commitment {
             cap: Vec::new(),
@@ -1477,16 +1512,16 @@ mod tests {
         };
         let circuit = r1cs.csc_lincheck_circuit();
 
-        let zc = crate::zerocheck::ZerocheckProof {
+        let zc = ZerocheckProof {
             round1_ab: Vec::new(),
             round1_c: Vec::new(),
             multilinear_rounds: Vec::new(),
-            final_a_eval: crate::field::F128::ZERO,
-            final_b_eval: crate::field::F128::ZERO,
-            final_c_eval: crate::field::F128::ZERO,
+            final_a_eval: F128::ZERO,
+            final_b_eval: F128::ZERO,
+            final_c_eval: F128::ZERO,
             grinding_nonces: Vec::new(),
         };
-        let lc = crate::lincheck::LincheckProof {
+        let lc = LincheckProof {
             rounds: Vec::new(),
             z_partial: Vec::new(),
             matrix_evals: Vec::new(),
@@ -1494,24 +1529,24 @@ mod tests {
         };
         let mut ch = FsChallenger::new(b"non-identity-c-test");
         assert!(matches!(
-            super::verify_core(&r1cs, &zc, &lc, &commitment, circuit, &mut ch),
-            Err(super::FlockVerifyError::NonIdentityC)
+            verify_core(&r1cs, &zc, &lc, &commitment, circuit, &mut ch),
+            Err(FlockVerifyError::NonIdentityC)
         ));
 
-        let ag = crate::zerocheck::ag_skip::AgProof {
+        let ag = AgProof {
             round1_ab: Vec::new(),
             round1_c: Vec::new(),
             r1_nonce: 0,
             multilinear_rounds: Vec::new(),
-            final_a_eval: crate::field::F128::ZERO,
-            final_b_eval: crate::field::F128::ZERO,
-            final_c_eval: crate::field::F128::ZERO,
+            final_a_eval: F128::ZERO,
+            final_b_eval: F128::ZERO,
+            final_c_eval: F128::ZERO,
             grinding_nonces: Vec::new(),
         };
         let mut ch = FsChallenger::new(b"non-identity-c-test");
         assert!(matches!(
-            super::verify_core_ag(&r1cs, &ag, &lc, &commitment, circuit, &mut ch),
-            Err(super::FlockVerifyError::NonIdentityC)
+            verify_core_ag(&r1cs, &ag, &lc, &commitment, circuit, &mut ch),
+            Err(FlockVerifyError::NonIdentityC)
         ));
     }
 }

@@ -1,6 +1,11 @@
+use crate::all_core_pool;
+use crate::perf_core_count_cached;
+use rayon::current_num_threads;
 use rayon::prelude::*;
+use std::arch::aarch64::*;
 
 use super::super::{F128, build_sum_table};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const NEON_TILE_T: usize = 8;
 
@@ -33,8 +38,6 @@ pub fn partial_fold_packed_z_neon_single_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use std::arch::aarch64::*;
-
     const TILE_T: usize = NEON_TILE_T;
     const BLOCK_K: usize = 8;
 
@@ -136,7 +139,6 @@ unsafe fn process_block_neon_single(
     tables_ptr: *const u8,
     out_ptr: *mut F128,
 ) {
-    use std::arch::aarch64::*;
     const TILE_T: usize = NEON_TILE_T;
 
     let o = out_ptr as *mut u8;
@@ -247,12 +249,8 @@ pub fn partial_fold_packed_z_neon_iblock_padded(
     // no ST change. Oversubscribe (3/worker) only when the pool is larger than
     // the P-core count — i.e. likely includes slower E-cores — so rayon can
     // steal from a straggler. Each chunk is a BLOCK_K multiple.
-    let p = rayon::current_num_threads().max(1);
-    let chunks_per_worker = if p <= crate::perf_core_count_cached() {
-        1
-    } else {
-        3
-    };
+    let p = current_num_threads().max(1);
+    let chunks_per_worker = if p <= perf_core_count_cached() { 1 } else { 3 };
     let i_chunk = (useful / (p * chunks_per_worker))
         .max(BLOCK_K)
         .next_multiple_of(BLOCK_K);
@@ -349,7 +347,7 @@ pub fn partial_fold_packed_z_neon_oblock_padded(
 
     // One private length-k partial per worker; workers own contiguous tile bands,
     // so each tile's sum-tables are built exactly once (not once per worker).
-    let p = rayon::current_num_threads().max(1);
+    let p = current_num_threads().max(1);
     let tiles_per_worker = n_tiles.div_ceil(p);
     let n_workers = n_tiles.div_ceil(tiles_per_worker); // ≤ p, every band non-empty
 
@@ -421,8 +419,6 @@ pub fn partial_fold_packed_z_neon_allcore_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     const TILE_T: usize = NEON_TILE_T;
     const BLOCK_K: usize = 8;
 
@@ -449,7 +445,7 @@ pub fn partial_fold_packed_z_neon_allcore_padded(
         return vec![F128::ZERO; k];
     }
 
-    let pool = crate::all_core_pool();
+    let pool = all_core_pool();
     let next_tile = AtomicUsize::new(0);
     let partials: Vec<Vec<F128>> = pool.broadcast(|_| {
         let mut partial = vec![F128::ZERO; k];

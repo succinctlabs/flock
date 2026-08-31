@@ -1,4 +1,8 @@
 use super::*;
+use flock_core::circuit::builder::SlotId;
+use std::env::var;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 /// Wall 2's registry-geometry constants at the settled envelope (slim,
 /// m* = 29): the UNION of the leaf-outer's and the node's type sets, at the
@@ -53,15 +57,14 @@ pub(super) const ENV_APP_WORDS: usize = 8;
 /// bench sets this per stage so a 5-run median costs ONE ~3-5 s setup
 /// instead of five — the per-shape setup was ~96% of the bench's wall
 /// clock. `usize::MAX` = unset (the `TOWER_STEADY` env knob applies).
-pub(super) static STEADY_OVERRIDE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(usize::MAX);
+pub(super) static STEADY_OVERRIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 pub(super) fn steady_reps() -> usize {
-    let ov = STEADY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let ov = STEADY_OVERRIDE.load(Ordering::Relaxed);
     if ov != usize::MAX {
         return ov;
     }
-    std::env::var("TOWER_STEADY")
+    var("TOWER_STEADY")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
@@ -227,10 +230,10 @@ pub(super) fn envelope_shape() -> EnvShape {
 /// byte-identically.
 pub(super) fn slot_cached<G>(
     sb: &mut ShapeBuilder,
-    cache: &mut Vec<(usize, flock_core::circuit::builder::SlotId)>,
+    cache: &mut Vec<(usize, SlotId)>,
     key: usize,
     mk: impl FnOnce() -> G,
-) -> flock_core::circuit::builder::SlotId
+) -> SlotId
 where
     G: GateType + Send + Sync + 'static,
     G::Row: Send + 'static,
@@ -257,7 +260,7 @@ where
 pub(super) fn declare_envelope_slots(
     sb: &mut ShapeBuilder,
     nu: usize,
-    cache: &mut Vec<(usize, flock_core::circuit::builder::SlotId)>,
+    cache: &mut Vec<(usize, SlotId)>,
     env: &EnvShape,
 ) -> CollapsedSlots {
     debug_assert_eq!(nu, env.nu, "the envelope declares at nu*");
@@ -305,7 +308,7 @@ pub(super) fn declare_envelope_slots(
 pub(super) fn pad_envelope_counts(
     sb: &mut ShapeBuilder,
     q: &CollapsedSlots,
-    cache: &[(usize, flock_core::circuit::builder::SlotId)],
+    cache: &[(usize, SlotId)],
     env: &EnvShape,
     zw: Wire,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
@@ -325,7 +328,7 @@ pub(super) fn pad_envelope_counts(
                    hints: &mut Vec<[u32; SLOT_WORDS]>,
                    over: &mut Vec<String>,
                    name: &str,
-                   s: flock_core::circuit::builder::SlotId,
+                   s: SlotId,
                    target: usize,
                    hinted: bool,
                    fixed_inputs: Option<&[Wire]>| {

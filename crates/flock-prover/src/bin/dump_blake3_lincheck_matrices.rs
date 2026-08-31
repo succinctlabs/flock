@@ -16,8 +16,10 @@
 //!
 //! Run: cargo run --release --quiet --bin dump_blake3_lincheck_matrices -- <out.bin>
 
+use env::args;
 use std::env;
 use std::fs::File;
+use std::io::Result;
 use std::io::{BufWriter, Write};
 
 use flock_prover::r1cs::SparseBinaryMatrix;
@@ -44,19 +46,19 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     (col_ptr, rows_flat)
 }
 
-fn write_u32(w: &mut impl Write, v: u32) -> std::io::Result<()> {
+fn write_u32(w: &mut impl Write, v: u32) -> Result<()> {
     w.write_all(&v.to_le_bytes())
 }
 
-fn write_u32s(w: &mut impl Write, v: &[u32]) -> std::io::Result<()> {
+fn write_u32s(w: &mut impl Write, v: &[u32]) -> Result<()> {
     for &x in v {
         w.write_all(&x.to_le_bytes())?;
     }
     Ok(())
 }
 
-fn main() -> std::io::Result<()> {
-    let out = env::args()
+fn main() -> Result<()> {
+    let out = args()
         .nth(1)
         .unwrap_or_else(|| "blake3_lincheck_matrices.bin".to_string());
 

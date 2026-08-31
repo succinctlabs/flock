@@ -28,6 +28,9 @@
 use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::field::F128;
 use flock_core::pcs::ligerito::LigeritoProfile;
+use flock_core::pcs::ligerito::embedded_initial_k_or_default;
+use flock_core::schedule::TableClass;
+use flock_core::transcript_record::TranscriptShape;
 use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
 use flock_prover::challenger::FsChallenger;
 use flock_prover::pcs::PcsParams;
@@ -35,11 +38,13 @@ use flock_prover::prover::{self, UnionElementSlotInput};
 use flock_prover::schedule::{Registry, TableType};
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier;
+use prover::prove_fast_ligerito_union_mixed_class;
+use std::env::var_os;
 use std::sync::Arc;
-
-const DOMAIN: &[u8] = b"flock-union-element-v0";
+use verifier::verify_ligerito_union_mixed_class;
 
 use flock_core::test_rng::Rng;
+const DOMAIN: &[u8] = b"flock-union-element-v0";
 
 /// Same element gate block `union_element.rs` uses: two free wires, a product,
 /// a linear pin, zero padding above.
@@ -77,12 +82,9 @@ fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
     PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
-            union.dense_m(),
-            LigeritoProfile::Fast,
-        ),
+        log_batch_size: embedded_initial_k_or_default(union.dense_m(), LigeritoProfile::Fast),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(flock_core::pcs::ligerito::embedded_initial_k_or_default(
+        num_lanes: union.commit_lanes(embedded_initial_k_or_default(
             union.dense_m(),
             LigeritoProfile::Fast,
         )),
@@ -97,10 +99,7 @@ fn record_element_only(
     kappas: &[usize],
     counts: &[usize],
     seed: u64,
-) -> (
-    flock_core::transcript_record::TranscriptShape,
-    flock_core::transcript_record::TranscriptShape,
-) {
+) -> (TranscriptShape, TranscriptShape) {
     let mut rng = Rng::new(seed);
     let (w0, w1) = (F128::new(7, 0), F128::new(0, 3));
 
@@ -113,7 +112,7 @@ fn record_element_only(
         .element_types()
         .iter()
         .map(|t| match &t.class {
-            flock_core::schedule::TableClass::LargeField(e) => e.clone(),
+            TableClass::LargeField(e) => e.clone(),
             _ => unreachable!("element-only registry"),
         })
         .collect();
@@ -131,7 +130,7 @@ fn record_element_only(
         .collect();
 
     let mut ch_p = RecordingChallenger::new(FsChallenger::new(DOMAIN));
-    let (proof, commitment, _claims_p) = prover::prove_fast_ligerito_union_mixed_class(
+    let (proof, commitment, _claims_p) = prove_fast_ligerito_union_mixed_class(
         &union,
         &pcs_params,
         Vec::new(),
@@ -140,7 +139,7 @@ fn record_element_only(
     );
 
     let mut ch_v = RecordingChallenger::new(FsChallenger::new(DOMAIN));
-    verifier::verify_ligerito_union_mixed_class(
+    verify_ligerito_union_mixed_class(
         &union,
         &[],
         &commitment,
@@ -173,7 +172,7 @@ fn element_only_transcript_shape_is_data_independent() {
         (0, 0xA11CE_0004),
     ];
 
-    let mut reference: Option<flock_core::transcript_record::TranscriptShape> = None;
+    let mut reference: Option<TranscriptShape> = None;
     for (count, seed) in cases {
         let (shape_p, shape_v) = record_element_only(nu, &kappas, &[count], seed);
 
@@ -313,7 +312,7 @@ fn element_only_transcript_shape_is_pinned() {
         inv.finalize_parents,
     );
 
-    if std::env::var_os("TRANSCRIPT_SHAPE_PRINT").is_some() {
+    if var_os("TRANSCRIPT_SHAPE_PRINT").is_some() {
         println!("const EXPECTED: &str = \"{}\";", shape.digest_hex());
         return;
     }

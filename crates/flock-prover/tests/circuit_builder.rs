@@ -20,6 +20,11 @@
 //! BLAKE3 rather than SHA-256 on purpose: it is the settled hash for this
 //! work, so validating the SHA path would validate one we do not use.
 
+use bincode::serialize;
+use blake3::Compression;
+use blake3::build_block_r1cs;
+use blake3::generate_witness_batch_major_partial;
+use blake3::io_schema;
 use flock_core::circuit::builder::{CircuitBuilder, GateType, SlotWitness, Wire};
 use flock_core::field::F128;
 use flock_core::pcs::PcsParams;
@@ -28,10 +33,29 @@ use flock_hash::{HashKind, blake3_compress};
 use flock_prover::challenger::FsChallenger;
 use flock_prover::prover::{self, UnionSlotProverInput};
 use flock_prover::r1cs_hashes::blake3;
+use flock_prover::r1cs_hashes::fs_chain::IV as FS_CHAIN_IV;
 use flock_prover::schedule::TableType;
 use flock_prover::union::UnionInstance;
 use flock_prover::verifier;
+use prover::prove_fast_ligerito_union_circuit;
+use prover::prove_fast_ligerito_union_mixed_class;
+use std::array::from_fn;
+use std::iter::once;
+use std::time::Instant;
+use verifier::verify_ligerito_union_circuit;
+use verifier::verify_ligerito_union_mixed_class;
+use zerocheck::prove_with_label;
+use zerocheck::verify_with_label;
 
+use flock_core::challenger::Challenger as _;
+use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType, zerocheck};
+use flock_core::test_rng::Rng;
+use flock_core::transcript_record::{RecordingChallenger, StreamWord, TranscriptOp};
+use flock_prover::prover::UnionElementSlotInput;
+use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+use flock_prover::schedule::IoWord;
+use flock_prover::schedule::Registry;
+use std::sync::Arc;
 const DOMAIN: &[u8] = b"flock-circuit-builder-v0";
 
 const CHUNK_START: u32 = 1 << 0;
@@ -96,12 +120,11 @@ struct Blake3Gate {
 }
 
 impl GateType for Blake3Gate {
-    type Row = blake3::Compression;
+    type Row = Compression;
     type Hint = ();
 
     fn table(&self) -> TableType {
-        TableType::from_block_r1cs(&blake3::build_block_r1cs(self.nu))
-            .with_io_schema(blake3::io_schema())
+        TableType::from_block_r1cs(&build_block_r1cs(self.nu)).with_io_schema(io_schema())
     }
 
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
@@ -135,8 +158,6 @@ impl GateType for Blake3Gate {
     }
 }
 
-use flock_core::test_rng::Rng;
-
 /// One BLAKE3 chunk (16 chained blocks) as a circuit: the IV and every message
 /// block are public, the chunk's chaining value out is public, and every
 /// intermediate CV is wired row to row.
@@ -147,9 +168,7 @@ fn blake3_chunk_chain_through_the_builder() {
     let n_blocks = 16usize; // one 1 KiB chunk
     let mut rng = Rng(0xB1A3_0001);
 
-    let messages: Vec<[u32; 16]> = (0..n_blocks)
-        .map(|_| std::array::from_fn(|_| rng.next_u32()))
-        .collect();
+    let messages: Vec<[u32; 16]> = (0..n_blocks).map(|_| from_fn(|_| rng.next_u32())).collect();
 
     let mut b = CircuitBuilder::new(nu);
     let g = b.slot(Blake3Gate { nu });
@@ -216,17 +235,17 @@ fn blake3_chunk_chain_through_the_builder() {
         num_lanes: union.commit_lanes(6),
         merkle_hash: Default::default(),
     };
-    let r1cs = blake3::build_block_r1cs(nu);
+    let r1cs = build_block_r1cs(nu);
     let lc = r1cs.csc_lincheck_circuit();
 
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+    let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
         &pcs_params,
         vec![UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major_partial(rows, nu),
+            generate_witness_batch_major_partial(rows, nu),
             lc,
         )],
         Vec::new(),
@@ -234,7 +253,7 @@ fn blake3_chunk_chain_through_the_builder() {
     );
 
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit(
+    verify_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
@@ -253,7 +272,7 @@ fn blake3_chunk_chain_through_the_builder() {
     bad[last] += F128::ONE;
     let mut ch = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union_circuit(
+        verify_ligerito_union_circuit(
             &union,
             &built.shape.circuit,
             &bad,
@@ -288,10 +307,6 @@ fn blake3_chunk_chain_through_the_builder() {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn fs_chain_circuit_derives_the_challenges() {
-    use flock_core::challenger::Challenger as _;
-    use flock_core::transcript_record::{RecordingChallenger, StreamWord};
-    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
-
     const D: &[u8] = b"flock-fs-chain-mvp";
     let nu = 8usize; // BLAKE3 kappa = 14 ⇒ M = 22; 256 rows of capacity
 
@@ -314,7 +329,7 @@ fn fs_chain_circuit_derives_the_challenges() {
     let c2 = ch.sample_f128();
     let shape = ch.shape();
 
-    let values: Vec<F128> = std::iter::once(scalars[0])
+    let values: Vec<F128> = once(scalars[0])
         .chain(slice.iter().copied())
         .chain([scalars[1], scalars[2]])
         .collect();
@@ -363,7 +378,7 @@ fn fs_chain_circuit_derives_the_challenges() {
     // ---- build the circuit ----
     let mut b = CircuitBuilder::new(nu);
     let g = b.slot(Blake3Gate { nu });
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&FS_CHAIN_IV);
     let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
 
     // Stream words become public cells, memoized in `word_wire` so every
@@ -456,25 +471,25 @@ fn fs_chain_circuit_derives_the_challenges() {
         num_lanes: union.commit_lanes(6),
         merkle_hash: Default::default(),
     };
-    let r1cs = blake3::build_block_r1cs(nu);
+    let r1cs = build_block_r1cs(nu);
     let lc = r1cs.csc_lincheck_circuit();
     let rows = built.rows::<Blake3Gate>(g);
 
     let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+    let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
         &pcs_params,
         vec![UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major_partial(rows, nu),
+            generate_witness_batch_major_partial(rows, nu),
             lc,
         )],
         Vec::new(),
         &mut c,
     );
     let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit(
+    verify_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
@@ -492,7 +507,7 @@ fn fs_chain_circuit_derives_the_challenges() {
     bad[last] += F128::ONE;
     let mut c = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union_circuit(
+        verify_ligerito_union_circuit(
             &union,
             &built.shape.circuit,
             &bad,
@@ -525,13 +540,6 @@ fn fs_chain_circuit_derives_the_challenges() {
 #[test]
 #[ignore] // Heavy — run with `-- --ignored`.
 fn mvp_fs_chain_of_a_real_proof() {
-    use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
-    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
-    use flock_prover::prover::UnionElementSlotInput;
-    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
-    use flock_prover::schedule::Registry;
-    use std::sync::Arc;
-
     const INNER: &[u8] = b"flock-union-element-v0";
     let (inner_nu, kappa, count) = (12usize, 3usize, 1usize << 12);
 
@@ -575,7 +583,7 @@ fn mvp_fs_chain_of_a_real_proof() {
     // settled Merkle/FS hash for this work. `FsChallenger::new` defaults to
     // SHA-256, which would be a different chain entirely.
     let mut ch_p = FsChallenger::with_hash(INNER, HashKind::Blake3);
-    let (inner_proof, inner_commit, _) = prover::prove_fast_ligerito_union_mixed_class(
+    let (inner_proof, inner_commit, _) = prove_fast_ligerito_union_mixed_class(
         &union,
         &inner_params,
         Vec::new(),
@@ -587,7 +595,7 @@ fn mvp_fs_chain_of_a_real_proof() {
 
     // Record the VERIFIER's transcript — that is what a recursive verifier replays.
     let mut rec = RecordingChallenger::new(FsChallenger::with_hash(INNER, HashKind::Blake3));
-    verifier::verify_ligerito_union_mixed_class(
+    verify_ligerito_union_mixed_class(
         &union,
         &[],
         &inner_commit,
@@ -639,7 +647,7 @@ fn mvp_fs_chain_of_a_real_proof() {
     let nu = (trace.rows.len().next_power_of_two().trailing_zeros() as usize).max(1);
     let mut b = CircuitBuilder::new(nu);
     let g = b.slot(Blake3Gate { nu });
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&FS_CHAIN_IV);
     let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
     let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
@@ -722,19 +730,19 @@ fn mvp_fs_chain_of_a_real_proof() {
         num_lanes: outer.commit_lanes(6),
         merkle_hash: Default::default(),
     };
-    let r1cs = blake3::build_block_r1cs(nu);
+    let r1cs = build_block_r1cs(nu);
     let lc = r1cs.csc_lincheck_circuit();
     let rows = built.rows::<Blake3Gate>(g);
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+    let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
         &outer_params,
         vec![UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major_partial(rows, nu),
+            generate_witness_batch_major_partial(rows, nu),
             lc,
         )],
         Vec::new(),
@@ -742,9 +750,9 @@ fn mvp_fs_chain_of_a_real_proof() {
     );
     let prove_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit(
+    verify_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
@@ -768,7 +776,7 @@ fn mvp_fs_chain_of_a_real_proof() {
         trace.rows.len(),
         outer.m_total(),
         built.witness.public.len(),
-        bincode::serialize(&proof).unwrap().len(),
+        serialize(&proof).unwrap().len(),
     );
 }
 
@@ -790,12 +798,11 @@ fn mvp_fs_chain_of_a_real_proof() {
 /// Every operation the round needs is one call: `x·y` is `(x+0)·(y+0)`,
 /// `(x+y)·z` is direct, and `x+y+z` is the sum output.
 struct ArithGate {
-    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    ty: Arc<ElementTableType>,
 }
 
 impl ArithGate {
     fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let one = F128::ONE;
         let mut b = ElementTableBuilder::new(3); // 8 columns; 6,7 self-pinned zero
         b.free_wire(0)
@@ -805,7 +812,7 @@ impl ArithGate {
             .mult_lin(4, &[(0, one), (1, one)], &[(2, one), (3, one)])
             .linear(5, &[(0, one), (1, one), (2, one), (3, one)]);
         Self {
-            ty: std::sync::Arc::new(b.build().expect("arith block")),
+            ty: Arc::new(b.build().expect("arith block")),
         }
     }
 }
@@ -815,7 +822,6 @@ impl GateType for ArithGate {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_prover::schedule::IoWord;
         TableType::element(self.ty.clone()).with_io_schema(vec![
             IoWord::input(0),
             IoWord::input(1),
@@ -869,11 +875,6 @@ impl GateType for ArithGate {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
-    use flock_core::challenger::Challenger as _;
-    use flock_core::transcript_record::{RecordingChallenger, StreamWord};
-    use flock_prover::prover::UnionElementSlotInput;
-    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
-
     const D: &[u8] = b"flock-mvp2";
     let nu = 8usize;
 
@@ -917,7 +918,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     let arith = b.slot(ArithGate::new());
 
     let one = b.public_value(F128::ONE);
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&FS_CHAIN_IV);
     let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
     let mut outs: Vec<Vec<Wire>> = Vec::new();
     let mut inputs: Vec<[Wire; 7]> = Vec::new();
@@ -1048,7 +1049,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
         num_lanes: outer.commit_lanes(6),
         merkle_hash: Default::default(),
     };
-    let r1cs = blake3::build_block_r1cs(nu);
+    let r1cs = build_block_r1cs(nu);
     let lc = r1cs.csc_lincheck_circuit();
     let hash_rows = built.rows::<Blake3Gate>(hash);
     let el = match &built.witness.witnesses[built.registry_slot(arith)] {
@@ -1057,13 +1058,13 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     };
 
     let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+    let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
         &params,
         vec![UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major_partial(hash_rows, nu),
+            generate_witness_batch_major_partial(hash_rows, nu),
             lc,
         )],
         vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
@@ -1072,7 +1073,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
         &mut c,
     );
     let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit(
+    verify_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
@@ -1091,7 +1092,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     bad[last] += F128::ONE;
     let mut c = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union_circuit(
+        verify_ligerito_union_circuit(
             &outer,
             &built.shape.circuit,
             &bad,
@@ -1133,12 +1134,6 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp2b_full_element_zerocheck_replayed() {
-    use flock_core::challenger::Challenger as _;
-    use flock_core::element_r1cs::{ElementTableBuilder, zerocheck};
-    use flock_core::transcript_record::{RecordingChallenger, StreamWord};
-    use flock_prover::prover::UnionElementSlotInput;
-    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
-
     const D: &[u8] = b"flock-mvp2b";
     const LABEL: &[u8] = b"flock-element-union-zc-v0";
     let nu = 9usize;
@@ -1169,11 +1164,11 @@ fn mvp2b_full_element_zerocheck_replayed() {
     ety.affine_products_into(&z, n_log, None, &mut pa, &mut pb);
 
     let mut ch_p = FsChallenger::with_hash(D, HashKind::Blake3);
-    let (zc_proof, _) = zerocheck::prove_with_label(LABEL, pa, pb, &z, m_words, &mut ch_p);
+    let (zc_proof, _) = prove_with_label(LABEL, pa, pb, &z, m_words, &mut ch_p);
 
     // ---- record the verifier's transcript for it ----
     let mut rec = RecordingChallenger::new(FsChallenger::with_hash(D, HashKind::Blake3));
-    zerocheck::verify_with_label(LABEL, m_words, &zc_proof, &mut rec).expect("zerocheck verifies");
+    verify_with_label(LABEL, m_words, &zc_proof, &mut rec).expect("zerocheck verifies");
 
     // Phase 2 continues on the SAME transcript — the recorder is a challenger,
     // so the script just carries on. The round messages here are synthetic (a
@@ -1223,7 +1218,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
     let arith = b.slot(ArithGate::new());
     let zero = b.public_value(F128::ZERO);
     let one = b.public_value(F128::ONE);
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&FS_CHAIN_IV);
     let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
 
     let mut outs: Vec<Vec<Wire>> = Vec::new();
@@ -1421,22 +1416,22 @@ fn mvp2b_full_element_zerocheck_replayed() {
         num_lanes: outer.commit_lanes(6),
         merkle_hash: Default::default(),
     };
-    let r1cs = blake3::build_block_r1cs(nu);
+    let r1cs = build_block_r1cs(nu);
     let lc = r1cs.csc_lincheck_circuit();
     let hrows = built.rows::<Blake3Gate>(hash);
     let el = match &built.witness.witnesses[built.registry_slot(arith)] {
         SlotWitness::Element(z) => z.clone(),
         _ => unreachable!(),
     };
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+    let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
         &params,
         vec![UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major_partial(hrows, nu),
+            generate_witness_batch_major_partial(hrows, nu),
             lc,
         )],
         vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
@@ -1445,9 +1440,9 @@ fn mvp2b_full_element_zerocheck_replayed() {
         &mut c,
     );
     let prove_ms = t.elapsed().as_secs_f64() * 1e3;
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit(
+    verify_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
@@ -1469,6 +1464,6 @@ fn mvp2b_full_element_zerocheck_replayed() {
         built.shape.counts[built.registry_slot(arith)],
         outer.m_total(),
         built.witness.public.len(),
-        bincode::serialize(&proof).unwrap().len(),
+        serialize(&proof).unwrap().len(),
     );
 }

@@ -32,8 +32,11 @@
 //!   cargo run --release --bin dump_commit_vectors -- cuda-ghash/commit_vectors.bin
 //!   cargo run --release --bin dump_commit_vectors -- out.bin 24 1 5
 
+use env::args;
+use flock_prover::merkle::cap_layer;
 use std::env;
 use std::fs::File;
+use std::io::Result;
 use std::io::{BufWriter, Write};
 
 use flock_hash::HashKind;
@@ -59,16 +62,13 @@ impl RngExt for Rng {
     }
 }
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "commit_vectors.bin".to_string());
-    let m: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
-    let log_inv_rate: usize = env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let log_batch_size: usize = env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(5);
+    let m: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let log_inv_rate: usize = args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let log_batch_size: usize = args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     let params = PcsParams {
         m,
@@ -93,12 +93,10 @@ fn main() -> std::io::Result<()> {
     // The commitment now carries a CAP LAYER instead of a single root; the
     // tree root is the depth-0 cap, which is what the CUDA Merkle kernel
     // reproduces.
-    let root =
-        flock_prover::merkle::cap_layer(&prover_data.merkle_tree, commitment.params.n_leaves(), 0)
-            [0];
+    let root = cap_layer(&prover_data.merkle_tree, commitment.params.n_leaves(), 0)[0];
 
     let mut w = BufWriter::new(File::create(&path)?);
-    let u32le = |w: &mut BufWriter<File>, v: usize| -> std::io::Result<()> {
+    let u32le = |w: &mut BufWriter<File>, v: usize| -> Result<()> {
         w.write_all(&(v as u32).to_le_bytes())
     };
 

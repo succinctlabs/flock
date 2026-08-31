@@ -22,8 +22,11 @@
 //! Run:
 //!   cargo run --release --bin dump_induce_vectors -- cuda-ghash/induce_vectors.bin 10 2 8
 
+use env::args;
+use std::collections::HashSet;
 use std::env;
 use std::fs::File;
+use std::io::Result;
 use std::io::{BufWriter, Write};
 
 use flock_prover::field::F128;
@@ -31,21 +34,18 @@ use flock_prover::pcs::ligerito::{eval_sk_at_vks, induce_sumcheck_poly};
 
 use flock_core::test_rng::Rng;
 
-fn write_f128(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn write_f128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "induce_vectors.bin".to_string());
-    let log_msg_cols: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let v_len: usize = env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(2);
-    let n_queries: usize = env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let log_msg_cols: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let v_len: usize = args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(2);
+    let n_queries: usize = args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(8);
 
     let num_interleaved = 1usize << v_len;
     // build_eq_table(alpha) must have >= n_queries entries.
@@ -61,7 +61,7 @@ fn main() -> std::io::Result<()> {
     // Distinct query positions in [0, 2^log_msg_cols).
     let mut queries: Vec<usize> = Vec::with_capacity(n_queries);
     {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         while queries.len() < n_queries {
             let q = (rng.next_u64() as usize) % n.max(1);
             if seen.insert(q) {

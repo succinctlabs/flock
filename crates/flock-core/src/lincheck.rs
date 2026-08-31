@@ -116,23 +116,33 @@
 //!   `byte_idx` and apply it across all `i_inner` with one lookup + one XOR
 //!   per byte.
 
+use crate::all_core_pool;
+use crate::alloc_uninit_vec;
 use crate::challenger::Challenger;
+use crate::ecore_rich_topology;
 use crate::field::F128;
+use crate::genus95_curve_code::FsRng;
+use crate::genus95_curve_code::evaluation_point_from_nonce_pow;
+use crate::genus95_curve_code::sample_random_evaluation_point;
 use crate::genus95_curve_code::{EvaluationPoint, base_evaluation_functional};
 use crate::r1cs::SparseBinaryMatrix;
+use crate::zerocheck::ag_skip::K_SKIP;
+use crate::zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET;
+use crate::zerocheck::ag_skip::fallback_point;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
+use flock_multilinear::IndexOrder;
+use flock_multilinear::eq_table;
+use rayon::current_num_threads;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::env::var;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::mem::take;
 use std::sync::atomic::AtomicBool;
-
-mod kernels;
-mod union;
-
-pub use union::{
-    MatrixAssertion, UnionLincheckSlot, eq_prefix_sum, eq_prefix_weight, prove_union_capture_z_vec,
-    prove_union_capture_z_vec_with_grinding, union_comb_partial, verify_union,
-    verify_union_deferred, verify_union_deferred_with_grinding, verify_union_with_grinding,
-};
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;
@@ -142,6 +152,13 @@ pub use kernels::{
     partial_fold_packed_z_neon_oblock_padded, partial_fold_packed_z_neon_single,
     partial_fold_packed_z_neon_single_padded,
 };
+pub use union::{
+    MatrixAssertion, UnionLincheckSlot, eq_prefix_sum, eq_prefix_weight, prove_union_capture_z_vec,
+    prove_union_capture_z_vec_with_grinding, union_comb_partial, verify_union,
+    verify_union_deferred, verify_union_deferred_with_grinding, verify_union_with_grinding,
+};
+mod kernels;
+mod union;
 
 /// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
 /// `i_inner`-partitioned `partial_fold_packed_z_neon_iblock_padded` instead of the
@@ -174,9 +191,9 @@ pub static LC_PCORES_ONLY: AtomicBool = AtomicBool::new(false);
 /// ~11 ms vs ~2.3 ms all-core on 4P+4E, and the same ~10.2 → ~2.9 ms verify
 /// win reproduces on 10P+4E, so the hop pays on every measured topology.
 fn lincheck_all_cores_enabled() -> bool {
-    !LC_PCORES_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && std::env::var("LINCHECK_PCORES_ONLY").is_err()
-        && crate::all_core_pool().current_num_threads() > rayon::current_num_threads()
+    !LC_PCORES_ONLY.load(Ordering::Relaxed)
+        && var("LINCHECK_PCORES_ONLY").is_err()
+        && all_core_pool().current_num_threads() > current_num_threads()
 }
 
 /// [`lincheck_all_cores_enabled`] plus the E-rich topology requirement — the
@@ -186,7 +203,7 @@ fn lincheck_all_cores_enabled() -> bool {
 // Only consulted by the aarch64 partial-fold dispatch; dead elsewhere.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 fn lincheck_use_all_cores() -> bool {
-    lincheck_all_cores_enabled() && crate::ecore_rich_topology()
+    lincheck_all_cores_enabled() && ecore_rich_topology()
 }
 
 /// `circuit.fold_alpha_batched` on the all-core pool when profitable. The
@@ -202,7 +219,7 @@ fn fold_alpha_batched_pooled(
     eq_inner: &[F128],
 ) -> Vec<F128> {
     if circuit.n_cols() >= SUMCHECK_PAR_THRESHOLD && lincheck_all_cores_enabled() {
-        crate::all_core_pool().install(|| circuit.fold_alpha_batched(alpha, eq_inner))
+        all_core_pool().install(|| circuit.fold_alpha_batched(alpha, eq_inner))
     } else {
         circuit.fold_alpha_batched(alpha, eq_inner)
     }
@@ -388,8 +405,8 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
 }
 
 // Compact Debug — the row arrays run to millions of entries.
-impl std::fmt::Debug for CscCircuit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for CscCircuit {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("CscCircuit")
             .field("n_cols", &self.n_cols)
             .field("nnz_a", &self.a_rows.len())
@@ -429,7 +446,6 @@ impl LincheckCircuit for CscCircuit {
         self.const_pin
     }
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
-        use rayon::prelude::*;
         assert_eq!(eq_inner.len(), self.n_cols);
         let one_col = |c: usize| {
             let mut sa = F128::ZERO;
@@ -457,7 +473,6 @@ impl LincheckCircuit for CscCircuit {
     /// apart costs strictly LESS — the walk is identical and the per-column
     /// multiply disappears. The default would walk twice.
     fn fold_split(&self, eq_inner: &[F128]) -> (Vec<F128>, Vec<F128>) {
-        use rayon::prelude::*;
         assert_eq!(eq_inner.len(), self.n_cols);
         let one_col = |c: usize| {
             let mut sa = F128::ZERO;
@@ -712,7 +727,7 @@ pub enum LincheckError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
-    flock_multilinear::eq_table(point, F128::ONE, flock_multilinear::IndexOrder::LowToHigh)
+    eq_table(point, F128::ONE, IndexOrder::LowToHigh)
 }
 
 /// Fold a sparse boolean matrix's rows against an eq table at the row
@@ -745,10 +760,7 @@ pub fn sparse_row_fold(matrix: &SparseBinaryMatrix, eq_table: &[F128]) -> Vec<F1
         }
         out
     } else {
-        // Scatter-reduce: per-thread accumulator, XOR-merge at the end. Each
-        // thread allocates a length-n_cols buffer (~256 KB at k=16384) — fine
-        // vs the witness-scale buffers already in flight.
-        use rayon::prelude::*;
+        // Fold sparse rows with one accumulator per worker.
         matrix
             .rows
             .par_iter()
@@ -987,8 +999,7 @@ fn partial_fold_packed_z_best(
             // n_log ≥ 16; below that the L1-resident `iblock` wins. `FOLD_IBLOCK` forces
             // iblock everywhere (bench A/B).
             let n_log = m - k_log;
-            if n_log >= OBLOCK_MIN_N_LOG && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if n_log >= OBLOCK_MIN_N_LOG && !FOLD_IBLOCK.load(Ordering::Relaxed) {
                 // Large folds additionally hop to the all-core (P+E) pool —
                 // dynamic tile assignment drains around the slower E-cores.
                 if lincheck_use_all_cores() {
@@ -1113,7 +1124,7 @@ pub fn pack_z_lincheck(z_logical: &[bool], m: usize, k_log: usize) -> Vec<u8> {
     let n_stripes = n_outer / 8;
 
     // Uninit alloc — every byte is written exactly once in the loop below.
-    let mut z_packed: Vec<u8> = crate::alloc_uninit_vec(n_total / 8);
+    let mut z_packed: Vec<u8> = alloc_uninit_vec(n_total / 8);
     for byte_idx in 0..n_stripes {
         for i_inner in 0..k {
             let mut byte = 0u8;
@@ -1133,11 +1144,7 @@ pub fn pack_z_lincheck(z_logical: &[bool], m: usize, k_log: usize) -> Vec<u8> {
 /// Same output as [`pack_z_lincheck`] but reads bits from an F_{2^128}-packed
 /// witness (polynomial basis: bit `i` of logical = bit `i % 128` of
 /// `z_packed_f128[i / 128]`).
-pub fn pack_z_lincheck_from_packed(
-    z_packed_f128: &[crate::field::F128],
-    m: usize,
-    k_log: usize,
-) -> Vec<u8> {
+pub fn pack_z_lincheck_from_packed(z_packed_f128: &[F128], m: usize, k_log: usize) -> Vec<u8> {
     let k = 1usize << k_log;
     let n_total = 1usize << m;
     assert_eq!(z_packed_f128.len(), n_total / 128);
@@ -1147,7 +1154,7 @@ pub fn pack_z_lincheck_from_packed(
     // Uninit alloc — the par_chunks_mut loop below writes every byte of
     // every k-byte stripe exactly once. Saves ~10 ms of sequential
     // zero-fill at m=29 (64 MB byte buffer) on the main thread.
-    let mut z_packed: Vec<u8> = crate::alloc_uninit_vec(n_total / 8);
+    let mut z_packed: Vec<u8> = alloc_uninit_vec(n_total / 8);
     // Each stripe (byte_idx) writes a disjoint k-byte chunk — process them in
     // parallel. Inside one stripe, k independent output bytes.
     z_packed
@@ -1195,11 +1202,7 @@ impl SkipPoint {
         match self {
             SkipPoint::Phi8(z) => lagrange_weights_naive(k_skip, *z),
             SkipPoint::Ag(p) => {
-                debug_assert_eq!(
-                    k_skip,
-                    crate::zerocheck::ag_skip::K_SKIP,
-                    "AG base code is k_skip=6 only"
-                );
+                debug_assert_eq!(k_skip, K_SKIP, "AG base code is k_skip=6 only");
                 let bf = base_evaluation_functional(p)
                     .expect("AG base evaluation functional: denominator nonzero at point");
                 (0..(1usize << k_skip)).map(|i| bf[i]).collect()
@@ -1213,15 +1216,13 @@ impl SkipPoint {
     /// arm seeds a hash-matched DRBG (`FsRng`, following the transcript hash)
     /// from two F128 squeezes and replays the rejection sampler on both sides (unlike the zerocheck's `r₁`, which now uses the
     /// prover-side nonce grind — see `ag_skip::sample_r1_prover`).
-    pub fn sample_fresh<Ch: crate::challenger::Challenger>(&self, ch: &mut Ch) -> SkipPoint {
+    pub fn sample_fresh<Ch: Challenger>(&self, ch: &mut Ch) -> SkipPoint {
         match self {
             SkipPoint::Phi8(_) => SkipPoint::Phi8(ch.sample_f128()),
             SkipPoint::Ag(_) => {
                 let seed = Self::ag_fresh_seed(ch);
-                let p = crate::genus95_curve_code::sample_random_evaluation_point(
-                    &mut crate::genus95_curve_code::FsRng::new(ch.hash_kind(), seed),
-                )
-                .unwrap_or_else(|_| crate::zerocheck::ag_skip::fallback_point());
+                let p = sample_random_evaluation_point(&mut FsRng::new(ch.hash_kind(), seed))
+                    .unwrap_or_else(|_| fallback_point());
                 SkipPoint::Ag(p)
             }
         }
@@ -1230,7 +1231,7 @@ impl SkipPoint {
     /// The 32-byte transcript seed for a fresh AG skip point: label + two
     /// squeezes. Shared by [`Self::sample_fresh`] (deterministic replay on
     /// both sides) and the fused-nonce pair below.
-    fn ag_fresh_seed<Ch: crate::challenger::Challenger>(ch: &mut Ch) -> [u8; 32] {
+    fn ag_fresh_seed<Ch: Challenger>(ch: &mut Ch) -> [u8; 32] {
         ch.observe_label(b"flock-lincheck-ag-skip-point");
         let s0 = ch.sample_f128();
         let s1 = ch.sample_f128();
@@ -1245,7 +1246,7 @@ impl SkipPoint {
     /// Bind the chosen fused nonce into the transcript — later challenges
     /// (nothing today, but the claim value flows onward) depend on the point
     /// through it. Mirrored exactly by the verifier.
-    fn observe_ag_fresh_nonce<Ch: crate::challenger::Challenger>(ch: &mut Ch, nonce: u32) {
+    fn observe_ag_fresh_nonce<Ch: Challenger>(ch: &mut Ch, nonce: u32) {
         ch.observe_label(b"flock-lincheck-ag-skip-nonce");
         ch.observe_bytes(&nonce.to_le_bytes());
     }
@@ -1257,7 +1258,7 @@ impl SkipPoint {
     /// [`crate::zerocheck::ag_skip::AG_SAMPLING_CREDIT_BITS`] = 5 bits on
     /// top, the point carries `pow_bits + 5` grinding bits total, and the
     /// verifier mirror is ONE-SHOT (no rejection replay).
-    pub fn sample_fresh_pow_prover<Ch: crate::challenger::Challenger>(
+    pub fn sample_fresh_pow_prover<Ch: Challenger>(
         &self,
         ch: &mut Ch,
         pow_bits: u32,
@@ -1267,10 +1268,8 @@ impl SkipPoint {
         };
         let seed = Self::ag_fresh_seed(ch);
         let kind = ch.hash_kind();
-        for nonce in 0..crate::zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET {
-            if let Some(p) = crate::genus95_curve_code::evaluation_point_from_nonce_pow(
-                &seed, nonce, kind, pow_bits,
-            ) {
+        for nonce in 0..R1_FUSED_ATTEMPT_BUDGET {
+            if let Some(p) = evaluation_point_from_nonce_pow(&seed, nonce, kind, pow_bits) {
                 Self::observe_ag_fresh_nonce(ch, nonce);
                 return (SkipPoint::Ag(p), u64::from(nonce));
             }
@@ -1281,7 +1280,7 @@ impl SkipPoint {
     /// Verifier mirror of [`Self::sample_fresh_pow_prover`]: one hash + one
     /// point attempt; `None` rejects (bad PoW, bad point, or a nonce outside
     /// the prover's scan budget).
-    pub fn sample_fresh_pow_verifier<Ch: crate::challenger::Challenger>(
+    pub fn sample_fresh_pow_verifier<Ch: Challenger>(
         &self,
         ch: &mut Ch,
         nonce: u64,
@@ -1292,17 +1291,11 @@ impl SkipPoint {
         };
         let seed = Self::ag_fresh_seed(ch);
         let nonce = u32::try_from(nonce).ok()?;
-        if nonce >= crate::zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET {
+        if nonce >= R1_FUSED_ATTEMPT_BUDGET {
             return None;
         }
         Self::observe_ag_fresh_nonce(ch, nonce);
-        crate::genus95_curve_code::evaluation_point_from_nonce_pow(
-            &seed,
-            nonce,
-            ch.hash_kind(),
-            pow_bits,
-        )
-        .map(SkipPoint::Ag)
+        evaluation_point_from_nonce_pow(&seed, nonce, ch.hash_kind(), pow_bits).map(SkipPoint::Ag)
     }
 
     /// Extract the φ₈ field point. Panics on an AG point — used at RS PCS-verify
@@ -1415,7 +1408,7 @@ fn sparse_row_fold_alpha_batched(
     // accumulator, then reduce. Overhead is O(n_cols × num_chunks) with
     // num_chunks ≈ 4× the thread count — negligible vs. the 21M-add body.
     let n_rows = a_0.num_rows;
-    let p = rayon::current_num_threads().max(1);
+    let p = current_num_threads().max(1);
     // ~4 chunks per worker for work-stealing balance, ≥256 rows each to keep
     // accumulator alloc/reduce overhead amortized.
     let chunk_rows = (n_rows.div_ceil(p * 4)).max(256);
@@ -1765,7 +1758,7 @@ fn prove_padded_inner<Ch: Challenger>(
     assert_eq!(x_ab.x_outer.len(), n_log);
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let trace = var("LINCHECK_TRACE").is_ok();
 
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(
         inner_rest_len,
@@ -1787,11 +1780,7 @@ fn prove_padded_inner<Ch: Challenger>(
     //    the sparse-matrix default this is the fused single-pass row-fold;
     //    per-hash circuit walkers compute the same `comb_vec` directly from
     //    the constraint graph.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t = if trace { Some(Instant::now()) } else { None };
     let eq_inner =
         build_quirky_eq_table_from_weights(&x_ab.z_skip.weights(k_skip), &x_ab.x_inner_rest);
     if let Some(t) = t {
@@ -1801,11 +1790,7 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t = if trace { Some(Instant::now()) } else { None };
     let mut comb_vec = fold_alpha_batched_pooled(circuit, alpha, &eq_inner);
     if let Some(t) = t {
         eprintln!(
@@ -1832,11 +1817,7 @@ fn prove_padded_inner<Ch: Challenger>(
     }
 
     // 3. Partial fold of z at the shared outer half (length-k F128 vector).
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t = if trace { Some(Instant::now()) } else { None };
     let eq_x_outer = build_eq_table(&x_ab.x_outer);
     let z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
     if let Some(t) = t {
@@ -1891,11 +1872,7 @@ fn column_sumcheck_prove<Ch: Challenger>(
     debug_assert_eq!(comb_vec.len(), z_vec.len());
     debug_assert!(comb_vec.len().is_power_of_two());
     let inner_rest_len = comb_vec.len().trailing_zeros() as usize - k_skip;
-    let t_sumcheck_start = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t_sumcheck_start = if trace { Some(Instant::now()) } else { None };
 
     // 5. Standard multilinear product-sumcheck over the high `inner_rest_len`
     //    bits of `i`. Each round binds the TOP remaining bit. After
@@ -1991,7 +1968,7 @@ fn column_sumcheck_prove<Ch: Challenger>(
         rounds,
         z_partial,
         matrix_evals: Vec::new(),
-        grinding_nonces: std::mem::take(grinding_nonces),
+        grinding_nonces: take(grinding_nonces),
     };
     let claim = LincheckClaim {
         r_inner_skip,
@@ -2102,7 +2079,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     challenger.observe_label(b"flock-lincheck-v0");
     let mut nonce_idx = 0;
 
-    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let trace = var("VERIFY_TRACE").is_ok();
     let fmt = |s: f64| -> String {
         let ms = s * 1000.0;
         if ms < 1.0 {
@@ -2126,7 +2103,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     // 2. Build α-batched comb_vec via the circuit's per-block fold (same call
     //    the prover made — sparse default delegates to the fused row-fold;
     //    per-hash impls walk the constraint graph directly).
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let eq_inner =
         build_quirky_eq_table_from_weights(&x_ab.z_skip.weights(k_skip), &x_ab.x_inner_rest);
     if trace {
@@ -2135,7 +2112,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
             fmt(t.elapsed().as_secs_f64())
         );
     }
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut comb_vec = fold_alpha_batched_pooled(circuit, alpha, &eq_inner);
     if trace {
         eprintln!(
@@ -2147,7 +2124,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     // 3. Replay the multilinear product-sumcheck (inner_rest_len rounds),
     //    folding comb_vec in lockstep so we end up with the "comb_partial"
     //    vector of length 2^k_skip. Parallel fold for the early (large) rounds.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     // Constant-wire pin (mirror of prove): β sampled after α, comb gains +β at
     // the constant column, and the initial target gains +β·1 — the honest
     // all-ones constant column folds to 1. See docs/const-wire-pin.md.
@@ -2243,7 +2220,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     // 7. Derive output claim value via φ8 Lagrange on z_partial at z_skip.
     //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest;
     //    PCS catches mismatches downstream.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let lambda = r_inner_skip.weights(k_skip);
     let w = inner_product(&lambda, &proof.z_partial);
     if trace {
@@ -2273,6 +2250,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+    use std::collections::HashSet;
 
     use crate::test_rng::Rng;
 
@@ -2380,7 +2358,7 @@ mod tests {
     /// `k × k` slots. Used for tests.
     fn random_sparse_matrix(k: usize, nnz: usize, rng: &mut Rng) -> SparseBinaryMatrix {
         let mut rows: Vec<Vec<usize>> = vec![Vec::new(); k];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut count = 0;
         while count < nnz {
             let r = (rng.next_u64() as usize) % k;

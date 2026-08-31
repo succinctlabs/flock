@@ -12,8 +12,11 @@
 //!
 //! Run: cargo run --release --bin dump_transpose_induce_vectors -- out.bin 16 1 218
 
+use env::args;
+use std::collections::HashSet;
 use std::env;
 use std::fs::File;
+use std::io::Result;
 use std::io::{BufWriter, Write};
 
 use flock_prover::field::F128;
@@ -28,13 +31,13 @@ fn ceil_log2(n: usize) -> usize {
         (n - 1).ilog2() as usize + 1
     }
 }
-fn wf(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn wf(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
 
-fn main() -> std::io::Result<()> {
-    let a: Vec<String> = env::args().collect();
+fn main() -> Result<()> {
+    let a: Vec<String> = args().collect();
     let arg = |i: usize, d: usize| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
     let path = a
         .get(1)
@@ -54,7 +57,7 @@ fn main() -> std::io::Result<()> {
     // distinct query positions in the FULL codeword domain [0, block_len).
     let mut queries: Vec<usize> = Vec::with_capacity(n_queries);
     {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         while queries.len() < n_queries {
             let q = (rng.next_u64() as usize) % block_len;
             if seen.insert(q) {

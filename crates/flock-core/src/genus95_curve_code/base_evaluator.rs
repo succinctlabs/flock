@@ -1,4 +1,5 @@
 use std::ops::Index;
+use std::slice::Iter;
 use std::sync::OnceLock;
 
 use super::constants::{BASE_FUNCTIONAL_BITS, BASE_FUNCTIONAL_BYTES, BASE_X_POWER_COUNT};
@@ -24,7 +25,7 @@ impl BaseFunctional {
     }
 
     #[inline(always)]
-    pub fn iter(&self) -> std::slice::Iter<'_, F128> {
+    pub fn iter(&self) -> Iter<'_, F128> {
         self.coordinates.iter()
     }
 

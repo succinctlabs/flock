@@ -15,26 +15,34 @@
 //!   - SHA-256 PoW checks (1 compression each)
 //!   - BLAKE3 Fiat–Shamir absorption (bytes + squeezes, ≈ compressions)
 
+use flock_prover::challenger::fs_count::{reset as reset_fs_count, snapshot as snapshot_fs_count};
 use flock_prover::challenger::{FsChallenger, fs_count};
+use flock_prover::init_perf_thread_pool;
 use flock_prover::merkle::hash_count;
+use flock_prover::merkle::hash_count::{
+    reset as reset_hash_count, snapshot as snapshot_hash_count,
+};
 use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG};
+use std::array::from_fn;
+use std::env::var;
+use std::time::Instant;
 
 use flock_core::test_rng::Rng;
 
 fn random_compression(rng: &mut Rng) -> Compression {
-    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+    let m: [u32; 16] = from_fn(|_| rng.next_u32());
     (cv, m, rng.next_u32() as u64, 64u32, 11u32)
 }
 
 fn reset_counters() {
-    hash_count::reset();
-    fs_count::reset();
+    reset_hash_count();
+    reset_fs_count();
 }
 
 fn report(label: &str, blake3_bytes: u64) {
-    let (leaf_calls, leaf_compr, pair_calls) = hash_count::snapshot();
-    let (squeezes, squeezed_bytes, pow) = fs_count::snapshot();
+    let (leaf_calls, leaf_compr, pair_calls) = snapshot_hash_count();
+    let (squeezes, squeezed_bytes, pow) = snapshot_fs_count();
     let sha_total = leaf_compr + 2 * pair_calls + pow;
 
     // BLAKE3 estimate, broken out because the FS chain table has to be sized
@@ -91,7 +99,7 @@ fn run(m: usize, rate: usize) {
         .map(|_| random_compression(&mut rng))
         .collect();
 
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     let mut ch_p = FsChallenger::new(b"flock-hash-count");
     let (proof, commitment, _) = setup.prove_fast(&blocks, &mut ch_p);
     println!("  (prove: {:.1} s)", t0.elapsed().as_secs_f64());
@@ -103,7 +111,7 @@ fn run(m: usize, rate: usize) {
 
     reset_counters();
     let mut ch_v = FsChallenger::new(b"flock-hash-count");
-    let t1 = std::time::Instant::now();
+    let t1 = Instant::now();
     setup
         .verify(&commitment, &proof, &mut ch_v)
         .expect("lig verify");
@@ -113,8 +121,8 @@ fn run(m: usize, rate: usize) {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
-    let runs = std::env::var("VHC_RUNS").unwrap_or_else(|_| "22:1,30:1,30:2".to_string());
+    let _ = init_perf_thread_pool();
+    let runs = var("VHC_RUNS").unwrap_or_else(|_| "22:1,30:1,30:2".to_string());
     for entry in runs.split(',') {
         let parts: Vec<&str> = entry.trim().split(':').collect();
         assert_eq!(parts.len(), 2, "bad VHC_RUNS entry {entry:?} (use m:rate)");

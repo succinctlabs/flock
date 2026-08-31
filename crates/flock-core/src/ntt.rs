@@ -10,10 +10,10 @@
 
 use crate::field::F8;
 
-pub mod additive_ntt_f128;
-pub mod inv_table;
 pub use additive_ntt_f128::AdditiveNttF128;
 pub use inv_table::InvNttTableByteSingleGf8;
+pub mod additive_ntt_f128;
+pub mod inv_table;
 
 /// Twiddle recurrence used to build the next subspace layer's evaluation points:
 /// `next_s(s, root) = s² + root · s = s · (s + root)`.

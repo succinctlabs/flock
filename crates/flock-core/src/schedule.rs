@@ -12,7 +12,13 @@
 //! class PIOP runs only over its region (see
 //! [`Registry::new`]).
 
+use crate::r1cs::BlockR1cs;
+use crate::r1cs::absorb_matrix;
+use blake3::Hasher;
+use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::element_r1cs::ElementTableType;
 use crate::r1cs::SparseBinaryMatrix;
@@ -153,7 +159,7 @@ impl TableType {
     /// the replication count, which becomes the registry's uniform capacity
     /// `nu` (pass the r1cs's `n_log()` to [`Registry::new`] to reproduce
     /// today's geometry exactly).
-    pub fn from_block_r1cs(r1cs: &crate::r1cs::BlockR1cs) -> Self {
+    pub fn from_block_r1cs(r1cs: &BlockR1cs) -> Self {
         Self {
             k_log: r1cs.k_log,
             useful_bits: r1cs.useful_bits,
@@ -278,7 +284,7 @@ pub struct Registry {
     /// manual `Clone` resetting the cache), every field here is private and
     /// immutable after construction, so the cache can never go stale and the
     /// derived `Clone` may carry it.
-    digest_cache: std::sync::OnceLock<[u8; 32]>,
+    digest_cache: OnceLock<[u8; 32]>,
 }
 
 impl Registry {
@@ -351,7 +357,7 @@ impl Registry {
             // the cell-slot enumeration and hence σ's index space depend on
             // it).
             let used_cols = ty.used_word_cols();
-            let mut seen = std::collections::BTreeSet::new();
+            let mut seen = BTreeSet::new();
             for w in &ty.io_schema {
                 assert!(
                     w.word_col < used_cols,
@@ -368,7 +374,7 @@ impl Registry {
         // Class-major, then non-increasing capacity area = k_log descending
         // (uniform capacity). Stable, so equal-width types keep their given
         // order — and the boolean types stay a prefix of the list.
-        types.sort_by_key(|ty| (ty.is_element(), std::cmp::Reverse(ty.k_log)));
+        types.sort_by_key(|ty| (ty.is_element(), Reverse(ty.k_log)));
         let num_boolean = types.iter().filter(|ty| !ty.is_element()).count();
 
         // Pack each class from its own base, area-descending. Boolean starts
@@ -470,7 +476,7 @@ impl Registry {
             m_bool,
             m_elem,
             element_base,
-            digest_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
         }
     }
 
@@ -520,7 +526,7 @@ impl Registry {
     /// subsequent calls are essentially free.
     pub fn digest(&self) -> [u8; 32] {
         *self.digest_cache.get_or_init(|| {
-            let mut h = blake3::Hasher::new();
+            let mut h = Hasher::new();
             h.update(b"flock-registry-v1");
             h.update(&[1u8]);
             h.update(&(self.nu as u32).to_le_bytes());
@@ -534,9 +540,9 @@ impl Registry {
                 };
                 h.update(&[present]);
                 h.update(&value.to_le_bytes());
-                crate::r1cs::absorb_matrix(&mut h, &ty.a_0);
-                crate::r1cs::absorb_matrix(&mut h, &ty.b_0);
-                crate::r1cs::absorb_matrix(&mut h, &ty.c_0);
+                absorb_matrix(&mut h, &ty.a_0);
+                absorb_matrix(&mut h, &ty.b_0);
+                absorb_matrix(&mut h, &ty.c_0);
                 // Element payload appends ONLY when present — see above.
                 if let Some(el) = ty.element_type() {
                     h.update(ELEMENT_CLASS_LABEL);
@@ -781,7 +787,14 @@ impl<'r> Instance<'r> {
 mod tests {
     use super::*;
     use crate::r1cs::{BlockR1cs, WitnessLayout};
+    use std::sync::OnceLock;
 
+    use crate::challenger::{Challenger, FsChallenger};
+    use crate::element_r1cs::ElementTableBuilder;
+    use crate::field::F128;
+    use crate::test_rng::Rng;
+    use crate::zerocheck::univariate_skip::pack_bits;
+    use crate::zerocheck::{prove_packed, prove_packed_padded};
     /// Empty matrix stub — layout tests never apply the matrices, mirroring
     /// the walker-based encoders' stub practice.
     fn stub() -> SparseBinaryMatrix {
@@ -809,15 +822,12 @@ mod tests {
     /// columns free wires (so `k = 2^kappa` and every column is used). Only
     /// the shape matters to the schedule.
     pub(crate) fn elem_ty(kappa: usize) -> TableType {
-        use crate::element_r1cs::ElementTableBuilder;
         let mut b = ElementTableBuilder::new(kappa);
         for y in 0..1usize << kappa {
             b.free_wire(y);
         }
         TableType::element(Arc::new(b.build().expect("free-wire block is valid")))
     }
-
-    use crate::test_rng::Rng;
 
     /// Offset/prefix/alignment arithmetic on the doc's 3-type shape
     /// (κ = 16/15/14, ν = 10), fed in shuffled order to exercise the sort.
@@ -880,8 +890,8 @@ mod tests {
             c_0: stub(),
             layout: WitnessLayout::BatchMajor,
             const_pin: None,
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         };
 
         assert_eq!(reg.m_total(), r1cs.m);
@@ -958,10 +968,6 @@ mod tests {
     /// as the dense prover on an honestly padded union witness.
     #[test]
     fn instance_padding_spec_proves_like_dense() {
-        use crate::challenger::{Challenger, FsChallenger};
-        use crate::zerocheck::univariate_skip::pack_bits;
-        use crate::zerocheck::{prove_packed, prove_packed_padded};
-
         let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
         let m = reg.m_total();
         let inst = Instance::new(&reg, vec![5, 3]);
@@ -1236,9 +1242,6 @@ mod tests {
     /// through [`ElementTableType::digest`]).
     #[test]
     fn element_payload_binds_the_digest() {
-        use crate::element_r1cs::ElementTableBuilder;
-        use crate::field::F128;
-
         let bool_only = Registry::new(vec![ty(10, 700)], 3);
         let mixed = Registry::new(vec![ty(10, 700), elem_ty(3)], 3);
         assert_ne!(
@@ -1378,7 +1381,6 @@ mod tests {
     /// bookkeeping (`used_cols`, heights, `padding_spec`) reads.
     #[test]
     fn element_type_presents_word_geometry() {
-        use crate::element_r1cs::ElementTableBuilder;
         let mut b = ElementTableBuilder::new(3); // width 8
         b.free_wire(0).free_wire(1).mult(2, 0, 1); // k = 3 real columns
         let el = Arc::new(b.build().unwrap());

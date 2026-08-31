@@ -1,4 +1,8 @@
+use crate::r1cs_hashes::blake3::{Compression, build_block_r1cs, io_schema};
+#[cfg(test)]
+use core_merkle::merkle_tree;
 use flock_hash::blake3_compress;
+use std::array::from_fn;
 
 use super::*;
 
@@ -75,7 +79,7 @@ pub(super) fn digest_words(d: &[u32; SLOT_WORDS]) -> [F128; 2] {
 }
 
 pub(super) fn hash_to_digest(h: &[u8; 32]) -> [u32; SLOT_WORDS] {
-    std::array::from_fn(|w| u32::from_le_bytes(h[4 * w..4 * w + 4].try_into().unwrap()))
+    from_fn(|w| u32::from_le_bytes(h[4 * w..4 * w + 4].try_into().unwrap()))
 }
 
 #[cfg(test)]
@@ -103,12 +107,11 @@ pub(super) struct Blake3Gate {
 }
 
 impl GateType for Blake3Gate {
-    type Row = blake3::Compression;
+    type Row = Compression;
     type Hint = ();
 
     fn table(&self) -> TableType {
-        TableType::from_block_r1cs(&blake3::build_block_r1cs(self.nu))
-            .with_io_schema(blake3::io_schema())
+        TableType::from_block_r1cs(&build_block_r1cs(self.nu)).with_io_schema(io_schema())
     }
 
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
@@ -236,7 +239,7 @@ impl Tree {
         let data: Vec<u8> = (0..n_leaves * leaf_bytes)
             .map(|_| rng.next_u32() as u8)
             .collect();
-        let flat = core_merkle::merkle_tree(&data, n_leaves, HashKind::Blake3);
+        let flat = merkle_tree(&data, n_leaves, HashKind::Blake3);
         let root = flat[flat.len() - 1];
         Self {
             data,

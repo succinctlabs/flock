@@ -60,13 +60,19 @@
 use crate::bits::transpose_8x8_bits;
 use crate::challenger::Challenger;
 use crate::field::F128;
+use crate::field::F256;
 use crate::pcs::tensor_algebra::{TensorAlgebra, TensorAlgebra256};
+use crate::scratch::take_f128;
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use crate::zerocheck::univariate_skip::build_eq;
+use flock_multilinear::IndexOrder;
+use flock_multilinear::eq_table_scaled;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::env::var;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use super::pack::LOG_PACKING;
 
@@ -305,7 +311,7 @@ pub(crate) fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
 /// merged transport's inner open to materialize `γ·eq(ρ, ·)` directly as
 /// `b_combined`.
 pub(crate) fn build_eq_scaled_parallel(r: &[F128], seed: F128) -> Vec<F128> {
-    flock_multilinear::eq_table_scaled(r, F128::ONE, seed, flock_multilinear::IndexOrder::LowToHigh)
+    eq_table_scaled(r, F128::ONE, seed, IndexOrder::LowToHigh)
 }
 
 /// Tensor-factored `build_eq`: split the point `r` (length `n`) into a low
@@ -1743,7 +1749,7 @@ pub fn fold_b128_elems_split(eq_lo: &[F128], eq_hi: &[F128], eq_r_dprime: &[F128
 pub(crate) fn fold_b128_from_table(eq_lo: &[F128], eq_hi: &[F128], tables: &[F128]) -> Vec<F128> {
     let b = eq_lo.len();
     // Each slot is written exactly once (`*slot = acc`) before any read.
-    let mut out = crate::scratch::take_f128(b * eq_hi.len());
+    let mut out = take_f128(b * eq_hi.len());
     out.par_chunks_mut(b)
         .zip(eq_hi.par_iter())
         .for_each(|(out_block, &e_hi)| {
@@ -2141,13 +2147,13 @@ pub fn prove_with_grinding<Ch: Challenger>(
     // So packed_witness.len() = 2^(x_outer.len() - 1). Enforce that.
     assert_eq!(l, 1 << (x_outer.len() - 1));
 
-    let trace = std::env::var("PCS_TRACE").is_ok();
+    let trace = var("PCS_TRACE").is_ok();
 
     challenger.observe_label(b"flock-ring-switch-v0");
 
     // Suffix is x_outer[1..] (length m-7); first coord becomes the 7th-bit factor.
     let suffix = &x_outer[1..];
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let suffix_tensor = build_eq_parallel(suffix);
     if trace {
         eprintln!(
@@ -2159,7 +2165,7 @@ pub fn prove_with_grinding<Ch: Challenger>(
     debug_assert_eq!(suffix_tensor.len(), l);
 
     // Compute and send s_hat_v.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let s_hat_v = fold_1b_rows_naive(packed_witness, &suffix_tensor);
     if trace {
         eprintln!(
@@ -2183,7 +2189,7 @@ pub fn prove_with_grinding<Ch: Challenger>(
     let sumcheck_claim = inner_product(&s_hat_u, &eq_r_dprime);
 
     // Compute transparent multilinear rs_eq_ind.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let rs_eq_ind = fold_b128_elems(&suffix_tensor, &eq_r_dprime);
     if trace {
         eprintln!(
@@ -2336,7 +2342,7 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
     Vec<u64>,
 ) {
     assert!(!x_outers.is_empty());
-    let trace = std::env::var("PCS_TRACE").is_ok();
+    let trace = var("PCS_TRACE").is_ok();
     let n = x_outers.len();
     let l = packed_witness.len();
     for x in x_outers {
@@ -2404,7 +2410,7 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
     // Gates the s_hat_v fold KERNEL only (the MFR split kernels need 16-wide
     // lo blocks). The rs_eq_ind below defers regardless — see the else arm.
     let use_split = l.is_multiple_of(16);
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
@@ -2459,7 +2465,7 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
     let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
         .filter(|&s| !has_precomputed(sparse_to_orig[s]))
         .collect();
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
     // Fill precomputed slots first.
@@ -2530,7 +2536,7 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
     //    (b) Sample γ_rs after all observations (Schwartz-Zippel-sound).
     //    (c) Per claim: bake γ_k into eq_r_dprime, fold. Output rs_eq_ind
     //        already has γ_k baked in — pcs combine just adds.
-    let t = std::time::Instant::now();
+    let t = Instant::now();
 
     struct ClaimWork {
         s_hat_v: Vec<F128>,
@@ -2856,10 +2862,7 @@ pub fn eval_rs_eq(z_vals: &[F128], query: &[F128], eq_r_dprime: &[F128]) -> F128
 /// (z_vals, query) pairs and returns the partially-evolved `TensorAlgebra`.
 /// Pair with [`eval_rs_eq_finish_from_prefix`] to share the prefix across
 /// many query points (e.g. residual `y_bits` positions).
-pub fn eval_rs_eq_prefix(
-    z_vals: &[F128],
-    query_prefix: &[F128],
-) -> crate::pcs::tensor_algebra::TensorAlgebra {
+pub fn eval_rs_eq_prefix(z_vals: &[F128], query_prefix: &[F128]) -> TensorAlgebra {
     assert!(query_prefix.len() <= z_vals.len());
     let mut eval = TensorAlgebra::from_vertical(F128::ONE);
     for (&z_i, &q_i) in z_vals.iter().zip(query_prefix.iter()) {
@@ -2875,7 +2878,7 @@ pub fn eval_rs_eq_prefix(
 /// (z, query) suffix. `z_vals_suffix` and `query_suffix` are the parts of
 /// the original `z_vals`/`query` past the prefix length.
 pub fn eval_rs_eq_finish_from_prefix(
-    prefix: &crate::pcs::tensor_algebra::TensorAlgebra,
+    prefix: &TensorAlgebra,
     z_vals_suffix: &[F128],
     query_suffix: &[F128],
     eq_r_dprime: &[F128],
@@ -2908,7 +2911,7 @@ pub fn eval_rs_eq_finish_from_prefix(
 ///
 /// `y_bits` encodes the suffix as a bitmask: bit `j` is the j-th suffix coord.
 pub fn eval_rs_eq_finish_from_prefix_binary_q(
-    prefix: &crate::pcs::tensor_algebra::TensorAlgebra,
+    prefix: &TensorAlgebra,
     z_vals_suffix: &[F128],
     y_bits: u32,
     eq_r_dprime: &[F128],
@@ -2934,10 +2937,7 @@ pub fn eval_rs_eq_finish_from_prefix_binary_q(
 
 /// Extension-field prefix evaluation for an F128 statement point evaluated at
 /// F256 Ligerito fold challenges.
-pub fn eval_rs_eq_prefix_f256(
-    z_vals: &[F128],
-    query_prefix: &[crate::field::F256],
-) -> crate::pcs::tensor_algebra::TensorAlgebra256 {
+pub fn eval_rs_eq_prefix_f256(z_vals: &[F128], query_prefix: &[F256]) -> TensorAlgebra256 {
     assert!(query_prefix.len() <= z_vals.len());
     let mut eval = TensorAlgebra256::one();
     for (&z, &q) in z_vals.iter().zip(query_prefix) {
@@ -2952,11 +2952,11 @@ pub fn eval_rs_eq_prefix_f256(
 /// Finish an extension-field ring-switch basis evaluation at a binary
 /// residual suffix.
 pub fn eval_rs_eq_finish_from_prefix_binary_q_f256(
-    prefix: &crate::pcs::tensor_algebra::TensorAlgebra256,
+    prefix: &TensorAlgebra256,
     z_vals_suffix: &[F128],
     y_bits: u32,
     eq_r_dprime: &[F128],
-) -> crate::field::F256 {
+) -> F256 {
     let mut eval = prefix.clone();
     for (j, &z) in z_vals_suffix.iter().enumerate() {
         let scalar = if (y_bits >> j) & 1 == 1 {
@@ -2973,13 +2973,20 @@ pub fn eval_rs_eq_finish_from_prefix_binary_q_f256(
 mod tests {
     use super::*;
     use crate::pcs::pack::pack_witness;
+    use crate::zerocheck::multilinear::lagrange_weights_naive;
     use crate::zerocheck::univariate_skip::build_eq;
+    use flock_multilinear::IndexOrder;
+    use flock_multilinear::evaluate;
 
+    use crate::challenger::FsChallenger;
+    use crate::challenger::{Challenger, RandomChallenger};
+    use crate::field::F256;
+    use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
+    use crate::test_rng::Rng;
     /// Binary-query specialization matches the general path bit-for-bit.
     #[test]
     fn eval_rs_eq_finish_binary_q_matches_general() {
-        use crate::challenger::Challenger;
-        let mut rng = crate::challenger::RandomChallenger::new(0x_B17_0BBE);
+        let mut rng = RandomChallenger::new(0x_B17_0BBE);
         let log_n = 20usize;
         let prefix_len = 15usize;
         let suffix_len = log_n - prefix_len; // 5
@@ -3021,9 +3028,6 @@ mod tests {
     /// cross terms.
     #[test]
     fn eval_rs_eq_f256_matches_dense_at_extension_points() {
-        use crate::challenger::{Challenger, RandomChallenger};
-        use crate::field::F256;
-
         let mut rng = RandomChallenger::new(0xF256_D315);
         for log_n in 1..8 {
             let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
@@ -3062,7 +3066,6 @@ mod tests {
     /// chains replay).
     #[test]
     fn linearized_coefficients_are_moore_row_mles() {
-        use crate::zerocheck::univariate_skip::build_eq;
         let mut rng = Rng::new(0x4D4F_4F52);
         for round in 0..3 {
             let rdp: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
@@ -3090,8 +3093,6 @@ mod tests {
             }
         }
     }
-
-    use crate::test_rng::Rng;
 
     /// Reference: directly compute ẑ_skip(z_skip, x_outer) for a Boolean witness `z`.
     ///
@@ -3169,7 +3170,6 @@ mod tests {
     /// produce identical (rs_eq_ind, sumcheck_claim).
     #[test]
     fn prove_verify_roundtrip() {
-        use crate::challenger::FsChallenger;
         let mut rng = Rng::new(0xBEEF);
         for &m in &[8usize, 9, 10, 11] {
             let z = rng.bits(1 << m);
@@ -3213,8 +3213,6 @@ mod tests {
     /// reject a malformed witness before deriving the point.
     #[test]
     fn prove_verify_roundtrip_with_grinding() {
-        use crate::challenger::FsChallenger;
-
         let m = 10usize;
         let mut rng = Rng::new(0x4752_494E_44);
         let z = rng.bits(1 << m);
@@ -3227,7 +3225,7 @@ mod tests {
         let (proof, out_p) = prove_with_grinding(&packed, &x_outer, 3, &mut ch_p);
 
         let mut ch_v = FsChallenger::new(b"flock-ring-grinding-test");
-        let skip_w = crate::zerocheck::multilinear::lagrange_weights_naive(6, z_skip);
+        let skip_w = lagrange_weights_naive(6, z_skip);
         let out_v = verify_with_grinding(claim, &skip_w, &x_outer, &proof, 3, &mut ch_v)
             .expect("honest grinded ring-switch proof verifies");
         assert_eq!(out_p.sumcheck_claim, out_v.sumcheck_claim);
@@ -3271,7 +3269,6 @@ mod tests {
     /// This is the *core* algebraic identity that makes BaseFold work.
     #[test]
     fn dp24_identity_holds() {
-        use crate::challenger::FsChallenger;
         let mut rng = Rng::new(0xABCD);
         for &m in &[8usize, 9, 10, 11] {
             let z = rng.bits(1 << m);
@@ -3290,7 +3287,6 @@ mod tests {
     /// Mutation rejection: flipping one bit of the proof must cause verify to reject.
     #[test]
     fn verify_rejects_mutated_proof() {
-        use crate::challenger::FsChallenger;
         let m = 10usize;
         let mut rng = Rng::new(0x99);
         let z = rng.bits(1 << m);
@@ -3327,7 +3323,6 @@ mod tests {
 
     #[test]
     fn prove_batched_matches_sequential() {
-        use crate::challenger::FsChallenger;
         let mut rng = Rng::new(0x1234_5678);
         for &m in &[8usize, 9, 10, 11] {
             let z = rng.bits(1 << m);
@@ -3479,7 +3474,7 @@ mod tests {
     /// with the real subset-sum structure.
     #[test]
     fn linearized_coefficients_reconstruct_fold() {
-        let mut ch = crate::challenger::RandomChallenger::new(0x11EA_A12E);
+        let mut ch = RandomChallenger::new(0x11EA_A12E);
         for _ in 0..3 {
             let eq_r: Vec<F128> = (0..1 << LOG_PACKING).map(|_| ch.sample_f128()).collect();
             let tables = build_fold_byte_table(&eq_r);
@@ -3614,7 +3609,6 @@ mod tests {
     /// general-purpose `fold_1b_rows` over the materialized suffix tensor.
     #[test]
     fn s_hat_v_from_z_vec_matches_fold_1b_rows_ab() {
-        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
         const K_SKIP: usize = 6;
         // (m, k_log) — K_SKIP fixed at 6 (so x_inner_rest has k_log − 6 coords;
         // x_inner_rest[0] becomes ring-switch's prefix0 because
@@ -3665,7 +3659,6 @@ mod tests {
     /// and K=2 (no precompute) fold_1b_rows dispatch branches.
     #[test]
     fn prove_batched_with_precomputed_matches_unprecomputed() {
-        use crate::challenger::FsChallenger;
         let mut rng = Rng::new(0xF00D);
         for &m in &[8usize, 9, 10, 11] {
             let z = rng.bits(1 << m);
@@ -3972,7 +3965,6 @@ mod tests {
     /// the dense kernels).
     #[test]
     fn prove_batched_with_sparse_claim_matches_sequential() {
-        use crate::challenger::FsChallenger;
         let mut rng = Rng::new(0xBEEF_CAFE);
         for &m in &[10usize, 11, 12] {
             let z = rng.bits(1 << m);
@@ -4039,7 +4031,7 @@ mod tests {
     #[test]
     fn eval_rs_eq_matches_dense() {
         fn mle_eval_naive(values: &[F128], r: &[F128]) -> F128 {
-            flock_multilinear::evaluate(values, r, flock_multilinear::IndexOrder::LowToHigh)
+            evaluate(values, r, IndexOrder::LowToHigh)
         }
 
         let mut rng = Rng::new(0xDEADBEEF);

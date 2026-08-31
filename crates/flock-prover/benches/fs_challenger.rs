@@ -18,6 +18,7 @@
 //!
 //! Run: `cargo bench --bench fs_challenger`
 
+use blake3::hash;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -144,7 +145,7 @@ fn main() {
                         let mut pre = [0u8; 64];
                         pre[..32].copy_from_slice(&state);
                         pre[32..40].copy_from_slice(&nonce.to_le_bytes());
-                        *blake3::hash(&pre).as_bytes()
+                        *hash(&pre).as_bytes()
                     }
                 };
                 acc ^= h[0];

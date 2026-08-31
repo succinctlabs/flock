@@ -29,8 +29,16 @@
 //! - `ec = ẑ(r)`. Because `C = I` this is *directly* a witness evaluation, so it
 //!   leaves as a packed-direct claim with no lincheck term.
 
+use crate::fold_min_len;
+use crate::scratch::give_f128;
+use crate::scratch::take_f128;
+use crate::sumcheck_round_min_len;
+use crate::zerocheck::multilinear::fold_in_place_single;
+use rayon::current_num_threads;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::mem::replace;
+use std::mem::take;
 
 use super::Grinding;
 use crate::challenger::Challenger;
@@ -225,8 +233,8 @@ pub fn prove_with_label_and_grinding<C: Challenger>(
     let out = prove_with_support_with_grinding(label, &pa, &pb, z, m_words, 0, None, grinding, ch);
     // The borrowed originals were never written; recycle them here, as the
     // pre-borrow fold used to when it swapped them out at round 1.
-    crate::scratch::give_f128(pa);
-    crate::scratch::give_f128(pb);
+    give_f128(pa);
+    give_f128(pb);
     out
 }
 
@@ -326,7 +334,7 @@ pub fn prove_with_support_with_grinding<C: Challenger>(
     let mut wz = match &sparse {
         Some(sup) => {
             let rows = 1usize << nu;
-            let mut w = crate::scratch::take_f128(n_words);
+            let mut w = take_f128(n_words);
             for (c, &n) in sup.live.iter().enumerate() {
                 w[c * rows..c * rows + n].copy_from_slice(&z[c * rows..c * rows + n]);
             }
@@ -374,7 +382,7 @@ pub fn prove_with_support_with_grinding<C: Challenger>(
                     // then fails to reconcile (a count-0 slot is exactly this
                     // case). `wz` really is zero: the witness is.
                     // O(columns), negligible.
-                    let done = std::mem::take(&mut sparse).expect("checked");
+                    let done = take(&mut sparse).expect("checked");
                     for (c, &n) in done.live.iter().enumerate() {
                         if n == 0 {
                             wa.owned_mut()[c] = done.a_dead[c];
@@ -407,10 +415,10 @@ pub fn prove_with_support_with_grinding<C: Challenger>(
     // by now); the borrowed originals stay with the caller.
     for t in [wa, wb] {
         if let Table::Owned(v) = t {
-            crate::scratch::give_f128(v);
+            give_f128(v);
         }
     }
-    crate::scratch::give_f128(wz);
+    give_f128(wz);
 
     let proof = Proof {
         rounds,
@@ -572,7 +580,7 @@ fn round_message(wa: &[F128], wb: &[F128], wz: &[F128], eq: &SplitEqGhash) -> (F
     };
 
     let pairs = block * n_blocks;
-    match crate::sumcheck_round_min_len(pairs, n_blocks) {
+    match sumcheck_round_min_len(pairs, n_blocks) {
         Some(min_len) => (0..n_blocks)
             .into_par_iter()
             .with_min_len(min_len)
@@ -671,7 +679,7 @@ fn round_message_sparse(
 
     // Gate on the LIVE pair count, not the dense size: at low utilization the
     // real work is a few hundred pairs and rayon task spawn would dominate it.
-    match crate::sumcheck_round_min_len(live_pairs_total(&iv), n_blocks) {
+    match sumcheck_round_min_len(live_pairs_total(&iv), n_blocks) {
         Some(min_len) => (0..n_blocks)
             .into_par_iter()
             .with_min_len(min_len)
@@ -735,8 +743,8 @@ impl Table<'_> {
     /// Swap in a folded successor, recycling the previous OWNED buffer (a
     /// borrowed predecessor is the caller's to keep).
     fn replace_with(&mut self, out: Vec<F128>) {
-        if let Self::Owned(old) = std::mem::replace(self, Self::Owned(out)) {
-            crate::scratch::give_f128(old);
+        if let Self::Owned(old) = replace(self, Self::Owned(out)) {
+            give_f128(old);
         }
     }
 
@@ -751,17 +759,17 @@ impl Table<'_> {
     /// pooled buffer first — half-size regions there are below the parallel
     /// threshold, so the copy is noise.
     fn fold(&mut self, rho: F128) {
-        match crate::fold_min_len(self.as_slice().len() / 2) {
+        match fold_min_len(self.as_slice().len() / 2) {
             Some(min_len) => {
                 let out = fold_low_out(self.as_slice(), rho, min_len);
                 self.replace_with(out);
             }
             None => match self {
-                Self::Owned(v) => crate::zerocheck::multilinear::fold_in_place_single(v, rho),
+                Self::Owned(v) => fold_in_place_single(v, rho),
                 Self::Borrowed(s) => {
-                    let mut v = crate::scratch::take_f128(s.len());
+                    let mut v = take_f128(s.len());
                     v.copy_from_slice(s);
-                    crate::zerocheck::multilinear::fold_in_place_single(&mut v, rho);
+                    fold_in_place_single(&mut v, rho);
                     self.replace_with(v);
                 }
             },
@@ -771,8 +779,8 @@ impl Table<'_> {
 
 fn fold_low_sparse(u: &mut Vec<F128>, rho: F128, row_vars: usize, live: &[usize], dead: &[F128]) {
     let out = fold_low_sparse_out(u, rho, row_vars, live, dead);
-    let old = std::mem::replace(u, out);
-    crate::scratch::give_f128(old);
+    let old = replace(u, out);
+    give_f128(old);
 }
 
 /// [`fold_low_sparse`]'s kernel: read `src`, return the pooled folded half.
@@ -791,13 +799,13 @@ fn fold_low_sparse_out(
         .filter(|&(_, &n)| n > 0)
         .map(|(c, &n)| (c * pairs, c * pairs + n.div_ceil(2)))
         .collect();
-    let mut out = crate::scratch::take_f128(half);
+    let mut out = take_f128(half);
     {
         let total = live_pairs_total(&iv);
         // Gate on LIVE work: `par_chunks_mut` over the full output would spawn
         // a task per chunk regardless of how few pairs are live, and at low
         // utilization that spawn cost is the whole round.
-        match crate::fold_min_len(total) {
+        match fold_min_len(total) {
             None => {
                 let out: &mut [F128] = &mut out;
                 for_live_pairs(&iv, 0, half, pairs, live, |xp, c, odd| {
@@ -808,7 +816,7 @@ fn fold_low_sparse_out(
                 });
             }
             Some(_) => {
-                let chunk = (half / rayon::current_num_threads().max(1))
+                let chunk = (half / current_num_threads().max(1))
                     .next_power_of_two()
                     .max(1 << 10);
                 out.par_chunks_mut(chunk).enumerate().for_each(|(k, dst)| {
@@ -852,13 +860,13 @@ fn dead_words_are_zero(z: &[F128], nu: usize, sup: &RowSupport) -> bool {
 /// serial kernel. Gating is the crate's [`crate::fold_min_len`], the same rule
 /// the other sub-gate folds use.
 fn fold_low(u: &mut Vec<F128>, rho: F128) {
-    match crate::fold_min_len(u.len() / 2) {
+    match fold_min_len(u.len() / 2) {
         Some(min_len) => {
             let out = fold_low_out(u, rho, min_len);
-            let old = std::mem::replace(u, out);
-            crate::scratch::give_f128(old);
+            let old = replace(u, out);
+            give_f128(old);
         }
-        None => crate::zerocheck::multilinear::fold_in_place_single(u, rho),
+        None => fold_in_place_single(u, rho),
     }
 }
 
@@ -866,7 +874,7 @@ fn fold_low(u: &mut Vec<F128>, rho: F128) {
 /// `take_f128(half)` returns a length-`half` buffer; the map writes every
 /// slot, satisfying the write-before-read contract.
 fn fold_low_out(src: &[F128], rho: F128, min_len: usize) -> Vec<F128> {
-    let mut out = crate::scratch::take_f128(src.len() / 2);
+    let mut out = take_f128(src.len() / 2);
     out.par_iter_mut()
         .with_min_len(min_len)
         .enumerate()
@@ -885,11 +893,14 @@ mod tests {
     use crate::element_r1cs::{ElementTableType, broadcast_add};
     use crate::test_rng::Rng;
     use crate::zerocheck::multilinear::eq_eval;
+    use crate::zerocheck::multilinear::fold_in_place_single;
+    use flock_multilinear::IndexOrder;
+    use flock_multilinear::evaluate;
 
     /// Direct MLE evaluation of `table` at `point`, binding the low variable
     /// first — the same order [`fold_low`] uses.
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
-        flock_multilinear::evaluate(table, point, flock_multilinear::IndexOrder::LowToHigh)
+        evaluate(table, point, IndexOrder::LowToHigh)
     }
 
     /// `(pa, pb)` for a witness — the same preparation [`super::super::prove`]
@@ -1181,7 +1192,7 @@ mod tests {
             let mut a = v.clone();
             fold_low(&mut a, rho);
             let mut b = v;
-            crate::zerocheck::multilinear::fold_in_place_single(&mut b, rho);
+            fold_in_place_single(&mut b, rho);
             assert_eq!(a, b, "log_n={log_n}");
         }
     }

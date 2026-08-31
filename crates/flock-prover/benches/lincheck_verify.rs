@@ -6,6 +6,7 @@
 //!   - `inner_product` for A and B consistency checks (the "× z_vec" pass — F128 muls)
 //!   - final `build_quirky_eq_table` + `inner_product` for the derived z-claim
 
+use flock_prover::init_perf_thread_pool;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -48,7 +49,7 @@ fn time_one<F: FnMut() -> R, R>(label: &str, n_iters: usize, mut f: F) -> f64 {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     let (a_0, b_0) = build_matrices();
     let k = 1usize << K_LOG;
     let inner_rest_len = K_LOG - K_SKIP;

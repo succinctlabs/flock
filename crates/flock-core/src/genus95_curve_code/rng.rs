@@ -5,6 +5,8 @@
 //! genus-95 tests — keeps the only cryptographic assumption SHA-256 (no separate
 //! stream-cipher RNG).
 
+use blake3::Hasher;
+use blake3::OutputReader;
 use flock_hash::HashKind;
 use rand_core::RngCore;
 use sha2::{Digest, Sha256};
@@ -80,12 +82,12 @@ impl RngCore for Sha256Rng {
 /// ([`crate::hash::HashKind::Blake3`]) so the sampler's expander follows the
 /// transcript's hash and no second primitive enters the soundness argument.
 pub struct Blake3Rng {
-    reader: blake3::OutputReader,
+    reader: OutputReader,
 }
 
 impl Blake3Rng {
     pub fn new(seed: [u8; 32]) -> Self {
-        let mut h = blake3::Hasher::new();
+        let mut h = Hasher::new();
         h.update(&seed);
         Self {
             reader: h.finalize_xof(),

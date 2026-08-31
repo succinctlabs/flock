@@ -17,6 +17,10 @@
 //!
 //! Run: `cargo bench --bench blake3_native_chain`
 
+use blake3::hash;
+use flock_prover::init_perf_thread_pool;
+use rayon::current_num_threads;
+use std::hint::black_box;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -29,7 +33,7 @@ use flock_core::test_rng::Rng;
 fn hash_chain(initial: [u8; 32], t: u64) -> [u8; 32] {
     let mut state = initial;
     for _ in 0..t {
-        state = *blake3::hash(&state).as_bytes();
+        state = *hash(&state).as_bytes();
     }
     state
 }
@@ -64,13 +68,13 @@ fn bench_single_chain(t: u64, runs: usize) {
     rng.fill_bytes(&mut initial);
 
     // Warm up branch predictor + caches.
-    let _ = std::hint::black_box(hash_chain(initial, 1024));
+    let _ = black_box(hash_chain(initial, 1024));
 
     let mut best = f64::INFINITY;
     let mut last_out = [0u8; 32];
     for run in 0..runs {
         let t0 = Instant::now();
-        let out = hash_chain(std::hint::black_box(initial), t);
+        let out = hash_chain(black_box(initial), t);
         let elapsed = t0.elapsed().as_secs_f64();
         let hps = t as f64 / elapsed;
         let ns_per_hash = elapsed * 1e9 / t as f64;
@@ -171,8 +175,8 @@ fn bench_parallel_chains(t_per_chain: u64, n_chains: usize, runs: usize) {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
-    let threads = rayon::current_num_threads();
+    let _ = init_perf_thread_pool();
+    let threads = current_num_threads();
     println!("(rayon threads available: {})", threads);
     #[cfg(target_arch = "aarch64")]
     println!("(target: aarch64 — using blake3 crate, NEON SIMD)");

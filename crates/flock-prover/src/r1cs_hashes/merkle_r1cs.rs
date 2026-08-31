@@ -107,11 +107,26 @@
 //! [`MerkleTreeLayout::root_bit`]). The claim-level glue binds them to
 //! public values.
 
+use blake3::BLAKE3_IV;
+use blake3::BLEN_BASE;
+use blake3::CV_BASE;
+use blake3::FLAGS_BASE;
+use blake3::K_LOG;
+use blake3::M_BASE;
+use blake3::OUT_LO_BASE;
+use blake3::T_HI_BASE;
+use blake3::T_LO_BASE;
+use blake3::USEFUL_BITS;
+use blake3::WORD_BITS;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
+use flock_core::zerocheck::K_SKIP;
 use flock_hash::blake3_compress;
+use std::array::from_fn;
+use std::sync::OnceLock;
 
 use super::blake3;
 use super::common::{empty_matrix, identity};
+use flock_core::schedule::IoWord;
 
 /// Bits in one digest / chaining value. Both supported encoders lay their
 /// input and output chaining values out as aligned `2^8`-bit slots.
@@ -186,11 +201,11 @@ pub struct HashSpec {
 /// `compress(IV, left‖right, 0, 64, PARENT)`.
 pub fn blake3_spec() -> HashSpec {
     HashSpec {
-        k_log: blake3::K_LOG,
-        useful_bits: blake3::USEFUL_BITS,
-        in_cv_base: blake3::CV_BASE,
-        out_cv_base: blake3::OUT_LO_BASE,
-        msg_base: blake3::M_BASE,
+        k_log: K_LOG,
+        useful_bits: USEFUL_BITS,
+        in_cv_base: CV_BASE,
+        out_cv_base: OUT_LO_BASE,
+        msg_base: M_BASE,
         flags: BLAKE3_FLAG_PARENT,
         compress: blake3_compress_cv,
         fixed_bits: blake3_fixed_bits,
@@ -221,18 +236,18 @@ fn blake3_compress_cv(
 /// BLAKE3's free inputs other than the message: `cv = IV`, `counter = 0`,
 /// `block_len = 64`, `flags = PARENT`.
 fn blake3_fixed_bits() -> Vec<(usize, bool)> {
-    let w = blake3::WORD_BITS;
+    let w = WORD_BITS;
     let mut out = Vec::with_capacity(SLOT_BITS + 4 * w);
-    for (word, iv) in blake3::BLAKE3_IV.iter().enumerate() {
+    for (word, iv) in BLAKE3_IV.iter().enumerate() {
         for b in 0..w {
-            out.push((blake3::CV_BASE + word * w + b, (iv >> b) & 1 == 1));
+            out.push((CV_BASE + word * w + b, (iv >> b) & 1 == 1));
         }
     }
     for (base, val) in [
-        (blake3::T_LO_BASE, NODE_COUNTER as u32),
-        (blake3::T_HI_BASE, (NODE_COUNTER >> 32) as u32),
-        (blake3::BLEN_BASE, NODE_BLOCK_LEN),
-        (blake3::FLAGS_BASE, BLAKE3_FLAG_PARENT),
+        (T_LO_BASE, NODE_COUNTER as u32),
+        (T_HI_BASE, (NODE_COUNTER >> 32) as u32),
+        (BLEN_BASE, NODE_BLOCK_LEN),
+        (FLAGS_BASE, BLAKE3_FLAG_PARENT),
     ] {
         for b in 0..w {
             out.push((base + b, (val >> b) & 1 == 1));
@@ -430,8 +445,7 @@ impl MerkleTreeLayout {
     /// Everything that IS here has an outside claimant: the leaf data is read
     /// by whatever proves the opened values, the index binds to the
     /// Fiat–Shamir query, and the root binds to the committed root.
-    pub fn io_schema(&self) -> Vec<flock_core::schedule::IoWord> {
-        use flock_core::schedule::IoWord;
+    pub fn io_schema(&self) -> Vec<IoWord> {
         assert!(
             self.leaf_blocks > 0,
             "io_schema is chunk-leaf only: the digest-leaf layout packs its \
@@ -492,15 +506,15 @@ impl MerkleTreeLayout {
         BlockR1cs {
             m: n_paths_log + self.k_log,
             k_log: self.k_log,
-            k_skip: flock_core::zerocheck::K_SKIP,
+            k_skip: K_SKIP,
             useful_bits: self.useful_bits,
             a_0,
             b_0,
             c_0: identity(self.k()),
             layout: WitnessLayout::BatchMajor,
             const_pin: Some(self.const_pos()),
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
 
@@ -605,7 +619,7 @@ pub struct ChunkPathInput {
 /// Chunk block `i`'s 16-word message: bytes `[64i, 64(i+1))` of the leaf
 /// data as little-endian words, per the BLAKE3 spec.
 fn leaf_msg_words(data: &[u8], block: usize) -> [u32; 16] {
-    std::array::from_fn(|w| {
+    from_fn(|w| {
         let o = block * 64 + 4 * w;
         u32::from_le_bytes(data[o..o + 4].try_into().unwrap())
     })

@@ -1,5 +1,7 @@
 use super::*;
-use flock_transcript::transcript_record::TranscriptOp as Op;
+use crate::r1cs_hashes::fs_chain::FsChainTrace;
+use flock_transcript::transcript_record::{TranscriptOp, TranscriptOp as Op};
+use std::mem::take;
 
 /// One packed-direct claim on the tape: its absorbed VALUE and gamma. The
 /// POINT is not on the stream since merged-open v1 — it is transcript-derived
@@ -17,7 +19,7 @@ pub(super) struct PdRec {
 #[inline]
 pub(super) fn squeeze_word_wire(
     outs: &[Vec<Wire>],
-    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &FsChainTrace,
     fin: usize,
     offset: usize,
 ) -> Wire {
@@ -128,7 +130,7 @@ pub(super) struct InitialOodRec {
 /// not as a wrong wire.
 #[allow(clippy::type_complexity)]
 pub(super) fn parse_open_levels(
-    ops: &[flock_transcript::transcript_record::TranscriptOp],
+    ops: &[TranscriptOp],
     cap0_bytes: usize,
     r: usize,
 ) -> (
@@ -576,7 +578,7 @@ pub(super) fn parse_open_levels(
         cur.bump();
         levels.push(OpenLevel {
             initial_ood: if li == 0 {
-                std::mem::take(&mut initial_ood)
+                take(&mut initial_ood)
             } else {
                 Vec::new()
             },

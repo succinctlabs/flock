@@ -22,17 +22,22 @@
 //!
 //! Run:  cargo run --release --bin dump_challenger_vectors -- cuda-ghash/challenger_vectors.bin
 
+use env::args;
+use flock_prover::field::F256;
+use std::collections::HashSet;
 use std::env;
 use std::fs::File;
+use std::io::Result;
 use std::io::{BufWriter, Write};
 
 use flock_prover::challenger::{Challenger, FsChallenger};
 use flock_prover::field::F128;
 
 use flock_core::test_rng::Rng;
+use flock_prover::pcs::stratified::LevelSchedule;
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "challenger_vectors.bin".to_string());
     let domain = b"flock-ligerito-test-v0";
@@ -116,7 +121,7 @@ fn main() -> std::io::Result<()> {
     {
         let block_len = 1000usize;
         let count = 20usize;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut qs: Vec<usize> = Vec::new();
         while qs.len() < count {
             let v = ch.sample_f128();
@@ -148,7 +153,7 @@ fn main() -> std::io::Result<()> {
     }
     // 6d. observe_f256 (two-coordinate slice observe — ladder message absorbs)
     {
-        let v = flock_prover::field::F256::new(rng.f128(), rng.f128());
+        let v = F256::new(rng.f128(), rng.f128());
         ch.observe_f256(v);
         let c = v.coordinates();
         let mut t = vec![10u8];
@@ -188,7 +193,6 @@ fn main() -> std::io::Result<()> {
     // the real LevelSchedule::decompose; the word→index mapping mirrors
     // ligerito.rs::queries_from_words (private — spec inlined here).
     {
-        use flock_prover::pcs::stratified::LevelSchedule;
         let (bits, log_block_len, count) = (2u32, 10usize, 279usize);
         let sched = LevelSchedule::decompose(count, log_block_len);
         assert_eq!(sched.queries(), count);

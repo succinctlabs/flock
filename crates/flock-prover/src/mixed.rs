@@ -31,6 +31,7 @@
 
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::ligerito::LigeritoProfile;
+use flock_core::pcs::ligerito::embedded_initial_k_or_default;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
 use flock_core::r1cs::BlockR1cs;
@@ -38,10 +39,23 @@ use flock_core::schedule::{Registry, TableType};
 use flock_core::union::UnionInstance;
 use flock_core::verifier::{self, FlockVerifyError};
 use flock_transcript::challenger::Challenger;
+use prover::prove_fast_ligerito_union;
+use serde::Deserializer;
+use serde::Serializer;
+use serde::de::Error;
 use serde::{Deserialize, Serialize};
+use verifier::verify_ligerito_union;
 
 use crate::prover::{self, UnionSlotProverInput};
-use crate::r1cs_hashes::{blake3, sha2};
+use crate::r1cs_hashes::blake3::{
+    Compression as Blake3Compression, K_LOG as BLAKE3_K_LOG,
+    build_block_r1cs as build_blake3_block_r1cs,
+    generate_witness_batch_major_partial_into as generate_blake3_witness_batch_major_partial_into,
+};
+use crate::r1cs_hashes::sha2::{
+    Compression as Sha2Compression, K_LOG as SHA2_K_LOG, build_block_r1cs as build_sha2_block_r1cs,
+    generate_witness_batch_major_partial_into as generate_sha2_witness_batch_major_partial_into,
+};
 
 /// A built-in mixed registry tier. Serialized in the wire format as the
 /// stable one-byte code of [`Self::code`] (via the explicit serde impls
@@ -130,16 +144,16 @@ impl MixedRegistryId {
 }
 
 impl Serialize for MixedRegistryId {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_u8(self.code())
     }
 }
 
 impl<'de> Deserialize<'de> for MixedRegistryId {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let code = u8::deserialize(d)?;
         Self::from_code(code)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown mixed registry id {code}")))
+            .ok_or_else(|| Error::custom(format!("unknown mixed registry id {code}")))
     }
 }
 
@@ -166,8 +180,8 @@ pub struct MixedCounts {
 impl MixedSetup {
     pub fn new(id: MixedRegistryId) -> Self {
         let nu = id.nu();
-        let sha2_r1cs = sha2::build_block_r1cs(nu);
-        let blake3_r1cs = blake3::build_block_r1cs(nu);
+        let sha2_r1cs = build_sha2_block_r1cs(nu);
+        let blake3_r1cs = build_blake3_block_r1cs(nu);
         let registry = Registry::new(
             vec![
                 TableType::from_block_r1cs(&sha2_r1cs),
@@ -176,8 +190,8 @@ impl MixedSetup {
             nu,
         );
         // Canonical slot order: SHA-256 (κ = 15) before BLAKE3 (κ = 14).
-        debug_assert_eq!(registry.types()[0].k_log, sha2::K_LOG);
-        debug_assert_eq!(registry.types()[1].k_log, blake3::K_LOG);
+        debug_assert_eq!(registry.types()[0].k_log, SHA2_K_LOG);
+        debug_assert_eq!(registry.types()[1].k_log, BLAKE3_K_LOG);
         Self {
             id,
             registry,
@@ -202,7 +216,7 @@ impl MixedSetup {
     /// `PcsParams.m` cannot redirect verification.
     pub fn pcs_params(&self, counts: MixedCounts, profile: LigeritoProfile) -> PcsParams {
         let union = self.union(counts);
-        let lb = flock_core::pcs::ligerito::embedded_initial_k_or_default(union.dense_m(), profile);
+        let lb = embedded_initial_k_or_default(union.dense_m(), profile);
         PcsParams {
             m: union.dense_m(),
             log_inv_rate: profile.log_inv_rate(),
@@ -223,8 +237,8 @@ impl MixedSetup {
     /// merged union proof under the `flock-mixed-v1` binding.
     pub fn prove<Ch: Challenger>(
         &self,
-        sha2_inputs: &[sha2::Compression],
-        blake3_inputs: &[blake3::Compression],
+        sha2_inputs: &[Sha2Compression],
+        blake3_inputs: &[Blake3Compression],
         profile: LigeritoProfile,
         challenger: &mut Ch,
     ) -> (R1csProofMergedLigerito, Commitment, R1csClaim) {
@@ -240,15 +254,15 @@ impl MixedSetup {
         // scatter form, without the copy.
         let slots = vec![
             UnionSlotProverInput::in_place(
-                |dst| sha2::generate_witness_batch_major_partial_into(sha2_inputs, nu, dst),
+                |dst| generate_sha2_witness_batch_major_partial_into(sha2_inputs, nu, dst),
                 self.sha2_r1cs.csc_lincheck_circuit(),
             ),
             UnionSlotProverInput::in_place(
-                |dst| blake3::generate_witness_batch_major_partial_into(blake3_inputs, nu, dst),
+                |dst| generate_blake3_witness_batch_major_partial_into(blake3_inputs, nu, dst),
                 self.blake3_r1cs.csc_lincheck_circuit(),
             ),
         ];
-        prover::prove_fast_ligerito_union(&union, &pcs_params, slots, challenger)
+        prove_fast_ligerito_union(&union, &pcs_params, slots, challenger)
     }
 
     /// Verify a mixed proof against the declared counts and the caller's
@@ -269,7 +283,7 @@ impl MixedSetup {
             self.sha2_r1cs.csc_lincheck_circuit(),
             self.blake3_r1cs.csc_lincheck_circuit(),
         ];
-        verifier::verify_ligerito_union(
+        verify_ligerito_union(
             &union,
             &circuits,
             commitment,
@@ -283,6 +297,8 @@ impl MixedSetup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bincode::deserialize;
+    use bincode::serialize;
 
     /// Tier table sanity: codes round-trip, capacities fit as documented,
     /// and `smallest_fitting` picks the smallest adequate tier.
@@ -313,12 +329,12 @@ mod tests {
     #[test]
     fn registry_id_serde_is_stable_code() {
         for id in MixedRegistryId::ALL {
-            let bytes = bincode::serialize(&id).unwrap();
+            let bytes = serialize(&id).unwrap();
             assert_eq!(bytes, vec![id.code()], "one stable byte");
-            let back: MixedRegistryId = bincode::deserialize(&bytes).unwrap();
+            let back: MixedRegistryId = deserialize(&bytes).unwrap();
             assert_eq!(back, id);
         }
-        assert!(bincode::deserialize::<MixedRegistryId>(&[0u8]).is_err());
+        assert!(deserialize::<MixedRegistryId>(&[0u8]).is_err());
     }
 
     /// The tier registry reproduces the geometry the M3/M4/M5 mixed tests

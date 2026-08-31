@@ -1,5 +1,14 @@
 #[allow(unused_imports)] // used only under cfg(test)
 use super::*;
+#[cfg(test)]
+use bincode::serialize;
+#[cfg(test)]
+use flock_core::{
+    pcs::{MergedOpenProof, ligerito::RecursiveProof},
+    proof::R1csProofCircuitMerged,
+};
+#[cfg(test)]
+use serde::Serialize;
 
 // ---------------------------------------------------------------------------
 // THE BENCHMARK CONTRACT: what a proof costs ONLINE.
@@ -83,16 +92,12 @@ pub(super) fn median_total(runs: &[Online]) -> f64 {
 /// compression per 64 bytes, so at the measured ~6.1 µs per b3 row a KiB of
 /// child proof is ~0.1 ms of parent per child.
 #[cfg(test)]
-pub(super) fn census_kib<T: serde::Serialize + ?Sized>(v: &T) -> f64 {
-    bincode::serialize(v).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0
+pub(super) fn census_kib<T: Serialize + ?Sized>(v: &T) -> f64 {
+    serialize(v).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0
 }
 
 #[cfg(test)]
-pub(super) fn proof_census(
-    label: &str,
-    p: &flock_core::proof::R1csProofCircuitMerged,
-    pcs: &PcsParams,
-) {
+pub(super) fn proof_census(label: &str, p: &R1csProofCircuitMerged, pcs: &PcsParams) {
     proof_census_parts(
         label,
         census_kib(p),
@@ -129,7 +134,7 @@ pub(super) fn proof_census_parts(
     boolean_kib: f64,
     element_kib: f64,
     wiring_kib: f64,
-    pcs_open: &flock_core::pcs::MergedOpenProof,
+    pcs_open: &MergedOpenProof,
     pcs: &PcsParams,
 ) {
     // Per-level stratified schedules, and the siblings a path emits ABOVE
@@ -177,19 +182,15 @@ pub(super) fn proof_census_parts(
     }
     let sz = |b: Result<Vec<u8>, _>| b.map(|v| v.len()).unwrap_or(0) as f64 / 1024.0;
     let lig = &pcs_open.inner.ligerito;
-    let rows = |v: &Vec<flock_core::pcs::ligerito::RecursiveProof>| -> (f64, f64) {
+    let rows = |v: &Vec<RecursiveProof>| -> (f64, f64) {
         (
-            v.iter()
-                .map(|r| sz(bincode::serialize(&r.opened_rows)))
-                .sum(),
-            v.iter()
-                .map(|r| sz(bincode::serialize(&r.merkle_proof)))
-                .sum(),
+            v.iter().map(|r| sz(serialize(&r.opened_rows))).sum(),
+            v.iter().map(|r| sz(serialize(&r.merkle_proof))).sum(),
         )
     };
     let (rec_rows, rec_paths) = rows(&lig.recursive_proofs);
-    let l0_rows = sz(bincode::serialize(&lig.initial_proof.opened_rows));
-    let l0_paths = sz(bincode::serialize(&lig.initial_proof.merkle_proof));
+    let l0_rows = sz(serialize(&lig.initial_proof.opened_rows));
+    let l0_paths = sz(serialize(&lig.initial_proof.merkle_proof));
     println!(
         "\n  PROOF CENSUS — {label}: {total:.1} KiB\n\
          \x20   boolean PIOP        {:6.1}\n\
@@ -210,20 +211,20 @@ pub(super) fn proof_census_parts(
         boolean_kib,
         element_kib,
         wiring_kib,
-        sz(bincode::serialize(&pcs_open.merged_rounds)),
-        sz(bincode::serialize(&pcs_open.ring_switches)),
-        sz(bincode::serialize(&pcs_open.frobenius.values)),
-        sz(bincode::serialize(&pcs_open.frobenius.rounds)),
-        sz(bincode::serialize(&pcs_open.frobenius.anchor)),
+        sz(serialize(&pcs_open.merged_rounds)),
+        sz(serialize(&pcs_open.ring_switches)),
+        sz(serialize(&pcs_open.frobenius.values)),
+        sz(serialize(&pcs_open.frobenius.rounds)),
+        sz(serialize(&pcs_open.frobenius.anchor)),
         l0_rows,
         l0_paths,
         rec_rows,
         rec_paths,
-        sz(bincode::serialize(&lig.initial_cap)) + sz(bincode::serialize(&lig.recursive_caps)),
-        sz(bincode::serialize(&lig.initial_cap)),
-        sz(bincode::serialize(&lig.recursive_caps)),
-        sz(bincode::serialize(&lig.final_proof)),
-        sz(bincode::serialize(&lig.sumcheck_transcript)),
+        sz(serialize(&lig.initial_cap)) + sz(serialize(&lig.recursive_caps)),
+        sz(serialize(&lig.initial_cap)),
+        sz(serialize(&lig.recursive_caps)),
+        sz(serialize(&lig.final_proof)),
+        sz(serialize(&lig.sumcheck_transcript)),
     );
 }
 
