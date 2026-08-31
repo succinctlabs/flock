@@ -152,6 +152,19 @@ impl TranscriptOp {
         }
     }
 
+    /// Whether this op owns a byte-payload ordinal: `ObserveBytes` (public
+    /// bytes) and both PoW forms (the private 16-byte nonce) share the
+    /// payload counter — the tower's tape walkers, fold/query regions and
+    /// `bytes_payload_mask` all index payloads this way.
+    pub fn carries_payload(&self) -> bool {
+        matches!(
+            self,
+            TranscriptOp::ObserveBytes(_)
+                | TranscriptOp::Pow { .. }
+                | TranscriptOp::LegacyPow { .. }
+        )
+    }
+
     /// Whether this op finalizes the pending state. Finalizations are the
     /// transcript's serial depth: a squeeze finalizes the running state, and
     /// everything after it depends on that state, so nothing downstream can
