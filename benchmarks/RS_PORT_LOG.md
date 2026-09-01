@@ -3576,3 +3576,37 @@ STILL DENSE-ONLY: `rounds3plus.rs` benches
 (`fold_and_round_pair_sparse_into`), so tail work still needs a real
 prove to adjudicate. Fixing it needs a `LiveLayout` fixture, not just a
 padding spec.
+
+### 16-bit gather tables: REFUTED, −21..25% — 2026-09-01
+
+The last untested lever on the round-2 fold: index the row fold with
+16-bit chunks instead of bytes — 4 gathers per row from `4 x 65536`
+entries (4 MiB) instead of 8 gathers from `8 x 256` (32 KiB). Built
+`T16[j][v] = data[2j][v & 0xff] + data[2j+1][v >> 8]` (same XOR multiset,
+so the fold is value-identical) plus a `fold_one_row_neon_q_unchecked_4x16`
+kernel, selected by a runtime knob so ONE binary measured both.
+
+Measured on the fixed SPARSE round-2 bench, m=29:
+
+| | 8-bit (8 gathers, 32 KiB) | 16-bit (4 gathers, 4 MiB) |
+|---|---|---|
+| ST | **35.42 ms** | 44.21 ms (+25%) |
+| MT | **6.59 ms** | 7.98 ms (+21%) |
+
+Checksums identical, so the table construction is right; it is simply
+slower. Halving the gather COUNT does not pay for leaving L1: 4 MiB sits
+in (shared) L2, and the added latency per gather more than eats the four
+saved. Building the table also costs 0.08 → 0.63 ms per prove.
+
+**Model correction.** The campaign's rule — "table footprint under
+128 KiB L1D is irrelevant; gather count and chain depth are what bind" —
+holds only WITHIN L1. Past L1 the footprint dominates and the rule
+inverts. That is consistent with the campaign's own earlier datum that an
+8x-SMALLER table also regressed 3.6%: the current 32 KiB, 8-gather shape
+is a local optimum in both directions.
+
+Reverted. With this closed, round 2's fold has no untested lever left
+that this session can identify: the arithmetic is q-resident
+(§wideneon + §qres, −16.2% ST on the real prove), the loop structure is
+right for the sparse route, and the table geometry is optimal in both
+directions.
