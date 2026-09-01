@@ -3745,3 +3745,39 @@ the switch OUTSIDE the loop and monomorphise (const generic), then
 verify the baseline arm still reproduces the unmodified timing before
 believing the other arm. Two probes today were wrecked by a flag read
 inside the loop.
+
+### §stripe (C-side from the lincheck stripe): RS blocked, AG unbuilt but PRICED — 2026-09-01
+
+**RS: blocked, measured.** Wiring `round1_..._stripe_c` on the union path
+fails with `Zerocheck(SumcheckFinalFailed)` — the union commits
+BatchMajor while the stripe fold assumes the RowMajor stripe↔witness
+index relation (the challenge tree gates the same mechanism on
+`layout == RowMajor`). Recorded 2026-08-31; unchanged.
+
+**AG: the mechanism does not exist and would need fresh derivation, so
+price it first.** AG's C side is a per-block bit transpose
+(`bitslice_block_into` / `transpose_fold_c_banks_2src`) plus 128
+`mul_acc_unred` into the even/odd friendly-bit banks — structurally the
+same thing §stripe deletes in RS ("removes the per-window bit transpose
+entirely; the drain's gathers drop from three to one").
+
+Priced with the const-generic probe (baseline reproduces the unmodified
+kernel at 12.29/12.32/12.49 ms, so this one is clean):
+
+| AG round 1, m=30 MT, production shape | |
+|---|---|
+| baseline | 12.32 ms |
+| C side removed entirely | 9.73 ms |
+| **whole C side** | **2.59 ms = 21.0% of round 1** |
+
+So the ceiling is 21% of round 1 — ~10 ms MT at m=32, where AG round 1
+is ~50 ms. RS's own §stripe captured −5.7% of its round 1 against a
+comparable share, i.e. roughly a quarter of its C side, since the stripe
+fold is not free either. Scaling that ratio suggests **~2-5 ms MT at
+m=32, ~1-3% of the AG zerocheck**.
+
+VERDICT: the only round-1 item with a non-trivial prize left, but it is
+NEW MATH, not a port — the AG C banks are over genus-95 code coordinates
+with the even/odd friendly split, and the derivation would have to
+target BatchMajor (the layout that killed the RS port) from the start.
+Not attempted; recorded with its price so the decision is informed.
