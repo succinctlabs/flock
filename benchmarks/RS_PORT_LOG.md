@@ -3256,3 +3256,40 @@ gated on `target_feature = "aes"` — from a block gated only on
 (aes is default) but would break a non-aes aarch64 build. Both arms are
 now correctly gated, with the extracted-fold path kept as the non-PMULL
 fallback.
+
+### AG skip fold: the byte-dot was the scalar twin of an existing NEON kernel — −9% ST, −7.5% MT — 2026-08-31
+
+Targeted by evidence, not by analogy. The earlier probes put the AG
+fold's cost at ~85% byte-dot gathers and only ~12% message chain
+(removing the Horner + products entirely saved 4–6 ms of 42), so the
+§wideneon/§qres treatment that paid in RS round 2 does NOT apply here —
+the accumulator is not where the time is. The gather is.
+
+`byte_dot_u64` folds one 64-bit message through `8 x [F128; 256]` tables:
+eight gathers XORed. That is *exactly* what RS's
+`fold_one_row_neon_q_unchecked_8` does, with the identical table layout
+(contiguous, `STRIDE = 256*16`) — but AG's was written scalar
+(`*table.get_unchecked(j).get_unchecked(byte)` + `F128 +`) while RS's is
+NEON. Re-exported the RS kernel from `multilinear` as `fold_row_q_neon`
+and routed AG's `byte_dot` through it on aarch64; the scalar form stays
+as the non-aarch64 path.
+
+Paired A/B (min-of-proves per invocation, alternating), m=32:
+
+| | NEON | scalar | delta |
+|---|---|---|---|
+| MT pair 1 | 37.99 | 41.12 | −3.13 |
+| MT pair 2 | 40.84 | 41.78 | −0.94 |
+| MT pair 3 | 40.47 | 44.50 | −4.03 |
+| **MT median** | | | **−3.1 (−7.5%), 3/3** |
+| ST pair 1 | 278.22 | 305.16 | −26.9 |
+| ST pair 2 | 280.03 | 309.26 | −29.2 |
+| **ST** | | | **−28 (−9.0%), 2/2** |
+
+Bit-identical (same table entries, same XOR multiset): core 560 green,
+prover 76 green, and the heavy `prove_fast_union_ag_roundtrip` verifies.
+
+Smaller than hoped — LLVM was already emitting reasonable code for the
+16-byte-aligned `F128` table loads, so this recovers the remaining gap
+rather than a 2×. But it is the first improvement to the AG path, and it
+lands on AG's second-largest phase.

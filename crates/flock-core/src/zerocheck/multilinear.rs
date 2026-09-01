@@ -49,6 +49,11 @@ mod kernels;
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::fold_one_row_neon_q_unchecked_8;
+/// The 8-gather row fold, re-exported for the AG skip fold: its `w` tables
+/// have the identical layout (8 x [F128; 256], STRIDE = 256*16), so the same
+/// kernel serves both.
+#[cfg(target_arch = "aarch64")]
+pub(crate) use kernels::aarch64::fold_one_row_neon_q_unchecked_8 as fold_row_q_neon;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",

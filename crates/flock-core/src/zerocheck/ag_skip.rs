@@ -175,6 +175,24 @@ pub(super) fn build_w_tables(w: &[F128]) -> Vec<[F128; 256]> {
 /// the XOR chain from depth 7 to 3. Output bit-identical.
 #[inline]
 pub(super) fn byte_dot(packed: &[u8], r: usize, table: &[[F128; 256]]) -> F128 {
+    // NEON: eight 16-byte table gathers XORed in vector registers, against the
+    // scalar form's sixteen u64 loads and fourteen GPR XORs. The `w` tables are
+    // `8 x [F128; 256]` contiguous — exactly the layout the RS row-fold kernel
+    // indexes (`STRIDE = 256*16`) — so the same kernel serves both trees.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::{vgetq_lane_u64, vreinterpretq_u64_u8};
+        let acc = crate::zerocheck::multilinear::fold_row_q_neon(
+            table.as_ptr() as *const u8,
+            packed.as_ptr().add(r * 8),
+        );
+        let q = vreinterpretq_u64_u8(acc);
+        return F128 {
+            lo: vgetq_lane_u64::<0>(q),
+            hi: vgetq_lane_u64::<1>(q),
+        };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     unsafe {
         let v = (packed.as_ptr().add(r * 8) as *const u64).read_unaligned();
         byte_dot_u64(v, table)
