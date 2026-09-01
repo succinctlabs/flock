@@ -4674,3 +4674,55 @@ So the tail is settled: the ladder with a fold1 entry (−4.5 ms MT, ST
 wash) stays; the entry cannot be moved into the fold; the general
 kernel's NEON residency (~−8 ms MT) remains the last kernel-level item.
 Probe removed; `lookahead_accum` back to private.
+
+### Commit attributed: NTT 98 + merkle 116 + lane fill 18 — at the hash roofline for rate 1/4 — 2026-09-01
+
+`FLOCK_COMMIT_TIMING=1`, m=32, warm prove 2: lane fill 17.66, ntt 98.44,
+merkle 116.45, commit total 232.59 ms. L0 is the Fast profile's rate 1/4
+(`log_inv_rate = 2`), so the L0 codeword is 2^27 F128 = 2 GB.
+
+- NTT: 2 GB in 98 ms = 0.73 ns/element. The challenge tree's L0 encode is
+  175.6 ms for 2^26 (rate 1/2) = 2.6 ns/element — ours is ~3.5× faster
+  per element. Roughly 2.5 full passes over 2 GB at ~50 GB/s.
+- Merkle: 2 GB hashed in 116 ms = 17 GB/s. The doc's two-state BLAKE3
+  kernel does 2.3–2.4 GB/s per core; 8 P-cores = 19 GB/s. ~90% of the
+  hash roofline. Yukon's merkle is 49.7 ms for 1 GB = 20 GB/s — same
+  rate, half the bytes.
+- Lane fill 17.7 (tiled earlier today, −31% ST).
+
+So our commit costs ~232 vs their ~145 pure because it encodes 4× and
+hashes 2× the bytes for the same message — the rate, i.e. protocol.
+Nothing here clears the bloat bar as implementation: the streaming
+commit / leaf-pipelining idea measured null on this tree before
+(memory: 6/12, parked), four-layer NTT fusion spills (+19–26%), and
+hashing less is a security decision, not mine.
+
+### Thread pools, and the all-core (P+E) experiments: fold marginal-and-fragile, ladder worse, lincheck null — 2026-09-01
+
+FACTS (flock-core/src/lib.rs): the global rayon pool is `init_perf_thread_pool`
+= P-cores only (8 threads, 8 MB stacks); a separate `all_core_pool()`
+(10 threads) exists for flat parallel-fors with many small independent
+items and one join, where work-stealing drains around the slow E-cores
+(its documented win: the open's combine −29% on 4P+4E). Sites hop to it
+behind `ecore_rich_topology()` = `2·E ≥ P`, which is FALSE on this 8P+2E
+M1 Max; `FLOCK_ALLCORE=1` forces the gate. So "fold 1 scales 5.2×" is 65%
+efficiency on 8 P-threads, not E-core dilution — that hypothesis is dead.
+Also explains the `RAYON_NUM_THREADS=8` trap: it disables
+`init_perf_thread_pool` AND shrinks the all-core pool to 8.
+
+Three flat-shaped phases tried on the all-core pool, same binary, env
+knobs, MT warm-min, alternating:
+- skip→mlv fold (376k independent 128-slot blocks): −2.27 / −2.53 /
+  −2.54 / **+9.24**. The outlier landed exactly when external load
+  appeared (load avg 3.3 → 6.8): under contention the E-cores become
+  stragglers at the join. −2.4 ms (0.3%) with that tail risk is below
+  the bar. Not kept.
+- tail ladder passes (thousands of chunks, 8-accumulator reduce per
+  chunk): **+1.89 / +4.59** — worse. The reduce-heavy shape is the
+  doc's straggler case. Dead.
+- lincheck (`FLOCK_ALLCORE=1`, the stripe fold's gated hop): the one
+  quiet pair +1.11 (null); two more pairs ran under a load spike
+  (absolutes 199 → 246–269) and are unreadable. Consistent with the
+  gate's design. Dead on this topology.
+
+All knobs removed; ag_skip.rs is exactly the committed ladder.
