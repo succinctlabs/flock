@@ -3334,3 +3334,43 @@ Consequences, now encoded in `benchmarks/abq.sh`:
 
 Usage: `benchmarks/abq.sh -b round2 -c <control-worktree> -m 29
 [-p 3] [-e "RAYON_NUM_THREADS=1"] [-a "32 3"] [-g "(best)"]`
+
+### More round-2 / AG-fold ILP: one marginal win, one regression — 2026-09-01
+
+Both loops are now gather-bound (32 table gathers per pair / per inner
+step), so the lever left is how many independent gather chains are in
+flight — the §twolane idea. Tried on both, using the new abq harness
+(each verdict took ~2 minutes rather than ~20).
+
+**Round 2, two pairs per iteration: −4.9% MT / −2.5% ST, 3/3, checksums
+identical.** Mechanism is loads-before-stores: with one pair the
+compiler cannot hoist the next iteration's gathers past the output
+stores, so eight chains only overlap if two pairs are folded before
+either is stored.
+**NOT KEPT — below the bloat bar.** 79 insertions for ~−2 ms MT
+(round 2 is ~43 ms of a ~900 ms prove, so 0.23% end to end). The log's
+own precedent rejected epool-zc at "−6..7 ms, ~200 lines"; this is a
+worse ratio. Patch preserved at
+`scratchpad/round2_2pair_unroll.patch` — restore with `git apply` if
+the bar ever moves.
+
+**AG fold, two inner steps per iteration: +15%, 0/3 — REGRESSION.**
+Same transformation, opposite sign. The AG fold writes into per-block
+128-element `am`/`bm` slices that are L1-resident, so its stores never
+blocked hoisting in the first place; doubling the live values (8 F128 +
+2 F256Unreduced) buys nothing and costs register pressure against a
+strictly serial γ²-Horner chain. Reverted.
+
+Worth recording as a rule: **round 2 and the AG fold look structurally
+identical — 32 gathers, four byte-dots, a wide accumulator — and
+respond OPPOSITELY to the same restructuring.** The difference is the
+output: round 2 streams into a large codeword-sized buffer, the AG fold
+into a small L1-resident block.
+
+Remaining untested lever for both: 16-bit gather indices (4 gathers per
+row fold instead of 8, from 4 x 65536-entry tables = 4 MiB). The
+campaign's performance model says "gather count and chain depth bind,
+table footprint under L1 is irrelevant" — but 4 MiB is far past L1, and
+the campaign already measured an 8x-smaller table as a −3.6%
+regression, so the sign is genuinely unknown. Cheap to settle with abq
+if anyone wants it.
