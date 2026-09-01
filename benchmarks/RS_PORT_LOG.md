@@ -2950,3 +2950,52 @@ open), stripe-C (batch-major layout), AB hoist (no GPU to free the
 cores), compact-K/cascade (sparse wins on RS; AG already has the
 hybrid), recursive fill fusion (wrong rate regime). That is the honest
 accounting of the port campaign against today's protocol.
+
+### RS vs AG, end to end — and a 3.2× dispatch bug in the AG path — 2026-08-31
+
+Added `BLAKE3_ZC=rs|ag` to the blake3_proof bench (bench-only selector,
+same family as BLAKE3_PROFILE / FLOCK_MERKLE_HASH). `prove_fast_union_ag`
+is a true drop-in — same union commit, lincheck and merged opening,
+only zerocheck round 1 differs — so this isolates the flavors on one
+witness. Earlier AG numbers in this log came from `ag_breakdown`, which
+drives the kernels on a DENSE synthetic witness and does NOT reflect the
+union path; that comparison was invalid.
+
+**AS SHIPPED, RS WINS BY 3.7×: RS 900 ms vs AG 3.37 s** at m=32.
+
+Cause, from `[ag-zc-timing]`: the union's run-list makes AG take its
+SPARSE route (out n = 48,234,496 = 71.875% — our occupancy), and the AG
+sparse route is pathological:
+
+| AG stage | sparse (default) | dense (gate raised) |
+|---|---|---|
+| round 1 | 147 ms | 55–69 ms |
+| skip→mlv fold | 307 ms | 193 ms |
+| mlv tail | **657 ms** | **120 ms** |
+
+`FLOCK_SPARSE_GATE=999999999` (dense) takes the whole AG prove
+**3.37 s → 1.04 s**. Paired, alternating, each flavor at its best
+config: rs 943/966/889/910 vs ag-dense 886/873/896/900 — **AG wins 3/4,
+median ≈ −34 ms (~4%)**. So AG is at parity-to-slightly-ahead of RS
+*when dispatched correctly*, and 3.7× behind as shipped.
+
+**MECHANISM:** the AG sparse tail forfeits the friendly-Horner kernel.
+`fold_and_friendly_round_pair_into` (the γ-geometric kernel with no
+per-term `eq_lo` PMULL) is called ONLY from the dense
+`mlv_tail_fs_resume` (ag_skip.rs:1634-1640); `mlv_tail_fs_sparse`
+routes through RS's `fold_and_round_pair_sparse_into` "with the
+friendly constants riding as ordinary `r_next` weights" (:1412) — i.e.
+the general kernel. The early rounds are the biggest, so losing the
+friendly kernel there costs 5.5× on the tail.
+
+**This is the `SPARSE_TAIL_GATE = 1` issue from this morning, now with
+a price tag.** The constant makes the gate `live ≤ n` — always true —
+contradicting its own doc ("Full utilization itself stays dense
+(live·2 > n) ... the dense kernels are the calibrated choice there").
+The asymmetry is measured, not assumed: at 71.875% occupancy sparse
+WINS for RS (mech 89.3 vs 142.7 ms, 8/8) and LOSES catastrophically for
+AG (tail 657 vs 120 ms). A global gate change would fix AG and cost RS
+~53 ms, so the fix is a flavor-aware (or friendly-kernel-aware) gate,
+not a new constant. NOT changed here — flagged for a decision, since AG
+is main's direction of travel and this is the largest single effect
+found all session.

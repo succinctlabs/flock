@@ -111,6 +111,15 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         Err(_) => HashKind::default(),
     };
     let fs = || FsChallenger::with_hash(b"flock-bench-v0", fs_hash);
+    // BLAKE3_ZC=rs|ag selects the boolean zerocheck flavor (default rs).
+    // `prove_fast_union_ag` is the same union commit / lincheck / merged
+    // opening — only zerocheck round 1 differs — so this isolates RS vs AG
+    // end to end on one witness.
+    let zc_ag = match std::env::var("BLAKE3_ZC").as_deref() {
+        Ok("ag") => true,
+        Ok("rs") | Err(_) => false,
+        Ok(v) => panic!("BLAKE3_ZC must be rs or ag (got {v})"),
+    };
     println!(
         "  merkle hash: {}   fs hash: {}",
         setup.pcs_params.merkle_hash, fs_hash
@@ -128,11 +137,23 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         .map(|run| mk_blocks(0xC0FFEE_BEEF ^ (n_blocks as u64) ^ (run as u64)))
         .collect();
 
+    println!("  zerocheck: {}", if zc_ag { "ag" } else { "rs" });
+
     // Warm-up.
     {
         let mut ch_p = fs();
-        let (p, _, _) = setup.prove_fast(&block_sets[0], &mut ch_p);
-        black_box(&p);
+        if zc_ag {
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (p, _, _) = setup.prove_fast_union_ag(&block_sets[0], &mut ch_p);
+                black_box(&p);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            panic!("BLAKE3_ZC=ag requires aarch64");
+        } else {
+            let (p, _, _) = setup.prove_fast(&block_sets[0], &mut ch_p);
+            black_box(&p);
+        }
     }
 
     // Best-of-n_runs prove_fast. Each run uses a distinct block vector so the
@@ -142,10 +163,18 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         let blocks = &block_sets[run + 1];
         let mut ch_p = fs();
         let t0 = Instant::now();
-        let (p, _, _) = setup.prove_fast(blocks, &mut ch_p);
+        if zc_ag {
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (p, _, _) = setup.prove_fast_union_ag(blocks, &mut ch_p);
+                black_box(&p);
+            }
+        } else {
+            let (p, _, _) = setup.prove_fast(blocks, &mut ch_p);
+            black_box(&p);
+        }
         let elapsed = t0.elapsed().as_secs_f64();
         best_fast = best_fast.min(elapsed);
-        black_box(&p);
         println!(
             "  [run {}/{}] prove_fast: {}",
             run + 1,
@@ -160,7 +189,9 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     );
 
     // Peak memory + verify time + serialized proof size (single prove).
-    {
+    // RS only: the AG prove returns a different bundle type, and this stage
+    // is not what the RS-vs-AG comparison is measuring.
+    if !zc_ag {
         let blocks_v = &block_sets[0];
         reset_peak();
         let mut ch_p = fs();
