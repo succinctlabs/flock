@@ -3536,3 +3536,43 @@ opportunity this log claimed it was. Both the "sparse 4→1 lookahead
 kernel neither tree has" item and the sparse-vs-cascade hybrid are
 closed. (The separate `SPARSE_TAIL_GATE` question for the AG path stands
 on its own evidence and is unaffected.)
+
+### Micro-benches fixed: they now drive the PRODUCTION sparse dispatch — 2026-09-01
+
+The zerocheck micro-benches predate the union/sparse work and measured a
+route the m=32 prove never takes. That gap produced a wrong verdict
+(a two-pair unroll read −3.5% on the dense bench and neutral on the real
+prove), so the benches are now shaped like the shipped witness.
+
+`benches/round2.rs` — rewritten to call
+`uni_skip_fold_and_round_pair_runs_sparse` under a run-list
+`PaddingSpec` matching the BLAKE3 union (`useful_bits = 11_707` of a
+2^14 block ⇒ `ceil(11707/128) = 92` useful chunk-columns of 128 =
+71.875% occupancy), with the dead column tail left honestly zero as the
+prover guarantees. **The dense entry is gone.** m starts at 20 because
+the block skip needs `k_log = m − 7 ≥ 13`.
+
+`benches/round1.rs` — the two-bank fusion variant now takes the same
+run-list instead of `PaddingSpec::dense(m)`.
+
+VALIDATED against the two things whose truth we already know from the
+real prove:
+
+| change | old DENSE bench | **new SPARSE bench** | real prove |
+|---|---|---|---|
+| §wideneon + §qres | −19.5% | **−13.1%, 3/3** | −16.2% |
+| two-pair unroll | −3.5%, 3/3 | **+0.24 ms, 1/3** | neutral, 4/7 |
+
+So it now both detects the real win and REJECTS the false positive that
+motivated the fix. Checksums identical in both cases.
+
+Note for future A/Bs: changing a bench's source means the control
+worktree must get the SAME bench file, or the two arms run different
+instruments — which shows up immediately as differing checksums (it did,
+because `cp` is aliased interactive and silently did not overwrite).
+
+STILL DENSE-ONLY: `rounds3plus.rs` benches
+`fold_and_compute_round_pair_optimized` and never the sparse tail
+(`fold_and_round_pair_sparse_into`), so tail work still needs a real
+prove to adjudicate. Fixing it needs a `LiveLayout` fixture, not just a
+padding spec.

@@ -176,7 +176,31 @@ fn main() {
             println!("  {:<40} {:>10.2} ms", "  (best)", best_opt_ms);
         }
 
-        // Two-bank fusion variant (also produces s_hat_v_c).
+        // Two-bank fusion variant (also produces s_hat_v_c), on the
+        // PRODUCTION dispatch: a run-list padding spec shaped like the union
+        // witness (92 of 128 chunk-columns useful = 71.875% occupancy), not
+        // `PaddingSpec::dense`. The dense spec measures a route the m=32
+        // prove never takes — the same gap that produced a wrong round-2
+        // verdict on 2026-09-01. Requires k_log = m - 7 >= 13 for the
+        // block-skip to engage, i.e. m >= 20.
+        let prod_padding = if m >= 20 {
+            let col_bits = m - 7;
+            flock_prover::zerocheck::PaddingSpec::from_runs(vec![
+                flock_prover::zerocheck::PaddingRun {
+                    k_log: col_bits,
+                    useful_bits_per_block: 1usize << col_bits,
+                    n_blocks: 92,
+                },
+                flock_prover::zerocheck::PaddingRun {
+                    k_log: col_bits,
+                    useful_bits_per_block: 0,
+                    n_blocks: 36,
+                },
+            ])
+        } else {
+            flock_prover::zerocheck::PaddingSpec::dense(m)
+        };
+
         let _ = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
             &a_packed,
             &b_packed,
@@ -185,7 +209,7 @@ fn main() {
             K_SKIP,
             &r,
             &table,
-            &flock_prover::zerocheck::PaddingSpec::dense(m),
+            &prod_padding,
         );
         let mut best_fusion_ms = f64::INFINITY;
         for run in 0..n_runs {
@@ -203,7 +227,7 @@ fn main() {
                 K_SKIP,
                 &r,
                 &table,
-                &flock_prover::zerocheck::PaddingSpec::dense(m),
+                &prod_padding,
             );
             let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
             println!("  {:<40} {:>10.2} ms", label, elapsed);
