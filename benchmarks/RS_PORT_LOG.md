@@ -3452,3 +3452,44 @@ outright.
 The two round-2 ports that DID land (§wideneon, §qres, 281.7 → 236.1 ms
 ST cumulative) were measured on the real prove throughout, so they are
 unaffected by this.
+
+### CORRECTION 2: the round-2 unroll is NEUTRAL on production, not a regression — 2026-09-01
+
+Benedikt pushed back that a kernel cannot be faster in isolation and
+slower in situ without something differing in how it is CALLED. He was
+right, and both of my explanations were wrong.
+
+First theory (short interval pieces) — **false**. Probed the actual
+argument: the sparse route calls `fold_pair_run` with pieces of 4096,
+3584, 3072, 2560, 2048, 1536, 1024 and 512 pairs. Long ranges; per-call
+overhead is not it.
+
+Second, the "+6.8% ST regression" itself — **an artifact of comparing
+two separately built BINARIES.** Re-measured with the unroll behind a
+runtime knob so ONE binary provides both arms, real prove, m=32 ST,
+7 alternating pairs: +11.7, −2.4, −1.7, +0.3, −1.4, +0.3, −4.9 →
+**median −1.4 ms (−0.6%), 4/7 — neutral.** The two-binary run's +16 ms
+was code layout/alignment, which at this effect size dominates: the
+control worktree was also three commits behind, so the binaries differed
+in more than the change.
+
+Corrected picture:
+
+| route | effect |
+|---|---|
+| dense (micro-bench) | −3.5% MT, −2.3% ST, 3/3 — real |
+| **sparse (production m=32)** | **neutral, −0.6%, 4/7** |
+
+So it is a genuine win on the DENSE round-2 route and buys nothing on
+the route production currently takes. Left unapplied (patch preserved in
+`scratchpad/round2_2pair_unroll.patch`), but note the coupling: **if the
+`SPARSE_TAIL_GATE` question is ever resolved toward dense dispatch, this
+becomes a live ~3% win** and should be revisited with it.
+
+**THIRD measurement error today, all one family:** cold-vs-warm proves,
+dense-vs-sparse routes, and now binary-vs-binary layout. Each time the
+two arms differed in more ways than the change. Rule going forward, and
+the one that actually settled this: **for effects under ~5%, switch the
+variant with a temporary runtime knob inside ONE binary.** Cross-binary
+A/B is only trustworthy for larger effects or when the trees differ by
+exactly the change.
