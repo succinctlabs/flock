@@ -23,6 +23,14 @@
 #       the "=== m = 29" block). Without it the FIRST matching line is used.
 #
 # Both arms are rebuilt first, then run in ALTERNATING order.
+#
+# LIMIT — READ THIS. The zerocheck micro-benches drive DENSE padding. The
+# production union prove at m=32 takes the SPARSE round-2/tail dispatch, whose
+# kernels run over short interval pieces with small, cache-resident outputs.
+# Changes to per-pair ARITHMETIC transfer between the two (wideneon/qres read
+# -19.5% here vs -16.2% on the real prove); changes to LOOP STRUCTURE do not —
+# a two-pair unroll measured -3.5% here and +6.8% on the real ST prove
+# (2026-09-01). Confirm anything structural with a full prove.
 set -u
 
 BENCH=""; CTL=""; PAIRS=3; ENVS=""; BARGS=""; PAT="(best)"; SECT=""

@@ -3411,3 +3411,44 @@ Horner" story is NOT needed to explain a null.
 `abq.sh` now takes the MIN over matching lines inside the `-m` section
 (section bounded by the next `===` banner), with both traps documented
 in its header.
+
+### Round-2 unroll: NOT APPLIED — it is dense-only, and production is sparse — 2026-09-01
+
+Benedikt's call was that ~5% of a phase clears the bloat bar, so the
+two-pair unroll was re-applied and re-verified. It does not survive the
+production check:
+
+| measurement | result |
+|---|---|
+| `round2` micro-bench (DENSE padding), MT | −3.5%, 3/3 |
+| `round2` micro-bench (DENSE padding), ST | −2.3%, 3/3 |
+| **real prove, m=32 MT (SPARSE route)** | **+1.4 ms, 1/3** |
+| **real prove, m=32 ST (SPARSE route)** | **+16 ms = +6.8%, 0/3** |
+
+ST real-prove pairs: 255.0/252.2/251.9 (unrolled) vs 240.7/236.4/234.9
+(plain). Reverted — this is a REGRESSION where it matters, not a
+bloat-bar rejection.
+
+WHY: production at m=32 takes the sparse round-2 route, which calls
+`fold_pair_run` per live INTERVAL PIECE — short ranges writing into
+small, L1-resident output slices. That is the same regime as the AG
+fold, where the unroll also bought nothing: when the stores are already
+cache-resident the compiler can interleave across iterations anyway, so
+the restructure adds control flow (two closures, a mixed-liveness
+branch, a tail loop) for no scheduling gain. The dense route writes into
+a codeword-sized buffer where the stores DO block hoisting, which is the
+only regime the unroll helps.
+
+**METHODOLOGICAL LESSON, the second self-inflicted one today: the
+zerocheck micro-benches drive DENSE padding and are NOT a proxy for the
+production sparse dispatch.** They were validated against §wideneon and
+§qres (−19.5% micro vs −16.2% real) only because those changes help both
+routes equally — they touch the per-pair arithmetic, not the loop
+structure. Any change to LOOP STRUCTURE or dispatch must be confirmed on
+the real prove. This caveat was written into abq.sh's introduction and
+then ignored one experiment later. abq.sh header updated to say it
+outright.
+
+The two round-2 ports that DID land (§wideneon, §qres, 281.7 → 236.1 ms
+ST cumulative) were measured on the real prove throughout, so they are
+unaffected by this.
