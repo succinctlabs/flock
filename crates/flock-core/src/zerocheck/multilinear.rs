@@ -641,9 +641,22 @@ where
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
+        use crate::field::gf2_128::aarch64::{WideNeon, wide_mul_unreduced_neon};
         let table_ptr = table.data.as_ptr() as *const u8;
         let a_pkt_ptr = a_packed.as_ptr();
         let b_pkt_ptr = b_packed.as_ptr();
+
+        // Deferred reduction IN THE VECTOR FILE. `F256Unreduced` is a
+        // four-word GPR struct: each `mul_unreduced` pays six
+        // `vgetq_lane_u64` extracts to leave the vector registers and each
+        // `^=` is four GPR XORs. `WideNeon` holds the same 256-bit
+        // accumulator as two vector registers — accumulate is two NEON XORs
+        // with no extracts, and the extracts are paid ONCE on the way out.
+        // Bit-identical: reduction is XOR-linear and the XOR multiset is
+        // unchanged. (The x86 arm below already accumulates wide via
+        // `WideGhashX4`; aarch64 had been left on the scalar struct.)
+        let mut p1_w = WideNeon::zero();
+        let mut pinf_w = WideNeon::zero();
 
         for pair in ps..pe {
             let x0l = 2 * (pair - out_base);
@@ -669,10 +682,14 @@ where
 
             let eq_l = eq_lo[pair & lo_mask];
             let g1 = a1 * b1;
-            p1_acc ^= eq_l.mul_unreduced(g1);
+            p1_w.xor_assign(wide_mul_unreduced_neon(eq_l, g1));
             let g_inf = (a0 + a1) * (b0 + b1);
-            pinf_acc ^= eq_l.mul_unreduced(g_inf);
+            pinf_w.xor_assign(wide_mul_unreduced_neon(eq_l, g_inf));
         }
+
+        // Leave the vector file once, here.
+        p1_acc ^= p1_w.to_unreduced();
+        pinf_acc ^= pinf_w.to_unreduced();
     }
     #[cfg(all(
         target_arch = "x86_64",

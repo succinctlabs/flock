@@ -3098,3 +3098,45 @@ its tail (276) still beats the all-dense tail (421). The earlier
 per-phase MT attribution (tail 657 vs 120) was taken from the COLD
 first prove (its `bind statement` read 1297 ms) and is withdrawn. The
 warm MT phase table is the outstanding measurement.
+
+### Round 2: vector-resident accumulator ported (§wideneon) — −9.2% ST, 3/3 — 2026-08-31
+
+**The campaign's round-2 machinery was NOT live.** Main's shared round-2
+kernel `fold_pair_run` (multilinear.rs) accumulates the 256-bit message
+partials in `F256Unreduced` — the four-word GPR struct that §wideneon
+replaced — so every `mul_unreduced` pays six `vgetq_lane_u64` extracts
+to leave the vector file and every `^=` is four GPR XORs. Notably main's
+**x86 arm already accumulates wide** (`WideGhashX4`); only aarch64 was
+left on the scalar struct. `WideNeon` was sitting in
+`field/gf2_128/aarch64.rs` — with a doc comment describing this exact
+optimization — reachable only from the dormant compact-K block.
+
+Ported: the aarch64 arm of `fold_pair_run` now accumulates into two
+`WideNeon` vector registers via `wide_mul_unreduced_neon`, flushing to
+`F256Unreduced` once per run. Both round-2 routes (interval/sparse at
+:966 and dense at :996) call `fold_pair_run`, so both get it. Bit-
+identical: reduction is XOR-linear and the XOR multiset is unchanged;
+all 13 proof pins hold, suites green (core 560, prover 76).
+
+**ST paired A/B vs 8bd1a27, 3 alternating pairs (m=32, quiet machine):**
+
+| phase | cand | ctrl | delta | |
+|---|---|---|---|---|
+| **round 2** | **239.3** | **281.7** | **−26.0 (−9.2%)** | **3/3** |
+| round 1 | 900.5 | 899.3 | +0.5 | control, flat |
+| tail | 273.2 | 275.6 | −2.4 | control, flat |
+| zc+lincheck | 1544.6 | 1580.5 | −46.3 | 2/3 |
+| commit | 1720.1 | 1729.8 | −9.8 | control, noise |
+| total | 4928.9 | 4986.8 | −50.2 | 2/3 |
+
+Round 2 is 3/3 disjoint at −26 ms; round 1 and the tail are flat, which
+is the correct control signature (the change touches only round 2's
+accumulator). The tex measured −13.4% for this on the old tree; we get
+−9.2%, on a baseline that is already cheaper because main's sparse path
+folds ~72% of the domain.
+
+Round 2 ST: **281.7 → 239.3 ms** — versus the campaign's 312 ms best on
+the old protocol. §qres (the register-resident message loop, a further
+−13% there) is the untouched second half of that section: the loop still
+computes `g1 = a1 * b1` as a REDUCED scalar multiply before the unreduced
+eq product, which is exactly the register-file crossing §qres removed.
