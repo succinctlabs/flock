@@ -4803,3 +4803,14 @@ largest cross-tree implementation delta either side found today, and it
 favors THIS tree, so it is not an action item here; it is one for the
 challenge tree, where a like-for-like kernel comparison would start
 from (a).
+
+Addendum (Yukon, closing): candidate (a) is theirs to run, as a
+DIAGNOSTIC — their `log_batch_size = 6` (64 lanes) is part of the
+committed PcsParams and the ranked harness gates on it, so a 128-lane run
+changes the commitment, not just the kernel. If the streaming width turns
+out to be the difference, their fix has to come from restructuring the
+kernel at 64 lanes. Also recorded: the "tower basis" claim originated as
+my hypothesis, was promoted to a conclusion on their side without a
+source check, and was caught by reading our header — the same failure
+mode as the friendly-kernel claim in the other direction. Verify from
+source before recording an explanation, in either direction.
