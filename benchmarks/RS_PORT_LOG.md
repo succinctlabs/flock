@@ -3493,3 +3493,46 @@ the one that actually settled this: **for effects under ~5%, switch the
 variant with a temporary runtime knob inside ONE binary.** Cross-binary
 A/B is only trustworthy for larger effects or when the trees differ by
 exactly the change.
+
+### Sparse vs dense in round 2 — the "sparse r2 + cascade tail" hybrid is REFUTED — 2026-09-01
+
+Benedikt asked why the micro-benches drive DENSE padding when production
+runs SPARSE, and whether round 2 should be dense at all. Both parts have
+answers, and the second one overturns this session's earlier claim.
+
+**Why the micro-benches are dense:** they predate the union/sparse work
+and call the dense entry point. That is a genuine tooling gap — it is why
+the two-pair unroll looked like a win. They remain valid for per-pair
+ARITHMETIC changes (wideneon/qres read −19.5% there vs −16.2% real), but
+not for anything touching dispatch or loop structure.
+
+**Should round 2 be dense? No.** Sparse round 2 costs 240 ms ST against
+the compact-K producer's 679 ms; it folds ~72% of the domain and wins
+outright.
+
+**And the hybrid this log proposed on 2026-08-31 — "sparse round 2
+handing off to the cascade tail, the win neither tree has" — is WRONG.**
+The claim rested on comparing the sparse tail (273 ms) with the dense
+route's cascade tail (75 ms). Those are not comparable: the dense route's
+tail starts at a QUARTER of the domain, because compact-K has already
+consumed rounds 2–5. Its cheap tail is bought by its expensive producer.
+
+Measured directly, one binary, temporary `FLOCK_ZC_TAILPOLICY` knob,
+real prove m=32 ST:
+
+| policy | round 2 | tail | zc+lincheck |
+|---|---|---|---|
+| sparse tail (today) | 240.6 | **277.3** | **1564.8** |
+| expand + cascade tail | 238.0 | **577.6** | 1855.2 |
+
+The hybrid is **2x WORSE on the tail**: it pays `expand_to_dense` at the
+largest size and then runs every tail round over the full domain instead
+of the 72% live span, and the cascade's pass-halving does not cover
+either cost. Reverted.
+
+CONCLUSION: **the current dispatch — sparse round 2, sparse tail — is
+correct**, and the zerocheck's route selection is not the open
+opportunity this log claimed it was. Both the "sparse 4→1 lookahead
+kernel neither tree has" item and the sparse-vs-cascade hybrid are
+closed. (The separate `SPARSE_TAIL_GATE` question for the AG path stands
+on its own evidence and is unaffected.)
