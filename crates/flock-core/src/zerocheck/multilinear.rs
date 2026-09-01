@@ -1229,7 +1229,11 @@ pub fn fold_in_place_single(a: &mut Vec<F128>, challenge: F128) {
 pub fn fold_in_place_pair(a: &mut Vec<F128>, b: &mut Vec<F128>, challenge: F128) {
     let n = a.len();
     assert_eq!(b.len(), n);
-    assert!(n.is_power_of_two() && n >= 2);
+    // Any EVEN length folds exactly — the sparse tail resolves a deferred
+    // lookahead challenge on its compact live PREFIX, which is a multiple of
+    // the chunk-column width but not a power of two. Power-of-two callers are
+    // unchanged.
+    assert!(n.is_multiple_of(2) && n >= 2, "fold_in_place_pair needs an even length ≥ 2");
     let half = n / 2;
     for x in 0..half {
         let a0 = a[2 * x];
@@ -1916,12 +1920,20 @@ pub fn lookahead_msg_second(q: &LookaheadSums, rho: F128) -> (F128, F128) {
     )
 }
 
-/// The 8 per-position Q products from the 4 folded values per witness
-/// (index = x + 2y): [s10, sinf0, c0, t11, c2, d0, dt, d2] — see the module
-/// comment for which sum each feeds.
+/// Per-position Q contribution — the 8 products from the 4 folded values per
+/// witness (index = x + 2y): [s10, sinf0, c0, t11, c2, d0, dt, d2], see the
+/// module comment for which sum each feeds — eq-weighted into the 8 unreduced
+/// accumulators.
+///
+/// ONE SCALING PER ROW: the four `a` values are pre-scaled by `eq` with four
+/// REDUCED multiplies, and each of the eight products is then a single
+/// UNREDUCED multiply that already carries the weight — 12 multiplies per
+/// position against the 16 of "8 reduced products, then 8 unreduced eq
+/// weightings". Exact: every product is bilinear, so `(eq·a)·b = eq·(a·b)` in
+/// the field, and the unreduced accumulators reduce to the same sums.
 #[inline(always)]
-pub(crate) fn lookahead_products(ga: &[F128; 4], gb: &[F128; 4]) -> [F128; 8] {
-    let (ga00, ga10, ga01, ga11) = (ga[0], ga[1], ga[2], ga[3]);
+fn lookahead_accum(ga: &[F128; 4], gb: &[F128; 4], eq: F128, acc: &mut [F256Unreduced; 8]) {
+    let (ga00, ga10, ga01, ga11) = (eq * ga[0], eq * ga[1], eq * ga[2], eq * ga[3]);
     let (gb00, gb10, gb01, gb11) = (gb[0], gb[1], gb[2], gb[3]);
     let sxa0 = ga00 + ga10;
     let sxb0 = gb00 + gb10;
@@ -1931,25 +1943,14 @@ pub(crate) fn lookahead_products(ga: &[F128; 4], gb: &[F128; 4]) -> [F128; 8] {
     let dcb = gb00 + gb01;
     let dsa = sxa0 + sxa1;
     let dsb = sxb0 + sxb1;
-    [
-        ga10 * gb10,               // s10
-        sxa0 * sxb0,               // sinf0
-        ga01 * gb01,               // col1 c0
-        ga11 * gb11,               // col1 @ X=1
-        sxa1 * sxb1,               // col1 c2
-        dca * dcb,                 // col∞ c0
-        (dca + dsa) * (dcb + dsb), // col∞ @ X=1
-        dsa * dsb,                 // col∞ c2
-    ]
-}
-
-/// Per-position Q contribution, eq-weighted into the 8 unreduced accumulators.
-#[inline(always)]
-fn lookahead_accum(ga: &[F128; 4], gb: &[F128; 4], eq: F128, acc: &mut [F256Unreduced; 8]) {
-    let p = lookahead_products(ga, gb);
-    for k in 0..8 {
-        acc[k] ^= eq.mul_unreduced(p[k]);
-    }
+    acc[0] ^= ga10.mul_unreduced(gb10); // s10
+    acc[1] ^= sxa0.mul_unreduced(sxb0); // sinf0
+    acc[2] ^= ga01.mul_unreduced(gb01); // col1 c0
+    acc[3] ^= ga11.mul_unreduced(gb11); // col1 @ X=1
+    acc[4] ^= sxa1.mul_unreduced(sxb1); // col1 c2
+    acc[5] ^= dca.mul_unreduced(dcb); // col∞ c0
+    acc[6] ^= (dca + dsa).mul_unreduced(dcb + dsb); // col∞ @ X=1
+    acc[7] ^= dsa.mul_unreduced(dsb); // col∞ c2
 }
 
 pub(crate) fn lookahead_finish(s: [F128; 8]) -> LookaheadSums {
@@ -1968,7 +1969,16 @@ macro_rules! lookahead_pass {
         /// Writes the folded arrays into `a_out`/`b_out` and returns the 8
         /// lookahead sums over the next two variables. `r_y` is the eq coord of
         /// the SECOND lookahead variable; `rest` the coords after it
-        /// (`rest.len() == log2(out_len/4)`). Parallel over the eq-hi chunks.
+        /// (`rest.len() == log2(DOMAIN/4)` where DOMAIN is the full logical
+        /// output domain). Parallel over the eq-hi chunks.
+        ///
+        /// `a` may be a PREFIX of the full domain (`a.len() <= PER_U <<
+        /// rest.len()`, a multiple of `PER_U`): the eq tables are sized from
+        /// `rest`, every position is weighted by its own global index, and
+        /// only the present positions are visited — so on a live-prefix layout
+        /// (the sparse tail's single interval) the sums are exactly the full
+        /// domain's with the dead suffix at zero, and the outputs are the dense
+        /// outputs' prefix. Full-domain callers are unchanged.
         pub fn $name(
             a: &[F128],
             b: &[F128],
@@ -1984,10 +1994,9 @@ macro_rules! lookahead_pass {
             assert_eq!(a.len() % PER_U, 0);
             assert_eq!(a_out.len(), 4 * n_u);
             assert_eq!(b_out.len(), 4 * n_u);
-            assert_eq!(
-                1usize << rest.len(),
-                n_u,
-                "rest coords must cover log2(len/{PER_U})"
+            assert!(
+                n_u <= 1usize << rest.len(),
+                "rest coords must cover log2(domain/{PER_U}); got a prefix longer than the domain"
             );
             let n_lo = rest.len() / 2;
             let eq_lo = build_eq(&rest[..n_lo]);
@@ -2001,7 +2010,8 @@ macro_rules! lookahead_pass {
                 .map(|(u_hi, (ao, bo))| {
                     let mut acc = [F256Unreduced::ZERO; 8];
                     let base_u = u_hi * lo_size;
-                    for u_lo in 0..lo_size {
+                    // A prefix's last chunk may be partial.
+                    for u_lo in 0..ao.len() / 4 {
                         let u = base_u + u_lo;
                         let mut ga = [F128::ZERO; 4];
                         let mut gb = [F128::ZERO; 4];

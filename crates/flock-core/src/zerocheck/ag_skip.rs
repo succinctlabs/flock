@@ -1481,10 +1481,30 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
     let mut domain = 1usize << n_mlv;
     let (mut a_nxt, mut b_nxt) = (Vec::new(), Vec::new());
     let mut i = 1usize;
+    // LOOKAHEAD on the sparse path. When the live layout is a single PREFIX
+    // interval — the shipped shape: the useful chunk-columns are a prefix, so
+    // the compact buffer IS the dense prefix — the dense lookahead ladder
+    // runs on it directly: `fold1/fold2_lookahead_into` size their eq tables
+    // from the challenge suffix and weight every position by its global
+    // index, so a prefix's sums are the full domain's with the dead suffix
+    // at zero, and its outputs are the dense outputs' prefix. Two rounds per
+    // pass with the message in the same sweep; measured on the dense route
+    // at m=32: the steady fold2 passes cost 19–36% less than the two classic
+    // rounds each replaces (the fold1 ENTRY pass is the one that does not
+    // pay, +16% ST). Same `pending2` invariant as `mlv_tail_fs_resume`: the
+    // arrays are folded through every sampled challenge except `rho_prev`
+    // (and `pending2` if set); while a challenge is deferred, `domain` is
+    // one halving ahead of the round index. Transcript-identical to the
+    // classic rounds (the lookahead messages are exact).
+    let mut pending2: Option<F128> = None;
+    let la_enabled = !LOOKAHEAD_DISABLE.load(Ordering::Relaxed);
     while i < n_mlv && domain >= 1024 && store.len() * super::sparse_tail_gate() <= domain {
-        let log_before = domain.trailing_zeros() as usize;
-        let mut r_next = vec![F128::ONE; log_before - 1];
-        r_next[1..].copy_from_slice(&r_rest[i + 1..]);
+        let live = store.len();
+        let is_prefix =
+            store.intervals().len() == 1 && store.intervals()[0].0 == 0 && a_mlv.len() == live;
+        let per_u = if pending2.is_some() { 16 } else { 8 };
+        let lookahead =
+            la_enabled && is_prefix && i + 1 < n_mlv && live >= 1024 && live % per_u == 0;
         // Output storage is bounded by the input's: shrinking pairs can
         // only round outward by one slot per interval end.
         let cap = store.len() + 2 * store.intervals().len() + 2;
@@ -1494,6 +1514,65 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
             a_nxt = crate::scratch::take_f128(cap);
             b_nxt = crate::scratch::take_f128(cap);
         }
+        if lookahead {
+            let out_len = if pending2.is_some() {
+                live / 4
+            } else {
+                live / 2
+            };
+            let (ao, bo) = (&mut a_nxt[..out_len], &mut b_nxt[..out_len]);
+            let q = if let Some(r2) = pending2 {
+                fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r_rest[i + 2..])
+            } else {
+                fold1_lookahead_into(
+                    &a_mlv,
+                    &b_mlv,
+                    ao,
+                    bo,
+                    (rho_prev, F128::ZERO),
+                    &r_rest[i + 2..],
+                )
+            };
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(out_len);
+            b_mlv.truncate(out_len);
+            store = LiveLayout::new(vec![(0, out_len)]);
+            domain = if pending2.is_some() {
+                domain / 4
+            } else {
+                domain / 2
+            };
+            let (m1a, mia) = lookahead_msg_first(&q, r_rest[i + 1]);
+            rounds.push((m1a, mia));
+            challenger.observe_f128(m1a);
+            challenger.observe_f128(mia);
+            let rho_a = challenger.sample_f128();
+            rhos.push(rho_a);
+            let (m1b, mib) = lookahead_msg_second(&q, rho_a);
+            rounds.push((m1b, mib));
+            challenger.observe_f128(m1b);
+            challenger.observe_f128(mib);
+            let rho_b = challenger.sample_f128();
+            rhos.push(rho_b);
+            rho_prev = rho_a;
+            pending2 = Some(rho_b);
+            i += 2;
+            continue;
+        }
+        // Leaving lookahead mode inside the sparse loop: resolve the deferred
+        // fold on the compact prefix (still one interval), then continue with
+        // the classic rounds.
+        if let Some(r2) = pending2.take() {
+            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+            store = LiveLayout::new(vec![(0, a_mlv.len())]);
+            domain /= 2;
+            rho_prev = r2;
+            continue;
+        }
+        let log_before = domain.trailing_zeros() as usize;
+        let mut r_next = vec![F128::ONE; log_before - 1];
+        r_next[1..].copy_from_slice(&r_rest[i + 1..]);
         let (m1, mi, store_out) = fold_and_round_pair_sparse_into(
             &a_mlv,
             &b_mlv,
@@ -1529,7 +1608,7 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
     crate::scratch::give_f128(a_nxt);
     crate::scratch::give_f128(b_nxt);
     let (tail_rounds, tail_rhos, a_eval, b_eval) =
-        mlv_tail_fs_resume(a_full, b_full, i, rho_prev, None, r_rest, challenger);
+        mlv_tail_fs_resume(a_full, b_full, i, rho_prev, pending2, r_rest, challenger);
     rounds.extend(tail_rounds);
     rhos.extend(tail_rhos);
     (rounds, rhos, a_eval, b_eval)
