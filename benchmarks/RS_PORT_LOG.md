@@ -3140,3 +3140,41 @@ the old protocol. §qres (the register-resident message loop, a further
 −13% there) is the untouched second half of that section: the loop still
 computes `g1 = a1 * b1` as a REDUCED scalar multiply before the unreduced
 eq product, which is exactly the register-file crossing §qres removed.
+
+### Why the commit bucket is noisy: it is the lane transpose fill — 2026-08-31
+
+Per-prove ST commit sub-timings (new `scan+take` / `lane fill` line under
+the existing FLOCK_COMMIT_TIMING knob):
+
+| prove | scan+take | lane fill | ntt | merkle | commit |
+|---|---|---|---|---|---|
+| 1 | 0.00 | 109.5 | ~644 | ~960 | 1720.4 |
+| 2 | 0.00 | 117.8 | ~636 | ~950 | 1740.6 |
+| 3 | 0.01 | **159.6** | ~646 | ~974 | 1766.5 |
+| 4 | 0.01 | **153.5** | ~637 | ~970 | 1767.2 |
+| 5 | 0.01 | 118.4 | ~644 | ~957 | 1732.7 |
+
+NTT varies 1.7%, merkle 2.5%, **the fill varies 46% (109–160 ms)** — and
+that accounts for essentially all of the commit bucket's ±34 ms swing.
+The allocation itself is free (0.00–0.01 ms: the scratch pool returns a
+warm buffer, so `prewarm_prover` is working).
+
+MECHANISM: `replicate_lane_major_fill` is the transpose
+`out[p·t + lane] = q[lane·d + p]`. It tiles over 64 positions but NOT
+over lanes, so it keeps **t concurrent read streams** open — one per
+lane, each walking a far-apart region of a 2 GB buffer — while writing
+with stride `t` elements. That is TLB/page-mapping bound, and page
+placement varies per process and per pool recycle: stable work, variable
+time. The NTT and Merkle are sequential streams over the same bytes and
+do not show it.
+
+**Methodological consequence: commit deltas below ~40 ms are not
+trustworthy on this host.** This retroactively explains the phantom
+"commit +10 / open +28" in the RS-vs-AG table (identical code both arms)
+and the ±34 commit swings in the round-2 A/B, where round 1 — a
+compute-bound phase — was flat to 0.2% in the same runs. Prefer
+compute-bound phases as controls.
+
+OPEN OPTIMIZATION: block the fill over lanes (e.g. 8 at a time) so the
+number of live read streams is bounded. Should cut both the mean and the
+variance of a 109–160 ms ST pass. Not attempted yet.

@@ -705,8 +705,19 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
         }
     }
     let codeword_len = params.n_positions() * t;
+    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let t_take = std::time::Instant::now();
     let mut codeword = crate::scratch::take_f128(codeword_len);
+    let t_take = t_take.elapsed();
+    let t_fill = std::time::Instant::now();
     replicate_lane_major_fill(&mut codeword, q, t, d);
+    if timing {
+        eprintln!(
+            "[commit-timing] scan+take {:.2} ms | lane fill {:.2} ms",
+            t_take.as_secs_f64() * 1e3,
+            t_fill.elapsed().as_secs_f64() * 1e3
+        );
+    }
     finalize_commit(codeword, live, params)
 }
 
