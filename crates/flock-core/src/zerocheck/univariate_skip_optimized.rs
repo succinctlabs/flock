@@ -1734,6 +1734,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn stripe_c_banks_match_drain_banks() {
         use crate::lincheck::pack_z_lincheck;
         use crate::zerocheck::univariate_skip::pack_bits;
@@ -1967,6 +1968,9 @@ mod tests {
         }
     }
 
+    // NEON-only: `shift_reduce_inner_ab_fused_neon` does not exist off aarch64,
+    // so without this gate the x86 CI leg fails to COMPILE the test crate.
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_fused_inner_matches_scalar_inner() {
         // The new register-fused NEON kernel — verify against the same scalar

@@ -46,13 +46,6 @@ impl<const NW: usize> BitRecord<NW> {
         Self { w: [0u64; NW] }
     }
 
-    /// The record's raw words, for sequential full-word publication
-    /// (see `PackedWordWriter::push_record` in blake3.rs).
-    #[inline(always)]
-    pub(crate) fn words(&self) -> &[u64; NW] {
-        &self.w
-    }
-
     /// OR a (pre-masked) value into record bits `[POS, POS + width)`.
     /// `POS` is const so the straddle branch and shifts fold at compile time.
     #[inline(always)]
@@ -333,109 +326,6 @@ where
         false,
         per_block,
     )
-}
-
-/// [`drive_witness_packed_and_lincheck`] for per-block builders that WRITE
-/// EVERY WORD of their (z, a, b) slices (no OR into pre-zeroed storage) —
-/// the group memset and its read-modify-write tax are skipped entirely.
-/// Requires `padding` so every slot is built; a `None` slot would be left
-/// uninitialized.
-/// Provenance tag for a witness-role scratch buffer of a specific layout.
-/// Derived independently at the take site (witness generation, from the
-/// encoder's own constants) and the give site (the prover, from the same
-/// values on `BlockR1cs`), so no plumbing carries it between them. Bump
-/// `V` on ANY change to the witness block layout or to which regions the
-/// full-write builder elides on a hit.
-pub(crate) fn witness_scratch_tag(m: usize, k_log: usize, useful_bits: usize, role: u64) -> u64 {
-    const V: u64 = 1;
-    (0x57u64 << 56)
-        | (V << 48)
-        | (role << 40)
-        | ((k_log as u64) << 32)
-        | ((useful_bits as u64) << 12)
-        | (m as u64)
-}
-
-pub(crate) const WITNESS_ROLE_Z: u64 = 1;
-pub(crate) const WITNESS_ROLE_A: u64 = 2;
-pub(crate) const WITNESS_ROLE_B: u64 = 3;
-
-pub(crate) fn drive_witness_packed_and_lincheck_full_write<S: Sync, F>(
-    initial_states: &[S],
-    padding: &S,
-    n_blocks_log: usize,
-    k_log: usize,
-    tags: [u64; 3],
-    per_block: F,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
-where
-    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64], [bool; 3]) + Sync,
-{
-    use rayon::prelude::*;
-
-    let k = 1usize << k_log;
-    let f128_per_block = k / 128;
-    let n_total = 1usize << n_blocks_log;
-    let n_blocks = initial_states.len();
-    assert!(n_blocks <= n_total);
-    assert!(n_total >= 8 && n_total.is_multiple_of(8));
-    let u64_per_block = k / 64;
-
-    let total_f128 = n_total * f128_per_block;
-    let elide_off = false;
-    let tag_of = |t: u64| if elide_off { 0 } else { t };
-    let (mut z, z_hit) = flock_core::scratch::take_f128_tagged(total_f128, tag_of(tags[0]));
-    let (mut a, a_hit) = flock_core::scratch::take_f128_tagged(total_f128, tag_of(tags[1]));
-    let (mut b, b_hit) = flock_core::scratch::take_f128_tagged(total_f128, tag_of(tags[2]));
-    let hits = [z_hit, a_hit, b_hit];
-    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
-
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
-            for k_in in 0..8 {
-                let global_idx = 8 * g + k_in;
-                let init: &S = if global_idx < n_blocks {
-                    &initial_states[global_idx]
-                } else {
-                    padding
-                };
-                // SAFETY: F128 is `repr(C, align(16))` with two LE u64
-                // fields; the rows are disjoint block-sized windows.
-                let row = |grp: &mut [F128]| -> &mut [u64] {
-                    unsafe {
-                        std::slice::from_raw_parts_mut(
-                            grp.as_mut_ptr().add(k_in * f128_per_block) as *mut u64,
-                            u64_per_block,
-                        )
-                    }
-                };
-                per_block(init, row(z_grp), row(a_grp), row(b_grp), hits);
-            }
-
-            // Bit-transpose 8 z chunks into the lincheck stripe.
-            let z_u64_all: &[u64] = unsafe {
-                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
-            };
-            for i in 0..u64_per_block {
-                let lanes: [u64; 8] = [
-                    z_u64_all[i],
-                    z_u64_all[u64_per_block + i],
-                    z_u64_all[2 * u64_per_block + i],
-                    z_u64_all[3 * u64_per_block + i],
-                    z_u64_all[4 * u64_per_block + i],
-                    z_u64_all[5 * u64_per_block + i],
-                    z_u64_all[6 * u64_per_block + i],
-                    z_u64_all[7 * u64_per_block + i],
-                ];
-                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
-            }
-        });
-
-    (z, a, b, z_lincheck)
 }
 
 fn drive_witness_packed_and_lincheck_impl<S: Sync, F>(

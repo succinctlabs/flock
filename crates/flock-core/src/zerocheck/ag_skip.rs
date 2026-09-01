@@ -200,7 +200,10 @@ pub(super) fn byte_dot(packed: &[u8], r: usize, table: &[[F128; 256]]) -> F128 {
 }
 
 /// [`byte_dot`] on a pre-loaded (possibly pre-combined) 64-bit message. Lets
-/// the tensor fold dot `m₀⊕m₁` without a memory round-trip.
+/// the tensor fold dot `m₀⊕m₁` without a memory round-trip. Non-aarch64 only:
+/// on aarch64 `byte_dot` goes through the NEON row-fold kernel and nothing
+/// reaches the scalar form, so it would trip `-D warnings` as dead code.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub(super) fn byte_dot_u64(v: u64, table: &[[F128; 256]]) -> F128 {
     unsafe {
