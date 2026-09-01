@@ -730,13 +730,25 @@ fn replicate_lane_major_fill(codeword: &mut [F128], q: &[F128], t: usize, d: usi
 
     let msg_len = t * d;
     debug_assert!(codeword.len().is_multiple_of(msg_len));
-    const TILE: usize = 64; // positions per tile
+    // Positions per tile. Each tile reads ONE contiguous run per lane, so the
+    // tile length IS the read burst length: at 64 positions that is a 1 KiB
+    // burst per lane, and with `t` lanes whose regions sit `d` elements apart
+    // the hardware prefetcher never establishes a stream — measured ~9 GB/s
+    // for what is a pure copy. Longer bursts fix that: at m=32 ST the fill
+    // goes 136 -> 94 ms median (64 -> 1024 positions; 4096 is slightly worse).
+    // At MT it is a wash (bandwidth-saturated across 8 workers either way),
+    // so this is an ST/low-thread win taken at zero MT cost.
+    //
+    // Sized against the work, not fixed: keep at least ~4 tiles per worker so
+    // small commits do not lose their parallelism to one huge tile.
+    let threads = rayon::current_num_threads().max(1);
+    let tile = (d / (4 * threads)).clamp(64, 1024);
     codeword.par_chunks_mut(msg_len).for_each(|rep| {
-        rep.par_chunks_mut(TILE * t)
+        rep.par_chunks_mut(tile * t)
             .enumerate()
-            .for_each(|(tile, out)| {
-                let p0 = tile * TILE;
-                let n = TILE.min(d - p0);
+            .for_each(|(tile_idx, out)| {
+                let p0 = tile_idx * tile;
+                let n = tile.min(d - p0);
                 for lane in 0..t {
                     let src = &q[lane * d + p0..lane * d + p0 + n];
                     for (p, &v) in src.iter().enumerate() {

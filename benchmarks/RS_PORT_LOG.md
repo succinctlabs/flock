@@ -3178,3 +3178,37 @@ compute-bound phases as controls.
 OPEN OPTIMIZATION: block the fill over lanes (e.g. 8 at a time) so the
 number of live read streams is bounded. Should cut both the mean and the
 variance of a 109–160 ms ST pass. Not attempted yet.
+
+### Lane-fill tiling: 1 KiB read bursts were starving the prefetcher — 2026-08-31
+
+Follow-up to the noise finding above. `replicate_lane_major_fill` tiled
+at 64 positions, and the tile length IS the per-lane read burst: 64
+F128 = 1 KiB, with `t` lanes whose source regions sit `d` elements
+(8 MiB at m=32) apart. The prefetcher never establishes a stream across
+61 far-separated 1 KiB bursts, so a pure copy ran at ~9 GB/s.
+
+Tile sweep, m=32, median of 5 proves per setting:
+
+| positions/tile | ST fill | MT fill |
+|---|---|---|
+| 64 (was) | 136 ms | ~31 ms |
+| 256 | 106 | ~32 |
+| **1024** | **94** | ~31 |
+| 4096 | 100 | — |
+| 2048 | — | ~30 |
+
+**ST −31%; MT is a wash** — at 8 workers the pass is bandwidth-saturated
+regardless of burst length, so this is an ST/low-thread win taken at
+zero MT cost. Shipped as a size-aware tile rather than a constant:
+`tile = (d / (4 * threads)).clamp(64, 1024)`, keeping ≥4 tiles per
+worker so small commits do not collapse to a single task. Verified after:
+ST fill median 136 → 103, min 124 → 63. Suites green (pure loop
+retiling; the commit byte-identity tests cover it).
+
+NOTE — this does NOT fix the commit bucket's variance. The residual
+spread is the same at every tile size (MT 16→35 ms within one process,
+ST 63→108), and it tracks prove ORDER, not geometry: the first proves
+of a process are consistently fastest. That points at scratch-pool /
+page state (the first proves get `prewarm_prover`'s prefaulted buffers,
+later ones get recycled ones), which is a separate lead. The
+"commit deltas under ~40 ms are untrustworthy" rule stands.
