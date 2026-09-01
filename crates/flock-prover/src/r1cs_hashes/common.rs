@@ -686,6 +686,7 @@ where
             a: &mut a,
             b: &mut b,
             elide_padding_writes: false,
+            dead_padding_unread: false,
         },
         per_group,
     );
@@ -727,6 +728,7 @@ where
         a,
         b,
         elide_padding_writes: _,
+        dead_padding_unread: _,
     } = dst;
     for buf in [&*z, &*a, &*b] {
         assert_eq!(buf.len(), total_f128, "witness destination length");
@@ -831,6 +833,7 @@ where
             a: &mut a,
             b: &mut b,
             elide_padding_writes: false,
+            dead_padding_unread: false,
         },
         per_group,
     );
@@ -867,6 +870,7 @@ where
         a,
         b,
         elide_padding_writes,
+        dead_padding_unread,
     } = dst;
     for buf in [&*z, &*a, &*b] {
         assert_eq!(buf.len(), total_f128, "witness destination length");
@@ -885,16 +889,51 @@ where
     } else {
         n_total / BM_V
     };
-    stripe
-        .par_chunks_mut(u64_per_block * 64)
-        .take(tail_groups)
-        .for_each(|g| g[useful_words * 64..].fill(0));
+    // The stripe tail (rows >= useful_words of each visited group) is only
+    // ever read by `partial_fold_packed_z_rows_best`, which is `useful_bits`
+    // aware and skips whole blocks past the useful region — so when the
+    // caller certifies `dead_padding_unread` it can stay dirty, saving
+    // 153 MB at m=32. Uncertified callers keep the strict contract: the
+    // stripe then matches canonical `pack_z_lincheck` byte for byte, which
+    // `batch_major_partial_zeroes_dummy_rows` pins.
+    if !dead_padding_unread {
+        stripe
+            .par_chunks_mut(u64_per_block * 64)
+            .take(tail_groups)
+            .for_each(|g| g[useful_words * 64..].fill(0));
+    }
     if !elide_padding_writes {
         // Zero the padding suffix (contiguous chunk-columns >=
         // useful_chunks); the group loop fully writes the useful prefix —
         // declared rows from the builders, dummy rows as zero flushes.
+        // Zero the padding suffix (contiguous chunk-columns >=
+        // useful_chunks) of **`z` ONLY**. `z` is the committed buffer: under
+        // identity compaction q IS this buffer, so its padding words go into
+        // the committed stack and must be honest zeros or the prover's own
+        // opening disagrees with its claims.
+        //
+        // `a` and `b` are NEVER committed — their only consumers are the
+        // run-list-gated zerocheck (Dead blocks skipped, Partial blocks
+        // cleansed into zeroed scratch; see the padding contract on
+        // `flock_core::proof::BooleanPiopProofAg`) and the count-proportional
+        // lincheck, none of which reads a declared-dead bit. So their suffix
+        // is left as-is, saving 2/3 of this memset — 288 MB of the 432 MB at
+        // m=32. Verified by `ab_padding_suffix_is_never_read`, which poisons
+        // exactly this region and pins the proof byte-identical; if a future
+        // consumer starts reading a/b padding, that test fails.
+        // Zero the padding suffix (contiguous chunk-columns >=
+        // useful_chunks). `z` ALWAYS: it is the committed buffer, and under
+        // identity compaction q IS this buffer, so its padding words land in
+        // the committed stack and must be honest zeros or the prover's own
+        // opening disagrees with its claims. `a`/`b` only when the caller has
+        // NOT certified `ab_padding_unread` — they are never committed, and
+        // the run-list-gated zerocheck plus count-proportional lincheck read
+        // no declared-dead bit. Skipping them saves 288 MB of the 432 MB here.
         let tail = useful_chunks << n_blocks_log;
-        for buf in [&mut *z, &mut *a, &mut *b] {
+        for (i, buf) in [&mut *z, &mut *a, &mut *b].into_iter().enumerate() {
+            if i > 0 && dead_padding_unread {
+                continue;
+            }
             buf[tail..]
                 .par_chunks_mut(1 << 16)
                 .for_each(|c| c.fill(F128::ZERO));

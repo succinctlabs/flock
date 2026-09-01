@@ -440,6 +440,17 @@ fn build_union_witness(
 
     let (mut z, mut a, mut b, mode) = union.take_witness_buffers(padding_unread);
     let elide = mode != flock_core::union::WitnessBufMode::PooledZeroed;
+    // The dead regions (a/b padding columns, lincheck stripe tail) are read
+    // by nobody on the merged pipeline: the
+    // boolean zerocheck is run-list gated on BOTH flavors (Dead blocks
+    // skipped, Partial cleansed) and the lincheck is count-proportional. This
+    // is the `padding_unread` predicate MINUS its identity-compaction clause,
+    // which exists only because `q` aliases the COMMITTED `z` buffer — an
+    // argument that says nothing about `a`/`b`. Element registries are
+    // excluded for the same reason they are there: their `a`/`b` are derived
+    // by gather rather than run-list gated.
+    let dead_padding_unread =
+        !union.has_element() && union.m_total() - union.n_log() >= pcs::LOG_PACKING;
     let nu = union.n_log();
     // Live-only element `pa`/`pb` derivation: when the region zerocheck will
     // take its sparse arm, dead rows of `a`/`b` are unread everywhere (their
@@ -448,7 +459,7 @@ fn build_union_witness(
     // by the zerocheck's OWN predicate so the two cannot drift.
     let elem_live = union.has_element() && flock_core::element_r1cs::union::dead_rows_unread(union);
     let stripes = union
-        .slot_dests(&mut z, &mut a, &mut b, elide)
+        .slot_dests(&mut z, &mut a, &mut b, elide, dead_padding_unread)
         .into_iter()
         .zip(sources)
         .enumerate()

@@ -1726,8 +1726,16 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let union = flock_core::union::UnionInstance::new(&self.registry, vec![self.n_blocks]);
-        let slot = crate::prover::UnionSlotProverInput::new(
-            generate_witness_batch_major_partial(blocks, self.n_blocks_log()),
+        let nu = self.n_blocks_log();
+        // IN-PLACE, not `new`: only this path reaches
+        // `UnionInstance::slot_dests`, which is where the union certifies
+        // `ab_padding_unread` and the driver can skip 288 MB of memset. The
+        // switch is perf-neutral on its own (the single-slot prebuilt path
+        // already aliased rather than scattering) — it is here to carry that
+        // certification, and it also makes the `[prove_union] witgen` timer
+        // honest, which previously read 0.00 ms for a 64 ms phase.
+        let slot = crate::prover::UnionSlotProverInput::in_place(
+            move |dst| generate_witness_batch_major_partial_into(blocks, nu, dst),
             self.r1cs.csc_lincheck_circuit(),
         );
         crate::prover::prove_fast_ligerito_union_ag(
@@ -2407,6 +2415,116 @@ mod tests {
         assert!(
             setup.verify_ag(&commitment, &bad, &mut ch).is_err(),
             "tampered batch-major AG proof accepted"
+        );
+    }
+
+    /// The two DEAD PADDING REGIONS are never read — the invariant that lets
+    /// `SlotWitnessDest::dead_padding_unread` skip 288 MB + 153 MB of memset
+    /// per prove. Proves the same witness twice, once with BOTH regions
+    /// filled with garbage that the driver then leaves in place, and pins the
+    /// two proofs BYTE-IDENTICAL:
+    ///   * `a`/`b` padding columns (>= ceil(useful_bits/128)), poisoned
+    ///     before generation since the driver no longer overwrites them;
+    ///   * the lincheck stripe tail (rows >= ceil(useful_bits/64) of each
+    ///     group), poisoned after generation, on the way to the lincheck.
+    /// If any consumer ever starts reading a declared-dead bit, this fails.
+    ///
+    /// `z` is deliberately not poisoned: its padding IS committed (under
+    /// identity compaction `q` aliases it), so it must stay honestly zero.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore] // Heavy — run with `cargo test dead_padding_regions -- --ignored`
+    fn dead_padding_regions_are_never_read() {
+        use flock_core::challenger::FsChallenger;
+        use flock_core::field::F128;
+
+        let setup = Blake3Setup::new(256);
+        let mut rng = Rng::new(0xABBA_D001);
+        let blocks: Vec<Compression> = (0..256)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+                (cv, m, counter, 64u32, 11u32)
+            })
+            .collect();
+
+        let prove = |poison: bool| {
+            let union =
+                flock_core::union::UnionInstance::new(&setup.registry, vec![setup.n_blocks]);
+            let nu = setup.n_blocks_log();
+            let blocks = &blocks;
+            let slot = crate::prover::UnionSlotProverInput::in_place(
+                move |dst| {
+                    let flock_core::union::SlotWitnessDest {
+                        z,
+                        a,
+                        b,
+                        elide_padding_writes,
+                        dead_padding_unread,
+                    } = dst;
+                    if poison {
+                        assert!(
+                            dead_padding_unread,
+                            "this shape must certify ab_padding_unread, or the \
+                             test is not exercising the skip"
+                        );
+                        let tail = USEFUL_BITS.div_ceil(128) << nu;
+                        let junk = F128::new(0xDEAD_BEEF_DEAD_BEEF, 0x0BAD_F00D_0BAD_F00D);
+                        for buf in [&mut *a, &mut *b] {
+                            buf[tail..].fill(junk);
+                        }
+                    }
+                    let mut stripe = generate_witness_batch_major_partial_into(
+                        blocks,
+                        nu,
+                        flock_core::union::SlotWitnessDest {
+                            z,
+                            a,
+                            b,
+                            elide_padding_writes,
+                            dead_padding_unread,
+                        },
+                    );
+                    if poison {
+                        // Stripe tail: rows [useful_words, u64_per_block) of
+                        // every 8-block group, in bytes.
+                        let u64_per_block = (1usize << K_LOG) / 64;
+                        let useful_words = USEFUL_BITS.div_ceil(64);
+                        for g in stripe.chunks_mut(u64_per_block * 64) {
+                            g[useful_words * 64..].fill(0xA5);
+                        }
+                    }
+                    stripe
+                },
+                setup.r1cs.csc_lincheck_circuit(),
+            );
+            let mut ch = FsChallenger::new(b"flock-ab-padding-v0");
+            let (proof, commitment, claim) = crate::prover::prove_fast_ligerito_union_ag(
+                &union,
+                &setup.pcs_params,
+                vec![slot],
+                &mut ch,
+            );
+            let bundle = crate::proof_io::R1csProofBundleLigeritoAg { commitment, proof };
+            (bundle.to_bytes(), claim)
+        };
+
+        let (clean, claim_clean) = prove(false);
+        let (dirty, claim_dirty) = prove(true);
+        assert_eq!(
+            claim_clean, claim_dirty,
+            "poisoned dead padding changed the claim"
+        );
+        assert_eq!(
+            clean.len(),
+            dirty.len(),
+            "poisoned dead padding changed the proof length"
+        );
+        assert!(
+            clean == dirty,
+            "poisoned dead padding changed the proof — something READS a \
+             declared-dead bit, so `dead_padding_unread` no longer holds"
         );
     }
 

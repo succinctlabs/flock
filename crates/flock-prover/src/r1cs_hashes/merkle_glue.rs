@@ -143,6 +143,7 @@ pub(crate) fn scatter_zab_into(
         a,
         b,
         elide_padding_writes,
+        dead_padding_unread: _,
     } = dst;
     assert_eq!(z.len() % words_per_block, 0, "aligned slot block");
     let n_total = z.len() / words_per_block;
