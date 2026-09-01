@@ -111,13 +111,32 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         Err(_) => HashKind::default(),
     };
     let fs = || FsChallenger::with_hash(b"flock-bench-v0", fs_hash);
-    // BLAKE3_ZC=rs|ag selects the boolean zerocheck flavor (default rs).
+    // Boolean zerocheck flavor. **AG is the default wherever its round-1
+    // kernel exists** (aarch64 NEON); x86 falls back to RS until the AVX-512
+    // AG round-1 kernel lands (docs/ag-recursion-plan.md Phase F.1). Same
+    // selector convention as the tower's `leaf_zc_ag()`/`outer_zc_ag()`,
+    // which have defaulted to AG since Phase B/C.
+    //
+    // Measured at m=32, paired alternating, 2026-09-01: AG 862.7 best /
+    // 866.6 median vs RS 894.8 / 919.7 — **−5.8%, AG 4/4**. Both arms run
+    // the DEFAULT (sparse) tail gate: an earlier reading that sparse cost AG
+    // 3.2× was a measurement artifact, and re-testing it paired shows AG
+    // sparse beating AG dense 4/4 (median −41.5 ms). Do not raise
+    // FLOCK_SPARSE_GATE for AG.
+    //
     // `prove_fast_union_ag` is the same union commit / lincheck / merged
-    // opening — only zerocheck round 1 differs — so this isolates RS vs AG
-    // end to end on one witness.
+    // opening — only zerocheck round 1 differs — so `BLAKE3_ZC=rs` still
+    // isolates RS vs AG end to end on one witness.
     let zc_ag = match std::env::var("BLAKE3_ZC").as_deref() {
-        Ok("ag") => true,
-        Ok("rs") | Err(_) => false,
+        Ok("ag") => {
+            assert!(
+                cfg!(target_arch = "aarch64"),
+                "BLAKE3_ZC=ag requires aarch64 (the AG round-1 kernel is NEON)"
+            );
+            true
+        }
+        Ok("rs") => false,
+        Err(_) => cfg!(target_arch = "aarch64"),
         Ok(v) => panic!("BLAKE3_ZC must be rs or ag (got {v})"),
     };
     println!(
@@ -188,37 +207,63 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         n_blocks as f64 / best_fast
     );
 
-    // Peak memory + verify time + serialized proof size (single prove).
-    // RS only: the AG prove returns a different bundle type, and this stage
-    // is not what the RS-vs-AG comparison is measuring.
-    if !zc_ag {
+    // Peak memory + verify time + serialized proof size (single prove), in
+    // WHICHEVER flavor is selected — this used to be RS-only, which would now
+    // silently drop these three lines from the default (AG) report.
+    {
         let blocks_v = &block_sets[0];
-        reset_peak();
-        let mut ch_p = fs();
-        let (proof, commitment, _) = setup.prove_fast(blocks_v, &mut ch_p);
-        println!("  peak memory: {:>8.2} MB", peak_mb());
-
-        if std::env::var_os("FLOCK_NO_GRIND").is_some() {
-            // Grind-free proofs fail PoW verification by design; skip so the
-            // phase TSV and summary lines below still print.
-            println!("  verify: skipped (FLOCK_NO_GRIND)");
+        // Grind-free proofs fail PoW verification by design; skip the verify
+        // so the phase TSV and summary lines below still print.
+        let no_grind = std::env::var_os("FLOCK_NO_GRIND").is_some();
+        let mut report = |peak: f64, verify: Option<f64>, size: usize| {
+            println!("  peak memory: {peak:>8.2} MB");
+            match verify {
+                Some(v) => println!("  verify: {}", fmt_ms(v)),
+                None => println!("  verify: skipped (FLOCK_NO_GRIND)"),
+            }
+            println!(
+                "  proof size: {} bytes ({:.2} KiB)",
+                size,
+                size as f64 / 1024.0
+            );
+        };
+        if zc_ag {
+            #[cfg(target_arch = "aarch64")]
+            {
+                reset_peak();
+                let mut ch_p = fs();
+                let (proof, commitment, _) = setup.prove_fast_union_ag(blocks_v, &mut ch_p);
+                let peak = peak_mb();
+                let verify = (!no_grind).then(|| {
+                    let mut ch_v = fs();
+                    let t = Instant::now();
+                    setup
+                        .verify_union_ag(&commitment, &proof, &mut ch_v)
+                        .expect("union-AG verify failed");
+                    t.elapsed().as_secs_f64()
+                });
+                let bundle =
+                    flock_prover::proof_io::R1csProofBundleLigeritoAg { commitment, proof };
+                report(peak, verify, bundle.to_bytes().len());
+                black_box(&bundle);
+            }
         } else {
-            let mut ch_v = fs();
-            let t = Instant::now();
-            let _ = setup
-                .verify(&commitment, &proof, &mut ch_v)
-                .expect("verify failed");
-            println!("  verify: {}", fmt_ms(t.elapsed().as_secs_f64()));
+            reset_peak();
+            let mut ch_p = fs();
+            let (proof, commitment, _) = setup.prove_fast(blocks_v, &mut ch_p);
+            let peak = peak_mb();
+            let verify = (!no_grind).then(|| {
+                let mut ch_v = fs();
+                let t = Instant::now();
+                setup
+                    .verify(&commitment, &proof, &mut ch_v)
+                    .expect("verify failed");
+                t.elapsed().as_secs_f64()
+            });
+            let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
+            report(peak, verify, bundle.to_bytes().len());
+            black_box(&bundle);
         }
-
-        let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
-        let proof_size = bundle.to_bytes().len();
-        println!(
-            "  proof size: {} bytes ({:.2} KiB)",
-            proof_size,
-            proof_size as f64 / 1024.0
-        );
-        black_box(&bundle);
     }
 
     // Per-phase breakdown: the union prover prints one under `PCS_TRACE=1`

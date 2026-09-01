@@ -158,12 +158,20 @@ const FLAVOR_R1CS_LIGERITO: u8 = 2;
 // retired 2026-08-14 with `chain.rs`/`chain_common.rs`; the byte stays
 // reserved and now parses as UnknownFlavor.
 const FLAVOR_MIXED_LIGERITO: u8 = 4;
+/// The AG-skip twin of [`FLAVOR_R1CS_LIGERITO`]. A separate byte because the
+/// payload struct differs (`R1csProofMergedLigeritoAg` carries
+/// `BooleanPiopProofAg`), so a reader must not try to parse one as the other.
+/// Under docs/ag-recursion-plan.md Phase F this flavor is renamed to primary
+/// and byte 2 retires with the RS structs.
+const FLAVOR_R1CS_LIGERITO_AG: u8 = 5;
 
 /// What kind of bundle a byte buffer holds. Returned by [`peek_flavor`] so
 /// generic readers (the CLI) can dispatch before parsing the payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BundleFlavor {
     R1cs,
+    /// The AG-skip boolean zerocheck flavor — the default on aarch64.
+    R1csAg,
     Mixed,
 }
 
@@ -182,6 +190,7 @@ pub fn peek_flavor(bytes: &[u8]) -> Result<BundleFlavor, DeserializeError> {
     }
     match bytes[6] {
         FLAVOR_R1CS_LIGERITO => Ok(BundleFlavor::R1cs),
+        FLAVOR_R1CS_LIGERITO_AG => Ok(BundleFlavor::R1csAg),
         FLAVOR_MIXED_LIGERITO => Ok(BundleFlavor::Mixed),
         other => Err(DeserializeError::UnknownFlavor(other)),
     }
@@ -263,6 +272,30 @@ impl R1csProofBundleLigerito {
     }
 }
 
+/// [`R1csProofBundleLigerito`] with the **AG-skip** boolean zerocheck — the
+/// default flavor on aarch64 (the AG round-1 kernel is NEON; x86 stays on the
+/// RS bundle until the AVX-512 port, docs/ag-recursion-plan.md Phase F.1).
+/// Same commitment and merged opening; only the boolean zerocheck differs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct R1csProofBundleLigeritoAg {
+    pub commitment: Commitment,
+    pub proof: flock_core::proof::R1csProofMergedLigeritoAg,
+}
+
+impl R1csProofBundleLigeritoAg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        write_header(&mut out, FLAVOR_R1CS_LIGERITO_AG);
+        bincode::serialize_into(&mut out, self)
+            .expect("bincode serialize R1csProofBundleLigeritoAg");
+        out
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
+        let payload = parse_header(bytes, FLAVOR_R1CS_LIGERITO_AG)?;
+        deserialize_payload(payload)
+    }
+}
+
 /// Bundles a multi-table MIXED proof (wire format v6): the built-in
 /// registry id — which pins the FULL registry, type list and uniform
 /// capacity `nu` included (see [`crate::mixed::MixedRegistryId`]) — the
@@ -335,7 +368,10 @@ fn parse_header(bytes: &[u8], expected_flavor: u8) -> Result<&[u8], DeserializeE
         return Err(DeserializeError::UnsupportedVersion(v));
     }
     let flavor = bytes[6];
-    if flavor != FLAVOR_R1CS_LIGERITO && flavor != FLAVOR_MIXED_LIGERITO {
+    if flavor != FLAVOR_R1CS_LIGERITO
+        && flavor != FLAVOR_R1CS_LIGERITO_AG
+        && flavor != FLAVOR_MIXED_LIGERITO
+    {
         return Err(DeserializeError::UnknownFlavor(flavor));
     }
     if flavor != expected_flavor {

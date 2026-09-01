@@ -24,13 +24,19 @@
 #
 # Both arms are rebuilt first, then run in ALTERNATING order.
 #
-# LIMIT — READ THIS. The zerocheck micro-benches drive DENSE padding. The
-# production union prove at m=32 takes the SPARSE round-2/tail dispatch, whose
-# kernels run over short interval pieces with small, cache-resident outputs.
-# Changes to per-pair ARITHMETIC transfer between the two (wideneon/qres read
-# -19.5% here vs -16.2% on the real prove); changes to LOOP STRUCTURE do not —
-# a two-pair unroll measured -3.5% here and +6.8% on the real ST prove
-# (2026-09-01). Confirm anything structural with a full prove.
+# LIMIT — READ THIS. A micro-bench is only a valid proxy if it drives the
+# route production takes. round2 and ag_breakdown were converted on
+# 2026-09-01 to the SPARSE run-list dispatch at the shipped 92/128 occupancy;
+# rounds3plus is still DENSE-only and remains a loop-structure trap.
+# Changes to per-pair ARITHMETIC transfer between routes (wideneon/qres read
+# -19.5% on the dense bench vs -16.2% on the real prove); changes to LOOP
+# STRUCTURE do not — a two-pair unroll measured -3.5% on the dense bench and
+# was neutral on the real prove, and the wrong reading cost half a day.
+# Confirm anything structural with a full prove.
+#
+# The full prove now defaults to the AG zerocheck on aarch64 (-5.8% vs RS,
+# 2026-09-01); use BLAKE3_ZC=rs to drive the RS arm. Do NOT raise
+# FLOCK_SPARSE_GATE for AG — sparse is AG's optimum on both ST and MT.
 set -u
 
 BENCH=""; CTL=""; PAIRS=3; ENVS=""; BARGS=""; PAT="(best)"; SECT=""

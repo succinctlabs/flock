@@ -100,11 +100,47 @@ fn bench_one(n_compressions: usize, n_runs: usize) {
         .map(|run| mk_inputs(0xC0FFEE_5A55 ^ (n_compressions as u64) ^ (run as u64)))
         .collect();
 
+    // Boolean zerocheck flavor, same convention as blake3_proof: **AG is the
+    // default wherever its NEON round-1 kernel exists**; x86 falls back to RS
+    // until the AVX-512 port (docs/ag-recursion-plan.md Phase F.1).
+    // `SHA2_ZC=rs` forces the RS arm for A/B.
+    let zc_ag = match std::env::var("SHA2_ZC").as_deref() {
+        Ok("ag") => {
+            assert!(
+                cfg!(target_arch = "aarch64"),
+                "SHA2_ZC=ag requires aarch64 (the AG round-1 kernel is NEON)"
+            );
+            true
+        }
+        Ok("rs") => false,
+        Err(_) => cfg!(target_arch = "aarch64"),
+        Ok(v) => panic!("SHA2_ZC must be rs or ag (got {v})"),
+    };
+    println!("  zerocheck: {}", if zc_ag { "ag" } else { "rs" });
+
+    // One prove under the selected flavor. The AG entry is the same union
+    // commit / lincheck / merged opening — only zerocheck round 1 differs.
+    macro_rules! prove {
+        ($inputs:expr, $ch:expr) => {
+            if zc_ag {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let (p, _, _) = setup.prove_fast_union_ag($inputs, $ch);
+                    black_box(&p);
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                unreachable!("zc_ag is false off aarch64");
+            } else {
+                let (p, _, _) = setup.prove_fast($inputs, $ch);
+                black_box(&p);
+            }
+        };
+    }
+
     // Warm-up.
     {
         let mut ch = FsChallenger::new(b"flock-bench-v0");
-        let (p, _, _) = setup.prove_fast(&input_sets[0], &mut ch);
-        black_box(&p);
+        prove!(&input_sets[0], &mut ch);
     }
 
     let mut best = f64::INFINITY;
@@ -112,10 +148,9 @@ fn bench_one(n_compressions: usize, n_runs: usize) {
         let inputs = &input_sets[run + 1];
         let mut ch = FsChallenger::new(b"flock-bench-v0");
         let t0 = Instant::now();
-        let (p, _, _) = setup.prove_fast(inputs, &mut ch);
+        prove!(inputs, &mut ch);
         let elapsed = t0.elapsed().as_secs_f64();
         best = best.min(elapsed);
-        black_box(&p);
         println!(
             "  [run {}/{}] prove_fast: {}",
             run + 1,

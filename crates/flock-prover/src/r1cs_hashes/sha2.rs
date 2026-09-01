@@ -1278,6 +1278,64 @@ impl Sha256HybridSetup {
         crate::prover::prove_fast_ligerito_union(&union, &self.pcs_params, vec![slot], challenger)
     }
 
+    /// [`Self::prove_fast`] with the **AG-skip** boolean zerocheck — the SAME
+    /// single-slot union commit, lincheck, and merged opening; only round 1
+    /// of the zerocheck differs. The preferred entry on aarch64 (measured
+    /// −5.8% end to end on the BLAKE3 twin at m=32). aarch64-only, because
+    /// the AG round-1 kernel is NEON SLP; x86 stays on [`Self::prove_fast`]
+    /// until the AVX-512 port lands (docs/ag-recursion-plan.md Phase F.1).
+    /// Verify with [`Self::verify_union_ag`].
+    #[cfg(target_arch = "aarch64")]
+    pub fn prove_fast_union_ag<Ch: flock_core::challenger::Challenger>(
+        &self,
+        compressions: &[([u32; 8], [u32; 16])],
+        challenger: &mut Ch,
+    ) -> (
+        flock_core::proof::R1csProofMergedLigeritoAg,
+        flock_core::pcs::Commitment,
+        flock_core::proof::R1csClaim,
+    ) {
+        assert_eq!(compressions.len(), self.n_compressions);
+        let union =
+            flock_core::union::UnionInstance::new(&self.registry, vec![self.n_compressions]);
+        let nu = self.n_blocks_log();
+        // IN-PLACE, as in the BLAKE3 twin: the only path that reaches
+        // `UnionInstance::slot_dests`, where the union certifies
+        // `ab_padding_unread` and the driver skips the a/b padding memset.
+        let slot = crate::prover::UnionSlotProverInput::in_place(
+            move |dst| generate_witness_batch_major_partial_into(compressions, nu, dst),
+            self.r1cs.csc_lincheck_circuit(),
+        );
+        crate::prover::prove_fast_ligerito_union_ag(
+            &union,
+            &self.pcs_params,
+            vec![slot],
+            challenger,
+        )
+    }
+
+    /// Verify a [`Self::prove_fast_union_ag`] proof. (Unlike the prove side,
+    /// this runs on every target.)
+    pub fn verify_union_ag<Ch: flock_core::challenger::Challenger>(
+        &self,
+        commitment: &flock_core::pcs::Commitment,
+        proof: &flock_core::proof::R1csProofMergedLigeritoAg,
+        challenger: &mut Ch,
+    ) -> Result<flock_core::proof::R1csClaim, flock_core::verifier::VerifyError> {
+        let union =
+            flock_core::union::UnionInstance::new(&self.registry, vec![self.n_compressions]);
+        let circuit = self.r1cs.csc_lincheck_circuit();
+        let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [circuit];
+        flock_core::verifier::verify_ligerito_union_ag(
+            &union,
+            &circs,
+            commitment,
+            proof,
+            &self.pcs_params,
+            challenger,
+        )
+    }
+
     pub fn verify<Ch: flock_core::challenger::Challenger>(
         &self,
         commitment: &flock_core::pcs::Commitment,
@@ -1848,6 +1906,49 @@ mod tests {
         assert!(
             setup.verify(&commitment, &bad, &mut ch).is_err(),
             "tampered batch-major proof accepted"
+        );
+    }
+
+    /// UNION-AG e2e for SHA-256: `prove_fast_union_ag` → `verify_union_ag`
+    /// roundtrip + tamper rejection. The twin of the BLAKE3
+    /// `prove_fast_union_ag_roundtrip` — same union transport and merged
+    /// opening, AG round 1 on `SkipPoint::Ag` claim points.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore] // Heavy — run with `cargo test sha2_prove_fast_union_ag_roundtrip -- --ignored`
+    fn sha2_prove_fast_union_ag_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+
+        let setup = Sha256HybridSetup::new(128);
+        let mut rng = Rng::new(0x5A2_A901);
+        let inputs: Vec<([u32; 8], [u32; 16])> = (0..128)
+            .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+            .collect();
+
+        let mut ch_p = FsChallenger::new(b"flock-sha2-union-ag-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast_union_ag(&inputs, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-sha2-union-ag-v0");
+        let claim_v = setup
+            .verify_union_ag(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("sha2 union-AG verify rejected honest proof: {e:?}"));
+        assert_eq!(claim_p, claim_v, "sha2 union-AG claim mismatch");
+
+        // Tampering an AG round-1 message must reject.
+        let mut bad = proof.clone();
+        bad.boolean.ag.round1_ab[0] += flock_core::field::F128::ONE;
+        let mut ch = FsChallenger::new(b"flock-sha2-union-ag-v0");
+        assert!(
+            setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+            "must reject a tampered sha2 union-AG round-1 message"
+        );
+
+        // A nonce vector off the grinding schedule must reject.
+        let mut bad = proof.clone();
+        bad.boolean.ag.grinding_nonces.push(0);
+        let mut ch = FsChallenger::new(b"flock-sha2-union-ag-v0");
+        assert!(
+            setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+            "must reject a sha2 proof with an off-schedule nonce count"
         );
     }
 
