@@ -3654,3 +3654,56 @@ ALSO: `benches/ag_breakdown.rs` drives the DENSE
 `round1_slp_packed_banks_fused`, not the `_padded` coverage kernel
 production uses — the same dense-only flaw fixed in round1/round2. Any
 AG round-1 work must be measured on the real prove until that is fixed.
+
+### Round-1 optimizations, one by one, against AG — 2026-09-01
+
+`ag_breakdown` fixed first (87b88a5) so all of this is measured on the
+padded/sparse kernels production calls. m=30 production shape: round-1
+12.27 / fold 16.24 / tail 13.18 ms.
+
+**§pmull (unreduced accumulation + multiplicative weight splitting).**
+Already LIVE in RS round 1 (x^4-scaled gather table + x^2 doubling,
+`univariate_skip_optimized/kernels/aarch64.rs:595,635`). Does not map to
+AG: it defers an F_{2^8} product reduction, and AG has none — its
+products are bitsliced F_2 AND/XOR and its eq-weighting already
+accumulates unreduced. Nearest analog (Karatsuba, 4→3 PMULL, cross
+correction deferred to `reduce_unred` by linearity) measured **0/3, ~+1%
+on the real AG prove** — reverted, third Karatsuba refutation on this
+core.
+
+**§twolane (ILP in the gather drain). NOT APPLICABLE.** Its premise is
+that one lane exposes only THREE dependency chains, so processing two
+lanes doubles them to six. AG's `product_fold_bs` accumulates into 160
+independent `res[p]` accumulators plus 128 C banks — 160+ chains are
+already in flight, and there is no gather-table drain at all. The
+optimization has nothing to widen.
+
+**§zeroskip (structurally fixed b rows). ALREADY REALIZED.** It guards
+rows where `b = 0` because `T(0) = 0`. Our own census (2026-08-31) found
+B_0 has exactly **4677 empty rows = K − USEFUL_BITS = 16384 − 11707** —
+i.e. every structurally-zero b row in this circuit IS the padding tail,
+which `BlockCoverage::Dead` already skips wholesale before any kernel
+runs. Inside live blocks there are no zero b rows left to guard.
+
+**§structuredb (all-ones b shortcut). UNDER THE BAR.** The constant rows
+in our useful region are constant-ONE (1409 rows, 11 whole 128-bit
+planes = 12% of the ~92 useful planes), not zero. Two independent
+reasons to expect little: the ceiling is 12% of the b-encode, a
+sub-phase of a 12 ms phase; and the tex itself records that
+constant-folding all-ones rows in RS "returns 6 ms where 27 were
+predicted", because halving a row's loads halves its memory-level
+parallelism — "whole-row elimination is what pays", and whole rows are
+already gone via coverage.
+
+An attempt to upper-bound the b-encode empirically (skip it entirely,
+measure the ceiling) was **contaminated and is not reported**: the
+`LazyLock` guard sits in the per-block hot path, and removing the encode
+measured SLOWER (19.6 vs 12.2 ms) — the same guard-in-the-loop artifact
+seen in the AG fold store probe. A valid version needs a const-generic
+or a second binary; not pursued, since the census already bounds the
+prize below the bar.
+
+VERDICT: all four round-1 optimizations are accounted for — one live,
+one refuted by measurement, one inapplicable by structure, one already
+realized by the coverage mechanism, and the residual under the bar. AG
+round 1 has no untested lever left from the tex.
