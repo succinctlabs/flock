@@ -2953,6 +2953,18 @@ accounting of the port campaign against today's protocol.
 
 ### RS vs AG, end to end — and a 3.2× dispatch bug in the AG path — 2026-08-31
 
+> **SUPERSEDED 2026-09-01 — the sparse-route pathology below no longer
+> reproduces.** Re-measured paired on the same machine and binary: AG
+> sparse beats AG dense on EVERY stage (round1 55.65 vs 57.09, fold 41.06
+> vs 47.21, tail **47.75 vs 65.66**, zc+lincheck 183.19 vs 209.32) and
+> 4/4 end to end. The "tail 657 vs 120 ms" reading is gone. Attribution
+> is NOT established — the round-2 §wideneon/§qres kernel landed in
+> `fold_pair_run`, which is exactly the RS sparse pair kernel the AG
+> sparse tail routes through, but that is a −19% win and cannot by
+> itself explain 5.5×. Treat the numbers in this entry as unreliable;
+> the live verdict is the "AG promoted to default" entry at the end of
+> this log. **Do not raise FLOCK_SPARSE_GATE for AG.**
+
 Added `BLAKE3_ZC=rs|ag` to the blake3_proof bench (bench-only selector,
 same family as BLAKE3_PROFILE / FLOCK_MERKLE_HASH). `prove_fast_union_ag`
 is a true drop-in — same union commit, lincheck and merged opening,
@@ -3834,3 +3846,596 @@ own challenge point, not round 1's.
 NOT BUILT. The derivation above is the reusable part: if AG's C side ever
 grows, or a stripe fold becomes available for free from a neighbouring
 phase, it can be implemented directly from the formula.
+
+### AG's C side decomposed: the transpose is free, the multiplies are a roofline — 2026-09-01
+
+Follow-up to §stripe-for-AG ("any idea of how to not add work?"). Before
+inventing a cheaper C path it is worth knowing WHICH half of the C cost
+a cheaper path would have to beat. Split with a const-generic probe
+(`C_MODE`, resolved outside the loop — the LazyLock-in-hot-path
+contamination trap from earlier today) inside
+`transpose_fold_c_banks_2src`, guarding its two stages separately.
+ag_breakdown, m=30, production 92/128 shape, 10 threads, 3 reps, round-1
+URM median (ms):
+
+| arm | r1 URM | Δ vs base | share of C |
+|---|---|---|---|
+| baseline | 12.26 | — | — |
+| no bit transpose | 12.15 | **−0.11** | 4% |
+| no bank multiplies | 9.61 | **−2.64** | 96% |
+
+**The bit transpose is free; the whole C side is the 128 `mul_acc_unred`
+bank accumulates.** So every structural idea aimed at the transpose —
+fusing C's transpose into the AB `transpose_128x128_2src` as a 3-source
+transpose, hoisting the `ws` staging buffer, a stripe that "removes the
+per-window bit transpose" — is chasing 0.11 ms of a 12.26 ms round 1.
+
+And the 2.64 ms is at the PMULL roofline. m=30 is 2^30 bits = 2^17
+blocks of 8192; 128 `mul_acc_unred` per block at 4 PMULL each is 67.1 M
+PMULL. Eight P-cores at 3.2 GHz and 1 PMULL/cycle is 25.6 G PMULL/s =
+**2.62 ms predicted vs 2.64 ms measured.** The kernel is saturated.
+
+Why the count cannot be reduced. The bitmask `x` is treated as a GF
+polynomial, so ONE `eq · x` covers 128 outer positions at once — the sum
+over positions is already free inside the multiply. That leaves 128
+destination banks × one eq-weight per block, all distinct, so there is
+nothing to XOR-before-multiplying. The eq-factoring route (group 2^t
+blocks sharing a prefix, `eq = E_p · w_s` with the `w_s` constant across
+groups) does not help either: the inner `Σ_s w_s·x_s` is a sum of
+POLYNOMIAL products, not a table index, so it still costs 2^t multiplies.
+The subset-sum-table trick that makes this work on the RS side needs the
+`x_s` to be indices, and here they are field elements. Karatsuba would
+cut 4 PMULL to 3, and it has now been refuted three times on this core.
+
+**VERDICT: no. There is no way to make the C side cheaper without adding
+work, because the work is already minimal and running at machine peak.**
+The C side is 21.5% of AG round 1, which is 51.3 ms of the m=32 MT
+prove — so the entire theoretical prize here is ~11 ms of 900 ms (1.2%),
+and the reachable fraction of it is zero. Probe reverted; tree clean.
+
+**Where the AG headroom actually is, by contrast:** `prove_fast_union_ag`
+is a complete verifying path (roundtrip test at blake3.rs:2421) that is
+10.9% faster than RS single-threaded and −60 ms of zerocheck at MT, and
+it is NOT the default — `BLAKE3_ZC=ag` is opt-in, gated aarch64-only
+because the round-1 kernel is NEON. Promoting it (with an RS fallback
+for other targets) is worth ~30× what any remaining C-side kernel idea
+could return, and costs no new kernel code.
+
+### Promoting AG to the default: −5.8% end to end, MT, 4/4 — 2026-09-01
+
+The claim above ("worth ~30× any remaining C-side idea") should carry a
+number, so: paired alternating A/B of the two flavors at their MT optima
+on the real m=32 prove — arm A `rs_sparse` (today's default), arm B
+`ag_dense` (AG's MT optimum; sparse costs AG 3.2× at MT). Best
+prove_fast per invocation, 4 pairs, order rotated.
+
+| | best | median |
+|---|---|---|
+| rs (default) | 894.82 | 919.74 |
+| ag | **862.73** | **866.61** |
+
+**Median −53.1 ms = −5.8%, AG wins 4/4.** Throughput 292,955 → 303,853
+c/s at the best-of. AG also has the tighter spread (862.7–881.2 vs
+894.8–928.3), consistent with the ST reading where AG was 10.9% ahead.
+
+For scale: every optimization the whole port campaign kept is worth
+1.027× (−2.7%). **This one dispatch change is worth more than all of
+them combined**, and it is not new kernel code — the path exists, has a
+prove→verify roundtrip test (blake3.rs:2421), and is exercised by
+ag_breakdown. The work is dispatch and fallback: `prove_fast_union_ag`
+is aarch64-only because the genus-95 round-1 kernel is NEON, so making
+it the default means selecting AG on aarch64 and RS elsewhere, plus
+deciding whether the MT dense/sparse gate follows the flavor (it must:
+sparse is AG's ST optimum and its MT pessimum).
+
+### AG PROMOTED TO DEFAULT — −8.2% end to end, 4/4 — 2026-09-01
+
+Acting on the AG-default lever measured earlier today. Two corrections to
+the record came first, both from Benedikt's pushback that the "sparse
+costs AG 3.2×" reading smelled like a timing error. He was right:
+
+**1. Sparse is AG's optimum, on every stage.** Paired, m=32, MT, same
+binary, min-per-phase (ms):
+
+| stage | AG sparse | AG dense |
+|---|---|---|
+| round 1 | **55.65** | 57.09 |
+| skip→mlv fold | **41.06** | 47.21 |
+| mlv tail | **47.75** | 65.66 |
+| zc + lincheck | **183.19** | 209.32 |
+
+End to end AG sparse beats AG dense 4/4 (median −41.5 ms). The
+2026-08-31 entry claiming a 657 ms sparse tail is marked SUPERSEDED in
+place. Attribution unresolved — flagged, not chased.
+
+**2. The promotion, measured in the SHIPPED config** (both arms on the
+default sparse gate; AG via the new default, RS via `BLAKE3_ZC=rs`):
+
+| | best | median |
+|---|---|---|
+| rs | 934.97 | 966.10 |
+| ag | **851.36** | **894.75** |
+
+**Median −79.4 ms = −8.2%, AG 4/4** (deltas −111.7 / −83.6 / −75.1 /
+−67.6). Best-of throughput 280,377 → **307,912 c/s**. Larger than the
+−5.8% measured this morning, because that comparison used AG *dense*.
+Absolute numbers ran ~7% high across both arms in this batch (warmer
+machine than the morning window) — the paired delta is the signal.
+
+WHAT LANDED:
+- `blake3_proof` / `sha2_proof` benches: zerocheck flavor defaults to AG
+  on aarch64, RS elsewhere; `BLAKE3_ZC=rs` / `SHA2_ZC=rs` force the RS
+  arm. Same selector convention as the tower's `leaf_zc_ag()` /
+  `outer_zc_ag()`, which have defaulted to AG since Phase B/C — the flat
+  prover was the last un-promoted surface.
+- `Sha256HybridSetup::prove_fast_union_ag` + `verify_union_ag`, the
+  mechanical twin of the BLAKE3 pair (SHA-256 had no AG entry at all),
+  with `sha2_prove_fast_union_ag_roundtrip` covering verify + round-1
+  tamper + off-schedule-nonce rejection. Green.
+- `proof_io::R1csProofBundleLigeritoAg` on new wire flavor byte 5, plus
+  `BundleFlavor::R1csAg`. Needed because the blake3 bench previously
+  SKIPPED peak-memory/verify/proof-size whenever AG was selected — with
+  AG now the default that would have silently dropped three headline
+  lines from every report. Both arms now report all three.
+  AG's proof is ~1.5 KB larger than RS's (305,436 vs 303,936 B at m=24).
+
+WHAT IS **NOT** DONE — RS REMOVAL IS BLOCKED, and not by preference:
+`docs/ag-recursion-plan.md` Phase F.1 is explicit that the AG round-1
+prover kernel is aarch64-NEON-only (`genus95_curve_code/round1.rs` is
+`#[cfg(target_arch = "aarch64")]` with a bare `use std::arch::aarch64::*`),
+so deleting RS without an AVX-512 port **kills x86 proving outright** —
+and `.github/workflows/test.yml` runs a first-class x86_64 leg pinned to
+`sapphirerapids` precisely to exercise those kernels. Phase F.2 adds the
+same blocker for CUDA. RS also still owns every transcript byte pin
+(m6 merged fixtures, mixed-class pins, chain/Merkle/keccak3/sha2). So
+the parallel `*Ag` API stays until those kernels exist, exactly as the
+plan prescribes; `prove_fast` keeps its type and its callers.
+
+### Dead-scaffolding cleanup alongside the AG promotion — 2026-09-01
+
+Scope chosen by Benedikt: delete only what is genuinely unreachable, keep
+RS compiling as the x86 fallback. Method: take the dead-code list under
+`cargo clippy --release --workspace --all-targets` on BOTH arches
+(aarch64 natively, x86_64 via `--target x86_64-apple-darwin -C
+target-cpu=sapphirerapids`, which is what CI's x86 leg pins) and delete
+only the intersection — anything dead on one arch alone is a live
+fallback on the other.
+
+DELETED (dead on both):
+- `r1cs_hashes/common.rs`: the whole full-write witness cluster —
+  `drive_witness_packed_and_lincheck_full_write`, `witness_scratch_tag`,
+  `WITNESS_ROLE_{Z,A,B}` (~105 lines), plus `BitRecord::words()` whose
+  doc still pointed at a `PackedWordWriter::push_record` caller that no
+  longer calls it.
+- `zerocheck/multilinear/kernels/aarch64.rs`: `fold_and_message_neon`
+  and `lookahead_chunk_neon` (~250 lines) — zero references anywhere in
+  the workspace; superseded by the fused round-2 kernel and the cascade
+  tail.
+
+KEPT, with the reason recorded in code:
+- `ag_skip::byte_dot_u64` reads dead on aarch64 only because today's
+  NEON `byte_dot` bypasses it; it is the LIVE x86 path. Gated
+  `#[cfg(not(target_arch = "aarch64"))]` so it stops tripping the arm64
+  lint leg's `-D warnings` without removing the fallback.
+
+TWO PRE-EXISTING BUGS FOUND WHILE VALIDATING, both fixed:
+1. **A silently disabled test.** `stripe_c_banks_match_drain_banks`
+   (univariate_skip_optimized.rs) sits between two `#[test]` functions
+   but had lost its own attribute, so it had never run. Restored — it
+   PASSES, so this is recovered coverage, not a latent failure.
+2. **The x86 test crate did not compile.**
+   `neon_fused_inner_matches_scalar_inner` calls
+   `shift_reduce_inner_ab_fused_neon`, which does not exist off aarch64,
+   with no arch gate — so CI's x86_64 leg was failing to build
+   `flock-core`'s tests before any of today's work. Gated. Verified at
+   HEAD to confirm it was not introduced here.
+
+AFTER: zero dead-code warnings on aarch64, `--workspace --all-targets`
+compiles clean on BOTH arches, workspace tests **637 passed / 0 failed**
+(one more than before, from the restored test). Perf unchanged by the
+cleanup: 850.27 ms best = **308,307 c/s**.
+
+Full AG report at m=32 (the bench reports these under AG for the first
+time): peak memory **8065 MB** vs RS's 8525 — AG holds ~460 MB less —
+verify 6.17 ms, proof 451.22 KiB vs RS's 449.76 (+1.46 KiB).
+
+NOTE for future sessions: `cargo fmt --all` under rustfmt 1.8.0 rewrites
+~11 committed files that were formatted by an older stable, and local
+`clippy -D warnings` fails workspace-wide on pre-existing
+`unsafe_op_in_unsafe_fn` (E0133) and an unknown-lint name. Neither is
+actionable here; format and lint only the files you touch.
+
+### Witness generation attributed — 64 ms nobody was timing, and it is at roofline — 2026-09-01
+
+**The trace was lying about witgen.** `[prove_union] witgen` prints
+0.00 ms, but that timer only wraps `build_union_witness`, and with a
+single PREBUILT slot that is a passthrough. The actual generation runs in
+`generate_witness_batch_major_partial`, called by
+`prove_fast_union_ag` BEFORE `prove_fast_ligerito_union_ag` — i.e.
+entirely outside the `[prove_union]` region. It shows up only as the gap
+between `[prove_union] TOTAL` (788 ms) and `best prove_fast` (~850 ms):
+**~64 ms, 7.6% of the prove, unattributed by every previous session.**
+
+Also fixed the micro-bench, which had the same disease round-2 had:
+`genwitness_phase` drove `generate_witness_with_ab_packed_and_lincheck`,
+the legacy ROW-MAJOR generator reached only from the retired direct-AG
+route. Production is BatchMajor. Repointed at
+`generate_witness_batch_major_partial` and extended to m=32 (the shipped
+size), with a checksum. It reads **110 ms standalone** at m=32 (higher
+than the in-prove 64 ms because the prove has the pool warm).
+
+STAGE ATTRIBUTION (m=32, best-of, const-read-once env probe inside
+`drive_witness_batch_major_partial_into`; probes are NOT additive —
+removing one lets others overlap):
+
+| stage | cost | note |
+|---|---|---|
+| `flush_rows_nt` ×3 | 25.7 ms | 1.5 GB of NT stores = **~58 GB/s, roofline** |
+| `per_group` (BLAKE3 build) | 17.8 ms | the only real compute |
+| padding-suffix memset | 15.0 ms | 432 MB — **required, see below** |
+| `stripe_from_rows` | 12.8 ms | |
+| stripe tail clear | 7.8 ms | 153 MB |
+| per-group row fill | 6.2 ms | 1.15 GB, L1-resident |
+
+**TWO NULL RESULTS, both instructive:**
+
+1. **`UnionSlotProverInput::in_place` is NEUTRAL** (median +0.2 ms, 2/4)
+   despite its own doc saying "prefer in_place on the hot path: at M=30
+   the scatter is ~10 ms". Reason: for a SINGLE slot the prebuilt path
+   is already an aliasing passthrough, so there is no scatter to remove.
+   The doc's advice is about multi-slot unions.
+
+2. **The padding memsets cannot be elided here — a COMPLETENESS
+   constraint, not soundness.** (Benedikt caught me using the wrong
+   word: padding is written entirely prover-side, and a cheating prover
+   may put anything there, so it cannot affect what a verifier accepts.
+   What breaks is the HONEST prover's own proof.) At FULL utilization
+   `compaction_is_identity()` is true (single slot at offset 0,
+   `n_t == 1<<nu`), so q IS the padded buffer: the committed polynomial
+   includes the padding, while the zerocheck/lincheck claims are
+   computed as if it were zero. The opening then disagrees with the
+   claim.
+
+   VERIFIED, not argued — forcing `padding_unread` true at full
+   utilization on the in-place path (the only path that consults it;
+   the all-prebuilt path returns `PooledZeroed` unconditionally via
+   `assemble_witness`) makes the m=28 prove fail its own verify with
+   **`union-AG verify failed: PcsOpen(Ligerito)`** — exactly the
+   predicted failure site. At partial utilization the elide already
+   kicks in automatically and verify passes.
+
+   **This re-opens the 15 ms as a live target.** Because the constraint
+   is only that the committed padding BE zero — not that anything read
+   it — the fix is not "skip the writes" but "keep last prove's zeros".
+   The padding suffix is shape-invariant across proves, so a witness
+   buffer returned to a DEDICATED pool class comes back with its padding
+   already zero and needs no memset. The scratch pool already has the
+   machinery for exactly this: `take_f128_tagged` returns a `hit` flag
+   and `witness_scratch_tag`/`WITNESS_ROLE_*` were built to let a
+   builder "elide on a hit" — that cluster was unreferenced and got
+   deleted in today's cleanup, but its design is the right one and it is
+   recoverable from git. NOT attempted; sized at ~15 ms (1.8%).
+
+**VERDICT: witgen is MOSTLY irreducible** — ~26 ms of NT stores runs at
+bandwidth roofline and ~18 ms is the BLAKE3 witness compute. The one
+genuinely addressable item is the 15 ms padding memset, via a
+padding-preserving buffer pool (above), which is worth a session. The
+durable improvement landed today is the corrected micro-bench. Probes
+reverted.
+
+### Round 3 (AG/sparse tail): the friendly-Horner kernel is NEVER used — 2026-09-01
+
+Attribution only; no code change yet. The AG tail under the shipped
+sparse dispatch is 46–48 ms (of ~850 ms). The 2026-08-31 entry's
+MECHANISM claim survives even though its numbers did not:
+`fold_and_friendly_round_pair_into` (the γ-geometric Horner kernel with
+no per-term `eq_lo` PMULL) has exactly ONE production call site,
+`mlv_tail_fs_resume` (ag_skip.rs:1655), and it only fires for rounds
+`i ∈ 1..=5`. The other call site (:2124) is the
+`friendly_round_matches_general` test.
+
+`mlv_tail_fs_sparse` runs the sparse rounds with the general RS kernel
+(`fold_and_round_pair_sparse_into`, friendly constants riding as
+ordinary `r_next` weights), then expands to dense and resumes. **Probed
+at m=32: the sparse loop consumes rounds 0..18 and hands off at i=18** —
+so on the AG/sparse path the friendly rounds 1–5 are ALREADY GONE by the
+time the friendly-capable code is reached. The kernel never runs.
+
+Sizing the prize honestly: with the domain halving each round, rounds
+1–5 (2^24…2^20) are ~48% of the tail's 2^26 total work, so ~22 ms is
+addressable, and the friendly kernel's saving within that is the
+per-term `eq_lo` PMULL — call it 20–40%. **Realistic prize ≈ 5–10 ms,
+i.e. 0.6–1.2% of the prove.** Worth doing, not spectacular; it needs a
+new `fold_and_friendly_round_pair_sparse_into` mirroring the dense
+kernel over `LiveLayout` intervals. NOT started — flagged with the
+mechanism verified so the next session can start from the kernel.
+
+Note this also explains why AG-sparse beats AG-dense on the tail
+(47.75 vs 65.66) DESPITE forfeiting the friendly kernel: skipping the
+147,456 dead blocks is worth more than the friendly Horner. The two wins
+are independent and should compound.
+
+### Tagged witness-buffer pool: BUILT, and it structurally cannot hit — 2026-09-01
+
+Following up the completeness correction: since the padding suffix only
+has to BE zero, not go unread, the move is to keep last prove's zeros via
+the scratch pool's provenance tags. Built it end to end:
+
+- `UnionInstance::witness_buffer_tag(role)` — FNV over `m_total`, `n_log`,
+  and per type `k_log`/`useful_bits`/offset/`m_slot`/count, version-stamped,
+  namespaced so it cannot collide with another tag family. Everything the
+  suffix boundary `ceil(useful_bits/128) << n_log` depends on.
+- `UnionInstance::witness_buffers_are_passthrough()` — the single-slot
+  spanning case, where `assemble_witness` moves a slot's buffers through
+  unchanged so take-site and give-site layouts are provably identical.
+- `take_witness_buffers` takes `a`/`b` via `take_f128_tagged` and returns
+  hit flags; `SlotWitnessDest` carries `padding_already_zero: [bool; 3]`;
+  the driver skips exactly that buffer's suffix fill, with a
+  `debug_assert` re-verifying the suffix really is zero on a hit.
+  `z` is deliberately never tagged — the aliased open folds over it.
+- Give-back at prover.rs returns `a`/`b` tagged.
+- `prove_fast_union_ag` switched to `in_place`, the only path that reaches
+  `take_witness_buffers` at all.
+
+It builds, verifies, and the debug-assert vouch holds under
+`-C debug-assertions=on`. A 6-pair A/B on the witgen line read median
+−1.46 ms, 3/6 — noise. **Then the reason: the tag NEVER HITS.** Traced
+both ends: the give fires every prove with a stable tag
+(`0x571dac7a374f798e`) and matching length; every subsequent take returns
+`a_hit=false b_hit=false`, at m=28 and m=32 alike. So both A/B arms were
+executing identical code and the "null" measured nothing.
+
+**MECHANISM — and it is structural, not a bug.** The pool clears a tag on
+"any other custody event — an untagged take". The witness buffers are
+handed back MID-PROVE (right after the boolean zerocheck), and the open
+stage then runs and is the single largest consumer of pooled `F128`
+scratch; `take_f128` prefers the smallest capacity ≥ n, so it takes our
+just-returned buffer and strips the tag long before the next prove asks
+for it.
+
+The two fixes both lose more than they win:
+- Hold the witness buffers back until the prove ends → the open faults
+  fresh pages instead of reusing that memory, which the pool's own doc
+  records as a **+24% open_batch regression on M4**.
+- A separate reserved pool → ~1 GB extra residency for the same reason.
+
+So the mid-prove give-back is load-bearing, and it is worth far more than
+the ~10 ms the padding skip could return. **This is very likely why
+`witness_scratch_tag`/`WITNESS_ROLE_*` were built and then left
+unreferenced** — the design is sound, the lifetime is not. Reverted.
+
+REVISED VERDICT on witgen: irreducible after all, but now for a
+demonstrated reason rather than the wrong one I gave first. The 15 ms
+padding memset is real, is required (completeness), and cannot be
+amortized across proves without giving up a larger win in the open.
+
+### LANDED: a/b padding columns are never read — −10.9 ms witgen, −6.7 ms prove — 2026-09-01
+
+Benedikt pushed back that witgen spending only ~16% on actual BLAKE3 was
+weird and asked whether memory work could be deferred or omitted. It can,
+and I had mis-scoped the constraint earlier today.
+
+**The identity-compaction argument only ever applied to `z`.** Under
+identity compaction `q` IS the `z` buffer, so `z`'s padding words are
+COMMITTED and must be honest zeros. `a` and `b` are never committed —
+their only consumers are the run-list-gated zerocheck (Dead blocks
+skipped, Partial cleansed; both flavors) and the count-proportional
+lincheck. The old code zeroed all three because one predicate,
+`padding_unread`, conflated "is this committed" with "does anyone read
+it".
+
+PROVEN, not argued: poisoning the a/b padding suffix with
+`DEADBEEF/0BADF00D` instead of zeroing it leaves the serialized proof
+**byte-identical** — checked at m=32 AG (fnv 7b3455b91c9e8f8b) and m=28
+RS (52d35e07443300ae).
+
+WHAT LANDED:
+- `SlotWitnessDest::ab_padding_unread`, certified by the union in
+  `build_union_witness` as `!has_element() && m_total - n_log >=
+  LOG_PACKING` — i.e. the existing `padding_unread` predicate MINUS its
+  identity-compaction clause, which says nothing about a/b. The driver
+  then zeroes `z`'s suffix always and a/b's only when uncertified, so
+  the strict generator contract still holds for every direct caller and
+  `batch_major_partial_zeroes_dummy_rows` keeps passing unchanged.
+- `prove_fast_union_ag` (BLAKE3 and SHA-256) switched to
+  `UnionSlotProverInput::in_place` — the only path that reaches
+  `slot_dests`, so the only one that can carry the certification. Neutral
+  on its own, and it also makes `[prove_union] witgen` honest: it read
+  0.00 ms for a 64 ms phase because the single-slot prebuilt source is a
+  passthrough.
+- `ab_padding_columns_are_never_read` — a permanent guard that proves the
+  same witness twice, poisoning exactly that region on one run, and pins
+  the proofs byte-identical. It also asserts `ab_padding_unread` is set,
+  so it cannot silently stop exercising the skip.
+
+MEASURED: witgen micro-bench m=32 **−10.9 ms, 4/4** (101.4 vs 112.3
+median) — 288 MB of the 432 MB memset gone. End to end, paired,
+same-binary knob: **median −6.74 ms, skip wins 4/5**; best prove 795.10
+ms = **329,699 c/s**, and in-prove witgen 64 → 41.4 ms. The end-to-end
+figure is smaller than the micro-bench's because part of the memset
+overlaps other work.
+
+NOT DONE: `prove_fast` (the RS x86 fallback) still uses the allocating
+prebuilt path and so does not get this. Same win is available there, but
+RS owns the m6 transcript fixtures, so it wants its own byte-identity
+check first.
+
+Two things NOT the cause, both refuted en route: NT (`stnp`) zero-fill of
+the suffix (neutral 3/3 — macOS memset already avoids RFO), and the
+tagged-pool amortization (never hits; see the entry above).
+
+ALSO: `mixed_blake3_sha256_roundtrip_and_tamper` FAILS AT HEAD, before
+any of today's work — a tampered lincheck round now returns
+`InvalidGrindingNonce` where the test expects `ConsistencyFailed`. The
+honest proof still verifies; the test over-specifies which rejection
+fires. Verified by stashing every local change. Pre-existing, not
+investigated further, flagged here so the next session does not blame it
+on this change.
+
+### LANDED: stripe tail joins the dead-padding skip — −3.2 ms witgen — 2026-09-01
+
+Second half of the "omit the memory work" thread. The lincheck stripe's
+tail (rows `>= ceil(useful_bits/64)` of each 8-block group, 153 MB at
+m=32) was cleared on every prove.
+
+**Why it is dead:** the stripe has exactly ONE reader,
+`partial_fold_packed_z_rows_best` (lincheck/union.rs:369), and it is
+handed `ty.useful_bits` and `n_t` explicitly — its own doc says it
+"threads `useful_bits` through so the kernel can skip blocks past the
+useful region of each block". So the tail is never touched, on either
+the full (`partial_fold_packed_z_best`) or row-prefix
+(`partial_fold_packed_z_rows_padded`) arm.
+
+Rather than add a second flag, `SlotWitnessDest::ab_padding_unread` was
+generalized to **`dead_padding_unread`** covering both dead regions —
+a/b padding columns and the stripe tail — with each region's reader named
+in the doc. Same certification, same predicate, one extra `if`. `z` is
+still excluded: its padding is committed.
+
+MEASURED (genwitness_phase, m=32, 8 alternating pairs, min-of-run):
+**median −3.24 ms, skip wins 8/8** (82.99 vs 87.12) — every delta
+negative, range −0.76 to −4.67. Below the 5.4 ms the 153 MB would
+suggest at ~28 GB/s, so part of the clear was already overlapping.
+
+COMBINED with the a/b skip, end to end at m=32, paired, same-binary
+knob: **median −22.4 ms, 4/6**; best prove **825.59 ms = 317,523 c/s**
+(deltas −44.4/−28.9/−23.5/−21.2/+1.4/+16.6). Larger than the ~14 ms of
+witgen the two skips account for — the rest is knock-on (441 MB fewer
+dirty pages and less cache pollution ahead of the commit).
+
+The guard test is now `dead_padding_regions_are_never_read`: it poisons
+BOTH regions on one of two otherwise identical proves — a/b before
+generation, the stripe tail after, on its way to the lincheck — and pins
+the proofs byte-identical. It also asserts the certification flag is set,
+so it cannot silently stop exercising the skip.
+
+Workspace 637/637, x86 `--all-targets` clean, no probe knobs left in the
+tree.
+
+**Witgen scoreboard at m=32** (standalone micro-bench, was 110 ms):
+now ~83 ms. Remaining: `flush_rows_nt` ×3 ≈ 26 ms (1.5 GB of NT stores
+at ~58 GB/s — bandwidth roofline, and it is the required output),
+`per_group` BLAKE3 build ≈ 18 ms, `stripe_from_rows` ≈ 13 ms, `z`'s
+required padding memset ≈ 5 ms, per-group row fill ≈ 6 ms. The two
+skippable regions are now skipped; what is left is either the answer or
+the bus.
+
+### Does §elision ("write it once") apply to flush_rows_nt? Ceiling measured: ~1 ms — 2026-09-01
+
+Benedikt asked whether `flush_rows_nt` is what the LaTeX doc attacks —
+`docs/zerocheck-optimizations.tex` §sec:elision, "Witness constant-region
+elision via scratch provenance": tag a pooled buffer with its layout
+provenance and, on a hit, skip rewriting the regions identical across
+every prove of that layout ("$b$'s all-ones prefix and reserved-slot
+words and all three streams' zero tails").
+
+**Yes, that is the same idea — and today's dead-padding work already took
+the part of it that pays.** The doc lists three constant regions; "all
+three streams' zero tails" is exactly the padding suffix + stripe tail
+now skipped via `dead_padding_unread`, worth −22 ms end to end. What
+remains of §elision is the constant regions INSIDE the useful data,
+which is what would let `flush_rows_nt` write less.
+
+**Ceiling, measured directly** (three witnesses from independent seeds,
+n=2^8, counting useful F128 words identical across all three):
+
+| stream | input-independent |
+|---|---|
+| z | **0.0 %** |
+| a | **0.0 %** |
+| b | **12.0 %** |
+| lincheck stripe | 0.8 % |
+
+Consistent with §sec:zeroskip's own tally (38 of 256 eight-byte K-rows of
+`b` pinned regardless of input = 14.8% at 64-bit granularity; a 128-bit
+word is constant only if both halves are, hence 12%).
+
+So `flush_rows_nt` writes 1.5 GB of which **~4% is even theoretically
+skippable** (12% of the `b` third). Against its measured ~26 ms that is
+**~1 ms**, and it would cost a per-row branch inside a streaming NT-store
+loop. The doc's own number agrees this was never large: 4/5 paired,
+147.0–149.0 vs 148.3–152.7 ms.
+
+**Two further blockers specific to this branch:**
+1. §elision operated on the ROW-MAJOR full-write builder
+   (`drive_witness_packed_and_lincheck_full_write` + `witness_scratch_tag`
+   + `WITNESS_ROLE_*`). That cluster was UNREFERENCED at HEAD — production
+   is the batch-major union builder — and was deleted in today's cleanup.
+2. Its prerequisite does not hold here anyway: the provenance tag NEVER
+   HITS in the union pipeline (traced this session — the witness buffers
+   are returned mid-prove and the open stage, the largest consumer of
+   pooled F128 scratch, takes them and strips the tag).
+
+**VERDICT: `flush_rows_nt`'s ~26 ms is the required output at bandwidth
+roofline.** 96% of those bytes genuinely differ every prove. The "write
+it once" idea was right about the zero tails — which is where today's
+−22 ms came from — and is worth ~1 ms on everything else.
+
+### The open, audited — cold vs warm, one −13 ms fix, and a pool lesson — 2026-09-01
+
+Applying the doc's own rule ("audit where the buffers come from before
+porting compute") to the phase no campaign had profiled. Instrument:
+`LIG_PROVE_TRACE=1` — the production basis prover
+(`extension::recursive_prover_with_basis_impl`) already carries a full
+per-bucket breakdown behind that flag; `FLOCK_LIG_TIMING` only covers
+the per-level commits, which is why earlier sessions saw 49 of 279 ms
+and called the rest "unexamined".
+
+**FIRST FINDING: the 279 ms I had been quoting was the COLD prove.**
+The recursive prover is **~181 ms warm** at m=32. The ~100 ms gap is
+first-prove-in-process cost: ~26 ms is one `give_f256` whose pool
+eviction frees a multi-hundred-MB buffer (munmap), the rest is cold
+recursive folds (`fold_extension` collects fresh, page-faulting once)
+and a cold fold 5. `best prove_fast` is a warm minimum, so none of this
+was in the headline — but it is ~12% of first-prove latency and should
+be on the list for a serving deployment.
+
+**WARM recursive prover, 181 ms:**
+
+| bucket | ms | verdict |
+|---|---|---|
+| initial_k folds + switch | 76 | fold 1 = 40 (below), switch 9.5 (fixed) |
+| recursive commits | 47 | NTT 29 + merkle 18; examined earlier |
+| L0 OOD (eq build + eval) | 23 | ≈ memory roofline for 512 MB write + 1 GB read |
+| induce | 14 | not examined |
+| level OODs | 10.5 | not examined |
+| recursive folds + switches | 5.7 | nothing there warm |
+
+Fold 1 (`fused_first_fold2_virtual`, 2^25 → 2^23): **compute roofline.**
+Per output it does `13 + 3T` F128 multiplies (fold2 = 7, `la_msg_quad`
+= 6, virtual basis `scale·lo·hi` = 3 per term); ST 208 ms over 2^23
+outputs is ~79 cycles/output ≈ 16 PMULL-throughput multiplies. MT 40 ms
+= 5.2× on 8P+2E — the E-core dilution is the only slack (~10 ms).
+
+Outside the recursive prover: **W build 33 ms and combine 45 ms both
+scale ~7× ST→MT** (234→33, 334→45), so they are parallel and
+compute-bound (4–7 F128 muls per element), not allocation problems.
+
+**LANDED: the code switch's serial promotion.** `code_switch_message`
+did `words.into_iter().map(F256::from).collect()` — SERIAL over 2^20
+elements, 4.25 ms, into a fresh allocation — while its neighbour
+`introduce_ood_with_eval` uses `into_par_iter`. Parallelized, plus
+`alloc_uninit` instead of `vec![ZERO; …]` for the two split buffers
+(16 + 32 MB of zeroing gone). Init switch **9.52 → 3–4 ms**, fold 5
+12.6 → 6–7, **warm recursive prover 181 → 166–169 ms** over four warm
+proves. Bit-identical: the m6 transcript fixtures pass, proof size
+unchanged.
+
+**THE LESSON, which cost 20 minutes and is worth recording:** my first
+version ALSO routed the three switch buffers through the scratch pool
+(`take_f128`/`take_f256`/`give_f128`). The switch got faster still
+(2.2 ms) — and the NEXT fold went from 3 ms to 21–62 ms, wildly
+variable, and the recursive prover got SLOWER overall (206–269 ms).
+Mechanism: `MAX_POOLED = 24` with evict-from-most-populated-class. Three
+new 16–32 MB entries per switch tip the class balance, the policy
+evicts buffers the fold reuses, the fold's `take_f256` misses and
+page-faults (or an eviction munmap lands mid-fold). **Adding pool
+traffic is not a local change.** Fresh allocations for short-lived
+mid-phase buffers are malloc-recycled on warm proves and stay out of
+the pool's accounting — that is the right default for anything that is
+not one of the ~18 long-lived per-prove buffers the pool was sized for.
+
+Remaining in the open, warm: induce 14 + level OODs 10.5 (unexamined),
+the E-core dilution on fold 1 (~10), L0 OOD's materialized 512 MB eq
+table (a virtual-basis variant exists for the folds; ~10 ms if the eval
+sweep could use it — speculative). And the cold-prove tax.
