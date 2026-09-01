@@ -2999,3 +2999,49 @@ AG (tail 657 vs 120 ms). A global gate change would fix AG and cost RS
 not a new constant. NOT changed here — flagged for a decision, since AG
 is main's direction of travel and this is the largest single effect
 found all session.
+
+### RS vs AG in their optimal configs — phase breakdown — 2026-08-31
+
+RS at its optimum (default = sparse round2/tail, which RS wins 8/8) vs
+AG at its optimum (dense route via FLOCK_SPARSE_GATE, since sparse costs
+AG 3.2x). Both under identical PCS_TRACE + FLOCK_ZC_TIMING load, 4
+alternating pairs, min-per-phase within each invocation, medians:
+
+**ZEROCHECK — the only phase whose code differs. AG WINS.**
+
+| stage | RS | AG |
+|---|---|---|
+| round 1 | 118.2 | **51.3** |
+| round 2 / skip→mlv fold | **63.1** | 79.5 |
+| tail | 92.9 | **83.9** |
+| zerocheck subtotal | 274.2 | **214.6** |
+| zc+lincheck bucket | 308.1 | **276.3** (0.897) |
+
+**AG's round 1 is 2.3× cheaper (51.3 vs 118.2 ms)** — the genus-95
+product-code round 1 vs the RS additive-NTT univariate skip. AG gives
+some back on the fold (it materializes the full 2^26 folded pair where
+RS's sparse round 2 does not) and is slightly ahead on the tail. Net
+−60 ms of zerocheck. This part is mechanism-local and well outside
+noise; it is the trustworthy half of this comparison.
+
+**SHARED PHASES — identical code, so measured deltas are artifacts.**
+commit +10.2 and open +27.6 for AG, but both arms run the same union
+commit, lincheck and merged opening. Most plausible mechanism is
+scratch-pool pressure: AG-dense holds a 2^26 F128 pair (~2 GB) where
+RS-sparse holds 0.72× that. Worth measuring; NOT a code difference.
+
+**END TO END — UNRESOLVED, do not quote a number.** Two runs disagree:
+untraced 4 pairs had AG ahead ~34 ms (3/4); traced 4 pairs had AG
+behind ~100 ms. Per-arm spread is ±100 ms, and the phase mins sum to
+within 38 ms of RS's total but 132 ms of AG's (AG's per-prove variance
+is higher, so min-of-phase and min-of-total come from different
+proves). A follow-up 8-pair untraced run was ABORTED after two pairs:
+absolute times had inflated to 1.07-1.40 s from 0.86 s, with WebKit at
+38% CPU and WindowServer at 44% (load avg 4.6) — foreign interactive
+load, the documented hazard. Battery was 98% charging, so not power.
+Re-run on a quiet machine.
+
+READING: AG is the better zerocheck, and the advantage is concentrated
+entirely in round 1. Its liabilities are a larger materialized
+intermediate and a currently catastrophic sparse route. Fixing the
+dispatch is what makes AG's round-1 advantage reachable end to end.
