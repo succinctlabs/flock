@@ -3293,3 +3293,44 @@ Smaller than hoped — LLVM was already emitting reasonable code for the
 16-byte-aligned `F128` table loads, so this recovers the remaining gap
 rather than a 2×. But it is the first improvement to the AG path, and it
 lands on AG's second-largest phase.
+
+### Measurement loop: 20 min → ~22 s (benchmarks/abq.sh) — 2026-08-31
+
+Timed the actual costs instead of assuming them. Corrections to how this
+session was working:
+
+| step | cost |
+|---|---|
+| full m=32 prove, **MT**, one invocation (5 proves + setup) | **6.9 s** |
+| same at **ST** | ~30 s |
+| `round2` micro-bench, whole m=16..29 sweep | **0.6 s** |
+| rebuild after touching a flock-core kernel (release) | **20.7 s** |
+| same build under `[profile.bench]` (lto=thin, cgu=1) | 54.3 s |
+
+So a 3-pair MT full-prove A/B is only ~41 s — my 10-20 minute A/Bs were
+all **ST**, where each prove is ~5 s. And once MT is used, **the BUILD is
+the dominant cost**, comparable to an entire A/B.
+
+Consequences, now encoded in `benchmarks/abq.sh`:
+- **Kernel work goes through the micro-benches**, which drive the same
+  kernels on a synthetic witness with no R1CS build, commit or open —
+  and most print a CHECKSUM, so bit-identity is proven for free instead
+  of by a 4-minute test suite. Validated: the round-2 ports measured
+  −16.2% on the full ST prove and **−19.5% here (3/3, checksums
+  identical) in 2 seconds**.
+- **Iterate under the RELEASE profile, not `cargo bench`'s.** The
+  workspace `[profile.bench]` (lto="thin", codegen-units=1) costs 54 s
+  vs 20 s and measured the SAME number on this kernel (54.11 vs
+  53.7-55.5 ms at m=29 ST). Re-measure under `cargo bench` only for a
+  published headline.
+- **Prefer MT for A/B, ST for certification.** ST is 4x more repeatable
+  (0.3-1.2%) but 4x slower per invocation.
+- **Explore parameters with a temporary runtime knob** (one build, many
+  configs — as the FLOCK_FILL_TILE sweep did), and remove it before
+  commit. That is the only way to get the 20 s build out of the loop.
+- abq.sh builds both arms concurrently and takes the FIRST matching
+  metric line inside an optional `-m <size>` section — grepping a whole
+  sweep and taking the min silently measures the smallest size.
+
+Usage: `benchmarks/abq.sh -b round2 -c <control-worktree> -m 29
+[-p 3] [-e "RAYON_NUM_THREADS=1"] [-a "32 3"] [-g "(best)"]`
