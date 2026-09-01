@@ -16,7 +16,9 @@ use rayon::prelude::*;
 /// Split extension values into the base-field table `g(b, x)`, with adjacent
 /// `(b=0, b=1)` values for every `x`.
 pub(super) fn split_coordinates(values: &[F256]) -> Vec<F128> {
-    let mut split = vec![F128::ZERO; 2 * values.len()];
+    // Uninitialized (every slot is written below, exact 2:1 zip), NOT pooled:
+    // see the note in `code_switch_message`.
+    let mut split: Vec<F128> = crate::alloc_uninit_vec(2 * values.len());
     split
         .par_chunks_exact_mut(2)
         .zip(values.par_iter())
@@ -30,7 +32,9 @@ pub(super) fn split_coordinates(values: &[F256]) -> Vec<F128> {
 /// Transport an extension-valued basis across the coordinate split. For each
 /// old basis value `B(x)`, the new pair is `(B(x), u B(x))`.
 pub(super) fn split_basis(values: &[F256]) -> Vec<F256> {
-    let mut split = vec![F256::ZERO; 2 * values.len()];
+    // Uninitialized (every slot is written below, exact 2:1 zip), NOT pooled:
+    // see the note in `code_switch_message`.
+    let mut split: Vec<F256> = crate::alloc_uninit_vec(2 * values.len());
     split
         .par_chunks_exact_mut(2)
         .zip(values.par_iter())
@@ -1527,7 +1531,20 @@ impl SumcheckProver256 {
 
     fn code_switch_message(&mut self) -> SumcheckMessage256 {
         let words = split_coordinates(&self.f);
-        let split_f = words.into_iter().map(F256::from).collect();
+        // Parallel promotion. The old form was a serial
+        // `into_iter().map(F256::from).collect()` — 4.25 ms at the m=32 init
+        // switch (n=2^20) against ~0.4 ms parallel. Deliberately NOT routed
+        // through the scratch pool: pooling these three switch buffers
+        // measured a 20–50 ms regression in the NEXT fold, because the extra
+        // pool traffic shifts the eviction policy onto the fold's own
+        // buffers (2026-09-01). Fresh allocations here are malloc-recycled
+        // on warm proves and stay out of the pool's accounting.
+        let mut split_f: Vec<F256> = crate::alloc_uninit_vec(words.len());
+        split_f
+            .par_iter_mut()
+            .zip(words.par_iter())
+            .for_each(|(dst, &w)| *dst = F256::from(w));
+        drop(words);
         crate::scratch::give_f256(std::mem::replace(&mut self.f, split_f));
         let split_b = split_basis(&self.combined_basis);
         crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, split_b));
