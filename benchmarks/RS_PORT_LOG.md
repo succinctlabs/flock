@@ -4726,3 +4726,44 @@ knobs, MT warm-min, alternating:
   gate's design. Dead on this topology.
 
 All knobs removed; ag_skip.rs is exactly the committed ladder.
+
+### Cross-tree NTT resolved, an E-core design worth parking, and a thermal caveat — 2026-09-01 (close of the unattended session)
+
+NTT per element-update, both trees on the same M1 Max. Ours: 128 lanes
+(the union's chunk-columns, inferred from the jagged trace), 92 live,
+per-sub-NTT 2^20 at k_code = 20, layers 2..20 (the replicate-fill
+pre-applies the rate layers) → 92·2^20·18 = 1.74e9 updates in 98.4 ms =
+**0.057 ns/update** (0.067 on their denominator, which includes the
+fill). Theirs: 0.138. The apparent 3.5× per-output-element decomposes
+as ~1.39× live-column skipping (ours, structural — their commit
+transforms every column) × ~2.1× that Yukon traced on their side: their
+`butterfly_fused_4layer_row` is gated x86_64+avx512+vpclmulqdq with NO
+aarch64 arm, so on Apple silicon it falls to portable scalar — the doc's
+"four-layer NTT fusion (+19–26%)" entry is an x86-only win. Their basis
+is LCH novel-polynomial over F_{2^128} (binius64-derived) with general
+F128 twiddles, plus zero-root/low-twiddle XOR-only fused kernels — so
+"cheap subfield early layers" was NOT the difference; I retract that
+guess. Net: no NTT implementation gap on OUR side to chase.
+
+E-CORES, the design that works for them and why ours didn't: a SEPARATE
+pool at QOS_CLASS_UTILITY draining a SHARED ATOMIC CHUNK QUEUE that the
+P pool also pulls from — no barrier, an E-core owns at most one tail
+chunk when the P-cores finish, byte-identical by construction. Their
+measured E-core share: 5–16% of fold8 blocks (a tail absorber, not a
+multiplier), and their own history records the same regression we
+measured when E-cores are folded into the main pool. Our tree already
+has the scaffolding (`set_utility_qos`, the `pull()`/scope pattern in
+lib.rs used by the merkle top). PARKED: applying it to the skip→mlv
+fold (376k independent blocks) is ~30 lines with an expected −2 to −4
+ms (the all-core hop measured −2.4 before it straggled) — below the bar
+on its own; worth doing only as part of a wider E-core pass over witgen
++ fold + lane fill (~8 ms combined ceiling on 8P+2E).
+
+THERMAL CAVEAT on the closing headline: after ~3.5 h of continuous
+benchmarking the machine is throttled — `best prove_fast` reads 964–987
+ms with verify at 9.6 ms against its normal 6.2, even at a 1-minute load
+under 3 (5-minute average 5.4; iTerm at 31% from trace output). **Do not
+record those as the state.** The last clean headline is 851 ms (AG
+promotion pair, cool machine); every win today was established by
+paired same-binary deltas, which do not depend on absolutes. Re-baseline
+cold before quoting a number.
