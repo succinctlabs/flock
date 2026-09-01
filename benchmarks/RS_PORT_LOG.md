@@ -4767,3 +4767,39 @@ record those as the state.** The last clean headline is 851 ms (AG
 promotion pair, cool machine); every win today was established by
 paired same-binary deltas, which do not depend on absolutes. Re-baseline
 cold before quoting a number.
+
+### CORRECTION to the NTT decomposition above — same basis on both trees; the ~2× is unexplained — 2026-09-01
+
+Two errors in the previous entry, one mine and one relayed:
+1. "1.39× live-column skipping" is NOT a factor: my 0.057 ns/update
+   already counts only the 92 live columns, so liveness is netted out.
+   Like-for-like, we execute 1.736e9 updates in 98.4 ms against their
+   1.275e9 in 175.6 — 1.36× MORE updates in 0.56× the time. The whole
+   gap is per-update: **2.43× on our denominator, 2.06× on theirs**
+   (98.4 + 17.7 fill vs their 175.6 which includes replicate-fill).
+2. Yukon's "4-layer fused butterfly falls to scalar on aarch64" is
+   retracted by them: the scheduling gate selects the NEON fused-3 path
+   on ARM; the scalar kernel is dead code there. And radix-16 is a
+   cache-associativity wall on this microarchitecture (16 row streams
+   into an 8-way L1D), not a missing port.
+
+That left "our tower basis's cheap subfield early layers" as the
+explanation by elimination — and OUR SOURCE REFUTES IT TOO:
+`crates/flock-core/src/ntt/additive_ntt_f128.rs` carries the same
+Irreducible/binius64 header as theirs — LCH novel polynomial basis over
+F_{2^128}, `NeighborsLastReference` skeleton, general twiddles
+`Ŵ_{ℓ-l-1}(z)`, the same XOR-only zero-root replica block, fused
+2-/3-layer NEON butterflies. Same algorithm family, both derived from
+the same reference. No subfield early layers here either.
+
+So the ~2× per element-update between two implementations of the same
+LCH NTT on the same machine is REAL and UNEXPLAINED. Candidates, none
+verified: (a) lane count — ours runs 128 interleaved sub-NTTs of 2^20,
+theirs 64 of 2^20, and the SoA butterfly's streaming/vectorization
+width follows the lane count; (b) kernel tuning — the fused-3 NEON
+kernels are each tree's own work on the shared skeleton; (c) counting —
+which layers each tree's fused kernels cover per pass. It is the
+largest cross-tree implementation delta either side found today, and it
+favors THIS tree, so it is not an action item here; it is one for the
+challenge tree, where a like-for-like kernel comparison would start
+from (a).
