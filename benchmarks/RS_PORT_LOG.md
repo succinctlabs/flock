@@ -3707,3 +3707,41 @@ VERDICT: all four round-1 optimizations are accounted for — one live,
 one refuted by measurement, one inapplicable by structure, one already
 realized by the coverage mechanism, and the residual under the bar. AG
 round 1 has no untested lever left from the tex.
+
+### Structured-b for AG, measured cleanly: ceiling is 2% of round 1 — 2026-09-01
+
+Re-ran the b-encode ceiling probe without the contamination. The fix was
+to make the skip a **const generic** (`process_block_fused<const SKIP_B:
+bool>`, with the two public entries resolving the flag ONCE and
+dispatching to a monomorphised inner fn), so the hot path sees a
+compile-time constant instead of a `LazyLock` deref per block.
+
+Validation that it is clean: baseline reads 12.33 / 12.68 / 12.66 ms,
+matching the UNMODIFIED kernel's 12.2-12.3 — the earlier version moved
+the baseline and inverted the result.
+
+| | AG round 1, m=30, production shape |
+|---|---|
+| baseline | 12.66 ms |
+| b-encode removed entirely | 10.55 ms |
+| **whole b-encode** | **2.11 ms = 16.7% of round 1** |
+
+So even deleting 100% of the b-operand encode buys 16.7% of round 1.
+Structured-b targets the structurally-constant planes only — our census
+puts that at 11 of ~92 useful planes (12%) — so its **ceiling is
+0.25 ms, 2.0% of round 1**, which is ~0.6% of the AG zerocheck and under
+0.1% end to end. And that is a ceiling: a real implementation cannot
+skip individual input planes of `encode_slp_derived` (a straight-line
+program mixing all 64), so it would require regenerating a reduced SLP
+plus hoisting the constant planes' contribution — a code-generation job
+for at most a quarter of a millisecond.
+
+**Structured-b for AG is dead, now by measurement rather than by
+analogy.** With it, every round-1 optimization in the tex is closed
+against AG.
+
+TECHNIQUE WORTH KEEPING: to probe a hot path by removing work, resolve
+the switch OUTSIDE the loop and monomorphise (const generic), then
+verify the baseline arm still reproduces the unmodified timing before
+believing the other arm. Two probes today were wrecked by a flag read
+inside the loop.
