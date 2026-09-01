@@ -4439,3 +4439,238 @@ Remaining in the open, warm: induce 14 + level OODs 10.5 (unexamined),
 the E-core dilution on fold 1 (~10), L0 OOD's materialized 512 MB eq
 table (a virtual-basis variant exists for the folds; ~10 ms if the eval
 sweep could use it — speculative). And the cold-prove tax.
+
+### The zc tail, per round — lookahead is a wash and friendly-Horner is 2–3× SLOWER — 2026-09-01
+
+Per-round probe inside `mlv_tail_fs_sparse` at m=32 (AG/sparse, warm
+prove 2). The live layout is ONE prefix interval every round (the 92/128
+useful chunk-columns are a prefix), at 71.9% of the domain.
+
+| round | domain | MT ms (8 thr, quiet) | ST ms | ST/MT |
+|---|---|---:|---:|---:|
+| 1 | 2^26 → 2^25 | 43.3 | 209.4 | 4.8× |
+| 2 | 2^25 | 12.2 | 80.0 | 6.6× |
+| 3 | 2^24 | 4.6 | 33.2 | 7.2× |
+| 4 | 2^23 | 2.4 | 16.6 | 7.0× |
+| 5 | 2^22 | 1.3 | 8.3 | 6.5× |
+| 6–17 | | ~2.5 | ~9 | |
+
+Round 1 is 59% of the tail and rounds 1–5 are 93%. Rounds 2–5 scale ~7×
+(compute-bound); round 1 ~5× (its 2.3 GB per pass is partly bus-bound).
+NOTE `RAYON_NUM_THREADS=8` bypasses the bench's perf pool and reads
+~35% worse than the default 10-thread pool (tail 66 vs 48) — do not use
+it to "match" another prover's thread count.
+
+**Lookahead ladder (dense `fold1/fold2_lookahead_into`): NULL per
+element.** Probed the dense route's passes at m=32: ST 338.5 (fold1-la,
+2^26→2^25) + 112.0 + 28.2 + 7.1 + … = 488 ms over 100% of 2^26 =
+7.3 ns/elt, against the sparse classic kernel's 356 ms over 71.9% =
+7.4 ns/elt. Counting multiplies explains it: the ENTRY pass `fold1-la`
+does 3 muls/input for a single halving (classic round 1: 2), so the
+ladder totals ~15% MORE arithmetic than classic, cancelling its ~23%
+traffic saving. Porting it to the sparse prefix would gain nothing.
+This also explains why AG-dense (with lookahead) loses to AG-sparse
+(without) on the tail: same per-element cost, 39% more elements.
+
+**Friendly-Horner on the sparse prefix: BUILT, correct, and 2–2.7×
+SLOWER.** With a single prefix interval the dense
+`fold_and_friendly_round_pair_into::<SHIFT>` runs on the compact buffer
+unchanged (its chunking follows `a_out.len()`, indexing is
+chunk-relative; only a debug_assert needed relaxing). Wired for rounds
+1..=5, same-binary A/B via a knob:
+
+| | friendly | general |
+|---|---:|---:|
+| MT round 1 | 86.1 | 43.0 |
+| MT tail | 156.6 | 66.4 |
+| ST round 1 | 552.4 | 203.2 |
+| ST tail | 1059.7 | 347.0 |
+
+Roundtrips (debug assertions on), verify, and
+`friendly_round_matches_general` all pass — it is bit-identical and
+simply slow. The kernel trades 2 unreduced eq_lo multiplies per pair
+(8 PMULL + 3 XOR, a 1-cycle accumulate chain) for 2 `shl_xor::<SHIFT>`
+on 384-bit `F256Unreduced` accumulators — more instructions AND a
+loop-carried shift chain. It was never load-bearing: in the dense resume
+it only fires when NOT in lookahead mode with len ≥ 1024, i.e. only
+under the `LOOKAHEAD_DISABLE` toggle. **The 2026-08-31 claim that the
+sparse tail "forfeits the friendly kernel at 5.5×" had the sign wrong:
+the sparse path is faster partly BECAUSE it never runs it.** Reverted.
+Flag for cleanup: the friendly branch in `mlv_tail_fs_resume` is dead
+in production and measurably worse than the general kernel where it
+would run.
+
+**Where the tail's time actually is:** the general sparse kernel's inner
+loop is scalar-style F128 arithmetic (`a0 + r*(a1+a0)`, `mul_unreduced`
+into `F256Unreduced`) — the same shape round 2's `fold_pair_run` had
+before §wideneon/§qres took it 281.7 → 236.1 ms ST (−16%). That NEON
+register-residency treatment is the remaining kernel-level lever on the
+tail: ~−55 ms ST, ~−8 ms MT on the 48 ms tail. Not started.
+
+Cross-prover: the challenge tree's tail is 28 ms MT to our 48 — but its
+"round 2 + tail" is 73 vs our "fold + tail" 89, and the domains and
+round boundaries differ, so the comparable gap is ~16 ms, not 20.
+
+### CORRECTION: lookahead is NOT a wash — the entry pass is; fold2-cascade pays — 2026-09-01
+
+The Yukon session pushed back on "lookahead null per element": their tail
+uses `fold2_and_message_lookahead_*` (two halvings + message per pass,
+cascaded all the way down), not the fold1 entry shape I measured. Also,
+"friendly" in their tree names round-1 CHALLENGE CONSTANTS (7 fixed
+constants so eq factors geometrically), not a Horner kernel — so my
+friendly-Horner refutation has no counterpart there; it stands on its
+own for AG.
+
+Re-deriving from my own dense-vs-classic probe, per PASS, scaled to equal
+element counts (classic sparse ÷ 0.71875):
+
+| pass | ST ladder | ST classic equiv | Δ | MT ladder | MT classic equiv | Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| entry fold1-la @2^26 (1 halving) | 338.5 | 291.3 | **+16%** | 53.7 | 60.2 | −11% |
+| fold2-la @2^25 (rounds 2+3) | 112.0 | 157.5 | **−29%** | 14.9 | 23.4 | **−36%** |
+| fold2-la @2^23 (rounds 4+5) | 28.2 | 34.6 | −19% | 3.8 | 5.1 | −25% |
+| fold2-la @2^21 (6+7) | 7.1 | 8.7 | −19% | 1.0 | 1.3 | −23% |
+| **total** | 488 | 495 | −1% | **74** | **92** | **−20%** |
+
+So the steady fold2 passes are 19–36% cheaper than the two classic rounds
+they replace; the ENTRY pass is 16% dearer than the one round it replaces
+and it is the biggest round, which is why the ST total nets to a wash.
+At MT the ladder is already −20% in total — I had compared it against a
+CONTENDED classic number (71 ms) and called it parity; the quiet figure
+(66) says otherwise. The earlier "porting the ladder to the sparse prefix
+would be null" is therefore WRONG at MT and right only at ST.
+
+**Revised lever — a prefix fold2-cascade tail:**
+1. `fold2_lookahead_into` on the live prefix: eq sized from `rest` (not
+   `a.len()`), iteration bounded by `a.len()`; the prefix is 23·2^k and
+   aligns to the eq-hi chunks for every round that matters.
+2. Enter at fold2, not fold1: have the sparse skip→mlv fold compute the
+   round-0/1 lookahead sums in its own sweep (the resume already accepts
+   `pending2` from a "fold-level lookahead" caller), so the tail's first
+   pass is a 4→1 fold. That removes the +16% entry pass entirely.
+Prize on the 48 ms MT tail: ~−10 ms with a fold1 entry (measured −20%),
+~−15 ms with a fold-level entry; ST ~−80 ms once the entry pass is gone.
+Cost: a real build (three pieces above), ~2% of the prove. Not started.
+
+### Design notes for the prefix fold2-cascade tail, from the challenge tree — 2026-09-01
+
+The revised lever ("enter at fold2 by forming the next rounds' lookahead
+aggregates in the producing sweep") is what the challenge tree already
+does, one round earlier in its numbering: its round-2 sweep forms
+round-3's lookahead aggregates while the group's outputs are still in
+registers (`fold_round2_compact_chunk_neon_lookahead_8`,
+multilinear/kernels/aarch64.rs:791 in that tree), and the cascade
+variants repeat the trick one level deeper (round-4 pairs visited four at
+a time so the six deferred round-5 aggregates form in-register, :1096) —
+the "composed 5+6 / 7+8 / 9+10 / 11+12" markers. So the ~10–15 ms MT bet
+is de-risked structurally; the layout question (prefix interval) remains
+ours to answer.
+
+Three details that make it pay, to steal when building it:
+
+1. **One weight per group, one scaling per row.** With r' = r_next[1]:
+   eq4(2y') = (1+r')·eq5(y') and eq4(2y'+1) = r'·eq5(y'), so the whole
+   group accumulates against the single odd-lane weight w = eq_lo[2t+1].
+   Pre-scale the four A outputs by w with four REDUCED multiplies, then
+   all eight lookahead products cost one UNREDUCED multiply each. The
+   constant rescalings (κ = (1+r')/r' on the even sums, r'^-1 on the six
+   deferred aggregates) are applied once by the driver, off the hot path.
+   If a fold2 kernel carries a per-term eq weight into each product, this
+   is where the multiplies go — and it is the same eq-factoring that our
+   own `SplitEqGhash` does at the lo/hi level, pushed one level further.
+2. **Don't pre-combine the parities.** Keep the even/odd halves split
+   when a producing pass hands off; XOR-ing them first forces the
+   consumer to recompute the odd half for the lookahead's W1/W2. Costs the
+   producer nothing, drops two of the eight products: 32 PMULL per group
+   instead of 38.
+3. **Group-level `b ≡ 1` shortcut.** When all four b outputs are ONE,
+   every difference product vanishes (b0+b1 = b2+b3 = 0) and only three
+   survive — three unreduced multiplies for the group; mixed groups take
+   the full path, value-identical. Worth checking how much of our b is
+   structurally one at tail depth (round 1 of the URM sees 22 of 256 all-
+   ones K-rows; after folding by random challenges that structure is
+   gone, so this likely only helps the first tail round — measure before
+   building).
+
+Cross-tree caveat they attached and I agree with: none of this is shown
+to transfer to a prefix-interval layout; the structural part ("enter at
+fold2, form aggregates in the producing sweep") is layout-independent
+and is exactly what the per-pass split says is the win.
+
+### LANDED (marginal): lookahead ladder on the sparse tail's prefix — −4.5 ms MT — 2026-09-01
+
+Built the prefix fold2-cascade ladder in `mlv_tail_fs_sparse`, in three
+measured steps:
+
+1. `lookahead_pass!` (fold1/fold2_lookahead_into) generalized to a PREFIX:
+   eq tables sized from `rest` (the challenge suffix), iteration bounded
+   by `a.len()`, partial last chunk safe. Full-domain callers unchanged —
+   kernel tests, RS m6 transcript pins, AG roundtrips, both m=32 routes
+   verify.
+2. The ladder itself, mirroring `mlv_tail_fs_resume`'s lookahead branch
+   on the compact buffer when the live layout is a single prefix interval
+   (the shipped shape), with the `pending2` invariant carried into the
+   dense resume at handoff. Transcript-identical (roundtrips with debug
+   assertions, sparse-tail tests, m=32 verify both ways). One real bug
+   found by the sha2 roundtrip: `fold_in_place_pair` asserted a power-of-
+   two length and the in-loop resolve runs on a non-pow2 prefix — the body
+   is exact for any even length, assert relaxed.
+3. "One scaling per row" (Yukon): pre-scale the four `a` values by eq
+   (4 reduced) so the 8 products carry the weight as single unreduced
+   multiplies — 16 → 12 per position. Bit-identical by bilinearity. ST:
+   fold1-la 256.7 → 239.4 (−6.7%), fold2-la 94.7 → 91.2 (−4%), exactly
+   what the PMULL count predicts (−32 unreduced + 24 reduced). Yukon's
+   further "one weight per GROUP" (κ) trick does NOT map here: their
+   group has 2 a-values per position so one weight spans two; ours has 4
+   per position and every product needs all four pre-scaled — 4 per
+   position is already the minimum.
+
+Per-pass, prefix ladder vs classic (ST, stable): fold1-la entry 239 vs
+classic r1 207 (+16%); fold2-la 91 vs r2+r3 112 (−19%); fold2-la 19.6 vs
+r4+r5 24.9 (−21%). The steady passes pay, the entry pass does not, and
+the entry is the biggest round.
+
+MEASURED, tail total, MT default pool, alternating, min of warm proves:
+**−4.86 / −4.54 / +0.36 ms, median −4.5 ms, ladder 2/3** (on a ~67 ms
+tail inflated by residual system load — macOS's on-device inference
+service, not Yukon). ST: wash (357 vs 351). ~0.5% of the prove: real,
+marginal, kept because it is bit-identical, ~90 lines, and the platform
+the fold-level entry stands on.
+
+The fold-level entry (form the round-0/1 lookahead sums inside the
+skip→mlv fold so the tail enters at fold2) is the remaining win: it
+turns the +16% entry pass into a −19% fold2 pass over 48M. Sized: tail
+passes −22 ms MT, MINUS whatever the extra 8-product accumulation costs
+inside the fold (per block: 32 quads × 12 multiplies against the
+current round-0 message's ~128 + Horner shifts → roughly +2 multiplies
+per output, ≈ +10 MT if compute-bound, less if the fold stays gather-
+bound). Net ~−12 ms MT with wide error bars — so it gets a cost PROBE
+inside the fold before any build.
+
+### The fold-level entry, PRICED and refuted: +19 ms MT in the fold vs −22 in the tail — 2026-09-01
+
+The ladder's remaining win required forming the round-0/1 lookahead
+aggregates inside the skip→mlv fold so the tail enters at fold2. Before
+building it, its cost was measured with a probe inside
+`fold_and_first_round_sparse`'s per-block closure: the real 32-quad
+lookahead accumulation (4 reduced pre-scalings + 8 unreduced products per
+quad, weighted by a 32-entry inner-eq table, eq_outer applied per block,
+reduced across blocks) over the just-folded outputs while they are still
+in L1, result black-boxed, messages untouched (verify unchanged).
+
+| | fold, base | fold, +accumulation | Δ |
+|---|---:|---:|---:|
+| MT (default pool), 3 alternating pairs | 60.6–62.7 | 80.6–82.8 | **+17.9 / +19.3 / +22.1** |
+| ST | 317.8 | 499.4 | **+181.6** |
+
+I had estimated +5–12 MT on the theory that the fold is gather-bound and
+would hide ALU work; it does not — the extra ~148 M multiplies cost the
+same ~1.2 ns each as in the tail kernels. Against the −22 ms MT the
+ladder's passes would save by entering at fold2, the net is ~0 at MT and
++70 ms at ST. **Dead.** NEON residency (the §wideneon treatment, −16% on
+round 2) could not close a 19-vs-22 gap.
+
+So the tail is settled: the ladder with a fold1 entry (−4.5 ms MT, ST
+wash) stays; the entry cannot be moved into the fold; the general
+kernel's NEON residency (~−8 ms MT) remains the last kernel-level item.
+Probe removed; `lookahead_accum` back to private.
