@@ -3212,3 +3212,47 @@ of a process are consistently fastest. That points at scratch-pool /
 page state (the first proves get `prewarm_prover`'s prefaulted buffers,
 later ones get recycled ones), which is a separate lead. The
 "commit deltas under ~40 ms are untrustworthy" rule stands.
+
+### Round 2: the register-resident message loop (§qres) — −11.6% ST, 3/3 — 2026-08-31
+
+Second half of the tex's round-2 section, on top of §wideneon. All three
+per-pair vector/GPR crossings it targets were still present after the
+accumulator port: (1) `fold_one_row_neon_unchecked_8` extracted its
+vector accumulator to an `F128` GPR struct, (2) `g1 = a1 * b1` went
+through the scalar field multiply struct-in/struct-out, (3)
+`wide_mul_unreduced_neon` re-entered the vector file.
+
+Every q-resident primitive was ALREADY in the tree, reachable only from
+the dormant compact-K block — `mul_q`, `wide_mul_unreduced_q`, and
+`fold_one_row_neon_q_unchecked_8`, whose own doc says it exists "for
+callers that keep computing on it (the round-2 message chain)". The
+chain now runs fold → `mul_q` → `wide_mul_unreduced_q` → `WideNeon`
+with nothing leaving the vector file; per pair the only traffic left is
+the four required folded-value stores (`vst1q_u64`) and one eq load.
+
+Bit-identical: `F128` is `repr(C, align(16)) {lo, hi}` and the
+extraction convention is lane0→lo, lane1→hi, so the vector stores write
+the same bytes; reduction stays XOR-linear. 13 proof pins unchanged.
+
+**ST paired A/B vs c9c4533, 3 alternating pairs:**
+
+| phase | cand | ctrl | delta | |
+|---|---|---|---|---|
+| **round 2** | **236.1** | **267.2** | **−31.0 (−11.6%)** | **3/3** |
+| round 1 | 897.3 | 898.4 | −0.0 | control, flat |
+| tail | 274.1 | 277.8 | −4.4 | control |
+| zc+lincheck | 1537.2 | 1572.8 | −35.4 | 3/3 |
+| commit | 1667.7 | 1677.3 | −9.9 | (under the ~40 ms noise floor) |
+
+Matches the tex's −13.0% for this section closely.
+
+**Round 2 cumulative today: 281.7 → 236.1 ms ST (−16.2%)** across
+§wideneon (−9.2%, 3/3) and §qres (−11.6%, 3/3), against the campaign's
+312 ms best on the old protocol.
+
+ALSO FIXED: §wideneon (da4e4b8) referenced `gf2_128::aarch64` — which is
+gated on `target_feature = "aes"` — from a block gated only on
+`target_arch = "aarch64"`. That compiles on `aarch64-apple-darwin`
+(aes is default) but would break a non-aes aarch64 build. Both arms are
+now correctly gated, with the extracted-fold path kept as the non-PMULL
+fallback.

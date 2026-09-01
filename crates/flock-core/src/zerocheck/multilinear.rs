@@ -45,7 +45,7 @@ use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 mod kernels;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, not(target_feature = "aes"))))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::fold_one_row_neon_q_unchecked_8;
@@ -639,9 +639,75 @@ where
     let mut p1_acc = F256Unreduced::ZERO;
     let mut pinf_acc = F256Unreduced::ZERO;
 
-    #[cfg(target_arch = "aarch64")]
+    // aarch64 + PMULL: the whole round-2 message chain stays resident in q
+    // registers. The fold returns its accumulator unextracted, the products
+    // use the q-resident multiply, and the eq products feed the wide
+    // accumulator directly — so none of the three per-pair vector/GPR
+    // crossings the extracted form paid (fold extract, scalar field multiply
+    // in/out, re-entry to accumulate) remain. Per pair the only traffic left
+    // is the four required folded-value stores and one eq load.
+    //
+    // Bit-identical to the extracted form: `F128` is `repr(C, align(16))`
+    // `{lo, hi}` and the extraction convention is lane0 -> lo, lane1 -> hi,
+    // so `vst1q_u64` writes exactly the same bytes; reduction is XOR-linear
+    // and the XOR multiset is unchanged.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     unsafe {
-        use crate::field::gf2_128::aarch64::{WideNeon, wide_mul_unreduced_neon};
+        use crate::field::gf2_128::aarch64::{WideNeon, mul_q, wide_mul_unreduced_q};
+        use core::arch::aarch64::{vld1q_u64, veorq_u64, vreinterpretq_u64_u8, vst1q_u64};
+        let table_ptr = table.data.as_ptr() as *const u8;
+        let a_pkt_ptr = a_packed.as_ptr();
+        let b_pkt_ptr = b_packed.as_ptr();
+        let mut p1_w = WideNeon::zero();
+        let mut pinf_w = WideNeon::zero();
+
+        for pair in ps..pe {
+            let x0l = 2 * (pair - out_base);
+            let x1l = x0l + 1;
+            if is_dead(pair) {
+                kill_pair(a_out, b_out, x0l, x1l, write_dead);
+                continue;
+            }
+            let x0g = 2 * pair;
+            let x1g = x0g + 1;
+
+            let a0 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                table_ptr,
+                a_pkt_ptr.add(x0g * 8),
+            ));
+            let b0 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                table_ptr,
+                b_pkt_ptr.add(x0g * 8),
+            ));
+            let a1 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                table_ptr,
+                a_pkt_ptr.add(x1g * 8),
+            ));
+            let b1 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                table_ptr,
+                b_pkt_ptr.add(x1g * 8),
+            ));
+
+            vst1q_u64(a_out.as_mut_ptr().add(x0l) as *mut u64, a0);
+            vst1q_u64(a_out.as_mut_ptr().add(x1l) as *mut u64, a1);
+            vst1q_u64(b_out.as_mut_ptr().add(x0l) as *mut u64, b0);
+            vst1q_u64(b_out.as_mut_ptr().add(x1l) as *mut u64, b1);
+
+            let eq_q = vld1q_u64(eq_lo.as_ptr().add(pair & lo_mask) as *const u64);
+            p1_w.xor_assign(wide_mul_unreduced_q(eq_q, mul_q(a1, b1)));
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            pinf_w.xor_assign(wide_mul_unreduced_q(eq_q, g_inf));
+        }
+
+        p1_acc ^= p1_w.to_unreduced();
+        pinf_acc ^= pinf_w.to_unreduced();
+    }
+
+    // aarch64 without PMULL: the extracted fold + portable field multiply.
+    // (`gf2_128::aarch64`, which holds the q-resident primitives, is itself
+    // gated on the `aes` feature.)
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+    unsafe {
         let table_ptr = table.data.as_ptr() as *const u8;
         let a_pkt_ptr = a_packed.as_ptr();
         let b_pkt_ptr = b_packed.as_ptr();
@@ -655,9 +721,6 @@ where
         // Bit-identical: reduction is XOR-linear and the XOR multiset is
         // unchanged. (The x86 arm below already accumulates wide via
         // `WideGhashX4`; aarch64 had been left on the scalar struct.)
-        let mut p1_w = WideNeon::zero();
-        let mut pinf_w = WideNeon::zero();
-
         for pair in ps..pe {
             let x0l = 2 * (pair - out_base);
             let x1l = x0l + 1;
@@ -681,15 +744,9 @@ where
             b_out[x1l] = b1;
 
             let eq_l = eq_lo[pair & lo_mask];
-            let g1 = a1 * b1;
-            p1_w.xor_assign(wide_mul_unreduced_neon(eq_l, g1));
-            let g_inf = (a0 + a1) * (b0 + b1);
-            pinf_w.xor_assign(wide_mul_unreduced_neon(eq_l, g_inf));
+            p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+            pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
         }
-
-        // Leave the vector file once, here.
-        p1_acc ^= p1_w.to_unreduced();
-        pinf_acc ^= pinf_w.to_unreduced();
     }
     #[cfg(all(
         target_arch = "x86_64",
