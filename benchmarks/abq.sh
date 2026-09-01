@@ -58,10 +58,18 @@ pick() { /bin/ls -t $1/target/release/deps/${BENCH}-* | grep -v '\.d$' | head -1
 N=$(pick /Users/buenz/flock-main); C=$(pick $CTL)
 echo "cand: $N" >&2; echo "ctrl: $C" >&2
 
-# Take the FIRST matching metric line (optionally inside the -m section), not
-# the min across a whole sweep — that would silently measure the smallest size.
-sect() { if [[ -n $SECT ]]; then awk -v m="=== m = $SECT " 'index($0,m){p=1} p'; else cat; fi }
-run()  { env $E "$1" $BA 2>&1 | sect | grep -F "$PAT" | head -1 | grep -oE "[0-9]+\.[0-9]+" | head -1 }
+# Metric = MIN over the matching lines INSIDE the -m section (section ends at
+# the next "===" banner). Two traps this avoids, both of which bit:
+#   * min across a whole sweep silently measures the SMALLEST size;
+#   * the FIRST matching line is the COLD prove — for ag_breakdown that is
+#     18.3 ms against a ~10 ms warm min, which manufactured a fake +15%
+#     regression on 2026-09-01 before this was fixed.
+sect() {
+  if [[ -n $SECT ]]; then
+    awk -v m="=== m = $SECT " 'index($0,m){p=1; next} p && /=== /{p=0} p'
+  else cat; fi
+}
+run()  { env $E "$1" $BA 2>&1 | sect | grep -F "$PAT" | grep -oE "[0-9]+\.[0-9]+" | sort -n | head -1 }
 sums() { env $E "$1" $BA 2>&1 | sect | grep -i checksum | head -1 }
 
 typeset -a D

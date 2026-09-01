@@ -3374,3 +3374,40 @@ table footprint under L1 is irrelevant" — but 4 MiB is far past L1, and
 the campaign already measured an 8x-smaller table as a −3.6%
 regression, so the sign is genuinely unknown. Cheap to settle with abq
 if anyone wants it.
+
+### CORRECTION: the AG-fold "+15% regression" was a cold-prove artifact — 2026-09-01
+
+The entry above reports the AG fold's two-step unroll as +15%, 0/3. **That
+number is wrong and is withdrawn.** `abq.sh` was taking the FIRST matching
+metric line, which for `ag_breakdown` is the COLD first prove (18.3 ms
+against a ~10 ms warm min), so both arms were cold and the comparison was
+noise. Round 2 was unaffected — its `(best)` line is already a min — which
+is why that result stands.
+
+Re-measured warm, same binary switched by a temporary knob, alternating:
+
+| pair | unroll | plain |
+|---|---|---|
+| 1 | 9.87 | 9.96 |
+| 2 | 9.94 | 10.05 |
+| 3 | 10.03 | 10.00 |
+
+**AG fold unroll is NEUTRAL (−0.9%, 2/3), not a regression.**
+
+Crossing the unroll against the Horner (one build, four configs) also
+shows no large effect: horner-on 10.04 vs 9.90, horner-off 8.83 vs 8.94
+— a ~2% swing either way, inside noise at single-shot resolution.
+
+So the real contrast is narrower than claimed: **round 2 gains ~5% MT
+from unrolling; the AG fold gains nothing.** The store destination
+remains the best explanation — round 2 streams into a codeword-sized
+buffer whose stores block the compiler from hoisting the next
+iteration's gathers, so folding two pairs before storing either exposes
+eight chains; the AG fold writes into 128-element `am`/`bm` slices that
+stay in L1, where the compiler could already interleave, so there is
+nothing left to expose. The earlier "register pressure against a serial
+Horner" story is NOT needed to explain a null.
+
+`abq.sh` now takes the MIN over matching lines inside the `-m` section
+(section bounded by the next `===` banner), with both traps documented
+in its header.
