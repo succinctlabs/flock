@@ -3610,3 +3610,47 @@ that this session can identify: the arithmetic is q-resident
 (§wideneon + §qres, −16.2% ST on the real prove), the loop structure is
 right for the sparse route, and the table geometry is optimal in both
 directions.
+
+### Round 1: §pmull is already live (RS); its AG analog (Karatsuba accumulate) REFUTED — 2026-09-01
+
+**RS round 1 already has §pmull.** The x^4-scaled gather table and the
+x^2 byte-doubling are in `univariate_skip_optimized/kernels/aarch64.rs`
+(:595, :635) — the multiplicative weight splitting survived the merge.
+Nothing to port.
+
+**The idea does not map to AG round 1 as written.** §pmull defers a
+per-product REDUCTION in F_{2^8}; AG round 1 has none to defer. Its
+products are bitsliced F_2 (`pr = (af&bx) ^ (ax&bf)` — AND/XOR, free),
+and its eq-weighting already accumulates unreduced into
+`UnredAcc = [ll, cross, hh]`. The "unreduced accumulation" half is
+therefore already present; there is no structured weight `x^K` to split,
+because the weight is one general `eq_o` per block.
+
+**What the same family did suggest, and it failed.** AG's accumulate is
+SCHOOLBOOK — 4 PMULL. Karatsuba forms the middle as
+`(eq.lo^eq.hi)·(xl^xh) = cross ^ ll ^ hh`, and since `ll`/`hh` are
+accumulated in their own lanes the correction defers to `reduce_unred`
+by linearity — structurally the same deferral §pmull uses. 3 PMULL, with
+`eq.lo^eq.hi` hoisting (eq is per-block constant).
+
+Value-identical (genus95 tests pass under both settings; the AG union
+roundtrip VERIFIES a real proof under Karatsuba). Measured on the REAL
+AG prove — `BLAKE3_ZC=ag`, the padded/coverage kernel, not
+`ag_breakdown` — ST, one binary, knob-switched, alternating:
+
+| pair | karatsuba | schoolbook | delta |
+|---|---|---|---|
+| 1 | 646.22 | 639.72 | +6.50 |
+| 2 | 644.60 | 639.75 | +4.85 |
+| 3 | 644.55 | 633.56 | +10.99 |
+
+**0/3, ~+1%. Reverted.** Third independent refutation of Karatsuba on
+this core (the campaign's NTT butterfly was +58%): trading one PMULL for
+two extra XORs and a longer dependency chain does not pay when PMULL
+throughput is not the binding constraint. The M1 model's
+"re-encoding fixed work never pays" rule now stands at 0/7.
+
+ALSO: `benches/ag_breakdown.rs` drives the DENSE
+`round1_slp_packed_banks_fused`, not the `_padded` coverage kernel
+production uses — the same dense-only flaw fixed in round1/round2. Any
+AG round-1 work must be measured on the real prove until that is fixed.
