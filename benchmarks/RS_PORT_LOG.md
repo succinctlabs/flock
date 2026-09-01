@@ -3781,3 +3781,56 @@ NEW MATH, not a port — the AG C banks are over genus-95 code coordinates
 with the even/odd friendly split, and the derivation would have to
 target BatchMajor (the layout that killed the RS port) from the start.
 Not attempted; recorded with its price so the decision is informed.
+
+### §stripe re-derived for AG: the math works, the economics do not — 2026-09-01
+
+Derived rather than ported, since the RS implementation is RowMajor-bound.
+
+**THE DERIVATION (correct, recorded for reuse).** Batch-major addresses
+are `[7 in-word | n_log batch | k_log-7 chunk]`; AG splits the same
+address as `[skip(6) | inner(7) | outer]`. So
+
+- AG skip (bits 0-5) = in-word bits 0-5
+- AG parity = inner dim 0 (bit 6) = in-word bit 6
+- AG inner dims 1-6 (bits 7-12) = **batch** bits 0-5
+- AG outer (bits 13+) = remaining batch bits AND all chunk bits
+
+With `pf = Σ_i x^i·bit_i` split by parity of `i`, the banks are
+
+    bank_p[k] = Σ_o eq_o · Σ_{i ≡ p (2)} x^i · z[o·128 + i, k]
+
+`x^i = Π_j (x^{2^j})^{i_j}` is a product of per-dim factors and `eq_o` is
+an eq tensor, so **W is rank-1 over every folded dimension** — the
+condition for a per-dim fold. Keep in-word bits 0-6 unfolded (128
+values); then `bank_0[k] = v[k]` and `bank_1[k] = x · v[64+k]`. The extra
+`x` on the odd bank is independently confirmed by the existing
+`banks_to_message`, which applies `gamma_inv` to bank1 "because the
+kernel's odd-i bank carries an extra γ from friendly bit 0".
+
+**BatchMajor is NOT the blocker here** — that only killed the RS port
+because that code assumes a fixed RowMajor index relation. Deriving
+fresh, the sole consequence is that AG's friendly dims 1-6 sit in the
+INSTANCE index rather than the row index, so the outer fold carries
+`eq ⊗ friendly` instead of pure `eq`. Still rank-1, still foldable.
+
+**THE ECONOMICS KILL IT.** The replacement needs one O(2^m)
+`fold_stripe_outer` pass — the same kernel lincheck uses,
+`partial_fold_packed_z_best`. Timed at the production shape
+(m=30, k_log=14, useful_bits=11_707, 8 threads): **3.80 ms**, against the
+**2.59 ms** of C-side work it would delete (measured above).
+
+| | fold ADDED | work REMOVED | net | ratio |
+|---|---|---|---|---|
+| RS §stripe | 180 ms | 250 ms | **−70** | 0.72 |
+| **AG** | **3.80 ms** | **2.59 ms** | **+1.21** | **1.47** |
+
+The fold's cost is set by the WITNESS SIZE, not by how efficient round 1
+is. RS won because its C side was expensive (a bit transpose plus 32 of
+48 gathers per lane). AG's round 1 is already far leaner — its whole C
+side is 21% of a 12.3 ms phase — so the same fixed-cost pass no longer
+pays. Nor can the fold be shared with lincheck: lincheck folds at its
+own challenge point, not round 1's.
+
+NOT BUILT. The derivation above is the reusable part: if AG's C side ever
+grows, or a stripe fold becomes available for free from a neighbouring
+phase, it can be implemented directly from the formula.
