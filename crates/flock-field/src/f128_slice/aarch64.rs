@@ -1,5 +1,4 @@
-use crate::F128;
-use crate::gf2_128::aarch64::ghash_mul_vec2_neon;
+use crate::{F128, gf2_128::aarch64::ghash_mul_vec2_neon};
 
 /// Two-lane pair fold using NEON and PMULL.
 ///

@@ -4,19 +4,18 @@
 //! [`FsChallenger`] supports SHA-256 and BLAKE3.
 //! `RandomChallenger` supports tests and benchmarks only.
 
-#[cfg(feature = "hash-count")]
-use self::fs_count::{POW_SHA256, SQUEEZED_BYTES, SQUEEZES};
-use blake3::Hasher;
-use blake3::IncrementCounter;
-use blake3::hash;
-use blake3::platform::Platform;
+use std::array::from_fn;
+
+use blake3::{Hasher, IncrementCounter, hash, platform::Platform};
 use flock_field::{F128, F256};
 use flock_hash::{BLAKE3_IV, HashKind, blake3_compress};
-use rayon::prelude::*;
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use sha2::{Digest, Sha256};
-use std::array::from_fn;
 #[cfg(feature = "hash-count")]
-use std::sync::atomic::Ordering;
+use {
+    crate::challenger::fs_count::{POW_SHA256, SQUEEZED_BYTES, SQUEEZES},
+    std::sync::atomic::Ordering,
+};
 
 /// Number of grinding bits needed to turn a Schwartz--Zippel event of
 /// degree at most `degree` over `F_{2^128}` into a *strictly* sub-`2^-128`
@@ -1255,8 +1254,12 @@ fn pow_scan(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashSet;
+
+    use crate::challenger::{
+        Challenger, F128, F256, FsChallenger, HashKind, RandomChallenger, blake3_pow_scan,
+        pow_has_leading_zero_bits,
+    };
 
     /// Every FsChallenger property must hold under both transcript hashes:
     /// the tagging, absorption order and duplex structure are shared, and
@@ -1649,7 +1652,7 @@ mod tests {
 
 #[cfg(test)]
 mod b3_chain_tests {
-    use super::*;
+    use crate::challenger::{Challenger, F128, FsChallenger};
 
     #[test]
     fn chained_blake3_is_deterministic_and_binding() {

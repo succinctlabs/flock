@@ -1,9 +1,14 @@
-use core::arch::aarch64::uint8x16_t;
-use core::arch::aarch64::uint16x8_t;
-use core::arch::aarch64::*;
+use core::arch::aarch64::{
+    uint8x16_t, uint8x16x4_t, uint16x8_t, vandq_u64, vdupq_n_u8, vdupq_n_u16, vdupq_n_u64,
+    veorq_u8, veorq_u16, veorq_u64, vextq_u8, vget_high_u8, vget_low_u8, vgetq_lane_u64, vld1q_u8,
+    vqtbl4q_u8, vreinterpretq_u8_u16, vreinterpretq_u8_u64, vreinterpretq_u64_u8, vshll_n_u8,
+    vshlq_n_u64, vshrq_n_u64, vst1q_u8,
+};
 
-use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
-use crate::field::gf2_8::neon::{gf8_mul_vec16, gf8_reduce_vec16};
+use crate::{
+    field::gf2_8::neon::{gf8_mul_vec16, gf8_reduce_vec16},
+    zerocheck::univariate_skip_optimized::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS},
+};
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]

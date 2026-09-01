@@ -25,24 +25,26 @@
 //! verify_ligerito_union`], and their mixed-class variants)
 //! accept any registry under the `flock-mixed-v1` binding.
 
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::lincheck::{QuirkyPoint, SkipPoint};
-use crate::merkle::{HashKind, hash_leaf, hash_pair};
-use crate::pcs::Commitment;
-use crate::pcs::dense_lanes;
+use core::{mem::take, ops::Range};
+use std::iter::repeat_n;
+
+use rayon::{
+    join,
+    prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut},
+};
+
 #[cfg(test)]
 use crate::schedule::TableClass;
-use crate::schedule::{Instance, Registry, TableType};
-use crate::scratch::give_zeroed_f128;
-use crate::scratch::take_f128;
-use crate::scratch::take_zeroed_f128;
-use crate::zerocheck::{K_SKIP, PaddingSpec};
-use core::mem::take;
-use core::ops::Range;
-use rayon::join;
-use rayon::prelude::*;
-use std::iter::repeat_n;
+use crate::{
+    challenger::Challenger,
+    field::F128,
+    lincheck::{QuirkyPoint, SkipPoint},
+    merkle::{HashKind, hash_leaf, hash_pair},
+    pcs::{Commitment, dense_lanes},
+    schedule::{Instance, Registry, TableType},
+    scratch::{give_zeroed_f128, take_f128, take_zeroed_f128},
+    zerocheck::{K_SKIP, PaddingSpec},
+};
 
 /// Floor of the committed dense-stack size, as a bit-variable count: the
 /// smallest embedded Ligerito security config is `m22` (`2^15` packed
@@ -1086,18 +1088,20 @@ pub struct SlotWitnessDest<'d> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::pcs::jagged::JaggedParams;
-    use crate::r1cs::SparseBinaryMatrix;
-    use crate::r1cs::{BlockR1cs, WitnessLayout};
-    use crate::zerocheck::PaddingRun;
-    use std::sync::Arc;
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
 
-    use crate::challenger::FsChallenger;
-    use crate::element_r1cs::ElementTableBuilder;
-    use crate::pcs::PcsParams;
-    use crate::test_rng::Rng;
+    use crate::{
+        challenger::FsChallenger,
+        element_r1cs::ElementTableBuilder,
+        pcs::{PcsParams, jagged::JaggedParams},
+        r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+        test_rng::Rng,
+        union::{
+            Challenger, Commitment, ElementSlotLayout, F128, K_SKIP, MIN_DENSE_M, Registry,
+            SkipPoint, SlotWitness, TableClass, TableType, UnionInstance,
+        },
+        zerocheck::PaddingRun,
+    };
     /// Empty matrix stub — nothing here applies the matrices (same practice
     /// as the schedule.rs layout tests).
     fn stub() -> SparseBinaryMatrix {

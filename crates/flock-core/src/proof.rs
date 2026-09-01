@@ -4,21 +4,21 @@
 //! verifier can name them without depending on the prove path. The prover
 //! produces these structs; the verifier consumes them.
 
-use crate::challenger::Challenger;
-use crate::circuit::WiringProof;
-use crate::element_r1cs::union::Claims;
-use crate::element_r1cs::union::Proof;
-use crate::field::F128;
-use crate::lincheck::{self, QuirkyPoint};
-use crate::pcs::{self, Commitment};
-use crate::r1cs::BlockR1cs;
-use crate::zerocheck;
 use lincheck::LincheckProof;
-use pcs::BatchOpeningProofLigerito;
-use pcs::MergedOpenProof;
+use pcs::{BatchOpeningProofLigerito, MergedOpenProof};
 use serde::{Deserialize, Serialize};
-use zerocheck::ZerocheckProof;
-use zerocheck::ag_skip::AgProof;
+use zerocheck::{ZerocheckProof, ag_skip::AgProof};
+
+use crate::{
+    challenger::Challenger,
+    circuit::WiringProof,
+    element_r1cs::union::{Claims, Proof},
+    field::F128,
+    lincheck::{self, QuirkyPoint},
+    pcs::{self, Commitment},
+    r1cs::BlockR1cs,
+    zerocheck,
+};
 
 /// Top-level R1CS proof: zerocheck + lincheck transcripts, plus one batched
 /// Ligerito PCS opening covering both the `ab` and `c` z-claims.

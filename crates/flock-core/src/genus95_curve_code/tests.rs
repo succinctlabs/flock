@@ -1,21 +1,25 @@
-use super::artin_schreier::ArtinSchreierSolver;
-use super::base_evaluator::{base_evaluation_functional, evaluate_base_functional};
-use super::constants::PRODUCT_MESSAGE_BITS;
-use super::constants::{BASE_X_POWER_COUNT, FOUR_RUSSIANS_BLOCK_BITS};
-use super::constants::{GAMMA_GROUP_COUNT, MAX_X_DEGREE, X_POWER_COUNT};
-use super::evaluator::{
-    EvaluationPoint, eval_poly_mask, evaluate_product_functional, product_evaluation_functional,
-    x_powers, y_powers,
-};
-use super::field::{F128, F128Ext};
-use super::messages::{BaseMessage, ProductMessage};
-use super::product::{extended_base_product_message, product_code_message};
-use super::sage_data::{ARTIN_SCHREIER_RHS, GAMMA_SLOT_MASKS, PRODUCT_DENOMINATOR};
-use super::sampling::{eval_base_rational_function, sample_random_evaluation_point};
-use super::tables::TABLES;
-use super::try_evaluation_point;
-use super::{RngCore, Sha256Rng};
 use std::collections::HashSet;
+
+use crate::genus95_curve_code::{
+    RngCore, Sha256Rng,
+    artin_schreier::ArtinSchreierSolver,
+    base_evaluator::{base_evaluation_functional, evaluate_base_functional},
+    constants::{
+        BASE_X_POWER_COUNT, FOUR_RUSSIANS_BLOCK_BITS, GAMMA_GROUP_COUNT, MAX_X_DEGREE,
+        PRODUCT_MESSAGE_BITS, X_POWER_COUNT,
+    },
+    evaluator::{
+        EvaluationPoint, eval_poly_mask, evaluate_product_functional,
+        product_evaluation_functional, x_powers, y_powers,
+    },
+    field::{F128, F128Ext},
+    messages::{BaseMessage, ProductMessage},
+    product::{extended_base_product_message, product_code_message},
+    sage_data::{ARTIN_SCHREIER_RHS, GAMMA_SLOT_MASKS, PRODUCT_DENOMINATOR},
+    sampling::{eval_base_rational_function, sample_random_evaluation_point},
+    tables::TABLES,
+    try_evaluation_point,
+};
 
 #[test]
 fn product_message_has_expected_prefix() {

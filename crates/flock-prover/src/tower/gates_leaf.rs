@@ -1,8 +1,12 @@
-use super::*;
-use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
-use flock_core::schedule::IoWord;
-use flock_field::gf2_256::QUADRATIC_NONRESIDUE;
 use std::sync::Arc;
+
+use flock_core::{
+    element_r1cs::{ElementTableBuilder, ElementTableType},
+    schedule::IoWord,
+};
+use flock_field::gf2_256::QUADRATIC_NONRESIDUE;
+
+use crate::tower::{F128, F256, GateType, SlotWitness, TableType};
 
 /// What the verifier actually computes from the opened leaves, at one level:
 ///

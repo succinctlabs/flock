@@ -116,46 +116,51 @@
 //!   `byte_idx` and apply it across all `i_inner` with one lookup + one XOR
 //!   per byte.
 
-use crate::all_core_pool;
-use crate::alloc_uninit_vec;
-use crate::challenger::Challenger;
-use crate::ecore_rich_topology;
-use crate::field::F128;
-use crate::genus95_curve_code::FsRng;
-use crate::genus95_curve_code::evaluation_point_from_nonce_pow;
-use crate::genus95_curve_code::sample_random_evaluation_point;
-use crate::genus95_curve_code::{EvaluationPoint, base_evaluation_functional};
-use crate::r1cs::SparseBinaryMatrix;
-use crate::zerocheck::ag_skip::K_SKIP;
-use crate::zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET;
-use crate::zerocheck::ag_skip::fallback_point;
-use crate::zerocheck::multilinear::lagrange_weights_naive;
-use flock_multilinear::IndexOrder;
-use flock_multilinear::eq_table;
-use rayon::current_num_threads;
-use rayon::prelude::*;
+use std::{
+    env::var,
+    fmt::{Debug, Formatter, Result as FmtResult},
+    mem::take,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
+
+use flock_multilinear::{IndexOrder, eq_table};
+use rayon::{
+    current_num_threads,
+    prelude::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+        IntoParallelRefMutIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+    },
+};
 use serde::{Deserialize, Serialize};
-use std::env::var;
-use std::fmt::Debug;
-use std::fmt::Formatter;
-use std::fmt::Result as FmtResult;
-use std::mem::take;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
-pub use kernels::partial_fold_packed_z_x86_tiled_padded;
+pub use crate::lincheck::kernels::partial_fold_packed_z_x86_tiled_padded;
 #[cfg(target_arch = "aarch64")]
-pub use kernels::{
+pub use crate::lincheck::kernels::{
     partial_fold_packed_z_neon_allcore_padded, partial_fold_packed_z_neon_iblock_padded,
     partial_fold_packed_z_neon_oblock_padded, partial_fold_packed_z_neon_single,
     partial_fold_packed_z_neon_single_padded,
 };
-pub use union::{
+pub use crate::lincheck::union::{
     MatrixAssertion, UnionLincheckSlot, eq_prefix_sum, eq_prefix_weight, prove_union_capture_z_vec,
     prove_union_capture_z_vec_with_grinding, union_comb_partial, verify_union,
     verify_union_deferred, verify_union_deferred_with_grinding, verify_union_with_grinding,
+};
+use crate::{
+    all_core_pool, alloc_uninit_vec,
+    challenger::Challenger,
+    ecore_rich_topology,
+    field::F128,
+    genus95_curve_code::{
+        EvaluationPoint, FsRng, base_evaluation_functional, evaluation_point_from_nonce_pow,
+        sample_random_evaluation_point,
+    },
+    r1cs::SparseBinaryMatrix,
+    zerocheck::{
+        ag_skip::{K_SKIP, R1_FUSED_ATTEMPT_BUDGET, fallback_point},
+        multilinear::lagrange_weights_naive,
+    },
 };
 mod kernels;
 mod union;
@@ -2248,11 +2253,28 @@ pub fn verify_with_grinding<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
     use std::collections::HashSet;
 
-    use crate::test_rng::Rng;
+    #[cfg(target_arch = "x86_64")]
+    use crate::lincheck::partial_fold_packed_z_x86_tiled_padded;
+    #[cfg(target_arch = "aarch64")]
+    use crate::lincheck::{
+        NEON_TILE_T, partial_fold_packed_z_neon_iblock_padded,
+        partial_fold_packed_z_neon_oblock_padded, partial_fold_packed_z_neon_single,
+        partial_fold_packed_z_neon_single_padded,
+    };
+    use crate::{
+        challenger::FsChallenger,
+        lincheck::{
+            F128, LincheckError, LincheckGrinding, LincheckProof, QuirkyPoint, SkipPoint,
+            SparseBinaryMatrix, SparseMatrixCircuit, build_eq_table,
+            build_quirky_eq_table_from_weights, n_log_ok_for_tile, pack_z_lincheck,
+            partial_fold_packed_z, partial_fold_packed_z_best, partial_fold_packed_z_fast,
+            partial_fold_packed_z_fast_padded, prove, prove_with_grinding, sparse_row_fold, verify,
+            verify_with_grinding,
+        },
+        test_rng::Rng,
+    };
 
     /// Naive MLE evaluation: `f̂(point) = Σ_i eq(point, i) · f[i]` where i ∈
     /// {0,1}^d and f[i] is given as a bool slice.

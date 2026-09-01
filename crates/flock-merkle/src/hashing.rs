@@ -3,29 +3,32 @@
 //! [`MerkleHash`] selects the hash implementation. [`HashKind`] supports runtime selection.
 //! BLAKE3 separates leaf and parent inputs. The current SHA-256 format does not.
 
-use blake3::Hasher;
-use blake3::IncrementCounter;
-use blake3::hazmat::Mode;
-use blake3::hazmat::merge_subtrees_non_root;
-use blake3::platform::Platform;
-use core::slice::from_raw_parts;
-use core::slice::from_raw_parts_mut;
+use core::slice::{from_raw_parts, from_raw_parts_mut};
+use std::sync::OnceLock;
+
+use blake3::{
+    Hasher, IncrementCounter,
+    hazmat::{HasherExt, Mode, merge_subtrees_non_root},
+    platform::Platform,
+};
 use flock_hash::Digest as HashDigest;
-use rayon::prelude::*;
+pub use flock_hash::{BLAKE3_IV, HashKind};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator, ParallelSlice,
+    ParallelSliceMut,
+};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "hash-count")]
+use {
+    crate::hashing::hash_count::{LEAF_CALLS, LEAF_COMPRESSIONS, PAIR_CALLS, blocks},
+    std::sync::atomic::Ordering::Relaxed,
+};
+
 #[cfg(any(
     all(target_arch = "aarch64", target_feature = "sha2"),
     all(target_arch = "x86_64", target_feature = "sha")
 ))]
-use sha256x4::hash4_equal_len;
-use std::sync::OnceLock;
-
-#[cfg(feature = "hash-count")]
-use self::hash_count::{LEAF_CALLS, LEAF_COMPRESSIONS, PAIR_CALLS, blocks};
-use blake3::hazmat::HasherExt;
-pub use flock_hash::{BLAKE3_IV, HashKind};
-#[cfg(feature = "hash-count")]
-use std::sync::atomic::Ordering::Relaxed;
+use crate::hashing::sha256x4::hash4_equal_len;
 pub type Hash = HashDigest;
 
 pub trait MerkleHash: Send + Sync + 'static {
@@ -101,8 +104,9 @@ mod sha256x4;
 /// Relaxed atomics — exact totals, no ordering guarantees across threads.
 #[cfg(feature = "hash-count")]
 pub mod hash_count {
-    use super::HashKind;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    use crate::hashing::HashKind;
 
     pub static LEAF_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static LEAF_COMPRESSIONS: AtomicU64 = AtomicU64::new(0);

@@ -15,19 +15,21 @@
 //!   - SHA-256 PoW checks (1 compression each)
 //!   - BLAKE3 Fiat–Shamir absorption (bytes + squeezes, ≈ compressions)
 
-use flock_prover::challenger::fs_count::{reset as reset_fs_count, snapshot as snapshot_fs_count};
-use flock_prover::challenger::{FsChallenger, fs_count};
-use flock_prover::init_perf_thread_pool;
-use flock_prover::merkle::hash_count;
-use flock_prover::merkle::hash_count::{
-    reset as reset_hash_count, snapshot as snapshot_hash_count,
-};
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG};
-use std::array::from_fn;
-use std::env::var;
-use std::time::Instant;
+use std::{array::from_fn, env::var, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::{
+        FsChallenger, fs_count,
+        fs_count::{reset as reset_fs_count, snapshot as snapshot_fs_count},
+    },
+    init_perf_thread_pool,
+    merkle::{
+        hash_count,
+        hash_count::{reset as reset_hash_count, snapshot as snapshot_hash_count},
+    },
+    r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG},
+};
 
 fn random_compression(rng: &mut Rng) -> Compression {
     let cv: [u32; 8] = from_fn(|_| rng.next_u32());

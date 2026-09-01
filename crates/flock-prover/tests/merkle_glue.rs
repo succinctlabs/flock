@@ -6,22 +6,26 @@
 //! would compute a different root and every downstream test would be
 //! measuring the wrong thing.
 
-use blake3::BLAKE3_IV;
-use flock_core::r1cs::BlockR1cs;
-use flock_core::schedule::{IoDirection, IoWord};
-use flock_hash::blake3_compress;
-use flock_prover::r1cs_hashes::blake3;
-use flock_prover::r1cs_hashes::blake3::build_matrices;
-use flock_prover::r1cs_hashes::merkle_glue::{
-    BitSpreadInput, BitSpreadTable, PowMaskInput, PowMaskTable, SwapInput, SwapTable,
-};
-use flock_prover::r1cs_hashes::merkle_r1cs::{
-    BLAKE3_FLAG_CHUNK_END, BLAKE3_FLAG_CHUNK_START, BLAKE3_FLAG_PARENT, ChunkPathInput,
-    MerkleTreeLayout, NODE_BLOCK_LEN, NODE_COUNTER, SLOT_WORDS, blake3_spec,
-};
 use std::array::from_fn;
 
-use flock_core::test_rng::Rng;
+use blake3::BLAKE3_IV;
+use flock_core::{
+    r1cs::BlockR1cs,
+    schedule::{IoDirection, IoWord},
+    test_rng::Rng,
+};
+use flock_hash::blake3_compress;
+use flock_prover::r1cs_hashes::{
+    blake3,
+    blake3::build_matrices,
+    merkle_glue::{
+        BitSpreadInput, BitSpreadTable, PowMaskInput, PowMaskTable, SwapInput, SwapTable,
+    },
+    merkle_r1cs::{
+        BLAKE3_FLAG_CHUNK_END, BLAKE3_FLAG_CHUNK_START, BLAKE3_FLAG_PARENT, ChunkPathInput,
+        MerkleTreeLayout, NODE_BLOCK_LEN, NODE_COUNTER, SLOT_WORDS, blake3_spec,
+    },
+};
 /// One compression's output chaining value.
 fn cv(h: &[u32; 8], m: &[u32; 16], flags: u32) -> [u32; SLOT_WORDS] {
     let out = blake3_compress(h, m, NODE_COUNTER, NODE_BLOCK_LEN, flags);

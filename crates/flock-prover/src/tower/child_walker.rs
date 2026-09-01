@@ -1,6 +1,5 @@
-use super::*;
-use crate::r1cs_hashes::blake3::build_block_r1cs;
-use crate::r1cs_hashes::fs_chain::{FsChainTrace, IV};
+use std::{array::from_fn, env::var, iter::repeat_n};
+
 use flock_core::{
     circuit::{SigmaAssertion, builder::SlotId},
     element_r1cs::union::ElementAssertion,
@@ -26,12 +25,36 @@ use flock_transcript::transcript_record::{
     RecordingChallenger, Stream, StreamWord, TranscriptOp as Op,
 };
 #[cfg(test)]
-use std::any::Any;
-use std::array::from_fn;
-use std::env::var;
-use std::iter::repeat_n;
-use verifier::verify_ligerito_union_circuit;
-use verifier::verify_ligerito_union_circuit_ag;
+use {
+    crate::tower::{
+        AssistLayerGate, BitSpreadGate, BitSpreadTable, Blake3Gate, FamilyTransposeTileGate,
+        MacGate256, MergedRoundGate, PowMaskGate, SpineGate, SpineGate256, SwapGate, ZcRoundGate,
+        digest_words, gates_blake3::Rng, gates_blake3::Tree, gates_blake3::leaf_word,
+        hash_to_digest, query::emit_opening,
+    },
+    std::any::Any,
+};
+
+use crate::{
+    r1cs_hashes::{
+        blake3::build_block_r1cs,
+        fs_chain::{FsChainTrace, IV},
+    },
+    tower::{
+        CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrLayerRec, GkrRec,
+        HashKind, InnerPd, LeafEvalGate, LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner,
+        MixedProof, MpRec, OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance,
+        Wire, ag_seed_bytes, assert_chain_replays, assertion_mac, bytes_payload_mask, cap_payloads,
+        cap_wires, check_residual_publics, circuit_structure_claim_wires, cw,
+        declare_envelope_slots, decode_ag_point, duplex_row_count_model,
+        emit_boolean_reported_check, emit_element_reported_check, emit_family_h, emit_fs_chain,
+        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region,
+        emit_spine256, flatten_ops, level_geometry, level_query_phase_b3_rows, level_sources,
+        merge_chain, observed_f256, pack8, parse_open_levels, payload_words, pin_recombination,
+        query_phase_b3_rows, replay_ligerito_spine256, squeeze_word_wire, strat_scheds,
+    },
+    verifier::{verify_ligerito_union_circuit, verify_ligerito_union_circuit_ag},
+};
 
 /// One recorded child verification, parsed: the tape pinned op-for-op, every
 /// region located, and every native replica the emitter and checker consume.

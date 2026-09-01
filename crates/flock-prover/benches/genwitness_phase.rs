@@ -2,16 +2,15 @@
 //! (the "gen_witness_ab + lincheck" phase). Best-of-N to isolate it from the
 //! rest of the prove pipeline's thermal load. Honors RAYON_NUM_THREADS.
 
-use flock_prover::init_perf_thread_pool;
-use std::array::from_fn;
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::r1cs_hashes::blake3::{
-    Blake3Setup, Compression, generate_witness_with_ab_packed_and_lincheck, min_n_blocks_log,
-};
+use std::{array::from_fn, hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    init_perf_thread_pool,
+    r1cs_hashes::blake3::{
+        Blake3Setup, Compression, generate_witness_with_ab_packed_and_lincheck, min_n_blocks_log,
+    },
+};
 
 fn random_compression(rng: &mut Rng) -> Compression {
     let cv: [u32; 8] = from_fn(|_| rng.next_u32());

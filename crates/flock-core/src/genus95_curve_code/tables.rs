@@ -1,23 +1,24 @@
-#[cfg(test)]
-use super::evaluator::eval_poly_mask;
-#[cfg(test)]
-use super::sage_data::ARTIN_SCHREIER_RHS;
 use std::sync::LazyLock;
 
-use super::artin_schreier::ArtinSchreierSolver;
 #[cfg(test)]
-use super::constants::BASE_Y_DEGREE;
-use super::constants::{
-    BASE_FUNCTIONAL_BITS, BASE_LIMBS, BASE_X_POWER_COUNT, FOUR_RUSSIANS_BLOCK_BITS,
-    GAMMA_GROUP_COUNT, PRODUCT_LIMBS, PRODUCT_MESSAGE_BITS, X_POWER_COUNT,
-};
-use super::messages::ExtendedMessage;
-use super::sage_data::{
-    BASE_DENOMINATOR, BASE_GAMMA_SLOT_MASKS, GAMMA_SLOT_MASKS, PRODUCT_DENOMINATOR, R_ROWS,
+use {
+    crate::genus95_curve_code::constants::BASE_Y_DEGREE,
+    crate::genus95_curve_code::evaluator::eval_poly_mask,
+    crate::genus95_curve_code::field::{F128, F128Ext},
+    crate::genus95_curve_code::sage_data::ARTIN_SCHREIER_RHS,
 };
 
-#[cfg(test)]
-use super::field::{F128, F128Ext};
+use crate::genus95_curve_code::{
+    artin_schreier::ArtinSchreierSolver,
+    constants::{
+        BASE_FUNCTIONAL_BITS, BASE_LIMBS, BASE_X_POWER_COUNT, FOUR_RUSSIANS_BLOCK_BITS,
+        GAMMA_GROUP_COUNT, PRODUCT_LIMBS, PRODUCT_MESSAGE_BITS, X_POWER_COUNT,
+    },
+    messages::ExtendedMessage,
+    sage_data::{
+        BASE_DENOMINATOR, BASE_GAMMA_SLOT_MASKS, GAMMA_SLOT_MASKS, PRODUCT_DENOMINATOR, R_ROWS,
+    },
+};
 
 /// A coefficient that is a ratio of two GF(2) polynomials in `x`, each stored as
 /// a degree-bitmask.  Only used by the test that checks sampled points satisfy

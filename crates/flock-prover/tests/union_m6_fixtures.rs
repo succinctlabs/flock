@@ -89,35 +89,40 @@
 //! rate, query count, cap and PoW change). Full workspace suite green;
 //! digests stable across two print runs.
 
+use std::{array::from_fn, env::var_os};
+
 use ::sha2 as sha2_hash;
 use bincode::serialize;
 use blake3::Blake3Setup;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
-use flock_prover::challenger::FsChallenger;
-use flock_prover::mixed::MixedRegistryId;
-use flock_prover::pcs::{Commitment, PcsParams};
-use flock_prover::proof_io::MixedProofBundleLigerito;
-use flock_prover::prover::{self, UnionSlotProverInput};
-use flock_prover::r1cs_hashes::blake3::{
-    Compression as Blake3Compression, build_block_r1cs as build_blake3_block_r1cs,
-    generate_witness_batch_major_partial as generate_blake3_witness_batch_major_partial,
+use flock_core::{
+    pcs::ligerito::LigeritoProfile,
+    proof::{R1csClaim, R1csProofMergedLigerito},
+    test_rng::Rng,
 };
-use flock_prover::r1cs_hashes::sha2::{
-    Compression as Sha2Compression, build_block_r1cs as build_sha2_block_r1cs,
-    generate_witness_batch_major_partial as generate_sha2_witness_batch_major_partial,
+use flock_prover::{
+    challenger::FsChallenger,
+    mixed::MixedRegistryId,
+    pcs::{Commitment, PcsParams},
+    proof_io::MixedProofBundleLigerito,
+    prover::{self, UnionSlotProverInput},
+    r1cs_hashes::{
+        blake3,
+        blake3::{
+            Compression as Blake3Compression, build_block_r1cs as build_blake3_block_r1cs,
+            generate_witness_batch_major_partial as generate_blake3_witness_batch_major_partial,
+        },
+        sha2,
+        sha2::{
+            Compression as Sha2Compression, build_block_r1cs as build_sha2_block_r1cs,
+            generate_witness_batch_major_partial as generate_sha2_witness_batch_major_partial,
+        },
+    },
+    schedule::{Registry, TableType},
+    union::UnionInstance,
 };
-use flock_prover::r1cs_hashes::{blake3, sha2};
-use flock_prover::schedule::{Registry, TableType};
-use flock_prover::union::UnionInstance;
 use prover::prove_fast_ligerito_union;
 use sha2::Sha256HybridSetup;
-use sha2_hash::Digest as _;
-use sha2_hash::Sha256;
-use std::array::from_fn;
-use std::env::var_os;
-
-use flock_core::test_rng::Rng;
+use sha2_hash::{Digest as _, Sha256};
 const DOMAIN: &[u8] = b"flock-m6-fixture-v0";
 
 fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<Blake3Compression> {

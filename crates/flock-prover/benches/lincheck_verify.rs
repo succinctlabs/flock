@@ -6,15 +6,15 @@
 //!   - `inner_product` for A and B consistency checks (the "× z_vec" pass — F128 muls)
 //!   - final `build_quirky_eq_table` + `inner_product` for the derived z-claim
 
-use flock_prover::init_perf_thread_pool;
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::field::F128;
-use flock_prover::lincheck::{build_quirky_eq_table, sparse_row_fold};
-use flock_prover::r1cs_hashes::sha2::{K_LOG, K_SKIP, build_matrices};
+use std::{hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    init_perf_thread_pool,
+    lincheck::{build_quirky_eq_table, sparse_row_fold},
+    r1cs_hashes::sha2::{K_LOG, K_SKIP, build_matrices},
+};
 
 fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     let mut acc = F128::ZERO;

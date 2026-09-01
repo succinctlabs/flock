@@ -16,9 +16,9 @@
 //!
 //! Used by the verifier's polylog `eval_rs_eq` (DP24 §1.3, Figure 3).
 
-use crate::field::QUADRATIC_NONRESIDUE;
-use crate::field::{F128, F256};
 use core::ops::{Add, AddAssign};
+
+use crate::field::{F128, F256, QUADRATIC_NONRESIDUE};
 
 /// The degree of `F_{2^128}` over `F_2`.
 pub const DEGREE: usize = 128;
@@ -202,9 +202,10 @@ fn square_transpose(elems: &mut [F128]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        pcs::tensor_algebra::{DEGREE, F128, TensorAlgebra},
+        test_rng::Rng,
+    };
 
     /// Site-specific draws kept verbatim from this file's former local `Rng`.
     trait RngExt {

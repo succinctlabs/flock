@@ -5,12 +5,9 @@
 //! for sm_120 (the inline-PTX clmad kernels are Blackwell-only) into a static
 //! archive the test binary links against.
 
-use env::var;
-use env::var_os;
-use std::env;
-use std::fs::read_dir;
-use std::path::PathBuf;
-use std::process::Command;
+use std::{env, fs::read_dir, path::PathBuf, process::Command};
+
+use env::{var, var_os};
 
 fn main() {
     if var_os("CARGO_FEATURE_GPU").is_none() {

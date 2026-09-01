@@ -10,15 +10,17 @@
 //! `f256_round1_lookahead_is_byte_identical` in flock-core; the historical
 //! byte anchors are the union m6 fixtures + the mixed-class pins.)
 
-use std::array::from_fn;
-use std::sync::Mutex;
-use std::sync::atomic::Ordering;
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::pcs::ligerito::FOLD_LOOKAHEAD_OVERRIDE;
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression};
+use std::{
+    array::from_fn,
+    sync::{Mutex, atomic::Ordering},
+};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    pcs::ligerito::FOLD_LOOKAHEAD_OVERRIDE,
+    r1cs_hashes::blake3::{Blake3Setup, Compression},
+};
 
 fn blocks(n: usize, seed: u64) -> Vec<Compression> {
     let mut rng = Rng(seed);

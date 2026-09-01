@@ -7,20 +7,22 @@
 //! and in any real prover). The naive variant only runs at m ≤ 20 — beyond
 //! that it's many seconds and uninformative.
 
-use flock_prover::init_perf_thread_pool;
-use flock_prover::zerocheck::PaddingSpec;
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::field::{F8, F128};
-use flock_prover::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
-use flock_prover::zerocheck::univariate_skip::{pack_bits, round1_extract_c_packed, round1_naive};
-use flock_prover::zerocheck::univariate_skip_optimized::{
-    K_SKIP, medium_challenges_ghash, round1_shift_reduce_extract_c_packed,
-    round1_shift_reduce_extract_c_packed_padded_with_s_hat_v, small_challenges_ghash,
-};
+use std::{hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::{F8, F128},
+    init_perf_thread_pool,
+    ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8},
+    zerocheck::{
+        PaddingSpec,
+        univariate_skip::{pack_bits, round1_extract_c_packed, round1_naive},
+        univariate_skip_optimized::{
+            K_SKIP, medium_challenges_ghash, round1_shift_reduce_extract_c_packed,
+            round1_shift_reduce_extract_c_packed_padded_with_s_hat_v, small_challenges_ghash,
+        },
+    },
+};
 const N_INNER: usize = 7;
 
 fn build_protocol_r(m: usize, outer: &[F128]) -> Vec<F128> {

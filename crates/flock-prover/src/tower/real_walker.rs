@@ -1,5 +1,5 @@
-use super::*;
-use crate::r1cs_hashes::fs_chain::{FsChainTrace, IV};
+use std::{array::from_fn, collections::BTreeMap, env::var, iter::repeat_n, sync::OnceLock};
+
 use flock_core::{
     circuit::{SigmaAssertion, builder::SlotId},
     element_r1cs::union::{ElementAssertion, region_slots},
@@ -26,11 +26,24 @@ use flock_field::QUADRATIC_NONRESIDUE;
 use flock_transcript::transcript_record::{
     RecordingChallenger, Stream, StreamWord, TranscriptOp as Op,
 };
-use std::array::from_fn;
-use std::collections::BTreeMap;
-use std::env::var;
-use std::iter::repeat_n;
-use std::sync::OnceLock;
+
+use crate::{
+    r1cs_hashes::fs_chain::{FsChainTrace, IV},
+    tower::{
+        ChildSlots, CollapsedSlots, F128, F256, FsChallenger, GkrLayerRec, GkrRec, HashKind,
+        InnerPd, LeafEvalGate, LeafEvalGate256, LeafOuter, Lvl, MergedChain, MixedProof, MpRec,
+        OpenLevel, PdRec, PiopRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire,
+        ZskipTapeRec, ZskipWires, ag_seed_bytes, assert_chain_replays, bytes_payload_mask,
+        cap_payloads, cap_wires, check_residual_publics, circuit_structure_claim_wires, cw,
+        decode_ag_point, duplex_row_count_model, emit_boolean_reported_check,
+        emit_element_reported_check, emit_fs_chain, emit_mac256, emit_pow_checks,
+        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region,
+        emit_spine256, flatten_ops, leaf_boolean_lcs, level_geometry, level_query_phase_b3_rows,
+        level_sources, merge_chain, observed_f256, outer_union, pack8, parse_open_levels,
+        payload_words, pin_recombination, query_phase_b3_rows, replay_ligerito_spine256,
+        squeeze_word_wire, strat_scheds,
+    },
+};
 
 /// One recorded REAL-child verification (the leaf outer as inner), parsed:
 /// the tape, each region, and the native values used by the checker.

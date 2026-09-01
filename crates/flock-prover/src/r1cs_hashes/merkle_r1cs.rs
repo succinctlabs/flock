@@ -107,26 +107,22 @@
 //! [`MerkleTreeLayout::root_bit`]). The claim-level glue binds them to
 //! public values.
 
-use blake3::BLAKE3_IV;
-use blake3::BLEN_BASE;
-use blake3::CV_BASE;
-use blake3::FLAGS_BASE;
-use blake3::K_LOG;
-use blake3::M_BASE;
-use blake3::OUT_LO_BASE;
-use blake3::T_HI_BASE;
-use blake3::T_LO_BASE;
-use blake3::USEFUL_BITS;
-use blake3::WORD_BITS;
-use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
-use flock_core::zerocheck::K_SKIP;
-use flock_hash::blake3_compress;
-use std::array::from_fn;
-use std::sync::OnceLock;
+use std::{array::from_fn, sync::OnceLock};
 
-use super::blake3;
-use super::common::{empty_matrix, identity};
-use flock_core::schedule::IoWord;
+use flock_core::{
+    r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+    schedule::IoWord,
+    zerocheck::K_SKIP,
+};
+use flock_hash::blake3_compress;
+
+use crate::r1cs_hashes::{
+    blake3::{
+        BLAKE3_IV, BLEN_BASE, CV_BASE, FLAGS_BASE, K_LOG, M_BASE, OUT_LO_BASE, T_HI_BASE,
+        T_LO_BASE, USEFUL_BITS, WORD_BITS,
+    },
+    common::{empty_matrix, identity},
+};
 
 /// Bits in one digest / chaining value. Both supported encoders lay their
 /// input and output chaining values out as aligned `2^8`-bit slots.

@@ -1,7 +1,9 @@
-use core::arch::x86_64::*;
+use core::arch::x86_64::{
+    __m512i, _mm_set_epi64x, _mm512_broadcast_i32x4, _mm512_loadu_si512, _mm512_permutex2var_epi64,
+    _mm512_set_epi64, _mm512_storeu_si512, _mm512_xor_si512,
+};
 
-use crate::F128;
-use crate::gf2_128::x86_64::ghash_mul_x4;
+use crate::{F128, gf2_128::x86_64::ghash_mul_x4};
 
 /// Four-lane pair fold using AVX-512 lane deinterleaving and VPCLMULQDQ.
 ///

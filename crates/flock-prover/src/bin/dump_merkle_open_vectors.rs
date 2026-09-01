@@ -17,18 +17,19 @@
 //!
 //! Run:  cargo run --release --bin dump_merkle_open_vectors -- cuda-ghash/merkle_open_vectors.bin 14 50
 
-use env::args;
-use std::collections::HashSet;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
+use std::{
+    collections::HashSet,
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
 
+use env::args;
+use flock_core::test_rng::Rng;
 use flock_hash::HashKind;
 use flock_prover::merkle::merkle_tree;
 
-use flock_core::test_rng::Rng;
-use merkle_octopus::merkle_multi_proof;
+use crate::merkle_octopus::merkle_multi_proof;
 // The multi-proof left the live protocol (cap layers replaced it); the CUDA
 // oracle pair keeps a frozen copy.
 #[path = "dump_common/merkle_octopus.rs"]

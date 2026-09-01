@@ -1,15 +1,18 @@
-use super::*;
-use core_merkle::hash_leaf;
-use core_merkle::hash_pair;
-use core_merkle::verify_merkle_proof_capped;
+use std::ops::Range;
+
 use flock_core::{
     circuit::builder::SlotId,
     lincheck::build_eq_table,
     pcs::{ligerito::LigeritoProof, stratified::LevelSchedule},
 };
+use flock_merkle::{hash_leaf, hash_pair, verify_merkle_proof_capped};
 use flock_multilinear::{IndexOrder, eq_table};
 use flock_transcript::transcript_record::{Stream, StreamWord};
-use std::ops::Range;
+
+use crate::tower::{
+    CHUNK_END, CHUNK_START, F128, F256, HashKind, OpenLevel, PARENT, PcsParams, ShapeBuilder, Wire,
+    cw, pack_params,
+};
 
 /// The three slots a collapsed opening writes into, plus the fused PoW mask
 /// slot the grinding checks ride: one 4-word [`PowMaskTable`] row carries a

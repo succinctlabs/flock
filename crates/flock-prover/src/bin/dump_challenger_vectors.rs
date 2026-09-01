@@ -22,19 +22,20 @@
 //!
 //! Run:  cargo run --release --bin dump_challenger_vectors -- cuda-ghash/challenger_vectors.bin
 
+use std::{
+    collections::HashSet,
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
+
 use env::args;
-use flock_prover::field::F256;
-use std::collections::HashSet;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::challenger::{Challenger, FsChallenger};
-use flock_prover::field::F128;
-
 use flock_core::test_rng::Rng;
-use flock_prover::pcs::stratified::LevelSchedule;
+use flock_prover::{
+    challenger::{Challenger, FsChallenger},
+    field::{F128, F256},
+    pcs::stratified::LevelSchedule,
+};
 
 fn main() -> Result<()> {
     let path = args()

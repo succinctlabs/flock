@@ -68,33 +68,28 @@
 //! 4. the returned gather claims reach the PCS opening, which is what binds
 //!    them to the commitment (and observes their values before `γ`).
 
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::matrix_fold::FoldMatrix;
-use crate::matrix_fold::MatrixClaim;
-use crate::matrix_fold::Weight;
-use crate::matrix_fold::bilinear;
-use crate::pcs::{DirectEqInd, PackedDirectClaim};
-use crate::product_gkr;
-use crate::schedule::{IoDirection, IoWord, Registry};
-use crate::scratch::give_f128;
-use crate::scratch::take_f128;
-use crate::union::UnionInstance;
-use crate::zerocheck::univariate_skip::build_eq;
+use std::{env::var, sync::OnceLock, time::Instant};
+
 use blake3::hash;
-use product_gkr::BatchedGrinding;
-use product_gkr::LiveMask;
-use product_gkr::ProductGkrBatchedProof;
-use product_gkr::ProductGkrError;
-use product_gkr::prove_batched_with_grinding;
-use product_gkr::s_id_basis;
-use product_gkr::verify_batched_with_grinding;
-use product_gkr::verify_batched_with_sigma_and_grinding;
-use rayon::prelude::*;
+use product_gkr::{
+    BatchedGrinding, LiveMask, ProductGkrBatchedProof, ProductGkrError,
+    prove_batched_with_grinding, s_id_basis, verify_batched_with_grinding,
+    verify_batched_with_sigma_and_grinding,
+};
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 use serde::{Deserialize, Serialize};
-use std::env::var;
-use std::sync::OnceLock;
-use std::time::Instant;
+
+use crate::{
+    challenger::Challenger,
+    field::F128,
+    matrix_fold::{FoldMatrix, MatrixClaim, Weight, bilinear},
+    pcs::{DirectEqInd, PackedDirectClaim},
+    product_gkr,
+    schedule::{IoDirection, IoWord, Registry},
+    scratch::{give_f128, take_f128},
+    union::UnionInstance,
+    zerocheck::univariate_skip::build_eq,
+};
 pub mod builder;
 
 /// Domain label of the circuit digest — versioned, since the digest covers the
@@ -1227,15 +1222,20 @@ fn verify_wiring_core<C: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
-    use crate::element_r1cs::ElementTableBuilder;
-    use crate::r1cs::SparseBinaryMatrix;
-    use crate::schedule::{TableClass, TableType};
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
-    use crate::test_rng::Rng;
+    use crate::{
+        challenger::FsChallenger,
+        circuit::{
+            Cell, CellSlot, CellSpace, Circuit, CircuitError, F128, IoWord, ProductGkrError,
+            Registry, SigmaAssertion, UnionInstance, WiringError, bilinear, prove_wiring,
+            verify_wiring, verify_wiring_deferred,
+        },
+        element_r1cs::ElementTableBuilder,
+        r1cs::SparseBinaryMatrix,
+        schedule::{TableClass, TableType},
+        test_rng::Rng,
+    };
 
     fn stub() -> SparseBinaryMatrix {
         SparseBinaryMatrix {

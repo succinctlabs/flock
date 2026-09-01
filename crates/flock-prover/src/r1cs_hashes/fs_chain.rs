@@ -21,10 +21,12 @@
 
 use flock_field::F128;
 use flock_hash::blake3_compress;
-use flock_transcript::challenger::pow_squeeze_counter;
-use flock_transcript::transcript_record::{Stream, TranscriptOp};
+use flock_transcript::{
+    challenger::pow_squeeze_counter,
+    transcript_record::{Stream, TranscriptOp},
+};
 
-use super::blake3::Compression;
+use crate::r1cs_hashes::blake3::Compression;
 
 /// One forked child chain: its own trace plus the four cross-chain links
 /// that connect it to its parent. The child is an INDEPENDENT chain (own
@@ -753,11 +755,17 @@ impl FsChainSponge {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use blake3::Hasher;
     use flock_field::F128;
-    use flock_transcript::challenger::{Challenger, FsChallenger};
-    use flock_transcript::transcript_record::{RecordingChallenger, StreamWord};
+    use flock_transcript::{
+        challenger::{Challenger, FsChallenger},
+        transcript_record::{RecordingChallenger, StreamWord},
+    };
+
+    use crate::r1cs_hashes::fs_chain::{
+        CvSource, FsChain, FsChainSponge, FsChainTrace, blake3_compress, trace_duplex,
+        trace_duplex_forked,
+    };
 
     /// The SPONGE trace builder must equal the chained challenger byte for
     /// byte: same absorb schedule, same squeeze outputs. The challenger is

@@ -1,15 +1,14 @@
-use std::mem::MaybeUninit;
-use std::ops::Index;
-use std::slice::Iter;
-use std::sync::OnceLock;
+use std::{mem::MaybeUninit, ops::Index, slice::Iter, sync::OnceLock};
 
-use super::constants::{
-    BASE_Y_DEGREE, COVER_BASIS_LEN, FOUR_RUSSIANS_BLOCK_BITS, FOUR_RUSSIANS_TABLE_SIZE,
-    PRODUCT_MESSAGE_BITS, PRODUCT_MESSAGE_BYTES, X_POWER_COUNT,
+use crate::genus95_curve_code::{
+    constants::{
+        BASE_Y_DEGREE, COVER_BASIS_LEN, FOUR_RUSSIANS_BLOCK_BITS, FOUR_RUSSIANS_TABLE_SIZE,
+        PRODUCT_MESSAGE_BITS, PRODUCT_MESSAGE_BYTES, X_POWER_COUNT,
+    },
+    field::{F128, F128Ext},
+    messages::ProductMessage,
+    tables::{FourRussiansLayout, TABLES},
 };
-use super::field::{F128, F128Ext};
-use super::messages::ProductMessage;
-use super::tables::{FourRussiansLayout, TABLES};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EvaluationPoint {

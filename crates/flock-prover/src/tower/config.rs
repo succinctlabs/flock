@@ -1,10 +1,13 @@
-use super::*;
-use crate::schedule::Registry;
-use flock_core::matrix_fold::FoldGrinding;
-use flock_core::pcs::ligerito::embedded_initial_k_or_default;
 #[cfg(test)]
 use std::env::VarError;
 use std::env::var;
+
+use flock_core::{matrix_fold::FoldGrinding, pcs::ligerito::embedded_initial_k_or_default};
+
+use crate::{
+    schedule::Registry,
+    tower::{HashKind, LigeritoProfile, PcsParams, UnionInstance},
+};
 
 /// The L0 interleave for a content-sized commit: the embedded config's
 /// own `initial_k` (6 everywhere except m29 Fast/Slim = 5 — the

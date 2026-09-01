@@ -16,48 +16,45 @@
 //!     [`crate::challenger::FsChallenger`] is SHA-256), so no second
 //!     cryptographic primitive enters the soundness argument.
 
-use super::BlockCoverage;
-#[cfg(target_arch = "aarch64")]
-use super::PaddingSpec;
-use super::ZerocheckGrinding;
-use super::cleanse_block;
-use super::sparse_tail_gate;
-use super::univariate_skip::SplitEqGhash;
-use super::univariate_skip::build_eq;
-use crate::genus95_curve_code::SAMPLE_ATTEMPT_BUDGET;
-use crate::genus95_curve_code::evaluation_point_from_nonce;
-use crate::genus95_curve_code::evaluation_point_from_nonce_pow;
-#[cfg(target_arch = "aarch64")]
-use crate::genus95_curve_code::round1::round1_slp_packed;
-#[cfg(target_arch = "aarch64")]
-use crate::genus95_curve_code::round1::round1_slp_packed_banks_fused;
-#[cfg(target_arch = "aarch64")]
-use crate::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded;
-use crate::merkle::HashKind;
-#[cfg(target_arch = "aarch64")]
-use crate::pcs::LOG_PACKING;
-use crate::scratch::give_f128;
-use crate::scratch::take_f128;
-use rayon::prelude::*;
-#[cfg(target_arch = "aarch64")]
-use std::env::var_os;
-use std::mem::swap;
-#[cfg(target_arch = "aarch64")]
-use std::time::Instant;
-
-use super::multilinear::{
-    LiveLayout, expand_to_dense, fold_and_compute_round_pair_into, fold_and_round_pair_sparse_into,
-    fold_in_place_pair, fold1_lookahead_into, fold2_lookahead_into, lookahead_msg_first,
-    lookahead_msg_second, round_pair_naive,
-};
-use crate::challenger::Challenger;
-use crate::field::{F128, F256Unreduced, mul_by_x};
-use crate::genus95_curve_code::{
-    EvaluationPoint, base_evaluation_functional, product_evaluation_functional,
+use std::{
+    mem::swap,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    ParallelSliceMut,
+};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_arch = "aarch64")]
+use {
+    crate::genus95_curve_code::round1::round1_slp_packed,
+    crate::genus95_curve_code::round1::round1_slp_packed_banks_fused,
+    crate::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded,
+    crate::pcs::LOG_PACKING, crate::zerocheck::PaddingSpec, std::env::var_os, std::time::Instant,
+};
+
+use crate::{
+    challenger::Challenger,
+    field::{F128, F256Unreduced, mul_by_x},
+    genus95_curve_code::{
+        EvaluationPoint, SAMPLE_ATTEMPT_BUDGET, base_evaluation_functional,
+        evaluation_point_from_nonce, evaluation_point_from_nonce_pow,
+        product_evaluation_functional,
+    },
+    merkle::HashKind,
+    scratch::{give_f128, take_f128},
+    zerocheck::{
+        BlockCoverage, ZerocheckGrinding, cleanse_block,
+        multilinear::{
+            LiveLayout, expand_to_dense, fold_and_compute_round_pair_into,
+            fold_and_round_pair_sparse_into, fold_in_place_pair, fold1_lookahead_into,
+            fold2_lookahead_into, lookahead_msg_first, lookahead_msg_second, round_pair_naive,
+        },
+        sparse_tail_gate,
+        univariate_skip::{SplitEqGhash, build_eq},
+    },
+};
 
 /// A/B toggle: when set, the mlv tail runs the classic one-round-per-pass loop
 /// (friendly-Horner + general fused kernels) instead of sumcheck LOOKAHEAD
@@ -1797,35 +1794,49 @@ pub fn verify_with_grinding<C: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    #[cfg(target_arch = "aarch64")]
-    use crate::alloc_uninit_f128_vec;
-    #[cfg(target_arch = "aarch64")]
-    use crate::challenger::FsChallenger;
-    use crate::genus95_curve_code::BASE_MESSAGE_BITS;
-    use crate::genus95_curve_code::BASE_Y_DEGREE;
-    use crate::genus95_curve_code::PRODUCT_MESSAGE_BITS;
-    #[cfg(target_arch = "aarch64")]
-    use crate::genus95_curve_code::SAMPLE_ATTEMPT_BUDGET;
-    #[cfg(target_arch = "aarch64")]
-    use crate::genus95_curve_code::{
-        BaseMessage, base_evaluation_functional, evaluate_base_functional,
-    };
-    use crate::genus95_curve_code::{RngCore, Sha256Rng, sample_random_evaluation_point};
-    use crate::genus95_curve_code::{evaluation_point_from_nonce, evaluation_point_from_nonce_pow};
-    use crate::lincheck::AG_LINCHECK_SKIP_POW_BITS;
-    #[cfg(target_arch = "aarch64")]
-    use crate::pcs::pack::pack_witness;
-    #[cfg(target_arch = "aarch64")]
-    use crate::pcs::ring_switch::{build_claim_weights_from_skip, claim_check, fold_1b_rows_naive};
-    use crate::zerocheck::ZerocheckGrinding;
-    #[cfg(target_arch = "aarch64")]
-    use crate::zerocheck::univariate_skip::SplitEqGhash;
-    #[cfg(target_arch = "aarch64")]
-    use crate::zerocheck::univariate_skip::build_eq;
-    #[cfg(target_arch = "aarch64")]
-    use crate::zerocheck::{PaddingRun, PaddingSpec};
     use flock_hash::HashKind;
+
+    #[cfg(target_arch = "aarch64")]
+    use crate::{
+        alloc_uninit_f128_vec,
+        challenger::FsChallenger,
+        genus95_curve_code::{
+            BaseMessage, SAMPLE_ATTEMPT_BUDGET, base_evaluation_functional,
+            evaluate_base_functional,
+        },
+        pcs::{
+            pack::pack_witness,
+            ring_switch::{build_claim_weights_from_skip, claim_check, fold_1b_rows_naive},
+        },
+        zerocheck::{
+            PaddingRun, PaddingSpec,
+            ag_skip::{
+                AgVerifyError, K_SKIP, LOOKAHEAD_DISABLE, Ordering, eval_ab_at, eval_c_at,
+                fold_and_compute_round_pair_into, fold_and_first_round,
+                fold_and_first_round_padded, fold_and_friendly_round_pair_into, fold_witness_at_r1,
+                friendly_norm, prove, prove_capture_s_hat_v_c,
+                prove_capture_s_hat_v_c_with_grinding, prove_multilinear, prove_round1,
+                prove_round1_banks, prove_round1_banks_padded, round_pair_naive, verify,
+                verify_multilinear, verify_with_grinding,
+            },
+            univariate_skip::{SplitEqGhash, build_eq},
+        },
+    };
+    use crate::{
+        genus95_curve_code::{
+            BASE_MESSAGE_BITS, BASE_Y_DEGREE, PRODUCT_MESSAGE_BITS, RngCore, Sha256Rng,
+            evaluation_point_from_nonce, evaluation_point_from_nonce_pow,
+            sample_random_evaluation_point,
+        },
+        lincheck::AG_LINCHECK_SKIP_POW_BITS,
+        zerocheck::{
+            ZerocheckGrinding,
+            ag_skip::{
+                AG_SAMPLING_CREDIT_BITS, F128, N_INNER, R1_POW_BITS, R1_ZERO_BOUND, d_const, d_inv,
+                friendly_challenges, gamma_pow,
+            },
+        },
+    };
 
     /// The pinned friendly challenges reproduce the geometric eq weight
     /// `eq(r_inner, b) = γ^{int(b)} / D` for every inner index `b ∈ [0, 128)`.

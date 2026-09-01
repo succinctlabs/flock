@@ -13,47 +13,33 @@
 //!    cross-checked against dense recomputations, plus tamper rejection
 //!    (corrupted round message / z_partial / comb-affecting declared count).
 
-use aggregate::Accumulator;
-use aggregate::prove_aggregate;
-use aggregate::verify_aggregate;
-use bincode::serialize;
-use flock_core::challenger::{Challenger, FsChallenger};
-use flock_core::field::F128;
-use flock_core::lincheck::{
-    self, LincheckCircuit, QuirkyPoint, SkipPoint, SparseMatrixCircuit, UnionLincheckSlot,
-    build_eq_table, build_quirky_eq_table, pack_z_lincheck,
-};
-use flock_core::r1cs::SparseBinaryMatrix;
-use flock_core::schedule::{Registry, TableClass, TableType};
-use flock_core::union::UnionInstance;
-use flock_core::zerocheck::multilinear::lagrange_weights_naive;
-use flock_core::zerocheck::univariate_skip::pack_bits;
-use flock_core::zerocheck::{self, K_SKIP};
-use lincheck::LincheckClaim;
-use lincheck::LincheckError;
-use lincheck::LincheckGrinding;
-use lincheck::LincheckProof;
-use lincheck::MatrixAssertion;
-use lincheck::eq_prefix_sum;
-use lincheck::eq_prefix_weight;
-use lincheck::prove_padded_capture_z_vec;
-use lincheck::prove_union_capture_z_vec;
-use lincheck::prove_union_capture_z_vec_with_grinding;
-use lincheck::union_comb_partial;
-use lincheck::verify as verify_lincheck;
-use lincheck::verify_union;
-use lincheck::verify_union_deferred;
-use lincheck::verify_union_with_grinding;
-use matrix_fold::col_marginal;
-use matrix_fold::prove_fold;
-use matrix_fold::verify_fold;
 use std::collections::BTreeSet;
-use zerocheck::prove_packed_padded;
-use zerocheck::verify as verify_zerocheck;
 
-use flock_core::aggregate::{self, AggregateError};
-use flock_core::matrix_fold::{self, FoldError, MatrixClaim, Weight};
-use flock_core::test_rng::Rng;
+use aggregate::{Accumulator, prove_aggregate, verify_aggregate};
+use bincode::serialize;
+use flock_core::{
+    aggregate::{self, AggregateError},
+    challenger::{Challenger, FsChallenger},
+    field::F128,
+    lincheck::{
+        self, LincheckCircuit, QuirkyPoint, SkipPoint, SparseMatrixCircuit, UnionLincheckSlot,
+        build_eq_table, build_quirky_eq_table, pack_z_lincheck,
+    },
+    matrix_fold::{self, FoldError, MatrixClaim, Weight},
+    r1cs::SparseBinaryMatrix,
+    schedule::{Registry, TableClass, TableType},
+    test_rng::Rng,
+    union::UnionInstance,
+    zerocheck::{self, K_SKIP, multilinear::lagrange_weights_naive, univariate_skip::pack_bits},
+};
+use lincheck::{
+    LincheckClaim, LincheckError, LincheckGrinding, LincheckProof, MatrixAssertion, eq_prefix_sum,
+    eq_prefix_weight, prove_padded_capture_z_vec, prove_union_capture_z_vec,
+    prove_union_capture_z_vec_with_grinding, union_comb_partial, verify as verify_lincheck,
+    verify_union, verify_union_deferred, verify_union_with_grinding,
+};
+use matrix_fold::{col_marginal, prove_fold, verify_fold};
+use zerocheck::{prove_packed_padded, verify as verify_zerocheck};
 const DOMAIN: &[u8] = b"flock-union-lincheck-test-v0";
 
 fn identity(k: usize) -> SparseBinaryMatrix {

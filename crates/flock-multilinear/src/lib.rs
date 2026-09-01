@@ -1,9 +1,11 @@
 //! Multilinear polynomial primitives for binary extension fields.
 
-use rayon::prelude::*;
-use std::mem::MaybeUninit;
-use std::mem::forget;
-use std::ops::{Add, Mul};
+use std::{
+    mem::{MaybeUninit, forget},
+    ops::{Add, Mul},
+};
+
+use rayon::prelude::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 /// Maps point coordinates to bits in a multilinear table index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,9 +137,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::array::from_fn;
-    use std::ops::{Add, Mul};
+    use std::{
+        array::from_fn,
+        ops::{Add, Mul},
+    };
+
+    use crate::{IndexOrder, build_eq_table, eq_eval, eq_table, eq_table_scaled, evaluate};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct F8(u8);

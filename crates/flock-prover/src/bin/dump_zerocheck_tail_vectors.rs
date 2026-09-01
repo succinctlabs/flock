@@ -21,16 +21,18 @@
 //!
 //! Run: cargo run --release --bin dump_zerocheck_tail_vectors -- cuda-ghash/zerocheck_tail_vectors.bin 16
 
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
+
 use env::args;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::F128;
-use flock_prover::zerocheck::multilinear::{fold_in_place_pair, round_pair_naive};
-
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    zerocheck::multilinear::{fold_in_place_pair, round_pair_naive},
+};
 
 fn wf(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;

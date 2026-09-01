@@ -1,18 +1,17 @@
-use super::*;
-use crate::prover::UnionElementSlotInput;
-use crate::r1cs_hashes::blake3::{build_block_r1cs, generate_witness_batch_major_partial_into};
-use crate::{
-    r1cs_hashes::fs_chain::{IV, trace_duplex},
-    schedule::Registry,
+use std::{
+    any::Any,
+    env::var,
+    iter::{once, repeat_n},
+    time::Instant,
 };
-use aggregate::JaggedKeyProve;
-use aggregate::JaggedKeyVerify;
-use aggregate::SigmaKey;
-use aggregate::prove_aggregate_classes_with_grinding;
-use aggregate::verify_aggregate_classes_with_grinding;
+
+use aggregate::{
+    JaggedKeyProve, JaggedKeyVerify, SigmaKey, prove_aggregate_classes_with_grinding,
+    verify_aggregate_classes_with_grinding,
+};
 use bincode::serialize;
-use flock_core::aggregate;
 use flock_core::{
+    aggregate,
     aggregate::{Accumulator, TypeMatrices},
     circuit::{Circuit, WiringError},
     element_r1cs::union::ElementAssertion,
@@ -26,17 +25,43 @@ use flock_core::{
 };
 use flock_field::PHI_8_TABLE;
 use flock_transcript::transcript_record::{RecordingChallenger, StreamWord, TranscriptOp as Op};
-use prover::prove_fast_ligerito_union_circuit;
-#[cfg(target_arch = "aarch64")]
-use prover::prove_fast_ligerito_union_circuit_ag;
-use rayon::prelude::*;
-use std::any::Any;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 #[cfg(test)]
-use std::array::from_fn;
-use std::env::var;
-use std::iter::once;
-use std::iter::repeat_n;
-use std::time::Instant;
+use {
+    crate::tower::{
+        build_chain_proof, build_fl_node, gates_blake3::Rng, native_chain, pack4, test_config,
+    },
+    std::array::from_fn,
+};
+
+#[cfg(target_arch = "aarch64")]
+use crate::prover::prove_fast_ligerito_union_circuit_ag;
+use crate::{
+    prover::{UnionElementSlotInput, prove_fast_ligerito_union_circuit},
+    r1cs_hashes::{
+        blake3::{build_block_r1cs, generate_witness_batch_major_partial_into},
+        fs_chain::{IV, trace_duplex},
+    },
+    schedule::Registry,
+    tower::{
+        BitSpreadGate, BitSpreadTable, Blake3Gate, ChildSlots, DOMAIN, ENV_ACC_MAIN_WORDS, EnvTail,
+        F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FoldPub, FsChallenger, HashKind,
+        LeafOuter, MatrixClaim, MergedChain, MixedProof, Online, PcsParams, PowMaskGate,
+        PowMaskTable, RealRegion, RealTape, SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable,
+        TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire, ZskipTapeRec, ZskipWires,
+        assert_chain_replays, balance_extra_rows, bytes_payload_mask, challenge_word_locs,
+        check_ag_skip_publics, check_fold_publics, check_jagged_fold_publics,
+        check_real_child_region, emit_ag_point_binding, emit_fold_region, emit_fs_chain,
+        emit_fs_chain_partitioned, emit_jagged_fold_region, emit_lagrange_lows,
+        emit_real_child_region, emit_recorded_pow_checks, env_acc_chain_base, env_acc_main_base,
+        env_app_base, env_pass_base, envelope_shape, flatten_ops, fold_region_ops,
+        jagged_fold_region_ops, labeled_bytes_payloads, leaf_boolean_lcs, leaf_boolean_mats,
+        live_element_input_from_rows, locate_and_pin_folds, locate_and_pin_jagged_folds,
+        merge_chain, outer_lanes, outer_union, outer_zc_ag, pack8, pad_envelope_counts,
+        payload_words, pcs_batch_for, read_acc_entry, replay_fold_endpoints,
+        replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+    },
+};
 
 /// The PRODUCTION per-proof tape cost of one child: the recorded deferred
 /// verify alone — the tape (op sequence + values + challenges) and the

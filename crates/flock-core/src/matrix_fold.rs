@@ -57,16 +57,20 @@
 //! `(q(1), q(∞))` with `q(0)` re-derived from the running claim, and each
 //! round binds the LOW remaining variable.
 
-use crate::element_r1cs::SparseF128Matrix;
-use crate::pcs::jagged::JaggedParams;
-use crate::pcs::jagged::assist_boundaries;
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::r1cs::SparseBinaryMatrix;
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    challenger::Challenger,
+    element_r1cs::SparseF128Matrix,
+    field::F128,
+    pcs::jagged::{JaggedParams, assist_boundaries},
+    r1cs::SparseBinaryMatrix,
+};
 
 const DOMAIN: &[u8] = b"flock-matrix-fold-v0";
 
@@ -1399,9 +1403,16 @@ pub fn verify_fold_jagged_with_grinding<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
-    use crate::pcs::jagged::JaggedParams;
+    use crate::{
+        challenger::FsChallenger,
+        matrix_fold::{
+            F128, FoldError, FoldGrinding, JaggedClaim, JaggedRowWeight, JaggedTable, MatrixClaim,
+            SparseBinaryMatrix, Weight, col_marginal, discharge_jagged, prove_fold,
+            prove_fold_jagged_with_grinding, prove_fold_with_grinding, verify_fold,
+            verify_fold_jagged_with_grinding, verify_fold_with_grinding,
+        },
+        pcs::jagged::JaggedParams,
+    };
 
     const D: &[u8] = b"matrix-fold-test";
 

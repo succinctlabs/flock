@@ -70,26 +70,28 @@
 //! (A sibling `logup_gkr` — a fractional **sum** GKR with an `a/b ⊕ c/d` gate —
 //! exists on the `recursive-verifier` branch of `flock-dev`, not ported here.)
 
-use crate::challenger::grinding_bits_for_degree;
-use crate::fold_min_len;
-use crate::scratch::give_f128;
-use crate::scratch::take_f128;
-use crate::sumcheck_round_min_len;
-use crate::zerocheck::univariate_skip::build_eq;
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::array::from_fn;
-use std::env::var;
-use std::mem::replace;
-use std::mem::swap;
-use std::mem::take;
-use std::sync::OnceLock;
-use std::time::Duration;
-use std::time::Instant;
+use std::{
+    array::from_fn,
+    env::var,
+    mem::{replace, swap, take},
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::zerocheck::univariate_skip::SplitEqGhash;
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator, ParallelSliceMut,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    challenger::{Challenger, grinding_bits_for_degree},
+    field::F128,
+    fold_min_len,
+    scratch::{give_f128, take_f128},
+    sumcheck_round_min_len,
+    zerocheck::univariate_skip::{SplitEqGhash, build_eq},
+};
 
 // ---------------------------------------------------------------------------
 // Proof / claim / error types
@@ -2041,11 +2043,17 @@ fn verify_batched_core<C: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
-
-    use crate::ntt::AdditiveNttF128;
-    use crate::test_rng::Rng;
+    use crate::{
+        challenger::FsChallenger,
+        ntt::AdditiveNttF128,
+        product_gkr::{
+            BatchedGrinding, Challenger, DOMAIN_BATCHED, F128, LiveMask, ProductGkrBatchedProof,
+            ProductGkrError, build_s_id_vec, mle_eval, prove_batched,
+            prove_batched_dense_masked_for_tests, prove_batched_with_grinding, s_id_basis,
+            s_id_value, verify_batched, verify_batched_with_grinding, verify_batched_with_sigma,
+        },
+        test_rng::Rng,
+    };
     /// The GROUPED pipeline is transcript-identical to the dense masked
     /// pipeline — proof and claim byte-equal on random (f, g, σ, mask),
     /// validity not required. The permanent differential oracle for the

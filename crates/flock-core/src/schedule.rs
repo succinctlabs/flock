@@ -12,17 +12,19 @@
 //! class PIOP runs only over its region (see
 //! [`Registry::new`]).
 
-use crate::r1cs::BlockR1cs;
-use crate::r1cs::absorb_matrix;
-use blake3::Hasher;
-use std::cmp::Reverse;
-use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::{
+    cmp::Reverse,
+    collections::BTreeSet,
+    sync::{Arc, OnceLock},
+};
 
-use crate::element_r1cs::ElementTableType;
-use crate::r1cs::SparseBinaryMatrix;
-use crate::zerocheck::{PaddingRun, PaddingSpec};
+use blake3::Hasher;
+
+use crate::{
+    element_r1cs::ElementTableType,
+    r1cs::{BlockR1cs, SparseBinaryMatrix, absorb_matrix},
+    zerocheck::{PaddingRun, PaddingSpec},
+};
 
 /// Largest `k_log` a registry accepts. Far above any real table (`M` would
 /// already be astronomical), and load-bearing for the injectivity of
@@ -785,16 +787,20 @@ impl<'r> Instance<'r> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::r1cs::{BlockR1cs, WitnessLayout};
     use std::sync::OnceLock;
 
-    use crate::challenger::{Challenger, FsChallenger};
-    use crate::element_r1cs::ElementTableBuilder;
-    use crate::field::F128;
-    use crate::test_rng::Rng;
-    use crate::zerocheck::univariate_skip::pack_bits;
-    use crate::zerocheck::{prove_packed, prove_packed_padded};
+    use crate::{
+        challenger::{Challenger, FsChallenger},
+        element_r1cs::ElementTableBuilder,
+        field::F128,
+        r1cs::{BlockR1cs, WitnessLayout},
+        schedule::{
+            Arc, Instance, IoWord, MAX_K_LOG, PaddingRun, Registry, Slot, SparseBinaryMatrix,
+            TableClass, TableType,
+        },
+        test_rng::Rng,
+        zerocheck::{prove_packed, prove_packed_padded, univariate_skip::pack_bits},
+    };
     /// Empty matrix stub — layout tests never apply the matrices, mirroring
     /// the walker-based encoders' stub practice.
     fn stub() -> SparseBinaryMatrix {

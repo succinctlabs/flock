@@ -31,15 +31,15 @@
 //!   cargo run --release --bin dump_sumcheck_vectors -- cuda-ghash/sumcheck_vectors.bin 12
 //!   cargo run --release --bin dump_sumcheck_vectors -- out.bin 22
 
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
+
 use env::args;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::F128;
-
 use flock_core::test_rng::Rng;
+use flock_prover::field::F128;
 
 fn write_f128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;

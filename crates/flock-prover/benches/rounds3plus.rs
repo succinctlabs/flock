@@ -13,16 +13,16 @@
 //! Target from PROTOCOL_REFERENCE.md: ~49 ms single-thread for "Multilinear
 //! rounds 3..23" at m=29.
 
-use flock_prover::init_perf_thread_pool;
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::field::F128;
-use flock_prover::zerocheck::multilinear::{
-    fold_and_compute_round_pair_optimized, fold_in_place_pair, round_pair_naive,
-};
+use std::{hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    init_perf_thread_pool,
+    zerocheck::multilinear::{
+        fold_and_compute_round_pair_optimized, fold_in_place_pair, round_pair_naive,
+    },
+};
 const K_SKIP: usize = 6;
 
 /// Run the full multilinear chain on (a, b). Mirrors the C++ inner loop

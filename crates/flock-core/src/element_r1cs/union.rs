@@ -78,30 +78,33 @@
 //! fixed Boolean pattern, which is why they open as **packed-direct** claims
 //! with a `Sparse` eq tensor and no ring-switching.
 
-use super::lincheck::ElementLincheckError;
-use super::lincheck::Proof as LincheckProof;
-use crate::matrix_fold::Weight;
-use crate::matrix_fold::bilinear;
-use crate::pcs::ring_switch::build_eq_parallel;
-use crate::scratch::give_zeroed_f128;
-use crate::scratch::take_zeroed_f128;
 use core::ops::Range;
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use zerocheck::Claim;
-use zerocheck::ElementZerocheckError;
-use zerocheck::RowSupport;
-use zerocheck::prove_with_support_with_grinding;
-use zerocheck::verify_with_label_and_grinding;
 
-use super::lincheck::{column_sumcheck_prove, column_sumcheck_replay};
-use super::zerocheck::Proof as ZerocheckProof;
-use super::{ElementTableType, Grinding, zerocheck};
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::matrix_fold::MatrixClaim;
-use crate::union::{ElementSlotLayout, UnionInstance};
-use crate::zerocheck::univariate_skip::build_eq;
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice};
+use serde::{Deserialize, Serialize};
+use zerocheck::{
+    Claim, ElementZerocheckError, RowSupport, prove_with_support_with_grinding,
+    verify_with_label_and_grinding,
+};
+
+use crate::{
+    challenger::Challenger,
+    element_r1cs::{
+        ElementTableType, Grinding,
+        lincheck::{
+            ElementLincheckError, Proof as LincheckProof, column_sumcheck_prove,
+            column_sumcheck_replay,
+        },
+        zerocheck,
+        zerocheck::Proof as ZerocheckProof,
+    },
+    field::F128,
+    matrix_fold::{MatrixClaim, Weight, bilinear},
+    pcs::ring_switch::build_eq_parallel,
+    scratch::{give_zeroed_f128, take_zeroed_f128},
+    union::{ElementSlotLayout, UnionInstance},
+    zerocheck::univariate_skip::build_eq,
+};
 
 /// Domain labels of the region PIOP's two phases — distinct from the
 /// standalone single-table labels, so a region proof can never be replayed as
@@ -638,7 +641,7 @@ impl ElementAssertion {
 
 #[cfg(test)]
 mod test_support {
-    use super::*;
+    use crate::element_r1cs::union::{F128, RegionSlot, build_eq, eq_prefix_weight, slot_comb};
 
     /// Evaluates the region combination without materializing the region.
     pub(super) fn region_comb_at(
@@ -808,24 +811,30 @@ pub fn give_back_live_region(union: &UnionInstance<'_>, pa: Vec<F128>, pb: Vec<F
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{region_comb_at, region_comb_at_oracle};
-    use super::*;
-    use crate::challenger::FsChallenger;
-    use crate::element_r1cs::broadcast_add;
-    use crate::element_r1cs::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
-    use crate::element_r1cs::zerocheck;
-    use crate::element_r1cs::{ElementTableBuilder, ElementTableType};
-    use crate::r1cs::SparseBinaryMatrix;
-    use crate::schedule::TableClass;
-    use crate::schedule::{Registry, TableType};
-    use crate::test_rng::Rng;
-    use crate::zerocheck::multilinear::eq_eval;
-    use flock_multilinear::IndexOrder;
-    use flock_multilinear::evaluate;
-    use std::sync::Arc;
-    use std::time::Instant;
-    use zerocheck::LABEL;
-    use zerocheck::prove_with_support;
+    use std::{sync::Arc, time::Instant};
+
+    use flock_multilinear::{IndexOrder, evaluate};
+    use zerocheck::{LABEL, prove_with_support};
+
+    use crate::{
+        challenger::FsChallenger,
+        element_r1cs::{
+            ElementTableBuilder, ElementTableType, broadcast_add,
+            tests::{mixed_gate, mixed_witness, mult_gate, mult_witness},
+            union::{
+                ElementUnionError, ElementZerocheckError, F128, Grinding, Proof, UnionInstance,
+                collapse_rows, eq_prefix_weight, fill_slot, prove, prove_with_grinding,
+                region_comb, region_slots, row_support,
+                test_support::{region_comb_at, region_comb_at_oracle},
+                verify, verify_deferred, verify_with_grinding,
+            },
+            zerocheck,
+        },
+        r1cs::SparseBinaryMatrix,
+        schedule::{Registry, TableClass, TableType},
+        test_rng::Rng,
+        zerocheck::multilinear::eq_eval,
+    };
 
     /// Direct MLE evaluation at `point`, binding the low variable first.
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {

@@ -1,14 +1,15 @@
-#[allow(unused_imports)] // used only under cfg(test)
-use super::*;
 #[cfg(test)]
-use bincode::serialize;
-#[cfg(test)]
-use flock_core::{
-    pcs::{MergedOpenProof, ligerito::RecursiveProof},
-    proof::R1csProofCircuitMerged,
+use {
+    bincode::serialize,
+    flock_core::{
+        pcs::{MergedOpenProof, ligerito::RecursiveProof},
+        proof::R1csProofCircuitMerged,
+    },
+    serde::Serialize,
 };
-#[cfg(test)]
-use serde::Serialize;
+
+#[allow(unused_imports)] // used only under cfg(test)
+use crate::tower::{MixedProof, PcsParams};
 
 // ---------------------------------------------------------------------------
 // THE BENCHMARK CONTRACT: what a proof costs ONLINE.

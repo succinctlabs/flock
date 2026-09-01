@@ -45,41 +45,38 @@
 //!   each Ch / Maj AND row would blow up to thousands of terms.
 //! - `H_out[w]` — the public output of the compression.
 
-use super::common::build_block_r1cs_with_matrices;
-use super::common::drive_witness_batch_major;
-use super::common::drive_witness_batch_major_into;
-use super::common::drive_witness_batch_major_partial;
-use super::common::drive_witness_batch_major_partial_into;
-use super::common::drive_witness_packed_and_lincheck;
-use super::common::{
-    BitRecord, add_carry_parts, const_add_parts, fused_add3_parts, fused_add4_parts, or_bit_at,
-    or_u32_at_bit,
+use std::array::from_fn;
+
+use flock_core::{
+    lincheck::LincheckCircuit,
+    pcs::{
+        Commitment, PcsParams,
+        ligerito::{LigeritoProfile, embedded_initial_k_or_default},
+    },
+    proof::{R1csClaim, R1csProofMergedLigerito},
+    r1cs::{BlockR1cs, SparseBinaryMatrix},
+    scratch::prewarm_prover,
+    union::{SlotWitnessDest, UnionInstance},
+    verifier::{FlockVerifyError, verify_ligerito_union},
 };
-use crate::prover::UnionSlotProverInput;
-use crate::prover::prove_fast_ligerito_union;
-use crate::schedule::{Registry, TableType};
-use flock_core::lincheck::LincheckCircuit;
-use flock_core::pcs::Commitment;
-use flock_core::pcs::PcsParams;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::ligerito::embedded_initial_k_or_default;
-use flock_core::proof::R1csClaim;
-use flock_core::proof::R1csProofMergedLigerito;
-use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
-use flock_core::scratch::prewarm_prover;
-use flock_core::union::SlotWitnessDest;
-use flock_core::union::UnionInstance;
-use flock_core::verifier::FlockVerifyError;
-use flock_core::verifier::verify_ligerito_union;
 use flock_field::F128;
 use flock_transcript::challenger::Challenger;
-use std::array::from_fn;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Compile-time slot layout
 // ───────────────────────────────────────────────────────────────────────────
-
-use super::common::{BM_V, BmRow, add_carry_parts_v, or_bit_row, or_u32_row};
+use crate::r1cs_hashes::common::{BM_V, BmRow, add_carry_parts_v, or_bit_row, or_u32_row};
+use crate::{
+    prover::{UnionSlotProverInput, prove_fast_ligerito_union},
+    r1cs_hashes::common::{
+        BitRecord, add_carry_parts, build_block_r1cs_with_matrices, const_add_parts,
+        drive_witness_batch_major, drive_witness_batch_major_into,
+        drive_witness_batch_major_partial, drive_witness_batch_major_partial_into,
+        drive_witness_packed_and_lincheck, fused_add3_parts, fused_add4_parts, or_bit_at,
+        or_u32_at_bit,
+    },
+    schedule::{Registry, TableType},
+};
 /// Inner-dimension log: `K = 2^15 = 32,768` rows per block.
 pub const K_LOG: usize = 15;
 pub const K: usize = 1 << K_LOG;
@@ -1687,18 +1684,28 @@ pub fn generate_witness_batch_major_partial_into(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::prover::UnionSlotProverInput;
-    use crate::prover::prove_fast_ligerito_union;
-    use flock_core::lincheck::CscCircuit;
-    use flock_core::union::UnionInstance;
     use std::array::from_fn;
 
-    use flock_core::lincheck::pack_z_lincheck_from_packed;
-    use flock_core::lincheck::{LincheckCircuit, SparseMatrixCircuit};
-    use flock_core::test_rng::Rng;
+    use flock_core::{
+        lincheck::{CscCircuit, LincheckCircuit, SparseMatrixCircuit, pack_z_lincheck_from_packed},
+        test_rng::Rng,
+        union::UnionInstance,
+    };
     use flock_field::F128;
     use flock_transcript::challenger::FsChallenger;
+
+    use crate::{
+        prover::{UnionSlotProverInput, prove_fast_ligerito_union},
+        r1cs_hashes::sha2::{
+            A_NEW_BASE, CH_AND_BASE, E_NEW_BASE, FlockVerifyError, H_BASE, H_OUT_BASE, K, K_LOG,
+            M_BASE, MAJ_AND_BASE, N_ROUNDS, OUT_CARRY_BASE, ROUND_BASE, ROUND_CARRY_BASE,
+            SCHED_CARRY_BASE, SHA256_IV, Sha2LincheckCircuit, Sha256HybridSetup,
+            SparseBinaryMatrix, USEFUL_BITS, WORD_BITS, Z_CONST_POS, build_block_r1cs,
+            build_block_witness, build_matrices, generate_witness_batch_major,
+            generate_witness_batch_major_partial, generate_witness_with_ab_packed_and_lincheck,
+            hash_to_phys_bits, read_h_out, round_add_bits, sha256_compress,
+        },
+    };
     /// The walker's constant-wire pin must equal the pin the R1CS itself
     /// declares — see the blake3 twin of this test.
     #[test]

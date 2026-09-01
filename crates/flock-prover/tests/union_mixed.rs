@@ -20,53 +20,53 @@
 //! byte-identity differentials against the direct jagged path lived in
 //! `tests/union_roundtrip.rs` on the harness binding.
 
-use bincode::deserialize;
-use bincode::serialize;
-use flock_core::field::F128;
-use flock_core::lincheck::LincheckCircuit;
-use flock_core::lincheck::LincheckError;
-use flock_core::pcs::commit;
-use flock_core::pcs::commit_lane_major;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::ligerito::embedded_initial_k_or_default;
-use flock_core::pcs::{PcsOpenError, PcsParams};
-use flock_core::proof::R1csProofMergedLigerito;
-use flock_core::r1cs::BlockR1cs;
-use flock_core::scratch::give_f128;
-use flock_core::scratch::give_u8;
-use flock_core::scratch::prewarm_prover;
-use flock_core::union::SlotWitness;
-use flock_core::verifier::FlockVerifyError;
-use flock_prover::challenger::FsChallenger;
-use flock_prover::prover::{self, UnionSlotProverInput};
-use flock_prover::r1cs_hashes::blake3::{
-    Blake3Setup, Compression as Blake3Compression, K_LOG as BLAKE3_K_LOG,
-    build_block_r1cs as build_blake3_block_r1cs,
-    generate_witness_batch_major as generate_blake3_witness_batch_major,
-    generate_witness_batch_major_partial as generate_blake3_witness_batch_major_partial,
-    generate_witness_batch_major_partial_into as generate_blake3_witness_batch_major_partial_into,
+use std::{
+    array::from_fn,
+    env::var,
+    sync::{Mutex, MutexGuard},
+    time::Instant,
 };
-use flock_prover::r1cs_hashes::sha2::{
-    Compression as Sha2Compression, K_LOG as SHA2_K_LOG, Sha256HybridSetup,
-    build_block_r1cs as build_sha2_block_r1cs,
-    generate_witness_batch_major as generate_sha2_witness_batch_major,
-    generate_witness_batch_major_partial as generate_sha2_witness_batch_major_partial,
-    generate_witness_batch_major_partial_into as generate_sha2_witness_batch_major_partial_into,
-};
-use flock_prover::schedule::{Registry, TableType};
-use flock_prover::union::UnionInstance;
-use flock_prover::verifier;
-use prover::prove_fast_ligerito_union;
-use prover::prove_fast_ligerito_union_mixed_class;
-use std::array::from_fn;
-use std::env::var;
-use std::sync::Mutex;
-use std::sync::MutexGuard;
-use verifier::verify_ligerito_union;
-use verifier::verify_ligerito_union_mixed_class;
 
-use flock_core::test_rng::Rng;
-use std::time::Instant;
+use bincode::{deserialize, serialize};
+use flock_core::{
+    field::F128,
+    lincheck::{LincheckCircuit, LincheckError},
+    pcs::{
+        PcsOpenError, PcsParams, commit, commit_lane_major,
+        ligerito::{LigeritoProfile, embedded_initial_k_or_default},
+    },
+    proof::R1csProofMergedLigerito,
+    r1cs::BlockR1cs,
+    scratch::{give_f128, give_u8, prewarm_prover},
+    test_rng::Rng,
+    union::SlotWitness,
+    verifier::FlockVerifyError,
+};
+use flock_prover::{
+    challenger::FsChallenger,
+    prover::{self, UnionSlotProverInput},
+    r1cs_hashes::{
+        blake3::{
+            Blake3Setup, Compression as Blake3Compression, K_LOG as BLAKE3_K_LOG,
+            build_block_r1cs as build_blake3_block_r1cs,
+            generate_witness_batch_major as generate_blake3_witness_batch_major,
+            generate_witness_batch_major_partial as generate_blake3_witness_batch_major_partial,
+            generate_witness_batch_major_partial_into as generate_blake3_witness_batch_major_partial_into,
+        },
+        sha2::{
+            Compression as Sha2Compression, K_LOG as SHA2_K_LOG, Sha256HybridSetup,
+            build_block_r1cs as build_sha2_block_r1cs,
+            generate_witness_batch_major as generate_sha2_witness_batch_major,
+            generate_witness_batch_major_partial as generate_sha2_witness_batch_major_partial,
+            generate_witness_batch_major_partial_into as generate_sha2_witness_batch_major_partial_into,
+        },
+    },
+    schedule::{Registry, TableType},
+    union::UnionInstance,
+    verifier,
+};
+use prover::{prove_fast_ligerito_union, prove_fast_ligerito_union_mixed_class};
+use verifier::{verify_ligerito_union, verify_ligerito_union_mixed_class};
 
 const DOMAIN: &[u8] = b"flock-mixed-e2e-v0";
 

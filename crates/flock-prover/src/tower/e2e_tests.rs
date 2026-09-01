@@ -1,20 +1,31 @@
-use super::*;
-use crate::r1cs_hashes::blake3::build_block_r1cs;
-use aggregate::Accumulator;
-use aggregate::JaggedKeyProve;
-use aggregate::JaggedKeyVerify;
-use aggregate::prove_aggregate_classes_with_grinding;
-use aggregate::verify_aggregate_classes_with_grinding;
-use bincode::serialize;
-use flock_core::aggregate;
-use flock_core::{
-    element_r1cs::union::ElementAssertion, lincheck::LincheckCircuit, matrix_fold::MatrixClaim,
+use std::{array::from_fn, env::var, slice::from_ref, sync::atomic::Ordering, time::Instant};
+
+use aggregate::{
+    Accumulator, JaggedKeyProve, JaggedKeyVerify, prove_aggregate_classes_with_grinding,
+    verify_aggregate_classes_with_grinding,
 };
-use std::array::from_fn;
-use std::env::var;
-use std::slice::from_ref;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use bincode::serialize;
+use flock_core::{
+    aggregate, element_r1cs::union::ElementAssertion, lincheck::LincheckCircuit,
+    matrix_fold::MatrixClaim,
+};
+
+use crate::{
+    r1cs_hashes::blake3::build_block_r1cs,
+    tower::{
+        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, SpineIn,
+        UnionInstance, build_chain_proof, build_fl_node, build_node_outer_app, chain_blake_r1cs,
+        chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
+        envelope::STEADY_OVERRIDE,
+        envelope_shape,
+        gates_blake3::Rng,
+        leaf_boolean_lcs, leaf_boolean_mats, native_chain,
+        node::{N_KEY_SLOTS, digest_f128, entry_live},
+        node_jagged_params,
+        online::{median_total, proof_census_mixed, report_stage},
+        outer_union, pack4, test_config, tower_fold_grinding,
+    },
+};
 
 /// **WALL 3: THE SPINE CONVERGES.** Eight chain segments → four FLs → a
 /// BASE node (two FLs, fresh-only) → node_2 (a fresh FL + the base) →

@@ -20,42 +20,34 @@
 //! BLAKE3 rather than SHA-256 on purpose: it is the settled hash for this
 //! work, so validating the SHA path would validate one we do not use.
 
-use bincode::serialize;
-use blake3::Compression;
-use blake3::build_block_r1cs;
-use blake3::generate_witness_batch_major_partial;
-use blake3::io_schema;
-use flock_core::circuit::builder::{CircuitBuilder, GateType, SlotWitness, Wire};
-use flock_core::field::F128;
-use flock_core::pcs::PcsParams;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_hash::{HashKind, blake3_compress};
-use flock_prover::challenger::FsChallenger;
-use flock_prover::prover::{self, UnionSlotProverInput};
-use flock_prover::r1cs_hashes::blake3;
-use flock_prover::r1cs_hashes::fs_chain::IV as FS_CHAIN_IV;
-use flock_prover::schedule::TableType;
-use flock_prover::union::UnionInstance;
-use flock_prover::verifier;
-use prover::prove_fast_ligerito_union_circuit;
-use prover::prove_fast_ligerito_union_mixed_class;
-use std::array::from_fn;
-use std::iter::once;
-use std::time::Instant;
-use verifier::verify_ligerito_union_circuit;
-use verifier::verify_ligerito_union_mixed_class;
-use zerocheck::prove_with_label;
-use zerocheck::verify_with_label;
+use std::{array::from_fn, iter::once, sync::Arc, time::Instant};
 
-use flock_core::challenger::Challenger as _;
-use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType, zerocheck};
-use flock_core::test_rng::Rng;
-use flock_core::transcript_record::{RecordingChallenger, StreamWord, TranscriptOp};
-use flock_prover::prover::UnionElementSlotInput;
-use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
-use flock_prover::schedule::IoWord;
-use flock_prover::schedule::Registry;
-use std::sync::Arc;
+use bincode::serialize;
+use blake3::{Compression, build_block_r1cs, generate_witness_batch_major_partial, io_schema};
+use flock_core::{
+    challenger::Challenger as _,
+    circuit::builder::{CircuitBuilder, GateType, SlotWitness, Wire},
+    element_r1cs::{ElementTableBuilder, ElementTableType, zerocheck},
+    field::F128,
+    pcs::{PcsParams, ligerito::LigeritoProfile},
+    test_rng::Rng,
+    transcript_record::{RecordingChallenger, StreamWord, TranscriptOp},
+};
+use flock_hash::{HashKind, blake3_compress};
+use flock_prover::{
+    challenger::FsChallenger,
+    prover::{self, UnionElementSlotInput, UnionSlotProverInput},
+    r1cs_hashes::{
+        blake3,
+        fs_chain::{CvSource, FsChain, IV as FS_CHAIN_IV},
+    },
+    schedule::{IoWord, Registry, TableType},
+    union::UnionInstance,
+    verifier,
+};
+use prover::{prove_fast_ligerito_union_circuit, prove_fast_ligerito_union_mixed_class};
+use verifier::{verify_ligerito_union_circuit, verify_ligerito_union_mixed_class};
+use zerocheck::{prove_with_label, verify_with_label};
 const DOMAIN: &[u8] = b"flock-circuit-builder-v0";
 
 const CHUNK_START: u32 = 1 << 0;

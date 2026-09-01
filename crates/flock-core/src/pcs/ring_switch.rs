@@ -57,24 +57,26 @@
 //! The packed witness has `2^(m−7)` F_{2^128} elements indexed by the suffix.
 //! `s_hat_v` has 128 entries indexed by the 7-bit prefix.
 
-use crate::bits::transpose_8x8_bits;
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::field::F256;
-use crate::pcs::tensor_algebra::{TensorAlgebra, TensorAlgebra256};
-use crate::scratch::take_f128;
-use crate::zerocheck::PaddingSpec;
-use crate::zerocheck::multilinear::lagrange_weights_naive;
-use crate::zerocheck::univariate_skip::build_eq;
-use flock_multilinear::IndexOrder;
-use flock_multilinear::eq_table_scaled;
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::env::var;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::{env::var, sync::OnceLock, time::Instant};
 
-use super::pack::LOG_PACKING;
+use flock_multilinear::{IndexOrder, eq_table_scaled};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSlice,
+    ParallelSliceMut,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    bits::transpose_8x8_bits,
+    challenger::Challenger,
+    field::{F128, F256},
+    pcs::{
+        pack::LOG_PACKING,
+        tensor_algebra::{TensorAlgebra, TensorAlgebra256},
+    },
+    scratch::take_f128,
+    zerocheck::{PaddingSpec, multilinear::lagrange_weights_naive, univariate_skip::build_eq},
+};
 
 /// Per-block padding descriptor in F_{2^128} units. Computed once from a bit-
 /// level [`PaddingSpec`] and reused across the fold kernels: any chunk whose
@@ -2971,18 +2973,33 @@ pub fn eval_rs_eq_finish_from_prefix_binary_q_f256(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::pcs::pack::pack_witness;
-    use crate::zerocheck::multilinear::lagrange_weights_naive;
-    use crate::zerocheck::univariate_skip::build_eq;
-    use flock_multilinear::IndexOrder;
-    use flock_multilinear::evaluate;
+    use flock_multilinear::{IndexOrder, evaluate};
 
-    use crate::challenger::FsChallenger;
-    use crate::challenger::{Challenger, RandomChallenger};
-    use crate::field::F256;
-    use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
-    use crate::test_rng::Rng;
+    use crate::{
+        challenger::{Challenger, FsChallenger, RandomChallenger},
+        field::F256,
+        lincheck::{pack_z_lincheck, partial_fold_packed_z},
+        pcs::{
+            pack::pack_witness,
+            ring_switch::{
+                F128, LOG_PACKING, PaddingSpec, RingSwitchError, RsEqInd, build_claim_weights,
+                build_eq_sparse, build_eq_split, build_fold_byte_table, claim_check, eval_rs_eq,
+                eval_rs_eq_finish_from_prefix, eval_rs_eq_finish_from_prefix_binary_q,
+                eval_rs_eq_prefix, eval_rs_eq_prefix_f256, fold_1b_rows_1way_mfr_8wide_k4,
+                fold_1b_rows_1way_mfr_16wide_padded, fold_1b_rows_2way_mfr,
+                fold_1b_rows_2way_mfr_8wide, fold_1b_rows_2way_mfr_8wide_padded,
+                fold_1b_rows_2way_mfr_16wide_padded, fold_1b_rows_2way_mfr_padded,
+                fold_1b_rows_naive, fold_1b_rows_sparse, fold_1b_rows_split,
+                fold_1b_rows_split_2way, fold_b128_elems, fold_b128_elems_naive,
+                fold_b128_elems_sparse, fold_b128_elems_split, fold_one_slot, inner_product,
+                linearized_coefficients, moore_inverse, prove, prove_batched,
+                prove_batched_padded_with_precomputed, prove_with_grinding, s_hat_v_from_z_vec,
+                split_n_lo, subset_sums_4, tensor_algebra_transpose, verify, verify_with_grinding,
+            },
+        },
+        test_rng::Rng,
+        zerocheck::{multilinear::lagrange_weights_naive, univariate_skip::build_eq},
+    };
     /// Binary-query specialization matches the general path bit-for-bit.
     #[test]
     fn eval_rs_eq_finish_binary_q_matches_general() {

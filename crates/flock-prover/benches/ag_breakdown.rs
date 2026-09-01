@@ -21,21 +21,19 @@ fn main() {
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64_only {
-    use std::env::args;
-    use std::hint::black_box;
-    use std::sync::atomic::Ordering;
-    use std::time::Instant;
-
-    use flock_prover::challenger::FsChallenger;
-    use flock_prover::field::F128;
-    use flock_prover::genus95_curve_code::round1::round1_slp_packed_banks_fused;
-    use flock_prover::zerocheck::ag_skip::{
-        LOOKAHEAD_DISABLE, N_INNER, fold_and_first_round, friendly_challenges,
-        prove_capture_s_hat_v_c,
-    };
-    use rayon::current_num_threads;
+    use std::{env::args, hint::black_box, sync::atomic::Ordering, time::Instant};
 
     use flock_core::test_rng::Rng;
+    use flock_prover::{
+        challenger::FsChallenger,
+        field::F128,
+        genus95_curve_code::round1::round1_slp_packed_banks_fused,
+        zerocheck::ag_skip::{
+            LOOKAHEAD_DISABLE, N_INNER, fold_and_first_round, friendly_challenges,
+            prove_capture_s_hat_v_c,
+        },
+    };
+    use rayon::current_num_threads;
 
     pub(super) fn run() {
         let m: usize = args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);

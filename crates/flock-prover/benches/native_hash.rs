@@ -15,8 +15,7 @@
 //!
 //! Run: `cargo bench --bench native_hash`
 
-use std::hint::black_box;
-use std::time::Instant;
+use std::{hint::black_box, time::Instant};
 
 use flock_hash::blake3_compress;
 use flock_prover::r1cs_hashes::sha2::sha256_compress;

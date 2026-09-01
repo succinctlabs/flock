@@ -3,19 +3,22 @@
 //! Uses `Sha256HybridSetup::prove_fast` — the fused (z, a, b, c, z_lincheck)
 //! generator, mirroring `sha_packed::prove_fast`.
 
-use flock_prover::init_perf_thread_pool;
-use flock_prover::proof_io::R1csProofBundleLigerito;
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::array::from_fn;
-use std::env::var;
-use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::r1cs_hashes::sha2::{K_LOG, Sha256HybridSetup, USEFUL_BITS, min_n_blocks_log};
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    array::from_fn,
+    env::var,
+    hint::black_box,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
+};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    proof_io::R1csProofBundleLigerito,
+    r1cs_hashes::sha2::{K_LOG, Sha256HybridSetup, USEFUL_BITS, min_n_blocks_log},
+};
 // Peak-heap tracker (wraps System): records the high-water mark of currently
 // outstanding bytes, same notion as binius64's peakmem-alloc. Negligible
 // overhead (one relaxed atomic op per alloc/dealloc).

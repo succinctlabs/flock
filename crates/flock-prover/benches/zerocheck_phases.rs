@@ -16,24 +16,27 @@
 //!
 //! Plus an end-to-end `prove_packed` run for cross-check.
 
-use flock_prover::init_perf_thread_pool;
-use std::hint::black_box;
-use std::mem::swap;
-use std::time::Instant;
-
-use flock_prover::challenger::{Challenger, FsChallenger};
-use flock_prover::field::{F8, F128};
-use flock_prover::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
-use flock_prover::zerocheck::multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
-    interpolate_at_z_on_lambda, round_pair_naive, uni_skip_fold_and_round_pair_optimized_packed,
-};
-use flock_prover::zerocheck::prove_packed;
-use flock_prover::zerocheck::univariate_skip_optimized::{
-    c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed, small_challenges_ghash,
-};
+use std::{hint::black_box, mem::swap, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::{Challenger, FsChallenger},
+    field::{F8, F128},
+    init_perf_thread_pool,
+    ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8},
+    zerocheck::{
+        multilinear::{
+            UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
+            interpolate_at_z_on_lambda, round_pair_naive,
+            uni_skip_fold_and_round_pair_optimized_packed,
+        },
+        prove_packed,
+        univariate_skip_optimized::{
+            c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed,
+            small_challenges_ghash,
+        },
+    },
+};
 const K_SKIP: usize = 6;
 const N_INNER: usize = 7;
 

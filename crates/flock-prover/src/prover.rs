@@ -26,84 +26,52 @@
 //! ```
 
 use core::mem::size_of;
-use flock_core::circuit::Circuit;
-use flock_core::circuit::WiringProof;
-use flock_core::circuit::prove_wiring_with_grinding;
-use flock_core::element_r1cs::ElementTableType;
-use flock_core::element_r1cs::union::Claims;
-use flock_core::element_r1cs::union::Proof;
-use flock_core::element_r1cs::union::copy_live_region;
-use flock_core::element_r1cs::union::dead_rows_unread;
-use flock_core::element_r1cs::union::fill_slot;
-use flock_core::element_r1cs::union::give_back_live_region;
-use flock_core::element_r1cs::union::prove_with_grinding;
-use flock_core::lincheck::SkipPoint;
-use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
-use flock_core::pcs::{self, Commitment, PcsParams};
-use flock_core::proof::BooleanPiopProof;
-#[cfg(target_arch = "aarch64")]
-use flock_core::proof::BooleanPiopProofAg;
-use flock_core::proof::R1csProofCircuitMerged;
-#[cfg(target_arch = "aarch64")]
-use flock_core::proof::R1csProofCircuitMergedAg;
-#[cfg(target_arch = "aarch64")]
-use flock_core::proof::R1csProofLigeritoAg;
-use flock_core::proof::R1csProofMergedLigerito;
-#[cfg(target_arch = "aarch64")]
-use flock_core::proof::R1csProofMergedLigeritoAg;
-use flock_core::proof::R1csProofMixedClassMerged;
-use flock_core::proof::UnionClassClaims;
-use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
-use flock_core::r1cs::{BlockR1cs, WitnessLayout};
-use flock_core::schedule::TableClass;
-use flock_core::scratch::give_f128;
-use flock_core::scratch::give_u8;
-use flock_core::union::SlotWitness;
-use flock_core::union::SlotWitnessDest;
-use flock_core::union::UnionInstance;
-use flock_core::union::WitnessBufMode;
-use flock_core::zerocheck;
-#[cfg(target_arch = "aarch64")]
-use flock_core::zerocheck::ag_skip::AgProof;
+use std::{env::var, mem::size_of_val, slice::from_raw_parts, sync::Arc, time::Instant};
+
+use flock_core::{
+    circuit::{Circuit, WiringProof, prove_wiring_with_grinding},
+    element_r1cs::{
+        ElementTableType,
+        union::{
+            Claims, Proof, copy_live_region, dead_rows_unread, fill_slot, give_back_live_region,
+            prove_with_grinding,
+        },
+    },
+    lincheck::{self, QuirkyPoint, SkipPoint, pack_z_lincheck_from_packed},
+    pcs::{self, Commitment, PcsParams},
+    proof::{
+        BooleanPiopProof, R1csClaim, R1csProofCircuitMerged, R1csProofLigerito,
+        R1csProofMergedLigerito, R1csProofMixedClassMerged, UnionClassClaims, ZClaim,
+        bind_statement,
+    },
+    r1cs::{BlockR1cs, WitnessLayout},
+    schedule::TableClass,
+    scratch::{give_f128, give_u8},
+    union::{SlotWitness, SlotWitnessDest, UnionInstance, WitnessBufMode},
+    zerocheck,
+};
 use flock_field::F128;
 use flock_transcript::challenger::Challenger;
-use lincheck::LincheckCircuit;
-use lincheck::LincheckProof;
-use lincheck::SparseMatrixCircuit;
-use lincheck::UnionLincheckSlot;
-#[cfg(target_arch = "aarch64")]
-use lincheck::prove_padded_capture_z_vec;
-use lincheck::prove_padded_capture_z_vec_with_grinding;
-use lincheck::prove_union_capture_z_vec_with_grinding;
-use pcs::BatchOpeningProofLigerito;
-use pcs::DirectEqInd;
-use pcs::LOG_PACKING;
-use pcs::MergedOpenProof;
-use pcs::OpeningGrinding;
-use pcs::PackedDirectClaim;
-use pcs::ProverData;
-use pcs::commit;
-use pcs::commit_into;
-use pcs::commit_lane_major;
-use pcs::ligerito::ProverConfig;
-use pcs::open_batch_merged;
-use pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding;
-use pcs::ring_switch::s_hat_v_from_z_vec;
+use lincheck::{
+    LincheckCircuit, LincheckProof, SparseMatrixCircuit, UnionLincheckSlot,
+    prove_padded_capture_z_vec_with_grinding, prove_union_capture_z_vec_with_grinding,
+};
+use pcs::{
+    BatchOpeningProofLigerito, DirectEqInd, LOG_PACKING, MergedOpenProof, OpeningGrinding,
+    PackedDirectClaim, ProverData, commit, commit_into, commit_lane_major, ligerito::ProverConfig,
+    open_batch_merged, open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding,
+    ring_switch::s_hat_v_from_z_vec,
+};
 use rayon::join;
-use std::env::var;
-use std::mem::size_of_val;
-use std::slice::from_raw_parts;
-use std::sync::Arc;
-use std::time::Instant;
-use zerocheck::PaddingSpec;
-use zerocheck::ZerocheckProof;
+use zerocheck::{PaddingSpec, ZerocheckProof, prove_packed_padded_capture_s_hat_v_c_with_grinding};
 #[cfg(target_arch = "aarch64")]
-use zerocheck::ag_skip::K_SKIP;
-#[cfg(target_arch = "aarch64")]
-use zerocheck::ag_skip::prove_capture_s_hat_v_c;
-#[cfg(target_arch = "aarch64")]
-use zerocheck::ag_skip::prove_capture_s_hat_v_c_with_grinding;
-use zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding;
+use {
+    flock_core::proof::BooleanPiopProofAg, flock_core::proof::R1csProofCircuitMergedAg,
+    flock_core::proof::R1csProofLigeritoAg, flock_core::proof::R1csProofMergedLigeritoAg,
+    flock_core::zerocheck::ag_skip::AgProof, lincheck::prove_padded_capture_z_vec,
+    zerocheck::ag_skip::K_SKIP, zerocheck::ag_skip::prove_capture_s_hat_v_c,
+    zerocheck::ag_skip::prove_capture_s_hat_v_c_with_grinding,
+};
 
 /// Construct a multilinear `x_outer_full` of length `m − k_skip` from a
 /// QuirkyPoint: concatenate `x_inner_rest` and `x_outer`. This is the format

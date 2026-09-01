@@ -18,12 +18,13 @@
 //! [`super::univariate_skip_optimized`] drops a constant F₈ factor
 //! `C_s = φ₈(0x1C)` from the eq-on-S weights; this one keeps it.
 
-use flock_multilinear::IndexOrder;
-use flock_multilinear::eq_table;
-use rayon::prelude::*;
+use flock_multilinear::{IndexOrder, eq_table};
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
-use crate::field::{F8, F128, mul_by_x, phi8};
-use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
+use crate::{
+    field::{F8, F128, mul_by_x, phi8},
+    ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8},
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -532,11 +533,15 @@ pub fn round1_evals_on_s(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::pcs::pack::pack_witness;
-    use crate::pcs::ring_switch::fold_1b_rows_naive;
-    use crate::test_rng::Rng;
+    use crate::{
+        pcs::{pack::pack_witness, ring_switch::fold_1b_rows_naive},
+        test_rng::Rng,
+        zerocheck::univariate_skip::{
+            AdditiveNttGf8, F8, F128, InvNttTableByteSingleGf8, SplitEqGhash, build_eq, pack_bits,
+            round1_evals_on_s, round1_extract_c, round1_extract_c_packed,
+            round1_extract_c_packed_with_s_hat_v, round1_naive,
+        },
+    };
 
     #[test]
     fn build_eq_basic() {

@@ -30,28 +30,19 @@
 //! // Then call e.g. `setup.verify(&bundle.commitment, &bundle.proof, ...)`.
 //! ```
 
+use std::{
+    error::Error,
+    fmt::{Display, Formatter, Result as FmtResult},
+    fs::{File, rename, write},
+    io::{Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult},
+    path::Path,
+};
+
+use bincode::{DefaultOptions, Error as BincodeError, Options, serialize_into};
+use flock_core::{pcs::Commitment, proof::R1csProofMergedLigerito};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
 use crate::mixed::MixedRegistryId;
-use bincode::DefaultOptions;
-use bincode::Error as BincodeError;
-use bincode::serialize_into;
-use flock_core::proof::R1csProofMergedLigerito;
-use serde::de::DeserializeOwned;
-use std::error::Error;
-use std::fmt::Display;
-use std::fmt::Formatter;
-use std::fmt::Result as FmtResult;
-use std::fs::File;
-use std::fs::rename;
-use std::fs::write;
-use std::io::Read;
-use std::io::Result as IoResult;
-use std::io::{Error as IoError, ErrorKind as IoErrorKind};
-use std::path::Path;
-
-use bincode::Options;
-use serde::{Deserialize, Serialize};
-
-use flock_core::pcs::Commitment;
 
 /// Magic bytes prepended to every serialized proof. Lets readers reject
 /// random binary data early.
@@ -355,19 +346,25 @@ impl Error for BundleReadError {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::r1cs_hashes::blake3::{Blake3Setup, Compression};
-    use bincode::serialize;
-    use flock_hash::blake3_compress;
-    use flock_transcript::challenger::FsChallenger;
-    use std::array::from_fn;
-    use std::env::temp_dir;
-    use std::fs::remove_file;
+    use std::{array::from_fn, env::temp_dir, fs::remove_file};
 
-    use crate::mixed::{MixedCounts, MixedRegistryId, MixedSetup};
-    use flock_core::pcs::ligerito::LigeritoProfile;
-    use flock_core::test_rng::Rng;
+    use bincode::serialize;
+    use flock_core::{pcs::ligerito::LigeritoProfile, test_rng::Rng};
+    use flock_hash::blake3_compress;
     use flock_prover_test_inputs::{random_blake3_inputs, random_sha2_inputs};
+    use flock_transcript::challenger::FsChallenger;
+
+    use crate::{
+        mixed::{MixedCounts, MixedRegistryId, MixedSetup},
+        proof_io::{
+            BundleFlavor, DeserializeError, FLAVOR_MIXED_LIGERITO, FLAVOR_R1CS_LIGERITO,
+            HEADER_LEN, MAGIC, MAX_BUNDLE_BYTES, MixedProofBundleLigerito, R1csProofBundleLigerito,
+            VERSION, check_bundle_size, deserialize_payload, peek_flavor, read_bytes_from_file,
+            read_mixed_bundle_ligerito_from_file, write_bytes_to_file,
+            write_mixed_bundle_ligerito_to_file,
+        },
+        r1cs_hashes::blake3::{Blake3Setup, Compression},
+    };
 
     /// Build a small honest BLAKE3 chain (n=8) for the bundle tests.
     fn honest_chain(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8]) {
@@ -557,10 +554,13 @@ mod tests {
 
     /// Deterministic input generators shared with the mixed bundle test.
     mod flock_prover_test_inputs {
-        use super::Rng;
-        use crate::r1cs_hashes::blake3::Compression as Blake3Compression;
-        use crate::r1cs_hashes::sha2::Compression as Sha2Compression;
         use std::array::from_fn;
+
+        use flock_core::test_rng::Rng;
+
+        use crate::r1cs_hashes::{
+            blake3::Compression as Blake3Compression, sha2::Compression as Sha2Compression,
+        };
 
         pub fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<Blake3Compression> {
             (0..n)

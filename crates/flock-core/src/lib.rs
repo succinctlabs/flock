@@ -17,27 +17,21 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
-use crate::field::F128;
-use rayon::ThreadPoolBuilder;
-use rayon::current_num_threads;
-use std::alloc::Layout;
-use std::alloc::alloc_zeroed;
-use std::alloc::handle_alloc_error;
-#[cfg(target_os = "linux")]
-use std::collections::HashSet;
-use std::env::var;
-#[cfg(target_os = "linux")]
-use std::fs::read_dir;
-#[cfg(target_os = "linux")]
-use std::fs::read_to_string;
-#[cfg(target_os = "macos")]
-use std::process::Command;
-#[cfg(target_os = "macos")]
-use std::str::from_utf8;
-use std::sync::OnceLock;
-use std::thread::available_parallelism;
+use std::{
+    alloc::{Layout, alloc_zeroed, handle_alloc_error},
+    env::var,
+    sync::OnceLock,
+    thread::available_parallelism,
+};
 
 pub use flock_parallel::all_core_pool;
+use rayon::{ThreadPoolBuilder, current_num_threads};
+#[cfg(target_os = "linux")]
+use {std::collections::HashSet, std::fs::read_dir, std::fs::read_to_string};
+#[cfg(target_os = "macos")]
+use {std::process::Command, std::str::from_utf8};
+
+use crate::field::F128;
 pub mod aggregate;
 pub mod bits;
 pub mod challenger;

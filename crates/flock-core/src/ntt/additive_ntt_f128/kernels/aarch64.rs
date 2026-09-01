@@ -1,5 +1,4 @@
-use crate::field::F128;
-use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+use crate::field::{F128, gf2_128::aarch64::ghash_mul_vec2_neon};
 
 /// Process two butterflies at a time within a block sharing one twiddle.
 ///

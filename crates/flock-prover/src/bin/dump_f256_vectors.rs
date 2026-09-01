@@ -12,16 +12,16 @@
 //!
 //! Run:  cargo run --release --bin dump_f256_vectors -- cuda-ghash/f256_vectors.bin
 
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+    iter::once,
+};
+
 use env::args;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-use std::iter::once;
-
-use flock_prover::field::{F128, F256, mul_by_x_inv};
-
 use flock_core::test_rng::Rng;
+use flock_prover::field::{F128, F256, mul_by_x_inv};
 
 fn w128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;

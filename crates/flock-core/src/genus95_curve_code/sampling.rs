@@ -1,16 +1,21 @@
-use super::artin_schreier::ArtinSchreierSolver;
-use super::constants::{BASE_Y_DEGREE, SAMPLE_X_POWER_COUNT};
-use super::evaluator::{EvaluationPoint, eval_poly_mask, x_powers, y_powers};
-use super::field::{F128, F128Ext};
-use super::rng::FsRng;
-#[cfg(test)]
-use super::tables::RationalMask;
-use super::tables::TABLES;
-use crate::challenger::has_leading_zero_bits;
 use blake3::Hasher;
 use flock_hash::HashKind;
 use rand_core::RngCore;
 use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+use crate::genus95_curve_code::tables::RationalMask;
+use crate::{
+    challenger::has_leading_zero_bits,
+    genus95_curve_code::{
+        artin_schreier::ArtinSchreierSolver,
+        constants::{BASE_Y_DEGREE, SAMPLE_X_POWER_COUNT},
+        evaluator::{EvaluationPoint, eval_poly_mask, x_powers, y_powers},
+        field::{F128, F128Ext},
+        rng::FsRng,
+        tables::TABLES,
+    },
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SampleError {

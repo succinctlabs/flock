@@ -30,27 +30,17 @@
 //!
 //! This variant is hardcoded for `k_skip = 6` (ell=64, n_chunks=8, N_INNER=7).
 
-use rayon::prelude::*;
-
 use std::sync::OnceLock;
 
-use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
-use crate::ntt::InvNttTableByteSingleGf8;
-
-use super::PaddingSpec;
-use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
-
-use self::kernels::{
-    accumulate_convert, accumulate_convert_with_s_hat_v,
-    bit_transpose_64bytes as kernel_bit_transpose_64bytes,
-    shift_reduce_inner_ab as kernel_shift_reduce_inner_ab,
-};
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 #[cfg(all(test, target_arch = "aarch64"))]
-use kernels::aarch64::{
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
+use {
+    crate::zerocheck::univariate_skip_optimized::kernels::aarch64::{
+        bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
+    },
+    crate::zerocheck::univariate_skip_optimized::kernels::bit_transpose_64bytes_scalar,
 };
-#[cfg(all(test, target_arch = "aarch64"))]
-use kernels::bit_transpose_64bytes_scalar;
+
 #[cfg(all(
     test,
     any(
@@ -58,7 +48,7 @@ use kernels::bit_transpose_64bytes_scalar;
         all(target_arch = "x86_64", target_feature = "gfni")
     )
 ))]
-use kernels::shift_reduce_inner_ab_scalar;
+use crate::zerocheck::univariate_skip_optimized::kernels::shift_reduce_inner_ab_scalar;
 #[cfg(all(
     test,
     target_arch = "x86_64",
@@ -66,9 +56,22 @@ use kernels::shift_reduce_inner_ab_scalar;
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
-use kernels::x86_64::shift_reduce_inner_ab_x86_avx512;
+use crate::zerocheck::univariate_skip_optimized::kernels::x86_64::shift_reduce_inner_ab_x86_avx512;
 #[cfg(all(test, target_arch = "x86_64", target_feature = "gfni"))]
-use kernels::x86_64::shift_reduce_inner_ab_x86_sse;
+use crate::zerocheck::univariate_skip_optimized::kernels::x86_64::shift_reduce_inner_ab_x86_sse;
+use crate::{
+    field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8},
+    ntt::InvNttTableByteSingleGf8,
+    zerocheck::{
+        PaddingSpec,
+        univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits},
+        univariate_skip_optimized::kernels::{
+            accumulate_convert, accumulate_convert_with_s_hat_v,
+            bit_transpose_64bytes as kernel_bit_transpose_64bytes,
+            shift_reduce_inner_ab as kernel_shift_reduce_inner_ab,
+        },
+    },
+};
 mod kernels;
 
 // ---------------------------------------------------------------------------
@@ -950,15 +953,41 @@ fn round1_shift_reduce_extract_c_packed_serial(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ntt::AdditiveNttGf8;
-    use crate::zerocheck::univariate_skip::round1_naive;
-    use crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash;
-
-    use crate::test_rng::Rng;
-    use crate::zerocheck::PaddingSpec;
-    use crate::zerocheck::univariate_skip::pack_bits;
-    use crate::zerocheck::univariate_skip::round1_extract_c_packed_with_s_hat_v;
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "gfni")
+    ))]
+    use crate::zerocheck::univariate_skip_optimized::shift_reduce_inner_ab_scalar;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    use crate::zerocheck::univariate_skip_optimized::shift_reduce_inner_ab_x86_avx512;
+    #[cfg(all(target_arch = "x86_64", target_feature = "gfni"))]
+    use crate::zerocheck::univariate_skip_optimized::shift_reduce_inner_ab_x86_sse;
+    #[cfg(target_arch = "aarch64")]
+    use crate::zerocheck::univariate_skip_optimized::{
+        bit_transpose_64bytes_neon, bit_transpose_64bytes_scalar, shift_reduce_inner_ab_fused_neon,
+        shift_reduce_inner_ab_neon,
+    };
+    use crate::{
+        ntt::AdditiveNttGf8,
+        test_rng::Rng,
+        zerocheck::{
+            PaddingSpec,
+            univariate_skip::{pack_bits, round1_extract_c_packed_with_s_hat_v, round1_naive},
+            univariate_skip_optimized::{
+                ELL, F8, F128, InvNttTableByteSingleGf8, K_SKIP, N_CHUNKS, N_INNER, PHI_8_TABLE,
+                SMALL_CHAL_F8, c_s_f128, convert_table, d_inv, medium_challenges_ghash, mul_by_x,
+                phi8, round1_shift_reduce_extract_c, round1_shift_reduce_extract_c_packed,
+                round1_shift_reduce_extract_c_packed_padded,
+                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v,
+                round1_shift_reduce_extract_c_packed_serial, small_challenges_ghash,
+            },
+        },
+    };
     /// **Soundness assumption.** Zerocheck and the Ligerito PCS opening at
     /// L0 both depend on the seven "friendly" constants — three small
     /// (`φ_8(SMALL_CHAL_F8[k])`, k ∈ 0..3) and four medium

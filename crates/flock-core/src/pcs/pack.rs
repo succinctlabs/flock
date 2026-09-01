@@ -21,7 +21,8 @@
 //! [DP24]: https://eprint.iacr.org/2024/504
 
 use core::slice::from_raw_parts;
-use rayon::prelude::*;
+
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 use crate::field::F128;
 
@@ -105,9 +106,10 @@ pub fn unpack_witness(packed: &[F128], m: usize) -> Vec<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        pcs::pack::{F128, LOG_PACKING, pack_witness, unpack_witness},
+        test_rng::Rng,
+    };
 
     #[test]
     fn pack_unpack_roundtrip() {

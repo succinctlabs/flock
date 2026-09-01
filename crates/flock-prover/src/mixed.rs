@@ -29,32 +29,37 @@
 //! new id byte. The id ↔ byte mapping below is explicit and stable — it is
 //! what [`crate::proof_io`] serializes.
 
-use flock_core::lincheck::LincheckCircuit;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::ligerito::embedded_initial_k_or_default;
-use flock_core::pcs::{Commitment, PcsParams};
-use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
-use flock_core::r1cs::BlockR1cs;
-use flock_core::schedule::{Registry, TableType};
-use flock_core::union::UnionInstance;
-use flock_core::verifier::{self, FlockVerifyError};
+use flock_core::{
+    lincheck::LincheckCircuit,
+    pcs::{
+        Commitment, PcsParams,
+        ligerito::{LigeritoProfile, embedded_initial_k_or_default},
+    },
+    proof::{R1csClaim, R1csProofMergedLigerito},
+    r1cs::BlockR1cs,
+    schedule::{Registry, TableType},
+    union::UnionInstance,
+    verifier::{self, FlockVerifyError},
+};
 use flock_transcript::challenger::Challenger;
 use prover::prove_fast_ligerito_union;
-use serde::Deserializer;
-use serde::Serializer;
-use serde::de::Error;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 use verifier::verify_ligerito_union;
 
-use crate::prover::{self, UnionSlotProverInput};
-use crate::r1cs_hashes::blake3::{
-    Compression as Blake3Compression, K_LOG as BLAKE3_K_LOG,
-    build_block_r1cs as build_blake3_block_r1cs,
-    generate_witness_batch_major_partial_into as generate_blake3_witness_batch_major_partial_into,
-};
-use crate::r1cs_hashes::sha2::{
-    Compression as Sha2Compression, K_LOG as SHA2_K_LOG, build_block_r1cs as build_sha2_block_r1cs,
-    generate_witness_batch_major_partial_into as generate_sha2_witness_batch_major_partial_into,
+use crate::{
+    prover::{self, UnionSlotProverInput},
+    r1cs_hashes::{
+        blake3::{
+            Compression as Blake3Compression, K_LOG as BLAKE3_K_LOG,
+            build_block_r1cs as build_blake3_block_r1cs,
+            generate_witness_batch_major_partial_into as generate_blake3_witness_batch_major_partial_into,
+        },
+        sha2::{
+            Compression as Sha2Compression, K_LOG as SHA2_K_LOG,
+            build_block_r1cs as build_sha2_block_r1cs,
+            generate_witness_batch_major_partial_into as generate_sha2_witness_batch_major_partial_into,
+        },
+    },
 };
 
 /// A built-in mixed registry tier. Serialized in the wire format as the
@@ -296,9 +301,9 @@ impl MixedSetup {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use bincode::deserialize;
-    use bincode::serialize;
+    use bincode::{deserialize, serialize};
+
+    use crate::mixed::{LigeritoProfile, MixedCounts, MixedRegistryId, MixedSetup, RegistryFamily};
 
     /// Tier table sanity: codes round-trip, capacities fit as documented,
     /// and `smallest_fitting` picks the smallest adequate tier.

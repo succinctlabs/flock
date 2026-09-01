@@ -8,18 +8,17 @@
 //!
 //! Run: `cargo bench --bench pcs_commit`
 
-use core::mem::size_of;
-use core::slice::from_raw_parts;
-use flock_prover::init_perf_thread_pool;
-use merkle::merkle_tree;
+use core::{mem::size_of, slice::from_raw_parts};
 use std::time::Instant;
 
-use flock_prover::field::F128;
-use flock_prover::merkle;
-use flock_prover::ntt::AdditiveNttF128;
-use flock_prover::pcs::{LOG_PACKING, PcsParams, commit, pack_witness};
-
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    init_perf_thread_pool, merkle,
+    ntt::AdditiveNttF128,
+    pcs::{LOG_PACKING, PcsParams, commit, pack_witness},
+};
+use merkle::merkle_tree;
 
 /// Site-specific draws kept verbatim from this file's former local `Rng`.
 trait RngExt {

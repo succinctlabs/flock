@@ -16,14 +16,17 @@
 //!
 //! Run: cargo run --release --quiet --bin dump_blake3_lincheck_matrices -- <out.bin>
 
-use env::args;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
 
-use flock_prover::r1cs::SparseBinaryMatrix;
-use flock_prover::r1cs_hashes::blake3::{K, USEFUL_BITS, build_matrices};
+use env::args;
+use flock_prover::{
+    r1cs::SparseBinaryMatrix,
+    r1cs_hashes::blake3::{K, USEFUL_BITS, build_matrices},
+};
 
 fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     let mut col_ptr = vec![0u32; m.num_cols + 1];

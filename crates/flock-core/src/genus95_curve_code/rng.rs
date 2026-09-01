@@ -5,8 +5,7 @@
 //! genus-95 tests — keeps the only cryptographic assumption SHA-256 (no separate
 //! stream-cipher RNG).
 
-use blake3::Hasher;
-use blake3::OutputReader;
+use blake3::{Hasher, OutputReader};
 use flock_hash::HashKind;
 use rand_core::RngCore;
 use sha2::{Digest, Sha256};

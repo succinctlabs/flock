@@ -10,25 +10,25 @@
 //! Run:   `cargo bench --bench field`
 //! On M-series, requires `.cargo/config.toml` so the `aes` feature is on.
 
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
-use flock_prover::init_perf_thread_pool;
-use std::hint::black_box;
-use std::time::Instant;
+use std::{hint::black_box, time::Instant};
 
-#[cfg(target_arch = "aarch64")]
-use flock_prover::field::gf2_8::neon::gf8_mul_vec16;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use flock_prover::field::gf2_128::aarch64::{
     ghash_mul_binius, ghash_mul_karatsuba, ghash_mul_karatsuba_barrett, ghash_mul_schoolbook,
 };
-use flock_prover::field::gf2_128::software::ghash_mul;
 #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
 use flock_prover::field::gf2_128::x86_64::{
     ghash_mul_binius, ghash_mul_karatsuba, ghash_mul_karatsuba_barrett, ghash_mul_schoolbook,
 };
-use flock_prover::field::mul_by_x;
-use flock_prover::field::{F8, F128, F256Unreduced};
+use flock_prover::{
+    field::{F8, F128, F256Unreduced, gf2_128::software::ghash_mul, mul_by_x},
+    init_perf_thread_pool,
+};
+#[cfg(target_arch = "aarch64")]
+use {
+    core::arch::aarch64::{veorq_u8, vld1q_u8, vst1q_u8},
+    flock_prover::field::gf2_8::neon::gf8_mul_vec16,
+};
 
 const N: usize = 100_000_000;
 

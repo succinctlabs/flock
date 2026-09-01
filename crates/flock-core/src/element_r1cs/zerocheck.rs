@@ -29,21 +29,26 @@
 //! - `ec = ẑ(r)`. Because `C = I` this is *directly* a witness evaluation, so it
 //!   leaves as a packed-direct claim with no lincheck term.
 
-use crate::fold_min_len;
-use crate::scratch::give_f128;
-use crate::scratch::take_f128;
-use crate::sumcheck_round_min_len;
-use crate::zerocheck::multilinear::fold_in_place_single;
-use rayon::current_num_threads;
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::mem::replace;
-use std::mem::take;
+use std::mem::{replace, take};
 
-use super::Grinding;
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::zerocheck::univariate_skip::SplitEqGhash;
+use rayon::{
+    current_num_threads,
+    prelude::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator,
+        ParallelIterator, ParallelSliceMut,
+    },
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    challenger::Challenger,
+    element_r1cs::Grinding,
+    field::F128,
+    fold_min_len,
+    scratch::{give_f128, take_f128},
+    sumcheck_round_min_len,
+    zerocheck::{multilinear::fold_in_place_single, univariate_skip::SplitEqGhash},
+};
 
 /// Domain label of the standalone single-table zerocheck. The union's
 /// element-region zerocheck runs the same protocol under its own label — see
@@ -887,15 +892,20 @@ fn fold_low_out(src: &[F128], rho: F128, min_len: usize) -> Vec<F128> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
-    use crate::element_r1cs::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
-    use crate::element_r1cs::{ElementTableType, broadcast_add};
-    use crate::test_rng::Rng;
-    use crate::zerocheck::multilinear::eq_eval;
-    use crate::zerocheck::multilinear::fold_in_place_single;
-    use flock_multilinear::IndexOrder;
-    use flock_multilinear::evaluate;
+    use flock_multilinear::{IndexOrder, evaluate};
+
+    use crate::{
+        challenger::FsChallenger,
+        element_r1cs::{
+            ElementTableType, broadcast_add,
+            tests::{mixed_gate, mixed_witness, mult_gate, mult_witness},
+            zerocheck::{
+                Challenger, ElementZerocheckError, F128, LABEL, Proof, fold_low, prove, verify,
+            },
+        },
+        test_rng::Rng,
+        zerocheck::multilinear::{eq_eval, fold_in_place_single},
+    };
 
     /// Direct MLE evaluation of `table` at `point`, binding the low variable
     /// first — the same order [`fold_low`] uses.

@@ -41,25 +41,33 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
-use crate::all_core_pool;
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-use core::arch::aarch64::*;
-use rayon::current_num_threads;
-use rayon::prelude::*;
-use std::env::var;
-use std::env::var_os;
-use std::mem::size_of_val;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::{
+    env::{var, var_os},
+    mem::size_of_val,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
-use crate::field::F128;
-
-use self::kernels::{
-    butterfly_fused_2layer, butterfly_fused_3layer, butterfly_fused_4layer_row, butterfly_row_pair,
+#[cfg(target_arch = "aarch64")]
+use rayon::prelude::{IntoParallelRefIterator, ParallelSlice};
+use rayon::{
+    current_num_threads,
+    prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut},
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-use self::kernels::{
-    butterfly_neon_block, butterfly_neon_block_pair, butterfly_neon_block_pair_chunk,
+use {
+    crate::ntt::additive_ntt_f128::kernels::{
+        butterfly_neon_block, butterfly_neon_block_pair, butterfly_neon_block_pair_chunk,
+    },
+    core::arch::aarch64::{vgetq_lane_u64, vmull_p64, vreinterpretq_u64_p128},
+};
+
+use crate::{
+    all_core_pool,
+    field::F128,
+    ntt::additive_ntt_f128::kernels::{
+        butterfly_fused_2layer, butterfly_fused_3layer, butterfly_fused_4layer_row,
+        butterfly_row_pair,
+    },
 };
 mod kernels;
 
@@ -1316,9 +1324,10 @@ fn ceil_log2(n: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        ntt::additive_ntt_f128::{AdditiveNttF128, F128},
+        test_rng::Rng,
+    };
 
     fn rand_vec(rng: &mut Rng, n: usize) -> Vec<F128> {
         (0..n).map(|_| rng.f128()).collect()

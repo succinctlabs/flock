@@ -13,8 +13,7 @@
 //! Off by default (a single cached-bool check per instrumented call), so A/B
 //! benches that exercise the old paths on purpose stay silent unless asked.
 
-use std::env::var_os;
-use std::sync::OnceLock;
+use std::{env::var_os, sync::OnceLock};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 

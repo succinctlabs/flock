@@ -14,40 +14,37 @@
 //! The codeword is a flat sequence of `2^k_code` F_{2^128} elements. Each
 //! Merkle leaf is **one** F_{2^128} element = 16 bytes.
 
-use crate::alloc_uninit_f128_vec;
-use crate::element_r1cs::Grinding;
-use crate::lincheck::LincheckGrinding;
-use crate::matrix_fold::FoldGrinding;
-use crate::pcs::OpeningGrinding;
-use crate::pcs::ligerito::LigeritoProfile;
-use crate::pcs::ligerito::ProverConfig;
-use crate::pcs::ligerito::VerifierConfig;
-use crate::pcs::ligerito::prover_config_for;
-use crate::pcs::ligerito::udr_queries;
-use crate::pcs::ligerito::verifier_config_for;
-use crate::pcs::stratified::LevelSchedule;
-use crate::product_gkr::BatchedGrinding;
-use crate::scratch::give_f128;
-use crate::scratch::take_f128;
-use crate::scratch::try_take_f128;
-use crate::zerocheck::ZerocheckGrinding;
-use core::mem::size_of;
-use core::slice::from_raw_parts;
-use merkle::cap_layer;
-use merkle::merkle_tree;
-use rayon::current_num_threads;
-use rayon::prelude::*;
-use std::env::var_os;
-use std::mem::take;
-use std::ptr::write_bytes;
-use std::thread::scope;
-use std::time::Instant;
+use core::{mem::size_of, slice::from_raw_parts};
+use std::{env::var_os, mem::take, ptr::write_bytes, thread::scope, time::Instant};
 
-use crate::field::F128;
-use crate::merkle::{self, Hash, HashKind};
-use crate::ntt::AdditiveNttF128;
-use crate::pcs::pack::LOG_PACKING;
+use merkle::{cap_layer, merkle_tree};
+use rayon::{
+    current_num_threads,
+    prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut},
+};
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    alloc_uninit_f128_vec,
+    element_r1cs::Grinding,
+    field::F128,
+    lincheck::LincheckGrinding,
+    matrix_fold::FoldGrinding,
+    merkle::{self, Hash, HashKind},
+    ntt::AdditiveNttF128,
+    pcs::{
+        OpeningGrinding,
+        ligerito::{
+            LigeritoProfile, ProverConfig, VerifierConfig, prover_config_for, udr_queries,
+            verifier_config_for,
+        },
+        pack::LOG_PACKING,
+        stratified::LevelSchedule,
+    },
+    product_gkr::BatchedGrinding,
+    scratch::{give_f128, take_f128, try_take_f128},
+    zerocheck::ZerocheckGrinding,
+};
 
 /// PCS configuration. Polynomial-basis subspace `{1, x, x², …}` for the NTT.
 ///
@@ -668,16 +665,24 @@ pub fn prefault_codeword_during<R>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::pack::pack_witness;
-    use super::*;
-    use crate::merkle::cap_layer;
-    use crate::merkle::merkle_tree;
-    use crate::scratch::take_f128;
     use core::slice::from_raw_parts;
 
-    use crate::ntt::AdditiveNttF128;
-    use crate::pcs::ligerito::LigeritoProfile;
-    use crate::test_rng::Rng;
+    use crate::{
+        merkle::{cap_layer, merkle_tree},
+        ntt::AdditiveNttF128,
+        pcs::{
+            commit::{
+                BatchedGrinding, F128, FoldGrinding, Grinding, HashKind, LOG_PACKING,
+                LincheckGrinding, OpeningGrinding, PcsParams, ZerocheckGrinding, commit,
+                commit_lane_major, dense_lanes, finalize_commit, lane_grid_from_lane_major,
+                replicate_lane_major_fill,
+            },
+            ligerito::LigeritoProfile,
+            pack::pack_witness,
+        },
+        scratch::take_f128,
+        test_rng::Rng,
+    };
 
     /// The Ligerito configs derived from `PcsParams` must carry the params'
     /// Merkle hash, not the embedded security config's `hash` field. If they

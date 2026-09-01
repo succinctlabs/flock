@@ -12,14 +12,15 @@
 //! through `prove_fold`/`verify_fold` with the folded claim discharging
 //! identically — the merge-node operation.
 
-use flock_core::challenger::FsChallenger;
-use flock_core::field::F128;
-use flock_core::matrix_fold::{
-    DenseMatrix, FoldMatrix, MatrixClaim, Weight, bilinear, prove_fold, verify_fold,
+use flock_core::{
+    challenger::FsChallenger,
+    field::F128,
+    matrix_fold::{
+        DenseMatrix, FoldMatrix, MatrixClaim, Weight, bilinear, prove_fold, verify_fold,
+    },
+    product_gkr::{build_s_sigma_vec, prove_batched, verify_batched},
+    test_rng::Rng,
 };
-use flock_core::product_gkr::{build_s_sigma_vec, prove_batched, verify_batched};
-
-use flock_core::test_rng::Rng;
 
 /// One trusting-verified GKR over a constant witness (every permutation is
 /// honest on a constant `f = g`, so sigma is unconstrained and exercises a

@@ -28,19 +28,21 @@
 //! Run:
 //!   cargo run --release --bin dump_blake3_witness_vectors -- cuda-ghash/blake3_witness_vectors.bin 24 5
 
-use env::args;
-use std::array::from_fn;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::F128;
-use flock_prover::r1cs_hashes::blake3::{
-    Compression, K_LOG, generate_witness_with_ab_packed_and_lincheck, min_n_blocks_log,
+use std::{
+    array::from_fn,
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
 };
 
+use env::args;
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    r1cs_hashes::blake3::{
+        Compression, K_LOG, generate_witness_with_ab_packed_and_lincheck, min_n_blocks_log,
+    },
+};
 
 fn write_f128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;

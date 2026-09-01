@@ -37,14 +37,14 @@
 //!
 //! [`FsChallenger`]: crate::challenger::FsChallenger
 
-use sha2::{Digest, Sha256};
-
-use crate::challenger::Challenger;
-use crate::challenger::{
-    KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE, OP_SQUEEZE,
-};
 use flock_field::F128;
 use flock_hash::HashKind;
+use sha2::{Digest, Sha256};
+
+use crate::challenger::{
+    Challenger, KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE,
+    OP_SQUEEZE,
+};
 
 /// One protocol-level transcript action, with values stripped.
 ///
@@ -965,10 +965,16 @@ impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
     use blake3::Hasher;
     use flock_hash::{BLAKE3_IV, blake3_compress};
+
+    use crate::{
+        challenger::FsChallenger,
+        transcript_record::{
+            Challenger, F128, HashKind, RecordingChallenger, StreamWord, TranscriptOp,
+            TranscriptShape,
+        },
+    };
 
     /// Drive a challenger through one op of every kind, returning the
     /// challenges it produced. Shared so the bare and decorated runs are

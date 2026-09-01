@@ -16,21 +16,25 @@
 //! Run:  cargo run --release --bin dump_ligerito_f256_vectors -- \
 //!         cuda-ghash/ligerito_f256_vectors.bin [m=22]
 
-use env::args;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::field::F128;
-use flock_prover::ntt::AdditiveNttF128;
-use flock_prover::pcs::LOG_PACKING;
-use flock_prover::pcs::ligerito::{
-    LigeritoProfile, ligero_commit, prover_config_for, recursive_prover_with_basis,
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
 };
 
+use env::args;
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    field::F128,
+    ntt::AdditiveNttF128,
+    pcs::{
+        LOG_PACKING,
+        ligerito::{
+            LigeritoProfile, ligero_commit, prover_config_for, recursive_prover_with_basis,
+        },
+    },
+};
 
 fn wf(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;

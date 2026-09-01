@@ -11,33 +11,28 @@
 //! schema words at columns >= 64, the wired circuit path, and the
 //! cross-class crossing. All small shapes — they run un-ignored.
 
-use flock_core::element_r1cs::ElementTableType;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use prover::prove_fast_ligerito_union_circuit;
-use prover::prove_fast_ligerito_union_mixed_class;
-use sha2::SHA256_IV;
-use sha2::build_block_r1cs;
-use sha2::generate_witness_batch_major_partial;
-use sha2::sha256_compress;
-use std::array::from_fn;
-use std::sync::Arc;
-use verifier::verify_ligerito_union_circuit;
-use verifier::verify_ligerito_union_mixed_class;
+use std::{array::from_fn, sync::Arc};
 
-use flock_core::circuit::{Cell, Circuit};
-use flock_core::element_r1cs::ElementTableBuilder;
-use flock_core::field::gf2_128::F128;
-use flock_core::schedule::IoWord;
-use flock_prover::challenger::FsChallenger;
-use flock_prover::pcs::PcsParams;
-use flock_prover::prover::{self, UnionElementSlotInput};
-use flock_prover::schedule::{Registry, TableType};
-use flock_prover::union::UnionInstance;
-use flock_prover::verifier;
-
-use flock_core::test_rng::Rng;
-use flock_prover::prover::UnionSlotProverInput;
-use flock_prover::r1cs_hashes::sha2;
+use flock_core::{
+    circuit::{Cell, Circuit},
+    element_r1cs::{ElementTableBuilder, ElementTableType},
+    field::gf2_128::F128,
+    pcs::ligerito::LigeritoProfile,
+    schedule::IoWord,
+    test_rng::Rng,
+};
+use flock_prover::{
+    challenger::FsChallenger,
+    pcs::PcsParams,
+    prover::{self, UnionElementSlotInput, UnionSlotProverInput},
+    r1cs_hashes::sha2,
+    schedule::{Registry, TableType},
+    union::UnionInstance,
+    verifier,
+};
+use prover::{prove_fast_ligerito_union_circuit, prove_fast_ligerito_union_mixed_class};
+use sha2::{SHA256_IV, build_block_r1cs, generate_witness_batch_major_partial, sha256_compress};
+use verifier::{verify_ligerito_union_circuit, verify_ligerito_union_mixed_class};
 const DOMAIN: &[u8] = b"flock-kappa7-probe";
 
 const EL_A: usize = 0;

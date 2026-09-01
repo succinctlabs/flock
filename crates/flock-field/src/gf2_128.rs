@@ -15,38 +15,33 @@
 //! (4 PMULL schoolbook + 2-stage recursive reduction, 2 extra PMULL), which
 //! benchmarked as the fastest of four variants tried.
 
+use core::ops::{Add, AddAssign, BitXor, BitXorAssign, Mul, MulAssign};
+
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "mul-count")]
+use {
+    crate::gf2_128::op_count::{INVS, MULS},
+    std::sync::atomic::Ordering,
+};
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-use self::aarch64::{
+use crate::gf2_128::aarch64::{
     ghash_mul_binius as ghash_mul_binius_aarch64,
     ghash_mul_unreduced_neon as ghash_mul_unreduced_aarch64, ghash_square as ghash_square_aarch64,
 };
-#[cfg(feature = "mul-count")]
-use self::op_count::{INVS, MULS};
 #[cfg(not(any(
     all(target_arch = "aarch64", target_feature = "aes"),
     all(target_arch = "x86_64", target_feature = "pclmulqdq")
 )))]
-use self::software::{
+use crate::gf2_128::software::{
     ghash_mul as ghash_mul_software, ghash_mul_unreduced as ghash_mul_unreduced_software,
     ghash_square as ghash_square_software,
 };
 #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
-use self::x86_64::{
+use crate::gf2_128::x86_64::{
     ghash_mul_karatsuba_barrett as ghash_mul_x86_64,
     ghash_mul_unreduced_x86 as ghash_mul_unreduced_x86_64, ghash_square_x86 as ghash_square_x86_64,
 };
-#[cfg(all(
-    test,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-use core::arch::x86_64::*;
-use core::ops::{Add, AddAssign, BitXor, BitXorAssign, Mul, MulAssign};
-#[cfg(feature = "mul-count")]
-use std::sync::atomic::Ordering;
-
-use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(C, align(16))]
@@ -397,33 +392,40 @@ fn ghash_square(a: F128) -> F128 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    use core::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
+
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    use super::aarch64::{
+    use crate::gf2_128::aarch64::{
         ghash_mul_binius as ghash_mul_binius_aarch64,
         ghash_mul_karatsuba as ghash_mul_karatsuba_aarch64,
         ghash_mul_karatsuba_barrett as ghash_mul_karatsuba_barrett_aarch64,
         ghash_mul_schoolbook as ghash_mul_schoolbook_aarch64, ghash_mul_vec2_neon,
     };
     #[cfg(feature = "mul-count")]
-    use super::op_count::{MULS_PER_INV, measure};
-    use super::software::ghash_mul as ghash_mul_software;
+    use crate::gf2_128::op_count::{MULS_PER_INV, measure};
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    use super::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
+    use crate::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
     #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
-    use super::x86_64::{
+    use crate::gf2_128::x86_64::{
         ghash_mul_binius as ghash_mul_binius_x86_64,
         ghash_mul_karatsuba as ghash_mul_karatsuba_x86_64,
         ghash_mul_karatsuba_barrett as ghash_mul_karatsuba_barrett_x86_64,
         ghash_mul_schoolbook as ghash_mul_schoolbook_x86_64,
         ghash_mul_unreduced_x86 as ghash_mul_unreduced_x86_64,
     };
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        gf2_128::{F128, F256Unreduced, mul_by_x, software::ghash_mul as ghash_mul_software},
+        test_rng::Rng,
+    };
 
     #[test]
     fn add_identities() {

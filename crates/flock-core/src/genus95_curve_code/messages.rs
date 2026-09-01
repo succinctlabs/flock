@@ -1,7 +1,8 @@
-use super::constants::{PRODUCT_LIMBS, PRODUCT_MESSAGE_BITS};
+use std::ops::{BitXor, BitXorAssign};
+
 use rand_core::RngCore;
-use std::ops::BitXor;
-use std::ops::BitXorAssign;
+
+use crate::genus95_curve_code::constants::{PRODUCT_LIMBS, PRODUCT_MESSAGE_BITS};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BaseMessage(pub u64);

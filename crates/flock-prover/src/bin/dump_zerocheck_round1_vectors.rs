@@ -2,22 +2,26 @@
 //!
 //! The canonical CUDA round-one test uses this output.
 
-use env::args;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::{F8, F128};
-use flock_prover::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
-use flock_prover::zerocheck::PaddingSpec;
-use flock_prover::zerocheck::univariate_skip::{pack_bits, round1_naive};
-use flock_prover::zerocheck::univariate_skip_optimized::{
-    c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
-    small_challenges_ghash,
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
 };
 
+use env::args;
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::{F8, F128},
+    ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8},
+    zerocheck::{
+        PaddingSpec,
+        univariate_skip::{pack_bits, round1_naive},
+        univariate_skip_optimized::{
+            c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
+            small_challenges_ghash,
+        },
+    },
+};
 const K_SKIP: usize = 6;
 const N_INNER: usize = 7;
 

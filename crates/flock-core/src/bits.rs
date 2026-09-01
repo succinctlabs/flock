@@ -58,8 +58,9 @@ pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::array::from_fn;
+
+    use crate::bits::{lowest_one, transpose_8_u64s_to_64_bytes, transpose_8x8_bits};
 
     /// [`lowest_one`] against an independent `trailing_zeros` reference. Not
     /// against `usize::isolate_lowest_one`: the whole point of the helper is

@@ -1,12 +1,15 @@
-use super::portable::butterfly_fused_4layer;
-use super::portable::{
-    butterfly_fused_2layer as butterfly_fused_2layer_portable,
-    butterfly_row_pair as butterfly_row_pair_portable,
+use core::arch::x86_64::{
+    __m512i, _mm_set_epi64x, _mm512_broadcast_i32x4, _mm512_loadu_si512, _mm512_setzero_si512,
+    _mm512_storeu_si512, _mm512_xor_si512,
 };
-use core::arch::x86_64::*;
 
-use crate::field::F128;
-use crate::field::gf2_128::x86_64::ghash_mul_x4;
+use crate::{
+    field::{F128, gf2_128::x86_64::ghash_mul_x4},
+    ntt::additive_ntt_f128::kernels::portable::{
+        butterfly_fused_2layer as butterfly_fused_2layer_portable, butterfly_fused_4layer,
+        butterfly_row_pair as butterfly_row_pair_portable,
+    },
+};
 
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {

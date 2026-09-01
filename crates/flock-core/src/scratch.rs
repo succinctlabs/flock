@@ -17,17 +17,15 @@
 //! the m = 29 prove set). Call [`clear`] to release everything to the OS,
 //! e.g. after the last prove of a batch.
 
-use crate::alloc_uninit_vec;
-use crate::alloc_zeroed_vec;
-use core::mem::size_of;
-use core::ops::Range;
-use rayon::prelude::*;
-use std::env::var_os;
-use std::mem::ManuallyDrop;
-use std::ptr::write_bytes;
+use core::{mem::size_of, ops::Range};
+use std::{env::var_os, mem::ManuallyDrop, ptr::write_bytes, sync::Mutex};
 
-use crate::field::{F128, F256};
-use std::sync::Mutex;
+use rayon::prelude::{IntoParallelRefMutIterator, ParallelIterator, ParallelSliceMut};
+
+use crate::{
+    alloc_uninit_vec, alloc_zeroed_vec,
+    field::{F128, F256},
+};
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 
@@ -434,7 +432,9 @@ pub fn clear() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::scratch::{
+        F128, MAX_POOLED, POOL, clear, give_f128, give_zeroed_f128, take_f128, take_zeroed_f128,
+    };
 
     #[test]
     fn take_reuses_given_buffer() {

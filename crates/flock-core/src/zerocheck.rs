@@ -15,31 +15,32 @@
 //! is tested on honest witnesses; verify also rejects byte-mutated proofs and
 //! shape-corrupted ones.
 
-use crate::challenger::Challenger;
-use crate::field::{F8, F128};
-use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
-use crate::scratch::give_f128;
-use crate::scratch::take_f128;
-use crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v;
-use ag_skip::R1_POW_BITS;
-use multilinear::expand_to_dense;
-use multilinear::uni_skip_fold_and_round_pair_runs_sparse;
-use serde::{Deserialize, Serialize};
-use std::env::var;
-use std::env::var_os;
-use std::mem::replace;
-use std::mem::swap;
-use std::sync::OnceLock;
-use std::time::Instant;
-
-use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_and_round_pair_sparse_into,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_optimized_packed_padded,
+use std::{
+    env::{var, var_os},
+    mem::{replace, swap},
+    sync::OnceLock,
+    time::Instant,
 };
+
+use ag_skip::R1_POW_BITS;
+use multilinear::{
+    UniSkipFoldTable, expand_to_dense, fold_and_compute_round_pair_into,
+    fold_and_round_pair_sparse_into, fold_in_place_pair, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round_pair_naive,
+    uni_skip_fold_and_round_pair_optimized_packed_padded, uni_skip_fold_and_round_pair_runs_sparse,
+};
+use serde::{Deserialize, Serialize};
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
     small_challenges_ghash,
+};
+
+use crate::{
+    challenger::Challenger,
+    field::{F8, F128},
+    ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8},
+    scratch::{give_f128, take_f128},
+    zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v,
 };
 // The AG-skip prover half (round-1 kernel drivers, friendly-Horner tail,
 // r1 nonce grind) is only reachable from aarch64-gated entry points; the
@@ -1227,13 +1228,19 @@ pub fn verify_with_grinding<C: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
     use std::iter::repeat_n;
 
-    use crate::test_rng::Rng;
-    use crate::transcript_record::{RecordingChallenger, TranscriptOp};
-    use univariate_skip::pack_bits;
+    use crate::{
+        challenger::FsChallenger,
+        test_rng::Rng,
+        transcript_record::{RecordingChallenger, TranscriptOp},
+        zerocheck::{
+            BlockCoverage, Challenger, F128, K_SKIP, PaddingRun, PaddingSpec, ZerocheckError,
+            ZerocheckGrinding, ZerocheckProof, cleanse_block, prove_packed, prove_packed_padded,
+            prove_packed_padded_capture_s_hat_v_c, prove_packed_with_grinding,
+            univariate_skip::pack_bits, verify, verify_with_grinding,
+        },
+    };
 
     /// Pack three Boolean vectors into the (a_packed, b_packed, c_packed)
     /// shape that `prove_packed` consumes.

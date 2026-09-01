@@ -41,35 +41,28 @@
 //! So a leaf over two proofs folds `2 → 1`, and a `2 → 1` merge of two
 //! recursive proofs folds `4 → 1` (two inherited, two fresh).
 
-use crate::circuit::Circuit;
-use crate::circuit::SigmaAssertion;
-use crate::element_r1cs::SparseF128Matrix;
-use crate::element_r1cs::union::ElementUnionError;
-use crate::lincheck::LincheckCircuit;
-use crate::matrix_fold::bilinear;
-use crate::pcs::jagged::JaggedParams;
-use crate::union::UnionInstance;
-use matrix_fold::FoldError;
-use matrix_fold::FoldGrinding;
-use matrix_fold::FoldMatrix;
-use matrix_fold::JaggedAssertion;
-use matrix_fold::JaggedClaim;
-use matrix_fold::JaggedTable;
-use matrix_fold::col_marginal;
-use matrix_fold::discharge_jagged;
-use matrix_fold::prove_fold_jagged_with_grinding;
-use matrix_fold::prove_fold_with_grinding;
-use matrix_fold::verify_fold_jagged_with_grinding;
-use matrix_fold::verify_fold_with_grinding;
+use matrix_fold::{
+    FoldError, FoldGrinding, FoldMatrix, JaggedAssertion, JaggedClaim, JaggedTable, col_marginal,
+    discharge_jagged, prove_fold_jagged_with_grinding, prove_fold_with_grinding,
+    verify_fold_jagged_with_grinding, verify_fold_with_grinding,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::challenger::Challenger;
-use crate::element_r1cs::union::ElementAssertion;
-use crate::field::F128;
-use crate::lincheck::{LincheckError, MatrixAssertion};
-use crate::matrix_fold::{self, FoldProof, MatrixClaim};
-use crate::r1cs::SparseBinaryMatrix;
-use crate::schedule::Registry;
+use crate::{
+    challenger::Challenger,
+    circuit::{Circuit, SigmaAssertion},
+    element_r1cs::{
+        SparseF128Matrix,
+        union::{ElementAssertion, ElementUnionError},
+    },
+    field::F128,
+    lincheck::{LincheckCircuit, LincheckError, MatrixAssertion},
+    matrix_fold::{self, FoldProof, MatrixClaim, bilinear},
+    pcs::jagged::JaggedParams,
+    r1cs::SparseBinaryMatrix,
+    schedule::Registry,
+    union::UnionInstance,
+};
 
 const DOMAIN: &[u8] = b"flock-aggregate-v0";
 

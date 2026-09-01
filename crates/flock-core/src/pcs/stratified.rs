@@ -238,10 +238,13 @@ pub fn validate_schedules(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::merkle::cap_depth;
-    use crate::pcs::ligerito::default_config;
-    use crate::pcs::ligerito::default_verifier_config;
+    use crate::{
+        merkle::cap_depth,
+        pcs::{
+            ligerito::{default_config, default_verifier_config},
+            stratified::{LevelSchedule, level_block_logs, schedules, validate_schedules},
+        },
+    };
 
     #[test]
     fn decompose_is_binary_representation() {

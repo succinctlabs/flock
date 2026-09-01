@@ -19,19 +19,20 @@
 //! L0 folds blocks). Knobs: `MICRO_RUNS` (default 7 per arm), `MICRO_M` /
 //! `MICRO_K` / `MICRO_LANES` for the other shipped shapes — the envelope
 //! outer is `MICRO_M=29 MICRO_K=5 MICRO_LANES=24`.
+use std::{env::var, sync::atomic::Ordering, time::Instant};
+
 use bincode::serialize;
-use flock_core::challenger::FsChallenger;
-use flock_core::field::F128;
-use flock_core::merkle::HashKind;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::{
-    DirectEqInd, OpeningGrinding, PackedDirectClaim, PcsParams, VIRTUAL_B_OVERRIDE,
-    commit_lane_major, open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding,
+use flock_core::{
+    challenger::FsChallenger,
+    field::F128,
+    merkle::HashKind,
+    pcs::{
+        DirectEqInd, OpeningGrinding, PackedDirectClaim, PcsParams, VIRTUAL_B_OVERRIDE,
+        commit_lane_major, ligerito::LigeritoProfile,
+        open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding,
+    },
+    zerocheck::PaddingSpec,
 };
-use flock_core::zerocheck::PaddingSpec;
-use std::env::var;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 const DOMAIN: &[u8] = b"flock-virtual-b-microbench";
 

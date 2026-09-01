@@ -1,6 +1,12 @@
-use super::{F128, F256Unreduced, ghash_reduce};
-use core::arch::aarch64::*;
-use core::mem::transmute;
+use core::{
+    arch::aarch64::{
+        uint64x2_t, vdupq_n_u64, veorq_u64, vextq_u64, vgetq_lane_u64, vmull_p64, vshlq_n_u64,
+        vshrq_n_u64, vzip1q_u64, vzip2q_u64,
+    },
+    mem::transmute,
+};
+
+use crate::gf2_128::{F128, F256Unreduced, ghash_reduce};
 
 /// 64×64 carry-less product, returned as a 128-bit vector.
 ///

@@ -10,19 +10,34 @@
 //! `u^b B(x)`. Consequently each recursive level spends one fold round on the
 //! coordinate bit and removes only `k - 1` variables from the extension table.
 
-use super::*;
-use crate::pcs::ring_switch::build_eq_scaled_parallel;
-use crate::scratch::give_f256;
-use crate::scratch::take_f256;
-use flock_multilinear::IndexOrder;
-use flock_multilinear::eq_table;
-use merkle::cap_layer;
-use std::env::var;
-use std::env::var_os;
-use std::mem::replace;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-use std::time::Instant;
+use std::{
+    env::{var, var_os},
+    mem::replace,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
+
+use flock_multilinear::{IndexOrder, eq_table};
+
+use crate::{
+    merkle::cap_layer,
+    pcs::{
+        ligerito::{
+            AdditiveNttF128, BasisWindowFn, Challenger, F128, F256, FOLD_LOOKAHEAD_OVERRIDE,
+            FinalProof, FoldLookahead, Hash, IndexedParallelIterator, IntoParallelIterator,
+            IntoParallelRefIterator, IntoParallelRefMutIterator, LigeritoProof, ParallelIterator,
+            ParallelSliceMut, ProverConfig, RecursiveProof, SumcheckMessage, SumcheckMessage256,
+            VerifierConfig, VirtualEqBasis, VirtualEqTerm, build_eq_table, ceil_log2,
+            eval_sk_at_vks, grind_and_sample_queries, induce_sumcheck_poly_auto, ligero_commit,
+            merkle_paths_for, next_s, round_msg_and_eval_blocked,
+            round_msg_and_eval_eq_point_blocked, round_msg_eval_and_lookahead,
+            round_msg_eval_and_lookahead_eq_point_blocked, verify_and_sample_queries,
+            verify_level_opens,
+        },
+        ring_switch::build_eq_scaled_parallel,
+    },
+    scratch::{give_f256, take_f256},
+};
 
 /// Split extension values into the base-field table `g(b, x)`, with adjacent
 /// `(b=0, b=1)` values for every `x`.
@@ -2913,8 +2928,16 @@ pub(super) fn induce_enforced_sum(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::{Challenger, RandomChallenger};
+    use crate::{
+        challenger::{Challenger, RandomChallenger},
+        pcs::ligerito::extension::{
+            F128, F256, VirtualEqBasis, VirtualEqBasis256, build_eq_table, build_eq_table256,
+            fold_base, fold_extension, fused_first_fold_virtual, fused_fold_applies,
+            fused_fold_msg_base, fused_fold_msg_ext, fused_fold_msg_fbase, induce_enforced_sum,
+            next_round_msg, round_msg, round_msg_fbase, split_basis, split_coordinates,
+            split_inner_product,
+        },
+    };
 
     fn random_f256(challenger: &mut RandomChallenger) -> F256 {
         F256::new(challenger.sample_f128(), challenger.sample_f128())

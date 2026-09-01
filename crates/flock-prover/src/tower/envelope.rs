@@ -1,8 +1,17 @@
-use super::*;
+use std::{
+    env::var,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
 use flock_core::circuit::builder::SlotId;
-use std::env::var;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+
+use crate::tower::{
+    AssistLayerGate, BitSpreadGate, BitSpreadTable, Blake3Gate, CollapsedSlots, F128,
+    FamilyTransposeTileGate, GateType, LeafEvalGate, LeafEvalGate256, MacGate, MacGate256,
+    MergedRoundGate, PowMaskGate, PrefixGate, PrefixGate256, ResidualAccGate256,
+    ResidualPrefix3Gate256, ResidualWeightsGate256, SLOT_WORDS, ShapeBuilder, SpineGate,
+    SpineGate256, SwapGate, UnionInstance, Wire, ZcRoundGate, cw,
+};
 
 /// Wall 2's registry-geometry constants at the settled envelope (slim,
 /// m* = 29): the UNION of the leaf-outer's and the node's type sets, at the

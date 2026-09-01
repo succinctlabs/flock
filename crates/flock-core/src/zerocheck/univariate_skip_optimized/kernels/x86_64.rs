@@ -1,10 +1,15 @@
-use core::arch::x86_64::*;
+use core::arch::x86_64::{
+    __m128i, __m512i, _mm_gf2p8mul_epi8, _mm_loadu_si128, _mm_set1_epi8, _mm_setzero_si128,
+    _mm_storeu_si128, _mm_xor_si128, _mm512_and_si512, _mm512_gf2p8mul_epi8, _mm512_loadu_si512,
+    _mm512_permutexvar_epi8, _mm512_set1_epi8, _mm512_set1_epi64, _mm512_setzero_si512,
+    _mm512_slli_epi64, _mm512_srli_epi64, _mm512_storeu_si512, _mm512_xor_si512,
+};
 
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-use super::super::{ELL, F128, N_MEDIUM};
-#[cfg(target_feature = "gfni")]
-use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
 use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+use crate::zerocheck::univariate_skip_optimized::{ELL, F128, N_MEDIUM};
+#[cfg(target_feature = "gfni")]
+use crate::zerocheck::univariate_skip_optimized::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
 
 /// AVX-512 (VBMI) 64-byte bit-transpose — direct port of the NEON two-stage
 /// algorithm. `_mm512_permutexvar_epi8` does the byte-gather (NEON `vqtbl4q`)

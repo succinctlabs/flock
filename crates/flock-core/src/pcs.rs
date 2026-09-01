@@ -19,75 +19,59 @@
 //! See [DP24](https://eprint.iacr.org/2024/504) (ring-switching) and the
 //! ligerito module docs for the recursion.
 
-use crate::all_core_pool;
-use crate::challenger::Challenger;
-use crate::ecore_rich_topology;
-#[cfg(feature = "mul-count")]
-use crate::field::gf2_128::op_count::MULS_PER_INV;
-#[cfg(feature = "mul-count")]
-use crate::field::gf2_128::op_count::snapshot;
-use crate::field::{F128, F256, F256Unreduced};
-use crate::lincheck::SkipPoint;
-use crate::lincheck::build_eq_table;
-use crate::matrix_fold::JaggedAssertion;
-use crate::matrix_fold::{JaggedClaim, JaggedRowWeight, JaggedTable};
-use crate::merkle::cap_layer;
-use crate::pcs::tensor_algebra::TensorAlgebra256;
-use crate::scratch::give_f128;
-use crate::scratch::take_f128;
-use crate::zerocheck::PaddingSpec;
+use std::{
+    env::{var, var_os},
+    mem::swap,
+    sync::atomic::{AtomicU8, Ordering},
+    time::Instant,
+};
+
 pub use commit::{
     Commitment, PcsParams, ProverData, commit, commit_into, commit_lane_major, dense_lanes,
     prefault_codeword_during,
 };
-use jagged::FrobeniusClaim;
-use jagged::JaggedParams;
-use jagged::MergedWeightClaim;
-use jagged::MultipointDefer;
-use jagged::MultipointGrinding;
-use jagged::MultipointTwistedProof;
-use jagged::ScalarGroupClaim;
-use jagged::build_merged_weight_and_prime;
-use jagged::fold_and_round_oop_par;
-use jagged::fold_oop_par;
-use jagged::fold_round_claim;
-use jagged::prove_multipoint_twisted_with_grinding;
-use jagged::verify_multipoint_twisted_deferred_with_grinding;
-use jagged::verify_multipoint_twisted_with_grinding;
-use ligerito::BasisWindowFn;
-use ligerito::FoldLookahead;
-use ligerito::LigeritoProof;
-use ligerito::ProverConfig;
-use ligerito::VerifierConfig;
-use ligerito::VirtualEqBasis;
-use ligerito::extension::recursive_verifier_with_basis_succinct;
-use ligerito::lookahead_accum_group;
-use ligerito::lookahead_finish;
-use ligerito::recursive_prover_with_basis_precomputed_round0_lanes;
-use ligerito::xor_acc8;
+use jagged::{
+    FrobeniusClaim, JaggedParams, MergedWeightClaim, MultipointDefer, MultipointGrinding,
+    MultipointTwistedProof, ScalarGroupClaim, build_merged_weight_and_prime,
+    fold_and_round_oop_par, fold_oop_par, fold_round_claim, prove_multipoint_twisted_with_grinding,
+    verify_multipoint_twisted_deferred_with_grinding, verify_multipoint_twisted_with_grinding,
+};
+use ligerito::{
+    BasisWindowFn, FoldLookahead, LigeritoProof, ProverConfig, VerifierConfig, VirtualEqBasis,
+    extension::recursive_verifier_with_basis_succinct, lookahead_accum_group, lookahead_finish,
+    recursive_prover_with_basis_precomputed_round0_lanes, xor_acc8,
+};
 pub use pack::{LOG_PACKING, pack_witness};
-use rayon::current_num_threads;
-use rayon::join;
-use rayon::prelude::*;
-use ring_switch::RingSwitchError;
-use ring_switch::RsEqInd;
-use ring_switch::build_eq_scaled_parallel;
-use ring_switch::build_fold_byte_table;
-use ring_switch::eval_rs_eq_finish_from_prefix_binary_q_f256;
-use ring_switch::eval_rs_eq_prefix_f256;
-use ring_switch::fold_b128_from_table;
-use ring_switch::fold_one_slot;
-use ring_switch::linearized_coefficients;
-use ring_switch::prove_batched_padded_with_precomputed_unbatched_and_grinding;
-use ring_switch::verify_succinct_with_grinding;
+use rayon::{
+    current_num_threads, join,
+    prelude::{
+        IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSlice,
+        ParallelSliceMut,
+    },
+};
+use ring_switch::{
+    RingSwitchError, RsEqInd, build_eq_scaled_parallel, build_fold_byte_table,
+    eval_rs_eq_finish_from_prefix_binary_q_f256, eval_rs_eq_prefix_f256, fold_b128_from_table,
+    fold_one_slot, linearized_coefficients,
+    prove_batched_padded_with_precomputed_unbatched_and_grinding, verify_succinct_with_grinding,
+};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 use serde::{Deserialize, Serialize};
-use std::env::var;
-use std::env::var_os;
-use std::mem::swap;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+#[cfg(feature = "mul-count")]
+use {crate::field::gf2_128::op_count::MULS_PER_INV, crate::field::gf2_128::op_count::snapshot};
+
+use crate::{
+    all_core_pool,
+    challenger::Challenger,
+    ecore_rich_topology,
+    field::{F128, F256, F256Unreduced},
+    lincheck::{SkipPoint, build_eq_table},
+    matrix_fold::{JaggedAssertion, JaggedClaim, JaggedRowWeight, JaggedTable},
+    merkle::cap_layer,
+    pcs::tensor_algebra::TensorAlgebra256,
+    scratch::{give_f128, take_f128},
+    zerocheck::PaddingSpec,
+};
 pub mod commit;
 pub mod jagged;
 pub mod ligerito;
@@ -2342,15 +2326,18 @@ fn verify_batch_merged_core<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
-    use crate::pcs::ligerito::LigeritoProfile;
-    use crate::pcs::ligerito::prover_config_for;
-    use crate::pcs::ligerito::verifier_config_for;
-    use crate::zerocheck::multilinear::lagrange_weights_naive;
-    use crate::zerocheck::univariate_skip::build_eq;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        challenger::FsChallenger,
+        pcs::{
+            F128, LOG_PACKING, OpeningGrinding, PaddingSpec, PcsError, PcsParams, RingSwitchError,
+            commit,
+            ligerito::{LigeritoProfile, prover_config_for, verifier_config_for},
+            open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding, pack_witness,
+            verify_opening_batch_ligerito_mixed_with_grinding,
+        },
+        test_rng::Rng,
+        zerocheck::{multilinear::lagrange_weights_naive, univariate_skip::build_eq},
+    };
 
     fn zhat_skip_reference(z: &[bool], m: usize, z_skip: F128, x_outer: &[F128]) -> F128 {
         const K_SKIP: usize = 6;

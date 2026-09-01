@@ -17,15 +17,15 @@
 //!
 //! Run: `cargo bench --bench blake3_native_chain`
 
+use std::{hint::black_box, time::Instant};
+
 use blake3::hash;
-use flock_prover::init_perf_thread_pool;
-use rayon::current_num_threads;
-use std::hint::black_box;
-use std::time::Instant;
-
-use rayon::prelude::*;
-
 use flock_core::test_rng::Rng;
+use flock_prover::init_perf_thread_pool;
+use rayon::{
+    current_num_threads,
+    prelude::{IntoParallelRefIterator, ParallelIterator},
+};
 
 /// Compute H^T(x) where H = BLAKE3 (32-byte output) and `x` is a 32-byte input.
 /// The chain has a strict data dependency — no parallelism inside.

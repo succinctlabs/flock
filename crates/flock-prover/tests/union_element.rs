@@ -27,49 +27,39 @@
 //! are the closure of the standalone milestone's dummy-row gap, so each is
 //! checked in the profile where it is observable.
 
-use bincode::deserialize;
-use bincode::serialize;
-use blake3::Compression;
-use blake3::build_block_r1cs;
-use blake3::generate_witness_batch_major_partial;
-use el::prove;
-use el::verify;
-use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
-use flock_core::field::F128;
-use flock_core::merkle::HashKind;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::ligerito::embedded_initial_k_or_default;
-use flock_core::proof::R1csProofMixedClassMerged;
-use flock_core::proof::UnionClassClaims;
-use flock_core::r1cs::BlockR1cs;
-use flock_core::schedule::TableClass;
-use flock_prover::challenger::Challenger as _;
-use flock_prover::challenger::FsChallenger;
-use flock_prover::pcs::Commitment;
-use flock_prover::pcs::PcsParams;
-use flock_prover::prover::{self, UnionElementSlotInput, UnionSlotProverInput};
-use flock_prover::r1cs_hashes::blake3;
-use flock_prover::r1cs_hashes::blake3::USEFUL_BITS;
-use flock_prover::schedule::{Registry, TableType};
-use flock_prover::union::UnionInstance;
-use flock_prover::verifier;
-use prover::prove_fast_ligerito_union;
-use prover::prove_fast_ligerito_union_mixed_class;
-use sha2_hash::Sha256;
-use std::array::from_fn;
-use std::env::var_os;
-use std::panic::AssertUnwindSafe;
-use std::panic::catch_unwind;
-use std::panic::set_hook;
-use std::panic::take_hook;
-use std::sync::Arc;
-use verifier::FlockVerifyError;
-use verifier::verify_ligerito_union_mixed_class;
+use std::{
+    array::from_fn,
+    env::var_os,
+    panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook},
+    sync::Arc,
+};
 
-use flock_core::element_r1cs::{self as el, ElementStatement};
-use flock_core::test_rng::Rng;
+use bincode::{deserialize, serialize};
+use blake3::{Compression, build_block_r1cs, generate_witness_batch_major_partial};
+use el::{prove, verify};
+use flock_core::{
+    element_r1cs::{self as el, ElementStatement, ElementTableBuilder, ElementTableType},
+    field::F128,
+    merkle::HashKind,
+    pcs::ligerito::{LigeritoProfile, embedded_initial_k_or_default},
+    proof::{R1csProofMixedClassMerged, UnionClassClaims},
+    r1cs::BlockR1cs,
+    schedule::TableClass,
+    test_rng::Rng,
+};
+use flock_prover::{
+    challenger::{Challenger as _, FsChallenger},
+    pcs::{Commitment, PcsParams},
+    prover::{self, UnionElementSlotInput, UnionSlotProverInput},
+    r1cs_hashes::{blake3, blake3::USEFUL_BITS},
+    schedule::{Registry, TableType},
+    union::UnionInstance,
+    verifier,
+};
+use prover::{prove_fast_ligerito_union, prove_fast_ligerito_union_mixed_class};
 use sha2 as sha2_hash;
-use sha2_hash::Digest as _;
+use sha2_hash::{Digest as _, Sha256};
+use verifier::{FlockVerifyError, verify_ligerito_union_mixed_class};
 const DOMAIN: &[u8] = b"flock-union-element-v0";
 
 // ---------------------------------------------------------------------------

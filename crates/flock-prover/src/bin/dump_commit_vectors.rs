@@ -32,17 +32,19 @@
 //!   cargo run --release --bin dump_commit_vectors -- cuda-ghash/commit_vectors.bin
 //!   cargo run --release --bin dump_commit_vectors -- out.bin 24 1 5
 
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
+
 use env::args;
-use flock_prover::merkle::cap_layer;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_hash::HashKind;
-use flock_prover::pcs::{PcsParams, commit, pack_witness};
-
 use flock_core::test_rng::Rng;
+use flock_hash::HashKind;
+use flock_prover::{
+    merkle::cap_layer,
+    pcs::{PcsParams, commit, pack_witness},
+};
 
 /// Site-specific draws kept verbatim from this file's former local `Rng`.
 trait RngExt {

@@ -2,22 +2,25 @@
 //! modules (`sha2`, `blake3`). The shared `prove_fast`
 //! orchestration lives in [`crate::prover::prove_fast_ligerito_union`].
 
-use flock_core::scratch::take_f128;
-use flock_core::scratch::take_u8;
-use rayon::prelude::*;
-use std::array::from_fn;
 #[cfg(not(target_arch = "aarch64"))]
 use std::ptr::copy_nonoverlapping;
-use std::ptr::write_bytes;
-use std::slice::from_raw_parts;
-use std::slice::from_raw_parts_mut;
+use std::{
+    array::from_fn,
+    ptr::write_bytes,
+    slice::{from_raw_parts, from_raw_parts_mut},
+    sync::OnceLock,
+};
 
-use std::sync::OnceLock;
-
-use flock_core::bits::transpose_8_u64s_to_64_bytes;
-use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
-use flock_core::union::SlotWitnessDest;
+use flock_core::{
+    bits::transpose_8_u64s_to_64_bytes,
+    r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+    scratch::{take_f128, take_u8},
+    union::SlotWitnessDest,
+};
 use flock_field::F128;
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
 
 /// OR the low 32 bits of `val` into `buf` starting at bit-offset `bit_off`.
 /// Handles u64 straddling when `bit_off % 64 > 32`.

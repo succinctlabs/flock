@@ -13,18 +13,31 @@
 //! systematic "value" coordinates are the raw witness product; the verifier
 //! reconstructs them from the zerocheck identity, so they are not emitted here.
 
-use super::slp_derived::encode_slp_derived;
-use crate::zerocheck::cleanse_block;
-use rayon::current_num_threads;
-use rayon::prelude::*;
+use std::{
+    arch::aarch64::{
+        uint8x16_t, uint64x2_t, vandq_u8, vandq_u64, vbslq_u8, vcombine_u8, vdupq_n_u8,
+        vdupq_n_u64, veorq_u8, veorq_u64, vgetq_lane_u64, vld1_u8, vld1q_u8, vmull_p64,
+        vreinterpretq_u8_u16, vreinterpretq_u8_u32, vreinterpretq_u8_u64, vreinterpretq_u16_u8,
+        vreinterpretq_u32_u8, vreinterpretq_u64_p128, vreinterpretq_u64_u8, vshlq_n_u8, vshrq_n_u8,
+        vst1q_u8, vtrn1q_u8, vtrn1q_u16, vtrn1q_u32, vtrn1q_u64, vtrn2q_u8, vtrn2q_u16, vtrn2q_u32,
+        vtrn2q_u64,
+    },
+    sync::OnceLock,
+};
 
-use crate::field::{F128, F256Unreduced};
-use std::arch::aarch64::*;
-use std::sync::OnceLock;
+use rayon::{
+    current_num_threads,
+    prelude::{IntoParallelIterator, ParallelIterator},
+};
 
-use super::messages::BaseMessage;
-use super::product::extended_base_product_message;
-use crate::zerocheck::BlockCoverage;
+use crate::{
+    field::{F128, F256Unreduced},
+    genus95_curve_code::{
+        messages::BaseMessage, product::extended_base_product_message,
+        slp_derived::encode_slp_derived,
+    },
+    zerocheck::{BlockCoverage, cleanse_block},
+};
 
 #[inline(always)]
 unsafe fn product_bs(
@@ -1133,13 +1146,23 @@ fn bitslice_block_into(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::fs::write;
+    use std::{
+        collections::{BTreeSet, HashMap},
+        fs::write,
+    };
 
-    use crate::genus95_curve_code::product::extended_base_product_message;
-    use crate::genus95_curve_code::{BaseMessage, product_code_message};
-    use crate::test_rng::Rng;
-    use std::collections::{BTreeSet, HashMap};
+    use crate::{
+        genus95_curve_code::{
+            BaseMessage,
+            product::extended_base_product_message,
+            product_code_message,
+            round1::{
+                F128, derived_m, round1_raw_packed, round1_slp_packed, round1_slp_packed_banks,
+                round1_slp_packed_banks_fused,
+            },
+        },
+        test_rng::Rng,
+    };
 
     /// Derive the by-point fresh encode `M` from the M2 evaluator's OWN extension
     /// (`extended_base_product_message`), so the kernel speaks the evaluator's

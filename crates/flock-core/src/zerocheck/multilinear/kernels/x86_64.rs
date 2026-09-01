@@ -1,9 +1,16 @@
-use core::arch::x86_64::*;
-use core::mem::transmute;
+use core::{
+    arch::x86_64::{
+        __m128i, __m512i, _mm_load_si128, _mm_set_epi64x, _mm_setzero_si128, _mm_xor_si128,
+        _mm512_broadcast_i32x4, _mm512_loadu_si512, _mm512_permutex2var_epi64, _mm512_set_epi64,
+        _mm512_storeu_si512, _mm512_xor_si512,
+    },
+    mem::transmute,
+};
 
-use crate::field::gf2_128::x86_64::ghash_mul_x4;
-use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
-use crate::field::{F128, F256Unreduced};
+use crate::field::{
+    F128, F256Unreduced,
+    gf2_128::x86_64::{WideGhashX4, f128x4_loadu, ghash_mul_x4},
+};
 
 /// Fold the four rows for one round-2 pair in parallel x86 SIMD registers.
 /// Returns `[a0, a1, b0, b1]`.

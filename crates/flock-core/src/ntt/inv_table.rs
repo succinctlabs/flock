@@ -20,13 +20,16 @@
 //! Scalar/correctness-first implementation; NEON `apply_triple` and the
 //! unrolled `ntt_and_accum` can be added if the URM hot path needs them.
 
-use crate::bits::lowest_one;
-use crate::field::F8;
-use crate::ntt::AdditiveNttGf8;
 #[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
+use core::arch::aarch64::{veorq_u8, vextq_u8, vld1q_u8, vst1q_u8};
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::*;
+use core::arch::x86_64::{
+    __m128i, __m512i, _mm_loadu_si128, _mm_shuffle_epi32, _mm_storeu_si128, _mm_xor_si128,
+    _mm512_loadu_si512, _mm512_shuffle_epi32, _mm512_shuffle_i64x2, _mm512_storeu_si512,
+    _mm512_xor_si512,
+};
+
+use crate::{bits::lowest_one, field::F8, ntt::AdditiveNttGf8};
 
 #[derive(Clone, Debug)]
 pub struct InvNttTableByteSingleGf8 {
@@ -363,9 +366,10 @@ impl InvNttTableByteSingleGf8 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        ntt::inv_table::{AdditiveNttGf8, F8, InvNttTableByteSingleGf8},
+        test_rng::Rng,
+    };
 
     /// Naive reference: unpack `bytes` into `ell` GF(2)-valued F8 elements
     /// (one per coefficient bit), apply inv_NTT_S, then fwd_NTT_Λ.

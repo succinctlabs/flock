@@ -15,15 +15,18 @@
 //!
 //! Run:  `cargo bench --bench genus95_curve_code`
 
-use std::hint::black_box;
-use std::time::{Duration, Instant};
+use std::{
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
-use flock_prover::field::F128;
-use flock_prover::genus95_curve_code::RngCore;
-use flock_prover::genus95_curve_code::{
-    BaseMessage, ProductMessage, Sha256Rng, base_evaluation_functional, evaluate_base_functional,
-    evaluate_product_functional, product_code_message, product_evaluation_functional,
-    sample_random_evaluation_point,
+use flock_prover::{
+    field::F128,
+    genus95_curve_code::{
+        BaseMessage, ProductMessage, RngCore, Sha256Rng, base_evaluation_functional,
+        evaluate_base_functional, evaluate_product_functional, product_code_message,
+        product_evaluation_functional, sample_random_evaluation_point,
+    },
 };
 
 const WINDOW: Duration = Duration::from_millis(750);

@@ -2,20 +2,21 @@
 //!
 //! [`MerkleHash`] selects the hash implementation. [`HashKind`] supports runtime selection.
 
+use std::{env::var, slice::from_ref};
+
 use flock_parallel::all_core_pool;
+use rayon::current_num_threads;
+
 #[cfg(feature = "hash-count")]
-pub use hashing::hash_count;
-pub use hashing::{
+pub use crate::hashing::hash_count;
+pub use crate::hashing::{
     Blake3MerkleHash, Hash, HashKind, MerkleHash, Sha256MerkleHash, hash_leaf, hash_pair,
 };
 #[cfg(test)]
-use hashing::{
+use crate::hashing::{
     blake3_hash_many_leaves, blake3_hash_many_parents, blake3_leaf_cv,
     blake3_leaf_size_is_batchable, blake3_parent_cv,
 };
-use rayon::current_num_threads;
-use std::env::var;
-use std::slice::from_ref;
 mod hashing;
 
 /// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
@@ -325,10 +326,19 @@ pub fn verify_merkle_proof_with<H: MerkleHash>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use blake3::hazmat::{HasherExt, Mode, merge_subtrees_non_root};
-    use blake3::{Hasher, hash};
+    use blake3::{
+        Hasher, hash,
+        hazmat::{HasherExt, Mode, merge_subtrees_non_root},
+    };
     use sha2::{Digest, Sha256};
+
+    use crate::{
+        Blake3MerkleHash, Hash, HashKind, Sha256MerkleHash, blake3_hash_many_leaves,
+        blake3_hash_many_parents, blake3_leaf_cv, blake3_leaf_size_is_batchable, blake3_parent_cv,
+        cap_depth, cap_layer, hash_leaf, hash_pair, merkle_proof, merkle_proof_capped, merkle_root,
+        merkle_tree, merkle_tree_sequential, merkle_tree_with, verify_merkle_proof,
+        verify_merkle_proof_capped,
+    };
 
     /// Every structural test runs against both hashes: the tree and path
     /// logic is hash-agnostic, so anything true of one must hold for the

@@ -41,18 +41,21 @@
 //! swap, whose output feeds the compression, whose output chains to the root.
 //! Same treatment the composite gives it, same reason.
 
-use flock_core::scratch::take_u8;
-use flock_core::union::SlotWitnessDest;
-use flock_core::zerocheck::K_SKIP;
-use rayon::prelude::*;
 use std::sync::OnceLock;
 
-use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
-use flock_core::schedule::IoWord;
+use flock_core::{
+    r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+    schedule::IoWord,
+    scratch::take_u8,
+    union::SlotWitnessDest,
+    zerocheck::K_SKIP,
+};
 use flock_field::F128;
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
+};
 
-use super::common::identity;
-use super::merkle_r1cs::SLOT_WORDS;
+use crate::r1cs_hashes::{common::identity, merkle_r1cs::SLOT_WORDS};
 
 /// Bits in a digest.
 const SLOT_BITS: usize = 32 * SLOT_WORDS;
@@ -1177,9 +1180,13 @@ impl PowMaskTable {
 
 #[cfg(test)]
 mod family_h_tests {
-    use super::*;
-    use flock_core::pcs::ring_switch::tensor_algebra_transpose;
     use std::array::from_fn;
+
+    use flock_core::pcs::ring_switch::tensor_algebra_transpose;
+
+    use crate::r1cs_hashes::merkle_glue::{
+        F128, FamilyTransposeTileInput, FamilyTransposeTileTable,
+    };
 
     #[test]
     fn transpose_tiles_assemble_exactly_and_are_constrained() {

@@ -15,9 +15,7 @@
 //!
 //! Run: `cargo run --release --example gen_ligerito_configs`
 
-use std::fs::write;
-use std::path::Path;
-use std::process::exit;
+use std::{fs::write, path::Path, process::exit};
 
 use flock_prover::pcs::ligerito::{LigeritoProfile, LigeritoSecurityConfig};
 

@@ -1,13 +1,17 @@
-use super::*;
-use crate::prover::UnionElementSlotInput;
-use flock_core::schedule::IoWord;
+use std::sync::Arc;
+
 use flock_core::{
     circuit::builder::SlotId,
     element_r1cs::{ElementTableBuilder, ElementTableType},
     pcs::{jagged::assist_sparse_transitions, ligerito::eval_sk_at_vks},
+    schedule::IoWord,
 };
 use flock_field::QUADRATIC_NONRESIDUE;
-use std::sync::Arc;
+
+use crate::{
+    prover::UnionElementSlotInput,
+    tower::{F128, F256, GateType, ShapeBuilder, SlotWitness, TableType, Wire, build_mac256},
+};
 
 /// The sumcheck-spine gate: one fold-and-eval step of the verifier's running
 /// quadratic, `RoundQuad` in circuit form (char-2, so `u1 = t + u0` is the

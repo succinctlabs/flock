@@ -1,7 +1,8 @@
-use super::*;
-use crate::r1cs_hashes::fs_chain::FsChainTrace;
-use flock_transcript::transcript_record::{TranscriptOp, TranscriptOp as Op};
 use std::mem::take;
+
+use flock_transcript::transcript_record::{TranscriptOp, TranscriptOp as Op};
+
+use crate::{r1cs_hashes::fs_chain::FsChainTrace, tower::Wire};
 
 /// One packed-direct claim on the tape: its absorbed VALUE and gamma. The
 /// POINT is not on the stream since merged-open v1 — it is transcript-derived

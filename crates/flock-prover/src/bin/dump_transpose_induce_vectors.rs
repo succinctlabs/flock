@@ -12,17 +12,16 @@
 //!
 //! Run: cargo run --release --bin dump_transpose_induce_vectors -- out.bin 16 1 218
 
+use std::{
+    collections::HashSet,
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
+
 use env::args;
-use std::collections::HashSet;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::F128;
-use flock_prover::pcs::ligerito::induce_sumcheck_poly_via_ntt;
-
 use flock_core::test_rng::Rng;
+use flock_prover::{field::F128, pcs::ligerito::induce_sumcheck_poly_via_ntt};
 
 fn ceil_log2(n: usize) -> usize {
     if n <= 1 {

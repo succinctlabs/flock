@@ -4,25 +4,25 @@
 //! prove path; the verifier they call lives in `flock-core`. Moved here from
 //! `flock_core::verifier`'s in-crate test module when the crates were split.
 
-use flock_prover::challenger::FsChallenger;
-use flock_prover::lincheck::LincheckError;
-use flock_prover::pcs::ligerito::LigeritoProfile;
-use flock_prover::pcs::{self, PcsParams};
-use flock_prover::prover::prove_ligerito;
-use flock_prover::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
-use flock_prover::verifier::{self, FlockVerifyError};
-use flock_prover::zerocheck::{K_SKIP, ZerocheckError};
-use pcs::pack_witness;
 use std::sync::OnceLock;
-use verifier::verify_ligerito;
-#[cfg(target_arch = "aarch64")]
-use verifier::verify_ligerito_ag;
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    lincheck::LincheckError,
+    pcs::{self, PcsParams, ligerito::LigeritoProfile},
+    prover::prove_ligerito,
+    r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+    verifier::{self, FlockVerifyError},
+    zerocheck::{K_SKIP, ZerocheckError},
+};
+use pcs::pack_witness;
+use verifier::verify_ligerito;
 #[cfg(target_arch = "aarch64")]
-use flock_prover::field::F128;
-#[cfg(target_arch = "aarch64")]
-use flock_prover::prover::prove_ligerito_ag;
+use {
+    flock_prover::field::F128, flock_prover::prover::prove_ligerito_ag,
+    verifier::verify_ligerito_ag,
+};
 
 fn identity(k: usize) -> SparseBinaryMatrix {
     SparseBinaryMatrix {

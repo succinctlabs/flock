@@ -33,43 +33,43 @@
 //! Verifier reconstructs `G(0)` from the running claim via
 //! `current_claim = (1+r_now)·G(0) + r_now·G(1)`.
 
-use crate::alloc_uninit_f128_vec;
-use crate::bits::lowest_one;
+use std::{array::from_fn, mem::take, ops::Range, sync::OnceLock};
+
+use flock_multilinear::{eq_eval as multilinear_eq_eval, fold_low};
+use rayon::{
+    current_num_threads,
+    prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut},
+};
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+use {
+    crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4},
+    crate::zerocheck::multilinear::kernels::x86_64::{
+        fold_and_message_x86_avx512, fold_round2_pair_x86_unchecked_8,
+    },
+};
+
 #[cfg(not(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 )))]
 use crate::field::f128_slice::fold_pairs;
-use crate::scratch::take_f128;
-use crate::zerocheck::PaddingRun;
-use flock_multilinear::eq_eval as multilinear_eq_eval;
-use flock_multilinear::fold_low;
-use rayon::current_num_threads;
-use rayon::prelude::*;
-use std::array::from_fn;
-use std::mem::take;
-use std::ops::Range;
-use std::sync::OnceLock;
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
-use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
-use crate::zerocheck::PaddingSpec;
-use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
-
 #[cfg(target_arch = "aarch64")]
-use kernels::aarch64::fold_one_row_neon_unchecked_8;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecked_8};
+use crate::zerocheck::multilinear::kernels::aarch64::fold_one_row_neon_unchecked_8;
+use crate::{
+    alloc_uninit_f128_vec,
+    bits::lowest_one,
+    field::{F128, F256Unreduced, PHI_8_TABLE},
+    scratch::take_f128,
+    zerocheck::{
+        PaddingRun, PaddingSpec,
+        univariate_skip::{SplitEqGhash, build_eq, pack_bits},
+    },
+};
 mod kernels;
 
 /// Returns `(pair_in_block_mask, useful_pairs_inclusive)` for the round-2
@@ -2001,15 +2001,36 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::field::F8;
-    use crate::field::PHI_8_TABLE;
-    use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
-    use crate::test_rng::Rng;
-    use crate::zerocheck::univariate_skip_optimized::{
-        c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed,
-        small_challenges_ghash,
+    #[cfg(target_arch = "aarch64")]
+    use crate::zerocheck::multilinear::fold_one_row_neon_unchecked_8;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ))]
+    use crate::zerocheck::multilinear::fold_round2_pair_x86_unchecked_8;
+    use crate::{
+        field::{F8, PHI_8_TABLE},
+        ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8},
+        test_rng::Rng,
+        zerocheck::{
+            multilinear::{
+                F128, LiveLayout, PaddingSpec, UniSkipFoldTable, balanced_interval_tasks, build_eq,
+                fold_and_compute_round_pair_optimized, fold_at_z_naive, fold_in_place_pair,
+                fold_in_place_single, interpolate_at_z_combined, interpolate_at_z_on_lambda,
+                lagrange_weights_naive, lagrange_weights_on_coset, pack_bits, round_pair_naive,
+                subspace_denominator_pair, uni_skip_fold_and_round_pair_naive,
+                uni_skip_fold_and_round_pair_optimized,
+                uni_skip_fold_and_round_pair_optimized_packed,
+                uni_skip_fold_and_round_pair_optimized_packed_padded,
+                uni_skip_fold_and_round_pair_optimized_packed_serial,
+            },
+            univariate_skip_optimized::{
+                c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed,
+                small_challenges_ghash,
+            },
+        },
     };
     /// The closed-form Lagrange weights agree with the textbook `O(ell²)`
     /// product, at every `k_skip` the protocol can use, on random points AND

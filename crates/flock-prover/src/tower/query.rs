@@ -1,7 +1,5 @@
-use super::*;
-#[cfg(test)]
-use crate::r1cs_hashes::blake3::{build_block_r1cs, generate_witness_batch_major_partial};
-use crate::r1cs_hashes::fs_chain::FsChainTrace;
+use std::iter::repeat_n;
+
 use flock_core::{
     circuit::builder::{CircuitShape, SlotId},
     lincheck::{LincheckCircuit, build_eq_table},
@@ -11,25 +9,37 @@ use flock_core::{
 use flock_multilinear::{IndexOrder, eq_table};
 use flock_transcript::transcript_record::{Stream, StreamWord, TranscriptOp, TranscriptOp as Op};
 #[cfg(test)]
-use prover::prove_fast_ligerito_union_circuit;
-#[cfg(test)]
-use std::array::from_fn;
-use std::iter::repeat_n;
-#[cfg(test)]
-use std::panic::AssertUnwindSafe;
-#[cfg(test)]
-use std::panic::catch_unwind;
-#[cfg(test)]
-use verifier::verify_ligerito_union_circuit;
+use {
+    crate::r1cs_hashes::blake3::{build_block_r1cs, generate_witness_batch_major_partial},
+    crate::tower::{
+        Blake3Gate, DOMAIN, HashKind, PowMaskGate, PowMaskTable, gates_glue::PowMaskInput,
+        pcs_batch_for,
+    },
+    crate::{
+        challenger::FsChallenger,
+        prover::{UnionSlotProverInput, prove_fast_ligerito_union_circuit},
+        r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
+        union::UnionInstance,
+        verifier::verify_ligerito_union_circuit,
+    },
+    flock_core::{circuit::builder::CircuitWitness, pcs::ligerito::LigeritoProfile},
+    flock_hash::blake3_compress,
+    flock_transcript::challenger::pow_squeeze_counter,
+    std::array::from_fn,
+    std::panic::AssertUnwindSafe,
+    std::panic::catch_unwind,
+};
 
-#[cfg(test)]
-use crate::r1cs_hashes::fs_chain::CHAIN_SQUEEZE;
-#[cfg(test)]
-use flock_core::circuit::builder::CircuitWitness;
-#[cfg(test)]
-use flock_hash::blake3_compress;
-#[cfg(test)]
-use flock_transcript::challenger::pow_squeeze_counter;
+use crate::{
+    r1cs_hashes::fs_chain::FsChainTrace,
+    tower::{
+        CHUNK_END, CHUNK_START, CollapsedSlots, F128, F256, Lvl, MacGate, MacGate256, MixedProof,
+        OpenLevel, PARENT, PcsParams, PrefixGate, PrefixGate256, ResidualAccGate256,
+        ResidualPrefix3Gate256, ResidualWeightsGate256, RoundRec, SLOT_WORDS, ShapeBuilder, Wire,
+        cw, emit_mac256, hash_to_digest, l0_ood_z_index, pack_params, slot_cached,
+        squeeze_word_wire,
+    },
+};
 
 /// Emit the whole QUERY PHASE — every level's Merkle openings against the
 /// absorbed caps, plus the leaf-eval accumulators — as circuit rows.

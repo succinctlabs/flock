@@ -1,4 +1,4 @@
-use core::arch::aarch64::*;
+use core::arch::aarch64::{veorq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8};
 
 use crate::field::F128;
 

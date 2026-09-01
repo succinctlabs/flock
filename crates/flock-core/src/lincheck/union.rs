@@ -59,19 +59,20 @@
 //! bind inside the lincheck. At full utilization the sum is exactly `1`
 //! (the eq-sum identity), reproducing today's `target += β` byte for byte.
 
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::matrix_fold::{MatrixClaim, Weight};
-use crate::schedule::Registry;
-use crate::union::UnionInstance;
-use crate::zerocheck::K_SKIP;
-use std::env::var;
-use std::time::Instant;
+use std::{env::var, time::Instant};
 
-use super::{
-    LincheckCircuit, LincheckClaim, LincheckError, LincheckGrinding, LincheckProof, QuirkyPoint,
-    SkipPoint, build_eq_table, build_quirky_eq_table_from_weights, column_sumcheck_prove,
-    inner_product, partial_fold_packed_z_rows_best,
+use crate::{
+    challenger::Challenger,
+    field::F128,
+    lincheck::{
+        LincheckCircuit, LincheckClaim, LincheckError, LincheckGrinding, LincheckProof,
+        QuirkyPoint, SkipPoint, build_eq_table, build_quirky_eq_table_from_weights,
+        column_sumcheck_prove, inner_product, partial_fold_packed_z_rows_best,
+    },
+    matrix_fold::{MatrixClaim, Weight},
+    schedule::Registry,
+    union::UnionInstance,
+    zerocheck::K_SKIP,
 };
 
 /// One slot's lincheck inputs, in slot order — the union counterpart of the
@@ -941,11 +942,15 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::r1cs::SparseBinaryMatrix;
-    use crate::schedule::{TableClass, TableType};
-
-    use crate::test_rng::Rng;
+    use crate::{
+        lincheck::union::{
+            F128, K_SKIP, Registry, build_eq_table, eq_prefix_sum, eq_prefix_weight,
+            union_comb_partial,
+        },
+        r1cs::SparseBinaryMatrix,
+        schedule::{TableClass, TableType},
+        test_rng::Rng,
+    };
 
     fn stub() -> SparseBinaryMatrix {
         SparseBinaryMatrix {

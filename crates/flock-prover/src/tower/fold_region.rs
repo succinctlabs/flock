@@ -1,5 +1,5 @@
-use super::*;
-use crate::r1cs_hashes::fs_chain::FsChainTrace;
+use std::iter::repeat_n;
+
 use flock_core::{
     circuit::builder::SlotId,
     genus95_curve_code::{EvaluationPoint, SAMPLE_ATTEMPT_BUDGET, base_evaluation_functional},
@@ -7,7 +7,11 @@ use flock_core::{
     zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET,
 };
 use flock_transcript::transcript_record::{TranscriptOp, TranscriptOp as Op};
-use std::iter::repeat_n;
+
+use crate::{
+    r1cs_hashes::fs_chain::FsChainTrace,
+    tower::{F128, ShapeBuilder, TowerConfig, Wire, squeeze_word_wire, tower_fold_grinding},
+};
 
 /// One absorbed claim's stream ordinals on a fold tape: the four weight
 /// slices and the value, in absorb order.
@@ -1203,12 +1207,19 @@ pub(super) fn check_jagged_fold_publics(
 /// this checker's coverage by design.)
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use flock_core::{
         genus95_curve_code::evaluation_point_from_nonce_pow, zerocheck::ag_skip::R1_POW_BITS,
     };
-    use std::panic::AssertUnwindSafe;
-    use std::panic::catch_unwind;
+    use flock_merkle::HashKind;
+
+    use crate::tower::{
+        fold_region::{
+            F128, R1_FUSED_ATTEMPT_BUDGET, base_evaluation_functional, check_ag_skip_publics,
+        },
+        fs_chain::ag_seed_bytes,
+    };
 
     #[test]
     fn ag_skip_publics_checker_rejects_tampers() {

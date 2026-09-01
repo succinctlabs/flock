@@ -1,64 +1,3 @@
-use super::F128;
-use super::{F8, InvNttTableByteSingleGf8};
-
-#[cfg(target_arch = "aarch64")]
-use self::aarch64::{
-    accumulate_convert as accumulate_convert_aarch64,
-    accumulate_convert_with_s_hat_v as accumulate_convert_with_s_hat_v_aarch64,
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
-};
-#[cfg(not(target_arch = "aarch64"))]
-use self::portable::accumulate_convert as accumulate_convert_portable;
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    )
-)))]
-use self::portable::accumulate_convert_with_s_hat_v as accumulate_convert_with_s_hat_v_portable;
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "avx512vbmi"
-    )
-)))]
-use self::portable::bit_transpose_64bytes_scalar;
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(target_arch = "x86_64", target_feature = "gfni")
-)))]
-use self::portable::shift_reduce_inner_ab_scalar;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-use self::x86_64::accumulate_convert_with_s_hat_v_x86_avx512;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi"
-))]
-use self::x86_64::bit_transpose_64bytes_avx512;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "gfni",
-    target_feature = "avx512f",
-    target_feature = "avx512bw"
-))]
-use self::x86_64::shift_reduce_inner_ab_x86_avx512;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "gfni",
-    not(all(target_feature = "avx512f", target_feature = "avx512bw"))
-))]
-use self::x86_64::shift_reduce_inner_ab_x86_sse;
 #[cfg(all(test, target_arch = "aarch64"))]
 pub(super) use portable::bit_transpose_64bytes_scalar;
 #[cfg(all(
@@ -69,6 +8,66 @@ pub(super) use portable::bit_transpose_64bytes_scalar;
     )
 ))]
 pub(super) use portable::shift_reduce_inner_ab_scalar;
+
+#[cfg(target_arch = "aarch64")]
+use crate::zerocheck::univariate_skip_optimized::kernels::aarch64::{
+    accumulate_convert as accumulate_convert_aarch64,
+    accumulate_convert_with_s_hat_v as accumulate_convert_with_s_hat_v_aarch64,
+    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
+};
+#[cfg(not(target_arch = "aarch64"))]
+use crate::zerocheck::univariate_skip_optimized::kernels::portable::accumulate_convert as accumulate_convert_portable;
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+)))]
+use crate::zerocheck::univariate_skip_optimized::kernels::portable::accumulate_convert_with_s_hat_v as accumulate_convert_with_s_hat_v_portable;
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    )
+)))]
+use crate::zerocheck::univariate_skip_optimized::kernels::portable::bit_transpose_64bytes_scalar;
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "gfni")
+)))]
+use crate::zerocheck::univariate_skip_optimized::kernels::portable::shift_reduce_inner_ab_scalar;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+use crate::zerocheck::univariate_skip_optimized::kernels::x86_64::accumulate_convert_with_s_hat_v_x86_avx512;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+use crate::zerocheck::univariate_skip_optimized::kernels::x86_64::bit_transpose_64bytes_avx512;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+use crate::zerocheck::univariate_skip_optimized::kernels::x86_64::shift_reduce_inner_ab_x86_avx512;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    not(all(target_feature = "avx512f", target_feature = "avx512bw"))
+))]
+use crate::zerocheck::univariate_skip_optimized::kernels::x86_64::shift_reduce_inner_ab_x86_sse;
+use crate::zerocheck::univariate_skip_optimized::{F8, F128, InvNttTableByteSingleGf8};
 mod portable;
 
 #[cfg(target_arch = "aarch64")]

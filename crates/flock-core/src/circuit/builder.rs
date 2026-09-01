@@ -33,20 +33,24 @@
 //! a *regenerated* circuit must be the SAME circuit, not merely an equivalent
 //! one.
 
-use crate::alloc_zeroed_vec;
 use core::ops::Range;
-use std::any::{Any, TypeId, type_name};
-use std::cmp::Reverse;
-use std::env::var;
-use std::mem::take;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{
+    any::{Any, TypeId, type_name},
+    cmp::Reverse,
+    env::var,
+    mem::take,
+    sync::Arc,
+    time::Instant,
+};
 
-use crate::field::F128;
-use crate::schedule::{IoDirection, Registry, TableType};
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
-use super::{Cell, Circuit, CircuitError};
-use rayon::prelude::*;
+use crate::{
+    alloc_zeroed_vec,
+    circuit::{Cell, Circuit, CircuitError},
+    field::F128,
+    schedule::{IoDirection, Registry, TableType},
+};
 
 /// A value in the circuit, and the cells that must hold it.
 ///
@@ -1638,10 +1642,16 @@ fn decode(c: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::element_r1cs::{ElementTableBuilder, ElementTableType};
-    use crate::schedule::IoWord;
     use std::sync::Arc;
+
+    use crate::{
+        circuit::builder::{
+            Any, Cell, Circuit, CircuitBuilder, F128, GateType, Registry, ShapeBuilder,
+            SlotWitness, TableType, Wire,
+        },
+        element_r1cs::{ElementTableBuilder, ElementTableType},
+        schedule::IoWord,
+    };
 
     #[test]
     fn fixed_public_values_are_digest_bound_and_checked() {

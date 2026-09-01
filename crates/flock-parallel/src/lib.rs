@@ -1,10 +1,8 @@
 //! Shared parallel execution resources.
 
-use rayon::ThreadPool;
-use rayon::ThreadPoolBuilder;
-use std::env::var;
-use std::sync::OnceLock;
-use std::thread::available_parallelism;
+use std::{env::var, sync::OnceLock, thread::available_parallelism};
+
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
 /// Returns the shared rayon pool that uses all available cores.
 pub fn all_core_pool() -> &'static ThreadPool {

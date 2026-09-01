@@ -1,21 +1,8 @@
-use crate::r1cs_hashes::blake3::generate_witness_batch_major_partial;
-#[cfg(test)]
-use crate::r1cs_hashes::blake3::{Compression, build_block_r1cs};
-use flock_hash::blake3_compress;
-use prover::prove_fast_ligerito_union_circuit;
-#[cfg(target_arch = "aarch64")]
-use prover::prove_fast_ligerito_union_circuit_ag;
-#[cfg(test)]
-use std::any::Any;
-#[cfg(test)]
-use std::array::from_fn;
-use std::time::Instant;
-use verifier::verify_ligerito_union_circuit;
-use verifier::verify_ligerito_union_circuit_ag;
-use verifier::verify_ligerito_union_circuit_ag_deferred;
-use verifier::verify_ligerito_union_circuit_deferred;
+use std::{
+    sync::{Arc, Mutex, OnceLock},
+    time::Instant,
+};
 
-use super::*;
 use flock_core::{
     circuit::{
         Circuit, SigmaAssertion, WiringProof,
@@ -27,11 +14,40 @@ use flock_core::{
     proof::{R1csProofCircuitMerged, R1csProofCircuitMergedAg, UnionClassClaims},
     verifier::{DeferredMatrixWork, FlockVerifyError},
 };
+use flock_hash::blake3_compress;
 use flock_transcript::challenger::Challenger;
-use std::sync::{Arc, Mutex, OnceLock};
-
 #[cfg(test)]
-use flock_core::{circuit::WiringError, product_gkr::ProductGkrError};
+use {
+    crate::{
+        r1cs_hashes::blake3::{Compression, build_block_r1cs},
+        tower::{
+            ChildSlots, ChildTape, SLOT_WORDS, check_child_region, emit_child_region,
+            gates_blake3::Rng, test_config,
+        },
+    },
+    flock_core::{
+        circuit::{WiringError, builder::CircuitBuilder},
+        pcs::ligerito::LigeritoProfile,
+        product_gkr::ProductGkrError,
+    },
+    std::{any::Any, array::from_fn},
+};
+
+#[cfg(target_arch = "aarch64")]
+use crate::prover::prove_fast_ligerito_union_circuit_ag;
+use crate::{
+    prover::prove_fast_ligerito_union_circuit,
+    r1cs_hashes::blake3::generate_witness_batch_major_partial,
+    tower::{
+        Blake3Gate, CHUNK_END, CHUNK_START, DOMAIN, F128, FsChallenger, HashKind, IV, Online,
+        PcsParams, ROOT, ShapeBuilder, TowerConfig, UnionInstance, UnionSlotProverInput, Wire,
+        chain_blake_r1cs, leaf_zc_ag, pack_params, pack4, pack8, pcs_batch_for, steady_reps,
+    },
+    verifier::{
+        verify_ligerito_union_circuit, verify_ligerito_union_circuit_ag,
+        verify_ligerito_union_circuit_ag_deferred, verify_ligerito_union_circuit_deferred,
+    },
+};
 
 /// A circuit-union proof by boolean-zerocheck FLAVOR — parallel arms so
 /// the chain leaf and envelope outers. Both forms share all other regions.

@@ -30,42 +30,40 @@
 //!    b. Last step: send remaining poly + open f^i.
 //!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
-use super::commit::replicate_message_fill;
-use crate::challenger::Challenger;
-use crate::field::f128_slice::fold_pairs;
-use crate::field::{F128, F256, F256Unreduced};
-use crate::lincheck::build_eq_table;
-use crate::merkle::{self, Hash, HashKind};
-use crate::ntt::additive_ntt_f128::AdditiveNttF128;
-use crate::pcs::LOG_PACKING;
-use crate::pcs::ring_switch::build_eq_scaled_parallel;
-use crate::pcs::stratified;
-use crate::scratch::give_f128;
-use crate::scratch::take_f128;
-use core::mem::size_of;
-use core::slice::from_raw_parts;
+use core::{mem::size_of, slice::from_raw_parts};
+use std::{
+    collections::HashMap,
+    env::var,
+    mem::{replace, take},
+    sync::atomic::AtomicU8,
+    time::{Duration, Instant},
+};
+
 use extension::recursive_prover_with_basis_impl;
-use merkle::cap_layer;
-use merkle::hash_leaf;
-use merkle::merkle_proof_capped;
-use merkle::merkle_tree;
-use merkle::verify_merkle_proof_capped;
-use rayon::current_num_threads;
-use rayon::prelude::*;
+use merkle::{cap_layer, hash_leaf, merkle_proof_capped, merkle_tree, verify_merkle_proof_capped};
+use rayon::{
+    current_num_threads,
+    prelude::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+        IntoParallelRefMutIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+    },
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::env::var;
-use std::mem::replace;
-use std::mem::take;
-use std::sync::atomic::AtomicU8;
-use std::time::Duration;
-use std::time::Instant;
-use stratified::LevelSchedule;
-use stratified::level_block_logs;
-use stratified::schedules;
-use stratified::validate_schedules;
-use toml::from_str;
-use toml::to_string_pretty;
+use stratified::{LevelSchedule, level_block_logs, schedules, validate_schedules};
+use toml::{from_str, to_string_pretty};
+
+use crate::{
+    challenger::Challenger,
+    field::{F128, F256, F256Unreduced, f128_slice::fold_pairs},
+    lincheck::build_eq_table,
+    merkle::{self, Hash, HashKind},
+    ntt::additive_ntt_f128::AdditiveNttF128,
+    pcs::{
+        LOG_PACKING, commit::replicate_message_fill, ring_switch::build_eq_scaled_parallel,
+        stratified,
+    },
+    scratch::{give_f128, take_f128},
+};
 
 pub(crate) mod extension;
 
@@ -5448,23 +5446,41 @@ pub fn recursive_verifier<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::Challenger;
-    use crate::challenger::FsChallenger;
-    use crate::challenger::RandomChallenger;
-    use crate::lincheck::build_eq_table;
-    use crate::pcs::LOG_PACKING;
-    use bincode::deserialize;
-    use bincode::serialize;
     use core::mem::size_of;
-    use extension::evaluate_dense_at_residual;
-    use extension::recursive_verifier_with_basis_succinct;
-    use serde_json::from_str;
-    use serde_json::to_string_pretty;
-    use std::mem::take;
-    use std::time::Duration;
-    use std::time::Instant;
-    use stratified::LevelSchedule;
+    use std::{
+        mem::take,
+        time::{Duration, Instant},
+    };
+
+    use bincode::{deserialize, serialize};
+    use serde_json::{from_str, to_string_pretty};
+
+    use crate::{
+        challenger::{Challenger, FsChallenger, RandomChallenger},
+        lincheck::build_eq_table,
+        pcs::{
+            LOG_PACKING,
+            ligerito::{
+                AdditiveNttF128, EMBEDDED_CONFIGS, F128, FOLD_FIELD_LOG_Q, FoldLookahead, Hash,
+                HashKind, LIST_DECODING_QUERY_TARGET_BITS, LigeritoProfile, LigeritoProof,
+                LigeritoSecurityConfig, ProverConfig, RoundQuad, SoundnessRegime, SumcheckMessage,
+                SumcheckProver, VerifierConfig, algebraic_grinding_schedule, ceil_log2,
+                default_config, embedded_initial_k, eval_mle_lsb, eval_sk_at_vks,
+                extension::{evaluate_dense_at_residual, recursive_verifier_with_basis_succinct},
+                fold_and_msg_blocked, fold_and_msg_blocked_jit, induce_sumcheck_enforced_sum,
+                induce_sumcheck_evaluate_at_residual, induce_sumcheck_poly,
+                induce_sumcheck_poly_via_ntt, ligero_commit, merkle_paths_for, paper_ood_bits,
+                paper_per_query_bits, partial_eval_lsb, partial_eval_lsb_one, prover_config_for,
+                recursive_prover, recursive_prover_with_basis,
+                recursive_prover_with_basis_precomputed_round0, recursive_prover_with_l0,
+                recursive_verifier, round_msg_and_eval_blocked,
+                round_msg_and_eval_eq_point_blocked, round_msg_eval_and_lookahead, round1,
+                sample_queries, transpose_forward_ntt, transpose_forward_ntt_sparse, udr_queries,
+                verifier_config_for, verify_level_opens,
+            },
+            stratified::LevelSchedule,
+        },
+    };
 
     /// The factored EqPoint opening uses the JIT basis on both commitment
     /// layouts.  A full/power-of-two lane grid has `d = 1`, so pin that the

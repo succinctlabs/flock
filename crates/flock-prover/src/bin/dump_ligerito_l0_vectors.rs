@@ -15,25 +15,28 @@
 //! Run:  cargo run --release --bin dump_ligerito_l0_vectors -- \
 //!         cuda-ghash/ligerito_l0_vectors.bin 14 4 0 3 1 2 1 40 0
 
-use env::args;
-use flock_prover::merkle::Hash;
-use std::collections::HashSet;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_hash::HashKind;
-use flock_prover::challenger::{Challenger, FsChallenger};
-use flock_prover::field::F128;
-use flock_prover::lincheck::build_eq_table;
-use flock_prover::ntt::AdditiveNttF128;
-use flock_prover::pcs::ligerito::{
-    LigeroWitness, SumcheckProver, eval_sk_at_vks, induce_sumcheck_poly, ligero_commit,
+use std::{
+    collections::HashSet,
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
 };
 
+use env::args;
 use flock_core::test_rng::Rng;
-use merkle_octopus::merkle_multi_proof;
+use flock_hash::HashKind;
+use flock_prover::{
+    challenger::{Challenger, FsChallenger},
+    field::F128,
+    lincheck::build_eq_table,
+    merkle::Hash,
+    ntt::AdditiveNttF128,
+    pcs::ligerito::{
+        LigeroWitness, SumcheckProver, eval_sk_at_vks, induce_sumcheck_poly, ligero_commit,
+    },
+};
+
+use crate::merkle_octopus::merkle_multi_proof;
 // The multi-proof left the live protocol (cap layers replaced it); the CUDA
 // oracle pair keeps a frozen copy. Same story for the single-root absorb:
 // `LigeroWitness::root()` was retired with the cap-layer switch, but this

@@ -19,16 +19,15 @@
 //! Run:
 //!   cargo run --release --bin dump_ligerito_sumcheck_vectors -- cuda-ghash/sumcheck_vectors.bin 12
 
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
+
 use env::args;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::F128;
-use flock_prover::pcs::ligerito::SumcheckProver;
-
 use flock_core::test_rng::Rng;
+use flock_prover::{field::F128, pcs::ligerito::SumcheckProver};
 
 fn write_f128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;

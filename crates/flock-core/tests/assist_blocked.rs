@@ -10,14 +10,16 @@
 //! Informational — run with
 //! `cargo test -p flock-core --release --test assist_blocked -- --ignored --nocapture`.
 
-use flock_core::challenger::FsChallenger;
-use flock_core::field::F128;
-use flock_core::pcs::jagged::{
-    FrobeniusClaim, JaggedParams, f_hat_t, prove_assist, prove_frobenius_assist, verify_assist,
-    verify_frobenius_assist,
+use std::{hint::black_box, time::Instant};
+
+use flock_core::{
+    challenger::FsChallenger,
+    field::F128,
+    pcs::jagged::{
+        FrobeniusClaim, JaggedParams, f_hat_t, prove_assist, prove_frobenius_assist, verify_assist,
+        verify_frobenius_assist,
+    },
 };
-use std::hint::black_box;
-use std::time::Instant;
 
 /// xorshift — the probe only needs points that aren't structurally special.
 struct Rng(u64);

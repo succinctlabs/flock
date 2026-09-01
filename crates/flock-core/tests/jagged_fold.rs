@@ -8,13 +8,15 @@
 //! verifier's own statements (`frobenius_statements`) lands with the
 //! assertion-export step, mirroring how sigma route B was pinned.
 
-use flock_core::challenger::FsChallenger;
-use flock_core::field::F128;
-use flock_core::matrix_fold::{
-    FoldError, JaggedClaim, JaggedRowWeight, JaggedTable, MatrixClaim, discharge_jagged,
-    prove_fold_jagged, verify_fold_jagged,
+use flock_core::{
+    challenger::FsChallenger,
+    field::F128,
+    matrix_fold::{
+        FoldError, JaggedClaim, JaggedRowWeight, JaggedTable, MatrixClaim, discharge_jagged,
+        prove_fold_jagged, verify_fold_jagged,
+    },
+    pcs::jagged::JaggedParams,
 };
-use flock_core::pcs::jagged::JaggedParams;
 
 struct Rng(u64);
 impl Rng {

@@ -19,29 +19,33 @@
 //! Counters are global and relaxed, so the standalone measurements run
 //! single-threaded and one at a time.
 
-use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
-use flock_core::field::F128;
-use flock_core::field::gf2_128::op_count::{Snapshot, measure};
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::schedule::TableClass;
-use flock_prover::challenger::FsChallenger;
-use flock_prover::init_perf_thread_pool;
-use flock_prover::pcs::PcsParams;
-use flock_prover::prover::{self, UnionElementSlotInput};
-use flock_prover::schedule::{Registry, TableType};
-use flock_prover::union::UnionInstance;
-use flock_prover::verifier;
-use prover::prove_fast_ligerito_union_mixed_class;
-use std::array::from_fn;
-use std::sync::Arc;
-use verifier::verify_ligerito_union_mixed_class;
-use verifier::verify_ligerito_union_mixed_class_deferred;
+use std::{array::from_fn, sync::Arc};
 
-use flock_core::test_rng::Rng;
-use flock_core::zerocheck::multilinear::{
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, lagrange_weights_naive,
+use flock_core::{
+    element_r1cs::{ElementTableBuilder, ElementTableType},
+    field::{
+        F128,
+        gf2_128::op_count::{Snapshot, measure},
+    },
+    pcs::ligerito::LigeritoProfile,
+    schedule::TableClass,
+    test_rng::Rng,
+    zerocheck::multilinear::{
+        interpolate_at_z_combined, interpolate_at_z_on_lambda, lagrange_weights_naive,
+    },
 };
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression};
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    pcs::PcsParams,
+    prover::{self, UnionElementSlotInput},
+    r1cs_hashes::blake3::{Blake3Setup, Compression},
+    schedule::{Registry, TableType},
+    union::UnionInstance,
+    verifier,
+};
+use prover::prove_fast_ligerito_union_mixed_class;
+use verifier::{verify_ligerito_union_mixed_class, verify_ligerito_union_mixed_class_deferred};
 const DOMAIN: &[u8] = b"flock-union-element-v0";
 const K_SKIP: usize = 6;
 

@@ -63,38 +63,43 @@
 //! Fiat–Shamir order: commit → bind statement → τ → zerocheck rounds → α →
 //! lincheck rounds → γ-batched opening.
 
-use crate::alloc_uninit_vec;
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::merkle::Hash;
-use crate::pcs::ligerito::{ProverConfig, VerifierConfig};
-use crate::pcs::ring_switch::build_eq_parallel;
-use crate::pcs::{
-    self, Commitment, DirectEqInd, LOG_PACKING, PackedDirectClaim, PackedDirectClaimRef, PcsParams,
-    commit,
-};
-use crate::zerocheck::PaddingSpec;
-use crate::zerocheck::univariate_skip::build_eq;
-use blake3::Hasher;
-use lincheck::ElementLincheckError;
-use lincheck::Proof as LincheckProof;
-use lincheck::prove_with_grinding as prove_lincheck_with_grinding;
-use lincheck::verify_with_grinding as verify_lincheck_with_grinding;
-use pcs::BatchOpeningProofLigerito;
-use pcs::PcsError;
-use pcs::ligerito::LigeritoProfile;
-use pcs::ligerito::default_config;
-use pcs::ligerito::default_verifier_config;
-use pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding;
-use pcs::verify_opening_batch_ligerito_mixed_with_grinding;
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use zerocheck::Claim;
-use zerocheck::ElementZerocheckError;
-use zerocheck::Proof as ZerocheckProof;
-use zerocheck::prove_with_grinding as prove_zerocheck_with_grinding;
-use zerocheck::verify_with_grinding as verify_zerocheck_with_grinding;
+
+use blake3::Hasher;
+use lincheck::{
+    ElementLincheckError, Proof as LincheckProof,
+    prove_with_grinding as prove_lincheck_with_grinding,
+    verify_with_grinding as verify_lincheck_with_grinding,
+};
+use pcs::{
+    BatchOpeningProofLigerito, PcsError,
+    ligerito::{LigeritoProfile, default_config, default_verifier_config},
+    open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding,
+    verify_opening_batch_ligerito_mixed_with_grinding,
+};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
+};
+use serde::{Deserialize, Serialize};
+use zerocheck::{
+    Claim, ElementZerocheckError, Proof as ZerocheckProof,
+    prove_with_grinding as prove_zerocheck_with_grinding,
+    verify_with_grinding as verify_zerocheck_with_grinding,
+};
+
+use crate::{
+    alloc_uninit_vec,
+    challenger::Challenger,
+    field::F128,
+    merkle::Hash,
+    pcs::{
+        self, Commitment, DirectEqInd, LOG_PACKING, PackedDirectClaim, PackedDirectClaimRef,
+        PcsParams, commit,
+        ligerito::{ProverConfig, VerifierConfig},
+        ring_switch::build_eq_parallel,
+    },
+    zerocheck::{PaddingSpec, univariate_skip::build_eq},
+};
 pub mod lincheck;
 pub mod union;
 pub mod zerocheck;
@@ -1021,9 +1026,12 @@ fn strip_constants(ty: &ElementTableType, zc: &Claim) -> (F128, F128) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        element_r1cs::{
+            ElementTableBuilder, ElementTableType, F128, SparseF128Matrix, TypeError, broadcast_add,
+        },
+        test_rng::Rng,
+    };
 
     /// The canonical test gate: `kappa = 2`, columns `0,1` free wires (the
     /// operands), column `2` their product, column `3` padding.
@@ -1310,15 +1318,23 @@ pub(crate) mod tests {
 
 #[cfg(test)]
 mod e2e_tests {
-    use super::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
-    use super::*;
-    use crate::challenger::FsChallenger;
-    use crate::element_r1cs::lincheck::prove as prove_lincheck;
-    use crate::element_r1cs::zerocheck::prove as prove_zerocheck;
-    use crate::test_rng::Rng;
-    use bincode::deserialize;
-    use bincode::serialize;
     use std::time::Instant;
+
+    use bincode::{deserialize, serialize};
+
+    use crate::{
+        challenger::FsChallenger,
+        element_r1cs::{
+            ElementClaim, ElementLincheckError, ElementProof, ElementR1csError, ElementStatement,
+            ElementTableBuilder, ElementZerocheckError, F128, Grinding, broadcast_add,
+            lincheck::prove as prove_lincheck,
+            prove, prove_with_grinding, strip_constants,
+            tests::{mixed_gate, mixed_witness, mult_gate, mult_witness},
+            verify, verify_with_grinding,
+            zerocheck::prove as prove_zerocheck,
+        },
+        test_rng::Rng,
+    };
 
     const TRANSCRIPT: &[u8] = b"flock-element-e2e";
 

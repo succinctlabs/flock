@@ -9,17 +9,15 @@
 //! `N_RUNS` defaults to 10. At m=29 single-thread each prove_fast is ~440 ms,
 //! so 10 runs = 4.4 sec, dominating the ~0.5 sec setup.
 
-use flock_prover::init_perf_thread_pool;
-use rayon::current_num_threads;
-use std::array::from_fn;
-use std::env::args;
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log};
+use std::{array::from_fn, env::args, hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log},
+};
+use rayon::current_num_threads;
 
 fn random_compression(rng: &mut Rng) -> Compression {
     let cv: [u32; 8] = from_fn(|_| rng.next_u32());

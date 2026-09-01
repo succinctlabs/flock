@@ -2,21 +2,24 @@
 //! timing breakdown. Times the fast prover path (`Blake3Setup::prove_fast`);
 //! the slow `prove` path is exercised by unit tests in `src/blake3.rs`.
 
-use flock_prover::init_perf_thread_pool;
-use flock_prover::pcs::ligerito::LigeritoProfile;
-use flock_prover::proof_io::R1csProofBundleLigerito;
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::array::from_fn;
-use std::env::var;
-use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::merkle::HashKind;
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log};
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    array::from_fn,
+    env::var,
+    hint::black_box,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
+};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    merkle::HashKind,
+    pcs::ligerito::LigeritoProfile,
+    proof_io::R1csProofBundleLigerito,
+    r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log},
+};
 // Peak-heap tracker (wraps System), as in keccak_proof/sha2_proof — lets the
 // BLAKE3_LOG2S report emit a "peak memory:" line for bench_blake3.sh.
 struct PeakAlloc;

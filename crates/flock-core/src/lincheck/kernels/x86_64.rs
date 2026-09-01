@@ -1,8 +1,8 @@
-use core::arch::x86_64::*;
+use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128};
 
-use rayon::prelude::*;
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice};
 
-use super::super::{F128, build_sum_table};
+use crate::lincheck::{F128, build_sum_table};
 
 /// x86 single-matrix inner kernel — SSE2 mirror of
 /// [`process_block_neon_single`]. Sweeps `TILE_T = 8` stripes for one

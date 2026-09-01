@@ -1,10 +1,17 @@
-use crate::r1cs_hashes::blake3::{Compression, build_block_r1cs, io_schema};
-#[cfg(test)]
-use core_merkle::merkle_tree;
-use flock_hash::blake3_compress;
 use std::array::from_fn;
 
-use super::*;
+use flock_hash::blake3_compress;
+#[cfg(test)]
+use {
+    crate::r1cs_hashes::merkle_r1cs::{ChunkPathInput, MerkleTreeLayout, blake3_spec},
+    flock_core::circuit::builder::{CircuitBuilder, Wire},
+    flock_merkle::{HashKind, merkle_tree},
+};
+
+use crate::{
+    r1cs_hashes::blake3::{Compression, build_block_r1cs, io_schema},
+    tower::{F128, GateType, SLOT_WORDS, SlotWitness, TableType},
+};
 
 pub(super) const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
 

@@ -6,16 +6,14 @@
 //! Target from PROTOCOL_REFERENCE.md: ~38 ms single-thread at m=29 (the
 //! "29→23 collapse + P_2(1), P_2(∞)" step).
 
-use flock_prover::init_perf_thread_pool;
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::field::F8;
-use flock_prover::zerocheck::multilinear::{
-    UniSkipFoldTable, uni_skip_fold_and_round_pair_optimized_packed,
-};
+use std::{hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F8,
+    init_perf_thread_pool,
+    zerocheck::multilinear::{UniSkipFoldTable, uni_skip_fold_and_round_pair_optimized_packed},
+};
 const K_SKIP: usize = 6;
 
 fn _silence_unused() {

@@ -25,25 +25,26 @@
 //! transcript would look perfectly healthy. Every case here asserts the verify
 //! accepted before touching the shape.
 
-use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
-use flock_core::field::F128;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::ligerito::embedded_initial_k_or_default;
-use flock_core::schedule::TableClass;
-use flock_core::transcript_record::TranscriptShape;
-use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
-use flock_prover::challenger::FsChallenger;
-use flock_prover::pcs::PcsParams;
-use flock_prover::prover::{self, UnionElementSlotInput};
-use flock_prover::schedule::{Registry, TableType};
-use flock_prover::union::UnionInstance;
-use flock_prover::verifier;
-use prover::prove_fast_ligerito_union_mixed_class;
-use std::env::var_os;
-use std::sync::Arc;
-use verifier::verify_ligerito_union_mixed_class;
+use std::{env::var_os, sync::Arc};
 
-use flock_core::test_rng::Rng;
+use flock_core::{
+    element_r1cs::{ElementTableBuilder, ElementTableType},
+    field::F128,
+    pcs::ligerito::{LigeritoProfile, embedded_initial_k_or_default},
+    schedule::TableClass,
+    test_rng::Rng,
+    transcript_record::{RecordingChallenger, TranscriptOp, TranscriptShape},
+};
+use flock_prover::{
+    challenger::FsChallenger,
+    pcs::PcsParams,
+    prover::{self, UnionElementSlotInput},
+    schedule::{Registry, TableType},
+    union::UnionInstance,
+    verifier,
+};
+use prover::prove_fast_ligerito_union_mixed_class;
+use verifier::verify_ligerito_union_mixed_class;
 const DOMAIN: &[u8] = b"flock-union-element-v0";
 
 /// Same element gate block `union_element.rs` uses: two free wires, a product,

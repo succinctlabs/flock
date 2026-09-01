@@ -10,19 +10,15 @@
 //! delta isolates the kernel speedup. Expect ~1.0× below the guard (both iblock)
 //! and oblock's win above it (≈1.4–1.7× by m=28–29 at this k_log).
 
-use flock_prover::init_perf_thread_pool;
-use std::collections::HashSet;
-use std::env::var;
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::lincheck::{QuirkyPoint, SkipPoint, SparseMatrixCircuit, prove};
-use flock_prover::r1cs::SparseBinaryMatrix;
+use std::{collections::HashSet, env::var, hint::black_box, sync::atomic::Ordering, time::Instant};
 
 use flock_core::test_rng::Rng;
-use flock_prover::lincheck::FOLD_IBLOCK;
-use std::sync::atomic::Ordering;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    lincheck::{FOLD_IBLOCK, QuirkyPoint, SkipPoint, SparseMatrixCircuit, prove},
+    r1cs::SparseBinaryMatrix,
+};
 const K_LOG: usize = 11; // k = 2048
 const K_SKIP: usize = 6; // matches zerocheck's univariate-skip dim
 

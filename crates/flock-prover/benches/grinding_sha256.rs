@@ -8,13 +8,14 @@
 //! For each `c`, runs many independent grindings (each with a fresh 32-byte
 //! prefix) so the geometric noise in number of tries averages out.
 
-use flock_prover::init_perf_thread_pool;
-use rayon::current_num_threads;
-use rayon::scope;
-use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::{
+    hint::black_box,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    time::Instant,
+};
 
+use flock_prover::init_perf_thread_pool;
+use rayon::{current_num_threads, scope};
 use sha2::{Digest, Sha256};
 
 #[inline(always)]

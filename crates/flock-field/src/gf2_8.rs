@@ -13,13 +13,12 @@
 //! Reduction: x^8 ≡ x^4 + x^3 + x + 1, so the upper byte h folds back as
 //!   h ^ (h<<1) ^ (h<<3) ^ (h<<4).
 
-#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-use self::software::clmul8 as clmul8_software;
 #[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
-#[cfg(all(test, target_arch = "aarch64"))]
-use core::mem::transmute;
+use core::arch::aarch64::{vdup_n_p8, vgetq_lane_u16, vmull_p8, vreinterpretq_u16_p16};
 use core::ops::{Add, AddAssign, Mul, MulAssign};
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+use crate::gf2_8::software::clmul8 as clmul8_software;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -142,8 +141,13 @@ pub const fn gf8_reduce(p: u16) -> u8 {
 
 #[cfg(target_arch = "aarch64")]
 pub mod neon {
-    use core::arch::aarch64::*;
-    use core::mem::transmute;
+    use core::{
+        arch::aarch64::{
+            poly8x8_t, uint8x8_t, uint8x16_t, veorq_u8, vget_high_u8, vget_low_u8, vmull_p8,
+            vreinterpretq_u8_u16, vreinterpretq_u16_p16, vshlq_n_u16, vuzp1q_u8, vuzp2q_u8,
+        },
+        mem::transmute,
+    };
 
     /// Reduce 16 polynomial products (in interleaved layout `[lo0,hi0, lo1,hi1, ...]`,
     /// passed as `(c0, c1)`) modulo `x^8 + x^4 + x^3 + x + 1`, returning 16 reduced
@@ -216,11 +220,12 @@ pub mod neon {
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "aarch64")]
-    use super::neon::gf8_mul_vec16;
-    use super::software::clmul8 as clmul8_software;
-    use super::*;
+    use {crate::gf2_8::neon::gf8_mul_vec16, core::mem::transmute, std::arch::aarch64::vld1q_u8};
 
-    use crate::test_rng::Rng;
+    use crate::{
+        gf2_8::{F8, clmul8, software::clmul8 as clmul8_software},
+        test_rng::Rng,
+    };
 
     #[test]
     fn add_is_xor() {

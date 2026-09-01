@@ -14,24 +14,29 @@
 //! replicated here — so a protocol change cannot silently drift the gate
 //! from the verifier it transcribes.
 
-use flock_core::circuit::builder::{GateType, ShapeBuilder, SlotWitness};
-use flock_core::element_r1cs::ElementTableType;
-use flock_core::field::F128;
-use flock_core::pcs::PcsParams;
-use flock_core::pcs::jagged::{STATE_INITIAL, STATE_SUCCESS, assist_sparse_transitions};
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::schedule::IoWord;
-use flock_core::verifier;
-use flock_prover::challenger::FsChallenger;
-use flock_prover::prover::{self, UnionElementSlotInput};
-use flock_prover::schedule::TableType;
-use flock_prover::union::UnionInstance;
-use prover::prove_fast_ligerito_union_circuit;
 use std::sync::Arc;
-use verifier::verify_ligerito_union_circuit;
 
-use flock_core::element_r1cs::ElementTableBuilder;
-use flock_core::test_rng::Rng;
+use flock_core::{
+    circuit::builder::{GateType, ShapeBuilder, SlotWitness},
+    element_r1cs::{ElementTableBuilder, ElementTableType},
+    field::F128,
+    pcs::{
+        PcsParams,
+        jagged::{STATE_INITIAL, STATE_SUCCESS, assist_sparse_transitions},
+        ligerito::LigeritoProfile,
+    },
+    schedule::IoWord,
+    test_rng::Rng,
+    verifier,
+};
+use flock_prover::{
+    challenger::FsChallenger,
+    prover::{self, UnionElementSlotInput},
+    schedule::TableType,
+    union::UnionInstance,
+};
+use prover::prove_fast_ligerito_union_circuit;
+use verifier::verify_ligerito_union_circuit;
 const DOMAIN: &[u8] = b"flock-circuit-assist-v0";
 
 /// `point_bit`'s convention: coordinate `layer`, zero past the end.

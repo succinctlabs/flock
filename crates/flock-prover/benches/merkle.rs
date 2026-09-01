@@ -20,12 +20,13 @@
 //!
 //! Run: `cargo bench --bench merkle`
 
-use blake3::hash;
-use flock_prover::init_perf_thread_pool;
-use std::hint::black_box;
-use std::time::Instant;
+use std::{hint::black_box, time::Instant};
 
-use flock_prover::merkle::{HashKind, hash_leaf, merkle_tree};
+use blake3::hash;
+use flock_prover::{
+    init_perf_thread_pool,
+    merkle::{HashKind, hash_leaf, merkle_tree},
+};
 use sha2::{Digest, Sha256};
 
 const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];

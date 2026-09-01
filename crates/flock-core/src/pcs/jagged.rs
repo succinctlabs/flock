@@ -76,26 +76,32 @@
 //! `(G(1), G(∞))` encoding (SP1's `{0, ½, 1}` interpolation needs `2⁻¹`, which
 //! does not exist in `F128`).
 
-use crate::alloc_uninit_f128_vec;
-use crate::bits::lowest_one;
-use crate::challenger::Challenger;
-use crate::challenger::grinding_bits_for_degree;
-use crate::field::F128;
-use crate::lincheck::build_eq_table;
-use crate::pcs::ring_switch::fold_one_slot;
-use crate::scratch::give_f128;
-use crate::scratch::take_f128;
-use rayon::prelude::*;
+use std::{
+    collections::BTreeMap,
+    env::{var, var_os},
+    mem::{replace, swap},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::env::var;
-use std::env::var_os;
-use std::mem::replace;
-use std::mem::swap;
-use std::sync::OnceLock;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+
+use crate::{
+    alloc_uninit_f128_vec,
+    bits::lowest_one,
+    challenger::{Challenger, grinding_bits_for_degree},
+    field::F128,
+    lincheck::build_eq_table,
+    pcs::ring_switch::fold_one_slot,
+    scratch::{give_f128, take_f128},
+};
 
 /// Configuration of a jagged function: the (zero-padded to `2^k`) column
 /// heights, summarized as the cumulative-height prefix sums.
@@ -1301,8 +1307,13 @@ pub fn prove_assist<C: Challenger>(
 
 #[cfg(test)]
 mod assist_test_support {
-    use super::*;
-    use std::cmp::Ordering::*;
+    use std::cmp::Ordering::{Equal, Greater, Less};
+
+    use crate::pcs::jagged::{
+        Challenger, F128, IndexedParallelIterator, IntoParallelRefIterator, JaggedAssistProof,
+        JaggedParams, ParallelIterator, STATE_SUCCESS, assist_columns, g_hat_eval, g_hat_eval_cd,
+        int_bit,
+    };
 
     /// Evaluates the dense assist weight multilinear.
     pub(super) fn assist_w_at(cols: &[(F128, u64, u64)], rho: &[F128], m: usize) -> F128 {
@@ -4581,7 +4592,7 @@ pub(crate) fn fold_round_claim(claim: F128, g_one: F128, g_inf: F128, r: F128) -
 
 #[cfg(test)]
 mod round_test_support {
-    use super::*;
+    use crate::pcs::jagged::{F128, IndexedParallelIterator, ParallelIterator, ParallelSlice};
 
     /// Degree-2 round message `(G(1), G(∞))` for `Σ_{x'} a(X,x')·b(X,x')`, low bit
     /// bound: `a(0,x') = a[2x']`, `a(1,x') = a[2x'+1]`. Serial reference; retained
@@ -4738,28 +4749,44 @@ pub(crate) fn fold_and_round_oop_par(
 
 #[cfg(test)]
 mod tests {
-    use super::assist_test_support::{assist_suffix_rows, assist_w_at, prove_assist_naive};
-    use super::round_test_support::{fold_and_round_fused, round_msg, round_msg_par};
-    use super::*;
-    use crate::challenger::{FsChallenger, RandomChallenger};
-    use crate::init_perf_thread_pool;
-    use crate::pcs::ring_switch;
-    use crate::test_rng::Rng;
-    use crate::zerocheck::multilinear::fold_in_place_pair;
-    use flock_multilinear::IndexOrder;
-    use flock_multilinear::evaluate;
+    use std::{
+        env::var,
+        hint::black_box,
+        iter::repeat_n,
+        mem::{size_of, swap},
+        sync::atomic::Ordering,
+        time::{Duration, Instant},
+    };
+
+    use flock_multilinear::{IndexOrder, evaluate};
     use rayon::current_num_threads;
-    use ring_switch::build_fold_byte_table;
-    use ring_switch::fold_one_slot;
-    use ring_switch::linearized_coefficients;
-    use std::env::var;
-    use std::hint::black_box;
-    use std::iter::repeat_n;
-    use std::mem::size_of;
-    use std::mem::swap;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-    use std::time::Instant;
+    use ring_switch::{build_fold_byte_table, fold_one_slot, linearized_coefficients};
+
+    use crate::{
+        challenger::{FsChallenger, RandomChallenger},
+        init_perf_thread_pool,
+        pcs::{
+            jagged::{
+                AssistBlocks, Challenger, F128, FrobeniusClaim, JaggedAssistProof, JaggedParams,
+                JaggedSumcheckProof, MultipointGrinding, MultipointTwistedProof,
+                SPARSE_DENSIFY_FACTOR, ScalarGroupClaim, SparseGroupPair, VIRTUAL_A_OVERRIDE,
+                aligned_full_columns, assist_boundaries, assist_buckets, assist_columns_at,
+                assist_eq_at_blocked, assist_shared_tail_blocked, assist_sparse_transitions,
+                assist_suffix_low_blocked, assist_suffix_rows_blocked,
+                assist_test_support::{assist_suffix_rows, assist_w_at, prove_assist_naive},
+                assist_w_at_blocked, build_eq_table, f_hat_t, fold_and_round_oop_par, fold_oop_par,
+                fold_partials, frob_inv, generate_f_and_claim, int_bit, point_bit, prove,
+                prove_assist, prove_frobenius_assist, prove_multipoint_twisted,
+                prove_multipoint_twisted_with_grinding, prove_with_assist,
+                round_test_support::{fold_and_round_fused, round_msg, round_msg_par},
+                verify, verify_assist, verify_frobenius_assist, verify_multipoint_twisted,
+                verify_multipoint_twisted_with_grinding, verify_with_assist,
+            },
+            ring_switch,
+        },
+        test_rng::Rng,
+        zerocheck::multilinear::fold_in_place_pair,
+    };
 
     fn sample_vec(ch: &mut RandomChallenger, n: usize) -> Vec<F128> {
         (0..n).map(|_| ch.sample_f128()).collect()

@@ -1,5 +1,3 @@
-use super::*;
-use crate::r1cs_hashes::fs_chain::{CvSource, FsChainTrace, Link, trace_duplex_forked};
 use flock_core::{
     circuit::builder::SlotId,
     genus95_curve_code::{
@@ -8,6 +6,11 @@ use flock_core::{
 };
 use flock_hash::blake3_compress;
 use flock_transcript::transcript_record::{Stream, StreamWord, TranscriptOp, TranscriptOp as Op};
+
+use crate::{
+    r1cs_hashes::fs_chain::{CvSource, FsChainTrace, Link, trace_duplex_forked},
+    tower::{F128, HashKind, ShapeBuilder, Wire, pack_params},
+};
 
 /// A shared-constant public: one public input PER DISTINCT VALUE, wired to
 /// every use through copy constraints — the `zw`/`ow` pattern generalized.

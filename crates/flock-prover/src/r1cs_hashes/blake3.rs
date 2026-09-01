@@ -96,56 +96,51 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use super::common::build_block_r1cs_with_matrices;
-use super::common::drive_witness_batch_major;
-use super::common::drive_witness_batch_major_into;
-use super::common::drive_witness_batch_major_partial;
-use super::common::drive_witness_batch_major_partial_into;
-use super::common::drive_witness_packed_and_lincheck;
-use crate::prover::UnionSlotProverInput;
-#[cfg(target_arch = "aarch64")]
-use crate::prover::prove_fast_ligerito_ag_from_witness;
-use crate::prover::prove_fast_ligerito_union;
-#[cfg(target_arch = "aarch64")]
-use crate::prover::prove_fast_ligerito_union_ag;
-use crate::schedule::{Registry, TableType};
-use flock_core::lincheck::LincheckCircuit;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::ligerito::embedded_initial_k_or_default;
-#[cfg(target_arch = "aarch64")]
-use flock_core::pcs::prefault_codeword_during;
-use flock_core::proof::R1csProofLigeritoAg;
-use flock_core::proof::R1csProofMergedLigerito;
-use flock_core::proof::R1csProofMergedLigeritoAg;
-use flock_core::r1cs::WitnessLayout;
-use flock_core::scratch::prewarm_prover;
-use flock_core::union::SlotWitnessDest;
-use flock_core::union::UnionInstance;
-use rayon::prelude::*;
-use std::array::from_fn;
-use std::mem::take;
-use std::slice::from_raw_parts_mut;
-use verifier::FlockVerifyError;
-use verifier::verify_ligerito_ag;
-use verifier::verify_ligerito_union;
-use verifier::verify_ligerito_union_ag;
+use std::{array::from_fn, mem::take, slice::from_raw_parts_mut};
 
-use super::common::{
-    BitRecord, add_carry_parts, fused_add3_parts, or_bit_at, or_u32_at_bit, xor_dedup,
+use flock_core::{
+    lincheck::LincheckCircuit,
+    pcs::{
+        Commitment, PcsParams,
+        ligerito::{LigeritoProfile, embedded_initial_k_or_default},
+    },
+    proof::{R1csClaim, R1csProofLigeritoAg, R1csProofMergedLigerito, R1csProofMergedLigeritoAg},
+    r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+    schedule::IoWord,
+    scratch::prewarm_prover,
+    union::{SlotWitnessDest, UnionInstance},
+    verifier,
 };
-use flock_core::pcs::{Commitment, PcsParams};
-use flock_core::proof::R1csClaim;
-use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
-use flock_core::schedule::IoWord;
-use flock_core::verifier;
 use flock_field::F128;
 use flock_transcript::challenger::Challenger;
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
+};
+use verifier::{
+    FlockVerifyError, verify_ligerito_ag, verify_ligerito_union, verify_ligerito_union_ag,
+};
+#[cfg(target_arch = "aarch64")]
+use {
+    crate::prover::prove_fast_ligerito_ag_from_witness,
+    crate::prover::prove_fast_ligerito_union_ag, flock_core::pcs::prefault_codeword_during,
+};
 
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
-
-use super::common::{BM_V, BmRow, add_carry_parts_v, fused_add3_parts_v, or_bit_row, or_u32_row};
+use crate::r1cs_hashes::common::{
+    BM_V, BmRow, add_carry_parts_v, fused_add3_parts_v, or_bit_row, or_u32_row,
+};
+use crate::{
+    prover::{UnionSlotProverInput, prove_fast_ligerito_union},
+    r1cs_hashes::common::{
+        BitRecord, add_carry_parts, build_block_r1cs_with_matrices, drive_witness_batch_major,
+        drive_witness_batch_major_into, drive_witness_batch_major_partial,
+        drive_witness_batch_major_partial_into, drive_witness_packed_and_lincheck,
+        fused_add3_parts, or_bit_at, or_u32_at_bit, xor_dedup,
+    },
+    schedule::{Registry, TableType},
+};
 /// Block dim: one BLAKE3 compression occupies `2^K_LOG = 16,384` z slots.
 pub const K_LOG: usize = 14;
 /// `k = 2^K_LOG`.
@@ -2072,24 +2067,33 @@ pub fn generate_witness_batch_major_partial_into(
 
 #[cfg(test)]
 mod tests {
-    use crate::prover::UnionSlotProverInput;
-    use crate::prover::prove_fast_ligerito_union;
+    use std::{array::from_fn, collections::HashSet};
+
     use blake3::hash;
-    use flock_core::lincheck::CscCircuit;
-    use flock_core::union::UnionInstance;
-    use flock_hash::blake3_compress;
-    use std::array::from_fn;
-    use std::collections::HashSet;
-
-    use super::*;
-
-    use flock_core::lincheck::pack_z_lincheck_from_packed;
-    use flock_core::lincheck::{LincheckCircuit, SparseMatrixCircuit};
-    use flock_core::pcs::ligerito::LigeritoProfile;
-    use flock_core::schedule::IoDirection;
-    use flock_core::test_rng::Rng;
+    use flock_core::{
+        lincheck::{CscCircuit, LincheckCircuit, SparseMatrixCircuit, pack_z_lincheck_from_packed},
+        pcs::ligerito::LigeritoProfile,
+        schedule::IoDirection,
+        test_rng::Rng,
+        union::UnionInstance,
+    };
     use flock_field::F128;
+    use flock_hash::blake3_compress;
     use flock_transcript::challenger::FsChallenger;
+
+    use crate::{
+        prover::{UnionSlotProverInput, prove_fast_ligerito_union},
+        r1cs_hashes::blake3::{
+            BLAKE3_IV, Blake3LincheckCircuit, Blake3Setup, CV_BASE, Compression, FlockVerifyError,
+            G_BASE, G_STRIDE, GS_BASE, IO_CV0, IO_M0, IO_OUT_HI0, IO_OUT_LO0, IO_PARAMS, K, K_LOG,
+            M_BASE, N_G, OUT_HI_BASE, OUT_LO_BASE, SLOT_BITS, T_LO_BASE, USEFUL_BITS, WORD_BITS,
+            Z_CONST_POS, build_block_r1cs, build_block_witness, build_matrices, g_bit,
+            g_block_bits, generate_witness, generate_witness_batch_major,
+            generate_witness_batch_major_partial, generate_witness_with_ab_packed,
+            generate_witness_with_ab_packed_and_lincheck, io_schema, min_n_blocks_log, off_maj2,
+            out_hi_bit, out_lo_bit,
+        },
+    };
     /// The walker's constant-wire pin must equal the pin the R1CS itself
     /// declares — a walker inheriting the trait's `None` default silently
     /// drops the pin and reopens the all-zero-witness gap.

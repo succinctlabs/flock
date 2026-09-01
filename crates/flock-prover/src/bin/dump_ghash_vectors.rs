@@ -11,15 +11,15 @@
 //!
 //! Run:  cargo run --release --bin dump_ghash_vectors -- cuda-ghash/vectors.bin
 
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
+
 use env::args;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::F128;
-
 use flock_core::test_rng::Rng;
+use flock_prover::field::F128;
 
 fn main() -> Result<()> {
     let path = args().nth(1).unwrap_or_else(|| "vectors.bin".to_string());

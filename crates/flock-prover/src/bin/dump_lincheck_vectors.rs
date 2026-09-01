@@ -40,23 +40,24 @@
 //! Run:
 //!   cargo run --release --bin dump_lincheck_vectors -- cuda-ghash/lincheck_vectors.bin 10 4 2 16
 
-use env::args;
-use lincheck::pack_z_lincheck;
-use lincheck::prove_padded_capture_z_vec;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::challenger::{Challenger, FsChallenger};
-use flock_prover::field::F128;
-use flock_prover::lincheck::{
-    self, CscCircuit, LincheckCircuit, QuirkyPoint, SkipPoint, build_eq_table,
-    build_quirky_eq_table,
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
 };
-use flock_prover::r1cs::SparseBinaryMatrix;
 
+use env::args;
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::{Challenger, FsChallenger},
+    field::F128,
+    lincheck::{
+        self, CscCircuit, LincheckCircuit, QuirkyPoint, SkipPoint, build_eq_table,
+        build_quirky_eq_table,
+    },
+    r1cs::SparseBinaryMatrix,
+};
+use lincheck::{pack_z_lincheck, prove_padded_capture_z_vec};
 const DOMAIN: &[u8] = b"flock-lincheck-test";
 
 fn write_f128(w: &mut impl Write, x: F128) -> Result<()> {

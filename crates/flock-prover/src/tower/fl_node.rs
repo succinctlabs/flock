@@ -1,15 +1,16 @@
-use super::*;
-use crate::prover::UnionElementSlotInput;
-use crate::r1cs_hashes::blake3::{build_block_r1cs, generate_witness_batch_major_partial_into};
-use crate::r1cs_hashes::fs_chain::IV;
-use aggregate::JaggedKeyProve;
-use aggregate::JaggedKeyVerify;
-use aggregate::prove_aggregate_classes_with_grinding;
-use aggregate::verify_aggregate_classes_with_grinding;
-#[cfg(test)]
-use bincode::serialize;
-use flock_core::aggregate;
+use std::{
+    any::Any,
+    iter::once,
+    sync::{Arc, Mutex, OnceLock},
+    time::Instant,
+};
+
+use aggregate::{
+    JaggedKeyProve, JaggedKeyVerify, prove_aggregate_classes_with_grinding,
+    verify_aggregate_classes_with_grinding,
+};
 use flock_core::{
+    aggregate,
     aggregate::{Accumulator, ElementMatrices},
     element_r1cs::union::ElementAssertion,
     lincheck::{LincheckCircuit, SkipPoint},
@@ -20,21 +21,43 @@ use flock_core::{
 };
 use flock_field::PHI_8_TABLE;
 use flock_transcript::transcript_record::{RecordingChallenger, StreamWord, TranscriptOp as Op};
-use prover::prove_fast_ligerito_union_circuit;
+#[cfg(test)]
+use {
+    crate::tower::{
+        ChainLane, build_chain_proof, build_node_outer_app, gates_blake3::Rng, test_config,
+    },
+    bincode::serialize,
+    std::array::from_fn,
+    std::cmp::Reverse,
+    std::env::var,
+};
+
 #[cfg(target_arch = "aarch64")]
-use prover::prove_fast_ligerito_union_circuit_ag;
-use std::any::Any;
-#[cfg(test)]
-use std::array::from_fn;
-#[cfg(test)]
-use std::cmp::Reverse;
-#[cfg(test)]
-use std::env::var;
-use std::iter::once;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
-use verifier::verify_ligerito_union_circuit_ag_deferred;
-use verifier::verify_ligerito_union_circuit_deferred;
+use crate::prover::prove_fast_ligerito_union_circuit_ag;
+use crate::{
+    prover::{UnionElementSlotInput, prove_fast_ligerito_union_circuit},
+    r1cs_hashes::{
+        blake3::{build_block_r1cs, generate_witness_batch_major_partial_into},
+        fs_chain::IV,
+    },
+    tower::{
+        BitSpreadGate, BitSpreadTable, Blake3Gate, ChainProof, ChildSlots, ChildTape, DOMAIN,
+        EnvTail, F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FsChallenger, HashKind,
+        LeafOuter, MergedChain, MixedProof, Online, PcsParams, PowMaskGate, PowMaskTable,
+        SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable, TowerConfig, UnionInstance,
+        UnionSlotProverInput, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays,
+        balance_extra_rows, bytes_payload_mask, challenge_word_locs, check_ag_skip_publics,
+        check_child_region, check_fold_publics, check_jagged_fold_publics, emit_ag_point_binding,
+        emit_child_region, emit_fold_region, emit_fs_chain_partitioned, emit_jagged_fold_region,
+        emit_lagrange_lows, emit_recorded_pow_checks, env_acc_chain_base, env_app_base,
+        envelope_shape, flatten_ops, fold_region_ops, jagged_fold_region_ops,
+        labeled_bytes_payloads, live_element_input_from_rows, locate_and_pin_folds,
+        locate_and_pin_jagged_folds, merge_chain, native_chain, outer_lanes, outer_union,
+        outer_zc_ag, pack4, pack8, pad_envelope_counts, pcs_batch_for, replay_fold_endpoints,
+        replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+    },
+    verifier::{verify_ligerito_union_circuit_ag_deferred, verify_ligerito_union_circuit_deferred},
+};
 
 /// The first-level node as a BUILDER: [`build_fl_node`]'s output. `lo` is
 /// a real, RECURSABLE [`LeafOuter`] (BLAKE3 for both the FS chain and the

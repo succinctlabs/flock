@@ -9,19 +9,17 @@
 //!
 //! Run: `cargo bench --bench blake3_fast_vs_slim`  (ST: RAYON_NUM_THREADS=1)
 
-use flock_prover::init_perf_thread_pool;
-use flock_prover::proof_io::R1csProofBundleLigerito;
-use rayon::current_num_threads;
-use std::array::from_fn;
-use std::env::var;
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log};
+use std::{array::from_fn, env::var, hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
-use flock_prover::pcs::ligerito::LigeritoProfile;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    pcs::ligerito::LigeritoProfile,
+    proof_io::R1csProofBundleLigerito,
+    r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log},
+};
+use rayon::current_num_threads;
 
 fn random_compression(rng: &mut Rng) -> Compression {
     let cv: [u32; 8] = from_fn(|_| rng.next_u32());

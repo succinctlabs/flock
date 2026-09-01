@@ -12,19 +12,20 @@
 //!
 //! Run: cargo run --release --bin dump_zerocheck_full_vectors -- cuda-ghash/zerocheck_full_vectors.bin 15
 
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
+
 use env::args;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::field::{F8, F128};
-use flock_prover::ntt::AdditiveNttGf8;
-use flock_prover::zerocheck::prove_packed;
-use flock_prover::zerocheck::univariate_skip::pack_bits;
-
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    field::{F8, F128},
+    ntt::AdditiveNttGf8,
+    zerocheck::{prove_packed, univariate_skip::pack_bits},
+};
 const DOMAIN: &[u8] = b"flock-zerocheck-full-test";
 const K_SKIP: usize = 6;
 

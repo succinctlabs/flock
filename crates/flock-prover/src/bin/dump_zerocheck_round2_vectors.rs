@@ -20,20 +20,22 @@
 //!
 //! Run: cargo run --release --bin dump_zerocheck_round2_vectors -- cuda-ghash/zerocheck_round2_vectors.bin 15
 
-use env::args;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::F128;
-use flock_prover::zerocheck::PaddingSpec;
-use flock_prover::zerocheck::multilinear::{
-    UniSkipFoldTable, uni_skip_fold_and_round_pair_optimized_packed_padded,
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
 };
-use flock_prover::zerocheck::univariate_skip::pack_bits;
 
+use env::args;
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    zerocheck::{
+        PaddingSpec,
+        multilinear::{UniSkipFoldTable, uni_skip_fold_and_round_pair_optimized_packed_padded},
+        univariate_skip::pack_bits,
+    },
+};
 const K_SKIP: usize = 6;
 
 fn wf(w: &mut impl Write, x: F128) -> Result<()> {

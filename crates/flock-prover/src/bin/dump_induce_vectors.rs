@@ -22,17 +22,19 @@
 //! Run:
 //!   cargo run --release --bin dump_induce_vectors -- cuda-ghash/induce_vectors.bin 10 2 8
 
+use std::{
+    collections::HashSet,
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
+
 use env::args;
-use std::collections::HashSet;
-use std::env;
-use std::fs::File;
-use std::io::Result;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::F128;
-use flock_prover::pcs::ligerito::{eval_sk_at_vks, induce_sumcheck_poly};
-
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    pcs::ligerito::{eval_sk_at_vks, induce_sumcheck_poly},
+};
 
 fn write_f128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;

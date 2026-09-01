@@ -3,73 +3,53 @@
 //! ZClaims, and verifies the PCS openings at those points against the
 //! witness commitment.
 
-use crate::challenger::Challenger;
-use crate::circuit::Circuit;
-use crate::circuit::SigmaAssertion;
-use crate::circuit::WiringError;
-use crate::circuit::WiringProof;
-use crate::circuit::verify_wiring_deferred_with_grinding;
-use crate::circuit::verify_wiring_with_grinding;
-use crate::element_r1cs::union::Claims;
-use crate::element_r1cs::union::ElementAssertion;
-use crate::element_r1cs::union::ElementUnionError;
-use crate::element_r1cs::union::Proof;
-use crate::element_r1cs::union::verify_deferred_with_grinding;
-use crate::field::F128;
+use std::{env::var, sync::OnceLock, time::Instant};
+
+use lincheck::{
+    LincheckCircuit, LincheckError, LincheckGrinding, LincheckProof, MatrixAssertion,
+    verify as verify_lincheck, verify_union_deferred_with_grinding,
+    verify_with_grinding as verify_lincheck_with_grinding,
+};
+use pcs::{
+    BatchOpeningProofLigerito, LOG_PACKING, PackedDirectClaimRef, PcsError, verify_batch_merged,
+    verify_batch_merged_deferred, verify_opening_batch_ligerito_mixed_with_grinding,
+};
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use zerocheck::{
+    ZerocheckError, ZerocheckGrinding, ZerocheckProof,
+    ag_skip::{
+        AgProof, AgVerifyError, K_SKIP, verify as verify_ag,
+        verify_with_grinding as verify_ag_with_grinding,
+    },
+    verify_with_grinding as verify_zerocheck_with_grinding,
+};
 #[cfg(feature = "mul-count")]
-use crate::field::gf2_128::op_count::MULS_PER_INV;
-#[cfg(feature = "mul-count")]
-use crate::field::gf2_128::op_count::snapshot;
-use crate::lincheck;
-use crate::lincheck::SkipPoint;
-use crate::matrix_fold::JaggedAssertion;
-use crate::pcs::MergedOpenProof;
-use crate::pcs::PcsOpenError;
-use crate::pcs::PcsParams;
-use crate::pcs::{self, Commitment};
-use crate::proof::BooleanPiopProof;
-use crate::proof::BooleanPiopProofAg;
-use crate::proof::R1csProofCircuitMerged;
-use crate::proof::R1csProofCircuitMergedAg;
-use crate::proof::R1csProofLigeritoAg;
-use crate::proof::R1csProofMergedLigerito;
-use crate::proof::R1csProofMergedLigeritoAg;
-use crate::proof::R1csProofMixedClassMerged;
-use crate::proof::UnionClassClaims;
-use crate::proof::bind_statement;
-use crate::proof::{R1csClaim, R1csProofLigerito, ZClaim};
-use crate::r1cs::BlockR1cs;
-use crate::union::UnionInstance;
-use crate::zerocheck;
-use lincheck::LincheckCircuit;
-use lincheck::LincheckError;
-use lincheck::LincheckGrinding;
-use lincheck::LincheckProof;
-use lincheck::MatrixAssertion;
-use lincheck::verify as verify_lincheck;
-use lincheck::verify_union_deferred_with_grinding;
-use lincheck::verify_with_grinding as verify_lincheck_with_grinding;
-use pcs::BatchOpeningProofLigerito;
-use pcs::LOG_PACKING;
-use pcs::PackedDirectClaimRef;
-use pcs::PcsError;
-use pcs::verify_batch_merged;
-use pcs::verify_batch_merged_deferred;
-use pcs::verify_opening_batch_ligerito_mixed_with_grinding;
-use rayon::ThreadPool;
-use rayon::ThreadPoolBuilder;
-use std::env::var;
-use std::sync::OnceLock;
-use std::time::Instant;
-use zerocheck::ZerocheckError;
-use zerocheck::ZerocheckGrinding;
-use zerocheck::ZerocheckProof;
-use zerocheck::ag_skip::AgProof;
-use zerocheck::ag_skip::AgVerifyError;
-use zerocheck::ag_skip::K_SKIP;
-use zerocheck::ag_skip::verify as verify_ag;
-use zerocheck::ag_skip::verify_with_grinding as verify_ag_with_grinding;
-use zerocheck::verify_with_grinding as verify_zerocheck_with_grinding;
+use {crate::field::gf2_128::op_count::MULS_PER_INV, crate::field::gf2_128::op_count::snapshot};
+
+use crate::{
+    challenger::Challenger,
+    circuit::{
+        Circuit, SigmaAssertion, WiringError, WiringProof, verify_wiring_deferred_with_grinding,
+        verify_wiring_with_grinding,
+    },
+    element_r1cs::union::{
+        Claims, ElementAssertion, ElementUnionError, Proof, verify_deferred_with_grinding,
+    },
+    field::F128,
+    lincheck,
+    lincheck::SkipPoint,
+    matrix_fold::JaggedAssertion,
+    pcs::{self, Commitment, MergedOpenProof, PcsOpenError, PcsParams},
+    proof::{
+        BooleanPiopProof, BooleanPiopProofAg, R1csClaim, R1csProofCircuitMerged,
+        R1csProofCircuitMergedAg, R1csProofLigerito, R1csProofLigeritoAg, R1csProofMergedLigerito,
+        R1csProofMergedLigeritoAg, R1csProofMixedClassMerged, UnionClassClaims, ZClaim,
+        bind_statement,
+    },
+    r1cs::BlockR1cs,
+    union::UnionInstance,
+    zerocheck,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FlockVerifyError {
@@ -1413,22 +1393,26 @@ fn verify_core_inner<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FlockVerifyError, commitment_params_match_expected, verifier_pool, verify_core,
-        verify_core_ag,
-    };
-    use crate::challenger::FsChallenger;
-    use crate::field::F128;
-    use crate::lincheck::LincheckProof;
-    use crate::merkle::HashKind;
-    use crate::pcs::ligerito::LigeritoProfile;
-    use crate::pcs::{Commitment, PcsParams};
-    use crate::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
-    use crate::zerocheck::ZerocheckProof;
-    use crate::zerocheck::ag_skip::AgProof;
-    use crate::zerocheck::ag_skip::K_SKIP;
-    use rayon::current_num_threads;
     use std::sync::OnceLock;
+
+    use rayon::current_num_threads;
+
+    use crate::{
+        challenger::FsChallenger,
+        field::F128,
+        lincheck::LincheckProof,
+        merkle::HashKind,
+        pcs::{Commitment, PcsParams, ligerito::LigeritoProfile},
+        r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+        verifier::{
+            FlockVerifyError, commitment_params_match_expected, verifier_pool, verify_core,
+            verify_core_ag,
+        },
+        zerocheck::{
+            ZerocheckProof,
+            ag_skip::{AgProof, K_SKIP},
+        },
+    };
 
     /// The verifier is intentionally single-threaded: every `par_*` reached
     /// from a verify core must collapse onto the one-thread `verifier_pool`.

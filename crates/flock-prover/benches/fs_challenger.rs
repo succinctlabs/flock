@@ -18,12 +18,13 @@
 //!
 //! Run: `cargo bench --bench fs_challenger`
 
-use blake3::hash;
-use std::hint::black_box;
-use std::time::Instant;
+use std::{hint::black_box, time::Instant};
 
-use flock_core::challenger::{Challenger, FsChallenger};
-use flock_core::field::F128;
+use blake3::hash;
+use flock_core::{
+    challenger::{Challenger, FsChallenger},
+    field::F128,
+};
 use flock_hash::HashKind;
 use sha2::{Digest, Sha256};
 

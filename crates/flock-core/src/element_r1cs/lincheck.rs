@@ -55,18 +55,19 @@
 //! Rounds bind the **top** remaining variable, so the challenge list reversed is
 //! the column point LSB-first — matching the rows-low witness layout.
 
-use crate::pcs::ring_switch::build_eq_parallel;
-use rayon::prelude::*;
+use rayon::prelude::{ParallelIterator, ParallelSlice};
 use serde::{Deserialize, Serialize};
 
-use super::ElementTableType;
-use super::Grinding;
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::lincheck::{
-    sumcheck_bind_both_and_eval_next, sumcheck_bind_top_in_place_par, sumcheck_round_eval_par,
+use crate::{
+    challenger::Challenger,
+    element_r1cs::{ElementTableType, Grinding},
+    field::F128,
+    lincheck::{
+        sumcheck_bind_both_and_eval_next, sumcheck_bind_top_in_place_par, sumcheck_round_eval_par,
+    },
+    pcs::ring_switch::build_eq_parallel,
+    zerocheck::univariate_skip::build_eq,
 };
-use crate::zerocheck::univariate_skip::build_eq;
 
 /// Domain label of the standalone single-table lincheck. The union's
 /// element-region lincheck runs the same sumcheck core under its own label
@@ -453,15 +454,21 @@ fn partial_fold_rows(z: &[F128], r_row: &[F128]) -> Vec<F128> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
-    use crate::element_r1cs::ElementTableBuilder;
-    use crate::element_r1cs::broadcast_add;
-    use crate::element_r1cs::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
-    use crate::test_rng::Rng;
-    use crate::zerocheck::multilinear::eq_eval;
-    use flock_multilinear::IndexOrder;
-    use flock_multilinear::evaluate;
+    use flock_multilinear::{IndexOrder, evaluate};
+
+    use crate::{
+        challenger::FsChallenger,
+        element_r1cs::{
+            ElementTableBuilder, broadcast_add,
+            lincheck::{
+                Challenger, ElementTableType, F128, LABEL, Proof, build_eq, comb_vector,
+                partial_fold_rows, prove, verify,
+            },
+            tests::{mixed_gate, mixed_witness, mult_gate, mult_witness},
+        },
+        test_rng::Rng,
+        zerocheck::multilinear::eq_eval,
+    };
 
     /// Direct MLE evaluation at `point`, binding the low variable first.
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {

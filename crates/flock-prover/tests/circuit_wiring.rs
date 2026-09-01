@@ -36,60 +36,51 @@
 //! --ignored`. A DEBUG run needs `--test-threads=1` (the repo's known
 //! pre-existing rayon stack hazard in the Ligerito recursion).
 
-use aggregate::Accumulator;
-use aggregate::JaggedKeyProve;
-use aggregate::JaggedKeyVerify;
-use aggregate::prove_aggregate;
-use aggregate::prove_aggregate_classes;
-use aggregate::verify_aggregate;
-use aggregate::verify_aggregate_classes;
-use bincode::deserialize;
-use bincode::serialize;
-use flock_core::circuit::CellSlot;
-use flock_core::circuit::WiringProof;
-use flock_core::circuit::prove_wiring;
-use flock_core::circuit::verify_wiring;
-use flock_core::circuit::{Cell, Circuit, CircuitError, WiringError};
-use flock_core::element_r1cs::union::verify as verify_element_union;
-use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
-use flock_core::field::F128;
-use flock_core::lincheck::LincheckCircuit;
-use flock_core::pcs::LOG_PACKING;
-use flock_core::pcs::PcsParams;
-use flock_core::pcs::jagged::JaggedParams;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::ligerito::embedded_initial_k_or_default;
-use flock_core::product_gkr::{ProductGkrError, prove_batched, verify_batched_with_sigma};
-use flock_core::proof::R1csProofCircuitMerged;
-#[cfg(target_arch = "aarch64")]
-use flock_core::proof::R1csProofCircuitMergedAg;
-use flock_core::r1cs::BlockR1cs;
-use flock_prover::challenger::FsChallenger;
-use flock_prover::pcs::Commitment;
-use flock_prover::prover::{self, UnionElementSlotInput, UnionSlotProverInput};
-use flock_prover::r1cs_hashes::sha2;
-use flock_prover::schedule::{IoWord, Registry, TableType};
-use flock_prover::union::UnionInstance;
-use flock_prover::verifier::{self, FlockVerifyError};
-use prover::prove_fast_ligerito_union_circuit;
-#[cfg(target_arch = "aarch64")]
-use prover::prove_fast_ligerito_union_circuit_ag;
-use sha2::SHA256_IV;
-use sha2::build_block_r1cs;
-use sha2::generate_witness_batch_major_partial;
-use sha2::sha256_compress;
-use std::array::from_fn;
-use std::sync::Arc;
-use verifier::verify_ligerito_union_circuit;
-#[cfg(target_arch = "aarch64")]
-use verifier::verify_ligerito_union_circuit_ag;
-#[cfg(target_arch = "aarch64")]
-use verifier::verify_ligerito_union_circuit_ag_deferred;
-use verifier::verify_ligerito_union_circuit_deferred;
+use std::{array::from_fn, sync::Arc};
 
-use flock_core::aggregate;
-use flock_core::test_rng::Rng;
-use flock_core::zerocheck::univariate_skip::build_eq;
+use aggregate::{
+    Accumulator, JaggedKeyProve, JaggedKeyVerify, prove_aggregate, prove_aggregate_classes,
+    verify_aggregate, verify_aggregate_classes,
+};
+use bincode::{deserialize, serialize};
+use flock_core::{
+    aggregate,
+    circuit::{
+        Cell, CellSlot, Circuit, CircuitError, WiringError, WiringProof, prove_wiring,
+        verify_wiring,
+    },
+    element_r1cs::{ElementTableBuilder, ElementTableType, union::verify as verify_element_union},
+    field::F128,
+    lincheck::LincheckCircuit,
+    pcs::{
+        LOG_PACKING, PcsParams,
+        jagged::JaggedParams,
+        ligerito::{LigeritoProfile, embedded_initial_k_or_default},
+    },
+    product_gkr::{ProductGkrError, prove_batched, verify_batched_with_sigma},
+    proof::R1csProofCircuitMerged,
+    r1cs::BlockR1cs,
+    test_rng::Rng,
+    zerocheck::univariate_skip::build_eq,
+};
+use flock_prover::{
+    challenger::FsChallenger,
+    pcs::Commitment,
+    prover::{self, UnionElementSlotInput, UnionSlotProverInput},
+    r1cs_hashes::sha2,
+    schedule::{IoWord, Registry, TableType},
+    union::UnionInstance,
+    verifier::{self, FlockVerifyError},
+};
+use prover::prove_fast_ligerito_union_circuit;
+use sha2::{SHA256_IV, build_block_r1cs, generate_witness_batch_major_partial, sha256_compress};
+use verifier::{verify_ligerito_union_circuit, verify_ligerito_union_circuit_deferred};
+#[cfg(target_arch = "aarch64")]
+use {
+    flock_core::proof::R1csProofCircuitMergedAg, prover::prove_fast_ligerito_union_circuit_ag,
+    verifier::verify_ligerito_union_circuit_ag,
+    verifier::verify_ligerito_union_circuit_ag_deferred,
+};
 const DOMAIN: &[u8] = b"flock-circuit-wiring-v0";
 
 fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {

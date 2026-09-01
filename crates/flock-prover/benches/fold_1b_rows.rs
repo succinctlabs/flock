@@ -6,19 +6,18 @@
 //! multi-MB suffix tensor is never streamed. Sweeps the split width `n_lo`.
 //! Best-of-N to isolate from pipeline thermal load. Honors RAYON_NUM_THREADS.
 
-use flock_prover::init_perf_thread_pool;
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::field::F128;
-use flock_prover::pcs::ring_switch::{
-    build_eq_split, fold_1b_rows_1way_mfr_8wide_k4, fold_1b_rows_1way_mfr_16wide_k4,
-    fold_1b_rows_2way_mfr_8wide_padded, fold_1b_rows_split, split_n_lo,
-};
-use flock_prover::zerocheck::PaddingSpec;
-use flock_prover::zerocheck::univariate_skip::build_eq;
+use std::{hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    init_perf_thread_pool,
+    pcs::ring_switch::{
+        build_eq_split, fold_1b_rows_1way_mfr_8wide_k4, fold_1b_rows_1way_mfr_16wide_k4,
+        fold_1b_rows_2way_mfr_8wide_padded, fold_1b_rows_split, split_n_lo,
+    },
+    zerocheck::{PaddingSpec, univariate_skip::build_eq},
+};
 
 fn bench_one(m: usize, n_runs: usize) {
     // packed_witness has 2^(m - LOG_PACKING) = 2^(m-7) F128 elements; the suffix

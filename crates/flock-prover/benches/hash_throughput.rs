@@ -4,18 +4,23 @@
 //! `RAYON_NUM_THREADS`; `benchmarks/bench_hash_throughput.sh` runs the complete
 //! single- and multi-threaded matrix and renders it as Markdown.
 
-use flock_prover::init_perf_thread_pool;
-use std::array::from_fn;
-use std::env::var;
-use std::hint::black_box;
-use std::time::{Duration, Instant};
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression};
-use flock_prover::r1cs_hashes::sha2::Sha256HybridSetup;
-use rayon::current_num_threads;
+use std::{
+    array::from_fn,
+    env::var,
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    r1cs_hashes::{
+        blake3::{Blake3Setup, Compression},
+        sha2::Sha256HybridSetup,
+    },
+};
+use rayon::current_num_threads;
 
 fn random_sha2_input(rng: &mut Rng) -> ([u32; 8], [u32; 16]) {
     (from_fn(|_| rng.next_u32()), from_fn(|_| rng.next_u32()))

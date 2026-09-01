@@ -1,5 +1,5 @@
-use super::*;
-use crate::schedule::Registry;
+use std::{array::from_fn, iter::repeat_n};
+
 use flock_core::{
     circuit::{CellSlot, CellSpace, SigmaAssertion, builder::SlotId},
     genus95_curve_code::EvaluationPoint,
@@ -8,8 +8,14 @@ use flock_core::{
 use flock_field::PHI_8_TABLE;
 use flock_hash::blake3_compress;
 use flock_transcript::challenger::has_leading_zero_bits;
-use std::array::from_fn;
-use std::iter::repeat_n;
+
+use crate::{
+    schedule::Registry,
+    tower::{
+        CHUNK_END, CHUNK_START, F128, IV, PdRec, ROOT, ShapeBuilder, UnionInstance, Wire,
+        ag_seed_bytes, cw, emit_pow_checks, pack_params,
+    },
+};
 
 /// One wiring-GKR layer, located on the tape (the assembly's wire map).
 pub(super) struct GkrLayerRec {

@@ -9,20 +9,24 @@
 //! boolean (`k = 2^k_log`). `C_0 = I_k` is implicit (we still carry the
 //! materialized `c_0` matrix for utilities like `satisfies`).
 
-use crate::bits::transpose_8_u64s_to_64_bytes;
-use crate::field::F128;
-use crate::lincheck::CscCircuit;
-use crate::lincheck::QuirkyPoint;
-use crate::lincheck::SkipPoint;
-use crate::lincheck::SparseMatrixCircuit;
-use crate::zerocheck::PaddingSpec;
+use std::{
+    array::from_fn,
+    slice::{from_raw_parts, from_raw_parts_mut},
+    sync::OnceLock,
+};
+
 use blake3::Hasher;
-use rayon::current_num_threads;
-use rayon::prelude::*;
-use std::array::from_fn;
-use std::slice::from_raw_parts;
-use std::slice::from_raw_parts_mut;
-use std::sync::OnceLock;
+use rayon::{
+    current_num_threads,
+    prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut},
+};
+
+use crate::{
+    bits::transpose_8_u64s_to_64_bytes,
+    field::F128,
+    lincheck::{CscCircuit, QuirkyPoint, SkipPoint, SparseMatrixCircuit},
+    zerocheck::PaddingSpec,
+};
 
 /// Sparse boolean matrix. `rows[i]` lists the column indices where the entry is 1.
 #[derive(Clone, Debug)]
@@ -768,9 +772,15 @@ fn matrix_vector_product(m: &SparseBinaryMatrix, z: &[bool]) -> Vec<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::pcs::pack_witness;
     use std::sync::OnceLock;
+
+    use crate::{
+        pcs::pack_witness,
+        r1cs::{
+            BlockR1cs, SparseBinaryMatrix, WitnessLayout, apply_block_diag,
+            apply_block_diag_packed, get_bit_packed,
+        },
+    };
 
     /// Identity base matrix: `A_0 = I_k`. Each row has exactly one nonzero at
     /// the diagonal.

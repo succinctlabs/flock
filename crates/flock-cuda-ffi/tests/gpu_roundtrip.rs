@@ -9,35 +9,37 @@
 //! n_blocks_log, gated on a Ligerito config existing for that m.
 #![cfg(feature = "gpu")]
 
+use std::{
+    ffi::{CString, c_char},
+    fmt::Debug,
+    fs::read,
+    ptr::{null, null_mut},
+    slice::from_raw_parts,
+    sync::{Mutex, OnceLock},
+    time::Instant,
+};
+
 use b3::build_block_r1cs;
 use flock_cuda_ffi::gpu::device_count;
-use flock_prover::prover::prove_ligerito;
-use flock_prover::r1cs::BlockR1cs;
+use flock_prover::{
+    challenger::FsChallenger,
+    field::{F8, F128, F256},
+    lincheck::{self, LincheckProof},
+    ntt::AdditiveNttGf8,
+    pcs::{
+        BatchOpeningProofLigerito, Commitment, PcsParams,
+        ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage256},
+        ring_switch::RingSwitchProof,
+    },
+    proof::R1csProofLigerito,
+    prover::prove_ligerito,
+    r1cs::{BlockR1cs, SparseBinaryMatrix},
+    r1cs_hashes::blake3 as b3,
+    verifier,
+    zerocheck::{K_SKIP, ZerocheckProof},
+};
 use lincheck::SparseMatrixCircuit;
-use std::ffi::CString;
-use std::ffi::c_char;
-use std::fmt::Debug;
-use std::fs::read;
-use std::ptr::null;
-use std::ptr::null_mut;
-use std::slice::from_raw_parts;
-use std::sync::Mutex;
-use std::sync::OnceLock;
-use std::time::Instant;
 use verifier::verify_ligerito;
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::field::{F8, F128, F256};
-use flock_prover::lincheck::{self, LincheckProof};
-use flock_prover::ntt::AdditiveNttGf8;
-use flock_prover::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage256};
-use flock_prover::pcs::ring_switch::RingSwitchProof;
-use flock_prover::pcs::{BatchOpeningProofLigerito, Commitment, PcsParams};
-use flock_prover::proof::R1csProofLigerito;
-use flock_prover::r1cs::SparseBinaryMatrix;
-use flock_prover::r1cs_hashes::blake3 as b3;
-use flock_prover::verifier;
-use flock_prover::zerocheck::{K_SKIP, ZerocheckProof};
 
 const DOMAIN: &[u8] = b"flock-lig-r1cs-v0";
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());

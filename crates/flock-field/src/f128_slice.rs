@@ -1,7 +1,8 @@
 //! Architecture-selected kernels over contiguous [`F128`] slices.
 
+use crate::F128;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-use self::aarch64::fold_pairs as fold_pairs_aarch64;
+use crate::f128_slice::aarch64::fold_pairs as fold_pairs_aarch64;
 #[cfg(any(
     test,
     not(any(
@@ -13,14 +14,13 @@ use self::aarch64::fold_pairs as fold_pairs_aarch64;
         all(target_arch = "aarch64", target_feature = "aes")
     ))
 ))]
-use self::portable::fold_pairs as fold_pairs_portable;
+use crate::f128_slice::portable::fold_pairs as fold_pairs_portable;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-use self::x86_64::fold_pairs as fold_pairs_x86_64;
-use super::F128;
+use crate::f128_slice::x86_64::fold_pairs as fold_pairs_x86_64;
 
 #[cfg(any(
     test,
@@ -87,7 +87,7 @@ pub fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::f128_slice::{F128, fold_pairs, fold_pairs_portable};
 
     #[test]
     fn selected_fold_matches_portable_with_offset_and_tail() {

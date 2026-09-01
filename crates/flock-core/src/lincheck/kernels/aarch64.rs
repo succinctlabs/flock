@@ -1,11 +1,21 @@
-use crate::all_core_pool;
-use crate::perf_core_count_cached;
-use rayon::current_num_threads;
-use rayon::prelude::*;
-use std::arch::aarch64::*;
+use std::{
+    arch::aarch64::{vdupq_n_u8, veorq_u8, vld1q_u8, vst1q_u8},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-use super::super::{F128, build_sum_table};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use rayon::{
+    current_num_threads,
+    prelude::{
+        IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator,
+        ParallelIterator, ParallelSlice, ParallelSliceMut,
+    },
+};
+
+use crate::{
+    all_core_pool,
+    lincheck::{F128, build_sum_table},
+    perf_core_count_cached,
+};
 
 const NEON_TILE_T: usize = 8;
 

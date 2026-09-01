@@ -2,10 +2,9 @@
 //!
 //! Each protocol component selects its hash independently. The default is SHA-256.
 
+use std::fmt::{Display, Formatter, Result as FmtResult};
+
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
-use std::fmt::Formatter;
-use std::fmt::Result as FmtResult;
 
 pub type Digest = [u8; 32];
 
@@ -127,8 +126,9 @@ pub fn blake3_compress(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::{from_str, to_string};
+
+    use crate::HashKind;
 
     /// Every variant, for tests that sweep both.
     pub(crate) const ALL: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
