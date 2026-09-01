@@ -1218,6 +1218,13 @@ impl Sha256HybridSetup {
             vec![crate::schedule::TableType::from_block_r1cs(&r1cs)],
             n_log,
         );
+        // Warm the registry digest too: `bind_statement` absorbs it before
+        // any challenge, and materializing it BLAKE3-hashes every type's
+        // sparse A/B/C matrices (~21M nonzeros here), which measured ~0.8 s
+        // inside the FIRST prove's statement binding. It is cached in a
+        // `OnceLock` and is a pure function of the registry, so warming it
+        // here only moves when the cache is filled — no transcript effect.
+        let _ = registry.digest();
         let pcs_params = {
             let union = flock_core::union::UnionInstance::new(&registry, vec![n_compressions]);
             let m = union.dense_m();

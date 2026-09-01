@@ -3045,3 +3045,56 @@ READING: AG is the better zerocheck, and the advantage is concentrated
 entirely in round 1. Its liabilities are a larger materialized
 intermediate and a currently catastrophic sparse route. Fixing the
 dispatch is what makes AG's round-1 advantage reachable end to end.
+
+### Statement-binding digest warmed at setup — first-prove latency −0.8 s — 2026-08-31
+
+`union.bind_statement` absorbs `Registry::digest()`, which materializes
+by BLAKE3-hashing every type's sparse A/B/C matrices (~21M nonzeros for
+BLAKE3) — ~0.8–1.3 s, paid inside the FIRST prove and cached in a
+`OnceLock` thereafter. The setup already warms the CSC fold circuit and
+prefaults the scratch pool for exactly this reason, so the digest now
+joins them (`blake3.rs`, `sha2.rs`: `let _ = registry.digest();`).
+
+Verified: first-prove `bind statement` **1297 → 0.01 ms**, first-prove
+TOTAL ~1.6–2.4 s → 843 ms. Pure cache-warm — the digest is a
+deterministic function of the registry, so this only moves WHEN the
+cache fills; suites green (core 560, prover 76) with all 13 proof pins
+unchanged. Steady-state throughput is unaffected (the second and later
+proves already hit the cache); this is first-proof latency only, which
+matters for one-shot provers and for any measurement that averages
+rather than takes a minimum.
+
+### Single-threaded RS vs AG, both dispatch routes — 2026-08-31 (quiet machine)
+
+`RAYON_NUM_THREADS=1`, m=32, 4 configs rotated over 2 rounds,
+min-per-phase per invocation, medians (ms). Repeatability 0.34–1.23%
+per config — the ST instrument the campaign always preferred:
+
+| config | total | commit | zc+linc | open | r1 | r2/fold | tail |
+|---|---|---|---|---|---|---|---|
+| rs_sparse | 5081 | 1721 | 1570 | 1580 | 899 | 280 | 273 |
+| rs_dense | 5383 | 1725 | 2004 | 1591 | 902 | 679 | 75 |
+| **ag_sparse** | **4526** | 1712 | **1012** | 1598 | **364** | 244 | 276 |
+| ag_dense | 4736 | 1716 | 1183 | 1597 | 365 | 266 | 421 |
+
+1. **AG is 10.9% faster than RS at ST** (4526 vs 5081, 1.123×), and
+   ALL of it is the zerocheck (1012 vs 1570 = −558 ms).
+2. **AG round 1 is 2.5× cheaper** (364 vs 899) — matches the MT ratio
+   (51 vs 118), so it is a kernel property, not a scheduling one.
+3. **Sparse is optimal for BOTH flavors at ST** — RS 1570 vs 2004,
+   AG 1012 vs 1183. This INVERTS the MT reading for AG (where sparse
+   measured 3.2× worse end to end), so the sparse route's problem is a
+   PARALLEL-scaling one, not a kernel-quality one.
+4. commit (1712–1725) and open (1580–1598) are flat across all four
+   configs — they are shared code, confirming the earlier MT
+   "commit +10 / open +28" deltas were measurement artifacts.
+
+CORRECTION to the RS-vs-AG entry above: the claim that AG's sparse
+route "forfeits the friendly-Horner kernel" and pays 5.5× for it is NOT
+supported. `mlv_tail_fs_sparse` runs sparse rounds and then expands
+once and RESUMES the lookahead/friendly tail, so it forfeits the
+friendly kernel only for the rounds it actually runs sparse — and at ST
+its tail (276) still beats the all-dense tail (421). The earlier
+per-phase MT attribution (tail 657 vs 120) was taken from the COLD
+first prove (its `bind statement` read 1297 ms) and is withdrawn. The
+warm MT phase table is the outstanding measurement.
