@@ -5077,3 +5077,91 @@ Side result: in-prove witgen now reads **43–47 ms** (it was ~64 before
 the dead-padding skip and the burst flush), and `[prove_union] TOTAL`
 bests were 760.6–764.7 ms across these runs on a loaded box — in the
 760–770 window predicted from the landed deltas.
+
+### LANDED: the STATISTICS LADDER — open −80..−107 ms, prove −115..−138 ms (3/3), bit-identical — 2026-09-02
+
+Benedikt asked for the open ("look at the latex, Yukon and the pre-merge
+code"). Attribution first, warm MT, m=32, `PCS_TRACE` + `LIG_PROVE_TRACE`
++ a throwaway sub-bucket probe:
+
+| open_merged 262 | ms |
+|---|---:|
+| W build + round-0 prime (2^25) | 36.6 (ST 247, evaluation-bound, materialized by measurement) |
+| merged product sumcheck, 25 rounds | 19.5 (ST 85, bandwidth-bound) |
+| combine sweep (seeded EqPoint prime + lookahead) | 46.0 (ST 332) |
+| ligerito: L0 OOD sweep | 19.7 |
+| ligerito: init folds + switch (fold 1 = 34–37 at 13+3T muls/output) | 62.7 |
+| ligerito: recursive commits, 5 levels (L1 encode 18 + merkle 9–12) | 52 |
+| ligerito: level OODs / induce / rec folds | 10.4 / 10.5 / 4.3 |
+
+Config at m=32: log_n 25, initial_k 6, ks [4,4,4,4,4], rates
+[1,3,5,7,9,11], queries [244,79,48,35,29,25], ood [1,2,2,2,2,2].
+
+**The structure that was being paid for three times.** The L0 basis is a
+sum of T = 2 rank-1 eq tensors — the seeded merged-transport point and
+the one L0 OOD point — and the six initial rounds bind exactly the six
+lane-block bits (`fold_block = 2^19`, pairs of blocks). Write the index
+as `u = e·d + h`; each term is `s_t · blk_t[e] · within_t[h]`. Then every
+L0 round message is a function of the block statistics
+`G_t[e] = Σ_h f[e,h]·within_t[h]` — 64 values per term — and the six
+array folds compose into one 64-term fold `f'[h] = Σ_e eq(r,e)·f[e,h]`
+straight into F256. The incremental ladder instead swept the 2^25 witness
+for the combine's prime+lookahead (46), swept it again for the OOD (20),
+then folded it through five passes with the virtual basis evaluated per
+output (63). This is the challenge tree's "direct fold" (Yukon: rounds
+0..4 cost 0.13 ms there; their kill-switch A/B prices the chain at −14 MT
+/ −119 ST on their open), which the regraft verdicts had filed as "dead
+by protocol" because their CODE was tied to the 100-bit basis open. The
+ALGEBRA is not: it needs a rank-1 basis and lane-major block rounds,
+which the f256 ladder has. Re-derived, not ported.
+
+Built (`pcs::STATS_LADDER_OVERRIDE` / `FLOCK_NO_STATS_LADDER` same-binary
+knob; `extension::init_phase_statistics`): one sweep computes both terms'
+statistics (2 muls/element), the OOD eval and β come from the 64-entry
+tables, the round messages are `stats_round_msg` over the folded block
+tables (the `(u_0,u_2)` convention with each term's rank-1 factor
+hoisted: `Σ_h (f_0+f_1)(B_0+B_1) = (blk_0+blk_1)(G_0+G_1)`), the fold is
+`fold_blocks_by_eq` (64 mixed F256×F128 muls per output over h-chunks),
+the switch basis is `Σ_t s_t·blk_t[0]·within_t[h]`, and the existing
+`code_switch_and_push_message` takes over. The combine skips its sweep
+under the same gate. Same field elements in the same transcript slots,
+so proof bytes are identical — `tests/stats_ladder.rs` is the oracle
+(small geometry always-on; the m32 leaf as `--ignored` microbench).
+
+Measured. m32 leaf inner open (2^25 words, 56/64 lanes, alternating
+in-process arms on one committed stack): stats ladder = sweep 12 +
+rounds 0.01 + fold 9 + basis 0.4 + switch 11 ≈ 34 ms vs combine 42 +
+L0 OOD 21 + init folds 69 = 132 ms; open **204.6 vs 298.9 min (−94),
+−91 median, proof bytes identical**. In-prove, same binary, 3 pairs:
+
+| pair | open stats / ladder | TOTAL stats / ladder |
+|---|---|---|
+| 1 | 162.9 / 262.1 | 630.3 / 768.2 |
+| 2 | 177.8 / 257.2 | 643.5 / 758.7 |
+| 3 | 161.2 / 268.0 | 636.4 / 772.3 |
+
+**Open −80..−107, prove −115..−138 ms, 3/3; best prove 630.3 ms** (the
+previous best on this box was 760.6). The TOTAL moves ~35 ms more than
+the open bucket — the ladder no longer allocates fold 1's two 256 MB
+F256 transients and gives the 512 MB witness back right after its one
+fold, so the pool sees less churn (the non-local pool lesson, this time
+in our favour); not chased further.
+
+Certification: fold_lookahead oracle, stats_ladder oracle, prover
+roundtrips, poison guard, core ligerito (73) and pcs (164) suites pass;
+workspace suite, fmt, x86 check and an m=32 prove+verify below.
+
+What remains in the open after this (warm MT, ~163): recursive commits
+52 (L1 encode 18 at 7.5 G updates/s vs the main commit's 17.6 — Yukon's
+L1 runs 10.1 with EIGHT lanes, so lane count is not the cause; their
+reference is twiddle register residency across row tiles,
+`butterfly_fused_3layer_rows` hoisting the seven twiddle loads out of
+the row loop — a loop-nest change worth measuring here; their sizing
+caution: radix-8 fused-3 already sits AT the M-series 8-way L1D
+associativity limit (16 concurrent row streams alias into one set), so
+tile the rows but never widen the radix, and pair the tiling with the
+zero-root variant that keeps four twiddle registers live), W build 37,
+merged sumcheck 19.5 (an alternating skip/fold2 schedule would cut its
+traffic ~45%, ≈ −8 MT / −40 ST), level OODs + induce ~21 (F256
+promotions of base-valued 2^20 bases: ~−6 with mixed-field kernels),
+switch 11.
