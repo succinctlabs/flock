@@ -4901,3 +4901,32 @@ Same primitive, same shape, not yet applied: the skip→mlv fold's
 376k-block loop (the all-core POOL hop measured −2.4 but straggled under
 load; the shared queue has no barrier) and witgen's group loop. ~−2 to
 −3 ms each, next if wanted.
+
+### Shared hetero queue on the skip→mlv fold: +24 ms, 3/3 — E-cores only help compute-bound phases — 2026-09-02
+
+Same primitive that landed on round 1 (−2.8), applied to the fold's
+376k-block loop: P workers + two utility-QoS E-threads pulling 320
+chunks of ~1.2k blocks from one atomic counter, per-worker lookahead
+sums merged after; the P-only arm restructured identically (raw-pointer
+block writes, rayon map/reduce) so the A/B isolates the schedule.
+
+| fold, MT, warm min | hetero | P-only | Δ |
+|---|---:|---:|---:|
+| pair 1 | 94.14 | 69.56 | +24.58 |
+| pair 2 | 92.25 | 68.97 | +23.28 |
+| pair 3 | 94.39 | 71.15 | +23.24 |
+
+Verify passes (correct), and it is a third SLOWER. Straggle cannot
+explain it (a chunk is ~1 ms P / ~3 ms E). The difference from round 1
+is what the phase is bound by: round 1 is PMULL-bound (E-cores add ALU),
+the fold is a 1 GB gather + 1.5 GB NT-store stream at ~the bus, and two
+slow extra writers into a saturated memory system cost far more than the
+~6% of work they take — the doc's "bandwidth-on-bandwidth" null (stripe
+transpose on E-cores during the commit), measured here for the fold.
+Reverted. Witgen (NT stores at roofline) is the same shape and was not
+built on that basis; if anyone wants the number, the primitive is a
+15-line drop-in.
+
+RULE, now with three data points (round 1 −2.8, fold +24, all-core
+pool hops earlier): on 8P+2E the E-cores pay only on compute-bound
+flat loops with a barrier-free queue; never on a phase at the bus.
