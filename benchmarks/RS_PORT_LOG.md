@@ -4930,3 +4930,45 @@ built on that basis; if anyone wants the number, the primitive is a
 RULE, now with three data points (round 1 −2.8, fold +24, all-core
 pool hops earlier): on 8P+2E the E-cores pay only on compute-bound
 flat loops with a barrier-free queue; never on a phase at the bus.
+
+### LANDED: witgen flushes 1 KB column bursts instead of 128-byte scatters — −12 ms ST, −3 to −6 ms MT — 2026-09-02
+
+Came out of Benedikt's "can commit and round 1 share one pass" question:
+they cannot (different inputs, a challenge between them), but reading
+the commit's lane fill next to witgen's flush exposed a store-pattern
+gap. The fill writes 2 GB + reads 0.5 GB in 17.7 ms — ~140 GB/s — while
+`flush_rows_nt` wrote 1.5 GB in 25.7 ms — 58 GB/s — on the same bus.
+The 58 was never the NT-store roofline; it was the roofline for
+92 scattered 128-byte stores per group at a 4 MB column stride (one per
+page). The layout cannot change (the open and the zerocheck kernels want
+column-major, and moving z into the codeword's position-major order
+would change the fold's variable order = the transcript), but the burst
+length can.
+
+`drive_witness_batch_major_partial_into` now stages WG = 8 consecutive
+groups (64 rows) per task and flushes each chunk-column as ONE
+contiguous 1 KB burst (`flush_rows_nt_burst`); the builder, dead-lane
+zeroing and the stripe are unchanged per group. Same words to the same
+addresses — `batch_major_partial_zeroes_dummy_rows` (which compares
+against the full generator word for word), the poison guard, the AG
+roundtrips, m6 pins and m=32 verify all pass.
+
+Measured, same binary, `FLOCK_WITGEN_GROUPS` knob, m=32:
+
+| | WG=1 (old) | WG=2 | WG=4 | WG=8 | WG=16 |
+|---|---:|---:|---:|---:|---:|
+| ST micro-bench | 351.6 | 339.1 | 340.5 | **339.4** | 353.2 |
+| in-prove witgen MT (pairs, Δ vs WG=1) | — | −3.1 / −1.7 | +4.8 / −2.1 | **−4.7 / −2.7** | −6.6 / −1.2 / −5.7 |
+
+The ST knee is clean: 96–384 KB of staging (WG 2–8) is a −12 ms win;
+768 KB (WG 16) spills L2 and gives it back. MT is noisy on a loaded
+machine (load 4–6 throughout) but negative at every WG ≥ 2 bar one
+pair; WG = 8 is the most consistent at MT and at the ST optimum. Kept
+at 8. The standalone micro-bench at MT was a wash-to-worse for WG 16
+(median +4) while the in-prove line was −5.7 3/3 — the production
+path (pooled, warm, `dead_padding_unread`) is the number that counts,
+and the burst is where its store traffic goes.
+
+Remaining witgen at m=32 after this: ~26 → ~15 ms of stores, ~18 BLAKE3
+compute, ~13 stripe_from_rows, ~5 z memset, ~6 row fill. The stripe's
+own writes are already group-major and contiguous.
