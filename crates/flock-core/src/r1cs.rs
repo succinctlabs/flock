@@ -1,13 +1,17 @@
 //! Block-diagonal R1CS over GF(2).
 //!
-//! The standard R1CS is `(A·z) ⊙ (B·z) ⊕ (C·z) = 0`. We fix `C = I` (the
-//! circuit-R1CS shape `(A·z) ⊙ (B·z) = z`), so the c-claim emitted by
-//! zerocheck is already a `z`-claim — no transformation needed downstream.
+//! The standard R1CS is `(A·z) ⊙ (B·z) ⊕ (C·z) = 0`. This representation and
+//! its matrix utilities retain a general `C`. The current optimized Boolean
+//! proof paths specialize to `C = I` (the circuit-R1CS shape
+//! `(A·z) ⊙ (B·z) = z`), so the c-claim emitted by zerocheck is already a
+//! `z`-claim. General C instead requires sending that claim through lincheck;
+//! see `new-circuit-lang-plan.md`.
 //!
-//! We further specialize to **block-diagonal `A` and `B`**:
+//! We further specialize to **block-diagonal `A`, `B`, and `C`**:
 //!   `A = I_{2^n_log} ⊗ A_0`, etc. The base matrices are `k × k` sparse
-//! boolean (`k = 2^k_log`). `C_0 = I_k` is implicit (we still carry the
-//! materialized `c_0` matrix for utilities like `satisfies`).
+//! boolean (`k = 2^k_log`). All three base matrices are materialized; utilities
+//! such as [`BlockR1cs::satisfies`] support general `C_0`, while current proof
+//! entry points check for identity where they use the direct-z-claim shortcut.
 
 use std::{
     array::from_fn,
