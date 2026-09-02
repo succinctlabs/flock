@@ -5021,3 +5021,59 @@ tail) is bandwidth-bound; and the data crossing the wall is the raw
 witness because the fold's functional depends on ρ₀. The commit/round-1
 fusion and the witgen/round-1 fusion both fail for the same reason —
 there is no exposed memory time on the near side of the wall to hide.
+
+### REFUTED: interleaving witgen's stores with compute — pipelined flush BUILT, bit-identical, no gain — 2026-09-02
+
+Benedikt's objection to the fusion verdict above: reads, compute and
+writes can be interleaved, so the bound is exposed memory time, not
+bytes moved. Right — so the two quantities that bound it were measured
+(throwaway knobs, m=32, MT, box at load 5–13 from macOS indexing
+throughout, so absolutes are inflated and only paired deltas count):
+
+**Round 1 splits 38.5 / 8.** Skipping the eq-weighted accumulate (both
+the 160 AB `mul_acc_unred` and the 128 C-bank ones, ANDs kept live):
+46.6/47.2 → 39.0/40.7 ms. The SLP + transposes + ANDs — the part that
+could move into witgen — are 38.5 ms; the challenge-dependent
+accumulate that must stay is ~8 ms of compute, under the ~13 ms it
+would take to re-read the 1.35 GB intermediate. A post-challenge pass
+would be memory-bound at ~13.
+
+**Witgen's stores ARE exposed: 12–18 ms.** Same instruction stream with
+the NT bursts redirected into a 16384-row window (SLC-resident):
+110.7→95.7, 105.2→93.3, 102.1→83.6 ms (micro-bench, 3/3). So the
+DRAM-destined stores cost ~15 ms that the core does not hide under its
+own compute today.
+
+Ideal-overlap bound for the witgen-computes-round-1 scheme, using
+those: today `W + 46.5`; scheme `W − 15 + 38.5 + 13 = W + 36.5` →
+−10 ms at best, requiring all 2.85 GB of stores to hide under witgen's
+compute and a large restructure (round-1 kernel hosted in the
+super-group loop, +1.35 GB footprint, partial-block cleansing moved).
+
+**The cheapest test of the thesis was built instead:** a
+software-pipelined flush inside witgen — double-buffered staging, the
+previous super-group's 1 KB column bursts issued one column slice per
+group in between this super-group's BLAKE3 builds, the last set
+flushed from the worker state's `Drop`. Bit-identical (dummy-rows
+contract both arms, poison guard). Measured, same binary, knob:
+
+| | pipelined | unpipelined (shipped) |
+|---|---|---|
+| ST micro (best) | 328.9 / 328.6 / 356.8 | 333.9 / 339.5 / 323.2 |
+| MT micro (best), 6 pairs | 3/6 negative | — |
+| in-prove witgen, WG=8, 4 pairs | 44.9 / 43.2 / 45.9 / 42.6 | 43.3 / 49.9 / 44.1 / 51.7 |
+| in-prove witgen, WG=4 (393 KB staging), 3 pairs | 47.4 / 49.8 / 48.9 | 46.8 / 50.4 / 51.1 |
+
+2/4 and 2/3 on the in-prove line, medians −3 and −0.7, totals worse or
+noise. Reverted: ~60 lines of double-buffer machinery for an effect
+that does not clear the noise floor is under the bloat bar. The
+reading: the ~15 ms is the memory system absorbing 8 cores' NT bursts,
+not a shortage of independent work in the instruction window —
+reordering the issue stream at group granularity, at two staging
+sizes, changes nothing. That is the same slack the fusion scheme would
+need to hide 1.35 GB more under, so the scheme stays refuted.
+
+Side result: in-prove witgen now reads **43–47 ms** (it was ~64 before
+the dead-padding skip and the burst flush), and `[prove_union] TOTAL`
+bests were 760.6–764.7 ms across these runs on a loaded box — in the
+760–770 window predicted from the landed deltas.
