@@ -4862,3 +4862,42 @@ elsewhere; the dense folds keep the Horner message). The earlier
 "fold-level entry: DEAD" entry above stands as a record of a probe that
 measured the wrong thing — the lesson is "replace, don't add" when
 pricing a fusion.
+
+### Hiding round 1 under the commit: not here — but AG round 1 was leaving the E-cores idle — 2026-09-02
+
+Benedikt asked whether AG round 1's work could hide under the commit as
+the pre-merge RS prep did, and whether the E-cores could take it. The
+answer splits:
+
+HOISTING UNDER THE COMMIT — no gain available on this box. AG round 1
+is in fact MORE hoistable than RS's in principle (no in-round challenge:
+the per-block 160-vector and C banks depend only on the witness, and
+`r_outer` enters only as the eq weight at the accumulate), but the
+commit window has no idle capacity to hoist INTO: the NTT is at ~50 GB/s
+and its top tiles already run P+E via `run_hetero_chunks`; the merkle is
+at the hash roofline and hops to the all-core pool (`merkle.rs:663`).
+The RS AB-hoist measured zero-sum here for the same reason. Hoisting
+would also have to materialize ~0.4–1 GB of eq-independent partials and
+drain them after `r_outer`. Not built.
+
+USING THE E-CORES DURING ROUND 1 — yes, and it was a gap. The "round-1
+E-core hetero drain" the merge audit listed as live is the RS round 1
+(`univariate_skip_optimized.rs:1226`); AG round 1 ran a plain rayon
+`into_par_iter` on the 8 P-cores with the 2 E-cores idle for ~49 ms.
+`round1_slp_packed_banks_fused_padded` now runs its chunk loop through
+`run_hetero_chunks_stateful` — P workers plus two utility-QoS E-threads
+pulling from one atomic counter, per-worker sums merged after — with
+chunks 4× finer (32/thread) so an E-core's last chunk cannot hold the
+join. Fiat-Shamir untouched, bit-identical up to XOR order.
+
+Measured at m=32, round-1 line, MT, alternating, warm min, same binary:
+**−2.73 / −2.77 / −4.64 ms, 3/3** (the E-cores absorb ~6% of the block
+work). ~0.35% of the prove — below the bar on its own, kept because it
+is ~15 lines on existing infrastructure with no new code path, and it
+restores what the pre-merge RS round 1 had. Verify passes on both
+routes; genus95 + sparse-tail tests and AG roundtrips pass; 637/637.
+
+Same primitive, same shape, not yet applied: the skip→mlv fold's
+376k-block loop (the all-core POOL hop measured −2.4 but straggled under
+load; the shared queue has no barrier) and witgen's group loop. ~−2 to
+−3 ms each, next if wanted.
