@@ -140,6 +140,28 @@ pub struct PackedDirectClaim {
 /// arms on this box carry ±4-8 ms of interference per sample.
 pub static VIRTUAL_B_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// In-process A/B override for the STATISTICS LADDER (see
+/// `ligerito::extension::init_phase_statistics`): `0` follows the
+/// `FLOCK_NO_STATS_LADDER` env knob, `1` forces it on, `2` forces the
+/// incremental L0 fold ladder. Both arms produce byte-identical proofs.
+pub static STATS_LADDER_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn virtual_b_enabled() -> bool {
+    match VIRTUAL_B_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => std::env::var_os("FLOCK_NO_VIRTUAL_B").is_none(),
+    }
+}
+
+pub(crate) fn stats_ladder_enabled() -> bool {
+    match STATS_LADDER_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => std::env::var_os("FLOCK_NO_STATS_LADDER").is_none(),
+    }
+}
+
 /// Fiat--Shamir grinding policy for the PCS transport that sits before the
 /// Ligerito opening.  Each nonzero field is applied immediately after its
 /// prover message(s) are bound and immediately before the challenge it
@@ -310,13 +332,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Chall
     // Lane-major only: the virtual basis rides the BLOCKED L0 fold, which is
     // what every shipped merged-transport open runs (a pow2-lane inner keeps
     // the tuned element-pairing kernel and its round-0 JIT).
-    let virtual_b = eq_basis.is_some()
-        && lane_major
-        && match VIRTUAL_B_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => true,
-            2 => false,
-            _ => std::env::var_os("FLOCK_NO_VIRTUAL_B").is_none(),
-        };
+    let virtual_b = eq_basis.is_some() && lane_major && virtual_b_enabled();
     let vbasis = if virtual_b {
         // The point IS the claim's, and γ is its single transcript scalar —
         // the same (γ, ρ) the split tables above were seeded with.
@@ -566,6 +582,27 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let mask = (1usize << n_lo) - 1;
         let bs = |u: usize| lo[u & mask] * hi[u >> n_lo];
         let blk = eqpoint_round0_block;
+        // STATISTICS LADDER: the lane-major inner open derives its round-0
+        // message and every later L0 round from block statistics inside the
+        // recursive prover (one sweep there covers this term AND the L0 OOD
+        // term), so the O(L) prime + lookahead sweep below is skipped. Same
+        // gate as the prover's: `virtual_b` = eq basis + lane-major, which
+        // is exactly this branch with `blk > 1`.
+        if blk > 1 && virtual_b_enabled() && stats_ladder_enabled() {
+            if trace {
+                eprintln!("  [open_batch] combine (seeded EqPoint, statistics ladder): no sweep");
+            }
+            return CombinedClaim {
+                ring_switches: Vec::new(),
+                batching_nonces,
+                b_combined: Vec::new(),
+                eq_basis: Some((lo, hi, n_lo)),
+                eq_gamma: Some(gammas_pd[0]),
+                target_combined,
+                round0_prime: (F128::ZERO, F128::ZERO),
+                round1_lookahead: None,
+            };
+        }
         if blk == 1 {
             // The ladder statically rejects a lookahead on this shape:
             // `fold_block == 1` comes with the factored (JIT) basis, so

@@ -1272,6 +1272,25 @@ impl SumcheckProver256 {
         }
     }
 
+    /// State entering the code switch from the statistics ladder: `f` and
+    /// the combined basis already folded by every L0 challenge, the
+    /// transcript holding the round-0 message plus the `initial_k − 1`
+    /// round messages the ladder produced.
+    pub(super) fn from_folded(
+        f: Vec<F256>,
+        combined_basis: Vec<F256>,
+        transcript: Vec<SumcheckMessage256>,
+    ) -> Self {
+        Self {
+            initial_f: None,
+            initial_b: None,
+            f,
+            combined_basis,
+            transcript,
+            pending: None,
+        }
+    }
+
     pub(super) fn first_fold_materialized(&mut self, r: F256, d: usize) -> SumcheckMessage256 {
         let f = self.initial_f.take().expect("first fold already consumed");
         let b = self.initial_b.take().expect("materialized basis missing");
@@ -1649,6 +1668,273 @@ fn base_table(values: &[F256]) -> Vec<F128> {
         .collect()
 }
 
+
+// ---------------------------------------------------------------------------
+// THE STATISTICS LADDER (lane-major L0 rounds).
+//
+// The L0 basis is a sum of T scaled eq tensors — the seeded merged-transport
+// point and the L0 OOD points — and the first `initial_k` rounds bind exactly
+// the lane-block bits `[log_n − initial_k, log_n)`. Write the index as
+// `u = e·d + h` (block `e`, in-block `h`, `d = 2^(log_n − initial_k)`); each
+// term factors as `B_t[u] = s_t · blk_t[e] · within_t[h]`, so every L0 round
+// message is a function of the block statistics
+//     `G_t[e] = Σ_h f[e·d + h] · within_t[h]`      (2^initial_k values per term)
+// — ONE sweep over `f` for all terms, then each round costs O(2^initial_k)
+// instead of O(L), and the `initial_k` array folds collapse into ONE pass
+// `f'[h] = Σ_e eq(r, e)·f[e·d + h]`. Every message and table value is the
+// field element the incremental ladder produces (field arithmetic is exact;
+// the sums merely reassociate), so the transcript is byte-identical —
+// `STATS_LADDER_OVERRIDE` is the same-binary A/B (tests/stats_ladder.rs).
+// This is the challenge tree's "direct fold" idea re-derived onto the f256
+// ladder: contract the rank-1 basis once, never materialize or fold it.
+// ---------------------------------------------------------------------------
+
+/// One block-statistic term: `B[e·d + h] = scale · blk[e] · within[h]`.
+struct StatTerm {
+    scale: F256,
+    /// `eq(coords[..n_within], h)`, unscaled.
+    within: Vec<F128>,
+    /// `eq(coords[n_within..], e)`, folded per round.
+    blk: Vec<F256>,
+    /// `G[e]`, folded per round.
+    g: Vec<F256>,
+}
+
+/// `G_t[e] = Σ_h f[e·d + h]·within_t[h]` for every term in ONE sweep over
+/// `f`; task = (block, h-chunk), XOR-additive so the chunk order is free.
+fn block_statistics(f: &[F128], withins: &[&[F128]], d: usize) -> Vec<Vec<F128>> {
+    let n_e = f.len() / d;
+    const CH: usize = 1 << 12;
+    let n_ch = d.div_ceil(CH);
+    let partial: Vec<Vec<F128>> = (0..n_e * n_ch)
+        .into_par_iter()
+        .map(|task| {
+            let (e, c) = (task / n_ch, task % n_ch);
+            let h0 = c * CH;
+            let h1 = (h0 + CH).min(d);
+            let fs = &f[e * d + h0..e * d + h1];
+            withins
+                .iter()
+                .map(|w| {
+                    fs.iter()
+                        .zip(&w[h0..h1])
+                        .fold(F128::ZERO, |acc, (&x, &y)| acc + x * y)
+                })
+                .collect()
+        })
+        .collect();
+    (0..withins.len())
+        .map(|t| {
+            (0..n_e)
+                .map(|e| {
+                    (0..n_ch).fold(F128::ZERO, |acc, c| acc + partial[e * n_ch + c][t])
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The block sumcheck's round message over the lowest surviving block bit:
+/// block pairs `(2j, 2j+1)`, the `(u_0, u_2)` convention of [`round_msg`]
+/// with each term's rank-1 factor hoisted — per term,
+/// `Σ_h (f_0 + f_1)(B_0 + B_1) = (blk_0 + blk_1)(G_0 + G_1)`.
+fn stats_round_msg(terms: &[StatTerm]) -> SumcheckMessage256 {
+    let mut u_0 = F256::ZERO;
+    let mut u_2 = F256::ZERO;
+    for t in terms {
+        let mut a = F256::ZERO;
+        let mut b = F256::ZERO;
+        for j in 0..t.blk.len() / 2 {
+            let (b0, b1) = (t.blk[2 * j], t.blk[2 * j + 1]);
+            let (g0, g1) = (t.g[2 * j], t.g[2 * j + 1]);
+            a += b0 * g0;
+            b += (b0 + b1) * (g0 + g1);
+        }
+        u_0 += t.scale * a;
+        u_2 += t.scale * b;
+    }
+    SumcheckMessage256 { u_0, u_2 }
+}
+
+/// Bind the lowest block bit: `x'[j] = x[2j] + r·(x[2j+1] + x[2j])`.
+fn fold_block_pairs(v: &mut Vec<F256>, r: F256) {
+    let half = v.len() / 2;
+    for j in 0..half {
+        let (x0, x1) = (v[2 * j], v[2 * j + 1]);
+        v[j] = x0 + r * (x1 + x0);
+    }
+    v.truncate(half);
+}
+
+/// `f'[h] = Σ_e w[e]·f[e·d + h]` — the `initial_k` incremental block folds
+/// composed into one pass (each is `x_0 + r(x_1 + x_0) = (1+r)x_0 + r·x_1`,
+/// and their composition is the eq-tensor weight `w = eq(r, ·)`).
+fn fold_blocks_by_eq(f: &[F128], w: &[F256], d: usize) -> Vec<F256> {
+    debug_assert_eq!(f.len(), w.len() * d);
+    let mut out = crate::scratch::take_f256(d);
+    const CH: usize = 1 << 11;
+    out.par_chunks_mut(CH).enumerate().for_each(|(c, oc)| {
+        let h0 = c * CH;
+        oc.fill(F256::ZERO);
+        for (e, &we) in w.iter().enumerate() {
+            let fs = &f[e * d + h0..e * d + h0 + oc.len()];
+            for (o, &x) in oc.iter_mut().zip(fs) {
+                *o += we * x;
+            }
+        }
+    });
+    out
+}
+
+/// The combined basis at the switch: `B'[h] = Σ_t s_t·blk_t[0]·within_t[h]`.
+fn materialize_folded_basis(terms: &[StatTerm], d: usize) -> Vec<F256> {
+    let coef: Vec<F256> = terms.iter().map(|t| t.scale * t.blk[0]).collect();
+    let mut out = crate::scratch::take_f256(d);
+    out.par_chunks_mut(1 << 12).enumerate().for_each(|(c, oc)| {
+        let h0 = c << 12;
+        for (i, o) in oc.iter_mut().enumerate() {
+            let mut v = F256::ZERO;
+            for (t, &cf) in terms.iter().zip(&coef) {
+                v += cf * t.within[h0 + i];
+            }
+            *o = v;
+        }
+    });
+    out
+}
+
+/// The lane-major L0 phase — OOD sampling, round-0 message, `initial_k`
+/// rounds, the fold and the code switch — via block statistics. Returns
+/// the prover state after the switch and the lane challenges.
+#[allow(clippy::too_many_arguments)]
+fn init_phase_statistics<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    seeded: VirtualEqBasis,
+    target: &mut F128,
+    ood_samples: usize,
+    claim_bits_0: u32,
+    d: usize,
+    initial_k: usize,
+    ood_values: &mut Vec<F128>,
+    claim_batch_grinding_nonces: &mut Vec<u64>,
+    challenger: &mut Ch,
+    trace: bool,
+) -> (SumcheckProver256, Vec<F256>) {
+    let log_n = packed_witness.len().trailing_zeros() as usize;
+    assert!(initial_k >= 1 && d == 1usize << (log_n - initial_k));
+    let n_within = log_n - initial_k;
+    let split = |point: &[F128]| -> (Vec<F128>, Vec<F256>) {
+        let within = crate::pcs::ring_switch::build_eq_scaled_parallel(&point[..n_within], F128::ONE);
+        let blk = crate::pcs::ring_switch::build_eq_scaled_parallel(&point[n_within..], F128::ONE);
+        (within, blk.into_iter().map(F256::from).collect())
+    };
+    assert_eq!(seeded.terms.len(), 1, "the seeded basis is one scaled eq tensor");
+    let (s_within, s_blk) = split(&seeded.terms[0].coords);
+    let gamma = seeded.terms[0].scale;
+    // OOD points: the first shares the seeded term's sweep, later ones (a
+    // non-shipped config) sweep on their own since each `z` depends on the
+    // previous `y`.
+    let t0 = std::time::Instant::now();
+    let mut zs: Vec<Vec<F128>> = Vec::with_capacity(ood_samples);
+    let mut terms: Vec<StatTerm> = Vec::with_capacity(1 + ood_samples);
+    let push_ood = |z: Vec<F128>,
+                    g: Vec<F128>,
+                    terms: &mut Vec<StatTerm>,
+                    target: &mut F128,
+                    ood_values: &mut Vec<F128>,
+                    nonces: &mut Vec<u64>,
+                    challenger: &mut Ch| {
+        let (within, blk) = split(&z);
+        let y = blk
+            .iter()
+            .zip(&g)
+            .fold(F128::ZERO, |acc, (&b, &gv)| acc + b.c0 * gv);
+        challenger.observe_f128(y);
+        ood_values.push(y);
+        let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits_0);
+        nonces.push(nonce);
+        *target += beta * y;
+        terms.push(StatTerm {
+            scale: F256::from(beta),
+            within,
+            blk,
+            g: g.into_iter().map(F256::from).collect(),
+        });
+    };
+    if ood_samples > 0 {
+        zs.push(challenger.sample_f128_vec(log_n));
+    }
+    let (first_within, _) = zs.first().map(|z| split(z)).unwrap_or_default();
+    let mut stats = if ood_samples > 0 {
+        block_statistics(&packed_witness, &[&s_within, &first_within], d)
+    } else {
+        block_statistics(&packed_witness, &[&s_within], d)
+    };
+    let t_sweep = t0.elapsed();
+    terms.push(StatTerm {
+        scale: F256::from(gamma),
+        within: s_within,
+        blk: s_blk,
+        g: stats.remove(0).into_iter().map(F256::from).collect(),
+    });
+    if ood_samples > 0 {
+        let g = stats.remove(0);
+        let z = zs.remove(0);
+        push_ood(z, g, &mut terms, target, ood_values, claim_batch_grinding_nonces, challenger);
+    }
+    for _ in 1..ood_samples {
+        let z = challenger.sample_f128_vec(log_n);
+        let (within, _) = split(&z);
+        let g = block_statistics(&packed_witness, &[&within], d).remove(0);
+        push_ood(z, g, &mut terms, target, ood_values, claim_batch_grinding_nonces, challenger);
+    }
+    // Round 0: base-valued (every factor is in F128), promoted like `new`.
+    let t1 = std::time::Instant::now();
+    let first = stats_round_msg(&terms);
+    debug_assert!(first.u_0.c1.is_zero() && first.u_2.c1.is_zero());
+    let mut transcript = vec![first];
+    observe_message(challenger, first);
+    let mut lane_challenges = Vec::with_capacity(initial_k);
+    for j in 0..initial_k {
+        let r = challenger.sample_f256();
+        lane_challenges.push(r);
+        for t in &mut terms {
+            fold_block_pairs(&mut t.blk, r);
+            fold_block_pairs(&mut t.g, r);
+        }
+        if j + 1 < initial_k {
+            let msg = stats_round_msg(&terms);
+            transcript.push(msg);
+            observe_message(challenger, msg);
+        }
+    }
+    let t_rounds = t1.elapsed();
+    let t2 = std::time::Instant::now();
+    let w = build_eq_table256(&lane_challenges);
+    let f = fold_blocks_by_eq(&packed_witness, &w, d);
+    crate::scratch::give_f128(packed_witness);
+    let t_fold = t2.elapsed();
+    let t3 = std::time::Instant::now();
+    let basis = materialize_folded_basis(&terms, d);
+    let t_basis = t3.elapsed();
+    let t4 = std::time::Instant::now();
+    let mut sumcheck = SumcheckProver256::from_folded(f, basis, transcript);
+    let msg = sumcheck.code_switch_and_push_message();
+    observe_message(challenger, msg);
+    if trace {
+        eprintln!(
+            "    stats ladder (d {d}, {} terms): sweep {:.2} | rounds {:.2} | fold {:.2} | basis {:.2} | switch {:.2} ms",
+            terms.len(),
+            t_sweep.as_secs_f64() * 1e3,
+            t_rounds.as_secs_f64() * 1e3,
+            t_fold.as_secs_f64() * 1e3,
+            t_basis.as_secs_f64() * 1e3,
+            t4.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    (sumcheck, lane_challenges)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     config: &ProverConfig,
@@ -1744,6 +2030,31 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         2 => false,
         _ => std::env::var_os("FLOCK_NO_FOLD_LOOKAHEAD").is_none(),
     };
+    // THE STATISTICS LADDER (see `init_phase_statistics`): lane-major with
+    // the factored basis. The combine skipped its O(L) sweep under the same
+    // gate, so `first_msg`/`round1_lookahead` carry nothing here.
+    let stats_path = virtual_basis.is_some() && l0_lane_major && crate::pcs::stats_ladder_enabled();
+    let (mut sumcheck, lane_challenges) = if stats_path {
+        let seeded = virtual_basis.take().expect("gated on Some");
+        let _t = std::time::Instant::now();
+        let out = init_phase_statistics(
+            packed_witness,
+            seeded,
+            &mut target,
+            ood_count(0),
+            claim_bits(0),
+            fold_block,
+            initial_k,
+            &mut ood_values,
+            &mut claim_batch_grinding_nonces,
+            challenger,
+            trace,
+        );
+        if trace {
+            t_init_folds += _t.elapsed();
+        }
+        out
+    } else {
     let mut lookahead = round1_lookahead.filter(|_| {
         let kind_ok = virtual_basis.is_some() || (l0_jit_basis.is_none() && fold_block == 1);
         alternation && kind_ok && initial_k >= 2 && packed_witness.len() >= 8 * fold_block
@@ -1988,6 +2299,8 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_init_folds += _t.elapsed();
     }
+        (sumcheck, lane_challenges)
+    };
 
     let n1 = log_n - initial_k;
     let mut current_split_dim = n1 + 1;
