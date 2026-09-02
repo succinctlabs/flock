@@ -1932,7 +1932,12 @@ pub fn lookahead_msg_second(q: &LookaheadSums, rho: F128) -> (F128, F128) {
 /// weightings". Exact: every product is bilinear, so `(eq·a)·b = eq·(a·b)` in
 /// the field, and the unreduced accumulators reduce to the same sums.
 #[inline(always)]
-fn lookahead_accum(ga: &[F128; 4], gb: &[F128; 4], eq: F128, acc: &mut [F256Unreduced; 8]) {
+pub(crate) fn lookahead_accum(
+    ga: &[F128; 4],
+    gb: &[F128; 4],
+    eq: F128,
+    acc: &mut [F256Unreduced; 8],
+) {
     let (ga00, ga10, ga01, ga11) = (eq * ga[0], eq * ga[1], eq * ga[2], eq * ga[3]);
     let (gb00, gb10, gb01, gb11) = (gb[0], gb[1], gb[2], gb[3]);
     let sxa0 = ga00 + ga10;

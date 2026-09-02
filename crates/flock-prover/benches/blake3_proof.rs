@@ -215,7 +215,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         // Grind-free proofs fail PoW verification by design; skip the verify
         // so the phase TSV and summary lines below still print.
         let no_grind = std::env::var_os("FLOCK_NO_GRIND").is_some();
-        let mut report = |peak: f64, verify: Option<f64>, size: usize| {
+        let report = |peak: f64, verify: Option<f64>, size: usize| {
             println!("  peak memory: {peak:>8.2} MB");
             match verify {
                 Some(v) => println!("  verify: {}", fmt_ms(v)),
