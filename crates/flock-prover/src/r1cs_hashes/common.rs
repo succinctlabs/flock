@@ -584,6 +584,42 @@ pub(crate) unsafe fn flush_rows_nt(
     }
 }
 
+/// [`flush_rows_nt`] for `n_sets` consecutive groups staged back to back
+/// (`rows_per_set` words each): for every chunk-column the sets' 8-row
+/// records are stored one after another, so column `c` receives ONE
+/// contiguous `128·n_sets`-byte burst at `dest[(c << n_log) + o0]` instead of
+/// `n_sets` scattered 128-byte stores.
+///
+/// # Safety
+/// As [`flush_rows_nt`], for rows `[o0, o0 + 8·n_sets)`.
+#[inline]
+pub(crate) unsafe fn flush_rows_nt_burst(
+    rows_all: &[BmRow],
+    n_sets: usize,
+    rows_per_set: usize,
+    dest: *mut u64,
+    o0: usize,
+    n_log: usize,
+    useful_chunks: usize,
+) {
+    debug_assert!(rows_all.len() >= n_sets * rows_per_set);
+    for c in 0..useful_chunks {
+        for i in 0..n_sets {
+            let rows = &rows_all[i * rows_per_set..(i + 1) * rows_per_set];
+            let even = &rows[2 * c];
+            let odd = &rows[2 * c + 1];
+            let mut buf = [0u64; 2 * BM_V];
+            for j in 0..BM_V {
+                buf[2 * j] = even[j];
+                buf[2 * j + 1] = odd[j];
+            }
+            unsafe {
+                nt_store_row(buf.as_ptr(), dest.add(((c << n_log) + o0 + i * BM_V) * 2));
+            }
+        }
+    }
+}
+
 /// Transpose the z rows into the lincheck byte-stripe for one V = 8 group.
 /// Only `useful_words` rows are written (the stripe tail stays zero).
 #[inline]
@@ -956,45 +992,96 @@ where
     } else {
         n_total / BM_V
     };
-    (0..n_groups).into_par_iter().for_each_init(
+    // BURST-LENGTH FLUSH. The witness is column-major (chunk-column c's 2^nu
+    // rows are contiguous, 4 MB apart per column), but the builder emits 8
+    // ROWS per group across all columns, so the natural flush is 92 separate
+    // 128-byte NT stores per group, each to a different page — measured at
+    // ~58 GB/s while the commit's contiguous lane fill runs the same bus at
+    // ~140 GB/s. Each task therefore stages WG consecutive groups (8·WG
+    // rows) and flushes them per column as ONE contiguous 128·WG-byte burst.
+    // Same words to the same addresses; the stripe stays per group (it is
+    // already group-major and contiguous). WG = 8 (1 KB bursts, 384 KB of
+    // staging per worker): measured at m=32 against the one-group flush,
+    // witgen −12 ms ST (339 vs 352) and −3 to −5 ms MT in-prove; WG = 16
+    // (768 KB staging) spills L2 and gives the ST gain back (+4).
+    const WG: usize = 8;
+    let wg = WG;
+    let n_super = n_groups.div_ceil(wg);
+    (0..n_super).into_par_iter().for_each_init(
         || {
             (
-                vec![[0u64; BM_V]; u64_per_block],
-                vec![[0u64; BM_V]; u64_per_block],
-                vec![[0u64; BM_V]; u64_per_block],
+                vec![[0u64; BM_V]; wg * u64_per_block],
+                vec![[0u64; BM_V]; wg * u64_per_block],
+                vec![[0u64; BM_V]; wg * u64_per_block],
             )
         },
-        move |(rz, ra, rb), g| {
-            rz[..useful_words].fill([0u64; BM_V]);
-            ra[..useful_words].fill([0u64; BM_V]);
-            rb[..useful_words].fill([0u64; BM_V]);
-            let o0 = g * BM_V;
-            let live = n_declared.saturating_sub(o0).min(BM_V);
-            if live > 0 {
-                // Dead lanes get the group's first real input as a
-                // placeholder — their rows are zeroed below, so the
-                // placeholder's data never reaches the buffers.
-                let group: [&S; BM_V] =
-                    std::array::from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(&inputs_ref[o0]));
-                per_group(group, rz, ra, rb);
-                if live < BM_V {
-                    for rows in [&mut *rz, &mut *ra, &mut *rb] {
-                        for row in rows[..useful_words].iter_mut() {
-                            for lane in row[live..].iter_mut() {
-                                *lane = 0;
+        move |(rz_all, ra_all, rb_all), sg| {
+            let g0 = sg * wg;
+            let n_in = wg.min(n_groups - g0);
+            for i in 0..n_in {
+                let g = g0 + i;
+                let rz = &mut rz_all[i * u64_per_block..(i + 1) * u64_per_block];
+                let ra = &mut ra_all[i * u64_per_block..(i + 1) * u64_per_block];
+                let rb = &mut rb_all[i * u64_per_block..(i + 1) * u64_per_block];
+                rz[..useful_words].fill([0u64; BM_V]);
+                ra[..useful_words].fill([0u64; BM_V]);
+                rb[..useful_words].fill([0u64; BM_V]);
+                let o0 = g * BM_V;
+                let live = n_declared.saturating_sub(o0).min(BM_V);
+                if live > 0 {
+                    // Dead lanes get the group's first real input as a
+                    // placeholder — their rows are zeroed below, so the
+                    // placeholder's data never reaches the buffers.
+                    let group: [&S; BM_V] =
+                        std::array::from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(&inputs_ref[o0]));
+                    per_group(group, rz, ra, rb);
+                    if live < BM_V {
+                        for rows in [&mut *rz, &mut *ra, &mut *rb] {
+                            for row in rows[..useful_words].iter_mut() {
+                                for lane in row[live..].iter_mut() {
+                                    *lane = 0;
+                                }
                             }
                         }
                     }
                 }
+                // Fully-dummy groups (live == 0) flush the pre-zeroed rows:
+                // the dummy region must be written, not skipped — see above.
+                // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
+                unsafe {
+                    stripe_from_rows(rz, sp.get() as *mut u8, o0, u64_per_block, useful_words);
+                }
             }
-            // Fully-dummy groups (live == 0) flush the pre-zeroed rows:
-            // the dummy region must be written, not skipped — see above.
-            // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
+            // SAFETY: the staged groups own rows [g0·8, (g0+n_in)·8) of every
+            // chunk-column; super-groups are disjoint.
             unsafe {
-                flush_rows_nt(rz, zp.get(), o0, n_blocks_log, useful_chunks);
-                flush_rows_nt(ra, ap.get(), o0, n_blocks_log, useful_chunks);
-                flush_rows_nt(rb, bp.get(), o0, n_blocks_log, useful_chunks);
-                stripe_from_rows(rz, sp.get() as *mut u8, o0, u64_per_block, useful_words);
+                flush_rows_nt_burst(
+                    rz_all,
+                    n_in,
+                    u64_per_block,
+                    zp.get(),
+                    g0 * BM_V,
+                    n_blocks_log,
+                    useful_chunks,
+                );
+                flush_rows_nt_burst(
+                    ra_all,
+                    n_in,
+                    u64_per_block,
+                    ap.get(),
+                    g0 * BM_V,
+                    n_blocks_log,
+                    useful_chunks,
+                );
+                flush_rows_nt_burst(
+                    rb_all,
+                    n_in,
+                    u64_per_block,
+                    bp.get(),
+                    g0 * BM_V,
+                    n_blocks_log,
+                    useful_chunks,
+                );
             }
         },
     );
