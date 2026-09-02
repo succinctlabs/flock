@@ -4814,3 +4814,51 @@ my hypothesis, was promoted to a conclusion on their side without a
 source check, and was caught by reading our header — the same failure
 mode as the friendly-kernel claim in the other direction. Verify from
 source before recording an explanation, in either direction.
+
+### LANDED: fold-level lookahead entry — the sparse tail enters at fold2 — −10 ms MT, −12 ST — 2026-09-02
+
+Benedikt pushed back on the "fold-level entry is dead" verdict ("I
+fundamentally think there should be a lot to gain here") and was right,
+because the probe that condemned it was wrong in one specific way: it
+ADDED the eight-product lookahead accumulation on top of the fold's
+existing round-0 Horner message. In a fused fold the sums REPLACE that
+message (round 0 falls out of them via `lookahead_msg_first`), so the
+fair cost is the difference. Measured in stages, each gated:
+
+1. Replacement probe (scalar `lookahead_accum` on the folded outputs,
+   `s1/s_inf` gone): fold **+10.5 ms MT** (+10.8/+10.3) and +98 ST —
+   half the add-on probe's +19/+182. Oracle: m=32 verifies with the
+   sums-derived round-0 message; all AG roundtrips pass.
+2. NEON-resident formation (`fold_block_at_la_neon`: byte-dots stay in
+   q-registers off `fold_row_q_neon`, four `mul_q` pre-scalings by the
+   quad's eq weight, eight `wide_mul_unreduced_q` into `WideNeon`
+   accumulators): fold cost **+5 ms** (67.4 vs 62–64 classic, vs 70 for
+   the scalar form).
+3. The entry: `fold_and_first_round_sparse` returns the sums;
+   `mlv_tail_fs_sparse` derives round 1's message at ρ₀ via
+   `lookahead_msg_second`, samples ρ₁, and starts the ladder at round 2
+   with `pending2 = Some(ρ₁)` — the tail's first pass is a fold2 over the
+   full 48M, no fold1 entry pass. Tail 62 → 45–47 in the same
+   conditions.
+
+fold+tail, MT, alternating, warm min, same binary (knob), on a
+partially loaded machine (load 3–6): scalar entry −11.7 / −7.5 / −9.8;
+NEON entry **−10.0 / −11.1 / −21.1** (the −21 is a contended classic
+arm). ST: **−11.9**. Call it −10 ms MT, ~1.2% of the prove, on top of
+the ladder's −4.5. Transcript-identical: m=32 verifies on both routes,
+RS m6 pins unchanged, roundtrips in release and with debug assertions.
+
+One bug caught by the suite, worth recording: `sparse_tail_matches_
+dense_at_low_utilization` failed because the ladder's resolve branch
+set `store` to a single prefix interval — previously safe, since
+`pending2` could only be `Some` after a lookahead pass, which required a
+prefix. The fold-level entry starts with a deferred challenge before
+any prefix is established, so on a multi-interval layout the resolve
+must halve every interval instead. Fixed; the in-place pairwise fold
+itself never straddles an interval (128-aligned).
+
+Now the default on the sparse route (NEON on aarch64+aes, scalar
+elsewhere; the dense folds keep the Horner message). The earlier
+"fold-level entry: DEAD" entry above stands as a record of a probe that
+measured the wrong thing — the lesson is "replace, don't add" when
+pricing a fusion.
