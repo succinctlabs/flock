@@ -4972,3 +4972,52 @@ and the burst is where its store traffic goes.
 Remaining witgen at m=32 after this: ~26 → ~15 ms of stores, ~18 BLAKE3
 compute, ~13 stripe_from_rows, ~5 z memset, ~6 row fill. The stripe's
 own writes are already group-major and contiguous.
+
+### PRICED, NOT BUILT: witgen computes the challenge-free half of round 1 — negative — 2026-09-02
+
+Benedikt's follow-up to the one-pass question: the walker builds a and b
+as it goes, and round 1's per-block product-code work does not depend on
+the zerocheck challenge (only the outer eq weight does), so witgen could
+compute that part, write it, and a post-challenge pass could form the
+message from the stored data — "maybe more writing and reading but better
+streaming". Three facts kill it on this box:
+
+**1. Round 1's reads are not exposed (measured).** Throwaway probe: the
+production padded kernel on the m=32 shape streamed from DRAM vs looped
+over a cache-resident window with the same live block count:
+
+| | ms per m=32 |
+|---|---:|
+| streamed, 1.2 GB from DRAM | 46.4 (25 GB/s) |
+| resident 96 MB window ×11 | 48.7 |
+| resident 24 MB window ×46 | 55.5 |
+| resident 6 MB window ×184 | 77.9 |
+
+Resident is never faster; the small-window arms are slower by the
+per-call join (≈0.17–0.2 ms × calls, the E-thread tail). Round 1 is
+compute-bound at a quarter of the bus. Moving its SLP into witgen
+relocates compute and saves no memory time.
+
+**2. The challenge-free intermediate is bigger than the inputs.** Per
+1024-byte block: `af∧bf` is 160 evaluation points × 128 lanes = 2560 B,
+the transposed C banks 1024 B — 3584 B vs the 3072 B of a+b+c it would
+replace (the code's rate is 64→160). Live: 1.35 GB written into a
+witgen that is already store-bound (+10–13 ms) and read back by the
+post-challenge accumulate pass (+the 288 unreduced muls/block that stay
+there anyway).
+
+**3. a and b must still cross the ρ₀ wall in full.** The skip→mlv fold
+is a ρ₀-dependent linear functional of the raw words, so the
+intermediate cannot replace them. Variants that drop the a/b writes by
+replaying the walker (a = A·z) need two replays (round 1 + fold) at
+≤ 17.8 ms each against ≤ 17 ms of savings (a/b stores ~10, fold's a/b
+read ~7); the replay-in-fold-only hybrid nets `X − 3` for a replay cost
+X. Nothing here is positive without the a/b derivation being under
+half the builder, which would need builder surgery to even measure.
+
+The streaming picture that comes out of this: everything before ρ₀
+(witgen, commit, round 1) is compute-bound; everything after it (fold,
+tail) is bandwidth-bound; and the data crossing the wall is the raw
+witness because the fold's functional depends on ρ₀. The commit/round-1
+fusion and the witgen/round-1 fusion both fail for the same reason —
+there is no exposed memory time on the near side of the wall to hide.
