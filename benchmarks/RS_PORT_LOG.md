@@ -5286,3 +5286,47 @@ Open (pairs 2–3) −17 / −16 ms; **best prove 601.4 ms**. Bit-identical:
 m6 merged-union proof-bytes pins, prover roundtrips, core pcs suite,
 the stats-ladder and fold-lookahead oracles. The promoted intake
 (`introduce_extension`) is deleted.
+
+### LANDED: the L0 Merkle was hashing every leaf on the generic path — merkle 116 → 39 ms MT, commit −78, prove −67..−90 — 2026-09-03
+
+Benedikt: "commit + zerocheck + lincheck should be cheaper now than
+before, because the AG skip is so much better — investigate." The
+investigation went through the 09-01 commit attribution, which had
+declared the merkle "at the hash roofline for rate 1/4, 2 GB". The
+L0 rate is 1/2 (`Blake3Setup::new` → `log_inv_rate 1`; the ligerito
+config's `log_inv_rates[0] = 1`), so the codeword is 2^26 F128 = 1 GB
+and 116 ms is 8.6 GB/s — HALF the roofline that entry itself quoted
+(2.3–2.4 GB/s per core), and half Yukon's 20 GB/s.
+
+Cause: `blake3_hash_many_leaves` dispatched the 8-way NEON kernel only
+for leaf sizes 64/128/256/512/1024 ("leaf sizes are `16 << log_batch_
+size`, so only powers of two arise" — true before the integer-lane
+commit). The union commits `commit_lanes` = 46 lanes at m=32, so the
+leaf is 736 bytes, and every one of the 2^20 leaves went to the generic
+per-leaf `blake3::Hasher` (parallel across leaves, single-stream
+inside). Fix: the kernel takes the last block's true length (a short
+final block is zero-padded, as BLAKE3 specifies — `compress2` now takes
+the block length instead of a constant 64), and the batcher accepts any
+single-chunk leaf (`1..=1024`), tail leaves on the generic path. Same
+chunk CVs, same roots.
+
+| m=32 | new | base |
+|---|---|---|
+| merkle MT (3 pairs) | 39.8 / 39.2 / 39.3 | 116.7 / 121.1 / 115.6 |
+| commit MT | 154.4 / 146.1 / 150.2 | 232.9 / 229.9 / 222.3 |
+| prove TOTAL MT | 583.8 / 554.4 / 540.4 | 651.1 / 643.5 / 625.7 |
+| merkle / commit / total ST | 314 / 1008 / 3206 | 941 / 1640 / 3938 |
+
+1 GB in 39 ms = 25.6 GB/s on the all-core pool. **Best prove 540.4 ms
+under load 17** — the previous best was 601. Certified: 24 merkle unit
+tests including the new sizes (1, 16, 32, 48, 63, 100, 736, 1000), m6
+merged-union proof-bytes pins (roots identical), roundtrips; workspace,
+fmt, x86 and m=32 verify below.
+
+And the answer to the question: pre-merge commit + zc + lincheck was
+262 + 120 + 19 = 401 (with ~130 ms of RS round-1 prep hidden under a
+stall-rich commit); now it is ~150 + ~170 + ~20 = 340 — cheaper by
+~60 ms, all of it from this fix. Before it, the sum was 405–415: the
+AG skip's saving (RS round 1 165 ms all-in → AG 48) was cancelled by
+round 1 no longer having a commit window with idle capacity to hide
+in, and by the merkle running at half speed.
