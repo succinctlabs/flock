@@ -1852,6 +1852,7 @@ fn materialize_folded_basis(terms: &[StatTerm], d: usize) -> Vec<F256> {
 fn init_phase_statistics<Ch: Challenger>(
     packed_witness: Vec<F128>,
     seeded: VirtualEqBasis,
+    seeded_stats: Option<Vec<F128>>,
     target: &mut F128,
     ood_samples: usize,
     claim_bits_0: u32,
@@ -1912,17 +1913,35 @@ fn init_phase_statistics<Ch: Challenger>(
         zs.push(challenger.sample_f128_vec(log_n));
     }
     let (first_within, _) = zs.first().map(|z| split(z)).unwrap_or_default();
-    let mut stats = if ood_samples > 0 {
-        block_statistics(&packed_witness, &[&s_within, &first_within], d)
+    // One sweep for the terms whose statistics are not already known: the
+    // seeded term's arrive from the merged sumcheck when the caller has
+    // them (`seeded_stats`), leaving only the OOD term to sweep for.
+    let n_e = packed_witness.len() / d;
+    let mut withins: Vec<&[F128]> = Vec::with_capacity(2);
+    if seeded_stats.is_none() {
+        withins.push(&s_within);
+    }
+    if ood_samples > 0 {
+        withins.push(&first_within);
+    }
+    let mut stats = if withins.is_empty() {
+        Vec::new()
     } else {
-        block_statistics(&packed_witness, &[&s_within], d)
+        block_statistics(&packed_witness, &withins, d)
     };
     let t_sweep = t0.elapsed();
+    let s_g = match seeded_stats {
+        Some(g) => {
+            assert_eq!(g.len(), n_e, "seeded statistics: one per lane block");
+            g
+        }
+        None => stats.remove(0),
+    };
     terms.push(StatTerm {
         scale: F256::from(gamma),
         within: s_within,
         blk: s_blk,
-        g: stats.remove(0).into_iter().map(F256::from).collect(),
+        g: s_g.into_iter().map(F256::from).collect(),
     });
     if ood_samples > 0 {
         let g = stats.remove(0);
@@ -2021,6 +2040,10 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // over the same messages, so `None` (or the A/B override) just takes
     // the plain fold path.
     round1_lookahead: Option<FoldLookahead>,
+    // The seeded term's block statistics when the caller already holds them
+    // (the merged transport: its sumcheck's folded witness at the lane-block
+    // round); `None` sweeps for them.
+    seeded_stats: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -2103,6 +2126,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let out = init_phase_statistics(
             packed_witness,
             seeded,
+            seeded_stats,
             &mut target,
             ood_count(0),
             claim_bits(0),

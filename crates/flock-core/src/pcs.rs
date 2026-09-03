@@ -246,6 +246,41 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Chall
     grinding: OpeningGrinding,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
+    open_batch_mixed_ligerito_seeded(
+        packed_witness,
+        prover_data,
+        commitment,
+        x_outers,
+        precomputed_s_hat_v,
+        packed_direct,
+        padding,
+        lig_config,
+        grinding,
+        None,
+        challenger,
+    )
+}
+
+/// [`open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding`] with
+/// the inner open's SEEDED BLOCK STATISTICS supplied by the caller: the
+/// merged transport's inner claim sits at the merged sumcheck's own point,
+/// so that sumcheck's folded witness after `log_n − initial_k` rounds IS
+/// `Σ_h f[e,h]·eq(ρ_{low}, h)` per lane block — the statistics ladder's
+/// seeded term, which it would otherwise sweep the witness to recompute.
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_mixed_ligerito_seeded<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    grinding: OpeningGrinding,
+    seeded_stats: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> BatchOpeningProofLigerito {
     // Belt-and-braces on the cap-depth derivation: the commit-time cap
     // (from `PcsParams::l0_cap_depth`) must be the layer the opener's
     // config implies — a config-source disagreement fails loudly here at
@@ -374,6 +409,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Chall
         round1_lookahead,
         jit,
         vbasis,
+        seeded_stats,
         challenger,
     );
     if trace {
@@ -1658,6 +1694,11 @@ pub fn open_batch_merged<Ch: Challenger>(
     let mut a = crate::scratch::take_f128(l / 4);
     let mut bb = crate::scratch::take_f128(l / 4);
     let mut cur = l;
+    // The inner open's seeded block statistics: the folded witness at the
+    // round where `2^initial_k` lane blocks remain (dead blocks past the
+    // live prefix are honest zeros of `q`, so the untouched tail is zeroed).
+    let seed_len = 1usize << lig_config.initial_k;
+    let mut seeded_stats: Option<Vec<F128>> = None;
     for round in 0..dense_log {
         let half = cur / 2;
         challenger.observe_f128(g_one);
@@ -1676,6 +1717,12 @@ pub fn open_batch_merged<Ch: Challenger>(
         } else {
             (&a, &bb)
         };
+        if cur == seed_len && seed_len < l {
+            let lv = live.min(cur);
+            let mut g = a_src[..lv].to_vec();
+            g.resize(cur, F128::ZERO);
+            seeded_stats = Some(g);
+        }
         if cur > 2 {
             let lv = live.min(cur);
             let lhalf = lv / 2;
@@ -1792,7 +1839,7 @@ pub fn open_batch_merged<Ch: Challenger>(
             )
         },
         || {
-            open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
+            open_batch_mixed_ligerito_seeded(
                 q,
                 prover_data,
                 commitment,
@@ -1802,6 +1849,7 @@ pub fn open_batch_merged<Ch: Challenger>(
                 &PaddingSpec::dense(commitment.params.m),
                 lig_config,
                 grinding,
+                seeded_stats,
                 challenger,
             )
         },

@@ -4771,6 +4771,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         None,
         None,
+        None,
         challenger,
     )
 }
@@ -4808,6 +4809,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_2: round0_uv.1,
         }),
         round1_lookahead,
+        None,
         challenger,
     )
 }
@@ -4836,6 +4838,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
     round1_lookahead: Option<FoldLookahead>,
     l0_jit_basis: Option<BasisWindowFn<'_>>,
     l0_virtual_basis: Option<VirtualEqBasis>,
+    seeded_stats: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     extension::recursive_prover_with_basis_impl(
@@ -4854,6 +4857,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
             u_2: round0_uv.1,
         }),
         round1_lookahead,
+        seeded_stats,
         challenger,
     )
 }
