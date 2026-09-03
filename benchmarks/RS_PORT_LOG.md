@@ -5228,3 +5228,28 @@ schedule (`from_message_fused3` writing the first radix-8 result
 straight from the compact message); that is a from_message path for
 the recursive levels, a larger port, parked. Lane count is not the
 cause (their 8 lanes beat our 16).
+
+### REFUTED: alternating skip/double-fold schedule on the merged product sumcheck — 2026-09-03
+
+The L0 ladder's schedule (skip a round via lookahead coefficients,
+then fold two challenges in one pass) applied to the transport's
+25-round product sumcheck `Σ_d q[d]·W[d]` (19.5 MT / 85 ST; ~45% less
+traffic on paper). Built twice, both byte-identical (m6 pins, the
+lookahead and stats oracles, pcs suite), both measured against the
+saved baseline binary, alternating, 3 MT pairs + 1 ST pair:
+
+| | merged SC MT | W build MT | merged SC ST | W build ST |
+|---|---|---|---|---|
+| baseline | 17.9 / 17.9 / 17.7 | 25.0 / 25.0 / 25.1 | 81.6 | 166.4 |
+| A: round-1 lookahead fused into the W build | 11.6 / 12.1 / 11.4 | 29.8 / 30.8 / 29.2 | 79.0 | 205.9 |
+| B: entry at a round-0 fold+lookahead pass | 16.2 / 16.1 / 16.0 | 24.6 / 24.7 / 26.0 | 107.7 | 168.1 |
+
+A: −6.2 on the sumcheck but +5.0 on the evaluation-bound W build (+40
+ST) — net −1 MT, +37 ST. B: −1.8 MT, +26 ST. Neither clears the bar.
+Mechanism: these passes are one multiply per element and already
+within ~1.3× of compute-bound at MT; the lookahead's extra products
+(the 8-unreduced-mul quad accumulator) tip them over, so the traffic
+saved is repaid in PMULLs, and at ST it is pure loss. The zerocheck
+ladder won because its per-element compute (eq-weighted products)
+dwarfed the lookahead; the transport sumcheck has no such cover.
+Reverted; do not retry without a cheaper lookahead.
