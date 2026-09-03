@@ -1245,7 +1245,13 @@ impl VirtualEqBasis256 {
 }
 
 enum PendingBasis {
-    Extension(Vec<F256>),
+    /// A base-valued basis on the current table (a level OOD's `eq(z, ·)`):
+    /// kept in F128, glued into `c0` only.
+    Base(Vec<F128>),
+    /// A base-valued basis stated BEFORE the coordinate split (the induced
+    /// query basis): its split form is the pairs `(B_j, 0), (0, B_j)`
+    /// (`u·B_j = (0, B_j)`), kept as the `B_j` alone.
+    PresplitBase(Vec<F128>),
 }
 
 pub(super) struct SumcheckProver256 {
@@ -1570,21 +1576,6 @@ impl SumcheckProver256 {
         round_msg_fbase(&self.f, &self.combined_basis)
     }
 
-    fn introduce_extension(&mut self, basis: Vec<F256>, claim: F256) -> SumcheckMessage256 {
-        assert_eq!(basis.len(), self.f.len());
-        let msg = round_msg(&self.f, &basis);
-        debug_assert_eq!(
-            basis
-                .iter()
-                .zip(&self.f)
-                .fold(F256::ZERO, |acc, (&b, &f)| acc + b * f),
-            claim
-        );
-        self.transcript.push(msg);
-        self.pending = Some(PendingBasis::Extension(basis));
-        msg
-    }
-
     /// Introduce a base-field MLE claim on the currently split table. The
     /// answer is one F128 value because every table word is in the subfield.
     pub(super) fn introduce_ood_with_eval(
@@ -1592,18 +1583,34 @@ impl SumcheckProver256 {
         basis: Vec<F128>,
     ) -> (SumcheckMessage256, F128) {
         assert_eq!(basis.len(), self.f.len());
-        // XOR-additive sum: chunk order cannot change the value.
-        let answer = self
+        assert!(
+            self.f.par_iter().all(|f| f.c1.is_zero()),
+            "OOD table must be base-valued"
+        );
+        // The table is base-valued right after a code switch and the basis
+        // is base-valued by construction, so the evaluation AND the round
+        // message are three F128 products per pair in one sweep — no F256
+        // promotion of a 2^20 basis, no F256×F256 products. Same field
+        // elements as the promoted form (XOR-additive sums, order-free).
+        let (answer, u_0, u_2) = self
             .f
-            .par_iter()
-            .zip(basis.par_iter())
-            .map(|(&f, &b)| {
-                assert_eq!(f.c1, F128::ZERO, "OOD table must be base-valued");
-                f.c0 * b
+            .par_chunks_exact(2)
+            .zip(basis.par_chunks_exact(2))
+            .map(|(fp, bp)| {
+                let (f0, f1) = (fp[0].c0, fp[1].c0);
+                let p0 = f0 * bp[0];
+                (p0 + f1 * bp[1], p0, (f0 + f1) * (bp[0] + bp[1]))
             })
-            .reduce(|| F128::ZERO, |a, b| a + b);
-        let ext_basis = basis.into_par_iter().map(F256::from).collect();
-        let msg = self.introduce_extension(ext_basis, F256::from(answer));
+            .reduce(
+                || (F128::ZERO, F128::ZERO, F128::ZERO),
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+            );
+        let msg = SumcheckMessage256 {
+            u_0: F256::from(u_0),
+            u_2: F256::from(u_2),
+        };
+        self.transcript.push(msg);
+        self.pending = Some(PendingBasis::Base(basis));
         (msg, answer)
     }
 
@@ -1614,18 +1621,56 @@ impl SumcheckProver256 {
         basis: Vec<F128>,
         claim: F256,
     ) -> SumcheckMessage256 {
-        let basis_ext: Vec<F256> = basis.into_par_iter().map(F256::from).collect();
-        self.introduce_extension(split_basis(&basis_ext), claim)
+        assert_eq!(2 * basis.len(), self.f.len());
+        assert!(
+            self.f.par_iter().all(|f| f.c1.is_zero()),
+            "presplit intake needs the base-valued post-switch table"
+        );
+        // Split basis pairs `(B_j, 0), (0, B_j)` against base-valued pairs
+        // `(f_0, f_1)`: `u_0 = Σ f_0·B_j` and `u_2 = Σ (f_0+f_1)·(B_j, B_j)
+        // = (S, S)` — two F128 products per pair, no promotion, no split
+        // array. Same field elements as the materialized split form.
+        let (u_0, s) = self
+            .f
+            .par_chunks_exact(2)
+            .zip(basis.par_iter())
+            .map(|(fp, &bj)| (fp[0].c0 * bj, (fp[0].c0 + fp[1].c0) * bj))
+            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
+        debug_assert_eq!(
+            self.f
+                .par_chunks_exact(2)
+                .zip(basis.par_iter())
+                .map(|(fp, &bj)| F256::new(fp[0].c0 * bj, fp[1].c0 * bj))
+                .reduce(|| F256::ZERO, |a, b| a + b),
+            claim
+        );
+        let msg = SumcheckMessage256 {
+            u_0: F256::from(u_0),
+            u_2: F256::new(s, s),
+        };
+        self.transcript.push(msg);
+        self.pending = Some(PendingBasis::PresplitBase(basis));
+        msg
     }
 
     pub(super) fn glue(&mut self, beta: F128) {
         let pending = self.pending.take().expect("glue without introduce");
         match pending {
-            PendingBasis::Extension(basis) => {
+            PendingBasis::Base(basis) => {
                 self.combined_basis
                     .par_iter_mut()
                     .zip(basis.par_iter())
-                    .for_each(|(dst, &src)| *dst += src * beta);
+                    .for_each(|(dst, &src)| dst.c0 += src * beta);
+            }
+            PendingBasis::PresplitBase(basis) => {
+                self.combined_basis
+                    .par_chunks_exact_mut(2)
+                    .zip(basis.par_iter())
+                    .for_each(|(pair, &bj)| {
+                        let v = bj * beta;
+                        pair[0].c0 += v;
+                        pair[1].c1 += v;
+                    });
             }
         }
     }
@@ -1667,7 +1712,6 @@ fn base_table(values: &[F256]) -> Vec<F128> {
         })
         .collect()
 }
-
 
 // ---------------------------------------------------------------------------
 // THE STATISTICS LADDER (lane-major L0 rounds).
@@ -1726,9 +1770,7 @@ fn block_statistics(f: &[F128], withins: &[&[F128]], d: usize) -> Vec<Vec<F128>>
     (0..withins.len())
         .map(|t| {
             (0..n_e)
-                .map(|e| {
-                    (0..n_ch).fold(F128::ZERO, |acc, c| acc + partial[e * n_ch + c][t])
-                })
+                .map(|e| (0..n_ch).fold(F128::ZERO, |acc, c| acc + partial[e * n_ch + c][t]))
                 .collect()
         })
         .collect()
@@ -1824,11 +1866,16 @@ fn init_phase_statistics<Ch: Challenger>(
     assert!(initial_k >= 1 && d == 1usize << (log_n - initial_k));
     let n_within = log_n - initial_k;
     let split = |point: &[F128]| -> (Vec<F128>, Vec<F256>) {
-        let within = crate::pcs::ring_switch::build_eq_scaled_parallel(&point[..n_within], F128::ONE);
+        let within =
+            crate::pcs::ring_switch::build_eq_scaled_parallel(&point[..n_within], F128::ONE);
         let blk = crate::pcs::ring_switch::build_eq_scaled_parallel(&point[n_within..], F128::ONE);
         (within, blk.into_iter().map(F256::from).collect())
     };
-    assert_eq!(seeded.terms.len(), 1, "the seeded basis is one scaled eq tensor");
+    assert_eq!(
+        seeded.terms.len(),
+        1,
+        "the seeded basis is one scaled eq tensor"
+    );
     let (s_within, s_blk) = split(&seeded.terms[0].coords);
     let gamma = seeded.terms[0].scale;
     // OOD points: the first shares the seeded term's sweep, later ones (a
@@ -1880,13 +1927,29 @@ fn init_phase_statistics<Ch: Challenger>(
     if ood_samples > 0 {
         let g = stats.remove(0);
         let z = zs.remove(0);
-        push_ood(z, g, &mut terms, target, ood_values, claim_batch_grinding_nonces, challenger);
+        push_ood(
+            z,
+            g,
+            &mut terms,
+            target,
+            ood_values,
+            claim_batch_grinding_nonces,
+            challenger,
+        );
     }
     for _ in 1..ood_samples {
         let z = challenger.sample_f128_vec(log_n);
         let (within, _) = split(&z);
         let g = block_statistics(&packed_witness, &[&within], d).remove(0);
-        push_ood(z, g, &mut terms, target, ood_values, claim_batch_grinding_nonces, challenger);
+        push_ood(
+            z,
+            g,
+            &mut terms,
+            target,
+            ood_values,
+            claim_batch_grinding_nonces,
+            challenger,
+        );
     }
     // Round 0: base-valued (every factor is in F128), promoted like `new`.
     let t1 = std::time::Instant::now();
@@ -2055,250 +2118,254 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
         out
     } else {
-    let mut lookahead = round1_lookahead.filter(|_| {
-        let kind_ok = virtual_basis.is_some() || (l0_jit_basis.is_none() && fold_block == 1);
-        alternation && kind_ok && initial_k >= 2 && packed_witness.len() >= 8 * fold_block
-    });
-    let _t = std::time::Instant::now();
-    for _ in 0..ood_count(0) {
-        let z = challenger.sample_f128_vec(log_n);
-        let mut ood_la = None;
-        let (ood_msg, y, eq_z) = if factored {
-            let (msg, y) = if lookahead.is_some() {
-                // Same factored sweep, plus the (f, eq_z) pair's own BLOCKED
-                // round-1 coefficients so the lookahead survives the β-glue.
-                let (msg, y, la) =
-                    round_msg_eval_and_lookahead_eq_point_blocked(&packed_witness, &z, fold_block);
-                ood_la = Some(la);
-                (msg, y)
+        let mut lookahead = round1_lookahead.filter(|_| {
+            let kind_ok = virtual_basis.is_some() || (l0_jit_basis.is_none() && fold_block == 1);
+            alternation && kind_ok && initial_k >= 2 && packed_witness.len() >= 8 * fold_block
+        });
+        let _t = std::time::Instant::now();
+        for _ in 0..ood_count(0) {
+            let z = challenger.sample_f128_vec(log_n);
+            let mut ood_la = None;
+            let (ood_msg, y, eq_z) = if factored {
+                let (msg, y) = if lookahead.is_some() {
+                    // Same factored sweep, plus the (f, eq_z) pair's own BLOCKED
+                    // round-1 coefficients so the lookahead survives the β-glue.
+                    let (msg, y, la) = round_msg_eval_and_lookahead_eq_point_blocked(
+                        &packed_witness,
+                        &z,
+                        fold_block,
+                    );
+                    ood_la = Some(la);
+                    (msg, y)
+                } else {
+                    round_msg_and_eval_eq_point_blocked(&packed_witness, &z, fold_block)
+                };
+                (msg, y, None)
             } else {
-                round_msg_and_eval_eq_point_blocked(&packed_witness, &z, fold_block)
+                // Same doubling recurrence as `build_eq_table`, parallel —
+                // value-identical (seed ONE), and this table is 2^log_n words.
+                let eq_z = crate::pcs::ring_switch::build_eq_scaled_parallel(&z, F128::ONE);
+                let (msg, y) = if lookahead.is_some() {
+                    // Same sweep, plus the (f, eq_z) pair's own round-1
+                    // coefficients so the lookahead survives the β-glue below.
+                    let (msg, y, la) = round_msg_eval_and_lookahead(&packed_witness, &eq_z);
+                    ood_la = Some(la);
+                    (msg, y)
+                } else {
+                    round_msg_and_eval_blocked(&packed_witness, &eq_z, fold_block)
+                };
+                (msg, y, Some(eq_z))
             };
-            (msg, y, None)
-        } else {
-            // Same doubling recurrence as `build_eq_table`, parallel —
-            // value-identical (seed ONE), and this table is 2^log_n words.
-            let eq_z = crate::pcs::ring_switch::build_eq_scaled_parallel(&z, F128::ONE);
-            let (msg, y) = if lookahead.is_some() {
-                // Same sweep, plus the (f, eq_z) pair's own round-1
-                // coefficients so the lookahead survives the β-glue below.
-                let (msg, y, la) = round_msg_eval_and_lookahead(&packed_witness, &eq_z);
-                ood_la = Some(la);
-                (msg, y)
-            } else {
-                round_msg_and_eval_blocked(&packed_witness, &eq_z, fold_block)
-            };
-            (msg, y, Some(eq_z))
-        };
-        challenger.observe_f128(y);
-        ood_values.push(y);
-        let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(0));
-        claim_batch_grinding_nonces.push(nonce);
-        target += beta * y;
-        if let Some(msg) = first_msg.as_mut() {
-            msg.u_0 += beta * ood_msg.u_0;
-            msg.u_2 += beta * ood_msg.u_2;
-        }
-        if let (Some(la), Some(ood)) = (lookahead.as_mut(), ood_la.as_ref()) {
-            lookahead_add_scaled(la, ood, beta);
-        }
-        if let Some(vb) = virtual_basis.as_mut() {
-            vb.add_term(z, beta);
-        } else if factored {
-            if let Some(vb) = jit_ood_basis.as_mut() {
-                vb.add_term(z, beta);
-            } else {
-                jit_ood_basis = Some(VirtualEqBasis::new(z, beta));
+            challenger.observe_f128(y);
+            ood_values.push(y);
+            let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(0));
+            claim_batch_grinding_nonces.push(nonce);
+            target += beta * y;
+            if let Some(msg) = first_msg.as_mut() {
+                msg.u_0 += beta * ood_msg.u_0;
+                msg.u_2 += beta * ood_msg.u_2;
             }
-        } else {
-            let eq_z = eq_z.expect("materialized OOD basis");
-            b_initial
-                .par_iter_mut()
-                .zip(eq_z.par_iter())
-                .for_each(|(dst, &src)| *dst += beta * src);
+            if let (Some(la), Some(ood)) = (lookahead.as_mut(), ood_la.as_ref()) {
+                lookahead_add_scaled(la, ood, beta);
+            }
+            if let Some(vb) = virtual_basis.as_mut() {
+                vb.add_term(z, beta);
+            } else if factored {
+                if let Some(vb) = jit_ood_basis.as_mut() {
+                    vb.add_term(z, beta);
+                } else {
+                    jit_ood_basis = Some(VirtualEqBasis::new(z, beta));
+                }
+            } else {
+                let eq_z = eq_z.expect("materialized OOD basis");
+                b_initial
+                    .par_iter_mut()
+                    .zip(eq_z.par_iter())
+                    .for_each(|(dst, &src)| *dst += beta * src);
+            }
         }
-    }
 
-    if trace {
-        t_l0_ood += _t.elapsed();
-    }
-
-    let _t = std::time::Instant::now();
-    let first = match first_msg {
-        Some(msg) => msg,
-        None => {
-            assert!(!factored, "factored L0 needs its precomputed first message");
-            round_msg_and_eval_blocked(&packed_witness, &b_initial, fold_block).0
+        if trace {
+            t_l0_ood += _t.elapsed();
         }
-    };
-    let materialized = (!factored).then_some(b_initial);
-    let mut sumcheck = SumcheckProver256::new(packed_witness, materialized, first);
-    observe_message(challenger, sumcheck.transcript()[0]);
-    if trace {
-        t_first += _t.elapsed();
-    }
 
-    let mut virtual_basis = virtual_basis.map(VirtualEqBasis256::from_base);
-    let mut jit = l0_jit_basis;
-    let mut lane_challenges = Vec::with_capacity(initial_k);
-    // The alternating schedule: a skip round evaluates a lookahead (the
-    // caller's base-field coefficients at round 0, [`La256`] mid-chain) and
-    // DEFERS its fold; the next fold pass absorbs both challenges and emits
-    // the following round's coefficients. The chain's last round never emits
-    // its own message (the code switch's replaces it), so a trailing
-    // deferred fold DRAINS message-free into the switch.
-    let mut pending_r0: Option<F256> = None;
-    let mut la_mid: Option<La256> = None;
-    let _t = std::time::Instant::now();
-    let mut t_fold_j = std::time::Instant::now();
-    for j in 0..initial_k {
-        let challenge = challenger.sample_f256();
-        lane_challenges.push(challenge);
-        let last = j + 1 == initial_k;
-        // La production pays only when the NEXT round exists to consume it
-        // as a skip — the last round drains into the switch, so producing
-        // there is pure waste (+4 F256 muls per output quad).
-        let want_la = alternation && j + 2 < initial_k;
-        let path;
-        if last {
-            // Materialize through any deferred challenge, then switch; the
-            // switch's fbase message is this round's transcript entry.
-            match pending_r0.take() {
-                Some(r0) => {
-                    path = "drain2+switch";
+        let _t = std::time::Instant::now();
+        let first = match first_msg {
+            Some(msg) => msg,
+            None => {
+                assert!(!factored, "factored L0 needs its precomputed first message");
+                round_msg_and_eval_blocked(&packed_witness, &b_initial, fold_block).0
+            }
+        };
+        let materialized = (!factored).then_some(b_initial);
+        let mut sumcheck = SumcheckProver256::new(packed_witness, materialized, first);
+        observe_message(challenger, sumcheck.transcript()[0]);
+        if trace {
+            t_first += _t.elapsed();
+        }
+
+        let mut virtual_basis = virtual_basis.map(VirtualEqBasis256::from_base);
+        let mut jit = l0_jit_basis;
+        let mut lane_challenges = Vec::with_capacity(initial_k);
+        // The alternating schedule: a skip round evaluates a lookahead (the
+        // caller's base-field coefficients at round 0, [`La256`] mid-chain) and
+        // DEFERS its fold; the next fold pass absorbs both challenges and emits
+        // the following round's coefficients. The chain's last round never emits
+        // its own message (the code switch's replaces it), so a trailing
+        // deferred fold DRAINS message-free into the switch.
+        let mut pending_r0: Option<F256> = None;
+        let mut la_mid: Option<La256> = None;
+        let _t = std::time::Instant::now();
+        let mut t_fold_j = std::time::Instant::now();
+        for j in 0..initial_k {
+            let challenge = challenger.sample_f256();
+            lane_challenges.push(challenge);
+            let last = j + 1 == initial_k;
+            // La production pays only when the NEXT round exists to consume it
+            // as a skip — the last round drains into the switch, so producing
+            // there is pure waste (+4 F256 muls per output quad).
+            let want_la = alternation && j + 2 < initial_k;
+            let path;
+            if last {
+                // Materialize through any deferred challenge, then switch; the
+                // switch's fbase message is this round's transcript entry.
+                match pending_r0.take() {
+                    Some(r0) => {
+                        path = "drain2+switch";
+                        if let Some(mut vb) = virtual_basis.take() {
+                            let p = fold_block.trailing_zeros() as usize;
+                            vb.fold_coord(p, r0);
+                            vb.fold_coord(p, challenge);
+                            let _ =
+                                sumcheck.first_fold2_virtual(r0, challenge, fold_block, &vb, false);
+                            // first_fold2_virtual pushes its message; the switch
+                            // replaces it — same shape as the plain path.
+                            let msg = sumcheck.code_switch_and_replace_message();
+                            observe_message(challenger, msg);
+                        } else if sumcheck.initial_pending() {
+                            let _ = sumcheck.first_fold2_materialized(r0, challenge, false);
+                            let msg = sumcheck.code_switch_and_replace_message();
+                            observe_message(challenger, msg);
+                        } else {
+                            sumcheck.fold2_drain(r0, challenge, fold_block);
+                            let msg = sumcheck.code_switch_and_push_message();
+                            observe_message(challenger, msg);
+                        }
+                    }
+                    None => {
+                        path = "fold+switch";
+                        // Plain (non-alternating) tail: fold with a message the
+                        // switch replaces, exactly the historical shape.
+                        let _ = if j == 0 {
+                            if let Some(mut vb) = virtual_basis.take() {
+                                vb.fold_coord(fold_block.trailing_zeros() as usize, challenge);
+                                sumcheck.first_fold_virtual(challenge, fold_block, &vb)
+                            } else if let Some(fill) = jit.take() {
+                                match jit_ood_basis.as_ref() {
+                                    Some(ood) => {
+                                        let combined = |out: &mut [F128], offset: usize| {
+                                            fill(out, offset);
+                                            ood.add_to(out, offset);
+                                        };
+                                        sumcheck.first_fold_jit(challenge, fold_block, &combined)
+                                    }
+                                    None => sumcheck.first_fold_jit(challenge, fold_block, fill),
+                                }
+                            } else {
+                                sumcheck.first_fold_materialized(challenge, fold_block)
+                            }
+                        } else {
+                            sumcheck.fold_materialized(challenge, fold_block)
+                        };
+                        let msg = sumcheck.code_switch_and_replace_message();
+                        observe_message(challenger, msg);
+                    }
+                }
+            } else {
+                let msg = if let (0, Some(la)) = (j, lookahead.as_ref()) {
+                    path = "lookahead-skip";
+                    // O(1) skip: round 1's message by polynomial identity; the
+                    // fold is deferred into the next double-fold pass.
+                    let msg = lookahead_eval256(la, challenge);
+                    sumcheck.push_skip_message(msg);
+                    pending_r0 = Some(challenge);
+                    msg
+                } else if let Some(la) = la_mid.take() {
+                    path = "skip";
+                    let msg = la.eval(challenge);
+                    sumcheck.push_skip_message(msg);
+                    pending_r0 = Some(challenge);
+                    msg
+                } else if let Some(r0) = pending_r0.take() {
                     if let Some(mut vb) = virtual_basis.take() {
+                        path = "fold2-virtual";
+                        // The deferred fold and this one both bind the variable
+                        // at bit log2(d): fold_coord removes it, so the second
+                        // bind at the SAME position takes the next block
+                        // variable — the ladder's successive block-d folds.
                         let p = fold_block.trailing_zeros() as usize;
                         vb.fold_coord(p, r0);
                         vb.fold_coord(p, challenge);
-                        let _ = sumcheck.first_fold2_virtual(r0, challenge, fold_block, &vb, false);
-                        // first_fold2_virtual pushes its message; the switch
-                        // replaces it — same shape as the plain path.
-                        let msg = sumcheck.code_switch_and_replace_message();
-                        observe_message(challenger, msg);
-                    } else if sumcheck.initial_pending() {
-                        let _ = sumcheck.first_fold2_materialized(r0, challenge, false);
-                        let msg = sumcheck.code_switch_and_replace_message();
-                        observe_message(challenger, msg);
+                        let (msg, la) =
+                            sumcheck.first_fold2_virtual(r0, challenge, fold_block, &vb, want_la);
+                        la_mid = la;
+                        msg
                     } else {
-                        sumcheck.fold2_drain(r0, challenge, fold_block);
-                        let msg = sumcheck.code_switch_and_push_message();
-                        observe_message(challenger, msg);
-                    }
-                }
-                None => {
-                    path = "fold+switch";
-                    // Plain (non-alternating) tail: fold with a message the
-                    // switch replaces, exactly the historical shape.
-                    let _ = if j == 0 {
-                        if let Some(mut vb) = virtual_basis.take() {
-                            vb.fold_coord(fold_block.trailing_zeros() as usize, challenge);
-                            sumcheck.first_fold_virtual(challenge, fold_block, &vb)
-                        } else if let Some(fill) = jit.take() {
-                            match jit_ood_basis.as_ref() {
-                                Some(ood) => {
-                                    let combined = |out: &mut [F128], offset: usize| {
-                                        fill(out, offset);
-                                        ood.add_to(out, offset);
-                                    };
-                                    sumcheck.first_fold_jit(challenge, fold_block, &combined)
-                                }
-                                None => sumcheck.first_fold_jit(challenge, fold_block, fill),
-                            }
+                        path = "fold2";
+                        let (msg, la) = if sumcheck.initial_pending() {
+                            sumcheck.first_fold2_materialized(r0, challenge, want_la)
                         } else {
-                            sumcheck.first_fold_materialized(challenge, fold_block)
-                        }
-                    } else {
-                        sumcheck.fold_materialized(challenge, fold_block)
-                    };
-                    let msg = sumcheck.code_switch_and_replace_message();
-                    observe_message(challenger, msg);
-                }
-            }
-        } else {
-            let msg = if let (0, Some(la)) = (j, lookahead.as_ref()) {
-                path = "lookahead-skip";
-                // O(1) skip: round 1's message by polynomial identity; the
-                // fold is deferred into the next double-fold pass.
-                let msg = lookahead_eval256(la, challenge);
-                sumcheck.push_skip_message(msg);
-                pending_r0 = Some(challenge);
-                msg
-            } else if let Some(la) = la_mid.take() {
-                path = "skip";
-                let msg = la.eval(challenge);
-                sumcheck.push_skip_message(msg);
-                pending_r0 = Some(challenge);
-                msg
-            } else if let Some(r0) = pending_r0.take() {
-                if let Some(mut vb) = virtual_basis.take() {
-                    path = "fold2-virtual";
-                    // The deferred fold and this one both bind the variable
-                    // at bit log2(d): fold_coord removes it, so the second
-                    // bind at the SAME position takes the next block
-                    // variable — the ladder's successive block-d folds.
-                    let p = fold_block.trailing_zeros() as usize;
-                    vb.fold_coord(p, r0);
-                    vb.fold_coord(p, challenge);
-                    let (msg, la) =
-                        sumcheck.first_fold2_virtual(r0, challenge, fold_block, &vb, want_la);
-                    la_mid = la;
-                    msg
-                } else {
-                    path = "fold2";
-                    let (msg, la) = if sumcheck.initial_pending() {
-                        sumcheck.first_fold2_materialized(r0, challenge, want_la)
-                    } else {
-                        sumcheck.mid_fold2(r0, challenge, fold_block, want_la)
-                    };
-                    la_mid = la;
-                    msg
-                }
-            } else if j == 0 {
-                // No caller lookahead: start the alternation at round 0 on
-                // the materialized path; virtual/jit first folds stay plain.
-                if let Some(mut vb) = virtual_basis.take() {
-                    path = "virtual-once";
-                    vb.fold_coord(fold_block.trailing_zeros() as usize, challenge);
-                    sumcheck.first_fold_virtual(challenge, fold_block, &vb)
-                } else if let Some(fill) = jit.take() {
-                    path = "jit";
-                    match jit_ood_basis.as_ref() {
-                        Some(ood) => {
-                            let combined = |out: &mut [F128], offset: usize| {
-                                fill(out, offset);
-                                ood.add_to(out, offset);
-                            };
-                            sumcheck.first_fold_jit(challenge, fold_block, &combined)
-                        }
-                        None => sumcheck.first_fold_jit(challenge, fold_block, fill),
+                            sumcheck.mid_fold2(r0, challenge, fold_block, want_la)
+                        };
+                        la_mid = la;
+                        msg
                     }
-                } else if want_la && fold_block == 1 {
-                    path = "fold+la";
-                    let (msg, la) = sumcheck.first_fold_materialized_la(challenge);
-                    la_mid = la;
-                    msg
+                } else if j == 0 {
+                    // No caller lookahead: start the alternation at round 0 on
+                    // the materialized path; virtual/jit first folds stay plain.
+                    if let Some(mut vb) = virtual_basis.take() {
+                        path = "virtual-once";
+                        vb.fold_coord(fold_block.trailing_zeros() as usize, challenge);
+                        sumcheck.first_fold_virtual(challenge, fold_block, &vb)
+                    } else if let Some(fill) = jit.take() {
+                        path = "jit";
+                        match jit_ood_basis.as_ref() {
+                            Some(ood) => {
+                                let combined = |out: &mut [F128], offset: usize| {
+                                    fill(out, offset);
+                                    ood.add_to(out, offset);
+                                };
+                                sumcheck.first_fold_jit(challenge, fold_block, &combined)
+                            }
+                            None => sumcheck.first_fold_jit(challenge, fold_block, fill),
+                        }
+                    } else if want_la && fold_block == 1 {
+                        path = "fold+la";
+                        let (msg, la) = sumcheck.first_fold_materialized_la(challenge);
+                        la_mid = la;
+                        msg
+                    } else {
+                        path = "materialized";
+                        sumcheck.first_fold_materialized(challenge, fold_block)
+                    }
                 } else {
                     path = "materialized";
-                    sumcheck.first_fold_materialized(challenge, fold_block)
-                }
-            } else {
-                path = "materialized";
-                sumcheck.fold_materialized(challenge, fold_block)
-            };
-            observe_message(challenger, msg);
+                    sumcheck.fold_materialized(challenge, fold_block)
+                };
+                observe_message(challenger, msg);
+            }
+            if trace {
+                eprintln!(
+                    "    init fold {j} ({path}, d {}): {:.2} ms",
+                    fold_block,
+                    t_fold_j.elapsed().as_secs_f64() * 1e3
+                );
+                t_fold_j = std::time::Instant::now();
+            }
         }
         if trace {
-            eprintln!(
-                "    init fold {j} ({path}, d {}): {:.2} ms",
-                fold_block,
-                t_fold_j.elapsed().as_secs_f64() * 1e3
-            );
-            t_fold_j = std::time::Instant::now();
+            t_init_folds += _t.elapsed();
         }
-    }
-    if trace {
-        t_init_folds += _t.elapsed();
-    }
         (sumcheck, lane_challenges)
     };
 
