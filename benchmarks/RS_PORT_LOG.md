@@ -5190,3 +5190,41 @@ Same field elements, so W and everything downstream are identical: the
 m6 merged-union proof-bytes pins pass, workspace 638/0, x86 check
 clean, m=32 verify passes. The probe knob and the multiply path were
 deleted (the baked form is unconditional).
+
+### REFUTED: tiled NEON radix-8 in the recursive commits' NTT — deep pass +1.0 ms, top −0.5, net loss — 2026-09-03
+
+Yukon's L1 finding (their recursive L1 encode runs FASTER per update
+than their main commit; ours 2.4× slower than ours) and their reference
+— twiddles held in vector registers across a tile of rows,
+`butterfly_fused_3layer_rows` — pointed at our recursive commits (52 ms,
+L1 encode 16–18). Our tree already HAS that kernel (the ranked top pass
+of the main commit uses it, hetero-scheduled), but the recursive commits
+enter through the generic `from_layer` driver: a portable per-row-group
+fused-3 top pass (one rayon item per 8 rows × 16 lanes = 2 KB) and a
+fused-2 (radix-4) + single-layer deep pass over 2 MB sub-groups.
+
+Built: the NEON tiled kernel with a `live` lane bound, used (a) in the
+generic top pass as (block, tile) jobs on the hetero queue and (b) in
+the deep pass wherever ≥ 3 layers remain, `zero_root` detected from the
+twiddles. Measured at m=32 with a top/deep split timer, same binary,
+3 pairs, L1 = log_d 19 / 16 lanes / start layer 3 / n_top 6:
+
+| L1 | radix-8 | shipped |
+|---|---|---|
+| top pass (layers 3–5) | 2.48 / 2.58 / 2.55 | 3.01 / 3.17 / 2.79 |
+| deep pass (13 layers) | 12.93 / 12.88 / 12.88 | 11.93 / 11.84 / 11.86 |
+| L1 encode | 16.90 / 16.95 / 17.03 | 16.42 / 16.61 / 16.27 |
+
+L2 (1/32) 7.1 vs 6.5–7.3, L3 (1/128) 2.95 vs 3.0–4.0: wash. The main
+commit never enters this driver (it takes `from_message`), so nothing
+moved there. Reverted. Reading: at 16 lanes a row is 256 B = 4 lines,
+and the radix-8 deep chain keeps 8 row streams live whose strides are
+multiples of the L1 set period — 32 lines contending for 8 ways, the
+wall Yukon's tree documents ("radix-8 is the widest fusion that fits";
+here it does not, at this lane width, in L2-resident sub-groups). The
+top pass gains from tiling/hetero but is only 3 ms. Yukon's own L1 at
+8 lanes runs 10.1 G updates/s to our 7.5 with a different layer
+schedule (`from_message_fused3` writing the first radix-8 result
+straight from the compact message); that is a from_message path for
+the recursive levels, a larger port, parked. Lane count is not the
+cause (their 8 lanes beat our 16).
