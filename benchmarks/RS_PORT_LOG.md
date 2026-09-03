@@ -5330,3 +5330,35 @@ stall-rich commit); now it is ~150 + ~170 + ~20 = 340 — cheaper by
 AG skip's saving (RS round 1 165 ms all-in → AG 48) was cancelled by
 round 1 no longer having a commit window with idle capacity to hide
 in, and by the merkle running at half speed.
+
+### E-cores, second pass: witgen and the W build join the P+E queue (−2 and −1.5 ms MT, 3/3); the statistics sweep does not — 2026-09-03
+
+Benedikt: "can we try again to engage the efficiency cores?" The rule
+from 09-01 stands (E-cores pay on compute-bound flat loops, never on
+phases at the bus), and three compute-bound loops had landed since:
+the statistics sweep and fused fold in the open, and the witness
+builder's super-group loop; the W build (lookup-bound) was the fourth
+candidate. All four went on the shared queue (`run_hetero_chunks` /
+`_stateful`, two utility-QoS E-threads) behind one knob; same outputs
+by construction (which worker runs a chunk cannot change its result;
+dummy-rows contract, m6 pins, pcs suite pass). Two alternating runs,
+3 pairs each, m=32 MT, warm min:
+
+| bucket | on / off (run 1, all four sites) | on / off (run 2, witgen + W build only) |
+|---|---|---|
+| witgen | 35.6 / 38.2, 37.2 / 38.5, 34.5 / 39.0 | 34.8 / 37.4, 37.4 / 38.7, 35.9 / 38.0 |
+| W build | 23.4 / 25.4, 23.3 / 25.8, 24.3 / 24.1 | 24.5 / 24.9, 23.9 / 25.7, 23.9 / 25.5 |
+| stats sweep | 14.0 / 10.8, 13.3 / 10.8, 13.7 / 10.9 | (rayon) |
+| fused fold | 8.6 / 8.7, 8.6 / 8.5, 8.4 / 8.6 | (rayon) |
+| prove TOTAL | 564 / 543, 552 / 539, 556 / 540 | 563 / 549, 538 / 535, 540 / 545 |
+
+Witgen −2.6/−1.3/−2.1 (6/6 across both runs) and the W build −0.4..−2.5
+(5/6) are kept, knob stripped: the builder is BLAKE3 compute and the W
+build is L1-table lookups, both flat. The statistics sweep LOSES
++2.5..+3.2 (3/3) — it streams 512 MB at ~47 GB/s, so two slow extra
+readers on a near-saturated bus hold the join (the fold/witgen lesson
+again); the fused fold is a wash. Both open sites reverted to rayon.
+The TOTAL cannot resolve a −3.5 ms bucket effect at load 7–13 (run 2:
++14 / +3 / −5); run 1's +12..+21 on the total is the sweep's loss plus
+noise. Kept on the same evidence standard as round 1's queue (−2.8,
+3/3 on its bucket).
