@@ -5527,3 +5527,18 @@ Switch −7 (3/3), fold +1..+3 at this load (pair 3 a wash; the extra
 that is the load), net ≈ −4 on the ladder; the open bucket resolved
 −0.4 / −1.0 in the two clean pairs, and the prove's best total is now
 **521.2 ms**. Workspace, fmt, x86 gates below.
+
+### REFUTED (below the bar): two transposed-NTT layers per pass in the induced-basis builder — 2026-09-03
+
+The L0 induced basis (`induce_sumcheck_poly_via_ntt`: scatter 244 query
+weights, apply the transposed additive NTT `Fᵀ` over 2^20, keep 2^19)
+ran its twelve dense layers past the sparse-window prefix as twelve
+passes over 16 MB. Fusing two layers per pass (inner sub-block
+butterflies, then the outer across-halves butterfly, per element — the
+same operation order, `induce_sumcheck_poly_via_ntt_matches_dense` and
+the m6 pins byte-identical) measured, alternating vs HEAD at m=32 MT:
+induce 6.73 / 6.33 / 6.71 vs 6.91 / 6.68 / 8.11 — −0.2 / −0.35 (/ −1.4
+under a load spike). The array is SLC-resident and the top layers stay
+single-layer anyway, so there was ~0.3 ms in it. Reverted; not worth
+its 40 lines. Prove best in this run: **500.2 ms** (both arms; load
+had dropped to ~8), open ~136 ms.
