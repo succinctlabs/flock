@@ -1,5 +1,31 @@
-#[allow(unused_imports)] // used only under cfg(test)
-use super::*;
+use std::{array::from_fn, env::var, slice::from_ref, sync::atomic::Ordering, time::Instant};
+
+use aggregate::{
+    Accumulator, JaggedKeyProve, JaggedKeyVerify, prove_aggregate_classes_with_grinding,
+    verify_aggregate_classes_with_grinding,
+};
+use bincode::serialize;
+use flock_core::{
+    aggregate, element_r1cs::union::ElementAssertion, lincheck::LincheckCircuit,
+    matrix_fold::MatrixClaim,
+};
+
+use crate::{
+    r1cs_hashes::blake3::build_block_r1cs,
+    tower::{
+        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, SpineIn,
+        UnionInstance, build_chain_proof, build_fl_node, build_node_outer_app, chain_blake_r1cs,
+        chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
+        envelope::STEADY_OVERRIDE,
+        envelope_shape,
+        gates_blake3::Rng,
+        leaf_boolean_lcs, leaf_boolean_mats, native_chain,
+        node::{N_KEY_SLOTS, digest_f128, entry_live},
+        node_jagged_params,
+        online::{median_total, proof_census_mixed, report_stage},
+        outer_union, pack4, test_config, tower_fold_grinding,
+    },
+};
 
 /// **WALL 3: THE SPINE CONVERGES.** Eight chain segments → four FLs → a
 /// BASE node (two FLs, fresh-only) → node_2 (a fresh FL + the base) →
@@ -33,12 +59,11 @@ use super::*;
 #[ignore] // Heavy — eight chain proofs and eight outers.
 pub(super) fn chain_spine_converges() {
     let cfg = test_config();
-    use flock_core::aggregate;
 
     let env = envelope_shape();
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_5B1E);
-    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let mut cps = Vec::new();
     let mut h = h0;
     for _ in 0..8 {
@@ -65,10 +90,10 @@ pub(super) fn chain_spine_converges() {
     }
     // The lane's chain-side materials, shared by every level.
     let chain_registry = &cps[0].inner.built.shape.registry;
-    let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
+    let blake_r1cs = build_block_r1cs(cps[0].inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
-    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let chain_circs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
     let chain_circuit = &cps[0].inner.built.shape.circuit;
     let chain_jp = chain_jagged_params(&cps[0]);
     let acc_base = fls[0].fold_pub_base;
@@ -246,7 +271,7 @@ pub(super) fn chain_spine_converges() {
         "the orphan boarded"
     );
     let base_jp = node_jagged_params(&base.lo);
-    let pass_acc = aggregate::Accumulator {
+    let pass_acc = Accumulator {
         registry_digest: n3.acc.registry_digest,
         per_type: Vec::new(),
         per_element: Vec::new(),
@@ -346,8 +371,7 @@ pub(super) fn chain_spine_converges() {
     // that would let node_3 fold it without a mismatch. The key words are
     // statement, so node_2's own proof refuses.
     {
-        let uni_w =
-            |c: &flock_core::matrix_fold::MatrixClaim| 2 + c.col.point.len() + c.row.point.len();
+        let uni_w = |c: &MatrixClaim| 2 + c.col.point.len() + c.row.point.len();
         let mut key_at = env_acc_main_base(&env);
         for (a, b) in n2.block.per_type.iter().chain(n2.block.per_element.iter()) {
             key_at += uni_w(a) + uni_w(b);
@@ -378,10 +402,7 @@ pub(super) fn chain_spine_converges() {
         n3.lo.shape.circuit.cells().nu(),
         n3.lo.shape.circuit.cells().mu(),
         n3.lo.public.len(),
-        bincode::serialize(&n3.lo.proof)
-            .map(|b| b.len())
-            .unwrap_or(0) as f64
-            / 1024.0,
+        serialize(&n3.lo.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
 }
 
@@ -389,9 +410,8 @@ pub(super) fn chain_spine_converges() {
 /// segments → two first-level nodes → one internal node; the chain-level
 /// accumulators ride the internal node as a PRIORS-ONLY LANE (their
 /// registry differs from the FL fold's, so they cannot join it), with the
-/// prior surfaces connected WIRE-TO-WIRE to the children's published
-/// accumulator claims — mvp11's recorded prediction ("a prior's surface
-/// IS what a previous outer publishes") landing. The ROOT then discharges
+/// prior surfaces connected wire-to-wire to the children's published
+/// accumulator claims. The root then discharges
 /// BOTH lanes — the chain lane against the chain b3 matrices + the chain
 /// circuit's sigma table, the FL lane against the FL mats/element
 /// types/digest — and reads the statement h_end == H^1024(h_start). Plus
@@ -401,11 +421,10 @@ pub(super) fn chain_spine_converges() {
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn chain_tower_e2e_with_lane() {
     let cfg = test_config();
-    use flock_core::aggregate;
 
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_0007);
-    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
     let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
     let cp2 = build_chain_proof(cfg, cp1.h_end, n_blocks);
@@ -419,10 +438,10 @@ pub(super) fn chain_tower_e2e_with_lane() {
 
     // The lane's registry materials — the CHAIN side.
     let chain_registry = &cp0.inner.built.shape.registry;
-    let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
+    let blake_r1cs = build_block_r1cs(cp0.inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
-    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let chain_circs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cp0);
     let lane = ChainLane {
         registry: chain_registry,
@@ -525,19 +544,16 @@ pub(super) fn chain_tower_e2e_with_lane() {
     {
         let mut bad_acc = fl0.acc.clone();
         bad_acc.per_type[0].0.value += F128::ONE;
-        let el_asserts_l: [(
-            &UnionInstance<'_>,
-            flock_core::element_r1cs::union::ElementAssertion,
-        ); 0] = [];
-        let jagged_pt: Vec<aggregate::JaggedKeyProve<'_>> = vec![(
+        let el_asserts_l: [(&UnionInstance<'_>, ElementAssertion); 0] = [];
+        let jagged_pt: Vec<JaggedKeyProve<'_>> = vec![(
             cp0.inner.built.shape.circuit.digest(),
             &chain_jp,
             Vec::new(),
         )];
-        let jagged_vt: Vec<aggregate::JaggedKeyVerify<'_>> =
+        let jagged_vt: Vec<JaggedKeyVerify<'_>> =
             vec![(cp0.inner.built.shape.circuit.digest(), Vec::new())];
         let mut chp = FsChallenger::with_chained_blake3(b"flock-chain-lane-tamper");
-        let (lagg, _) = aggregate::prove_aggregate_classes_with_grinding(
+        let (lagg, _) = prove_aggregate_classes_with_grinding(
             chain_registry,
             &chain_mats,
             &chain_circs,
@@ -553,7 +569,7 @@ pub(super) fn chain_tower_e2e_with_lane() {
         .expect("honest lane fold proves");
         let mut ch = FsChallenger::with_chained_blake3(b"flock-chain-lane-tamper");
         assert!(
-            aggregate::verify_aggregate_classes_with_grinding(
+            verify_aggregate_classes_with_grinding(
                 chain_registry,
                 &[],
                 &el_asserts_l,
@@ -600,10 +616,7 @@ pub(super) fn chain_tower_e2e_with_lane() {
         node.shape.circuit.cells().nu(),
         node.shape.circuit.cells().mu(),
         node.public.len(),
-        bincode::serialize(&node.proof)
-            .map(|b| b.len())
-            .unwrap_or(0) as f64
-            / 1024.0,
+        serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
 }
 
@@ -619,22 +632,22 @@ pub(super) fn chain_tower_e2e_with_lane() {
 #[ignore] // The headline measurement — run explicitly with --nocapture.
 pub(super) fn chain_tower_m32_headline() {
     let cfg = test_config();
-    let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
+    let n_blocks: usize = var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1 << 18);
     let mut rng = Rng(0xC4A1_0008);
-    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h0: [u32; 16] = from_fn(|_| rng.next_u32());
 
     // The sequential phase (the VDF delay): the chain values themselves.
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     let h_all = native_chain(&h0, 4 * n_blocks);
     let chain_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     // The leaves, timed individually (parallelizable in deployment).
     let mut _leaf_ms: Vec<f64> = Vec::new();
     let mut mk = |start: [u32; 16]| -> ChainProof {
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let cp = build_chain_proof(cfg, start, n_blocks);
         _leaf_ms.push(t.elapsed().as_secs_f64() * 1e3);
         cp
@@ -645,16 +658,16 @@ pub(super) fn chain_tower_m32_headline() {
     let cp3 = mk(cp2.h_end);
     assert_eq!(cp3.h_end, h_all, "the four segments ARE the chain");
 
-    let t_fl = std::time::Instant::now();
+    let t_fl = Instant::now();
     let fl0 = build_fl_node(cfg, &cp0, &cp1);
     let fl1 = build_fl_node(cfg, &cp2, &cp3);
     let _fl_ms = t_fl.elapsed().as_secs_f64() * 1e3 / 2.0;
 
     let chain_registry = &cp0.inner.built.shape.registry;
-    let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
+    let blake_r1cs = build_block_r1cs(cp0.inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
-    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let chain_circs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cp0);
     let lane = ChainLane {
         registry: chain_registry,
@@ -665,7 +678,7 @@ pub(super) fn chain_tower_m32_headline() {
         priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
     };
-    let t_in = std::time::Instant::now();
+    let t_in = Instant::now();
     let out = build_node_outer_app(
         cfg,
         &[&fl0.lo, &fl1.lo],
@@ -679,7 +692,7 @@ pub(super) fn chain_tower_m32_headline() {
     let lane_acc = out.lane_acc.expect("lane");
 
     // The root.
-    let t_root = std::time::Instant::now();
+    let t_root = Instant::now();
     for j in 0..4 {
         assert_eq!(
             node.public[app + 4 + j],
@@ -733,7 +746,7 @@ pub(super) fn chain_tower_m32_headline() {
     );
     report_stage("leaf", &leaves);
     report_stage("FL", &fl_t);
-    report_stage("internal", std::slice::from_ref(&nt));
+    report_stage("internal", from_ref(&nt));
     println!(
         "    root (both lanes + statement): {:.1} ms\n  \
          PER-LEAF ONLINE (leaf + FL/2 + internal/4): {:.0} ms -> {:.0}k compressions/sec\n  \
@@ -743,10 +756,7 @@ pub(super) fn chain_tower_m32_headline() {
         n_blocks as f64 / per_leaf_online,
         node.shape.circuit.cells().nu(),
         node.shape.circuit.cells().mu(),
-        bincode::serialize(&node.proof)
-            .map(|b| b.len())
-            .unwrap_or(0) as f64
-            / 1024.0,
+        serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
     proof_census_mixed("internal node", &node.proof, &node.pcs);
     proof_census_mixed("chain leaf (m32 Fast)", &cp0.inner.proof, &cp0.inner.pcs);
@@ -775,16 +785,16 @@ pub(super) fn chain_tower_m32_headline() {
 #[ignore] // Benchmark — run explicitly with --nocapture.
 pub(super) fn tower_online_bench() {
     let cfg = test_config();
-    let runs: usize = std::env::var("BENCH_RUNS")
+    let runs: usize = var("BENCH_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
+    let n_blocks: usize = var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(256);
     let mut rng = Rng(0xC4A1_00BE);
-    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h0: [u32; 16] = from_fn(|_| rng.next_u32());
 
     // MEASUREMENT HYGIENE: each stage runs with only ITS OWN inputs
     // resident. An m32 chain proof and an FL node are both large, and
@@ -801,7 +811,6 @@ pub(super) fn tower_online_bench() {
     // byte-identical setup. The node arms therefore run as BLOCKS seconds
     // apart instead of the old minutes-apart interleave; box drift over
     // seconds is far below what the interleave guarded against.
-    use std::sync::atomic::Ordering;
     STEADY_OVERRIDE.store(runs, Ordering::Relaxed); // +1: iteration 0 is the shape warmup (setup tier)
 
     // ---- LEAF: nothing else is alive; the measured proof BECOMES cp0 ----
@@ -841,7 +850,7 @@ pub(super) fn tower_online_bench() {
     let blake_r1cs = chain_blake_r1cs(cp0.inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
-    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let chain_circs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cp0);
     // ---- INTERNAL (= the spine's base) then SPINE, one call each ----
     // Both arms' online iterations run back to back inside their builder

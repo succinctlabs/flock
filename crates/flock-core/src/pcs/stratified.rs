@@ -238,11 +238,17 @@ pub fn validate_schedules(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{
+        merkle::cap_depth,
+        pcs::{
+            ligerito::{default_config, default_verifier_config},
+            stratified::{LevelSchedule, level_block_logs, schedules, validate_schedules},
+        },
+    };
 
     #[test]
     fn decompose_is_binary_representation() {
-        // Slim L0 shape from the design doc: q = 90 = 64 + 16 + 8 + 2, d = 19.
+        // Slim L0 shape: q = 90 = 64 + 16 + 8 + 2, d = 19.
         let s = LevelSchedule::decompose(90, 19);
         assert_eq!(s.summand_depths, vec![6, 4, 3, 1]);
         assert_eq!(s.queries(), 90);
@@ -327,16 +333,16 @@ mod tests {
         // Every ProverConfig/VerifierConfig construction site ends in
         // .with_default_stratified() — pin that the canonical constructor
         // yields stored schedules that pass the load-time authority check.
-        let p = crate::pcs::ligerito::default_config(20, 4, 2).unwrap();
+        let p = default_config(20, 4, 2).unwrap();
         assert_eq!(p.stratified.len(), p.queries.len());
         p.validate_stratified().unwrap();
         for (sched, &q) in p.stratified.iter().zip(&p.queries) {
             assert_eq!(sched.queries(), q);
             // Stratified cap = floor(lg q): never deeper than the old
             // ceil(lg q) cap, shallower exactly when q isn't a power of two.
-            assert!(sched.cap_depth() <= crate::merkle::cap_depth(q, sched.log_block_len));
+            assert!(sched.cap_depth() <= cap_depth(q, sched.log_block_len));
         }
-        let v = crate::pcs::ligerito::default_verifier_config(20, 4, 2).unwrap();
+        let v = default_verifier_config(20, 4, 2).unwrap();
         v.validate_stratified().unwrap();
         assert_eq!(
             p.stratified, v.stratified,

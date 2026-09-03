@@ -6,24 +6,22 @@
 //! Target from PROTOCOL_REFERENCE.md: ~38 ms single-thread at m=29 (the
 //! "29→23 collapse + P_2(1), P_2(∞)" step).
 
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::field::F8;
-use flock_prover::zerocheck::multilinear::{
-    UniSkipFoldTable, uni_skip_fold_and_round_pair_optimized_packed,
-};
-
-const K_SKIP: usize = 6;
+use std::{hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F8,
+    init_perf_thread_pool,
+    zerocheck::multilinear::{UniSkipFoldTable, uni_skip_fold_and_round_pair_optimized_packed},
+};
+const K_SKIP: usize = 6;
 
 fn _silence_unused() {
     let _ = F8::ZERO;
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — NEON path active)");
     #[cfg(all(

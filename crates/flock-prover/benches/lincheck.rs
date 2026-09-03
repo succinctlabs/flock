@@ -10,22 +10,22 @@
 //! delta isolates the kernel speedup. Expect ~1.0× below the guard (both iblock)
 //! and oblock's win above it (≈1.4–1.7× by m=28–29 at this k_log).
 
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::lincheck::{QuirkyPoint, SkipPoint, SparseMatrixCircuit, prove};
-use flock_prover::r1cs::SparseBinaryMatrix;
-
-const K_LOG: usize = 11; // k = 2048
-const K_SKIP: usize = 6; // matches zerocheck's univariate-skip dim
+use std::{collections::HashSet, env::var, hint::black_box, sync::atomic::Ordering, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    lincheck::{FOLD_IBLOCK, QuirkyPoint, SkipPoint, SparseMatrixCircuit, prove},
+    r1cs::SparseBinaryMatrix,
+};
+const K_LOG: usize = 11; // k = 2048
+const K_SKIP: usize = 6; // matches zerocheck's univariate-skip dim
 
 /// Sparse matrix with ~`nnz` random nonzeros across `k × k` slots.
 fn random_sparse_matrix(k: usize, nnz: usize, rng: &mut Rng) -> SparseBinaryMatrix {
     let mut rows: Vec<Vec<usize>> = vec![Vec::new(); k];
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut count = 0;
     while count < nnz {
         let r = (rng.next_u64() as usize) % k;
@@ -46,8 +46,8 @@ fn random_sparse_matrix(k: usize, nnz: usize, rng: &mut Rng) -> SparseBinaryMatr
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
-    let fold_ab = std::env::var("FOLD_AB").is_ok();
+    let _ = init_perf_thread_pool();
+    let fold_ab = var("FOLD_AB").is_ok();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes)");
     println!("k_log = {K_LOG}, k = {}", 1usize << K_LOG);
@@ -105,8 +105,6 @@ fn main() {
         // cancels. Both produce a bit-identical proof (checksum confirms); the
         // prove delta isolates the fold speedup where oblock engages.
         if fold_ab {
-            use flock_prover::lincheck::FOLD_IBLOCK;
-            use std::sync::atomic::Ordering;
             let (mut def_min, mut ib_min) = (f64::INFINITY, f64::INFINITY);
             let mut cs = 0u64;
             let ab_runs = n_runs.max(5);

@@ -17,8 +17,15 @@
 //! the m = 29 prove set). Call [`clear`] to release everything to the OS,
 //! e.g. after the last prove of a batch.
 
-use crate::field::F128;
-use std::sync::Mutex;
+use core::{mem::size_of, ops::Range};
+use std::{env::var_os, mem::ManuallyDrop, ptr::write_bytes, sync::Mutex};
+
+use rayon::prelude::{IntoParallelRefMutIterator, ParallelIterator, ParallelSliceMut};
+
+use crate::{
+    alloc_uninit_vec, alloc_zeroed_vec,
+    field::{F128, F256},
+};
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 
@@ -43,7 +50,7 @@ pub fn take_f128(n: usize) -> Vec<F128> {
     if let Some(v) = try_take_f128(n) {
         return v;
     }
-    crate::alloc_uninit_vec(n)
+    alloc_uninit_vec(n)
 }
 
 /// Pool-only variant of [`take_f128`]: returns `None` instead of falling
@@ -78,7 +85,7 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
     if let Some(i) = best {
         let mut v = pool.swap_remove(i);
         drop(pool);
-        if std::env::var_os("FLOCK_POOL_TRACE").is_some() {
+        if var_os("FLOCK_POOL_TRACE").is_some() {
             eprintln!(
                 "      [pool] take_f128 n=2^{:.1} cap=2^{:.1} ({}x)",
                 (n as f64).log2(),
@@ -93,7 +100,7 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
         unsafe { v.set_len(n) };
         return Some(v);
     }
-    if std::env::var_os("FLOCK_POOL_TRACE").is_some() {
+    if var_os("FLOCK_POOL_TRACE").is_some() {
         eprintln!(
             "      [pool] take_f128 n=2^{:.1} MISS (fresh)",
             (n as f64).log2()
@@ -157,15 +164,14 @@ pub fn give_f128(v: Vec<F128>) {
 /// trap in [`give_f128`]'s doc — do not separate them.
 ///
 /// Same write-before-read contract as [`take_f128`].
-pub fn take_f256(n: usize) -> Vec<crate::field::F256> {
-    use crate::field::F256;
+pub fn take_f256(n: usize) -> Vec<F256> {
     if let Some(v) = try_take_f128(2 * n) {
         // Reinterpreting requires an even F128 capacity so the F256 vec's
         // drop layout (`Layout::array::<F256>(cap/2)`) matches the
         // allocation. Practically every pooled buffer is a power-of-two
         // size; an odd-capacity stray just goes back untouched.
         if v.capacity().is_multiple_of(2) {
-            let mut v = std::mem::ManuallyDrop::new(v);
+            let mut v = ManuallyDrop::new(v);
             let (ptr, cap) = (v.as_mut_ptr(), v.capacity());
             // SAFETY: identical allocation layout (asserted even capacity);
             // both types are Copy PODs valid for every bit pattern; len n
@@ -175,12 +181,12 @@ pub fn take_f256(n: usize) -> Vec<crate::field::F256> {
         }
         give_f128(v);
     }
-    crate::alloc_uninit_vec(n)
+    alloc_uninit_vec(n)
 }
 
 /// Return an `F256` buffer to the shared pool (see [`take_f256`]).
-pub fn give_f256(v: Vec<crate::field::F256>) {
-    let mut v = std::mem::ManuallyDrop::new(v);
+pub fn give_f256(v: Vec<F256>) {
+    let mut v = ManuallyDrop::new(v);
     let (ptr, len, cap) = (v.as_mut_ptr(), v.len(), v.capacity());
     // SAFETY: exact inverse of the reinterpretation in [`take_f256`] —
     // identical allocation layout, POD contents, doubled len/cap in F128
@@ -225,19 +231,19 @@ pub fn take_zeroed_f128(n: usize) -> Vec<F128> {
     if let Some(i) = pool.iter().position(|v| v.len() == n) {
         let v = pool.swap_remove(i);
         drop(pool);
-        if std::env::var_os("FLOCK_POOL_TRACE").is_some() {
+        if var_os("FLOCK_POOL_TRACE").is_some() {
             eprintln!("      [pool] take_zeroed n=2^{:.1} HIT", (n as f64).log2());
         }
         return v;
     }
     drop(pool);
-    if std::env::var_os("FLOCK_POOL_TRACE").is_some() {
+    if var_os("FLOCK_POOL_TRACE").is_some() {
         eprintln!(
             "      [pool] take_zeroed n=2^{:.1} MISS (fresh lazy-zero)",
             (n as f64).log2()
         );
     }
-    crate::alloc_zeroed_vec(n)
+    alloc_zeroed_vec(n)
 }
 
 /// Return an all-zero-except-`dirty` buffer to the zero pool: re-zero exactly
@@ -251,8 +257,7 @@ pub fn take_zeroed_f128(n: usize) -> Vec<F128> {
 /// buffers only ever hand out their slot blocks (`slot_dests` carves exactly
 /// those, borrow-checked), and `copy_live_region` writes exactly the live
 /// spans its give-back re-zeros. Debug builds verify the invariant outright.
-pub fn give_zeroed_f128(mut v: Vec<F128>, dirty: &[core::ops::Range<usize>]) {
-    use rayon::prelude::*;
+pub fn give_zeroed_f128(mut v: Vec<F128>, dirty: &[Range<usize>]) {
     if v.capacity() == 0 {
         return;
     }
@@ -387,10 +392,9 @@ const PREWARM_BUDGET_BYTES: usize = 8 << 30;
 /// would still be handed out by `take` and fault during the prove, which is
 /// exactly the cost this is trying to place off the prove path.
 fn prewarm_sets(sets: &[(usize, usize, usize)]) {
-    use rayon::prelude::*;
     let mut bufs: Vec<Vec<F128>> = Vec::new();
     let mut budget = PREWARM_BUDGET_BYTES;
-    let w = core::mem::size_of::<F128>();
+    let w = size_of::<F128>();
     for &(m, n_large, n_small) in sets {
         if m < 7 {
             continue;
@@ -411,7 +415,7 @@ fn prewarm_sets(sets: &[(usize, usize, usize)]) {
     bufs.par_iter_mut().for_each(|b| {
         b.par_chunks_mut(1 << 16).for_each(|chunk| {
             // SAFETY: F128 is plain bytes (no Drop); zero is a valid pattern.
-            unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
+            unsafe { write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
         });
     });
     for b in bufs {
@@ -428,7 +432,9 @@ pub fn clear() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::scratch::{
+        F128, MAX_POOLED, POOL, clear, give_f128, give_zeroed_f128, take_f128, take_zeroed_f128,
+    };
 
     #[test]
     fn take_reuses_given_buffer() {

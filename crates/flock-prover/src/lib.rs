@@ -11,7 +11,12 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
-pub use flock_core::*;
+pub use flock_core::{
+    Zeroable, aggregate, all_core_pool, alloc_zeroed_vec, bits, challenger, circuit, element_r1cs,
+    field, genus95_curve_code, init_perf_thread_pool, lincheck, matrix_fold, merkle, ntt, pcs,
+    product_gkr, proof, r1cs, schedule, scratch, suboptimal, test_rng, transcript_record, union,
+    verifier, zerocheck,
+};
 
 pub mod mixed;
 pub mod proof_io;

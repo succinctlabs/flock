@@ -1,42 +1,50 @@
-//! The union instance — multi-table Phase 2 (M1 plumbing, M3 binding).
+//! Multi-table union instances.
 //!
 //! [`UnionInstance`] wraps a [`Registry`] + counts pair (the static slot
 //! layout of `schedule.rs` plus the per-proof declared counts) and derives
-//! everything the prove/verify paths need from the union address space,
-//! replacing what [`BlockR1cs`] provides for a single table today: the
+//! everything the prove and verify paths need from the union address space:
 //! count-derived run-list [`PaddingSpec`], the union jagged-grid heights
-//! (count-dependent height-`n_t` stacking since M5 — the committed size is
+//! (count-dependent height-`n_t` stacking; the committed size is
 //! count-proportional, floored at the smallest embedded Ligerito config),
-//! the layout-aware claim points, the union witness assembly, and — since
-//! M3 — the multi-table statement binding ([`Self::bind_statement`], label
+//! the layout-aware claim points, the union witness assembly, and
+//! the multi-table statement binding ([`Self::bind_statement`], label
 //! `flock-mixed-v1`).
 //!
 //! Under the uniform-capacity convention the union's BatchMajor address
 //! split is `[7 in-word | nu batch | M−7−nu chunk]` — structurally a single
-//! BatchMajor instance with `k_log = M − nu` (design doc §"The union
-//! instance"): every slot shares the row coordinates `[7, 7+nu)`, and a
+//! BatchMajor instance with `k_log = M − nu`. Every slot shares the row
+//! coordinates `[7, 7+nu)`, and a
 //! slot's chunk bits together with its frozen prefix form the union
 //! chunk-column index. The claim-point helpers below are therefore the
 //! `BlockR1cs` BatchMajor formulas evaluated over the union address space;
 //! for a one-type registry (one slot at offset 0, `M = m`) they agree with
-//! the `BlockR1cs` versions coordinate for coordinate — the union of one
-//! slot *is* today's instance.
+//! the `BlockR1cs` versions coordinate for coordinate.
 //!
 //! The prove/verify entries (`flock_prover::prover::
 //! prove_fast_ligerito_union` / [`crate::verifier::
 //! verify_ligerito_union`], and their mixed-class variants)
-//! accept any registry under the `flock-mixed-v1` binding. (The M1/M2
-//! single-type harness binding died with the jagged transport and its
-//! byte-identity differential tests.)
+//! accept any registry under the `flock-mixed-v1` binding.
 
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::lincheck::{QuirkyPoint, SkipPoint};
-use crate::pcs::Commitment;
+use core::{mem::take, ops::Range};
+use std::iter::repeat_n;
+
+use rayon::{
+    join,
+    prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut},
+};
+
 #[cfg(test)]
 use crate::schedule::TableClass;
-use crate::schedule::{Instance, Registry, TableType};
-use crate::zerocheck::{K_SKIP, PaddingSpec};
+use crate::{
+    challenger::Challenger,
+    field::F128,
+    lincheck::{QuirkyPoint, SkipPoint},
+    merkle::{HashKind, hash_leaf, hash_pair},
+    pcs::{Commitment, dense_lanes},
+    schedule::{Instance, Registry, TableType},
+    scratch::{give_zeroed_f128, take_f128, take_zeroed_f128},
+    zerocheck::{K_SKIP, PaddingSpec},
+};
 
 /// Floor of the committed dense-stack size, as a bit-variable count: the
 /// smallest embedded Ligerito security config is `m22` (`2^15` packed
@@ -199,7 +207,7 @@ impl<'r> UnionInstance<'r> {
 
     /// Word range of the element region inside the padded union buffers.
     /// Empty when there are no element types.
-    pub fn element_word_range(&self) -> core::ops::Range<usize> {
+    pub fn element_word_range(&self) -> Range<usize> {
         if !self.has_element() {
             return 0..0;
         }
@@ -385,7 +393,7 @@ impl<'r> UnionInstance<'r> {
     /// rotates).
     pub fn commit_lanes(&self, log_batch_size: usize) -> Option<usize> {
         let log_dim = self.dense_m() - 7 - log_batch_size;
-        let t = crate::pcs::dense_lanes(self.dense_words(), log_batch_size, log_dim);
+        let t = dense_lanes(self.dense_words(), log_batch_size, log_dim);
         (t < 1usize << log_batch_size).then_some(t)
     }
 
@@ -447,8 +455,6 @@ impl<'r> UnionInstance<'r> {
     /// are dirty by design and provably never read (the gather below reads
     /// declared rows only).
     pub fn compact_witness_unchecked(&self, z_padded: &[F128]) -> Vec<F128> {
-        use rayon::prelude::*;
-
         assert_eq!(z_padded.len(), self.packed_len(), "padded buffer length");
         let nu = self.n_log();
         // POOLED, not `vec![F128::ZERO; …]`. A fresh 134 MB zeroed Vec at
@@ -458,7 +464,7 @@ impl<'r> UnionInstance<'r> {
         // ~3.1 ms. The loop below writes `[0, dense_words)` exactly, so only
         // the power-of-two pad tail needs zeroing.
         let dense = self.dense_words();
-        let mut q = crate::scratch::take_f128(self.committed_words());
+        let mut q = take_f128(self.committed_words());
         q[dense..]
             .par_chunks_mut(1 << 16)
             .for_each(|c| c.fill(F128::ZERO));
@@ -573,7 +579,7 @@ impl<'r> UnionInstance<'r> {
         let mut suffix = Vec::with_capacity(x_outer.len() + r_inner_rest.len() - 1 + frozen);
         suffix.extend_from_slice(x_outer);
         suffix.extend_from_slice(&r_inner_rest[1..]);
-        suffix.extend(std::iter::repeat_n(F128::ZERO, frozen));
+        suffix.extend(repeat_n(F128::ZERO, frozen));
         QuirkyPoint {
             z_skip: r_inner_skip,
             x_inner_rest: vec![r_inner_rest[0]],
@@ -590,7 +596,7 @@ impl<'r> UnionInstance<'r> {
         let frozen = self.boolean_frozen_high();
         let mut x_outer = Vec::with_capacity(r_rest.len() - 1 + frozen);
         x_outer.extend_from_slice(&r_rest[1..]);
-        x_outer.extend(std::iter::repeat_n(F128::ZERO, frozen));
+        x_outer.extend(repeat_n(F128::ZERO, frozen));
         QuirkyPoint {
             z_skip,
             x_inner_rest: vec![r_rest[0]],
@@ -603,8 +609,7 @@ impl<'r> UnionInstance<'r> {
     // single-type harness binding (differential tests only).
     // -----------------------------------------------------------------------
 
-    /// The multi-table statement binding (design doc §"Statement digest and
-    /// transcript"): absorb, before any challenge is squeezed and in this
+    /// The multi-table statement binding. Before any challenge, absorb in this
     /// order, the `flock-mixed-v1` domain label, the registry digest
     /// ([`Registry::digest`]), the counts vector (one u64 LE per type, in
     /// slot order, as a single byte string — its length is additionally
@@ -640,8 +645,7 @@ impl<'r> UnionInstance<'r> {
     ///
     /// Absorbed before any challenge, and in particular before the wiring
     /// GKR — which squeezes `α, β` at entry, so the multiset statement must
-    /// already be fixed (design doc §"Statement, transcript, Fiat–Shamir";
-    /// `circuit::prove_wiring`'s contract).
+    /// already be fixed before `circuit::prove_wiring` starts.
     ///
     /// **Append-only:** the existing four observations are unchanged and the
     /// circuit payload follows under its own versioned label, so a non-circuit
@@ -671,7 +675,7 @@ impl<'r> UnionInstance<'r> {
     // -----------------------------------------------------------------------
 
     /// Word range of slot `t`'s aligned block in the padded union buffers.
-    pub fn slot_word_range(&self, t: usize) -> core::ops::Range<usize> {
+    pub fn slot_word_range(&self, t: usize) -> Range<usize> {
         let slot = &self.registry().slots()[t];
         let start = slot.offset >> 7;
         start..start + (1usize << (slot.m_slot - 7))
@@ -696,39 +700,30 @@ impl<'r> UnionInstance<'r> {
     pub fn take_witness_buffers(
         &self,
         padding_unread: bool,
-    ) -> (
-        Vec<F128>,
-        Vec<F128>,
-        Vec<F128>,
-        crate::union::WitnessBufMode,
-    ) {
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, WitnessBufMode) {
         let len = self.packed_len();
         if padding_unread {
             return (
-                crate::scratch::take_f128(len),
-                crate::scratch::take_f128(len),
-                crate::scratch::take_f128(len),
-                crate::union::WitnessBufMode::PooledDirty,
+                take_f128(len),
+                take_f128(len),
+                take_f128(len),
+                WitnessBufMode::PooledDirty,
             );
         }
         if self.dense_words() * 2 <= len {
             return (
-                crate::scratch::take_zeroed_f128(len),
-                crate::scratch::take_zeroed_f128(len),
-                crate::scratch::take_zeroed_f128(len),
-                crate::union::WitnessBufMode::FreshZeroed,
+                take_zeroed_f128(len),
+                take_zeroed_f128(len),
+                take_zeroed_f128(len),
+                WitnessBufMode::FreshZeroed,
             );
         }
-        let mut bufs = [
-            crate::scratch::take_f128(len),
-            crate::scratch::take_f128(len),
-            crate::scratch::take_f128(len),
-        ];
+        let mut bufs = [take_f128(len), take_f128(len), take_f128(len)];
         for buf in &mut bufs {
             self.zero_gaps(buf);
         }
         let [z, a, b] = bufs;
-        (z, a, b, crate::union::WitnessBufMode::PooledZeroed)
+        (z, a, b, WitnessBufMode::PooledZeroed)
     }
 
     /// Return a [`WitnessBufMode::FreshZeroed`] witness buffer to the zero
@@ -742,18 +737,16 @@ impl<'r> UnionInstance<'r> {
     /// switched to in-place first).
     pub fn give_back_witness_buffer(&self, buf: Vec<F128>) {
         debug_assert_eq!(buf.len(), self.packed_len(), "padded buffer length");
-        let dirty: Vec<core::ops::Range<usize>> = (0..self.registry().num_types())
+        let dirty: Vec<Range<usize>> = (0..self.registry().num_types())
             .map(|t| self.slot_word_range(t))
             .collect();
-        crate::scratch::give_zeroed_f128(buf, &dirty);
+        give_zeroed_f128(buf, &dirty);
     }
 
     /// A fully zeroed padded union buffer from the scratch pool — resident
     /// pages, parallel memset, no allocation tax.
     fn take_zeroed_buffer(&self) -> Vec<F128> {
-        use rayon::prelude::*;
-
-        let mut buf = crate::scratch::take_f128(self.packed_len());
+        let mut buf = take_f128(self.packed_len());
         buf.par_chunks_mut(1 << 16).for_each(|c| c.fill(F128::ZERO));
         buf
     }
@@ -763,8 +756,6 @@ impl<'r> UnionInstance<'r> {
     /// drivers. A registry whose slots tile the address space exactly has
     /// no gaps and this does nothing.
     fn zero_gaps(&self, buf: &mut [F128]) {
-        use rayon::prelude::*;
-
         debug_assert_eq!(buf.len(), self.packed_len());
         let mut cursor = 0usize;
         for t in 0..self.registry().num_types() {
@@ -797,7 +788,7 @@ impl<'r> UnionInstance<'r> {
         /// Carve `words` off `rest` after skipping `skip`, keeping the
         /// caller's lifetime (`mem::take` hands the borrow over wholesale).
         fn carve<'d>(rest: &mut &'d mut [F128], skip: usize, words: usize) -> &'d mut [F128] {
-            let (head, tail) = core::mem::take(rest).split_at_mut(skip + words);
+            let (head, tail) = take(rest).split_at_mut(skip + words);
             *rest = tail;
             &mut head[skip..]
         }
@@ -898,10 +889,10 @@ impl<'r> UnionInstance<'r> {
             "slot buffers must be zero on dummy rows and useless columns \
              (the union witness contract)"
         );
-        rayon::join(
+        join(
             || self.scatter_one(&mut z, ws, |w| &w.z_packed),
             || {
-                rayon::join(
+                join(
                     || self.scatter_one(&mut a, ws, |w| &w.a_packed),
                     || self.scatter_one(&mut b, ws, |w| &w.b_packed),
                 )
@@ -918,8 +909,6 @@ impl<'r> UnionInstance<'r> {
         slot_witnesses: &[SlotWitness],
         pick: impl Fn(&SlotWitness) -> &[F128] + Sync,
     ) {
-        use rayon::prelude::*;
-
         let nu = self.n_log();
         for (((ty, slot), w), &n_t) in self
             .registry()
@@ -1056,7 +1045,6 @@ pub enum WitnessBufMode {
 /// `b` input); the length itself is bound by the circuit digest's public
 /// layout, absorbed alongside.
 pub fn publics_digest(public: &[F128]) -> [u8; 32] {
-    use crate::merkle::{HashKind, hash_leaf, hash_pair};
     // An empty segment digests to the zero string: hash_leaf rejects empty
     // input (a BLAKE3 empty message must be root-flagged), the length is
     // statement-bound through the circuit digest, and equating it with a
@@ -1100,10 +1088,20 @@ pub struct SlotWitnessDest<'d> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::r1cs::SparseBinaryMatrix;
-    use crate::r1cs::{BlockR1cs, WitnessLayout};
+    use std::sync::{Arc, OnceLock};
 
+    use crate::{
+        challenger::FsChallenger,
+        element_r1cs::ElementTableBuilder,
+        pcs::{PcsParams, jagged::JaggedParams},
+        r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+        test_rng::Rng,
+        union::{
+            Challenger, Commitment, ElementSlotLayout, F128, K_SKIP, MIN_DENSE_M, Registry,
+            SkipPoint, SlotWitness, TableClass, TableType, UnionInstance,
+        },
+        zerocheck::PaddingRun,
+    };
     /// Empty matrix stub — nothing here applies the matrices (same practice
     /// as the schedule.rs layout tests).
     fn stub() -> SparseBinaryMatrix {
@@ -1139,12 +1137,10 @@ mod tests {
             c_0: stub(),
             layout: WitnessLayout::BatchMajor,
             const_pin: None,
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
-
-    use crate::test_rng::Rng;
 
     /// A single-slot union at full utilization declares the same jagged grid
     /// as today's `BlockR1cs::jagged_heights` — on the BLAKE3 and SHA-256
@@ -1432,11 +1428,8 @@ mod tests {
         assert!(q[cursor..].iter().all(|w| *w == F128::ZERO), "pad tail");
         // unrank ≡ compaction: every dense index maps back to the padded
         // word it was copied from.
-        let params = crate::pcs::jagged::JaggedParams::from_heights(
-            &union.jagged_heights(),
-            union.n_log(),
-            union.dense_m() - 7,
-        );
+        let params =
+            JaggedParams::from_heights(&union.jagged_heights(), union.n_log(), union.dense_m() - 7);
         for e in 0..union.dense_words() as u64 {
             let (row, col) = params.unrank(e);
             assert_eq!(q[e as usize], z[(col << 3) + row], "unrank at {e}");
@@ -1624,9 +1617,6 @@ mod tests {
     /// challenge, which is what makes the statement non-substitutable.
     #[test]
     fn bind_statement_sensitivity() {
-        use crate::challenger::FsChallenger;
-        use crate::pcs::PcsParams;
-
         let commitment = |root_byte: u8| Commitment {
             cap: vec![[root_byte; 32]],
             params: PcsParams {
@@ -1682,14 +1672,11 @@ mod tests {
     /// An element type of shape `(kappa, k)`: `k` free-wire columns, the rest
     /// self-pinned zero padding. Only the shape matters here.
     fn elem_ty(kappa: usize, k: usize) -> TableType {
-        use crate::element_r1cs::ElementTableBuilder;
         let mut b = ElementTableBuilder::new(kappa);
         for y in 0..k {
             b.free_wire(y);
         }
-        TableType::element(std::sync::Arc::new(
-            b.build().expect("free wires are valid"),
-        ))
+        TableType::element(Arc::new(b.build().expect("free wires are valid")))
     }
 
     /// A boolean-only registry's `boolean_padding_spec` IS its `padding_spec`
@@ -1791,7 +1778,7 @@ mod tests {
         // The padding run-list: an explicit zero run for the class gap, and
         // the element slot's two runs exactly like a boolean slot's.
         let runs = union.padding_spec();
-        let cols = |n_blocks, useful| crate::zerocheck::PaddingRun {
+        let cols = |n_blocks, useful| PaddingRun {
             k_log: 7 + 3,
             useful_bits_per_block: useful,
             n_blocks,
@@ -1934,11 +1921,8 @@ mod tests {
         assert!(q[cursor..].iter().all(|w| *w == F128::ZERO), "pad tail");
 
         // unrank ≡ compaction across the class boundary too.
-        let params = crate::pcs::jagged::JaggedParams::from_heights(
-            &union.jagged_heights(),
-            union.n_log(),
-            union.dense_m() - 7,
-        );
+        let params =
+            JaggedParams::from_heights(&union.jagged_heights(), union.n_log(), union.dense_m() - 7);
         for e in 0..union.dense_words() as u64 {
             let (row, col) = params.unrank(e);
             assert_eq!(q[e as usize], z[(col << 3) + row], "unrank at {e}");

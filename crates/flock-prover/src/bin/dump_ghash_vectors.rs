@@ -11,22 +11,19 @@
 //!
 //! Run:  cargo run --release --bin dump_ghash_vectors -- cuda-ghash/vectors.bin
 
-use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
 
+use env::args;
+use flock_core::test_rng::Rng;
 use flock_prover::field::F128;
 
-use flock_core::test_rng::Rng;
-
-fn main() -> std::io::Result<()> {
-    let path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "vectors.bin".to_string());
-    let count: u32 = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4096);
+fn main() -> Result<()> {
+    let path = args().nth(1).unwrap_or_else(|| "vectors.bin".to_string());
+    let count: u32 = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(4096);
 
     let mut rng = Rng::new(0xC0FFEE);
     let mut w = BufWriter::new(File::create(&path)?);

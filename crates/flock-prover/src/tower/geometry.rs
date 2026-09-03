@@ -1,4 +1,18 @@
-use super::*;
+use std::ops::Range;
+
+use flock_core::{
+    circuit::builder::SlotId,
+    lincheck::build_eq_table,
+    pcs::{ligerito::LigeritoProof, stratified::LevelSchedule},
+};
+use flock_merkle::{hash_leaf, hash_pair, verify_merkle_proof_capped};
+use flock_multilinear::{IndexOrder, eq_table};
+use flock_transcript::transcript_record::{Stream, StreamWord};
+
+use crate::tower::{
+    CHUNK_END, CHUNK_START, F128, F256, HashKind, OpenLevel, PARENT, PcsParams, ShapeBuilder, Wire,
+    cw, pack_params,
+};
 
 /// The three slots a collapsed opening writes into, plus the fused PoW mask
 /// slot the grinding checks ride: one 4-word [`PowMaskTable`] row carries a
@@ -6,18 +20,18 @@ use super::*;
 /// slot the same check paid two 16-word rows and two bit relocations.
 #[derive(Clone, Copy)]
 pub(super) struct CollapsedSlots {
-    pub(super) b3: flock_core::circuit::builder::SlotId,
+    pub(super) b3: SlotId,
     /// A second identical compression table for recursion shapes whose two
     /// independent child-verifier workloads each fit a smaller row domain.
     /// The Slim envelope and strict Fast nodes use distinct slots; smaller
     /// standalone and compatibility-profile circuits retain one slot.
-    pub(super) b3_alt: Option<flock_core::circuit::builder::SlotId>,
-    pub(super) swap: flock_core::circuit::builder::SlotId,
-    pub(super) spread: flock_core::circuit::builder::SlotId,
-    pub(super) pow: flock_core::circuit::builder::SlotId,
+    pub(super) b3_alt: Option<SlotId>,
+    pub(super) swap: SlotId,
+    pub(super) spread: SlotId,
+    pub(super) pow: SlotId,
     /// Present on recursive verifier circuits.  Smaller query-only fixtures
     /// do not declare the family-H transpose relation.
-    pub(super) family: Option<flock_core::circuit::builder::SlotId>,
+    pub(super) family: Option<SlotId>,
 }
 
 /// One opened Ligerito level's geometry. Legacy levels report it from the
@@ -41,11 +55,11 @@ pub(super) struct Lvl {
     /// The stratified schedule this level's config mandates. Every
     /// consumer (emit, residual, checker) maps query → (stratum depth,
     /// stratum, path slice) through this.
-    pub(super) sched: flock_core::pcs::stratified::LevelSchedule,
+    pub(super) sched: LevelSchedule,
     /// The tree's layers from the cap upward, folded natively by
     /// `level_geometry`: entry `i` is the depth-`(c − i)` layer, entry 0
     /// the cap itself — [`Self::full_path`]'s sibling sources.
-    pub(super) cap_layers: Vec<Vec<[u8; 32]>>,
+    cap_layers: Vec<Vec<[u8; 32]>>,
 }
 
 /// Map actual sumcheck-fold order back to the transcript point's natural
@@ -83,7 +97,7 @@ impl Lvl {
     /// The climb to a shallower summand's stratum terminal needs `c − c_k`
     /// more siblings, all folds of the cap: [`Self::full_path`] synthesizes
     /// them.
-    fn path_range(&self, k: usize) -> std::ops::Range<usize> {
+    fn path_range(&self, k: usize) -> Range<usize> {
         let len = self.depth - self.c;
         k * len..(k + 1) * len
     }
@@ -172,7 +186,7 @@ pub(super) fn native_cap_layers(
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|p| core_merkle::hash_pair(&p[0], &p[1], hash))
+            .map(|p| hash_pair(&p[0], &p[1], hash))
             .collect();
         layers.push(next);
     }
@@ -183,7 +197,7 @@ pub(super) fn native_cap_layers(
 /// STATEMENT side of the query-phase geometry (None while the inner's
 /// (m, profile) TOML is legacy). Derived from the same registry entry the
 /// inner was proven under; never from the proof.
-pub(super) fn strat_scheds(params: &PcsParams) -> Vec<flock_core::pcs::stratified::LevelSchedule> {
+pub(super) fn strat_scheds(params: &PcsParams) -> Vec<LevelSchedule> {
     params
         .ligerito_verifier_config()
         .expect("registered config")
@@ -196,7 +210,7 @@ pub(super) fn strat_scheds(params: &PcsParams) -> Vec<flock_core::pcs::stratifie
 /// capping, this is the whole witness a query phase needs — the proof itself
 /// carries it, so no prover data is ever plumbed through.
 pub(super) fn level_sources(
-    lig: &flock_core::pcs::ligerito::LigeritoProof,
+    lig: &LigeritoProof,
 ) -> Vec<(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)> {
     let r = lig.recursive_caps.len();
     (0..=r)
@@ -235,9 +249,8 @@ pub(super) fn level_geometry(
     lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
     chals: &[F128],
     hash: HashKind,
-    scheds: &[flock_core::pcs::stratified::LevelSchedule],
+    scheds: &[LevelSchedule],
 ) -> (Vec<Lvl>, Vec<F256>) {
-    use flock_core::lincheck::build_eq_table;
     assert_eq!(scheds.len(), levels.len(), "one schedule per open level");
     let mut geo: Vec<Lvl> = Vec::new();
     let mut native_sums: Vec<F256> = Vec::new();
@@ -273,16 +286,7 @@ pub(super) fn level_geometry(
             .map(|&i| F256::new(chals[i], chals[i + 1]))
             .collect();
         let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
-        let mut eqv = vec![F256::ONE];
-        for &v in &fold_vals {
-            let old = eqv.len();
-            eqv.resize(2 * old, F256::ZERO);
-            for i in 0..old {
-                let x = eqv[i];
-                eqv[i + old] = x * v;
-                eqv[i] = x * (F256::ONE + v);
-            }
-        }
+        let eqv = eq_table(&fold_vals, F256::ONE, IndexOrder::LowToHigh);
         let aw = build_eq_table(&alpha_vals);
         let c_min = sched.summand_depths.last().copied().unwrap_or(c);
         let lv = Lvl {
@@ -307,9 +311,9 @@ pub(super) fn level_geometry(
                 leaf_bytes.extend_from_slice(&f.lo.to_le_bytes());
                 leaf_bytes.extend_from_slice(&f.hi.to_le_bytes());
             }
-            let lh = core_merkle::hash_leaf(&leaf_bytes, hash);
+            let lh = hash_leaf(&leaf_bytes, hash);
             assert!(
-                core_merkle::verify_merkle_proof_capped(
+                verify_merkle_proof_capped(
                     cap,
                     1 << depth,
                     &lh,
@@ -393,8 +397,7 @@ pub(super) fn observed_f256(values: &[F128], start: usize, len: usize) -> Vec<F2
 }
 
 /// Stream-word indices per `observe_bytes` payload, in payload-word order.
-pub(super) fn payload_words(stream: &flock_core::transcript_record::Stream) -> Vec<Vec<usize>> {
-    use flock_core::transcript_record::StreamWord;
+pub(super) fn payload_words(stream: &Stream) -> Vec<Vec<usize>> {
     let mut pay_words: Vec<Vec<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
         if let StreamWord::Bytes { payload, word } = *w {
@@ -423,7 +426,7 @@ pub(super) fn payload_words(stream: &flock_core::transcript_record::Stream) -> V
 /// in-circuit cap trees bind them (chain + root connects, nothing
 /// checker-read), their payloads demote to witness in `pub_payloads`.
 pub(super) fn cap_payloads(
-    stream: &flock_core::transcript_record::Stream,
+    stream: &Stream,
     bytes: &[u8],
     lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
 ) -> Vec<usize> {
@@ -451,7 +454,7 @@ pub(super) fn cap_payloads(
 /// The absorbed caps' node wires: per level, `2^c` word-wire pairs in
 /// cap-layer order, read off the [`cap_payloads`]-located payloads.
 pub(super) fn cap_wires(
-    stream: &flock_core::transcript_record::Stream,
+    stream: &Stream,
     word_wire: &[Option<Wire>],
     cap_pays: &[usize],
 ) -> Vec<Vec<[Wire; 2]>> {

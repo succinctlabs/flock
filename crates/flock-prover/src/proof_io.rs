@@ -30,13 +30,19 @@
 //! // Then call e.g. `setup.verify(&bundle.commitment, &bundle.proof, ...)`.
 //! ```
 
-use std::io::{self, Read};
-use std::path::Path;
+use std::{
+    error::Error,
+    fmt::{Display, Formatter, Result as FmtResult},
+    fs::{File, rename, write},
+    io::{Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult},
+    path::Path,
+};
 
-use bincode::Options;
-use serde::{Deserialize, Serialize};
+use bincode::{DefaultOptions, Error as BincodeError, Options, serialize_into};
+use flock_core::{pcs::Commitment, proof::R1csProofMergedLigerito};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use flock_core::pcs::Commitment;
+use crate::mixed::MixedRegistryId;
 
 /// Magic bytes prepended to every serialized proof. Lets readers reject
 /// random binary data early.
@@ -48,115 +54,20 @@ const MAGIC: [u8; 5] = *b"FLOCK";
 /// verification into an unbounded allocation.
 const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Format version. Bumped on incompatible serialization changes.
-/// v20 enables the existing non-Ligerito algebraic grinding schedules for
-/// the strict Fast and Slim profiles. No payload fields changed, but their
-/// nonce vectors and Fiat--Shamir transcript shapes are incompatible with
-/// v19 proofs made under those profiles.
-/// v19 moves Ligerito sumcheck claims and challenges to F256. Recursive
-/// commitments remain over F128 by splitting each extension word into a
-/// coordinate bit, so the transcript, recursive dimensions, final `yr`, and
-/// sumcheck-message payload are all incompatible with v18.
-/// v18 changes every Johnson/Ligerito query schedule to make the consistency
-/// term strictly 128-bit after optional query grinding. No struct changes,
-/// but v17 paths/caps and transcript shapes cannot replay under the larger
-/// public query counts.
-/// v17 adds the claim- and consistency-batching PoW nonce vectors from the
-/// Flock paper's Appendix C.3 to `LigeritoProof`.
-/// v16 changes the Johnson/Ligerito transcript: L0 batches one additional OOD
-/// evaluation before the initial sumcheck message, and every deeper level now
-/// carries two OOD evaluations. The proof structs are unchanged, but v15
-/// proof bytes cannot be replayed under the two-point transcript.
-/// v15: remaining non-Ligerito algebraic grinding. Product-GKR, dense and
-/// jagged aggregation folds, chain shift, and Merkle-path shift proofs carry
-/// transcript-ordered PoW witnesses. Opening batching now protects all
-/// ring-switched and packed-direct coefficients with one PoW and samples the
-/// coefficients in one vector squeeze; the multipoint gamma schedule is
-/// derived from its actual `K - 1` degree. These proof and transcript changes
-/// are incompatible with v14.
-/// v14: PCS-transport grinding. Ring-switch proofs carry the PoW witness for
-/// their seven-coordinate point; opening proofs carry claim-batching and
-/// merged-sumcheck witnesses; the multipoint and Frobenius-anchor proofs
-/// carry their protected challenge witnesses. Old payloads cannot be
-/// interpreted under the Secure opening policy.
-/// v13: Element/dense PIOP grinding. Both the element zerocheck and element
-/// lincheck subproofs now carry their transcript-ordered nonce vectors; the
-/// Secure profile verifies them before tau, alpha, and every protected round
-/// challenge. Old mixed payloads therefore cannot be interpreted safely.
-/// v12: Boolean lincheck grinding. `LincheckProof` carries the nonce vector
-/// for α batching, every constant-wire β, every degree-two sumcheck round,
-/// and the final φ8 skip evaluation. Secure profiles select the schedule from
-/// the public PCS profile; old payloads cannot be interpreted safely.
-/// v11: Boolean zerocheck grinding. `ZerocheckProof` carries the nonce vector
-/// for the initial eq-weighted identity challenge, the univariate-skip
-/// challenge, and every multilinear sumcheck round. The verifier selects the
-/// required schedule from the public PCS profile, so an old payload could not
-/// be interpreted safely even when its nonce vector would be empty.
-///
-/// v9: the two-product multipoint grouping — packed-direct
-/// claims collapse by shared row point into merged-column scalar groups
-/// carrying ONE untwisted dual value each
-/// (`MultipointTwistedProof.group_values`); ring-switched claims keep 128.
-/// The sumcheck becomes two products (`ā·g + b̄·eq(ρ,·)`) and the single
-/// anchor binds the whole endpoint sum via closed-form-baked coefficients.
-/// The multipoint label bumps to v1 and the values' absorb shrinks from
-/// `128·K` to `128·R + P` words. Soundness:
-/// docs/multipoint-twisted-assist.tex §"The two-product grouping".
-///
-/// v8: the multipoint-twisted assist — `MergedOpenProof.
-/// frobenius` becomes `MultipointTwistedProof` (128K claimed dual values,
-/// m product-sumcheck rounds, one untwisted anchor); the transcript gains
-/// the values' absorb + gamma squeeze and loses the per-statement assist
-/// rounds. Soundness: docs/multipoint-twisted-assist.tex.
-///
-/// v10: stratified queries (docs/stratified-queries.tex) — every level's
-/// query count decomposes into power-of-two summands, one query per
-/// depth-c subtree; the absorbed cap moves to the TOP SET BIT of the
-/// count (from ⌈log2 q⌉) and openings carry per-summand path lengths.
-/// No struct changed — the vectors are self-describing — but v9 proofs
-/// can never verify under the stratified statement, so versioning stays
-/// strict.
-/// v7: Merkle capping — `Commitment.root`, `LigeritoProof.
-/// initial_root`, and `recursive_roots` become cap-node VECTORS (the
-/// commitment is the cap layer at depth ⌈log2 q⌉; the transcript absorbs
-/// the cap itself), and the per-tree octopus multi-proofs become flat
-/// per-query capped paths. The symmetric bookend to v3, which introduced
-/// the octopus.
-/// v6 switched the Mixed flavor's payload to the MERGED
-/// jagged/ring-switch transport ([`MixedProofBundleLigerito`] now carries
-/// an `R1csProofMergedLigerito` — design doc §"Capacity-free
-/// ring-switching"); the R1cs/Chain flavors' payloads are unchanged, but
-/// versioning is strict so v5 files are rejected.
-/// v5 added the Mixed flavor (registry id + counts vector +
-/// jagged-transport proof). v4 added `ood_values` + `fold_grinding_nonces`
-/// to `LigeritoProof` and `profile` to `PcsParams` (Johnson+OOD profiles).
-/// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
-/// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
-/// to the (since-deleted) chain-proof bundle.
-// v21 (2026-08-14): the R1cs flavor's payload became the MERGED union
-// proof — the standalone hash setups prove over the single-slot union
-// commit now (dense stack + integer lanes); the padded-commit
-// R1csProofLigerito payload is gone from this flavor.
-// v22 (2026-08-27): the profile consolidation (bloat ledger §C). The
-// grind-free `fast`/`slim` (+1 rate/level ladder) were deleted and the
-// `fast128`/`slim128` schedules took their names: aggressive +2/level
-// ladder, 16-bit query PoW per level, larger deep-level batch grinding. No
-// payload field changed, but a v21 proof made under `fast`/`slim` carries a
-// different query/rate/PoW schedule than this build derives for those
-// names, so it cannot be interpreted safely. `fast100`/`slim100`/`secure`
-// are byte-for-byte unchanged. In the same v22 window the mixed registry
-// codes 3 and 4 (`merkle26+blake3@nu3/nu7`) were retired with the
-// Merkle-path product; they are never reused.
+/// Format version for the current proof schemas and transcript rules.
+/// v22 (2026-08-27): the profile consolidation (bloat ledger §C) — the
+/// grind-free `fast`/`slim` were deleted and the `fast128`/`slim128`
+/// schedules took their names, so a v21 proof under those names carries a
+/// different query/rate/PoW schedule and cannot be interpreted safely; the
+/// mixed registry codes 3 and 4 (`merkle26+blake3@nu*`) were retired and
+/// are never reused. `fast100`/`slim100`/`secure` payloads are unchanged.
+/// (The per-version history this file used to carry lives in git.)
 const VERSION: u8 = 22;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see
-/// [`peek_flavor`]). Values 0/1 are reserved: they were the legacy BaseFold
-/// R1cs/Chain flavors.
+/// [`peek_flavor`]). Values 0, 1, and 3 are reserved.
 const FLAVOR_R1CS_LIGERITO: u8 = 2;
-// Flavor byte 3 was the hash-chain (shift-argument) bundle — the product was
-// retired 2026-08-14 with `chain.rs`/`chain_common.rs`; the byte stays
-// reserved and now parses as UnknownFlavor.
 const FLAVOR_MIXED_LIGERITO: u8 = 4;
 
 /// What kind of bundle a byte buffer holds. Returned by [`peek_flavor`] so
@@ -209,11 +120,11 @@ pub enum DeserializeError {
     /// load a `MixedProofBundleLigerito` from an R1CS bundle file).
     FlavorMismatch { expected: u8, found: u8 },
     /// The bincode-deserialization step failed (corrupted payload, etc.).
-    Bincode(bincode::Error),
+    Bincode(BincodeError),
 }
 
-impl std::fmt::Display for DeserializeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for DeserializeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::BadMagic => write!(f, "bad magic: not a FLOCK proof file"),
             Self::UnsupportedVersion(v) => {
@@ -232,10 +143,10 @@ impl std::fmt::Display for DeserializeError {
     }
 }
 
-impl std::error::Error for DeserializeError {}
+impl Error for DeserializeError {}
 
-impl From<bincode::Error> for DeserializeError {
-    fn from(e: bincode::Error) -> Self {
+impl From<BincodeError> for DeserializeError {
+    fn from(e: BincodeError) -> Self {
         Self::Bincode(e)
     }
 }
@@ -247,14 +158,14 @@ impl From<bincode::Error> for DeserializeError {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct R1csProofBundleLigerito {
     pub commitment: Commitment,
-    pub proof: flock_core::proof::R1csProofMergedLigerito,
+    pub proof: R1csProofMergedLigerito,
 }
 
 impl R1csProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + 1024);
         write_header(&mut out, FLAVOR_R1CS_LIGERITO);
-        bincode::serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
+        serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
         out
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
@@ -267,27 +178,24 @@ impl R1csProofBundleLigerito {
 /// registry id — which pins the FULL registry, type list and uniform
 /// capacity `nu` included (see [`crate::mixed::MixedRegistryId`]) — the
 /// declared counts vector (one `u64` per type, **in slot order**), the
-/// commitment to the dense stack, and the MERGED-transport union proof
-/// (design doc §"Capacity-free ring-switching").
-/// The statement is well-formedness only (design doc §"Statement,
-/// transcript, wire format"): the commitment opens to tables with the
+/// commitment to the dense stack, and the merged union proof.
+/// The statement proves well-formedness. The commitment opens to tables with the
 /// declared counts, every declared row satisfying its type's hash relation
 /// — no per-invocation I/O binding.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MixedProofBundleLigerito {
-    pub registry_id: crate::mixed::MixedRegistryId,
+    pub registry_id: MixedRegistryId,
     /// Declared invocation counts, in the registry's slot order.
     pub counts: Vec<u64>,
     pub commitment: Commitment,
-    pub proof: flock_core::proof::R1csProofMergedLigerito,
+    pub proof: R1csProofMergedLigerito,
 }
 
 impl MixedProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + 1024);
         write_header(&mut out, FLAVOR_MIXED_LIGERITO);
-        bincode::serialize_into(&mut out, self)
-            .expect("bincode serialize MixedProofBundleLigerito");
+        serialize_into(&mut out, self).expect("bincode serialize MixedProofBundleLigerito");
         out
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
@@ -300,7 +208,7 @@ impl MixedProofBundleLigerito {
 pub fn write_mixed_bundle_ligerito_to_file<P: AsRef<Path>>(
     path: P,
     bundle: &MixedProofBundleLigerito,
-) -> io::Result<()> {
+) -> IoResult<()> {
     write_bytes_to_file(path, &bundle.to_bytes())
 }
 
@@ -358,10 +266,8 @@ fn check_bundle_size(len: usize) -> Result<(), DeserializeError> {
     }
 }
 
-fn deserialize_payload<T: serde::de::DeserializeOwned>(
-    payload: &[u8],
-) -> Result<T, DeserializeError> {
-    Ok(bincode::DefaultOptions::new()
+fn deserialize_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T, DeserializeError> {
+    Ok(DefaultOptions::new()
         // Preserve the wire encoding used by bincode's top-level helpers.
         .with_fixint_encoding()
         .with_limit((MAX_BUNDLE_BYTES - HEADER_LEN) as u64)
@@ -375,7 +281,7 @@ fn deserialize_payload<T: serde::de::DeserializeOwned>(
 
 /// Atomically write `bytes` to `path` (write-then-rename via the
 /// stdlib — best-effort; on error the rename may leave a temp file behind).
-pub fn write_bytes_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<()> {
+pub fn write_bytes_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> IoResult<()> {
     let path = path.as_ref();
     let tmp = match path.parent() {
         Some(dir) => dir.join(format!(
@@ -386,19 +292,19 @@ pub fn write_bytes_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<
         )),
         None => Path::new(".flock-proof.tmp").to_path_buf(),
     };
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    write(&tmp, bytes)?;
+    rename(&tmp, path)
 }
 
 /// Read proof bytes from a file without ever buffering more than
 /// [`MAX_BUNDLE_BYTES`]. The `take` guard also handles a file growing between
 /// its metadata check and the read.
-pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)?;
+pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> IoResult<Vec<u8>> {
+    let mut file = File::open(path)?;
     let declared_len = file.metadata()?.len();
     if declared_len > MAX_BUNDLE_BYTES as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        return Err(IoError::new(
+            IoErrorKind::InvalidData,
             format!("proof bundle is {declared_len} bytes; maximum is {MAX_BUNDLE_BYTES}"),
         ));
     }
@@ -407,8 +313,8 @@ pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
         .take(MAX_BUNDLE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_BUNDLE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        return Err(IoError::new(
+            IoErrorKind::InvalidData,
             format!("proof bundle exceeded the {MAX_BUNDLE_BYTES}-byte maximum while reading"),
         ));
     }
@@ -419,12 +325,12 @@ pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 /// bytes weren't a valid bundle.
 #[derive(Debug)]
 pub enum BundleReadError {
-    Io(io::Error),
+    Io(IoError),
     Deserialize(DeserializeError),
 }
 
-impl std::fmt::Display for BundleReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for BundleReadError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Deserialize(e) => write!(f, "deserialize error: {e}"),
@@ -432,7 +338,7 @@ impl std::fmt::Display for BundleReadError {
     }
 }
 
-impl std::error::Error for BundleReadError {}
+impl Error for BundleReadError {}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -440,20 +346,34 @@ impl std::error::Error for BundleReadError {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::r1cs_hashes::blake3::{Blake3Setup, Compression, blake3_compress};
-    use flock_core::challenger::FsChallenger;
+    use std::{array::from_fn, env::temp_dir, fs::remove_file};
 
-    use flock_core::test_rng::Rng;
+    use bincode::serialize;
+    use flock_core::{pcs::ligerito::LigeritoProfile, test_rng::Rng};
+    use flock_hash::blake3_compress;
+    use flock_prover_test_inputs::{random_blake3_inputs, random_sha2_inputs};
+    use flock_transcript::challenger::FsChallenger;
+
+    use crate::{
+        mixed::{MixedCounts, MixedRegistryId, MixedSetup},
+        proof_io::{
+            BundleFlavor, DeserializeError, FLAVOR_MIXED_LIGERITO, FLAVOR_R1CS_LIGERITO,
+            HEADER_LEN, MAGIC, MAX_BUNDLE_BYTES, MixedProofBundleLigerito, R1csProofBundleLigerito,
+            VERSION, check_bundle_size, deserialize_payload, peek_flavor, read_bytes_from_file,
+            read_mixed_bundle_ligerito_from_file, write_bytes_to_file,
+            write_mixed_bundle_ligerito_to_file,
+        },
+        r1cs_hashes::blake3::{Blake3Setup, Compression},
+    };
 
     /// Build a small honest BLAKE3 chain (n=8) for the bundle tests.
     fn honest_chain(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8]) {
         let mut rng = Rng::new(seed);
-        let mut cv: [u32; 8] = std::array::from_fn(|_| rng.next_u64() as u32);
+        let mut cv: [u32; 8] = from_fn(|_| rng.next_u64() as u32);
         let cv0 = cv;
         let mut blocks = Vec::with_capacity(n);
         for _ in 0..n {
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
+            let m: [u32; 16] = from_fn(|_| rng.next_u64() as u32);
             let counter = 0u64;
             let block_len = 64u32;
             let flags = 0u32;
@@ -508,10 +428,10 @@ mod tests {
         }
 
         // File roundtrip.
-        let path = std::env::temp_dir().join("flock-proofio-roundtrip.bin");
+        let path = temp_dir().join("flock-proofio-roundtrip.bin");
         write_bytes_to_file(&path, &bytes).expect("write");
         let read_back = read_bytes_from_file(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
+        let _ = remove_file(&path);
         let bundle4 = R1csProofBundleLigerito::from_bytes(&read_back).expect("file round-trip");
         let mut chv = FsChallenger::new(b"flock-proofio-lig");
         setup
@@ -533,9 +453,6 @@ mod tests {
     #[test]
     #[ignore] // Heavier — run with `cargo test mixed_bundle_roundtrip -- --ignored`
     fn mixed_bundle_roundtrip_and_verify() {
-        use crate::mixed::{MixedCounts, MixedRegistryId, MixedSetup};
-        use flock_prover_test_inputs::{random_blake3_inputs, random_sha2_inputs};
-
         let setup = MixedSetup::new(MixedRegistryId::Blake3Sha2Nu7);
         let mut rng = Rng::new(0x0511_31ED);
         let sha2_inputs = random_sha2_inputs(&mut rng, 100);
@@ -593,7 +510,7 @@ mod tests {
             setup2
                 .verify(
                     counts,
-                    flock_core::pcs::ligerito::LigeritoProfile::Fast100,
+                    LigeritoProfile::Fast100,
                     &bundle2.commitment,
                     &bundle2.proof,
                     &mut chv,
@@ -621,10 +538,10 @@ mod tests {
         );
 
         // File roundtrip.
-        let path = std::env::temp_dir().join("flock-proofio-mixed-roundtrip.bin");
+        let path = temp_dir().join("flock-proofio-mixed-roundtrip.bin");
         write_mixed_bundle_ligerito_to_file(&path, &bundle).expect("write");
         let bundle3 = read_mixed_bundle_ligerito_from_file(&path).expect("file round-trip");
-        let _ = std::fs::remove_file(&path);
+        let _ = remove_file(&path);
         assert_eq!(bundle3.counts, bundle.counts);
 
         eprintln!(
@@ -637,30 +554,30 @@ mod tests {
 
     /// Deterministic input generators shared with the mixed bundle test.
     mod flock_prover_test_inputs {
-        use super::Rng;
+        use std::array::from_fn;
 
-        pub fn random_blake3_inputs(
-            rng: &mut Rng,
-            n: usize,
-        ) -> Vec<crate::r1cs_hashes::blake3::Compression> {
+        use flock_core::test_rng::Rng;
+
+        use crate::r1cs_hashes::{
+            blake3::Compression as Blake3Compression, sha2::Compression as Sha2Compression,
+        };
+
+        pub fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<Blake3Compression> {
             (0..n)
                 .map(|_| {
-                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u64() as u32);
-                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u64() as u32);
+                    let cv: [u32; 8] = from_fn(|_| rng.next_u64() as u32);
+                    let m: [u32; 16] = from_fn(|_| rng.next_u64() as u32);
                     (cv, m, rng.next_u64(), 64u32, 11u32)
                 })
                 .collect()
         }
 
-        pub fn random_sha2_inputs(
-            rng: &mut Rng,
-            n: usize,
-        ) -> Vec<crate::r1cs_hashes::sha2::Compression> {
+        pub fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<Sha2Compression> {
             (0..n)
                 .map(|_| {
                     (
-                        std::array::from_fn(|_| rng.next_u64() as u32),
-                        std::array::from_fn(|_| rng.next_u64() as u32),
+                        from_fn(|_| rng.next_u64() as u32),
+                        from_fn(|_| rng.next_u64() as u32),
                     )
                 })
                 .collect()
@@ -765,7 +682,7 @@ mod tests {
 
     #[test]
     fn bounded_decoder_rejects_trailing_bytes() {
-        let mut payload = bincode::serialize(&0x1280_u64).expect("serialize test value");
+        let mut payload = serialize(&0x1280_u64).expect("serialize test value");
         payload.push(0);
         assert!(deserialize_payload::<u64>(&payload).is_err());
     }

@@ -8,9 +8,14 @@
 //! For each `c`, runs many independent grindings (each with a fresh 32-byte
 //! prefix) so the geometric noise in number of tries averages out.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::{
+    hint::black_box,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    time::Instant,
+};
 
+use flock_prover::init_perf_thread_pool;
+use rayon::{current_num_threads, scope};
 use sha2::{Digest, Sha256};
 
 #[inline(always)]
@@ -55,7 +60,7 @@ fn grind_mt(prefix: &[u8; 32], c: u32, n_threads: usize) -> (u64, u64) {
     let total_attempts = AtomicUsize::new(0);
     let stride = n_threads as u64;
 
-    rayon::scope(|s| {
+    scope(|s| {
         for tid in 0..n_threads {
             let found_ref = &found;
             let attempts_ref = &total_attempts;
@@ -160,12 +165,12 @@ fn run_mt(c: u32, runs: usize, n_threads: usize) -> (f64, f64, f64) {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
-    let n_threads = rayon::current_num_threads();
+    let _ = init_perf_thread_pool();
+    let n_threads = current_num_threads();
 
     // Pre-warm the SHA-256 unit (first call sometimes shows JIT-style startup).
     let warm = hash_with_nonce(&[0u8; 32], 0);
-    std::hint::black_box(&warm);
+    black_box(&warm);
 
     println!("SHA-256 grinding cost — hardware-accelerated (sha2 crate, asm feature)");
     #[cfg(target_arch = "aarch64")]

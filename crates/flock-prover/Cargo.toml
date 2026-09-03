@@ -10,10 +10,18 @@ description = "Apple-silicon-optimized end-to-end prover for Flock (R1CS over GF
 # Forwarded to flock-core. See that crate's manifest for semantics.
 hash-count = ["flock-core/hash-count"]
 mul-count = ["flock-core/mul-count"]
-unsound-challenger = ["flock-core/unsound-challenger"]
+unsound-challenger = [
+    "flock-core/unsound-challenger",
+    "flock-transcript/unsound-challenger",
+]
 
 [dependencies]
 flock-core = { path = "../flock-core" }
+flock-field = { workspace = true }
+flock-hash = { workspace = true }
+flock-merkle = { workspace = true }
+flock-multilinear = { workspace = true }
+flock-transcript = { workspace = true }
 rayon = { workspace = true }
 sha2 = { workspace = true }
 blake3 = { workspace = true }
@@ -22,9 +30,10 @@ bincode = { workspace = true }
 
 [dev-dependencies]
 # Tests, benches, and examples use the insecure `RandomChallenger`, gated in
-# flock-core behind its `unsound-challenger` feature. Enabling it dev-only makes
+# flock-transcript behind its `unsound-challenger` feature. Enabling it dev-only makes
 # it available to test/bench/example builds without leaking into normal builds.
 flock-core = { path = "../flock-core", features = ["unsound-challenger"] }
+flock-transcript = { workspace = true, features = ["unsound-challenger"] }
 
 [[bench]]
 name = "ag_breakdown"

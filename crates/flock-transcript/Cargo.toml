@@ -1,0 +1,21 @@
+[package]
+name = "flock-transcript"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Hashing and Fiat-Shamir transcripts for Flock protocols."
+
+[features]
+hash-count = []
+unsound-challenger = []
+
+[dependencies]
+flock-field = { workspace = true }
+flock-hash = { workspace = true }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

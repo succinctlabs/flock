@@ -30,14 +30,40 @@
 //!    b. Last step: send remaining poly + open f^i.
 //!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
-use crate::challenger::Challenger;
-use crate::field::{F128, F256, F256Unreduced};
-use crate::lincheck::build_eq_table;
-use crate::merkle::{self, Hash, HashKind};
-use crate::ntt::additive_ntt_f128::AdditiveNttF128;
-use crate::pcs::LOG_PACKING;
-use crate::pcs::stratified;
+use core::{mem::size_of, slice::from_raw_parts};
+use std::{
+    collections::HashMap,
+    env::var,
+    mem::{replace, take},
+    sync::atomic::AtomicU8,
+    time::{Duration, Instant},
+};
+
+use extension::recursive_prover_with_basis_impl;
+use merkle::{cap_layer, hash_leaf, merkle_proof_capped, merkle_tree, verify_merkle_proof_capped};
+use rayon::{
+    current_num_threads,
+    prelude::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+        IntoParallelRefMutIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+    },
+};
 use serde::{Deserialize, Serialize};
+use stratified::{LevelSchedule, level_block_logs, schedules, validate_schedules};
+use toml::{from_str, to_string_pretty};
+
+use crate::{
+    challenger::Challenger,
+    field::{F128, F256, F256Unreduced, f128_slice::fold_pairs},
+    lincheck::build_eq_table,
+    merkle::{self, Hash, HashKind},
+    ntt::additive_ntt_f128::AdditiveNttF128,
+    pcs::{
+        LOG_PACKING, commit::replicate_message_fill, ring_switch::build_eq_scaled_parallel,
+        stratified,
+    },
+    scratch::{give_f128, take_f128},
+};
 
 pub(crate) mod extension;
 
@@ -175,14 +201,14 @@ pub struct ProverConfig {
     /// proof's shape: the allocation is statement authority
     /// (`docs/stratified-queries.tex`). Custom schedules are allowed but
     /// must pass [`stratified::validate_schedules`].
-    pub stratified: Vec<stratified::LevelSchedule>,
+    pub stratified: Vec<LevelSchedule>,
 }
 
 impl ProverConfig {
     /// Per-level block logs from the declared ladder shape (the block
     /// `queries[ℓ]` opens): see [`stratified::level_block_logs`].
     pub fn level_block_logs(&self) -> Vec<usize> {
-        stratified::level_block_logs(
+        level_block_logs(
             self.initial_log_msg_cols,
             &self.recursive_log_msg_cols,
             &self.log_inv_rates,
@@ -194,14 +220,14 @@ impl ProverConfig {
     /// hand-customized schedules replace the field afterwards and must pass
     /// [`stratified::validate_schedules`].
     pub fn with_default_stratified(mut self) -> Self {
-        self.stratified = stratified::schedules(&self.queries, &self.level_block_logs());
+        self.stratified = schedules(&self.queries, &self.level_block_logs());
         self
     }
 
     /// Validate the stored schedules against the query counts and ladder
     /// shape (the load-time authority check).
     pub fn validate_stratified(&self) -> Result<(), String> {
-        stratified::validate_schedules(&self.stratified, &self.queries, &self.level_block_logs())
+        validate_schedules(&self.stratified, &self.queries, &self.level_block_logs())
     }
 
     /// The L0 cap depth this config implies — the ONE rule commit-time
@@ -243,14 +269,14 @@ pub struct VerifierConfig {
     /// statement-side allocation, same contract as
     /// [`ProverConfig::stratified`]: config-build-time data, never derived
     /// at proof time or from the proof.
-    pub stratified: Vec<stratified::LevelSchedule>,
+    pub stratified: Vec<LevelSchedule>,
 }
 
 impl VerifierConfig {
     /// Per-level block logs from the declared ladder shape: see
     /// [`stratified::level_block_logs`].
     pub fn level_block_logs(&self) -> Vec<usize> {
-        stratified::level_block_logs(
+        level_block_logs(
             self.initial_log_msg_cols,
             &self.recursive_log_msg_cols,
             &self.log_inv_rates,
@@ -260,13 +286,13 @@ impl VerifierConfig {
     /// Attach the canonical stratified schedule; see
     /// [`ProverConfig::with_default_stratified`].
     pub fn with_default_stratified(mut self) -> Self {
-        self.stratified = stratified::schedules(&self.queries, &self.level_block_logs());
+        self.stratified = schedules(&self.queries, &self.level_block_logs());
         self
     }
 
     /// Validate the stored schedules (the load-time authority check).
     pub fn validate_stratified(&self) -> Result<(), String> {
-        stratified::validate_schedules(&self.stratified, &self.queries, &self.level_block_logs())
+        validate_schedules(&self.stratified, &self.queries, &self.level_block_logs())
     }
 
     /// The L0 cap depth this config implies; see
@@ -570,7 +596,7 @@ pub fn prover_config_for(
     log_batch_size: usize,
     profile: LigeritoProfile,
 ) -> Result<ProverConfig, String> {
-    let m = log_n + crate::pcs::LOG_PACKING;
+    let m = log_n + LOG_PACKING;
     let toml = embedded_security_config(m, profile).ok_or_else(|| {
         format!(
             "no security config registered for (m={m}, profile={}). \
@@ -600,7 +626,7 @@ pub fn verifier_config_for(
     log_batch_size: usize,
     profile: LigeritoProfile,
 ) -> Result<VerifierConfig, String> {
-    let m = log_n + crate::pcs::LOG_PACKING;
+    let m = log_n + LOG_PACKING;
     let toml = embedded_security_config(m, profile).ok_or_else(|| {
         format!(
             "no security config registered for (m={m}, profile={})",
@@ -1635,7 +1661,7 @@ impl LigeritoSecurityConfig {
         target_security_bits: usize,
     ) -> Result<Self, String> {
         let log_n = m
-            .checked_sub(crate::pcs::LOG_PACKING)
+            .checked_sub(LOG_PACKING)
             .ok_or_else(|| format!("m ({m}) < LOG_PACKING (7)"))?;
         let initial_k = 6usize;
         let prover = default_config(log_n, initial_k, log_inv_rate).map_err(|e| e.to_string())?;
@@ -1788,7 +1814,7 @@ impl LigeritoSecurityConfig {
             }
         };
         let log_n = m
-            .checked_sub(crate::pcs::LOG_PACKING)
+            .checked_sub(LOG_PACKING)
             .ok_or_else(|| format!("m ({m}) < LOG_PACKING (7)"))?;
         // `initial_k` (= L0 interleave; the committed row width is
         // content_words / 2^(log_n − initial_k)) is 6 except where noted.
@@ -2011,7 +2037,7 @@ impl LigeritoSecurityConfig {
     /// `include_str!("../../configs/ligerito/m29_fast.toml")` (for compile-time
     /// configs) or read it via `std::fs` (for runtime configs).
     pub fn from_toml_str(s: &str) -> Result<Self, String> {
-        let cfg: Self = toml::from_str(s).map_err(|e| format!("toml parse: {e}"))?;
+        let cfg: Self = from_str(s).map_err(|e| format!("toml parse: {e}"))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -2019,7 +2045,7 @@ impl LigeritoSecurityConfig {
     /// Serialize the config back out to TOML. Round-trip-stable with
     /// [`from_toml_str`].
     pub fn to_toml_string(&self) -> Result<String, String> {
-        toml::to_string_pretty(self).map_err(|e| format!("toml serialize: {e}"))
+        to_string_pretty(self).map_err(|e| format!("toml serialize: {e}"))
     }
 
     /// Build a `(ProverConfig, VerifierConfig)` pair from this security config.
@@ -2178,7 +2204,7 @@ pub struct LigeritoProof {
 
 impl LigeritoProof {
     pub fn size_bytes(&self) -> usize {
-        const ELEM: usize = core::mem::size_of::<F128>();
+        const ELEM: usize = size_of::<F128>();
         let level_bytes = |p: &RecursiveProof| -> usize {
             p.opened_rows.iter().map(|r| r.len() * ELEM).sum::<usize>() + p.merkle_proof.len() * 32
         };
@@ -2213,7 +2239,7 @@ impl LigeritoProof {
 
     /// Print a per-component breakdown of the proof size to stderr.
     pub fn print_size_breakdown(&self) {
-        const ELEM: usize = core::mem::size_of::<F128>();
+        const ELEM: usize = size_of::<F128>();
         let kb = |b: usize| {
             if b >= 1024 * 1024 {
                 format!("{:.2} MB", b as f64 / 1024.0 / 1024.0)
@@ -2521,8 +2547,6 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
     ris_for_basis: &[F128],
     yr_log_n: usize,
 ) -> Vec<F128> {
-    use crate::lincheck::build_eq_table;
-    use rayon::prelude::*;
     assert_eq!(ris_for_basis.len() + yr_log_n, log_msg_cols);
     let n_queries = queries.len();
     let yr_len = 1usize << yr_log_n;
@@ -2640,7 +2664,6 @@ pub fn induce_sumcheck_poly(
     queries: &[usize],
     alpha: &[F128],
 ) -> (Vec<F128>, F128) {
-    use rayon::prelude::*;
     let n = 1usize << log_msg_cols;
     let n_queries = queries.len();
     assert_eq!(opened_rows.len(), n_queries);
@@ -2669,7 +2692,7 @@ pub fn induce_sumcheck_poly(
 
     // Per-thread chunked accumulation: each thread accumulates a partial
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
-    let n_threads = rayon::current_num_threads().max(1);
+    let n_threads = current_num_threads().max(1);
     let chunk_size = (n_queries + n_threads - 1) / n_threads.max(1);
 
     let partials: Vec<(Vec<F128>, F128)> = (0..n_threads)
@@ -2733,10 +2756,9 @@ pub fn induce_sumcheck_poly(
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
 /// one parallel sweep per layer.)
 fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
-    use rayon::prelude::*;
     debug_assert_eq!(data.len(), 1usize << log_d);
     debug_assert!(log_d <= ntt.log_domain_size());
-    let n_threads = rayon::current_num_threads().max(1);
+    let n_threads = current_num_threads().max(1);
     for layer in (0..log_d).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
@@ -2885,8 +2907,6 @@ fn transpose_forward_ntt_sparse(
     values: &[F128],
     log_d: usize,
 ) -> Vec<F128> {
-    use rayon::prelude::*;
-    use std::collections::HashMap;
     let n = 1usize << log_d;
     // No prefix for small domains — just scatter + full dense transpose.
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
@@ -2947,7 +2967,7 @@ fn transpose_forward_ntt_sparse(
     }
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
-    let n_threads = rayon::current_num_threads().max(1);
+    let n_threads = current_num_threads().max(1);
     for layer in (0..(log_d - k)).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
@@ -3006,7 +3026,7 @@ pub struct LigeroWitness {
 // pool when a level's witness is replaced/dropped.
 impl Drop for LigeroWitness {
     fn drop(&mut self) {
-        crate::scratch::give_f128(std::mem::take(&mut self.mat));
+        give_f128(take(&mut self.mat));
     }
 }
 
@@ -3014,8 +3034,8 @@ impl Drop for LigeroWitness {
 // packed witness `f` and the γ-combined basis) — recycle both on drop.
 impl Drop for SumcheckProver {
     fn drop(&mut self) {
-        crate::scratch::give_f128(std::mem::take(&mut self.f));
-        crate::scratch::give_f128(std::mem::take(&mut self.combined_basis));
+        give_f128(take(&mut self.f));
+        give_f128(take(&mut self.combined_basis));
     }
 }
 
@@ -3029,7 +3049,7 @@ impl LigeroWitness {
     /// The cap layer at depth `c` — this witness's commitment message.
     #[inline]
     pub fn cap(&self, c: usize) -> &[Hash] {
-        merkle::cap_layer(&self.tree, self.block_len, c)
+        cap_layer(&self.tree, self.block_len, c)
     }
 }
 
@@ -3063,22 +3083,18 @@ pub fn ligero_commit(
     // replicas of `poly` (same write cost as copy + zero-fill) and start the
     // transform past those layers — see `pcs::commit::replicate_message_fill`.
     let codeword_len = block_len * num_interleaved;
-    let mut mat = crate::scratch::take_f128(codeword_len);
-    super::commit::replicate_message_fill(&mut mat, poly);
+    let mut mat = take_f128(codeword_len);
+    replicate_message_fill(&mut mat, poly);
 
     // RS-encode every lane in one call (each lane is one independent NTT).
     ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
-    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
-    let data_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            mat.as_ptr() as *const u8,
-            mat.len() * core::mem::size_of::<F128>(),
-        )
-    };
+    let leaf_size_bytes = num_interleaved * size_of::<F128>();
+    let data_bytes: &[u8] =
+        unsafe { from_raw_parts(mat.as_ptr() as *const u8, mat.len() * size_of::<F128>()) };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
+    let tree = merkle_tree(data_bytes, block_len, kind);
 
     LigeroWitness {
         mat,
@@ -3161,7 +3177,6 @@ impl RoundQuad {
 /// Uses a SINGLE combined basis poly. (Previously took `&[Vec<F128>]` and
 /// summed at every pair index; collapsing to one basis happens at glue time.)
 fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
@@ -3211,7 +3226,6 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
 /// pair. Bit-identical to the unfused path: F128 sums are exact and order-
 /// independent, so `y == mle_eval_inline(f, z)`.
 fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
@@ -3253,7 +3267,6 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
 /// ordinary LSB order; `d > 1` pairs corresponding entries in adjacent
 /// `d`-word blocks, as required by a lane-major L0 fold.
 fn round_msg_and_eval_blocked(f: &[F128], b: &[F128], d: usize) -> (SumcheckMessage, F128) {
-    use rayon::prelude::*;
     debug_assert!(d.is_power_of_two());
     debug_assert_eq!(f.len(), b.len());
     debug_assert!(f.len().is_multiple_of(2 * d));
@@ -3288,7 +3301,6 @@ fn round_msg_and_eval_blocked(f: &[F128], b: &[F128], d: usize) -> (SumcheckMess
 /// production path uses `fold_and_msg_lsb` instead.
 #[cfg(test)]
 fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
-    use rayon::prelude::*;
     let n = evals.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     let half = n / 2;
@@ -3329,8 +3341,6 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// Returns `(folded_f, folded_b, next_msg)` where `next_msg = round_msg_lsb
 /// (folded_f, folded_b)`. Bit-identical to the unfused sequence.
 fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
-    use crate::field::F256Unreduced;
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
@@ -3384,8 +3394,8 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
     // caller returns the outgoing pair via `scratch::give_f128`, see
     // [`SumcheckProver::fold`]).
     const CHUNK: usize = 2048;
-    let mut nf = crate::scratch::take_f128(half);
-    let mut nb = crate::scratch::take_f128(half);
+    let mut nf = take_f128(half);
+    let mut nb = take_f128(half);
     let (u_0, u_2) = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -3399,8 +3409,8 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
             // x86, NEON on aarch64), then pair up the just-folded values for
             // the msg. `src[2j]·(1+r) + src[2j+1]·r = v0 + (v0+v1)·r` exactly
             // in GF(2^128), so the kernel choice cannot change the bits.
-            crate::field::f128_slice::fold_pairs(f, base, fc, r);
-            crate::field::f128_slice::fold_pairs(b, base, bc, r);
+            fold_pairs(f, base, fc, r);
+            fold_pairs(b, base, bc, r);
             let mut k = 0;
             while k + 1 < len {
                 let f0 = fc[k];
@@ -3450,8 +3460,7 @@ pub struct FoldLookahead {
 /// `1` forces the schedule on, `2` forces the plain per-round folds.
 /// Byte-identical either way (exact polynomial identity) — the oracle
 /// tests alternate this to prove it.
-pub static FOLD_LOOKAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+pub static FOLD_LOOKAHEAD_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
 impl FoldLookahead {
     #[inline]
@@ -3555,7 +3564,6 @@ pub(crate) fn round_msg_eval_and_lookahead(
     f: &[F128],
     b: &[F128],
 ) -> (SumcheckMessage, F128, FoldLookahead) {
-    use rayon::prelude::*;
     debug_assert_eq!(f.len(), b.len());
     debug_assert!(f.len() >= 4 && f.len().is_multiple_of(4));
     // 9 accumulators: the 8 lookahead slots + the odd dot (y = u_0 + odd).
@@ -3599,7 +3607,6 @@ fn fold1_lookahead_lsb(
     b: &[F128],
     r: F128,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage, FoldLookahead) {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
@@ -3609,8 +3616,8 @@ fn fold1_lookahead_lsb(
     );
 
     const CHUNK: usize = 2048;
-    let mut nf = crate::scratch::take_f128(half);
-    let mut nb = crate::scratch::take_f128(half);
+    let mut nf = take_f128(half);
+    let mut nb = take_f128(half);
     let acc = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -3656,7 +3663,6 @@ fn fold2_lookahead_lsb(
     r_a: F128,
     r_b: F128,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage, FoldLookahead) {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert_eq!(b.len(), n);
     let quarter = n / 4;
@@ -3666,8 +3672,8 @@ fn fold2_lookahead_lsb(
     );
 
     const CHUNK: usize = 2048;
-    let mut nf = crate::scratch::take_f128(quarter);
-    let mut nb = crate::scratch::take_f128(quarter);
+    let mut nf = take_f128(quarter);
+    let mut nb = take_f128(quarter);
     let acc = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -3710,12 +3716,11 @@ fn fold2_lookahead_lsb(
 /// Fold both arrays by `r` with NO message computation (write-only drain for
 /// a pending lookahead challenge at the end of an odd-length schedule).
 fn fold_pair_no_msg(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>) {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
-    let mut nf = crate::scratch::take_f128(half);
-    let mut nb = crate::scratch::take_f128(half);
+    let mut nf = take_f128(half);
+    let mut nb = take_f128(half);
     const CHUNK: usize = 2048;
     nf.par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -3762,8 +3767,6 @@ fn fold_and_msg_blocked(
     d: usize,
     live_in: usize,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
-    use rayon::prelude::*;
-
     if d == 1 {
         return fold_and_msg_lsb(f, b, r);
     }
@@ -3809,8 +3812,8 @@ fn fold_and_msg_blocked(
         (lo, hi)
     }
 
-    let mut nf = crate::scratch::take_f128(half);
-    let mut nb = crate::scratch::take_f128(half);
+    let mut nf = take_f128(half);
+    let mut nb = take_f128(half);
 
     if blocks_out == 1 {
         // Last blocked round: one output block, so the NEXT round pairs
@@ -3909,17 +3912,13 @@ pub type BasisWindowFn<'a> = &'a (dyn Fn(&mut [F128], usize) + Sync);
 /// [`fold_and_msg_blocked`] with the basis supplied JUST-IN-TIME. Identical
 /// arithmetic and identical output; the only difference is that each task
 /// fills two small L1-resident windows of `b` rather than streaming them from
-/// a `2^m` array — which at `m = 30` removes both the 134 MB materialization
-/// and the 134 MB read of it, and measures FASTER than the read (measured
-/// by the since-deleted `tests/jit_fold.rs` probe, bloat ledger §E).
+/// a `2^m` array. At `m = 30`, this removes a 134 MB allocation and its read.
 ///
 /// `d = 1` is the ordinary adjacent/LSB pairing; `d > 1` is the blocked
 /// pairing used by a lane-major L0 fold.  The same task decomposition covers
 /// both cases: at `d = 1`, one task folds four adjacent input entries into
 /// two output entries and accumulates exactly one next-round message pair.
-// Test-only since the F128 `SumcheckProver::fold_blocked_jit` wrapper was
-// deleted (bloat ledger §A): the production JIT fold is the F256 one in
-// `extension`; the in-file jit-equivalence test keeps this as its oracle.
+// This F128 implementation is a test oracle for the F256 implementation.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn fold_and_msg_blocked_jit(
@@ -3929,8 +3928,6 @@ fn fold_and_msg_blocked_jit(
     d: usize,
     live_in: usize,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
-    use rayon::prelude::*;
-
     let n = f.len();
     debug_assert!(d.is_power_of_two() && n.is_power_of_two() && n >= 2 * d);
     let half = n / 2;
@@ -3939,8 +3936,8 @@ fn fold_and_msg_blocked_jit(
     let live_out = live_in.div_ceil(2).min(blocks_out);
     let one_plus_r = F128::ONE + r;
 
-    let mut nf = crate::scratch::take_f128(half);
-    let mut nb = crate::scratch::take_f128(half);
+    let mut nf = take_f128(half);
+    let mut nb = take_f128(half);
     const CH: usize = 1 << 11;
 
     // Combine one aligned run with an optionally-dead `hi`.
@@ -4078,12 +4075,8 @@ impl VirtualEqTerm {
 
     fn rebuild(&mut self) {
         self.n_lo = self.coords.len() / 2;
-        self.lo = crate::pcs::ring_switch::build_eq_scaled_parallel(
-            &self.coords[..self.n_lo],
-            self.scale,
-        );
-        self.hi =
-            crate::pcs::ring_switch::build_eq_scaled_parallel(&self.coords[self.n_lo..], F128::ONE);
+        self.lo = build_eq_scaled_parallel(&self.coords[..self.n_lo], self.scale);
+        self.hi = build_eq_scaled_parallel(&self.coords[self.n_lo..], F128::ONE);
     }
 
     #[inline]
@@ -4142,7 +4135,6 @@ fn round_msg_and_eval_eq_point_blocked(
     point: &[F128],
     d: usize,
 ) -> (SumcheckMessage, F128) {
-    use rayon::prelude::*;
     debug_assert_eq!(f.len(), 1usize << point.len());
     debug_assert!(f.len().is_multiple_of(2 * d));
     let eq = VirtualEqTerm::new(point.to_vec(), F128::ONE);
@@ -4182,7 +4174,6 @@ pub(crate) fn round_msg_eval_and_lookahead_eq_point_blocked(
     point: &[F128],
     d: usize,
 ) -> (SumcheckMessage, F128, FoldLookahead) {
-    use rayon::prelude::*;
     debug_assert_eq!(f.len(), 1usize << point.len());
     debug_assert!(d.is_power_of_two() && f.len().is_multiple_of(4 * d));
     let eq = VirtualEqTerm::new(point.to_vec(), F128::ONE);
@@ -4298,8 +4289,8 @@ impl SumcheckProver {
         // old ones.
         #[cfg(target_arch = "x86_64")]
         {
-            crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
-            crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
+            give_f128(replace(&mut self.f, nf));
+            give_f128(replace(&mut self.combined_basis, nb));
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -4316,8 +4307,8 @@ impl SumcheckProver {
     pub fn fold1_lookahead(&mut self, r: F128) -> (SumcheckMessage, FoldLookahead) {
         debug_assert!(self.pending_fold.is_none(), "fold1 with pending lookahead");
         let (nf, nb, msg, la) = fold1_lookahead_lsb(&self.f, &self.combined_basis, r);
-        crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
-        crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
+        give_f128(replace(&mut self.f, nf));
+        give_f128(replace(&mut self.combined_basis, nb));
         self.transcript.push(msg);
         (msg, la)
     }
@@ -4343,8 +4334,8 @@ impl SumcheckProver {
             .take()
             .expect("fold2_lookahead without pending challenge");
         let (nf, nb, msg, la) = fold2_lookahead_lsb(&self.f, &self.combined_basis, r_a, r);
-        crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
-        crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
+        give_f128(replace(&mut self.f, nf));
+        give_f128(replace(&mut self.combined_basis, nb));
         self.transcript.push(msg);
         (msg, la)
     }
@@ -4354,8 +4345,8 @@ impl SumcheckProver {
     pub fn drain_pending_fold(&mut self) {
         if let Some(r) = self.pending_fold.take() {
             let (nf, nb) = fold_pair_no_msg(&self.f, &self.combined_basis, r);
-            crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
-            crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
+            give_f128(replace(&mut self.f, nf));
+            give_f128(replace(&mut self.combined_basis, nb));
         }
     }
 
@@ -4388,7 +4379,6 @@ impl SumcheckProver {
     /// Combine the introduced basis into `combined_basis` with separation α.
     /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
     pub fn glue(&mut self, alpha: F128) {
-        use rayon::prelude::*;
         let (b_new, h_new) = self
             .pending_glue
             .take()
@@ -4462,7 +4452,7 @@ fn sample_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
     count: usize,
-    sched: &stratified::LevelSchedule,
+    sched: &LevelSchedule,
 ) -> Vec<usize> {
     assert!(
         block_len.is_power_of_two(),
@@ -4489,7 +4479,7 @@ fn sample_queries<Ch: Challenger>(
 fn queries_from_words(
     block_len: usize,
     count: usize,
-    sched: &stratified::LevelSchedule,
+    sched: &LevelSchedule,
     words: &[F128],
 ) -> Vec<usize> {
     let d = block_len.trailing_zeros() as usize;
@@ -4510,7 +4500,7 @@ fn grind_and_sample_queries<Ch: Challenger>(
     bits: u32,
     block_len: usize,
     count: usize,
-    sched: &stratified::LevelSchedule,
+    sched: &LevelSchedule,
 ) -> (u64, Vec<usize>) {
     assert!(
         count != 0,
@@ -4526,7 +4516,7 @@ fn verify_and_sample_queries<Ch: Challenger>(
     bits: u32,
     block_len: usize,
     count: usize,
-    sched: &stratified::LevelSchedule,
+    sched: &LevelSchedule,
 ) -> Option<Vec<usize>> {
     let words = challenger.verify_pow_and_sample_f128_vec(nonce, bits, count)?;
     Some(queries_from_words(block_len, count, sched, &words))
@@ -4542,7 +4532,7 @@ fn merkle_paths_for(
     tree: &[Hash],
     block_len: usize,
     queries: &[usize],
-    sched: &stratified::LevelSchedule,
+    sched: &LevelSchedule,
 ) -> Vec<Hash> {
     let d = block_len.trailing_zeros() as usize;
     assert_eq!(
@@ -4557,7 +4547,7 @@ fn merkle_paths_for(
     let c1 = sched.cap_depth();
     let mut out = Vec::with_capacity(sched.total_path_siblings());
     for &q in queries {
-        out.extend(merkle::merkle_proof_capped(tree, block_len, q, c1));
+        out.extend(merkle_proof_capped(tree, block_len, q, c1));
     }
     out
 }
@@ -4581,15 +4571,15 @@ pub fn recursive_prover<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = std::env::var("LIGERITO_TRACE").is_ok();
+    let trace = var("LIGERITO_TRACE").is_ok();
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
-    let t_total = std::time::Instant::now();
-    let mut t_commits = std::time::Duration::ZERO;
-    let t_induce = std::time::Duration::ZERO;
-    let t_sumcheck = std::time::Duration::ZERO;
-    let t_opens = std::time::Duration::ZERO;
+    let t_total = Instant::now();
+    let mut t_commits = Duration::ZERO;
+    let t_induce = Duration::ZERO;
+    let t_sumcheck = Duration::ZERO;
+    let t_opens = Duration::ZERO;
     let log_n = poly.len().trailing_zeros() as usize;
     let r = config.recursive_steps;
     let initial_k = config.initial_k;
@@ -4612,7 +4602,7 @@ pub fn recursive_prover<Ch: Challenger>(
     let log_inv_rate_0 = config.log_inv_rates[0];
     let log_msg_cols_0 = log_n - initial_k;
     let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate_0);
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let wtns_0 = ligero_commit(
         poly,
         log_msg_cols_0,
@@ -4658,15 +4648,15 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = std::env::var("LIGERITO_TRACE").is_ok();
+    let trace = var("LIGERITO_TRACE").is_ok();
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
-    let t_total = std::time::Instant::now();
-    let t_commits = std::time::Duration::ZERO;
-    let t_induce = std::time::Duration::ZERO;
-    let t_sumcheck = std::time::Duration::ZERO;
-    let t_opens = std::time::Duration::ZERO;
+    let t_total = Instant::now();
+    let t_commits = Duration::ZERO;
+    let t_induce = Duration::ZERO;
+    let t_sumcheck = Duration::ZERO;
+    let t_opens = Duration::ZERO;
 
     let log_n = poly.len().trailing_zeros() as usize;
     let r = config.recursive_steps;
@@ -4741,7 +4731,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
     l0_tree: &[Hash],
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    extension::recursive_prover_with_basis_impl(
+    recursive_prover_with_basis_impl(
         config,
         packed_witness,
         b_initial,
@@ -4775,7 +4765,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
     round1_lookahead: Option<FoldLookahead>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    extension::recursive_prover_with_basis_impl(
+    recursive_prover_with_basis_impl(
         config,
         packed_witness,
         b_initial,
@@ -4821,7 +4811,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
     l0_virtual_basis: Option<VirtualEqBasis>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    extension::recursive_prover_with_basis_impl(
+    recursive_prover_with_basis_impl(
         config,
         packed_witness,
         b_initial,
@@ -4851,11 +4841,11 @@ fn recursive_prover_inner<Ch: Challenger>(
     eval_point: &[F128],
     claimed_value: F128,
     challenger: &mut Ch,
-    t_total: std::time::Instant,
-    mut t_commits: std::time::Duration,
-    mut t_induce: std::time::Duration,
-    mut t_sumcheck: std::time::Duration,
-    mut t_opens: std::time::Duration,
+    t_total: Instant,
+    mut t_commits: Duration,
+    mut t_induce: Duration,
+    mut t_sumcheck: Duration,
+    mut t_opens: Duration,
     trace: bool,
 ) -> LigeritoProof {
     macro_rules! tlog {
@@ -4898,7 +4888,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     let log_msg_cols_1 = n1 - log_num_interleaved_1;
     let log_inv_rate_1 = config.log_inv_rates[1];
     let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let wtns_1 = ligero_commit(
         &f1,
         log_msg_cols_1,
@@ -4916,7 +4906,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     let num_queries_0 = udr_queries(log_inv_rate_0);
     let queries_0 = sample_queries(challenger, wtns_0.block_len, num_queries_0, strat(0));
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| wtns_0.row(q).to_vec()).collect();
     let merkle_proof_0 = merkle_paths_for(&wtns_0.tree, wtns_0.block_len, &queries_0, strat(0));
     t_opens += t.elapsed();
@@ -4927,7 +4917,7 @@ fn recursive_prover_inner<Ch: Challenger>(
 
     // ---- Induce basis from wtns_0 opens ----
     let sks_vks_n1 = eval_sk_at_vks(n1);
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
@@ -4941,7 +4931,7 @@ fn recursive_prover_inner<Ch: Challenger>(
 
     // ---- Start sumcheck: f¹ · eq(z[initial_k..], ·) = claimed_value ----
     let eq_z_residual = build_eq_table(&eval_point[initial_k..]);
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let (mut sc_prover, start_msg) = SumcheckProver::new(f1, eq_z_residual, claimed_value);
     t_sumcheck += t.elapsed();
     challenger.observe_f128(start_msg.u_0);
@@ -4962,7 +4952,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     for i in 0..r {
         let k_i = config.recursive_ks[i];
         let mut level_rs = Vec::with_capacity(k_i);
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         for _ in 0..k_i {
             let ri = challenger.sample_f128();
             let msg = sc_prover.fold(ri);
@@ -5037,7 +5027,7 @@ fn recursive_prover_inner<Ch: Challenger>(
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
         let f_evals = sc_prover.f().to_vec();
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let wtns_next = ligero_commit(
             &f_evals,
             log_msg_cols_next,
@@ -5058,7 +5048,7 @@ fn recursive_prover_inner<Ch: Challenger>(
         let queries_i =
             sample_queries(challenger, wtns_prev.block_len, num_queries_i, strat(i + 1));
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let opened_rows_i: Vec<Vec<F128>> = queries_i
             .iter()
             .map(|&q| wtns_prev.row(q).to_vec())
@@ -5116,20 +5106,16 @@ fn verify_level_opens(
     expected_num_interleaved: usize,
     paths: &[Hash],
     kind: HashKind,
-    sched: &stratified::LevelSchedule,
+    sched: &LevelSchedule,
 ) -> bool {
     if queries.len() != opened_rows.len() {
         return false;
     }
     let d = block_len.trailing_zeros() as usize;
     let leaf_of = |row: &Vec<F128>| {
-        let bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(
-                row.as_ptr() as *const u8,
-                row.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        merkle::hash_leaf(bytes, kind)
+        let bytes: &[u8] =
+            unsafe { from_raw_parts(row.as_ptr() as *const u8, row.len() * size_of::<F128>()) };
+        hash_leaf(bytes, kind)
     };
     let s = sched;
 
@@ -5157,14 +5143,7 @@ fn verify_level_opens(
             return false;
         }
         let leaf = leaf_of(row);
-        if !merkle::verify_merkle_proof_capped(
-            cap,
-            block_len,
-            &leaf,
-            q,
-            &paths[off..][..path_len],
-            kind,
-        ) {
+        if !verify_merkle_proof_capped(cap, block_len, &leaf, q, &paths[off..][..path_len], kind) {
             return false;
         }
         off += path_len;
@@ -5467,7 +5446,41 @@ pub fn recursive_verifier<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use core::mem::size_of;
+    use std::{
+        mem::take,
+        time::{Duration, Instant},
+    };
+
+    use bincode::{deserialize, serialize};
+    use serde_json::{from_str, to_string_pretty};
+
+    use crate::{
+        challenger::{Challenger, FsChallenger, RandomChallenger},
+        lincheck::build_eq_table,
+        pcs::{
+            LOG_PACKING,
+            ligerito::{
+                AdditiveNttF128, EMBEDDED_CONFIGS, F128, FOLD_FIELD_LOG_Q, FoldLookahead, Hash,
+                HashKind, LIST_DECODING_QUERY_TARGET_BITS, LigeritoProfile, LigeritoProof,
+                LigeritoSecurityConfig, ProverConfig, RoundQuad, SoundnessRegime, SumcheckMessage,
+                SumcheckProver, VerifierConfig, algebraic_grinding_schedule, ceil_log2,
+                default_config, embedded_initial_k, eval_mle_lsb, eval_sk_at_vks,
+                extension::{evaluate_dense_at_residual, recursive_verifier_with_basis_succinct},
+                fold_and_msg_blocked, fold_and_msg_blocked_jit, induce_sumcheck_enforced_sum,
+                induce_sumcheck_evaluate_at_residual, induce_sumcheck_poly,
+                induce_sumcheck_poly_via_ntt, ligero_commit, merkle_paths_for, paper_ood_bits,
+                paper_per_query_bits, partial_eval_lsb, partial_eval_lsb_one, prover_config_for,
+                recursive_prover, recursive_prover_with_basis,
+                recursive_prover_with_basis_precomputed_round0, recursive_prover_with_l0,
+                recursive_verifier, round_msg_and_eval_blocked,
+                round_msg_and_eval_eq_point_blocked, round_msg_eval_and_lookahead, round1,
+                sample_queries, transpose_forward_ntt, transpose_forward_ntt_sparse, udr_queries,
+                verifier_config_for, verify_level_opens,
+            },
+            stratified::LevelSchedule,
+        },
+    };
 
     /// The factored EqPoint opening uses the JIT basis on both commitment
     /// layouts.  A full/power-of-two lane grid has `d = 1`, so pin that the
@@ -5475,13 +5488,9 @@ mod tests {
     /// fold: folded witness, folded basis, and the next sumcheck message.
     #[test]
     fn jit_fold_matches_materialized_lsb_pairing() {
-        use crate::challenger::Challenger;
-
         for log_n in [4usize, 5, 10, 13] {
             let n = 1usize << log_n;
-            let mut rng = crate::challenger::RandomChallenger::new(
-                0xD100_0000_u64.wrapping_add(log_n as u64),
-            );
+            let mut rng = RandomChallenger::new(0xD100_0000_u64.wrapping_add(log_n as u64));
             let f: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
             let b: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
             let r = rng.sample_f128();
@@ -5503,11 +5512,9 @@ mod tests {
     /// the materialized equality-table oracle, including the claimed MLE.
     #[test]
     fn factored_ood_round_message_matches_materialized() {
-        use crate::challenger::Challenger;
-
         let log_n = 10usize;
         let n = 1usize << log_n;
-        let mut rng = crate::challenger::RandomChallenger::new(0x00D0_0D00);
+        let mut rng = RandomChallenger::new(0x00D0_0D00);
         let f: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let eq = build_eq_table(&z);
@@ -6125,8 +6132,8 @@ mod tests {
     #[test]
     fn ligerito_security_config_serde_roundtrip() {
         let cfg = blake3_m29_udr_example();
-        let json = serde_json::to_string_pretty(&cfg).expect("serialize");
-        let back: LigeritoSecurityConfig = serde_json::from_str(&json).expect("deserialize");
+        let json = to_string_pretty(&cfg).expect("serialize");
+        let back: LigeritoSecurityConfig = from_str(&json).expect("deserialize");
         back.validate().expect("roundtripped config validates");
         assert_eq!(back.levels.len(), cfg.levels.len());
         // rate 1/2, 100-bit target, full UD radius γ = δ/2 (ε* = 0):
@@ -6142,13 +6149,12 @@ mod tests {
     /// or the FS state would diverge between prover and verifier).
     #[test]
     fn ligerito_security_config_drives_roundtrip_with_grinding() {
-        use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
         let log_inv_rate = 1;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0x6817_D146);
+        let mut rng = RandomChallenger::new(0x6817_D146);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let b = build_eq_table(&z);
@@ -6195,7 +6201,7 @@ mod tests {
         let initial_cap =
             |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
-        let mut p_ch = crate::challenger::FsChallenger::new(b"pow-test");
+        let mut p_ch = FsChallenger::new(b"pow-test");
         let proof = recursive_prover_with_basis(
             &cfg,
             poly.clone(),
@@ -6225,15 +6231,15 @@ mod tests {
             stratified: vec![],
         }
         .with_default_stratified();
-        let mut v_ch = crate::challenger::FsChallenger::new(b"pow-test");
-        let ok = extension::recursive_verifier_with_basis_succinct(
+        let mut v_ch = FsChallenger::new(b"pow-test");
+        let ok = recursive_verifier_with_basis_succinct(
             &v_cfg,
             &proof,
             log_n,
             target,
             &initial_cap(&v_cfg),
             1usize << initial_k,
-            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         );
         assert!(
@@ -6244,15 +6250,15 @@ mod tests {
         // Tampering with the nonce flips the PoW check.
         let mut bad_proof = proof.clone();
         bad_proof.grinding_nonces[0] = bad_proof.grinding_nonces[0].wrapping_add(1);
-        let mut v_ch = crate::challenger::FsChallenger::new(b"pow-test");
-        let ok = extension::recursive_verifier_with_basis_succinct(
+        let mut v_ch = FsChallenger::new(b"pow-test");
+        let ok = recursive_verifier_with_basis_succinct(
             &v_cfg,
             &bad_proof,
             log_n,
             target,
             &initial_cap(&v_cfg),
             1usize << initial_k,
-            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         );
         assert!(
@@ -6270,13 +6276,12 @@ mod tests {
     /// and a legacy/stratified mode mismatch all reject.
     #[test]
     fn stratified_roundtrip_sweeps_query_counts() {
-        use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
         let log_inv_rate = 1;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0x57A7_1F1E);
+        let mut rng = RandomChallenger::new(0x57A7_1F1E);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let b = build_eq_table(&z);
@@ -6344,7 +6349,7 @@ mod tests {
             let sched0 = &cfg.stratified[0];
             let cap0 = wtns_0.cap(sched0.cap_depth()).to_vec();
 
-            let mut p_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
+            let mut p_ch = FsChallenger::new(b"strat-sweep");
             let proof = recursive_prover_with_basis(
                 &cfg,
                 poly.clone(),
@@ -6370,18 +6375,16 @@ mod tests {
                 "q1={q1}"
             );
 
-            let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
+            let mut v_ch = FsChallenger::new(b"strat-sweep");
             assert!(
-                extension::recursive_verifier_with_basis_succinct(
+                recursive_verifier_with_basis_succinct(
                     &v_cfg,
                     &proof,
                     log_n,
                     target,
                     &cap0,
                     1usize << initial_k,
-                    |ris, residual_log| {
-                        extension::evaluate_dense_at_residual(&b, ris, residual_log)
-                    },
+                    |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                     &mut v_ch,
                 ),
                 "honest stratified proof rejected (q0={q0}, q1={q1})"
@@ -6391,18 +6394,16 @@ mod tests {
             // stratum terminal.
             let mut bad = proof.clone();
             bad.initial_proof.opened_rows[0][0] += F128::ONE;
-            let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
+            let mut v_ch = FsChallenger::new(b"strat-sweep");
             assert!(
-                !extension::recursive_verifier_with_basis_succinct(
+                !recursive_verifier_with_basis_succinct(
                     &v_cfg,
                     &bad,
                     log_n,
                     target,
                     &cap0,
                     1usize << initial_k,
-                    |ris, residual_log| {
-                        extension::evaluate_dense_at_residual(&b, ris, residual_log)
-                    },
+                    |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                     &mut v_ch,
                 ),
                 "tampered row accepted (q0={q0})"
@@ -6411,18 +6412,16 @@ mod tests {
             // Tampered path sibling.
             let mut bad = proof.clone();
             bad.initial_proof.merkle_proof[0][0] ^= 1;
-            let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
+            let mut v_ch = FsChallenger::new(b"strat-sweep");
             assert!(
-                !extension::recursive_verifier_with_basis_succinct(
+                !recursive_verifier_with_basis_succinct(
                     &v_cfg,
                     &bad,
                     log_n,
                     target,
                     &cap0,
                     1usize << initial_k,
-                    |ris, residual_log| {
-                        extension::evaluate_dense_at_residual(&b, ris, residual_log)
-                    },
+                    |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                     &mut v_ch,
                 ),
                 "tampered sibling accepted (q0={q0})"
@@ -6431,18 +6430,16 @@ mod tests {
             // Truncated path vec: rejected on the total_path_siblings shape.
             let mut bad = proof.clone();
             bad.initial_proof.merkle_proof.pop();
-            let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
+            let mut v_ch = FsChallenger::new(b"strat-sweep");
             assert!(
-                !extension::recursive_verifier_with_basis_succinct(
+                !recursive_verifier_with_basis_succinct(
                     &v_cfg,
                     &bad,
                     log_n,
                     target,
                     &cap0,
                     1usize << initial_k,
-                    |ris, residual_log| {
-                        extension::evaluate_dense_at_residual(&b, ris, residual_log)
-                    },
+                    |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                     &mut v_ch,
                 ),
                 "truncated paths accepted (q0={q0})"
@@ -6454,18 +6451,16 @@ mod tests {
             let mut bad = proof.clone();
             let extra = bad.initial_proof.merkle_proof[0];
             bad.initial_proof.merkle_proof.push(extra);
-            let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
+            let mut v_ch = FsChallenger::new(b"strat-sweep");
             assert!(
-                !extension::recursive_verifier_with_basis_succinct(
+                !recursive_verifier_with_basis_succinct(
                     &v_cfg,
                     &bad,
                     log_n,
                     target,
                     &cap0,
                     1usize << initial_k,
-                    |ris, residual_log| {
-                        extension::evaluate_dense_at_residual(&b, ris, residual_log)
-                    },
+                    |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                     &mut v_ch,
                 ),
                 "padded paths accepted (q0={q0})"
@@ -6534,7 +6529,6 @@ mod tests {
     /// the challenge, and confirms the residual inner product matches.
     #[test]
     fn stateful_sumcheck_single_basis_roundtrip() {
-        use crate::challenger::Challenger;
         let n = 5;
         let len = 1usize << n;
         let f: Vec<F128> = (0..len)
@@ -6561,7 +6555,7 @@ mod tests {
 
         // Prover: 1 start message + (n-1) folds, leaving a length-2 residual.
         let (mut prover, _first) = SumcheckProver::new(f.clone(), b.clone(), h);
-        let mut ch = crate::challenger::RandomChallenger::new(0xC0FFEE);
+        let mut ch = RandomChallenger::new(0xC0FFEE);
         let mut ris: Vec<F128> = Vec::new();
         for _ in 0..(n - 1) {
             let r = ch.sample_f128();
@@ -6596,7 +6590,6 @@ mod tests {
     /// Multi-basis sumcheck: introduce_new + glue mid-protocol. Verifier replays.
     #[test]
     fn stateful_sumcheck_introduce_glue() {
-        use crate::challenger::Challenger;
         let n = 5;
         let len = 1usize << n;
         let mk = |seed: u64| -> Vec<F128> {
@@ -6614,7 +6607,7 @@ mod tests {
             .fold(F128::ZERO, |a, v| a + v);
 
         let (mut prover, _first) = SumcheckProver::new(f.clone(), b1.clone(), h1);
-        let mut ch = crate::challenger::RandomChallenger::new(0xBEEF);
+        let mut ch = RandomChallenger::new(0xBEEF);
 
         // Fold once before introducing b2 (must fold at the same dim as the introduced poly).
         let r0 = ch.sample_f128();
@@ -6711,14 +6704,13 @@ mod tests {
     ///      claim that the verifier reduces to a residual eval).
     #[test]
     fn induce_sumcheck_poly_consistent_with_codeword() {
-        use crate::challenger::Challenger;
         let log_msg = 4;
         let log_inv_rate = 1;
         let msg_cols = 1usize << log_msg;
         let block_len = msg_cols << log_inv_rate;
 
         // Single-lane (num_interleaved = 1, no v_challenges).
-        let mut ch = crate::challenger::RandomChallenger::new(0xF00DCAFE);
+        let mut ch = RandomChallenger::new(0xF00DCAFE);
         let msg: Vec<F128> = (0..msg_cols).map(|_| ch.sample_f128()).collect();
 
         // Encode via Flock's NTT (zero-pad to block_len).
@@ -6745,7 +6737,7 @@ mod tests {
         assert_eq!(basis_poly.len(), msg_cols);
 
         // Check 1: enforced_sum = Σ_i eq(α, i_bin) · c[q_i]
-        let alpha_weights: Vec<F128> = crate::lincheck::build_eq_table(&alpha)
+        let alpha_weights: Vec<F128> = build_eq_table(&alpha)
             .into_iter()
             .take(queries.len())
             .collect();
@@ -6771,7 +6763,6 @@ mod tests {
     /// shapes incl. the real m30_fast level dims.
     #[test]
     fn induce_sumcheck_poly_via_ntt_matches_dense() {
-        use crate::challenger::Challenger;
         let shapes = [
             (4usize, 1usize, 0usize, 6usize),
             (3, 1, 2, 5),
@@ -6784,7 +6775,7 @@ mod tests {
         for (si, &(log_msg, log_inv_rate, log_int, n_queries)) in shapes.iter().enumerate() {
             let block_len = 1usize << (log_msg + log_inv_rate);
             let num_interleaved = 1usize << log_int;
-            let mut ch = crate::challenger::RandomChallenger::new(0xA11CE ^ si as u64);
+            let mut ch = RandomChallenger::new(0xA11CE ^ si as u64);
             let mut queries: Vec<usize> = Vec::new();
             while queries.len() < n_queries.min(block_len) {
                 let q = (ch.sample_f128().lo as usize) % block_len;
@@ -6825,13 +6816,11 @@ mod tests {
     /// the same scattered input, across sizes (incl. > and < the k=8 prefix gate).
     #[test]
     fn transpose_sparse_matches_dense() {
-        use crate::challenger::Challenger;
         for &log_d in &[6usize, 11, 12, 14, 16, 18] {
             for &nq in &[1usize, 5, 43, 218] {
                 let n = 1usize << log_d;
                 let nq = nq.min(n);
-                let mut ch =
-                    crate::challenger::RandomChallenger::new(0xC0DE ^ (log_d * 131 + nq) as u64);
+                let mut ch = RandomChallenger::new(0xC0DE ^ (log_d * 131 + nq) as u64);
                 let ntt = AdditiveNttF128::standard(log_d);
                 let mut positions: Vec<usize> = Vec::new();
                 let mut values: Vec<F128> = Vec::new();
@@ -6858,7 +6847,6 @@ mod tests {
     /// partial-eval challenges used to fold lanes).
     #[test]
     fn induce_sumcheck_poly_with_interleaving_and_v_challenges() {
-        use crate::challenger::Challenger;
         let log_msg = 3; // msg_cols = 8
         let log_interleaved = 2; // num_interleaved = 4
         let log_inv_rate = 1; // block_len = 16
@@ -6867,7 +6855,7 @@ mod tests {
         let block_len = msg_cols << log_inv_rate;
         let poly_len = msg_cols * num_interleaved;
 
-        let mut ch = crate::challenger::RandomChallenger::new(0xDEAD_BEEF);
+        let mut ch = RandomChallenger::new(0xDEAD_BEEF);
         // poly[lane * msg_cols + col] convention (matches ligero_commit input).
         let poly: Vec<F128> = (0..poly_len).map(|_| ch.sample_f128()).collect();
 
@@ -6926,14 +6914,13 @@ mod tests {
     /// R = 1 (one recursive step).
     #[test]
     fn ligerito_r1_roundtrip_accepts() {
-        use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
         let log_inv_rate = 1;
         let num_queries = 0; // unused — kept to silence the moved literal
 
-        let mut rng = crate::challenger::RandomChallenger::new(0xCAFE_F00D);
+        let mut rng = RandomChallenger::new(0xCAFE_F00D);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
 
@@ -6987,11 +6974,11 @@ mod tests {
         let _ = num_queries; // queries derived per-level from log_inv_rates now
 
         // Prove
-        let mut p_ch = crate::challenger::FsChallenger::new(b"test");
+        let mut p_ch = FsChallenger::new(b"test");
         let proof = recursive_prover(&prover_cfg, &poly, &z, v, &mut p_ch);
 
         // Verify
-        let mut v_ch = crate::challenger::FsChallenger::new(b"test");
+        let mut v_ch = FsChallenger::new(b"test");
         let ok = recursive_verifier(&verifier_cfg, &proof, &z, v, &mut v_ch);
         assert!(ok, "verifier rejected a valid proof");
     }
@@ -7006,8 +6993,6 @@ mod tests {
         recursive_ks: Vec<usize>,
         log_inv_rates: Vec<usize>,
     ) -> usize {
-        use crate::challenger::Challenger;
-        use std::time::Instant;
         assert_eq!(log_inv_rates.len(), recursive_ks.len() + 1);
 
         // dims sanity: n1 = 16; after k_0=4 → 12; after k_1=3 → 9 → yr = 512 elems.
@@ -7020,7 +7005,7 @@ mod tests {
             n_running -= k;
         }
 
-        let mut rng = crate::challenger::RandomChallenger::new(0xBEEFCAFE);
+        let mut rng = RandomChallenger::new(0xBEEFCAFE);
         let queries_per_level: Vec<usize> = log_inv_rates.iter().map(|&r| udr_queries(r)).collect();
         eprintln!(
             "log_n={log_n}  initial_k={initial_k}  ks={:?}  log_inv_rates={:?}  queries={:?}",
@@ -7075,13 +7060,13 @@ mod tests {
         .with_default_stratified();
 
         // Time the prover, best of 3.
-        let mut best = std::time::Duration::from_secs(3600);
+        let mut best = Duration::from_secs(3600);
         let mut proof = {
-            let mut p_ch = crate::challenger::FsChallenger::new(b"size-test");
+            let mut p_ch = FsChallenger::new(b"size-test");
             recursive_prover(&cfg, &poly, &z, v, &mut p_ch)
         };
         for _ in 0..3 {
-            let mut p_ch = crate::challenger::FsChallenger::new(b"size-test");
+            let mut p_ch = FsChallenger::new(b"size-test");
             let t = Instant::now();
             proof = recursive_prover(&cfg, &poly, &z, v, &mut p_ch);
             let el = t.elapsed();
@@ -7096,7 +7081,7 @@ mod tests {
         proof.print_size_breakdown();
 
         // Smoke-check it verifies (so we know the proof is valid, not just plausibly-sized).
-        let mut v_ch = crate::challenger::FsChallenger::new(b"size-test");
+        let mut v_ch = FsChallenger::new(b"size-test");
         assert!(recursive_verifier(&v_cfg, &proof, &z, v, &mut v_ch));
         proof.size_bytes()
     }
@@ -7130,7 +7115,7 @@ mod tests {
         recursive_ks: Vec<usize>,
         log_inv_rates: Vec<usize>,
     ) -> usize {
-        const ELEM: usize = core::mem::size_of::<F128>();
+        const ELEM: usize = size_of::<F128>();
         assert_eq!(log_inv_rates.len(), recursive_ks.len() + 1);
         let r = recursive_ks.len();
         let kb = |b: usize| {
@@ -7186,7 +7171,7 @@ mod tests {
                 );
                 return usize::MAX;
             }
-            let sched = stratified::LevelSchedule::decompose(qn, log_block_len[i]);
+            let sched = LevelSchedule::decompose(qn, log_block_len[i]);
             let sib = sched.total_path_siblings();
             let cap_b = (1usize << sched.cap_depth()) * 32;
             let opened = qn * (1usize << log_num_interleaved[i]) * ELEM;
@@ -7320,7 +7305,6 @@ mod tests {
     /// Multi-level (R = 2) roundtrip.
     #[test]
     fn ligerito_r2_roundtrip_accepts() {
-        use crate::challenger::Challenger;
         let log_n = 18;
         let initial_k = 3;
         let k_0 = 3;
@@ -7328,7 +7312,7 @@ mod tests {
         let log_inv_rate = 1;
         let num_queries = 0;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0xABCD_1234);
+        let mut rng = RandomChallenger::new(0xABCD_1234);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let eq = build_eq_table(&z);
@@ -7381,12 +7365,12 @@ mod tests {
         }
         .with_default_stratified();
 
-        let mut p_ch = crate::challenger::FsChallenger::new(b"test-r2");
+        let mut p_ch = FsChallenger::new(b"test-r2");
         let proof = recursive_prover(&cfg, &poly, &z, v, &mut p_ch);
         assert_eq!(proof.recursive_caps.len(), 2);
         assert_eq!(proof.recursive_proofs.len(), 1);
 
-        let mut v_ch = crate::challenger::FsChallenger::new(b"test-r2");
+        let mut v_ch = FsChallenger::new(b"test-r2");
         let ok = recursive_verifier(&v_cfg, &proof, &z, v, &mut v_ch);
         assert!(ok, "R=2 verifier rejected valid proof");
     }
@@ -7394,12 +7378,11 @@ mod tests {
     /// `LigeritoProof` bincode-roundtrips identically.
     #[test]
     fn ligerito_proof_bincode_roundtrip() {
-        use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
         let log_inv_rate = 1;
-        let mut rng = crate::challenger::RandomChallenger::new(0xDEED_F00D);
+        let mut rng = RandomChallenger::new(0xDEED_F00D);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let eq = build_eq_table(&z);
@@ -7428,11 +7411,11 @@ mod tests {
             stratified: vec![],
         }
         .with_default_stratified();
-        let mut p_ch = crate::challenger::FsChallenger::new(b"serde");
+        let mut p_ch = FsChallenger::new(b"serde");
         let proof = recursive_prover(&cfg, &poly, &z, v, &mut p_ch);
 
-        let bytes = bincode::serialize(&proof).expect("serialize");
-        let proof2: LigeritoProof = bincode::deserialize(&bytes).expect("deserialize");
+        let bytes = serialize(&proof).expect("serialize");
+        let proof2: LigeritoProof = deserialize(&bytes).expect("deserialize");
         assert_eq!(proof, proof2);
         eprintln!("LigeritoProof bincode size: {} bytes", bytes.len());
     }
@@ -7446,11 +7429,10 @@ mod tests {
     /// the registered-config proof is also verified.
     #[test]
     fn f256_round1_lookahead_is_byte_identical() {
-        use crate::challenger::Challenger;
         let log_n = 15;
         let cfg = prover_config_for(log_n, 6, LigeritoProfile::Fast).unwrap();
 
-        let mut rng = crate::challenger::RandomChallenger::new(0x10_0CA_4EAD);
+        let mut rng = RandomChallenger::new(0x10_0CA_4EAD);
         let f: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let b: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
 
@@ -7475,7 +7457,7 @@ mod tests {
         );
 
         let prove = |cfg: &ProverConfig, la: Option<FoldLookahead>| -> LigeritoProof {
-            let mut ch = crate::challenger::FsChallenger::new(b"la-test");
+            let mut ch = FsChallenger::new(b"la-test");
             recursive_prover_with_basis_precomputed_round0(
                 cfg,
                 f.clone(),
@@ -7495,15 +7477,15 @@ mod tests {
         // And the proof is a real one.
         let v_cfg = verifier_config_for(log_n, 6, LigeritoProfile::Fast).unwrap();
         let cap = wtns.cap(v_cfg.l0_cap_depth()).to_vec();
-        let mut v_ch = crate::challenger::FsChallenger::new(b"la-test");
-        assert!(extension::recursive_verifier_with_basis_succinct(
+        let mut v_ch = FsChallenger::new(b"la-test");
+        assert!(recursive_verifier_with_basis_succinct(
             &v_cfg,
             &with_la,
             log_n,
             target,
             &cap,
             1 << cfg.initial_k,
-            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         ));
 
@@ -7523,13 +7505,12 @@ mod tests {
     /// round-trip cleanly.
     #[test]
     fn recursive_prover_with_basis_roundtrip_single_claim() {
-        use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
         let log_inv_rate = 1;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0xBA51_CAFE);
+        let mut rng = RandomChallenger::new(0xBA51_CAFE);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let b = build_eq_table(&z);
@@ -7572,7 +7553,7 @@ mod tests {
         let initial_cap =
             |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
-        let mut p_ch = crate::challenger::FsChallenger::new(b"basis-test");
+        let mut p_ch = FsChallenger::new(b"basis-test");
         let proof = recursive_prover_with_basis(
             &cfg,
             poly.clone(),
@@ -7601,15 +7582,15 @@ mod tests {
             stratified: vec![],
         }
         .with_default_stratified();
-        let mut v_ch = crate::challenger::FsChallenger::new(b"basis-test");
-        let ok = extension::recursive_verifier_with_basis_succinct(
+        let mut v_ch = FsChallenger::new(b"basis-test");
+        let ok = recursive_verifier_with_basis_succinct(
             &v_cfg,
             &proof,
             log_n,
             target,
             &initial_cap(&v_cfg),
             1usize << initial_k,
-            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         );
         assert!(ok, "basis-based verifier rejected valid proof");
@@ -7621,12 +7602,11 @@ mod tests {
     /// is on the live path rather than a theoretical branch.
     #[test]
     fn sample_queries_is_with_replacement_from_one_batched_squeeze() {
-        use crate::challenger::Challenger;
         let block_len = 1usize << 13;
         let count = udr_queries(1); // 243 — the shipped L0 count at rate 1/2
 
-        let sched = stratified::LevelSchedule::decompose(count, 13);
-        let mut ch = crate::challenger::FsChallenger::new(b"sample-queries-test");
+        let sched = LevelSchedule::decompose(count, 13);
+        let mut ch = FsChallenger::new(b"sample-queries-test");
         let qs = sample_queries(&mut ch, block_len, count, &sched);
 
         // Exactly `count` draws. The old sampler's draw count was data-
@@ -7636,12 +7616,12 @@ mod tests {
         assert!(qs.iter().all(|&q| q < block_len));
 
         // Challenger-deterministic.
-        let mut ch2 = crate::challenger::FsChallenger::new(b"sample-queries-test");
+        let mut ch2 = FsChallenger::new(b"sample-queries-test");
         assert_eq!(sample_queries(&mut ch2, block_len, count, &sched), qs);
 
         // One `sample_f128_vec` squeeze plus a low-bit mask — nothing else.
         // This pins the transcript shape the FS chain table has to replay.
-        let mut ch3 = crate::challenger::FsChallenger::new(b"sample-queries-test");
+        let mut ch3 = FsChallenger::new(b"sample-queries-test");
         let raw = ch3.sample_f128_vec(count);
         let expected: Vec<usize> = sched
             .query_strata()
@@ -7670,12 +7650,11 @@ mod tests {
     /// slip an unchecked row into the induced basis through the second slot.
     #[test]
     fn verify_level_opens_rejects_disagreeing_rows_at_a_repeated_position() {
-        use crate::challenger::Challenger;
         let (log_msg, log_interleaved, log_inv_rate) = (4usize, 2usize, 2usize);
         let num_interleaved = 1usize << log_interleaved;
         let poly_len = (1usize << log_msg) * num_interleaved;
 
-        let mut ch = crate::challenger::RandomChallenger::new(0x0DDD_1CE5);
+        let mut ch = RandomChallenger::new(0x0DDD_1CE5);
         let poly: Vec<F128> = (0..poly_len).map(|_| ch.sample_f128()).collect();
         let ntt = AdditiveNttF128::standard(log_msg + log_inv_rate);
         let w = ligero_commit(
@@ -7700,10 +7679,7 @@ mod tests {
         // (within one summand strata are disjoint, so repeats only ever
         // happen across summands).
         let queries = vec![9usize, 17, 33, 49, 9];
-        let sched = stratified::LevelSchedule::decompose(
-            queries.len(),
-            w.block_len.trailing_zeros() as usize,
-        );
+        let sched = LevelSchedule::decompose(queries.len(), w.block_len.trailing_zeros() as usize);
         let c = sched.cap_depth();
         let cap = w.cap(c).to_vec();
         let honest: Vec<Vec<F128>> = queries.iter().map(|&q| w.row(q).to_vec()).collect();
@@ -7820,7 +7796,6 @@ mod tests {
     /// `induce_sumcheck_poly` + `partial_eval_lsb`.
     #[test]
     fn induce_sumcheck_evaluate_at_residual_matches_dense() {
-        use crate::challenger::Challenger;
         let log_msg_cols = 6;
         let yr_log_n = 2;
         let prefix_len = log_msg_cols - yr_log_n;
@@ -7828,7 +7803,7 @@ mod tests {
         let log_num_interleaved = 2;
         let num_queries = 5;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0x2017_5052);
+        let mut rng = RandomChallenger::new(0x2017_5052);
         let queries: Vec<usize> = (0..num_queries).map(|i| (i * 7 + 3) % (1 << 8)).collect();
         let opened_rows: Vec<Vec<F128>> = (0..num_queries)
             .map(|_| (0..num_interleaved).map(|_| rng.sample_f128()).collect())
@@ -7899,14 +7874,13 @@ mod tests {
     /// ever diverged, the honest assertion here would fail.
     #[test]
     fn final_level_binding_pins_yr_to_committed_codeword() {
-        use crate::challenger::Challenger;
         let log_msg_cols = 5; // yr has 32 entries (within the shipped yr_log_n range)
         let log_inv_rate = 1;
         let num_queries = 20;
         let msg_cols = 1usize << log_msg_cols;
         let block_len = msg_cols << log_inv_rate;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0xB19D_1235);
+        let mut rng = RandomChallenger::new(0xB19D_1235);
         // num_interleaved = 1 ⇒ no lane fold (level_rs empty) ⇒ yr == the message.
         let yr: Vec<F128> = (0..msg_cols).map(|_| rng.sample_f128()).collect();
         let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
@@ -7974,13 +7948,12 @@ mod tests {
     /// callback evaluates the same materialized basis used by the prover.
     #[test]
     fn recursive_verifier_with_basis_succinct_accepts_dense_basis() {
-        use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
         let log_inv_rate = 1;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0x52CC_2017);
+        let mut rng = RandomChallenger::new(0x52CC_2017);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let b = build_eq_table(&z);
@@ -8023,7 +7996,7 @@ mod tests {
         let initial_cap =
             |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
-        let mut p_ch = crate::challenger::FsChallenger::new(b"succ-cmp");
+        let mut p_ch = FsChallenger::new(b"succ-cmp");
         let proof = recursive_prover_with_basis(
             &cfg,
             poly.clone(),
@@ -8053,15 +8026,15 @@ mod tests {
         }
         .with_default_stratified();
 
-        let mut v_ch = crate::challenger::FsChallenger::new(b"succ-cmp");
-        let ok = extension::recursive_verifier_with_basis_succinct(
+        let mut v_ch = FsChallenger::new(b"succ-cmp");
+        let ok = recursive_verifier_with_basis_succinct(
             &v_cfg,
             &proof,
             log_n,
             target,
             &initial_cap(&v_cfg),
             1usize << v_cfg.initial_k,
-            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         );
         assert!(ok, "F256 succinct verifier must accept");
@@ -8133,7 +8106,6 @@ mod tests {
     /// nonce family rejects.
     #[test]
     fn ligerito_ood_and_fold_grinding_roundtrip_and_tamper() {
-        use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 2;
         let ks = [2usize, 2, 2, 2];
@@ -8147,7 +8119,7 @@ mod tests {
             vec![0, 0, 0, 0, 0],
         );
 
-        let mut rng = crate::challenger::RandomChallenger::new(0x00D_7E57);
+        let mut rng = RandomChallenger::new(0x00D_7E57);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let b = build_eq_table(&z);
@@ -8170,7 +8142,7 @@ mod tests {
         let initial_cap =
             |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
-        let mut p_ch = crate::challenger::FsChallenger::new(b"ood-test");
+        let mut p_ch = FsChallenger::new(b"ood-test");
         let proof = recursive_prover_with_basis(
             &p_cfg,
             poly.clone(),
@@ -8188,15 +8160,15 @@ mod tests {
         assert_eq!(proof.consistency_batch_grinding_nonces.len(), 5);
 
         let verify = |proof: &LigeritoProof| {
-            let mut ch = crate::challenger::FsChallenger::new(b"ood-test");
-            extension::recursive_verifier_with_basis_succinct(
+            let mut ch = FsChallenger::new(b"ood-test");
+            recursive_verifier_with_basis_succinct(
                 &v_cfg,
                 proof,
                 log_n,
                 target,
                 &initial_cap(&v_cfg),
                 1usize << v_cfg.initial_k,
-                |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+                |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
                 &mut ch,
             )
         };
@@ -8275,9 +8247,8 @@ mod tests {
     /// derived TOML, not a hand-built config.
     #[test]
     fn ligerito_fast_profile_m22_roundtrip() {
-        use crate::challenger::Challenger;
         let m = 22usize;
-        let log_n = m - crate::pcs::LOG_PACKING;
+        let log_n = m - LOG_PACKING;
         let initial_k = 6;
         let p_cfg = prover_config_for(log_n, initial_k, LigeritoProfile::Fast)
             .expect("m22 fast prover config");
@@ -8288,7 +8259,7 @@ mod tests {
         assert!(p_cfg.fold_grinding_bits.iter().all(|&g| g == 0));
         assert!(p_cfg.recursive_ks.iter().all(|&k| k == 4));
 
-        let mut rng = crate::challenger::RandomChallenger::new(0xFA57_0022);
+        let mut rng = RandomChallenger::new(0xFA57_0022);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let b = build_eq_table(&z);
@@ -8311,7 +8282,7 @@ mod tests {
         let initial_cap =
             |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
-        let mut p_ch = crate::challenger::FsChallenger::new(b"m22-fast");
+        let mut p_ch = FsChallenger::new(b"m22-fast");
         let proof = recursive_prover_with_basis(
             &p_cfg,
             poly,
@@ -8323,15 +8294,15 @@ mod tests {
         );
 
         let verify = |candidate: &LigeritoProof| {
-            let mut v_ch = crate::challenger::FsChallenger::new(b"m22-fast");
-            extension::recursive_verifier_with_basis_succinct(
+            let mut v_ch = FsChallenger::new(b"m22-fast");
+            recursive_verifier_with_basis_succinct(
                 &v_cfg,
                 candidate,
                 log_n,
                 target,
                 &initial_cap(&v_cfg),
                 1usize << initial_k,
-                |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+                |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
                 &mut v_ch,
             )
         };
@@ -8364,9 +8335,8 @@ mod tests {
     /// for the wrong hash must reject, since the roots commit to the hash.
     #[test]
     fn ligerito_m22_roundtrip_under_blake3() {
-        use crate::challenger::Challenger;
         let m = 22usize;
-        let log_n = m - crate::pcs::LOG_PACKING;
+        let log_n = m - LOG_PACKING;
         let initial_k = 6;
         let mut p_cfg = prover_config_for(log_n, initial_k, LigeritoProfile::Fast)
             .expect("m22 fast prover config");
@@ -8378,7 +8348,7 @@ mod tests {
         p_cfg.merkle_hash = HashKind::Blake3;
         v_cfg.merkle_hash = HashKind::Blake3;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0xB1A5_E300);
+        let mut rng = RandomChallenger::new(0xB1A5_E300);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let b = build_eq_table(&z);
@@ -8401,7 +8371,7 @@ mod tests {
         let initial_cap =
             |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
-        let mut p_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
+        let mut p_ch = FsChallenger::new(b"m22-blake3");
         let proof = recursive_prover_with_basis(
             &p_cfg,
             poly,
@@ -8412,18 +8382,16 @@ mod tests {
             &mut p_ch,
         );
 
-        let mut v_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
+        let mut v_ch = FsChallenger::new(b"m22-blake3");
         assert!(
-            extension::recursive_verifier_with_basis_succinct(
+            recursive_verifier_with_basis_succinct(
                 &v_cfg,
                 &proof,
                 log_n,
                 target,
                 &initial_cap(&v_cfg),
                 1usize << initial_k,
-                |ris, residual_log| {
-                    extension::evaluate_dense_at_residual(&b, ris, residual_log)
-                },
+                |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                 &mut v_ch,
             ),
             "blake3 Merkle proof must verify"
@@ -8433,18 +8401,16 @@ mod tests {
         // recomputed root disagrees, so it must reject.
         let mut wrong_cfg = v_cfg.clone();
         wrong_cfg.merkle_hash = HashKind::Sha256;
-        let mut w_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
+        let mut w_ch = FsChallenger::new(b"m22-blake3");
         assert!(
-            !extension::recursive_verifier_with_basis_succinct(
+            !recursive_verifier_with_basis_succinct(
                 &wrong_cfg,
                 &proof,
                 log_n,
                 target,
                 &initial_cap(&v_cfg),
                 1usize << initial_k,
-                |ris, residual_log| {
-                    extension::evaluate_dense_at_residual(&b, ris, residual_log)
-                },
+                |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                 &mut w_ch
             ),
             "a sha256-configured verifier must reject a blake3 proof"
@@ -8457,9 +8423,8 @@ mod tests {
     /// Merkle mismatch checked above.
     #[test]
     fn ligerito_m22_roundtrip_over_hash_matrix() {
-        use crate::challenger::Challenger;
         const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
-        let log_n = 22usize - crate::pcs::LOG_PACKING;
+        let log_n = 22usize - LOG_PACKING;
         let initial_k = 6;
 
         for merkle_hash in KINDS {
@@ -8470,7 +8435,7 @@ mod tests {
                 p_cfg.merkle_hash = merkle_hash;
                 v_cfg.merkle_hash = merkle_hash;
 
-                let mut rng = crate::challenger::RandomChallenger::new(0x4A11_0000);
+                let mut rng = RandomChallenger::new(0x4A11_0000);
                 let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
                 let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
                 let b = build_eq_table(&z);
@@ -8487,7 +8452,7 @@ mod tests {
                 let initial_cap =
                     |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
-                let mut p_ch = crate::challenger::FsChallenger::with_hash(b"m22-matrix", fs_hash);
+                let mut p_ch = FsChallenger::with_hash(b"m22-matrix", fs_hash);
                 let proof = recursive_prover_with_basis(
                     &p_cfg,
                     poly,
@@ -8498,18 +8463,16 @@ mod tests {
                     &mut p_ch,
                 );
 
-                let mut v_ch = crate::challenger::FsChallenger::with_hash(b"m22-matrix", fs_hash);
+                let mut v_ch = FsChallenger::with_hash(b"m22-matrix", fs_hash);
                 assert!(
-                    extension::recursive_verifier_with_basis_succinct(
+                    recursive_verifier_with_basis_succinct(
                         &v_cfg,
                         &proof,
                         log_n,
                         target,
                         &initial_cap(&v_cfg),
                         1usize << initial_k,
-                        |ris, residual_log| {
-                            extension::evaluate_dense_at_residual(&b, ris, residual_log)
-                        },
+                        |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                         &mut v_ch
                     ),
                     "merkle={merkle_hash} fs={fs_hash} must verify"
@@ -8521,18 +8484,16 @@ mod tests {
                     HashKind::Sha256 => HashKind::Blake3,
                     HashKind::Blake3 => HashKind::Sha256,
                 };
-                let mut w_ch = crate::challenger::FsChallenger::with_hash(b"m22-matrix", other_fs);
+                let mut w_ch = FsChallenger::with_hash(b"m22-matrix", other_fs);
                 assert!(
-                    !extension::recursive_verifier_with_basis_succinct(
+                    !recursive_verifier_with_basis_succinct(
                         &v_cfg,
                         &proof,
                         log_n,
                         target,
                         &initial_cap(&v_cfg),
                         1usize << initial_k,
-                        |ris, residual_log| {
-                            extension::evaluate_dense_at_residual(&b, ris, residual_log)
-                        },
+                        |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                         &mut w_ch
                     ),
                     "merkle={merkle_hash}: an {other_fs} transcript must reject an {fs_hash} proof"
@@ -8546,13 +8507,12 @@ mod tests {
     /// produces.
     #[test]
     fn recursive_prover_with_basis_roundtrip_batched_claims() {
-        use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
         let log_inv_rate = 1;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0xBA51_BA51);
+        let mut rng = RandomChallenger::new(0xBA51_BA51);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z1: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let z2: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
@@ -8610,7 +8570,7 @@ mod tests {
         let initial_cap =
             |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
-        let mut p_ch = crate::challenger::FsChallenger::new(b"batched");
+        let mut p_ch = FsChallenger::new(b"batched");
         let proof = recursive_prover_with_basis(
             &cfg,
             poly.clone(),
@@ -8639,15 +8599,15 @@ mod tests {
             stratified: vec![],
         }
         .with_default_stratified();
-        let mut v_ch = crate::challenger::FsChallenger::new(b"batched");
-        let ok = extension::recursive_verifier_with_basis_succinct(
+        let mut v_ch = FsChallenger::new(b"batched");
+        let ok = recursive_verifier_with_basis_succinct(
             &v_cfg,
             &proof,
             log_n,
             target,
             &initial_cap(&v_cfg),
             1usize << initial_k,
-            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         );
         assert!(ok, "batched-basis verifier rejected valid proof");
@@ -8658,13 +8618,12 @@ mod tests {
     /// `recursive_prover` when given a matching pre-built L0.
     #[test]
     fn recursive_prover_with_l0_matches_full() {
-        use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
         let log_inv_rate = 1;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0xACED_BEEF);
+        let mut rng = RandomChallenger::new(0xACED_BEEF);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let eq = build_eq_table(&z);
@@ -8695,7 +8654,7 @@ mod tests {
         .with_default_stratified();
 
         // Path 1: built-in L0 commit.
-        let mut p_ch = crate::challenger::FsChallenger::new(b"l0-test");
+        let mut p_ch = FsChallenger::new(b"l0-test");
         let proof_a = recursive_prover(&cfg, &poly, &z, v, &mut p_ch);
 
         // Path 2: build L0 externally via ligero_commit, then call _with_l0.
@@ -8709,12 +8668,12 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let mut p_ch_b = crate::challenger::FsChallenger::new(b"l0-test");
+        let mut p_ch_b = FsChallenger::new(b"l0-test");
         let proof_b = recursive_prover_with_l0(
             &cfg,
             &poly,
-            std::mem::take(&mut wtns_0_external.mat),
-            std::mem::take(&mut wtns_0_external.tree),
+            take(&mut wtns_0_external.mat),
+            take(&mut wtns_0_external.tree),
             &z,
             v,
             &mut p_ch_b,
@@ -8755,21 +8714,20 @@ mod tests {
             stratified: vec![],
         }
         .with_default_stratified();
-        let mut v_ch = crate::challenger::FsChallenger::new(b"l0-test");
+        let mut v_ch = FsChallenger::new(b"l0-test");
         assert!(recursive_verifier(&v_cfg, &proof_b, &z, v, &mut v_ch));
     }
 
     /// Mutation rejection: change one element of yr → verify should fail.
     #[test]
     fn ligerito_r1_rejects_mutated_yr() {
-        use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
         let log_inv_rate = 1;
         let num_queries = 0;
 
-        let mut rng = crate::challenger::RandomChallenger::new(0xDEAD_BEEF);
+        let mut rng = RandomChallenger::new(0xDEAD_BEEF);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let eq = build_eq_table(&z);
@@ -8818,13 +8776,13 @@ mod tests {
         }
         .with_default_stratified();
 
-        let mut p_ch = crate::challenger::FsChallenger::new(b"test-mut");
+        let mut p_ch = FsChallenger::new(b"test-mut");
         let mut proof = recursive_prover(&prover_cfg, &poly, &z, v, &mut p_ch);
 
         // Mutate yr.
         proof.final_proof.yr[0] += F128::ONE;
 
-        let mut v_ch = crate::challenger::FsChallenger::new(b"test-mut");
+        let mut v_ch = FsChallenger::new(b"test-mut");
         let ok = recursive_verifier(&verifier_cfg, &proof, &z, v, &mut v_ch);
         assert!(!ok, "verifier accepted a proof with mutated yr");
     }

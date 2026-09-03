@@ -15,11 +15,33 @@
 //! is tested on honest witnesses; verify also rejects byte-mutated proofs and
 //! shape-corrupted ones.
 
-use crate::challenger::Challenger;
-use crate::field::{F8, F128};
-use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
-use serde::{Deserialize, Serialize};
+use std::{
+    env::{var, var_os},
+    mem::{replace, swap},
+    sync::OnceLock,
+    time::Instant,
+};
 
+use ag_skip::R1_POW_BITS;
+use multilinear::{
+    UniSkipFoldTable, expand_to_dense, fold_and_compute_round_pair_into,
+    fold_and_round_pair_sparse_into, fold_in_place_pair, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round_pair_naive,
+    uni_skip_fold_and_round_pair_optimized_packed_padded, uni_skip_fold_and_round_pair_runs_sparse,
+};
+use serde::{Deserialize, Serialize};
+use univariate_skip_optimized::{
+    c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
+    small_challenges_ghash,
+};
+
+use crate::{
+    challenger::Challenger,
+    field::{F8, F128},
+    ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8},
+    scratch::{give_f128, take_f128},
+    zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v,
+};
 // The AG-skip prover half (round-1 kernel drivers, friendly-Horner tail,
 // r1 nonce grind) is only reachable from aarch64-gated entry points; the
 // verifier half is cross-arch. Silence the resulting dead-code cascade on
@@ -29,16 +51,6 @@ pub mod ag_skip;
 pub mod multilinear;
 pub mod univariate_skip;
 pub mod univariate_skip_optimized;
-
-use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_and_round_pair_sparse_into,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_optimized_packed_padded,
-};
-use univariate_skip_optimized::{
-    c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
-    small_challenges_ghash,
-};
 
 /// Number of variables folded in round 1 via the additive-NTT univariate skip.
 /// |Λ| = 2^K_SKIP = 64 elements; the round-1 prover message is two length-64
@@ -123,7 +135,7 @@ impl ZerocheckGrinding {
     /// nonce, which makes no 128-bit claim).
     pub const fn ag_r1_bits(self) -> Option<u32> {
         if self.enabled {
-            Some(ag_skip::R1_POW_BITS)
+            Some(R1_POW_BITS)
         } else {
             None
         }
@@ -164,9 +176,9 @@ pub const SPARSE_TAIL_GATE: usize = 1;
 /// tuning knob for A/B experiments; the constant above is the default.
 /// Value-identical either way (the sparse kernels drop only zero terms).
 fn sparse_tail_gate() -> usize {
-    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static GATE: OnceLock<usize> = OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("FLOCK_SPARSE_GATE")
+        var("FLOCK_SPARSE_GATE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(SPARSE_TAIL_GATE)
@@ -309,7 +321,7 @@ impl PaddingSpec {
                 let b0 = blk << log2_block;
                 let (cs, ce) = (s.max(b0), e.min(b0 + block_bits));
                 let piece = (cs - b0, ce - b0);
-                out[blk] = match std::mem::replace(&mut out[blk], BlockCoverage::Dead) {
+                out[blk] = match replace(&mut out[blk], BlockCoverage::Dead) {
                     _ if piece == (0, block_bits) => BlockCoverage::Full,
                     BlockCoverage::Dead => BlockCoverage::Partial(vec![piece]),
                     BlockCoverage::Partial(mut v) => {
@@ -448,7 +460,7 @@ pub struct ZerocheckProof {
 
 /// Reasons the verifier may reject a proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
+pub enum ZerocheckError {
     /// `log_n` doesn't satisfy `log_n >= K_SKIP`.
     LogNTooSmall { log_n: usize, k_skip: usize },
     /// Round-1 messages have the wrong length (expected `2^K_SKIP`).
@@ -675,23 +687,15 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
-    let t_round1 = std::time::Instant::now();
+    let zc_timing = var_os("FLOCK_ZC_TIMING").is_some();
+    let t_round1 = Instant::now();
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
     let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if capture_s_hat_v_c {
-        let (ab, c, s) =
-            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
-                a_packed,
-                b_packed,
-                c_packed,
-                m,
-                k_skip,
-                &r,
-                &inv_table,
-                padding,
-            );
+        let (ab, c, s) = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+            a_packed, b_packed, c_packed, m, k_skip, &r, &inv_table, padding,
+        );
         (ab, c, Some(s))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
@@ -734,7 +738,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Convention A wrapping: pass `mlv_arg[0] = ONE` so the function's output
     // `mlv_arg[0] · G(1)` becomes the bare `G(1)` we send on the wire. The
     // verifier samples ρ_1 after observing this message.
-    let t_round2 = std::time::Instant::now();
+    let t_round2 = Instant::now();
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
@@ -764,7 +768,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // under compaction it is no longer `a_mlv.len()`.
     let mut domain = 1usize << n_mlv;
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, mut store) = if sparse_from_round2 {
-        let (a, b, m1, mi, st) = multilinear::uni_skip_fold_and_round_pair_runs_sparse(
+        let (a, b, m1, mi, st) = uni_skip_fold_and_round_pair_runs_sparse(
             a_packed,
             b_packed,
             m,
@@ -793,7 +797,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             t_round2.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t_tail = std::time::Instant::now();
+    let t_tail = Instant::now();
     let mut multilinear_msgs = Vec::with_capacity(n_mlv);
     multilinear_msgs.push((msg_1, msg_inf));
     challenger.observe_f128(msg_1);
@@ -823,10 +827,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // output); only needed when the first round is actually fused.
     let n_in = a_mlv.len();
     let (mut a_nxt, mut b_nxt) = if n_in >= 1024 {
-        (
-            crate::scratch::take_f128(n_in / 2),
-            crate::scratch::take_f128(n_in / 2),
-        )
+        (take_f128(n_in / 2), take_f128(n_in / 2))
     } else {
         (Vec::new(), Vec::new())
     };
@@ -860,10 +861,10 @@ fn prove_packed_padded_inner<C: Challenger>(
         {
             // Back to global indexing: scatter the live span into a full
             // padded buffer and zero the rest.
-            let a_full = multilinear::expand_to_dense(&a_mlv, &st, domain);
-            let b_full = multilinear::expand_to_dense(&b_mlv, &st, domain);
-            crate::scratch::give_f128(std::mem::replace(&mut a_mlv, a_full));
-            crate::scratch::give_f128(std::mem::replace(&mut b_mlv, b_full));
+            let a_full = expand_to_dense(&a_mlv, &st, domain);
+            let b_full = expand_to_dense(&b_mlv, &st, domain);
+            give_f128(replace(&mut a_mlv, a_full));
+            give_f128(replace(&mut b_mlv, b_full));
             // The ping-pong scratch shrank toward the compacted cap while
             // the tail ran sparse; the dense fold below slices
             // `a_nxt[..domain/2]`, so the scratch must re-grow with the
@@ -872,10 +873,10 @@ fn prove_packed_padded_inner<C: Challenger>(
             // can force this exit at `domain >= 1024` even at gate = 1 —
             // interval ends round `st.len()` outward past the domain.
             if a_nxt.len() < domain / 2 {
-                crate::scratch::give_f128(a_nxt);
-                crate::scratch::give_f128(b_nxt);
-                a_nxt = crate::scratch::take_f128(domain / 2);
-                b_nxt = crate::scratch::take_f128(domain / 2);
+                give_f128(a_nxt);
+                give_f128(b_nxt);
+                a_nxt = take_f128(domain / 2);
+                b_nxt = take_f128(domain / 2);
             }
             sparse_dirty = false;
         }
@@ -886,10 +887,10 @@ fn prove_packed_padded_inner<C: Challenger>(
             // only round outward by one slot per interval end.
             let cap = st.len() + 2 * st.intervals().len() + 2;
             if a_nxt.len() < cap {
-                crate::scratch::give_f128(a_nxt);
-                crate::scratch::give_f128(b_nxt);
-                a_nxt = crate::scratch::take_f128(cap);
-                b_nxt = crate::scratch::take_f128(cap);
+                give_f128(a_nxt);
+                give_f128(b_nxt);
+                a_nxt = take_f128(cap);
+                b_nxt = take_f128(cap);
             }
             let (m1, mi, store_out) = fold_and_round_pair_sparse_into(
                 &a_mlv,
@@ -901,8 +902,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                 st,
                 domain,
             );
-            std::mem::swap(&mut a_mlv, &mut a_nxt);
-            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            swap(&mut a_mlv, &mut a_nxt);
+            swap(&mut b_mlv, &mut b_nxt);
             a_mlv.truncate(store_out.len());
             b_mlv.truncate(store_out.len());
             store = Some(store_out);
@@ -922,8 +923,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             // folded size. The old (larger) buffer becomes scratch; we only
             // ever write its leading `half` slots next round, so its stale
             // length is harmless.
-            std::mem::swap(&mut a_mlv, &mut a_nxt);
-            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            swap(&mut a_mlv, &mut a_nxt);
+            swap(&mut b_mlv, &mut b_nxt);
             a_mlv.truncate(half);
             b_mlv.truncate(half);
             (m1, mi)
@@ -976,10 +977,10 @@ fn prove_packed_padded_inner<C: Challenger>(
 
     // Recycle the four tail buffers (the two len-1 survivors still own their
     // full round-2 capacity) for the next phase/prove.
-    crate::scratch::give_f128(a_mlv);
-    crate::scratch::give_f128(b_mlv);
-    crate::scratch::give_f128(a_nxt);
-    crate::scratch::give_f128(b_nxt);
+    give_f128(a_mlv);
+    give_f128(b_mlv);
+    give_f128(a_nxt);
+    give_f128(b_nxt);
 
     if zc_timing {
         eprintln!(
@@ -1017,12 +1018,12 @@ fn prove_packed_padded_inner<C: Challenger>(
 ///
 /// On accept: returns the [`ZerocheckClaim`] the caller must check against
 /// its PCS opening of `â`, `b̂`, `ĉ`.
-/// On reject: returns a [`VerifyError`] indicating which check failed.
+/// On reject: returns a [`ZerocheckError`] indicating which check failed.
 pub fn verify<C: Challenger>(
     log_n: usize,
     proof: &ZerocheckProof,
     challenger: &mut C,
-) -> Result<ZerocheckClaim, VerifyError> {
+) -> Result<ZerocheckClaim, ZerocheckError> {
     verify_with_grinding(log_n, proof, ZerocheckGrinding::disabled(), challenger)
 }
 
@@ -1034,38 +1035,38 @@ pub fn verify_with_grinding<C: Challenger>(
     proof: &ZerocheckProof,
     grinding: ZerocheckGrinding,
     challenger: &mut C,
-) -> Result<ZerocheckClaim, VerifyError> {
+) -> Result<ZerocheckClaim, ZerocheckError> {
     let m = log_n;
     let k_skip = K_SKIP;
     const N_INNER: usize = 7;
 
     if m < k_skip + N_INNER {
-        return Err(VerifyError::LogNTooSmall { log_n: m, k_skip });
+        return Err(ZerocheckError::LogNTooSmall { log_n: m, k_skip });
     }
     let n_mlv = m - k_skip;
     let ell = 1usize << k_skip;
 
     // ---- Shape checks ----
     if proof.round1_ab.len() != ell {
-        return Err(VerifyError::BadRound1Length {
+        return Err(ZerocheckError::BadRound1Length {
             expected: ell,
             got: proof.round1_ab.len(),
         });
     }
     if proof.round1_c.len() != ell {
-        return Err(VerifyError::BadRound1Length {
+        return Err(ZerocheckError::BadRound1Length {
             expected: ell,
             got: proof.round1_c.len(),
         });
     }
     if proof.multilinear_rounds.len() != n_mlv {
-        return Err(VerifyError::BadMultilinearRoundsLength {
+        return Err(ZerocheckError::BadMultilinearRoundsLength {
             expected: n_mlv,
             got: proof.multilinear_rounds.len(),
         });
     }
     if proof.grinding_nonces.len() != grinding.nonce_count(m) {
-        return Err(VerifyError::BadGrindingNonceCount {
+        return Err(ZerocheckError::BadGrindingNonceCount {
             expected: grinding.nonce_count(m),
             got: proof.grinding_nonces.len(),
         });
@@ -1078,7 +1079,7 @@ pub fn verify_with_grinding<C: Challenger>(
     let r_skip = if let Some(bits) = grinding.initial_bits(m) {
         let r_skip = challenger
             .verify_pow_and_sample_f128_vec(proof.grinding_nonces[nonce_idx], bits, k_skip)
-            .ok_or(VerifyError::InvalidGrindingNonce { which: "initial" })?;
+            .ok_or(ZerocheckError::InvalidGrindingNonce { which: "initial" })?;
         nonce_idx += 1;
         r_skip
     } else {
@@ -1101,7 +1102,7 @@ pub fn verify_with_grinding<C: Challenger>(
     let z = if let Some(bits) = grinding.skip_bits() {
         let z = challenger
             .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-            .ok_or(VerifyError::InvalidGrindingNonce { which: "skip" })?;
+            .ok_or(ZerocheckError::InvalidGrindingNonce { which: "skip" })?;
         nonce_idx += 1;
         z
     } else {
@@ -1116,7 +1117,7 @@ pub fn verify_with_grinding<C: Challenger>(
     // `ĉ(z, r_rest) = P^C(z)` directly.
     let computed_c_eval = interpolate_at_z_on_lambda(&proof.round1_c, k_skip, z);
     if computed_c_eval != proof.final_c_eval {
-        return Err(VerifyError::CEvalMismatch);
+        return Err(ZerocheckError::CEvalMismatch);
     }
 
     // ---- Reconstruct the initial AB running claim ----
@@ -1177,7 +1178,7 @@ pub fn verify_with_grinding<C: Challenger>(
         let rho = if let Some(bits) = grinding.multilinear_round_bits() {
             let rho = challenger
                 .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-                .ok_or(VerifyError::InvalidGrindingNonce {
+                .ok_or(ZerocheckError::InvalidGrindingNonce {
                     which: "multilinear",
                 })?;
             nonce_idx += 1;
@@ -1203,7 +1204,7 @@ pub fn verify_with_grinding<C: Challenger>(
     let r_rest: Vec<F128> = r[k_skip..].to_vec();
     let expected_final = proof.final_a_eval * proof.final_b_eval;
     if c_running != expected_final {
-        return Err(VerifyError::SumcheckFinalFailed);
+        return Err(ZerocheckError::SumcheckFinalFailed);
     }
 
     // ---- Fiat–Shamir: bind the final â, b̂ claims (mirrors `prove_packed_padded_inner`) ----
@@ -1227,15 +1228,23 @@ pub fn verify_with_grinding<C: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
+    use std::iter::repeat_n;
 
-    use crate::test_rng::Rng;
+    use crate::{
+        challenger::FsChallenger,
+        test_rng::Rng,
+        transcript_record::{RecordingChallenger, TranscriptOp},
+        zerocheck::{
+            BlockCoverage, Challenger, F128, K_SKIP, PaddingRun, PaddingSpec, ZerocheckError,
+            ZerocheckGrinding, ZerocheckProof, cleanse_block, prove_packed, prove_packed_padded,
+            prove_packed_padded_capture_s_hat_v_c, prove_packed_with_grinding,
+            univariate_skip::pack_bits, verify, verify_with_grinding,
+        },
+    };
 
     /// Pack three Boolean vectors into the (a_packed, b_packed, c_packed)
     /// shape that `prove_packed` consumes.
     fn pack_abc(a: &[bool], b: &[bool], c: &[bool]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        use univariate_skip::pack_bits;
         (pack_bits(a), pack_bits(b), pack_bits(c))
     }
 
@@ -1301,8 +1310,6 @@ mod tests {
     /// `Pow` operations for the recursion transcript tape.
     #[test]
     fn per_challenge_grinding_roundtrip_and_tape() {
-        use crate::transcript_record::{RecordingChallenger, TranscriptOp};
-
         let m = 13;
         let mut rng = Rng::new(0x1280_0001);
         let a = rng.bits(1 << m);
@@ -1334,7 +1341,7 @@ mod tests {
             })
             .collect();
         let mut expected = vec![4, 7];
-        expected.extend(std::iter::repeat_n(2, m - K_SKIP));
+        expected.extend(repeat_n(2, m - K_SKIP));
         assert_eq!(
             pow_bits, expected,
             "one PoW immediately precedes each protected challenge"
@@ -1345,7 +1352,7 @@ mod tests {
         let mut ch_bad = FsChallenger::new(b"flock-zc-grinding-v0");
         assert!(matches!(
             verify_with_grinding(m, &missing, grinding, &mut ch_bad),
-            Err(VerifyError::BadGrindingNonceCount { .. })
+            Err(ZerocheckError::BadGrindingNonceCount { .. })
         ));
     }
 
@@ -1447,7 +1454,7 @@ mod tests {
         let mut ch = FsChallenger::new(b"flock-test-v0");
         assert!(matches!(
             verify(m, &bad, &mut ch),
-            Err(VerifyError::BadRound1Length { .. })
+            Err(ZerocheckError::BadRound1Length { .. })
         ));
 
         // Truncate multilinear rounds.
@@ -1456,14 +1463,14 @@ mod tests {
         let mut ch = FsChallenger::new(b"flock-test-v0");
         assert!(matches!(
             verify(m, &bad, &mut ch),
-            Err(VerifyError::BadMultilinearRoundsLength { .. })
+            Err(ZerocheckError::BadMultilinearRoundsLength { .. })
         ));
 
         // log_n too small.
         let mut ch = FsChallenger::new(b"flock-test-v0");
         assert!(matches!(
             verify(K_SKIP + 6, &proof, &mut ch),
-            Err(VerifyError::LogNTooSmall { .. })
+            Err(ZerocheckError::LogNTooSmall { .. })
         ));
     }
 

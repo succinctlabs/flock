@@ -1,4 +1,67 @@
-use super::*;
+use std::{
+    any::Any,
+    env::var,
+    iter::{once, repeat_n},
+    time::Instant,
+};
+
+use aggregate::{
+    JaggedKeyProve, JaggedKeyVerify, SigmaKey, prove_aggregate_classes_with_grinding,
+    verify_aggregate_classes_with_grinding,
+};
+use bincode::serialize;
+use flock_core::{
+    aggregate,
+    aggregate::{Accumulator, TypeMatrices},
+    circuit::{Circuit, WiringError},
+    element_r1cs::union::ElementAssertion,
+    lincheck::{LincheckCircuit, SkipPoint},
+    matrix_fold::{FoldProof, JaggedAssertion, JaggedClaim},
+    pcs::{LOG_PACKING, jagged::JaggedParams},
+    product_gkr::ProductGkrError,
+    schedule::TableClass,
+    verifier::FlockVerifyError,
+    zerocheck::{K_SKIP, multilinear::subspace_denominator_pair},
+};
+use flock_field::PHI_8_TABLE;
+use flock_transcript::transcript_record::{RecordingChallenger, StreamWord, TranscriptOp as Op};
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+#[cfg(test)]
+use {
+    crate::tower::{
+        build_chain_proof, build_fl_node, gates_blake3::Rng, native_chain, pack4, test_config,
+    },
+    std::array::from_fn,
+};
+
+#[cfg(target_arch = "aarch64")]
+use crate::prover::prove_fast_ligerito_union_circuit_ag;
+use crate::{
+    prover::{UnionElementSlotInput, prove_fast_ligerito_union_circuit},
+    r1cs_hashes::{
+        blake3::{build_block_r1cs, generate_witness_batch_major_partial_into},
+        fs_chain::{IV, trace_duplex},
+    },
+    schedule::Registry,
+    tower::{
+        BitSpreadGate, BitSpreadTable, Blake3Gate, ChildSlots, DOMAIN, ENV_ACC_MAIN_WORDS, EnvTail,
+        F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FoldPub, FsChallenger, HashKind,
+        LeafOuter, MatrixClaim, MergedChain, MixedProof, Online, PcsParams, PowMaskGate,
+        PowMaskTable, RealRegion, RealTape, SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable,
+        TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire, ZskipTapeRec, ZskipWires,
+        assert_chain_replays, balance_extra_rows, bytes_payload_mask, challenge_word_locs,
+        check_ag_skip_publics, check_fold_publics, check_jagged_fold_publics,
+        check_real_child_region, emit_ag_point_binding, emit_fold_region, emit_fs_chain,
+        emit_fs_chain_partitioned, emit_jagged_fold_region, emit_lagrange_lows,
+        emit_real_child_region, emit_recorded_pow_checks, env_acc_chain_base, env_acc_main_base,
+        env_app_base, env_pass_base, envelope_shape, flatten_ops, fold_region_ops,
+        jagged_fold_region_ops, labeled_bytes_payloads, leaf_boolean_lcs, leaf_boolean_mats,
+        live_element_input_from_rows, locate_and_pin_folds, locate_and_pin_jagged_folds,
+        merge_chain, outer_lanes, outer_union, outer_zc_ag, pack8, pad_envelope_counts,
+        payload_words, pcs_batch_for, read_acc_entry, replay_fold_endpoints,
+        replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+    },
+};
 
 /// The PRODUCTION per-proof tape cost of one child: the recorded deferred
 /// verify alone — the tape (op sequence + values + challenges) and the
@@ -8,7 +71,6 @@ use super::*;
 /// copies on top of this. Union + lcs construction is included
 /// (conservative — a node would cache both).
 pub(super) fn record_child_verify(lo: &LeafOuter, domain: &'static [u8]) {
-    use flock_core::transcript_record::RecordingChallenger;
     let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
     let lcs = leaf_boolean_lcs(lo);
     let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
@@ -102,14 +164,14 @@ pub struct NodeOut {
     pub(super) lo: LeafOuter,
     /// The MAIN fold's accumulator — LIVE entries only, the thing a root
     /// discharges.
-    pub(super) acc: flock_core::aggregate::Accumulator,
+    pub(super) acc: Accumulator,
     /// The LAST online iteration (steady state under repetition).
     pub(super) online: Online,
     /// One record per online iteration (1 + steady_reps of them) — the
     /// bench's medians come from here, one setup for all of them.
     pub(super) onlines: Vec<Online>,
     pub(super) app_base: Option<usize>,
-    pub(super) lane_acc: Option<flock_core::aggregate::Accumulator>,
+    pub(super) lane_acc: Option<Accumulator>,
     /// The published ACC_MAIN + passenger blocks — what a spine parent
     /// inherits.
     pub(super) block: MainBlock,
@@ -123,15 +185,15 @@ pub struct NodeOut {
 /// the children's published accumulator claims (`claims_base` locates
 /// them; a prior's surface IS what the child published).
 pub struct ChainLane<'a> {
-    pub(super) registry: &'a crate::schedule::Registry,
-    pub(super) mats: &'a [flock_core::aggregate::TypeMatrices<'a>],
-    pub(super) circs: &'a [&'a dyn flock_core::lincheck::LincheckCircuit],
+    pub(super) registry: &'a Registry,
+    pub(super) mats: &'a [TypeMatrices<'a>],
+    pub(super) circs: &'a [&'a dyn LincheckCircuit],
     /// The lane's sigma table owner (the chain circuit).
-    pub(super) circuit: &'a flock_core::circuit::Circuit,
+    pub(super) circuit: &'a Circuit,
     /// The lane's jagged table owner (the chain LAYOUT — the count win's
     /// per-digest key, inherited priors-only through internal nodes).
-    pub(super) params: &'a flock_core::pcs::jagged::JaggedParams,
-    pub(super) priors: &'a [&'a flock_core::aggregate::Accumulator],
+    pub(super) params: &'a JaggedParams,
+    pub(super) priors: &'a [&'a Accumulator],
     /// The published `[rho_col | rho_row | value]` fold blocks' base in
     /// EACH child's public segment (every child shares the layout).
     pub(super) claims_base: usize,
@@ -181,10 +243,6 @@ pub fn build_node_outer_app(
     lane: Option<ChainLane<'_>>,
     spine: Option<SpineIn<'_>>,
 ) -> NodeOut {
-    use flock_core::aggregate;
-    use flock_core::matrix_fold::FoldProof;
-    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-
     const M11_NODE_DOMAIN: &[u8] = b"flock-mvp11-two-to-one-v0";
 
     // ARITY IS A KNOB: the node folds `k = los.len()` children in one
@@ -197,12 +255,11 @@ pub fn build_node_outer_app(
     assert!(n_kids >= 2, "a node folds at least two children");
     let forge_match = spine.as_ref().is_some_and(|sp| sp.forge);
     let lo0 = los[0];
-    // MIXED DIGESTS ARE THE SPINE (wall 3): a steady node's children are a
-    // FRESH FL and the PREVIOUS NODE, which are different circuits. They
-    // still share the registry, the publics length and the lane count (the
-    // wall-2 envelope), which is what makes ONE child region walk either —
-    // only the fold KEYS differ, one slot per child. Without a spine the
-    // old rule stands: one key, so one digest.
+    // A steady node has one fresh FL child and one prior node child.
+    // These children use different circuits. They share the registry, public
+    // length, and lane count. One child region
+    // can therefore walk either child. Only the fold keys differ.
+    // Without a spine, each child uses one circuit digest.
     if spine.is_none() {
         for lo in los {
             assert_eq!(
@@ -226,13 +283,10 @@ pub fn build_node_outer_app(
         .iter()
         .map(|lo| outer_union(&lo.shape.registry, lo.shape.counts.clone()))
         .collect();
-    let t_tapes = std::time::Instant::now();
+    let t_tapes = Instant::now();
     // The children's tapes are independent statement work — build them
     // concurrently (each is a recording verify + the region pins).
-    let rts: Vec<RealTape> = {
-        use rayon::prelude::*;
-        los.par_iter().map(|lo| RealTape::new(lo, DOMAIN)).collect()
-    };
+    let rts: Vec<RealTape> = { los.par_iter().map(|lo| RealTape::new(lo, DOMAIN)).collect() };
     let tape_setup_ms = t_tapes.elapsed().as_secs_f64() * 1e3;
     for i in 1..n_kids {
         assert_ne!(
@@ -268,7 +322,7 @@ pub fn build_node_outer_app(
     // different permutations — different layouts — cannot fold together.
     // The layout is a shape constant of the child circuit, so the key that
     // names the circuit names the table.
-    let key_circuits: Vec<&flock_core::circuit::Circuit> = match &spine {
+    let key_circuits: Vec<&Circuit> = match &spine {
         None => vec![&lo0.shape.circuit],
         Some(_) => los.iter().map(|lo| &lo.shape.circuit).collect(),
     };
@@ -280,19 +334,18 @@ pub fn build_node_outer_app(
         None => vec![(0..n_kids).collect()],
         Some(_) => (0..n_kids).map(|i| vec![i]).collect(),
     };
-    let params_j: Vec<flock_core::pcs::jagged::JaggedParams> = (0..n_keys)
+    let params_j: Vec<JaggedParams> = (0..n_keys)
         .map(|j| {
             let i = key_kids[j][0];
-            flock_core::pcs::jagged::JaggedParams::from_heights(
+            JaggedParams::from_heights(
                 &unions[i].jagged_heights(),
                 unions[i].n_log(),
-                los[i].commitment.params.m - flock_core::pcs::LOG_PACKING,
+                los[i].commitment.params.m - LOG_PACKING,
             )
         })
         .collect();
-    let jags: Vec<&flock_core::matrix_fold::JaggedAssertion> =
-        rts.iter().map(|rt| &rt.jag).collect();
-    let jagged_p: Vec<aggregate::JaggedKeyProve<'_>> = (0..n_keys)
+    let jags: Vec<&JaggedAssertion> = rts.iter().map(|rt| &rt.jag).collect();
+    let jagged_p: Vec<JaggedKeyProve<'_>> = (0..n_keys)
         .map(|j| {
             (
                 key_digests[j],
@@ -301,7 +354,7 @@ pub fn build_node_outer_app(
             )
         })
         .collect();
-    let jagged_v: Vec<aggregate::JaggedKeyVerify<'_>> = (0..n_keys)
+    let jagged_v: Vec<JaggedKeyVerify<'_>> = (0..n_keys)
         .map(|j| {
             (
                 key_digests[j],
@@ -309,7 +362,7 @@ pub fn build_node_outer_app(
             )
         })
         .collect();
-    let sigma_keys: Vec<aggregate::SigmaKey<'_>> = (0..n_keys)
+    let sigma_keys: Vec<SigmaKey<'_>> = (0..n_keys)
         .map(|j| {
             (
                 key_circuits[j],
@@ -322,7 +375,7 @@ pub fn build_node_outer_app(
     // the slot's circuit folds; one that does not is GATED to the zero
     // claim and its live original becomes an ORPHAN, which the passenger
     // carries rather than drops.
-    let prior_acc: Option<aggregate::Accumulator> = spine.as_ref().map(|sp| {
+    let prior_acc: Option<Accumulator> = spine.as_ref().map(|sp| {
         let p = sp.prior;
         assert_eq!(p.sigma.len(), N_KEY_SLOTS, "the prior's sigma slots");
         assert_eq!(p.jagged.len(), N_KEY_SLOTS, "the prior's jagged slots");
@@ -341,7 +394,7 @@ pub fn build_node_outer_app(
                 })
                 .collect()
         };
-        aggregate::Accumulator {
+        Accumulator {
             registry_digest: registry.digest(),
             per_type: p.per_type.clone(),
             per_element: p.per_element.clone(),
@@ -349,9 +402,9 @@ pub fn build_node_outer_app(
             jagged: norm(&p.jagged),
         }
     });
-    let priors: Vec<&aggregate::Accumulator> = prior_acc.iter().collect();
+    let priors: Vec<&Accumulator> = prior_acc.iter().collect();
     let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
-    let (agg, acc_p) = aggregate::prove_aggregate_classes_with_grinding(
+    let (agg, acc_p) = prove_aggregate_classes_with_grinding(
         registry,
         &mats,
         &lcs,
@@ -366,7 +419,7 @@ pub fn build_node_outer_app(
     )
     .expect("the node fold proves");
     let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_NODE_DOMAIN));
-    let acc_v = aggregate::verify_aggregate_classes_with_grinding(
+    let acc_v = verify_aggregate_classes_with_grinding(
         registry,
         &bool_asserts,
         &el_asserts,
@@ -389,7 +442,7 @@ pub fn build_node_outer_app(
         "the sigma group discharges"
     );
     assert_eq!(acc_v.jagged.len(), n_keys, "one jagged entry per key");
-    let jag_tables: Vec<([u8; 32], &flock_core::pcs::jagged::JaggedParams)> = (0..n_keys)
+    let jag_tables: Vec<([u8; 32], &JaggedParams)> = (0..n_keys)
         .map(|j| (key_digests[j], &params_j[j]))
         .collect();
     assert!(
@@ -497,11 +550,11 @@ pub fn build_node_outer_app(
     }
     // The jagged groups ride the SAME tape after the uniform folds — the
     // prior's (gated) entry first, then that key's children's claims.
-    let jagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = (0..n_keys)
+    let jagged_keys: Vec<([u8; 32], Vec<JaggedClaim>)> = (0..n_keys)
         .map(|j| {
-            let mut cs: Vec<flock_core::matrix_fold::JaggedClaim> = pri
+            let mut cs: Vec<JaggedClaim> = pri
                 .map(|p| {
-                    flock_core::matrix_fold::JaggedClaim::from_folded(&p.jagged[j].1)
+                    JaggedClaim::from_folded(&p.jagged[j].1)
                         .expect("an inherited jagged entry is scaled plain eq")
                 })
                 .into_iter()
@@ -592,19 +645,14 @@ pub fn build_node_outer_app(
     // (bool A/B + sigma) × [priorL, priorR], no fresh claims. ----
     const LANE_DOMAIN: &[u8] = b"flock-chain-lane-v0";
     let lane_native = lane.as_ref().map(|ln| {
-        let el_asserts_l: [(
-            &UnionInstance<'_>,
-            flock_core::element_r1cs::union::ElementAssertion,
-        ); 0] = [];
+        let el_asserts_l: [(&UnionInstance<'_>, ElementAssertion); 0] = [];
         // The jagged key rides PRIORS-ONLY through the lane, exactly like
         // the lane's other groups: the FL children's chain-keyed entries
         // fold with no fresh claims.
-        let ljagged_p: Vec<aggregate::JaggedKeyProve<'_>> =
-            vec![(ln.circuit.digest(), ln.params, Vec::new())];
-        let ljagged_v: Vec<aggregate::JaggedKeyVerify<'_>> =
-            vec![(ln.circuit.digest(), Vec::new())];
+        let ljagged_p: Vec<JaggedKeyProve<'_>> = vec![(ln.circuit.digest(), ln.params, Vec::new())];
+        let ljagged_v: Vec<JaggedKeyVerify<'_>> = vec![(ln.circuit.digest(), Vec::new())];
         let mut chp = FsChallenger::with_chained_blake3(LANE_DOMAIN);
-        let (lagg, lacc_p) = aggregate::prove_aggregate_classes_with_grinding(
+        let (lagg, lacc_p) = prove_aggregate_classes_with_grinding(
             ln.registry,
             ln.mats,
             ln.circs,
@@ -619,7 +667,7 @@ pub fn build_node_outer_app(
         )
         .expect("the lane fold proves");
         let mut lrec = RecordingChallenger::new(FsChallenger::with_chained_blake3(LANE_DOMAIN));
-        let lacc_v = aggregate::verify_aggregate_classes_with_grinding(
+        let lacc_v = verify_aggregate_classes_with_grinding(
             ln.registry,
             &[],
             &el_asserts_l,
@@ -666,15 +714,14 @@ pub fn build_node_outer_app(
         want.extend(fold_region_ops(cfg, &lclaims[n_uni_l..]));
         // The inherited jagged claims (the priors' chain-keyed entries,
         // plain eq by construction) ride the same tape after.
-        let ljagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = vec![(
+        let ljagged_keys: Vec<([u8; 32], Vec<JaggedClaim>)> = vec![(
             ln.circuit.digest(),
             ln.priors
                 .iter()
                 .flat_map(|p| p.jagged.iter())
                 .filter(|(d, _)| *d == ln.circuit.digest())
                 .map(|(_, c)| {
-                    flock_core::matrix_fold::JaggedClaim::from_folded(c)
-                        .expect("prior jagged entries are plain eq")
+                    JaggedClaim::from_folded(c).expect("prior jagged entries are plain eq")
                 })
                 .collect(),
         )];
@@ -725,8 +772,6 @@ pub fn build_node_outer_app(
     // ---- ONE outer: two REAL child regions + the fold region ----
 
     {
-        use crate::prover::UnionElementSlotInput;
-
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
         // hands back one linear numbering plus the four cross-link wires.
@@ -762,7 +807,7 @@ pub fn build_node_outer_app(
                 rts.iter().map(|rt| rt.b3_rows).sum::<usize>() + trace.rows.len(),
             )
         };
-        if std::env::var("B3_CENSUS").is_ok() {
+        if var("B3_CENSUS").is_ok() {
             let fold_pows = ops
                 .iter()
                 .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
@@ -838,7 +883,7 @@ pub fn build_node_outer_app(
             .find(|&&(n, _)| n == 8)
             .map(|&(_, s)| s)
             .expect("the child regions created the 8-lane leaf-eval slot");
-        let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
+        let iv_w = pack8(&IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [
             sb.fixed_public_input(iv_w[0]),
@@ -880,7 +925,7 @@ pub fn build_node_outer_app(
         );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
-            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+            if let StreamWord::Value(vi) = *w {
                 if vmap.len() <= vi {
                     vmap.resize(vi + 1, None);
                 }
@@ -1206,9 +1251,6 @@ pub fn build_node_outer_app(
         // nodes and the subspace denominator inverse — statement constants
         // the checker validates below (the ONE public surface the
         // in-circuit derivation adds).
-        use flock_core::field::PHI_8_TABLE;
-        use flock_core::zerocheck::K_SKIP;
-        use flock_core::zerocheck::multilinear::subspace_denominator_pair;
         // The RS lows machinery is emitted only when an RS child consumes
         // it; AG children take the Tier-0 published surface instead.
         let any_rs = rts
@@ -1335,7 +1377,7 @@ pub fn build_node_outer_app(
                     vals.push(F128::new(u64::from(nonce), 0));
                     let w = sb.public_input();
                     sb.connect(w, *nonce_w);
-                    let flock_core::lincheck::SkipPoint::Ag(pt) = tk.mat_assert.z_skip else {
+                    let SkipPoint::Ag(pt) = tk.mat_assert.z_skip else {
                         unreachable!("an AG tape carries an AG skip point")
                     };
                     let pt_w: [Wire; 5] = [pt.x, pt.y, pt.z1, pt.z2, pt.z3].map(|c| {
@@ -1554,7 +1596,7 @@ pub fn build_node_outer_app(
                     w.extend_from_slice(&fp.rho_row);
                     w.push(fp.value);
                 }
-                None => w.extend(std::iter::repeat_n(zw, 2 + k_col + k_row)),
+                None => w.extend(repeat_n(zw, 2 + k_col + k_row)),
             }
         };
         for fp in fold_pubs.iter().take(n_uni) {
@@ -1649,7 +1691,7 @@ pub fn build_node_outer_app(
             // Use the protocol tracer rather than a manual finalize loop:
             // Secure fold tapes contain fused `Pow`+squeeze operations whose
             // compression counter differs from an ordinary squeeze.
-            let ltrace = crate::r1cs_hashes::fs_chain::trace_duplex(lstream, lbytes, lops);
+            let ltrace = trace_duplex(lstream, lbytes, lops);
             assert_chain_replays(lops, &ltrace, lchals);
             let lpub_payloads = bytes_payload_mask(lops);
             let (lchain_outs, lww) = emit_fs_chain(
@@ -1679,7 +1721,7 @@ pub fn build_node_outer_app(
             );
             let mut lvmap: Vec<Option<usize>> = Vec::new();
             for (wi, w) in lstream.words.iter().enumerate() {
-                if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                if let StreamWord::Value(vi) = *w {
                     if lvmap.len() <= vi {
                         lvmap.resize(vi + 1, None);
                     }
@@ -1838,7 +1880,7 @@ pub fn build_node_outer_app(
             )
         });
 
-        if std::env::var("MAC_CENSUS").is_ok() {
+        if var("MAC_CENSUS").is_ok() {
             let mac_total = sb.rows_in_slot(cs.macs);
             println!("\nMAC ROW CENSUS (shared mac slot; child 0 labels, child 1 same shape):");
             for w in r0.census.windows(2) {
@@ -1859,7 +1901,7 @@ pub fn build_node_outer_app(
             );
             println!("  {:42} {:6}", "TOTAL", mac_total);
         }
-        if std::env::var("B3_CENSUS").is_ok() {
+        if var("B3_CENSUS").is_ok() {
             eprintln!(
                 "  [node emitted BLAKE rows] primary {} | secondary {} | model max {}",
                 sb.rows_in_slot(cs.q.b3),
@@ -1867,7 +1909,7 @@ pub fn build_node_outer_app(
                 b3_rows,
             );
         }
-        if std::env::var("PUB_CENSUS").is_ok() {
+        if var("PUB_CENSUS").is_ok() {
             println!("\nPUBLICS CENSUS (child 0; child 1 same shape):");
             for w in r0.census.windows(2) {
                 println!("  {:38} {:6}", w[1].0, w[1].1 - w[0].1);
@@ -1884,7 +1926,7 @@ pub fn build_node_outer_app(
             );
         }
         let build_ms = t_tapes.elapsed().as_secs_f64() * 1e3 - tape_setup_ms;
-        let t_build2 = std::time::Instant::now();
+        let t_build2 = Instant::now();
         // publics*: the node pads to the same public-segment length the
         // leaf does (free counts: the count VECTORS deliberately differ —
         // see the assert_ne below the builders).
@@ -1921,7 +1963,7 @@ pub fn build_node_outer_app(
         // ROUND-3 DATA (NODE_CENSUS=1): per-type schema words — each one a
         // cell slot AND a gather claim — plus live rows and utilization,
         // the consolidation pass's worklist.
-        if std::env::var("NODE_CENSUS").is_ok() {
+        if var("NODE_CENSUS").is_ok() {
             let mut lab: Vec<(usize, String)> = vec![
                 (shape2.registry_slot(cs.q.b3), "b3".to_string()),
                 (shape2.registry_slot(cs.q.swap), "swap".to_string()),
@@ -1968,7 +2010,7 @@ pub fn build_node_outer_app(
                 let used_cols = ty.useful_bits.div_ceil(128).min(1usize << (ty.k_log - 7));
                 let area = shape2.counts[t] * used_cols;
                 let native = match ty.class {
-                    flock_core::schedule::TableClass::Boolean => {
+                    TableClass::Boolean => {
                         area_b += area;
                         format!("GF(2)     {:6} bit-cols", ty.useful_bits)
                     }
@@ -1990,17 +2032,15 @@ pub fn build_node_outer_app(
                 area_b + area_e,
             );
         }
-        let hint_refs: Vec<&(dyn std::any::Any + Sync)> = hints
-            .iter()
-            .map(|h| h as &(dyn std::any::Any + Sync))
-            .collect();
+        let hint_refs: Vec<&(dyn Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
         let build_ms = build_ms + t_build2.elapsed().as_secs_f64() * 1e3;
         // THE INDEX-FILL RUNNER (setup): compile the fill plan, then pin it
         // row-identical against the generic walk before the online loop
         // trusts it — publics, every boolean row store, and every
         // element slot's packed witness, field for field. The walk stays the
         // differential oracle; only the plan runs in the timed loop.
-        let t_plan = std::time::Instant::now();
+        let t_plan = Instant::now();
         let fill_plan = shape2.fill_plan();
         let build_ms = build_ms + t_plan.elapsed().as_secs_f64() * 1e3;
         {
@@ -2059,8 +2099,8 @@ pub fn build_node_outer_app(
             // gotchas, third occurrence).
             merkle_hash: HashKind::Blake3,
         };
-        let t_r1cs = std::time::Instant::now();
-        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
+        let t_r1cs = Instant::now();
+        let b3_r1cs2 = build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
@@ -2088,15 +2128,14 @@ pub fn build_node_outer_app(
             // production statement work). The pin/locate scaffolding ran once
             // above (tape_setup_ms) — its indices are shape-stable.
             let tapes_ms = {
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 {
-                    use rayon::prelude::*;
                     los.par_iter()
                         .for_each(|lo| record_child_verify(lo, DOMAIN));
                 }
                 t.elapsed().as_secs_f64() * 1e3
             };
-            let t_trace = std::time::Instant::now();
+            let t_trace = Instant::now();
             // DEFERRED: rows and publics only — the element witnesses are never
             // packed; the assembly below feeds the prover from the rows.
             let mut built2 = shape2.run_filled_deferred(&fill_plan, &vals, &hint_refs);
@@ -2186,7 +2225,7 @@ pub fn build_node_outer_app(
                     read_acc_entry(&built2.public, &mut q, true, jlocs[0].n_col, jlocs[0].k_row),
                 ]
             };
-            let acc_pub = aggregate::Accumulator {
+            let acc_pub = Accumulator {
                 registry_digest: registry.digest(),
                 per_type: (0..n_bool)
                     .map(|t| (rebuilt[2 * t].clone(), rebuilt[2 * t + 1].clone()))
@@ -2318,7 +2357,7 @@ pub fn build_node_outer_app(
                     let (ljrebuilt, _, _) =
                         check_jagged_fold_publics(&built2.public, *lpb + lu_len, ljlocs, false);
                     let lane_ref = lane.as_ref().expect("lane");
-                    let lacc_pub2 = aggregate::Accumulator {
+                    let lacc_pub2 = Accumulator {
                         registry_digest: lane_ref.registry.digest(),
                         per_type: vec![(lrebuilt[0].clone(), lrebuilt[1].clone())],
                         per_element: Vec::new(),
@@ -2335,7 +2374,7 @@ pub fn build_node_outer_app(
                 }
             }
 
-            let t_asm = std::time::Instant::now();
+            let t_asm = Instant::now();
             // Recreated per online iteration — the spread closure consumes it.
             let spread_ty2 = BitSpreadTable::new(spread_w2);
             let pow_ty2 = PowMaskTable;
@@ -2344,7 +2383,7 @@ pub fn build_node_outer_app(
             // elide) — no intermediate capacity-sized buffers, no memcpy. The
             // rows are hoisted to owned Vecs because the closures must be Send
             // and `built2.rows` hands out `dyn Any`-backed borrows.
-            let b3_declared: Vec<_> = std::iter::once(cs.q.b3).chain(cs.q.b3_alt).collect();
+            let b3_declared: Vec<_> = once(cs.q.b3).chain(cs.q.b3_alt).collect();
             let b3_rows2: Vec<_> = b3_declared
                 .iter()
                 .map(|&slot| (slot, built2.rows::<Blake3Gate>(slot).to_vec()))
@@ -2392,9 +2431,7 @@ pub fn build_node_outer_app(
                 (
                     shape2.registry_slot(slot),
                     UnionSlotProverInput::in_place(
-                        move |dst| {
-                            blake3::generate_witness_batch_major_partial_into(&rows, nu2, dst)
-                        },
+                        move |dst| generate_witness_batch_major_partial_into(&rows, nu2, dst),
                         b3_lc2,
                     ),
                 )
@@ -2461,28 +2498,26 @@ pub fn build_node_outer_app(
                 .into_iter()
                 .map(|(_, rows)| live_element_input_from_rows(rows, nu2))
                 .collect();
-            let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            let mut lco: Vec<(usize, &dyn LincheckCircuit)> = vec![
                 (shape2.registry_slot(cs.q.swap), swap_lc2),
                 (shape2.registry_slot(cs.q.spread), spread_lc2),
                 (shape2.registry_slot(cs.q.pow), pow_lc2),
                 (shape2.registry_slot(family_slot), family_lc2),
             ];
-            lco.extend(b3_declared.iter().map(|&slot| {
-                (
-                    shape2.registry_slot(slot),
-                    b3_lc2 as &dyn flock_core::lincheck::LincheckCircuit,
-                )
-            }));
+            lco.extend(
+                b3_declared
+                    .iter()
+                    .map(|&slot| (shape2.registry_slot(slot), b3_lc2 as &dyn LincheckCircuit)),
+            );
             lco.sort_by_key(|(i, _)| *i);
-            let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
-                lco.into_iter().map(|(_, c)| c).collect();
+            let lcs2: Vec<&dyn LincheckCircuit> = lco.into_iter().map(|(_, c)| c).collect();
             let asm_ms = t_asm.elapsed().as_secs_f64() * 1e3;
-            let t0p = std::time::Instant::now();
+            let t0p = Instant::now();
             let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
             let (oproof, ocommit) = if outer_zc_ag() {
                 #[cfg(target_arch = "aarch64")]
                 {
-                    let (p, c, _) = prover::prove_fast_ligerito_union_circuit_ag(
+                    let (p, c, _) = prove_fast_ligerito_union_circuit_ag(
                         &union2,
                         &shape2.circuit,
                         &built2.public,
@@ -2496,7 +2531,7 @@ pub fn build_node_outer_app(
                 #[cfg(not(target_arch = "aarch64"))]
                 unreachable!("outer_zc_ag() is false off aarch64")
             } else {
-                let (p, c, _) = prover::prove_fast_ligerito_union_circuit(
+                let (p, c, _) = prove_fast_ligerito_union_circuit(
                     &union2,
                     &shape2.circuit,
                     &built2.public,
@@ -2508,7 +2543,7 @@ pub fn build_node_outer_app(
                 (MixedProof::Rs(p), c)
             };
             let prove_ms = t0p.elapsed().as_secs_f64() * 1e3;
-            let t0v = std::time::Instant::now();
+            let t0v = Instant::now();
             let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
             let vres = oproof.verify_circuit(
                 &union2,
@@ -2525,11 +2560,9 @@ pub fn build_node_outer_app(
                 assert!(
                     matches!(
                         vres,
-                        Err(flock_core::verifier::VerifyError::Wiring(
-                            flock_core::circuit::WiringError::Gkr(
-                                flock_core::product_gkr::VerifyError::ProductMismatch
-                            )
-                        ))
+                        Err(FlockVerifyError::Wiring(WiringError::Gkr(
+                            ProductGkrError::ProductMismatch
+                        )))
                     ),
                     "a forged live fold of a mismatched entry must die on the wiring product"
                 );
@@ -2540,7 +2573,7 @@ pub fn build_node_outer_app(
             let deferred_ms = if forge_match {
                 0.0
             } else {
-                let t0d = std::time::Instant::now();
+                let t0d = Instant::now();
                 let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
                 oproof
                     .verify_circuit_deferred(
@@ -2555,7 +2588,7 @@ pub fn build_node_outer_app(
                     .expect("the 2->1 node verifies deferred");
                 t0d.elapsed().as_secs_f64() * 1e3
             };
-            let b3_live: Vec<usize> = std::iter::once(cs.q.b3)
+            let b3_live: Vec<usize> = once(cs.q.b3)
                 .chain(cs.q.b3_alt)
                 .map(|slot| shape2.counts[shape2.registry_slot(slot)])
                 .collect();
@@ -2589,7 +2622,7 @@ pub fn build_node_outer_app(
                 tapes_ms + trace_ms + asm_ms + prove_ms,
                 verify_ms,
                 deferred_ms,
-                bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+                serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
                 build_ms,
                 tape_setup_ms,
             );
@@ -2616,7 +2649,7 @@ pub fn build_node_outer_app(
             shape2.registry_slot(cs.q.pow),
             shape2.registry_slot(family_slot),
         );
-        let b3_slots2 = std::iter::once(cs.q.b3)
+        let b3_slots2 = once(cs.q.b3)
             .chain(cs.q.b3_alt)
             .map(|slot| shape2.registry_slot(slot))
             .collect();
@@ -2672,7 +2705,7 @@ pub(super) fn internal_node_over_two_fl_nodes() {
     let cfg = test_config();
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_0006);
-    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
     let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
     let cp2 = build_chain_proof(cfg, cp1.h_end, n_blocks);
@@ -2756,10 +2789,7 @@ pub(super) fn internal_node_over_two_fl_nodes() {
         node.shape.circuit.cells().nu(),
         node.shape.circuit.cells().mu(),
         node.public.len(),
-        bincode::serialize(&node.proof)
-            .map(|b| b.len())
-            .unwrap_or(0) as f64
-            / 1024.0,
+        serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
 }
 
@@ -2767,11 +2797,11 @@ pub(super) fn internal_node_over_two_fl_nodes() {
 /// about, keyed by its circuit digest. Heights are a shape constant of
 /// that circuit, which is why the key names the table.
 #[cfg(test)]
-pub(super) fn node_jagged_params(lo: &LeafOuter) -> flock_core::pcs::jagged::JaggedParams {
+pub(super) fn node_jagged_params(lo: &LeafOuter) -> JaggedParams {
     let u = outer_union(&lo.shape.registry, lo.shape.counts.clone());
-    flock_core::pcs::jagged::JaggedParams::from_heights(
+    JaggedParams::from_heights(
         &u.jagged_heights(),
         u.n_log(),
-        lo.commitment.params.m - flock_core::pcs::LOG_PACKING,
+        lo.commitment.params.m - LOG_PACKING,
     )
 }

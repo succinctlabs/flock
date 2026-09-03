@@ -22,7 +22,7 @@ to the PowMask convention; `cross_class_circuit_ag_roundtrip` green).
 chain shape proves under AG, RS 17.6 vs AG 12.3 ms at m22 dev size).
 **Phase B COMPLETE** (this branch): the tower's chain leaf proves under AG
 on aarch64 and the whole pipeline replays it. What landed, all in
-`crates/flock-prover/src/tower.rs` unless noted:
+`crates/flock-prover/src/tower/` unless noted:
 
 1. `MixedProof` flavor enum (`Rs | Ag`) with `wiring()/pcs_open()/element()`
    accessors; `build_chain_proof` proves AG behind the private

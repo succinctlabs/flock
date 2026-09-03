@@ -1,4 +1,13 @@
-use super::*;
+#[cfg(test)]
+use std::env::VarError;
+use std::env::var;
+
+use flock_core::{matrix_fold::FoldGrinding, pcs::ligerito::embedded_initial_k_or_default};
+
+use crate::{
+    schedule::Registry,
+    tower::{HashKind, LigeritoProfile, PcsParams, UnionInstance},
+};
 
 /// The L0 interleave for a content-sized commit: the embedded config's
 /// own `initial_k` (6 everywhere except m29 Fast/Slim = 5 — the
@@ -6,7 +15,7 @@ use super::*;
 /// mismatched batch, so every params site whose `m` is content-derived
 /// must go through this.
 pub(super) fn pcs_batch_for(union: &UnionInstance, profile: LigeritoProfile) -> usize {
-    flock_core::pcs::ligerito::embedded_initial_k_or_default(union.dense_m(), profile)
+    embedded_initial_k_or_default(union.dense_m(), profile)
 }
 
 /// The two production recursion towers. The LEAF (the application's chain
@@ -53,9 +62,9 @@ impl TowerConfig {
 /// value is a typo and panics instead of silently selecting the default.
 #[cfg(test)]
 pub(super) fn test_config() -> TowerConfig {
-    match std::env::var("TOWER_CONFIG").as_deref() {
+    match var("TOWER_CONFIG").as_deref() {
         Ok("chain100") => TowerConfig::Chain100,
-        Ok("chain128") | Err(std::env::VarError::NotPresent) => TowerConfig::Chain128,
+        Ok("chain128") | Err(VarError::NotPresent) => TowerConfig::Chain128,
         other => panic!("TOWER_CONFIG must be `chain100` or `chain128`, got {other:?}"),
     }
 }
@@ -67,17 +76,17 @@ pub(super) fn test_config() -> TowerConfig {
 /// growing `TowerConfig`. `TOWER_LEAF_ZC=rs` forces the RS leaf for A/B
 /// measurement on aarch64.
 pub(super) fn leaf_zc_ag() -> bool {
-    cfg!(target_arch = "aarch64") && !matches!(std::env::var("TOWER_LEAF_ZC").as_deref(), Ok("rs"))
+    cfg!(target_arch = "aarch64") && !matches!(var("TOWER_LEAF_ZC").as_deref(), Ok("rs"))
 }
 
 /// Phase C flip-in-place: the envelope OUTERS (FL / internal / spine)
 /// prove under the AG skip on the same terms as the leaf.
 /// `TOWER_OUTER_ZC=rs` forces the RS outers for A/B measurement.
 pub(super) fn outer_zc_ag() -> bool {
-    cfg!(target_arch = "aarch64") && !matches!(std::env::var("TOWER_OUTER_ZC").as_deref(), Ok("rs"))
+    cfg!(target_arch = "aarch64") && !matches!(var("TOWER_OUTER_ZC").as_deref(), Ok("rs"))
 }
 
-pub(super) fn tower_fold_grinding(cfg: TowerConfig) -> flock_core::matrix_fold::FoldGrinding {
+pub(super) fn tower_fold_grinding(cfg: TowerConfig) -> FoldGrinding {
     let profile = cfg.outer_profile();
     PcsParams {
         m: 22,
@@ -106,10 +115,7 @@ pub(super) const ENVELOPE_FLOOR_M: usize = 29;
 /// applied. Every instance over a leaf/node OUTER shape must come from
 /// here — prover, verifier and tape recorder alike: the floor is
 /// STATEMENT data, like the counts.
-pub(super) fn outer_union<'r>(
-    registry: &'r crate::schedule::Registry,
-    counts: Vec<usize>,
-) -> UnionInstance<'r> {
+pub(super) fn outer_union<'r>(registry: &'r Registry, counts: Vec<usize>) -> UnionInstance<'r> {
     let mut u = UnionInstance::new(registry, counts);
     u.set_dense_floor(ENVELOPE_FLOOR_M);
     u

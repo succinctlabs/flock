@@ -20,6 +20,10 @@
 //!
 //! [DP24]: https://eprint.iacr.org/2024/504
 
+use core::slice::from_raw_parts;
+
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+
 use crate::field::F128;
 
 /// `log_2` of the packing width. F_{2^128} holds 128 bits = 2^7.
@@ -38,7 +42,6 @@ pub const PACKING_WIDTH: usize = 1 << LOG_PACKING;
 /// - if `z.len() != 1 << m`
 /// - if `m < LOG_PACKING`
 pub fn pack_witness(z: &[bool], m: usize) -> Vec<F128> {
-    use rayon::prelude::*;
     assert_eq!(z.len(), 1usize << m, "z length must be 2^m");
     assert!(
         m >= LOG_PACKING,
@@ -51,7 +54,7 @@ pub fn pack_witness(z: &[bool], m: usize) -> Vec<F128> {
     // byte 7 of `x * 0x0102040810204080` is Σ_r b_r·2^r (each lower product
     // byte sums distinct powers of two ≤ 0xFE — no carry into byte 7).
     // SAFETY: same length, and any &[bool] is a valid &[u8].
-    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(z.as_ptr() as *const u8, z.len()) };
+    let bytes: &[u8] = unsafe { from_raw_parts(z.as_ptr() as *const u8, z.len()) };
     #[inline]
     fn pack64(b: &[u8]) -> u64 {
         let mut w = 0u64;
@@ -103,9 +106,10 @@ pub fn unpack_witness(packed: &[F128], m: usize) -> Vec<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        pcs::pack::{F128, LOG_PACKING, pack_witness, unpack_witness},
+        test_rng::Rng,
+    };
 
     #[test]
     fn pack_unpack_roundtrip() {

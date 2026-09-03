@@ -55,17 +55,19 @@
 //! Rounds bind the **top** remaining variable, so the challenge list reversed is
 //! the column point LSB-first — matching the rows-low witness layout.
 
-use rayon::prelude::*;
+use rayon::prelude::{ParallelIterator, ParallelSlice};
 use serde::{Deserialize, Serialize};
 
-use super::ElementTableType;
-use super::Grinding;
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::lincheck::{
-    sumcheck_bind_both_and_eval_next, sumcheck_bind_top_in_place_par, sumcheck_round_eval_par,
+use crate::{
+    challenger::Challenger,
+    element_r1cs::{ElementTableType, Grinding},
+    field::F128,
+    lincheck::{
+        sumcheck_bind_both_and_eval_next, sumcheck_bind_top_in_place_par, sumcheck_round_eval_par,
+    },
+    pcs::ring_switch::build_eq_parallel,
+    zerocheck::univariate_skip::build_eq,
 };
-use crate::zerocheck::univariate_skip::build_eq;
 
 /// Domain label of the standalone single-table lincheck. The union's
 /// element-region lincheck runs the same sumcheck core under its own label
@@ -139,7 +141,7 @@ pub(crate) fn column_sumcheck_replay<C: Challenger>(
     grinding_nonces: &[u64],
     nonce_idx: &mut usize,
     ch: &mut C,
-) -> Result<(F128, Vec<F128>), VerifyError> {
+) -> Result<(F128, Vec<F128>), ElementLincheckError> {
     let mut running = target;
     let mut challenges = Vec::with_capacity(rounds.len());
     for &(e1, einf) in rounds {
@@ -148,7 +150,7 @@ pub(crate) fn column_sumcheck_replay<C: Challenger>(
         let rho = if let Some(bits) = grinding.round_bits() {
             let rho = ch
                 .verify_pow_and_sample_f128(grinding_nonces[*nonce_idx], bits)
-                .ok_or(VerifyError::InvalidGrindingNonce { which: "round" })?;
+                .ok_or(ElementLincheckError::InvalidGrindingNonce { which: "round" })?;
             *nonce_idx += 1;
             rho
         } else {
@@ -197,7 +199,7 @@ pub struct Claim {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
+pub enum ElementLincheckError {
     /// Wrong number of round messages (expected `kappa`).
     BadRoundCount {
         expected: usize,
@@ -307,7 +309,7 @@ pub fn verify<C: Challenger>(
     vb: F128,
     proof: &Proof,
     ch: &mut C,
-) -> Result<Claim, VerifyError> {
+) -> Result<Claim, ElementLincheckError> {
     verify_with_grinding(ty, n_log, r, va, vb, proof, Grinding::disabled(), ch)
 }
 
@@ -321,23 +323,23 @@ pub fn verify_with_grinding<C: Challenger>(
     proof: &Proof,
     grinding: Grinding,
     ch: &mut C,
-) -> Result<Claim, VerifyError> {
+) -> Result<Claim, ElementLincheckError> {
     let kappa = ty.kappa();
     let m_words = kappa + n_log;
     if r.len() != m_words {
-        return Err(VerifyError::BadPointLength {
+        return Err(ElementLincheckError::BadPointLength {
             expected: m_words,
             got: r.len(),
         });
     }
     if proof.rounds.len() != kappa {
-        return Err(VerifyError::BadRoundCount {
+        return Err(ElementLincheckError::BadRoundCount {
             expected: kappa,
             got: proof.rounds.len(),
         });
     }
     if proof.grinding_nonces.len() != grinding.lincheck_nonce_count(kappa) {
-        return Err(VerifyError::BadGrindingNonceCount {
+        return Err(ElementLincheckError::BadGrindingNonceCount {
             expected: grinding.lincheck_nonce_count(kappa),
             got: proof.grinding_nonces.len(),
         });
@@ -348,7 +350,7 @@ pub fn verify_with_grinding<C: Challenger>(
     let alpha = if let Some(bits) = grinding.alpha_bits() {
         let alpha = ch
             .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-            .ok_or(VerifyError::InvalidGrindingNonce { which: "alpha" })?;
+            .ok_or(ElementLincheckError::InvalidGrindingNonce { which: "alpha" })?;
         nonce_idx += 1;
         alpha
     } else {
@@ -379,7 +381,7 @@ pub fn verify_with_grinding<C: Challenger>(
         .zip(&eq_col)
         .fold(F128::ZERO, |acc, (c, e)| acc + *c * *e);
     if running != base * proof.z_eval {
-        return Err(VerifyError::SumcheckFinalFailed);
+        return Err(ElementLincheckError::SumcheckFinalFailed);
     }
 
     Ok(Claim {
@@ -438,7 +440,7 @@ fn comb_vector(ty: &ElementTableType, alpha: F128, eq_con: &[F128]) -> Vec<F128>
 /// reducing per-column accumulators is the thing to try. Left simple: the
 /// milestone is 3× inside its target.
 fn partial_fold_rows(z: &[F128], r_row: &[F128]) -> Vec<F128> {
-    let eq_row = crate::pcs::ring_switch::build_eq_parallel(r_row);
+    let eq_row = build_eq_parallel(r_row);
     let rows = eq_row.len();
     debug_assert_eq!(z.len() % rows, 0);
     z.par_chunks(rows)
@@ -452,20 +454,25 @@ fn partial_fold_rows(z: &[F128], r_row: &[F128]) -> Vec<F128> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
-    use crate::element_r1cs::broadcast_add;
-    use crate::element_r1cs::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
-    use crate::test_rng::Rng;
-    use crate::zerocheck::multilinear::eq_eval;
+    use flock_multilinear::{IndexOrder, evaluate};
+
+    use crate::{
+        challenger::FsChallenger,
+        element_r1cs::{
+            ElementTableBuilder, broadcast_add,
+            lincheck::{
+                Challenger, ElementTableType, F128, LABEL, Proof, build_eq, comb_vector,
+                partial_fold_rows, prove, verify,
+            },
+            tests::{mixed_gate, mixed_witness, mult_gate, mult_witness},
+        },
+        test_rng::Rng,
+        zerocheck::multilinear::eq_eval,
+    };
 
     /// Direct MLE evaluation at `point`, binding the low variable first.
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
-        let mut t = table.to_vec();
-        for &p in point {
-            crate::zerocheck::multilinear::fold_in_place_single(&mut t, p);
-        }
-        t[0]
+        evaluate(table, point, IndexOrder::LowToHigh)
     }
 
     /// `(Âz(r), B̂z(r))` straight from the matrices — the claims the lincheck is
@@ -694,7 +701,7 @@ mod tests {
     fn kappa_one_roundtrips() {
         let mut rng = Rng::new(31337);
         // kappa = 1: one column, a free wire (tautology row).
-        let mut b = crate::element_r1cs::ElementTableBuilder::new(1);
+        let mut b = ElementTableBuilder::new(1);
         b.free_wire(0);
         let ty = b.build().expect("free wire is valid");
         let n_log = 4usize;

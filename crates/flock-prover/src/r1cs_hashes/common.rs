@@ -2,12 +2,25 @@
 //! modules (`sha2`, `blake3`). The shared `prove_fast`
 //! orchestration lives in [`crate::prover::prove_fast_ligerito_union`].
 
-use std::sync::OnceLock;
+#[cfg(not(target_arch = "aarch64"))]
+use std::ptr::copy_nonoverlapping;
+use std::{
+    array::from_fn,
+    ptr::write_bytes,
+    slice::{from_raw_parts, from_raw_parts_mut},
+    sync::OnceLock,
+};
 
-use flock_core::bits::transpose_8_u64s_to_64_bytes;
-use flock_core::field::F128;
-use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
-use flock_core::union::SlotWitnessDest;
+use flock_core::{
+    bits::transpose_8_u64s_to_64_bytes,
+    r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+    scratch::{take_f128, take_u8},
+    union::SlotWitnessDest,
+};
+use flock_field::F128;
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
 
 /// OR the low 32 bits of `val` into `buf` starting at bit-offset `bit_off`.
 /// Handles u64 straddling when `bit_off % 64 > 32`.
@@ -318,8 +331,6 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    use rayon::prelude::*;
-
     let k = 1usize << k_log;
     let f128_per_block = k / 128;
     let u64_per_block = k / 64;
@@ -341,9 +352,9 @@ where
     // parallel build. The per-block builders OR 1-bits into pre-zeroed words,
     // so each group must be zeroed before its `per_block` calls. `z_lincheck`
     // stays `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
-    let mut z = flock_core::scratch::take_f128(total_f128);
-    let mut a = flock_core::scratch::take_f128(total_f128);
-    let mut b = flock_core::scratch::take_f128(total_f128);
+    let mut z = take_f128(total_f128);
+    let mut a = take_f128(total_f128);
+    let mut b = take_f128(total_f128);
     let mut z_lincheck = vec![0u8; (n_total / 8) * k];
 
     z.par_chunks_mut(8 * f128_per_block)
@@ -359,9 +370,9 @@ where
             // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
             // the valid `F128::ZERO`, so a byte memset is a correct init.
             unsafe {
-                std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+                write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+                write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+                write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
             }
             for k_in in 0..8 {
                 let global_idx = 8 * g + k_in;
@@ -381,30 +392,20 @@ where
                 // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
                 // LE order — same byte layout as a u64 pair.
                 let z_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        z_chunk.as_mut_ptr() as *mut u64,
-                        z_chunk.len() * 2,
-                    )
+                    from_raw_parts_mut(z_chunk.as_mut_ptr() as *mut u64, z_chunk.len() * 2)
                 };
                 let a_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        a_chunk.as_mut_ptr() as *mut u64,
-                        a_chunk.len() * 2,
-                    )
+                    from_raw_parts_mut(a_chunk.as_mut_ptr() as *mut u64, a_chunk.len() * 2)
                 };
                 let b_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        b_chunk.as_mut_ptr() as *mut u64,
-                        b_chunk.len() * 2,
-                    )
+                    from_raw_parts_mut(b_chunk.as_mut_ptr() as *mut u64, b_chunk.len() * 2)
                 };
                 per_block(init, z_u64, a_u64, b_u64);
             }
 
             // Bit-transpose 8 z chunks into the lincheck stripe.
-            let z_u64_all: &[u64] = unsafe {
-                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
-            };
+            let z_u64_all: &[u64] =
+                unsafe { from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2) };
             for i in 0..u64_per_block {
                 let lanes: [u64; 8] = [
                     z_u64_all[0 * u64_per_block + i],
@@ -527,7 +528,7 @@ pub(crate) unsafe fn nt_store_row(src: *const u64, dst: *mut u64) {
     }
     #[cfg(not(target_arch = "aarch64"))]
     unsafe {
-        std::ptr::copy_nonoverlapping(src, dst, 2 * BM_V);
+        copy_nonoverlapping(src, dst, 2 * BM_V);
     }
 }
 
@@ -570,7 +571,7 @@ pub(crate) unsafe fn stripe_from_rows(
 ) {
     let base = (o0 / 8) * u64_per_block * 64;
     for (w, row) in rows.iter().enumerate().take(useful_words) {
-        let out = unsafe { std::slice::from_raw_parts_mut(stripe.add(base + w * 64), 64) };
+        let out = unsafe { from_raw_parts_mut(stripe.add(base + w * 64), 64) };
         transpose_8_u64s_to_64_bytes(row, out);
     }
 }
@@ -646,9 +647,9 @@ where
     F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
 {
     let total_f128 = 1usize << (n_blocks_log + k_log - 7);
-    let mut z = flock_core::scratch::take_f128(total_f128);
-    let mut a = flock_core::scratch::take_f128(total_f128);
-    let mut b = flock_core::scratch::take_f128(total_f128);
+    let mut z = take_f128(total_f128);
+    let mut a = take_f128(total_f128);
+    let mut b = take_f128(total_f128);
     let stripe = drive_witness_batch_major_into(
         inputs,
         padding,
@@ -686,8 +687,6 @@ pub(crate) fn drive_witness_batch_major_into<S: Sync, F>(
 where
     F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
 {
-    use rayon::prelude::*;
-
     let n_total = 1usize << n_blocks_log;
     assert!(inputs.len() <= n_total);
     assert!(n_total >= BM_V);
@@ -709,7 +708,7 @@ where
     // `[0, useful_words)` of every group — including fully-dummy groups, which
     // flush zeros — so only each group's TAIL rows need clearing, a few percent
     // of the buffer instead of faulting in all of it.
-    let mut stripe = flock_core::scratch::take_u8(n_total * u64_per_block * 8);
+    let mut stripe = take_u8(n_total * u64_per_block * 8);
     stripe
         .par_chunks_mut(u64_per_block * 64)
         .for_each(|g| g[useful_words * 64..].fill(0));
@@ -743,8 +742,7 @@ where
             ra[..useful_words].fill([0u64; BM_V]);
             rb[..useful_words].fill([0u64; BM_V]);
             let o0 = g * BM_V;
-            let group: [&S; BM_V] =
-                std::array::from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(padding));
+            let group: [&S; BM_V] = from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(padding));
             per_group(group, rz, ra, rb);
             // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
             unsafe {
@@ -760,12 +758,11 @@ where
 }
 
 /// Partial-count variant of [`drive_witness_batch_major`] for the union's
-/// dynamic invocation counts (M4): the declared rows are `inputs`
+/// dynamic invocation counts: the declared rows are `inputs`
 /// (`inputs.len() = n_t ≤ 2^n_blocks_log`, any value — not necessarily a
 /// power of two), and every row in `[n_t, 2^n_blocks_log)` is left
-/// **identically zero** in `z`, `a`, `b`, and the lincheck stripe — the
-/// design doc's dummy-row semantics, which the union's count-derived
-/// run-lists and the lincheck's count-derived const-pin target require
+/// **identically zero** in `z`, `a`, `b`, and the lincheck stripe. The
+/// union's run lists and lincheck target require these zero rows
 /// (dummy rows carry the pin at 0; a real padding invocation would carry it
 /// at 1 and break the count binding).
 ///
@@ -792,9 +789,9 @@ where
     F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
 {
     let total_f128 = 1usize << (n_blocks_log + k_log - 7);
-    let mut z = flock_core::scratch::take_f128(total_f128);
-    let mut a = flock_core::scratch::take_f128(total_f128);
-    let mut b = flock_core::scratch::take_f128(total_f128);
+    let mut z = take_f128(total_f128);
+    let mut a = take_f128(total_f128);
+    let mut b = take_f128(total_f128);
     let stripe = drive_witness_batch_major_partial_into(
         inputs,
         n_blocks_log,
@@ -825,8 +822,6 @@ pub(crate) fn drive_witness_batch_major_partial_into<S: Sync, F>(
 where
     F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
 {
-    use rayon::prelude::*;
-
     let n_total = 1usize << n_blocks_log;
     let n_declared = inputs.len();
     assert!(n_declared <= n_total);
@@ -853,7 +848,7 @@ where
     // are count-proportional), and the padding suffix of z/a/b is skipped
     // outright (already zero, or dirty-but-unread, per the mode).
     let live_groups = inputs.len().div_ceil(BM_V);
-    let mut stripe = flock_core::scratch::take_u8(n_total * u64_per_block * 8);
+    let mut stripe = take_u8(n_total * u64_per_block * 8);
     let tail_groups = if elide_padding_writes {
         live_groups
     } else {
@@ -910,7 +905,7 @@ where
                 // placeholder — their rows are zeroed below, so the
                 // placeholder's data never reaches the buffers.
                 let group: [&S; BM_V] =
-                    std::array::from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(&inputs_ref[o0]));
+                    from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(&inputs_ref[o0]));
                 per_group(group, rz, ra, rb);
                 if live < BM_V {
                     for rows in [&mut *rz, &mut *ra, &mut *rb] {

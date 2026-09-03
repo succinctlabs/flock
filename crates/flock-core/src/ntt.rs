@@ -8,12 +8,12 @@
 //! that batch a/b/c with shared twiddles can be added later if the round-1 URM
 //! hot path needs them.
 
-use crate::field::F8;
-
-pub mod additive_ntt_f128;
-pub mod inv_table;
 pub use additive_ntt_f128::AdditiveNttF128;
 pub use inv_table::InvNttTableByteSingleGf8;
+
+use crate::field::F8;
+pub mod additive_ntt_f128;
+pub mod inv_table;
 
 /// Twiddle recurrence used to build the next subspace layer's evaluation points:
 /// `next_s(s, root) = s² + root · s = s · (s + root)`.
@@ -166,9 +166,10 @@ impl AdditiveNttGf8 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        ntt::{AdditiveNttGf8, F8},
+        test_rng::Rng,
+    };
 
     fn rand_vec(rng: &mut Rng, n: usize) -> Vec<F8> {
         (0..n).map(|_| F8((rng.next_u64() & 0xff) as u8)).collect()

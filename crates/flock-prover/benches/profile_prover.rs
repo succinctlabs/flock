@@ -9,34 +9,30 @@
 //! `N_RUNS` defaults to 10. At m=29 single-thread each prove_fast is ~440 ms,
 //! so 10 runs = 4.4 sec, dominating the ~0.5 sec setup.
 
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log};
+use std::{array::from_fn, env::args, hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log},
+};
+use rayon::current_num_threads;
 
 fn random_compression(rng: &mut Rng) -> Compression {
-    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+    let m: [u32; 16] = from_fn(|_| rng.next_u32());
     (cv, m, rng.next_u32() as u64, 64u32, 11u32)
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
-    let n_runs: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let n_blocks: usize = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(32768);
+    let _ = init_perf_thread_pool();
+    let n_runs: usize = args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let n_blocks: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(32768);
 
     let n_log = min_n_blocks_log(n_blocks);
     let m = K_LOG + n_log;
-    let threads = rayon::current_num_threads();
+    let threads = current_num_threads();
 
     println!(
         "Profile-prover bench: m={m}, n_blocks={n_blocks}, n_runs={n_runs}, threads={threads}"

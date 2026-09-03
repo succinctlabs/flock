@@ -20,8 +20,16 @@
 //! Scalar/correctness-first implementation; NEON `apply_triple` and the
 //! unrolled `ntt_and_accum` can be added if the URM hot path needs them.
 
-use crate::field::F8;
-use crate::ntt::AdditiveNttGf8;
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::{veorq_u8, vextq_u8, vld1q_u8, vst1q_u8};
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{
+    __m128i, __m512i, _mm_loadu_si128, _mm_shuffle_epi32, _mm_storeu_si128, _mm_xor_si128,
+    _mm512_loadu_si512, _mm512_shuffle_epi32, _mm512_shuffle_i64x2, _mm512_storeu_si512,
+    _mm512_xor_si512,
+};
+
+use crate::{bits::lowest_one, field::F8, ntt::AdditiveNttGf8};
 
 #[derive(Clone, Debug)]
 pub struct InvNttTableByteSingleGf8 {
@@ -84,7 +92,7 @@ impl InvNttTableByteSingleGf8 {
             if (w & (w - 1)) == 0 {
                 continue; // skip powers of 2 (already written)
             }
-            let lo_bit = crate::bits::lowest_one(w);
+            let lo_bit = lowest_one(w);
             let parent = w ^ lo_bit;
             // Borrow-checker friendly: read parent + bit_v slices, then write entry.
             let (parent_off, bit_off, entry_off) = (parent * ell, lo_bit * ell, w * ell);
@@ -181,7 +189,6 @@ impl InvNttTableByteSingleGf8 {
     /// method validates slice lengths.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn apply_neon_unchecked(&self, bytes: &[u8], out: &mut [F8]) {
-        use core::arch::aarch64::*;
         assert_eq!(bytes.len(), self.n_chunks);
         assert_eq!(out.len(), self.ell);
         let n128 = self.ell / 16; // 4 for ell = 64
@@ -234,7 +241,6 @@ impl InvNttTableByteSingleGf8 {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "sse2")]
     pub unsafe fn apply_x86_unchecked(&self, bytes: &[u8], out: &mut [F8]) {
-        use core::arch::x86_64::*;
         assert_eq!(bytes.len(), self.n_chunks);
         assert_eq!(out.len(), self.ell);
         let n128 = self.ell / 16; // 4 for ell = 64
@@ -293,7 +299,6 @@ impl InvNttTableByteSingleGf8 {
         // SAFETY: `bytes` contains `n_chunks == 8` readable bytes and `out`
         // contains `ell == 64` writable bytes.
         unsafe {
-            use core::arch::x86_64::*;
             let acc = self.apply_x86_avx512_register_unchecked(bytes.as_ptr());
             _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
         }
@@ -310,11 +315,7 @@ impl InvNttTableByteSingleGf8 {
     #[cfg(target_arch = "x86_64")]
     #[inline]
     #[target_feature(enable = "avx512f")]
-    pub(crate) unsafe fn apply_x86_avx512_register_unchecked(
-        &self,
-        bytes: *const u8,
-    ) -> core::arch::x86_64::__m512i {
-        use core::arch::x86_64::*;
+    pub(crate) unsafe fn apply_x86_avx512_register_unchecked(&self, bytes: *const u8) -> __m512i {
         debug_assert_eq!(self.ell, 64, "avx512 apply is specialized for ell = 64");
         debug_assert_eq!(self.n_chunks, 8, "avx512 apply expects eight input bytes");
         let base = self.data_ptr();
@@ -365,9 +366,10 @@ impl InvNttTableByteSingleGf8 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        ntt::inv_table::{AdditiveNttGf8, F8, InvNttTableByteSingleGf8},
+        test_rng::Rng,
+    };
 
     /// Naive reference: unpack `bytes` into `ell` GF(2)-valued F8 elements
     /// (one per coefficient bit), apply inv_NTT_S, then fwd_NTT_Λ.

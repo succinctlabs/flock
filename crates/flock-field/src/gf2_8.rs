@@ -13,7 +13,12 @@
 //! Reduction: x^8 ≡ x^4 + x^3 + x + 1, so the upper byte h folds back as
 //!   h ^ (h<<1) ^ (h<<3) ^ (h<<4).
 
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use core::arch::aarch64::{vdup_n_p8, vgetq_lane_u16, vmull_p8, vreinterpretq_u16_p16};
 use core::ops::{Add, AddAssign, Mul, MulAssign};
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+use crate::gf2_8::software::clmul8 as clmul8_software;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -90,36 +95,35 @@ fn clmul8(a: u8, b: u8) -> u16 {
 #[target_feature(enable = "aes")]
 #[inline]
 unsafe fn clmul8_neon(a: u8, b: u8) -> u16 {
-    use core::arch::aarch64::*;
     let va = vdup_n_p8(a);
     let vb = vdup_n_p8(b);
     let prod = vmull_p8(va, vb);
     vgetq_lane_u16::<0>(vreinterpretq_u16_p16(prod))
 }
 
-/// Software fallback / test oracle. Used when `aes` is off, and as the
-/// cross-check oracle inside the `software_matches_neon` unit test.
-#[allow(dead_code)]
-#[inline]
-const fn clmul8_software(a: u8, b: u8) -> u16 {
-    let b16 = b as u16;
-    let mut acc: u16 = 0;
-    let mut i = 0;
-    while i < 8 {
-        if (a >> i) & 1 != 0 {
-            acc ^= b16 << i;
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "aes"))))]
+mod software {
+    #[inline]
+    pub(super) const fn clmul8(a: u8, b: u8) -> u16 {
+        let b16 = b as u16;
+        let mut acc: u16 = 0;
+        let mut i = 0;
+        while i < 8 {
+            if (a >> i) & 1 != 0 {
+                acc ^= b16 << i;
+            }
+            i += 1;
         }
-        i += 1;
+        acc
     }
-    acc
 }
 
 /// Reduce a polynomial of degree ≤ 14 modulo x^8 + x^4 + x^3 + x + 1.
 /// Two-step fold: first turns 15-bit input into ≤12-bit, second into ≤8-bit.
 ///
-/// Exposed `pub(crate)` so the URM shift_reduce inner kernel can reuse it.
+/// Exposed so the URM shift-reduce kernel can reuse it.
 #[inline]
-pub(crate) const fn gf8_reduce(p: u16) -> u8 {
+pub const fn gf8_reduce(p: u16) -> u8 {
     let h: u16 = p >> 8;
     let t: u16 = (p & 0xff) ^ h ^ (h << 1) ^ (h << 3) ^ (h << 4);
     let h2: u16 = t >> 8;
@@ -137,8 +141,13 @@ pub(crate) const fn gf8_reduce(p: u16) -> u8 {
 
 #[cfg(target_arch = "aarch64")]
 pub mod neon {
-    use core::arch::aarch64::*;
-    use core::mem::transmute;
+    use core::{
+        arch::aarch64::{
+            poly8x8_t, uint8x8_t, uint8x16_t, veorq_u8, vget_high_u8, vget_low_u8, vmull_p8,
+            vreinterpretq_u8_u16, vreinterpretq_u16_p16, vshlq_n_u16, vuzp1q_u8, vuzp2q_u8,
+        },
+        mem::transmute,
+    };
 
     /// Reduce 16 polynomial products (in interleaved layout `[lo0,hi0, lo1,hi1, ...]`,
     /// passed as `(c0, c1)`) modulo `x^8 + x^4 + x^3 + x + 1`, returning 16 reduced
@@ -210,9 +219,13 @@ pub mod neon {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(target_arch = "aarch64")]
+    use {crate::gf2_8::neon::gf8_mul_vec16, core::mem::transmute, std::arch::aarch64::vld1q_u8};
 
-    use crate::test_rng::Rng;
+    use crate::{
+        gf2_8::{F8, clmul8, software::clmul8 as clmul8_software},
+        test_rng::Rng,
+    };
 
     #[test]
     fn add_is_xor() {
@@ -308,9 +321,6 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_gf8_mul_vec16_matches_scalar() {
-        use core::arch::aarch64::*;
-        use core::mem::transmute;
-
         let mut rng = Rng::new(0xBADC0FFEE);
         for _ in 0..256 {
             let mut a_arr = [0u8; 16];
@@ -328,7 +338,7 @@ mod tests {
             let result_vec = unsafe {
                 let a_v = vld1q_u8(a_arr.as_ptr());
                 let b_v = vld1q_u8(b_arr.as_ptr());
-                neon::gf8_mul_vec16(a_v, b_v)
+                gf8_mul_vec16(a_v, b_v)
             };
             let result: [u8; 16] = unsafe { transmute(result_vec) };
             assert_eq!(result, expected, "a={:02x?}, b={:02x?}", a_arr, b_arr);

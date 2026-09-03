@@ -1,29 +1,52 @@
-use super::*;
+use std::{array::from_fn, collections::BTreeMap, env::var, iter::repeat_n, sync::OnceLock};
 
-// **THE SWAP, step 1 — mvp9's outer becomes the inner.** The leaf-outer
-// circuit proof (the first real recursion node, BLAKE3/BLAKE3 from the
-// shared builder) is natively verified under a RecordingChallenger and its
-// tape walked by the SAME machinery mvp10's assembly consumes:
-// parse_open_levels, the region label map, level_geometry (native capped
-// paths + enforced-sum replicas per level), and the R=2 + P multipoint
-// schedule replayed to the anchor's claimed v — pinned before any
-// assembly, the step-1 pattern every phase ran. What it establishes about
-// the REAL inner's shape: the element PIOP parses at multi-slot scale, the
-// packed-direct claims are the element (c, lc) pair plus every wiring
-// gather, the R=2 + P>0 schedule holds, and the committed lane count is
-// once more an arbitrary integer.
-// ---------------------------------------------------------------------------
-// The REAL child: the leaf outer's deferred verifier as a reusable region
-// (the swap test's assembly, extracted so the 2→1 merge node can
-// instantiate a real child-tape region per child — the emit_child_region
-// precedent at leaf-outer scale)
-// ---------------------------------------------------------------------------
+use flock_core::{
+    circuit::{SigmaAssertion, builder::SlotId},
+    element_r1cs::union::{ElementAssertion, region_slots},
+    lincheck::{MatrixAssertion, SkipPoint, build_eq_table},
+    matrix_fold::{JaggedAssertion, JaggedRowWeight},
+    pcs::{
+        jagged::{
+            JaggedParams, STATE_INITIAL, STATE_SUCCESS, assist_boundaries,
+            assist_sparse_transitions, frob_inv,
+        },
+        ring_switch::{
+            build_fold_byte_table, inner_product, linearized_coefficients, moore_inverse,
+            tensor_algebra_transpose,
+        },
+    },
+    product_gkr::{LiveMask, s_id_basis},
+    zerocheck::{
+        ag_skip::friendly_challenges,
+        univariate_skip::build_eq,
+        univariate_skip_optimized::{medium_challenges_ghash, small_challenges_ghash},
+    },
+};
+use flock_field::QUADRATIC_NONRESIDUE;
+use flock_transcript::transcript_record::{
+    RecordingChallenger, Stream, StreamWord, TranscriptOp as Op,
+};
+
+use crate::{
+    r1cs_hashes::fs_chain::{FsChainTrace, IV},
+    tower::{
+        ChildSlots, CollapsedSlots, F128, F256, FsChallenger, GkrLayerRec, GkrRec, HashKind,
+        InnerPd, LeafEvalGate, LeafEvalGate256, LeafOuter, Lvl, MergedChain, MixedProof, MpRec,
+        OpenLevel, PdRec, PiopRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire,
+        ZskipTapeRec, ZskipWires, ag_seed_bytes, assert_chain_replays, bytes_payload_mask,
+        cap_payloads, cap_wires, check_residual_publics, circuit_structure_claim_wires, cw,
+        decode_ag_point, duplex_row_count_model, emit_boolean_reported_check,
+        emit_element_reported_check, emit_fs_chain, emit_mac256, emit_pow_checks,
+        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region,
+        emit_spine256, flatten_ops, leaf_boolean_lcs, level_geometry, level_query_phase_b3_rows,
+        level_sources, merge_chain, observed_f256, outer_union, pack8, parse_open_levels,
+        payload_words, pin_recombination, query_phase_b3_rows, replay_ligerito_spine256,
+        squeeze_word_wire, strat_scheds,
+    },
+};
 
 /// One recorded REAL-child verification (the leaf outer as inner), parsed:
-/// the tape pinned op-for-op, every region located, and every native
-/// replica the emitter and checker consume — the swap test's step-1 walk as
-/// a reusable unit. `new` runs the RECORDING verify itself, so every
-/// instantiation re-asserts the whole map on that child's tape.
+/// the tape, each region, and the native values used by the checker.
 pub(super) struct RealTape<'p> {
     pub(super) lo: &'p LeafOuter,
     // the recorded tape
@@ -34,8 +57,8 @@ pub(super) struct RealTape<'p> {
     /// Per level, the absorbed cap's payload index ([`cap_payloads`]).
     pub(super) cap_pays: Vec<usize>,
     // chain materials
-    pub(super) trace: crate::r1cs_hashes::fs_chain::FsChainTrace,
-    pub(super) stream: flock_core::transcript_record::Stream,
+    pub(super) trace: FsChainTrace,
+    pub(super) stream: Stream,
     pub(super) bytes: Vec<u8>,
     /// The fork's four cross-link wires ([`MergedChain::cross`]).
     pub(super) cross: Vec<Option<(usize, usize)>>,
@@ -43,14 +66,14 @@ pub(super) struct RealTape<'p> {
     pub(super) spread_w: usize,
     // located regions
     pub(super) gkr: GkrRec,
-    pub(super) piop_i: PiopRec,
-    pub(super) start_v_i: usize,
-    pub(super) gammas_i: Vec<PdRec>,
+    piop_i: PiopRec,
+    start_v_i: usize,
+    gammas_i: Vec<PdRec>,
     pub(super) w_rounds: Vec<RoundRec>,
     pub(super) w_resid: Vec<RoundRec>,
-    pub(super) mp_i: MpRec,
-    pub(super) inner_pd_i: InnerPd,
-    pub(super) yr_v_i: usize,
+    mp_i: MpRec,
+    inner_pd_i: InnerPd,
+    yr_v_i: usize,
     pub(super) yr_len: usize,
     pub(super) levels: Vec<OpenLevel>,
     pub(super) lvl_src: Vec<(&'p [[u8; 32]], &'p Vec<Vec<F128>>, &'p Vec<[u8; 32]>)>,
@@ -58,14 +81,12 @@ pub(super) struct RealTape<'p> {
     pub(super) native_sums: Vec<F256>,
     /// The grinding ops: (fin ordinal, payload ordinal, bits).
     pub(super) pows: Vec<(usize, usize, u32)>,
-    pub(super) n_gather: usize,
+    n_gather: usize,
     /// The child cell space's public-slot count — the recombination's tail.
     pub(super) n_pub_slots_c: usize,
     // the boolean PIOP's round ordinals ((ch, fin) pairs) + surfaces
     pub(super) zc_rounds_b: Vec<(usize, usize)>,
     pub(super) outer_b: (usize, usize),
-    #[allow(dead_code)] // The r_outer slice length — wall-4 shape data.
-    pub(super) outer_len: usize,
     pub(super) bl_alpha: (usize, usize),
     /// The const-pin beta squeezes: (ch, fin) per pinned boolean type.
     pub(super) betas_b: Vec<(usize, usize)>,
@@ -86,9 +107,9 @@ pub(super) struct RealTape<'p> {
     pub(super) rs_recs: Vec<(usize, usize, usize)>,
     pub(super) rs_gam_fins: Vec<(usize, usize)>,
     // native references + replicas
-    pub(super) mat_assert: flock_core::lincheck::MatrixAssertion,
-    pub(super) el_assert: flock_core::element_r1cs::union::ElementAssertion,
-    pub(super) sigma_native: flock_core::circuit::SigmaAssertion,
+    pub(super) mat_assert: MatrixAssertion,
+    pub(super) el_assert: ElementAssertion,
+    pub(super) sigma_native: SigmaAssertion,
     /// Which pd claim carries z_eval (order varies per tape).
     pub(super) z_ix: usize,
     pub(super) el_g0: Vec<F128>,
@@ -107,9 +128,6 @@ pub(super) struct RealTape<'p> {
     pub(super) k_cols_i: usize,
     pub(super) m_mp2: usize,
     pub(super) bounds_i: Vec<(u64, u64, u32)>,
-    #[allow(dead_code)]
-    // The layout's run→column map — the eqc_w era's consumer; kept as shape data.
-    pub(super) run_of: Vec<usize>,
     pub(super) x_ab_n: Vec<F128>,
     pub(super) x_c_n: Vec<F128>,
     pub(super) groups_ix: Vec<Vec<usize>>,
@@ -119,13 +137,11 @@ pub(super) struct RealTape<'p> {
     /// The deferred verify's jagged-layout export (the count win) — the
     /// independent reference for the W-value publics, tied to the native
     /// expect replica in the constructor.
-    pub(super) jag: flock_core::matrix_fold::JaggedAssertion,
+    pub(super) jag: JaggedAssertion,
 }
 
 impl<'p> RealTape<'p> {
     pub(super) fn new(lo: &'p LeafOuter, domain: &'static [u8]) -> Self {
-        use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-
         let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
         let lcs = leaf_boolean_lcs(lo);
         // ONE recorded DEFERRED verify serves both needs: it is
@@ -320,7 +336,7 @@ impl<'p> RealTape<'p> {
             "T0 folds to the anchor's claimed v"
         );
 
-        // ---- the wiring GKR walk (the mvp10 walker, real-inner layers) ----
+        // ---- the wiring GKR walk ----
         // Records every ordinal the transcription wires against and replays
         // the whole layer recursion natively in lockstep, input checks
         // included — the rhs consuming the DEFERRED s_sigma from the proof.
@@ -418,7 +434,7 @@ impl<'p> RealTape<'p> {
             assert_eq!(r_pt.len(), mu_i, "the GKR point spans the inner cell space");
             let alpha2 = chals[c_alpha];
             let beta2 = chals[c_alpha + 1];
-            let basis = flock_core::product_gkr::s_id_basis(mu_i);
+            let basis = s_id_basis(mu_i);
             // The LIVE-IDENTITY padding: leaves are w + α·(live⊙s_id) +
             // (β+1)·live + 1 (dead cells = 1), so the input checks carry
             // the masked closed forms.
@@ -470,10 +486,10 @@ impl<'p> RealTape<'p> {
         );
         assert_chain_replays(&ops, &trace, &chals);
         let b3_rows = trace.rows.len() + h_rows + query_phase_b3_rows(&geo);
-        if std::env::var("B3_CENSUS").is_ok() {
+        if var("B3_CENSUS").is_ok() {
             let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
             let blocks = trace.rows.len() - parents;
-            let mut pow_by_bits = std::collections::BTreeMap::<u32, usize>::new();
+            let mut pow_by_bits = BTreeMap::<u32, usize>::new();
             for op in &ops {
                 if let Op::Pow { bits } = op {
                     *pow_by_bits.entry(*bits).or_default() += 1;
@@ -571,7 +587,7 @@ impl<'p> RealTape<'p> {
             pub_payloads[p] = false;
         }
 
-        // The PoW grinding ops, located (the mvp7 machinery).
+        // Locate the PoW operations.
         let pows: Vec<(usize, usize, u32)> = {
             let mut out = Vec::new();
             let (mut fin, mut pay) = (0usize, 0usize);
@@ -643,8 +659,6 @@ impl<'p> RealTape<'p> {
         // recursive circuit independently computes the RS, packed-direct,
         // and group parts below; these values no longer discharge soundness.
         let (native_target, native_running) = {
-            use flock_core::pcs::ring_switch as rsw;
-            use flock_core::zerocheck::univariate_skip::build_eq;
             let gs: Vec<F128> = rs_gam_ch2.iter().map(|&ch| chals[ch]).collect();
             let mut rs_half = F128::ZERO;
             let mut coeffs: Vec<Vec<F128>> = Vec::new();
@@ -652,11 +666,9 @@ impl<'p> RealTape<'p> {
                 let shv = &vals_rec[sv..sv + 128];
                 let rdp: Vec<F128> = (0..7).map(|j| chals[rc + j]).collect();
                 let eq = build_eq(&rdp);
-                rs_half += gs[k] * rsw::inner_product(&rsw::tensor_algebra_transpose(shv), &eq);
+                rs_half += gs[k] * inner_product(&tensor_algebra_transpose(shv), &eq);
                 let scaled: Vec<F128> = eq.iter().map(|x| gs[k] * *x).collect();
-                coeffs.push(rsw::linearized_coefficients(&rsw::build_fold_byte_table(
-                    &scaled,
-                )));
+                coeffs.push(linearized_coefficients(&build_fold_byte_table(&scaled)));
             }
             let mut target = rs_half;
             for pd in &gammas_i {
@@ -732,14 +744,13 @@ impl<'p> RealTape<'p> {
             "the located alpha is the assertion's"
         );
         let (a_sum_n, b_sum_n) = {
-            let slots_el = flock_core::element_r1cs::union::region_slots(&union_i);
+            let slots_el = region_slots(&union_i);
             let nu_i = union_i.n_log();
             let mut a_sum = F128::ZERO;
             let mut b_sum = F128::ZERO;
             for s in &slots_el {
                 let kappa = s.ty.kappa();
-                let eq_con =
-                    flock_core::zerocheck::univariate_skip::build_eq(&el_assert.r_con[..kappa]);
+                let eq_con = build_eq(&el_assert.r_con[..kappa]);
                 let prefix = s.layout.region_prefix(nu_i);
                 let mut w = F128::ONE;
                 for (j, &x) in el_assert.r_con[kappa..].iter().enumerate() {
@@ -795,7 +806,7 @@ impl<'p> RealTape<'p> {
         // ---- the GKR input-check advice (masked M̂ and livê) ----
         let mu_i = lo.shape.circuit.cells().mu();
         let (mid_n, live_n) = {
-            let basis_i = flock_core::product_gkr::s_id_basis(mu_i);
+            let basis_i = s_id_basis(mu_i);
             let mask_i = lo.shape.circuit.live_mask();
             (
                 mask_i.masked_id_eval(&basis_i, &gkr_rec.r_pt),
@@ -812,15 +823,9 @@ impl<'p> RealTape<'p> {
         );
         assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
         let n_log_i = union_i.n_log();
-        let params_i = flock_core::pcs::jagged::JaggedParams::from_heights(
-            &union_i.jagged_heights(),
-            n_log_i,
-            m_mp2,
-        );
+        let params_i = JaggedParams::from_heights(&union_i.jagged_heights(), n_log_i, m_mp2);
         let k_cols_i = params_i.k;
-        // ROUND 4: the recombination + f == g, replayed from located words
-        // (the emitter binds these; until it landed they rode only this
-        // constructor's scaffolding verify).
+        // Recompute the recombination and f == g from located words.
         let n_pub_slots_c = pin_recombination(
             lo.shape.circuit.cells(),
             n_log_i,
@@ -832,7 +837,7 @@ impl<'p> RealTape<'p> {
             &gkr_rec.r_pt,
             gkr_rec.fgs_v,
         );
-        let bounds_i = flock_core::pcs::jagged::assist_boundaries(&params_i);
+        let bounds_i = assist_boundaries(&params_i);
         let n_runs = bounds_i.len();
         let run_y0: Vec<usize> = bounds_i
             .iter()
@@ -845,14 +850,6 @@ impl<'p> RealTape<'p> {
         let comp_ix = (0..n_runs)
             .max_by_key(|&r3| bounds_i[r3].2)
             .expect("at least one run");
-        let run_of: Vec<usize> = {
-            let mut v = Vec::with_capacity(1usize << k_cols_i);
-            for (r3, &(_, _, len)) in bounds_i.iter().enumerate() {
-                v.extend(std::iter::repeat_n(r3, len as usize));
-            }
-            assert_eq!(v.len(), 1usize << k_cols_i, "runs partition the columns");
-            v
-        };
         // The boolean PIOP's round ordinals, located with fins — plus the
         // MatrixAssertion surfaces the 2→1 merge connects to (z_skip's
         // squeeze, z_partial's slice).
@@ -863,7 +860,7 @@ impl<'p> RealTape<'p> {
         let (
             zc_rounds_b,
             zskip,
-            (outer_ch_b, outer_fin_b, outer_len),
+            (outer_ch_b, outer_fin_b, _outer_len),
             bl_alpha,
             betas_b,
             zc_finals_v,
@@ -1050,7 +1047,7 @@ impl<'p> RealTape<'p> {
                     );
                     assert_eq!(
                         mat_assert.z_skip,
-                        flock_core::lincheck::SkipPoint::Ag(pt),
+                        SkipPoint::Ag(pt),
                         "z_skip is the r1 point decoded from the located seed + nonce"
                     );
                 }
@@ -1119,10 +1116,7 @@ impl<'p> RealTape<'p> {
                     mat_assert.betas[t].expect("pinned"),
                     "beta {k} is the located squeeze"
                 );
-                let e = flock_core::product_gkr::LiveMask::eq_prefix_sum(
-                    &x_outer_n,
-                    union_i.counts()[t],
-                );
+                let e = LiveMask::eq_prefix_sum(&x_outer_n, union_i.counts()[t]);
                 entry += chals[betas_b[k].0] * e;
                 eps.push(e);
             }
@@ -1227,7 +1221,7 @@ impl<'p> RealTape<'p> {
                 for (j, &gp) in gpow_n.iter().enumerate().take(128) {
                     if j > 0 {
                         for x in rinv.iter_mut() {
-                            *x = flock_core::pcs::jagged::frob_inv(*x);
+                            *x = frob_inv(*x);
                         }
                     }
                     let mut prod = gp;
@@ -1253,10 +1247,10 @@ impl<'p> RealTape<'p> {
                     p
                 })
                 .collect();
-            let sparse_t = flock_core::pcs::jagged::assist_sparse_transitions();
+            let sparse_t = assist_sparse_transitions();
             let dp_native = |z_row: &[F128]| -> F128 {
                 let mut gdp = [F128::ZERO; 4];
-                gdp[flock_core::pcs::jagged::STATE_SUCCESS] = F128::ONE;
+                gdp[STATE_SUCCESS] = F128::ONE;
                 for layer in (0..=m_mp2).rev() {
                     let za = if layer < n_log_i {
                         z_row[layer]
@@ -1268,7 +1262,7 @@ impl<'p> RealTape<'p> {
                     } else {
                         F128::ZERO
                     };
-                    let eq4 = flock_core::lincheck::build_eq_table(&[za, rb]);
+                    let eq4 = build_eq_table(&[za, rb]);
                     let (rc, rd) = (sig_n[2 * layer], sig_n[2 * layer + 1]);
                     let e = [
                         (F128::ONE + rc) * (F128::ONE + rd),
@@ -1286,7 +1280,7 @@ impl<'p> RealTape<'p> {
                     }
                     gdp = prev;
                 }
-                gdp[flock_core::pcs::jagged::STATE_INITIAL]
+                gdp[STATE_INITIAL]
             };
             let run_weights_n = |z_col: &[F128]| -> Vec<F128> {
                 let mut w_at = vec![F128::ZERO; n_runs];
@@ -1409,7 +1403,6 @@ impl<'p> RealTape<'p> {
             n_pub_slots_c,
             zc_rounds_b,
             outer_b: (outer_ch_b, outer_fin_b),
-            outer_len,
             bl_alpha,
             betas_b,
             zc_finals_v,
@@ -1438,7 +1431,6 @@ impl<'p> RealTape<'p> {
             k_cols_i,
             m_mp2,
             bounds_i,
-            run_of,
             x_ab_n,
             x_c_n,
             groups_ix,
@@ -1455,8 +1447,8 @@ pub(super) struct RealRegion {
     pub(super) pub_base: usize,
     pub(super) n_query_pub: usize,
     pub(super) n_tail: usize,
-    pub(super) n_mat_pub: usize,
-    pub(super) n_ela_pub: usize,
+    n_mat_pub: usize,
+    n_ela_pub: usize,
     /// Labeled `public_len` checkpoints through the emission — the publics
     /// census (`PUB_CENSUS=1` on the node test prints the block sizes).
     pub(super) census: Vec<(&'static str, usize, usize)>,
@@ -1476,29 +1468,19 @@ pub(super) struct RealRegion {
     /// Every fresh claim in `sigma_native.claims()` as `(row, col, value)`
     /// wires, in accumulator order.
     pub(super) structure_claim_w: Vec<(Vec<Wire>, Vec<Wire>, Wire)>,
-    #[allow(dead_code)]
-    pub(super) pt_w: Vec<Wire>,
     /// element: every zc/lc round rho (round order) and the per-slot eval
     /// advice pairs (bound publics — connectable, unlike the minimal child).
-    #[allow(dead_code)]
     pub(super) el_zc_rho_w: Vec<Wire>,
-    #[allow(dead_code)]
     pub(super) el_lc_rho_w: Vec<Wire>,
-    #[allow(dead_code)]
     pub(super) el_eval_w: Vec<(Wire, Wire)>,
     /// boolean: the zc mlv / lc round rhos (round order), the absorbed
     /// z_partial words, and the per-type matrix_evals advice pairs.
-    #[allow(dead_code)]
     pub(super) b_mlv_w: Vec<Wire>,
-    #[allow(dead_code)]
     pub(super) b_lc_w: Vec<Wire>,
-    #[allow(dead_code)]
     pub(super) b_zpartial_w: Vec<Wire>,
-    #[allow(dead_code)]
     pub(super) mat_eval_w: Vec<(Wire, Wire)>,
     /// The residual close-out's prefix slot (and width).
-    #[allow(dead_code)]
-    pub(super) pf: (flock_core::circuit::builder::SlotId, usize),
+    pub(super) pf: (SlotId, usize),
     /// The child's PUBLIC SEGMENT as witness wires — the app-statement
     /// plumbing (hash-chain adjacency) reads through these.
     pub(super) child_pub_w: Vec<Wire>,
@@ -1506,7 +1488,6 @@ pub(super) struct RealRegion {
     /// (payload 3) — two public words. This is the KEY its sigma and
     /// jagged claims fold under, and the spine's match-gate compares it
     /// against the key an inherited entry was published with.
-    #[allow(dead_code)]
     pub(super) cd_w: [Wire; 2],
 }
 
@@ -1518,10 +1499,9 @@ pub(super) struct RealRegion {
 /// Moore row with one prefix product and seven MACs instead of wiring a
 /// 128-word constant row.
 pub(super) fn family_h_dual_decomposition() -> (F128, F128, [F128; 7]) {
-    use std::sync::OnceLock;
     static DECOMP: OnceLock<(F128, F128, [F128; 7])> = OnceLock::new();
     *DECOMP.get_or_init(|| {
-        let minv = flock_core::pcs::ring_switch::moore_inverse();
+        let minv = moore_inverse();
         let d = &minv[..128];
         let ratio = d[8] * d[7].inv();
         let ratio_inv = ratio.inv();
@@ -1546,18 +1526,18 @@ pub(super) fn family_h_dual_decomposition() -> (F128, F128, [F128; 7]) {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_family_h(
     sb: &mut ShapeBuilder,
-    tile: flock_core::circuit::builder::SlotId,
-    macs: flock_core::circuit::builder::SlotId,
-    fold_macs: flock_core::circuit::builder::SlotId,
-    spine: flock_core::circuit::builder::SlotId,
-    spine256: flock_core::circuit::builder::SlotId,
-    mac256: flock_core::circuit::builder::SlotId,
+    tile: SlotId,
+    macs: SlotId,
+    fold_macs: SlotId,
+    spine: SlotId,
+    spine256: SlotId,
+    mac256: SlotId,
     row_capacity: usize,
     shv: &[Vec<Wire>; 2],
     values: &[Vec<Wire>; 2],
     r_dprime: &[Vec<Wire>; 2],
     gamma: [Wire; 2],
-    pfslot: flock_core::circuit::builder::SlotId,
+    pfslot: SlotId,
     pf_w: usize,
     zw: Wire,
     ow: Wire,
@@ -1579,9 +1559,9 @@ pub(super) fn emit_family_h(
         let mut input = Vec::with_capacity(2 + 2 * pf_w);
         input.push(seed);
         input.extend_from_slice(a);
-        input.extend(std::iter::repeat_n(zw, pf_w - a.len()));
+        input.extend(repeat_n(zw, pf_w - a.len()));
         input.extend_from_slice(b);
-        input.extend(std::iter::repeat_n(zw, pf_w - b.len()));
+        input.extend(repeat_n(zw, pf_w - b.len()));
         input.push(ow);
         sb.gate(pfslot, &input)[0]
     };
@@ -1593,7 +1573,7 @@ pub(super) fn emit_family_h(
 
     // Equality weights are shared by the transpose dot and the seven sparse
     // corrections in every inverse-Moore coefficient.
-    let mut eq_w: [Vec<Wire>; 2] = std::array::from_fn(|_| Vec::with_capacity(128));
+    let mut eq_w: [Vec<Wire>; 2] = from_fn(|_| Vec::with_capacity(128));
     for k in 0..2 {
         for t in 0..128 {
             let bits: Vec<Wire> = (0..7)
@@ -1637,14 +1617,13 @@ pub(super) fn emit_family_h(
     // plus seven correction MACs computes it.  Constants are fixed publics:
     // changing any of them changes the circuit digest.
     let (mut g0_j, mut ratio_j, mut corrections_j) = family_h_dual_decomposition();
-    let minv = flock_core::pcs::ring_switch::moore_inverse();
+    let minv = moore_inverse();
     // Only the eight orbit seeds are fixed publics.  Successive Frobenius
     // powers are derived by the existing spine's squaring cell, saving more
     // than one thousand public constants at a two-child node.
     let mut g0_j_w = cw(sb, vals, consts, g0_j);
-    let mut corrections_j_w: [Wire; 7] =
-        std::array::from_fn(|t| cw(sb, vals, consts, corrections_j[t]));
-    let mut coeff_w: [Vec<Wire>; 2] = std::array::from_fn(|_| Vec::with_capacity(128));
+    let mut corrections_j_w: [Wire; 7] = from_fn(|t| cw(sb, vals, consts, corrections_j[t]));
+    let mut coeff_w: [Vec<Wire>; 2] = from_fn(|_| Vec::with_capacity(128));
     for j in 0..128 {
         let mut ratio_pows = [F128::ZERO; 7];
         ratio_pows[0] = ratio_j;
@@ -1721,7 +1700,7 @@ pub(super) fn emit_family_h(
         let p0 = sb.gate(macs, &[pair[0], kw, pair[1]])[0];
         vrs = sb.gate(macs, &[vrs, coeff_w[0][j], p0])[0];
         vrs = sb.gate(macs, &[vrs, coeff_w[1][j], pair[1]])[0];
-        k_j = k_j * k_j + flock_core::field::QUADRATIC_NONRESIDUE;
+        k_j = k_j * k_j + QUADRATIC_NONRESIDUE;
     }
     (rs_half, vrs)
 }
@@ -1736,7 +1715,7 @@ pub(super) fn emit_family_h(
 pub(super) fn emit_real_child_region(
     sb: &mut ShapeBuilder,
     cs: &mut ChildSlots,
-    b3_slot: flock_core::circuit::builder::SlotId,
+    b3_slot: SlotId,
     rt: &RealTape<'_>,
     vals: &mut Vec<F128>,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
@@ -1777,7 +1756,7 @@ pub(super) fn emit_real_child_region(
         .collect();
     let mut cen: Vec<(&'static str, usize, usize)> =
         vec![("start", sb.public_len(), sb.rows_in_slot(cs.macs))];
-    let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&IV);
     vals.extend_from_slice(&iv_w);
     let iv2 = [
         sb.fixed_public_input(iv_w[0]),
@@ -1801,13 +1780,13 @@ pub(super) fn emit_real_child_region(
         sb.public_len(),
         sb.rows_in_slot(cs.macs),
     ));
-    if std::env::var("PUB_CENSUS").is_ok() {
+    if var("PUB_CENSUS").is_ok() {
         let pay_pub: usize = stream
             .words
             .iter()
             .enumerate()
             .filter(|(wi, w)| {
-                matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. }
+                matches!(w, StreamWord::Bytes { payload, .. }
                     if rt.pub_payloads[*payload])
                     && ww[*wi].is_some()
             })
@@ -1827,7 +1806,7 @@ pub(super) fn emit_real_child_region(
             let wi = stream
                 .words
                 .iter()
-                .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pay))
+                .position(|w| matches!(w, StreamWord::Bytes { payload, .. } if *payload == pay))
                 .expect("pow nonce stream word");
             let nw = ww[wi].expect("pow nonce wired");
             [outs[sq[0]][1], nw]
@@ -1893,7 +1872,7 @@ pub(super) fn emit_real_child_region(
     // ---- intake W-rounds, spine, residual ----
     let mut vmap: Vec<Option<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
-        if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+        if let StreamWord::Value(vi) = *w {
             if vmap.len() <= vi {
                 vmap.resize(vi + 1, None);
             }
@@ -2070,23 +2049,23 @@ pub(super) fn emit_real_child_region(
     // The complete family-H relation.  All inputs below are already bound
     // transcript or proof wires; no target/V advice and no native checker are
     // part of the recursive statement anymore.
-    let shv_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+    let shv_w: [Vec<Wire>; 2] = from_fn(|k| {
         let sv = rt.rs_recs[k].0;
         (0..128).map(|i| wv(sv + i)).collect()
     });
-    let value_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+    let value_w: [Vec<Wire>; 2] = from_fn(|k| {
         mp_i.val_vs[128 * k..128 * (k + 1)]
             .iter()
             .map(|&vi| wv(vi))
             .collect()
     });
-    let rdp_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+    let rdp_w: [Vec<Wire>; 2] = from_fn(|k| {
         let fin = rt.rs_recs[k].1;
         (0..7)
             .map(|j| squeeze_word_wire(&outs, trace, fin, j))
             .collect()
     });
-    let gamma_w: [Wire; 2] = std::array::from_fn(|k| {
+    let gamma_w: [Wire; 2] = from_fn(|k| {
         let (fin, offset) = rt.rs_gam_fins[k];
         squeeze_word_wire(&outs, trace, fin, offset)
     });
@@ -2321,15 +2300,12 @@ pub(super) fn emit_real_child_region(
     // challenges — the RS ghash set or the AG set, by the tape's flavor.
     let t_vals_b: Vec<F128> = match &rt.zskip {
         ZskipTapeRec::Rs { .. } => {
-            use flock_core::zerocheck::univariate_skip_optimized::{
-                medium_challenges_ghash, small_challenges_ghash,
-            };
             let mut v: Vec<F128> = Vec::new();
             v.extend_from_slice(&small_challenges_ghash());
             v.extend_from_slice(&medium_challenges_ghash());
             v
         }
-        ZskipTapeRec::Ag { .. } => flock_core::zerocheck::ag_skip::friendly_challenges().to_vec(),
+        ZskipTapeRec::Ag { .. } => friendly_challenges().to_vec(),
     };
     assert_eq!(t_vals_b.len(), 7, "the seven baked inner constants");
     let mlv_pw: Vec<(F128, Wire)> = rt
@@ -2379,11 +2355,11 @@ pub(super) fn emit_real_child_region(
             for (a, _) in chunk {
                 g_in.push(*a);
             }
-            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
             for (_, b) in chunk {
                 g_in.push(*b);
             }
-            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
             g_in.push(ow);
             seed = sb.gate(pfslot, &g_in)[0];
         }
@@ -2401,7 +2377,7 @@ pub(super) fn emit_real_child_region(
         if j > 0 {
             let mut lvl_w = Vec::with_capacity(m_mp2);
             for t3 in 0..m_mp2 {
-                let y = flock_core::pcs::jagged::frob_inv(rinv_n2[t3]);
+                let y = frob_inv(rinv_n2[t3]);
                 rinv_n2[t3] = y;
                 vals.push(y);
                 let yw = sb.input();
@@ -2499,7 +2475,7 @@ pub(super) fn emit_real_child_region(
                         squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset)
                     })
                     .collect();
-                if let flock_core::matrix_fold::JaggedRowWeight::Combo(t) = &c.row {
+                if let JaggedRowWeight::Combo(t) = &c.row {
                     assert_eq!(t.len(), gws.len(), "combo terms == hot members");
                 }
                 jag_row_w.push(gws);
@@ -2564,7 +2540,7 @@ pub(super) fn emit_real_child_region(
         expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
     }
     sb.connect(anc_w, expect_w);
-    if std::env::var("ASSIST_CENSUS").is_ok() {
+    if var("ASSIST_CENSUS").is_ok() {
         eprintln!(
             "ASSIST CENSUS  runs {} of {} cols (k {}), m+1 {} — W side is {} PUBLISHED \
              claim values (the count win); the eqc_w/eq_dot machinery is gone",
@@ -2841,7 +2817,7 @@ pub(super) fn emit_real_child_region(
                     .position(|w| {
                         matches!(
                             w,
-                            flock_core::transcript_record::StreamWord::Bytes { payload, word: 0 }
+                            StreamWord::Bytes { payload, word: 0 }
                                 if *payload == *nonce_payload
                         )
                     })
@@ -2857,7 +2833,6 @@ pub(super) fn emit_real_child_region(
         },
         n_ela_pub: ela_pub.len(),
         structure_claim_w,
-        pt_w,
         el_zc_rho_w,
         el_lc_rho_w: piop_i
             .lc_rounds
@@ -2938,7 +2913,7 @@ pub(super) fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &Re
         rt.lo.proof.wiring().gkr.s_sigma_eval,
         "the emitted sigma value is the proof's deferred evaluation"
     );
-    let sa = flock_core::circuit::SigmaAssertion {
+    let sa = SigmaAssertion {
         rho: public[sig_base + 1..sig_base + 1 + rt.mu_i].to_vec(),
         nu: rt.lo.shape.circuit.cells().nu(),
         base_bits: rt.sigma_native.base_bits,

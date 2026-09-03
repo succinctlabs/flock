@@ -8,9 +8,8 @@
 //! scales with the NUMBER of boolean table types — not with rows, and not
 //! with trace size. Each [`MerkleTreeLayout`](super::merkle_r1cs::MerkleTreeLayout)
 //! shape is its own type and each one's walker stores its own copy of
-//! BLAKE3's base (21.03M nonzeros), so the four levels of the m=26 Fast
-//! ladder cost 4 × 21M on top of the FS chain's own 21M — 105.1M swept, ~91 ms
-//! of a 174 ms prove (`circuit_merkle::mvp5_all_levels_query_phase`).
+//! BLAKE3's base (21.03M nonzeros). Four levels therefore sweep about 105M
+//! nonzeros with the FS chain.
 //!
 //! Expressed as wiring, every compression is a row of ONE BLAKE3 table and the
 //! sweep is ~21M regardless of how many tree shapes there are.
@@ -42,12 +41,21 @@
 //! swap, whose output feeds the compression, whose output chains to the root.
 //! Same treatment the composite gives it, same reason.
 
-use flock_core::field::F128;
-use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
-use flock_core::schedule::IoWord;
+use std::sync::OnceLock;
 
-use super::common::identity;
-use super::merkle_r1cs::SLOT_WORDS;
+use flock_core::{
+    r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+    schedule::IoWord,
+    scratch::take_u8,
+    union::SlotWitnessDest,
+    zerocheck::K_SKIP,
+};
+use flock_field::F128;
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
+};
+
+use crate::r1cs_hashes::{common::identity, merkle_r1cs::SLOT_WORDS};
 
 /// Bits in a digest.
 const SLOT_BITS: usize = 32 * SLOT_WORDS;
@@ -104,7 +112,6 @@ fn scatter_zab(
         }
     }
 
-    use rayon::prelude::*;
     let mut stripe = vec![0u8; (n_total / 8) * k];
     stripe.par_chunks_mut(k).enumerate().for_each(|(g, chunk)| {
         for r in 0..8 {
@@ -134,11 +141,10 @@ pub(crate) fn scatter_zab_into(
     per_row: &[[Vec<bool>; 3]],
     k: usize,
     useful_bits: usize,
-    dst: flock_core::union::SlotWitnessDest<'_>,
+    dst: SlotWitnessDest<'_>,
 ) -> Vec<u8> {
-    use rayon::prelude::*;
     let words_per_block = k / 128;
-    let flock_core::union::SlotWitnessDest {
+    let SlotWitnessDest {
         z,
         a,
         b,
@@ -165,7 +171,7 @@ pub(crate) fn scatter_zab_into(
             b[addr] = pack_word(pb, w * 128);
         }
     }
-    let mut stripe = flock_core::scratch::take_u8((n_total / 8) * k);
+    let mut stripe = take_u8((n_total / 8) * k);
     let live_groups = per_row.len().div_ceil(8);
     let zero_groups = if elide_padding_writes {
         live_groups
@@ -208,7 +214,7 @@ pub(crate) fn scatter_zab_into(
 /// ```
 ///
 /// `b = 0` puts the running digest LEFT (`left = prev`, `right = sib`), which
-/// is what `flock_core::merkle` means by an even node index — the same
+/// is what `flock_merkle` means by an even node index — the same
 /// polarity `57aeb48` gave the composite, so the table's bit and the tree's
 /// position are the same number and a Fiat–Shamir challenge wires straight in.
 ///
@@ -304,15 +310,15 @@ impl SwapTable {
         BlockR1cs {
             m: n_log + Self::K_LOG,
             k_log: Self::K_LOG,
-            k_skip: flock_core::zerocheck::K_SKIP,
+            k_skip: K_SKIP,
             useful_bits: Self::USEFUL_BITS,
             a_0,
             b_0,
             c_0: identity(Self::k()),
             layout: WitnessLayout::BatchMajor,
             const_pin: Some(Self::CONST),
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
 
@@ -388,7 +394,6 @@ impl SwapTable {
         rows: &[SwapInput],
         nu: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        use rayon::prelude::*;
         let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
         scatter_zab(&per, Self::k(), Self::USEFUL_BITS, nu)
     }
@@ -397,9 +402,8 @@ impl SwapTable {
     /// destination block — the copy-free union assembly path.
     pub fn generate_witness_batch_major_into(
         rows: &[SwapInput],
-        dst: flock_core::union::SlotWitnessDest<'_>,
+        dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
-        use rayon::prelude::*;
         let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
         scatter_zab_into(&per, Self::k(), Self::USEFUL_BITS, dst)
     }
@@ -593,15 +597,15 @@ impl BitSpreadTable {
         BlockR1cs {
             m: n_log + self.k_log(),
             k_log: self.k_log(),
-            k_skip: flock_core::zerocheck::K_SKIP,
+            k_skip: K_SKIP,
             useful_bits: self.useful_bits(),
             a_0,
             b_0,
             c_0: identity(self.k()),
             layout: WitnessLayout::BatchMajor,
             const_pin: Some(self.const_pos()),
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
 
@@ -675,7 +679,6 @@ impl BitSpreadTable {
         rows: &[BitSpreadInput],
         nu: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        use rayon::prelude::*;
         let per: Vec<[Vec<bool>; 3]> = rows
             .par_iter()
             .map(|&i| self.build_masked_witness(i))
@@ -688,9 +691,8 @@ impl BitSpreadTable {
     pub fn generate_witness_batch_major_into(
         &self,
         rows: &[BitSpreadInput],
-        dst: flock_core::union::SlotWitnessDest<'_>,
+        dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
-        use rayon::prelude::*;
         let per: Vec<[Vec<bool>; 3]> = rows
             .par_iter()
             .map(|&i| self.build_masked_witness(i))
@@ -916,15 +918,15 @@ impl FamilyTransposeTileTable {
         BlockR1cs {
             m: n_log + Self::K_LOG,
             k_log: Self::K_LOG,
-            k_skip: flock_core::zerocheck::K_SKIP,
+            k_skip: K_SKIP,
             useful_bits: Self::USEFUL_BITS,
             a_0,
             b_0,
             c_0: identity(Self::k()),
             layout: WitnessLayout::BatchMajor,
             const_pin: Some(Self::CONST),
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
 
@@ -1016,16 +1018,14 @@ impl FamilyTransposeTileTable {
         rows: &[FamilyTransposeTileInput],
         nu: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        use rayon::prelude::*;
         let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
         scatter_zab(&per, Self::k(), Self::USEFUL_BITS, nu)
     }
 
     pub fn generate_witness_batch_major_into(
         rows: &[FamilyTransposeTileInput],
-        dst: flock_core::union::SlotWitnessDest<'_>,
+        dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
-        use rayon::prelude::*;
         let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
         scatter_zab_into(&per, Self::k(), Self::USEFUL_BITS, dst)
     }
@@ -1109,15 +1109,15 @@ impl PowMaskTable {
         BlockR1cs {
             m: n_log + self.k_log(),
             k_log: self.k_log(),
-            k_skip: flock_core::zerocheck::K_SKIP,
+            k_skip: K_SKIP,
             useful_bits: self.useful_bits(),
             a_0,
             b_0,
             c_0: identity(self.k()),
             layout: WitnessLayout::BatchMajor,
             const_pin: Some(self.const_pos()),
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
 
@@ -1162,7 +1162,6 @@ impl PowMaskTable {
         rows: &[PowMaskInput],
         nu: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        use rayon::prelude::*;
         let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
         scatter_zab(&per, self.k(), self.useful_bits(), nu)
     }
@@ -1172,9 +1171,8 @@ impl PowMaskTable {
     pub fn generate_witness_batch_major_into(
         &self,
         rows: &[PowMaskInput],
-        dst: flock_core::union::SlotWitnessDest<'_>,
+        dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
-        use rayon::prelude::*;
         let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
         scatter_zab_into(&per, self.k(), self.useful_bits(), dst)
     }
@@ -1182,11 +1180,17 @@ impl PowMaskTable {
 
 #[cfg(test)]
 mod family_h_tests {
-    use super::*;
+    use std::array::from_fn;
+
+    use flock_core::pcs::ring_switch::tensor_algebra_transpose;
+
+    use crate::r1cs_hashes::merkle_glue::{
+        F128, FamilyTransposeTileInput, FamilyTransposeTileTable,
+    };
 
     #[test]
     fn transpose_tiles_assemble_exactly_and_are_constrained() {
-        let rows: [F128; 128] = std::array::from_fn(|i| {
+        let rows: [F128; 128] = from_fn(|i| {
             F128::new(
                 (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
                 (!(i as u64)).rotate_left((i % 64) as u32),
@@ -1220,9 +1224,6 @@ mod family_h_tests {
                 );
             }
         }
-        assert_eq!(
-            assembled.to_vec(),
-            flock_core::pcs::ring_switch::tensor_algebra_transpose(&rows),
-        );
+        assert_eq!(assembled.to_vec(), tensor_algebra_transpose(&rows),);
     }
 }

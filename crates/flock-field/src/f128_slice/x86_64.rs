@@ -1,4 +1,9 @@
-use crate::field::F128;
+use core::arch::x86_64::{
+    __m512i, _mm_set_epi64x, _mm512_broadcast_i32x4, _mm512_loadu_si512, _mm512_permutex2var_epi64,
+    _mm512_set_epi64, _mm512_storeu_si512, _mm512_xor_si512,
+};
+
+use crate::{F128, gf2_128::x86_64::ghash_mul_x4};
 
 /// Four-lane pair fold using AVX-512 lane deinterleaving and VPCLMULQDQ.
 ///
@@ -6,9 +11,6 @@ use crate::field::F128;
 /// Requires `avx512f` and `vpclmulqdq`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
-    use core::arch::x86_64::*;
-
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
         let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));

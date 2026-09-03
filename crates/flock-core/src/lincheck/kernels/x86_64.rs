@@ -1,4 +1,8 @@
-use super::super::{F128, build_sum_table};
+use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128};
+
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice};
+
+use crate::lincheck::{F128, build_sum_table};
 
 /// x86 single-matrix inner kernel — SSE2 mirror of
 /// [`process_block_neon_single`]. Sweeps `TILE_T = 8` stripes for one
@@ -19,7 +23,6 @@ unsafe fn process_block_x86(
     tables_ptr: *const u8,
     out_ptr: *mut F128,
 ) {
-    use core::arch::x86_64::*;
     const TILE_T: usize = 8;
     // SAFETY: caller upholds the pointer/length contract documented above; SSE2
     // is baseline on x86_64.
@@ -77,8 +80,6 @@ pub fn partial_fold_packed_z_x86_tiled_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
-
     const TILE_T: usize = 8;
     const BLOCK_K: usize = 8;
 

@@ -6,24 +6,30 @@
 //! would compute a different root and every downstream test would be
 //! measuring the wrong thing.
 
-use flock_core::r1cs::BlockR1cs;
-use flock_core::schedule::{IoDirection, IoWord};
-use flock_prover::r1cs_hashes::blake3;
-use flock_prover::r1cs_hashes::merkle_glue::{
-    BitSpreadInput, BitSpreadTable, PowMaskInput, PowMaskTable, SwapInput, SwapTable,
-};
-use flock_prover::r1cs_hashes::merkle_r1cs::{
-    BLAKE3_FLAG_CHUNK_END, BLAKE3_FLAG_CHUNK_START, BLAKE3_FLAG_PARENT, ChunkPathInput,
-    MerkleTreeLayout, NODE_BLOCK_LEN, NODE_COUNTER, SLOT_WORDS, blake3_spec,
-};
+use std::array::from_fn;
 
+use flock_core::{
+    r1cs::BlockR1cs,
+    schedule::{IoDirection, IoWord},
+    test_rng::Rng,
+};
+use flock_hash::BLAKE3_IV;
+use flock_hash::blake3_compress;
+use flock_prover::r1cs_hashes::{
+    blake3::build_matrices,
+    merkle_glue::{
+        BitSpreadInput, BitSpreadTable, PowMaskInput, PowMaskTable, SwapInput, SwapTable,
+    },
+    merkle_r1cs::{
+        BLAKE3_FLAG_CHUNK_END, BLAKE3_FLAG_CHUNK_START, BLAKE3_FLAG_PARENT, ChunkPathInput,
+        MerkleTreeLayout, NODE_BLOCK_LEN, NODE_COUNTER, SLOT_WORDS, blake3_spec,
+    },
+};
 /// One compression's output chaining value.
 fn cv(h: &[u32; 8], m: &[u32; 16], flags: u32) -> [u32; SLOT_WORDS] {
-    let out = blake3::blake3_compress(h, m, NODE_COUNTER, NODE_BLOCK_LEN, flags);
+    let out = blake3_compress(h, m, NODE_COUNTER, NODE_BLOCK_LEN, flags);
     out[..SLOT_WORDS].try_into().unwrap()
 }
-
-use flock_core::test_rng::Rng;
 
 /// Site-specific draws kept verbatim from this file's former local `Rng`.
 trait RngExt {
@@ -32,7 +38,7 @@ trait RngExt {
 }
 impl RngExt for Rng {
     fn digest(&mut self) -> [u32; SLOT_WORDS] {
-        std::array::from_fn(|_| self.next_u32())
+        from_fn(|_| self.next_u32())
     }
     fn word(&mut self) -> u128 {
         (0..4).fold(0u128, |a, _| (a << 32) | self.next_u32() as u128)
@@ -140,9 +146,9 @@ fn swap_matches_the_composite_fold() {
             // here re-derives the swap rule, so agreeing with `root_chunk` is
             // a real check rather than a restatement.
             let blocks = leaf_bytes / 64;
-            let mut prev = blake3::BLAKE3_IV;
+            let mut prev = BLAKE3_IV;
             for i in 0..blocks {
-                let m: [u32; 16] = std::array::from_fn(|w| {
+                let m: [u32; 16] = from_fn(|w| {
                     let o = i * 64 + 4 * w;
                     u32::from_le_bytes(input.leaf_data[o..o + 4].try_into().unwrap())
                 });
@@ -164,7 +170,7 @@ fn swap_matches_the_composite_fold() {
                 let mut m = [0u32; 16];
                 m[..SLOT_WORDS].copy_from_slice(&left);
                 m[SLOT_WORDS..].copy_from_slice(&right);
-                prev = cv(&blake3::BLAKE3_IV, &m, BLAKE3_FLAG_PARENT);
+                prev = cv(&BLAKE3_IV, &m, BLAKE3_FLAG_PARENT);
             }
             assert_eq!(
                 prev,
@@ -328,7 +334,7 @@ fn pow_mask_inputs_the_load_bearing_check_word() {
 #[test]
 fn glue_is_negligible_against_blake3() {
     let b3 = {
-        let (a, b) = flock_prover::r1cs_hashes::blake3::build_matrices();
+        let (a, b) = build_matrices();
         a.rows.iter().map(|r| r.len()).sum::<usize>()
             + b.rows.iter().map(|r| r.len()).sum::<usize>()
     };

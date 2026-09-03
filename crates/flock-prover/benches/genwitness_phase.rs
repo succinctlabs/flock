@@ -2,23 +2,24 @@
 //! (the "gen_witness_ab + lincheck" phase). Best-of-N to isolate it from the
 //! rest of the prove pipeline's thermal load. Honors RAYON_NUM_THREADS.
 
-use std::hint::black_box;
-use std::time::Instant;
-
-use flock_prover::r1cs_hashes::blake3::{
-    Blake3Setup, Compression, generate_witness_with_ab_packed_and_lincheck, min_n_blocks_log,
-};
+use std::{array::from_fn, hint::black_box, time::Instant};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    init_perf_thread_pool,
+    r1cs_hashes::blake3::{
+        Blake3Setup, Compression, generate_witness_with_ab_packed_and_lincheck, min_n_blocks_log,
+    },
+};
 
 fn random_compression(rng: &mut Rng) -> Compression {
-    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+    let m: [u32; 16] = from_fn(|_| rng.next_u32());
     (cv, m, rng.next_u32() as u64, 64u32, 11u32)
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     for &n_blocks in &[32768usize, 65536] {
         let n_log = min_n_blocks_log(n_blocks);
         let _setup = Blake3Setup::new(n_blocks);

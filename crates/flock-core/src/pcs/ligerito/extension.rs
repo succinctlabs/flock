@@ -10,8 +10,34 @@
 //! `u^b B(x)`. Consequently each recursive level spends one fold round on the
 //! coordinate bit and removes only `k - 1` variables from the extension table.
 
-use super::*;
-use rayon::prelude::*;
+use std::{
+    env::{var, var_os},
+    mem::replace,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
+
+use flock_multilinear::{IndexOrder, eq_table};
+
+use crate::{
+    merkle::cap_layer,
+    pcs::{
+        ligerito::{
+            AdditiveNttF128, BasisWindowFn, Challenger, F128, F256, FOLD_LOOKAHEAD_OVERRIDE,
+            FinalProof, FoldLookahead, Hash, IndexedParallelIterator, IntoParallelIterator,
+            IntoParallelRefIterator, IntoParallelRefMutIterator, LigeritoProof, ParallelIterator,
+            ParallelSliceMut, ProverConfig, RecursiveProof, SumcheckMessage, SumcheckMessage256,
+            VerifierConfig, VirtualEqBasis, VirtualEqTerm, build_eq_table, ceil_log2,
+            eval_sk_at_vks, grind_and_sample_queries, induce_sumcheck_poly_auto, ligero_commit,
+            merkle_paths_for, next_s, round_msg_and_eval_blocked,
+            round_msg_and_eval_eq_point_blocked, round_msg_eval_and_lookahead,
+            round_msg_eval_and_lookahead_eq_point_blocked, verify_and_sample_queries,
+            verify_level_opens,
+        },
+        ring_switch::build_eq_scaled_parallel,
+    },
+    scratch::{give_f256, take_f256},
+};
 
 /// Split extension values into the base-field table `g(b, x)`, with adjacent
 /// `(b=0, b=1)` values for every `x`.
@@ -54,17 +80,7 @@ pub(super) fn split_inner_product(words: &[F128], basis: &[F256]) -> F256 {
 }
 
 fn build_eq_table256(point: &[F256]) -> Vec<F256> {
-    let mut table = vec![F256::ONE];
-    for &r in point {
-        let old = table.len();
-        table.resize(2 * old, F256::ZERO);
-        for i in 0..old {
-            let v = table[i];
-            table[i + old] = v * r;
-            table[i] = v * (F256::ONE + r);
-        }
-    }
-    table
+    eq_table(point, F256::ONE, IndexOrder::LowToHigh)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -573,8 +589,8 @@ fn fused_fold2_msg_base(
     let quarter = f.len() / 4;
     debug_assert!(quarter >= 2 && quarter.is_power_of_two());
     let want_la = want_la && (4..=LA_MAX_OUTPUTS).contains(&quarter);
-    let mut nf = crate::scratch::take_f256(quarter);
-    let mut nb = crate::scratch::take_f256(quarter);
+    let mut nf = take_f256(quarter);
+    let mut nb = take_f256(quarter);
     let gran = if want_la { 4 } else { 2 };
     let chunk = (1usize << 12).clamp(gran, quarter);
     debug_assert!(chunk.is_multiple_of(gran));
@@ -628,8 +644,8 @@ fn fused_fold2_msg_ext(
     debug_assert!(d.is_power_of_two() && quarter.is_power_of_two() && quarter >= d);
     let want_la = want_la && quarter >= 4 * d && quarter <= LA_MAX_OUTPUTS;
     let sblock = if want_la { 4 * d } else { 2 * d };
-    let mut nf = crate::scratch::take_f256(quarter);
-    let mut nb = crate::scratch::take_f256(quarter);
+    let mut nf = take_f256(quarter);
+    let mut nb = take_f256(quarter);
     // Output o = b·d + w composes inputs {4bd+w, +d, +2d, +3d}; a superblock
     // of `sblock` outputs reads the 4·sblock inputs at 4·(superblock start).
     // The split-based big-block branch requires FULL superblocks; smaller
@@ -802,8 +818,8 @@ fn fused_fold_msg_la_fbase(
     let half = f.len() / 2;
     debug_assert!(half.is_power_of_two() && half >= 4);
     debug_assert!(half <= LA_MAX_OUTPUTS, "caller gates by size");
-    let mut nf = crate::scratch::take_f256(half);
-    let mut nb = crate::scratch::take_f256(half);
+    let mut nf = take_f256(half);
+    let mut nb = take_f256(half);
     let chunk = (1usize << 12).clamp(4, half);
     debug_assert!(chunk.is_multiple_of(4));
     let acc = nf
@@ -849,8 +865,8 @@ fn fused_fold_msg_la_base(
     debug_assert_eq!(f.len(), b.len());
     let half = f.len() / 2;
     debug_assert!(half.is_power_of_two() && half >= 4);
-    let mut nf = crate::scratch::take_f256(half);
-    let mut nb = crate::scratch::take_f256(half);
+    let mut nf = take_f256(half);
+    let mut nb = take_f256(half);
     let chunk = (1usize << 12).clamp(4, half);
     debug_assert!(chunk.is_multiple_of(4));
     let acc = nf
@@ -906,8 +922,8 @@ fn fused_first_fold_virtual(
     let block = 2 * d;
     let zero2 = || (F256::ZERO, F256::ZERO);
     let sum2 = |(a0, a2): (F256, F256), (b0, b2): (F256, F256)| (a0 + b0, a2 + b2);
-    let mut nf = crate::scratch::take_f256(half);
-    let mut nb = crate::scratch::take_f256(half);
+    let mut nf = take_f256(half);
+    let mut nb = take_f256(half);
     let (u_0, u_2) = if block >= (1 << 16) {
         const KC: usize = 1 << 13;
         nf.par_chunks_mut(block)
@@ -1004,8 +1020,8 @@ fn fused_first_fold2_virtual(
     debug_assert!(d.is_power_of_two() && quarter.is_power_of_two() && quarter >= 2 * d);
     let want_la = want_la && quarter >= 4 * d && quarter <= LA_MAX_OUTPUTS;
     let sblock = if want_la { 4 * d } else { 2 * d };
-    let mut nf = crate::scratch::take_f256(quarter);
-    let mut nb = crate::scratch::take_f256(quarter);
+    let mut nf = take_f256(quarter);
+    let mut nb = take_f256(quarter);
     // Output o = b·d + w composes f inputs {4bd+w, +d, +2d, +3d}.
     let fold2 = |i: usize| -> F256 {
         let lo = F256::from(f[i]) + r0 * (f[i + d] + f[i]);
@@ -1160,10 +1176,8 @@ impl VirtualEqTerm256 {
 
     fn rebuild(&mut self) {
         self.n_lo = self.coords.len() / 2;
-        self.lo =
-            crate::pcs::ring_switch::build_eq_scaled_parallel(&self.coords[..self.n_lo], F128::ONE);
-        self.hi =
-            crate::pcs::ring_switch::build_eq_scaled_parallel(&self.coords[self.n_lo..], F128::ONE);
+        self.lo = build_eq_scaled_parallel(&self.coords[..self.n_lo], F128::ONE);
+        self.hi = build_eq_scaled_parallel(&self.coords[self.n_lo..], F128::ONE);
     }
 
     fn fold_coord(&mut self, p: usize, r: F256) {
@@ -1223,7 +1237,7 @@ impl VirtualEqBasis256 {
     fn materialize(&self) -> Vec<F256> {
         // Pooled + parallel: `fill` writes every slot of its chunk (zero
         // then add), so an uninitialized pooled buffer is fine.
-        let mut out = crate::scratch::take_f256(self.len());
+        let mut out = take_f256(self.len());
         out.par_chunks_mut(1 << 12)
             .enumerate()
             .for_each(|(i, chunk)| self.fill(chunk, i << 12));
@@ -1416,8 +1430,8 @@ impl SumcheckProver256 {
             return (self.fold_after_switch(r), None);
         }
         let (nf, nb, msg, la) = fused_fold_msg_la_fbase(&self.f, &self.combined_basis, r);
-        crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
-        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
+        give_f256(replace(&mut self.f, nf));
+        give_f256(replace(&mut self.combined_basis, nb));
         self.transcript.push(msg);
         (msg, la)
     }
@@ -1439,8 +1453,8 @@ impl SumcheckProver256 {
         );
         let (nf, nb, msg, la) =
             fused_fold2_msg_ext(&self.f, &self.combined_basis, r0, r1, d, want_la);
-        crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
-        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
+        give_f256(replace(&mut self.f, nf));
+        give_f256(replace(&mut self.combined_basis, nb));
         self.transcript.push(msg);
         (msg, la)
     }
@@ -1450,8 +1464,8 @@ impl SumcheckProver256 {
     pub(super) fn fold2_drain(&mut self, r0: F256, r1: F256, d: usize) {
         let (nf, nb, _msg, _) =
             fused_fold2_msg_ext(&self.f, &self.combined_basis, r0, r1, d, false);
-        crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
-        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
+        give_f256(replace(&mut self.f, nf));
+        give_f256(replace(&mut self.combined_basis, nb));
     }
 
     /// Message-free single fold — the drain before a switch (or the final
@@ -1459,8 +1473,8 @@ impl SumcheckProver256 {
     pub(super) fn drain(&mut self, r: F256, d: usize) {
         let nf = fold_extension(&self.f, r, d);
         let nb = fold_extension(&self.combined_basis, r, d);
-        crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
-        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
+        give_f256(replace(&mut self.f, nf));
+        give_f256(replace(&mut self.combined_basis, nb));
     }
 
     pub(super) fn fold_materialized(&mut self, r: F256, d: usize) -> SumcheckMessage256 {
@@ -1469,8 +1483,8 @@ impl SumcheckProver256 {
             // The replaced fold outputs cycle back to the shared pool; the
             // next fold (and the next prove) takes them warm instead of
             // faulting fresh pages.
-            crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
-            crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
+            give_f256(replace(&mut self.f, nf));
+            give_f256(replace(&mut self.combined_basis, nb));
             msg
         } else {
             self.f = fold_extension(&self.f, r, d);
@@ -1495,8 +1509,8 @@ impl SumcheckProver256 {
             return self.fold_materialized(r, 1);
         }
         let (nf, nb, msg) = fused_fold_msg_fbase(&self.f, &self.combined_basis, r, 1);
-        crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
-        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
+        give_f256(replace(&mut self.f, nf));
+        give_f256(replace(&mut self.combined_basis, nb));
         self.transcript.push(msg);
         msg
     }
@@ -1528,9 +1542,9 @@ impl SumcheckProver256 {
     fn code_switch_message(&mut self) -> SumcheckMessage256 {
         let words = split_coordinates(&self.f);
         let split_f = words.into_iter().map(F256::from).collect();
-        crate::scratch::give_f256(std::mem::replace(&mut self.f, split_f));
+        give_f256(replace(&mut self.f, split_f));
         let split_b = split_basis(&self.combined_basis);
-        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, split_b));
+        give_f256(replace(&mut self.combined_basis, split_b));
         round_msg_fbase(&self.f, &self.combined_basis)
     }
 
@@ -1679,23 +1693,23 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // Phase accounting behind LIG_PROVE_TRACE, mirroring the F128 impl's
     // [lig-prove] report so the two ladders stay comparable.
-    let trace = std::env::var("LIG_PROVE_TRACE").is_ok();
-    let t_total = std::time::Instant::now();
-    let mut t_l0_ood = std::time::Duration::ZERO;
-    let mut t_first = std::time::Duration::ZERO;
-    let mut t_init_folds = std::time::Duration::ZERO;
-    let mut t_commits = std::time::Duration::ZERO;
-    let mut t_ood = std::time::Duration::ZERO;
-    let mut t_grind = std::time::Duration::ZERO;
-    let mut t_opens = std::time::Duration::ZERO;
-    let mut t_induce = std::time::Duration::ZERO;
-    let mut t_folds = std::time::Duration::ZERO;
+    let trace = var("LIG_PROVE_TRACE").is_ok();
+    let t_total = Instant::now();
+    let mut t_l0_ood = Duration::ZERO;
+    let mut t_first = Duration::ZERO;
+    let mut t_init_folds = Duration::ZERO;
+    let mut t_commits = Duration::ZERO;
+    let mut t_ood = Duration::ZERO;
+    let mut t_grind = Duration::ZERO;
+    let mut t_opens = Duration::ZERO;
+    let mut t_induce = Duration::ZERO;
+    let mut t_folds = Duration::ZERO;
 
     challenger.observe_label(b"flock-ligerito-basis-f256-split-v0");
     challenger.observe_f128(target);
     let strat = |level: usize| &config.stratified[level];
     let cap_depth = |level: usize| config.stratified[level].cap_depth();
-    let initial_cap = merkle::cap_layer(l0_tree, block_len_0, cap_depth(0)).to_vec();
+    let initial_cap = cap_layer(l0_tree, block_len_0, cap_depth(0)).to_vec();
     challenger.observe_bytes(initial_cap.as_flattened());
 
     let claim_bits = |level: usize| config.claim_batch_grinding_bits[level] as u32;
@@ -1722,16 +1736,16 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // (len ≥ 8·d). FLOCK_NO_FOLD_LOOKAHEAD=1 / FOLD_LOOKAHEAD_OVERRIDE is
     // the A/B knob — value-identical either way (exact polynomial
     // identity), so proofs are byte-equal.
-    let alternation = match FOLD_LOOKAHEAD_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+    let alternation = match FOLD_LOOKAHEAD_OVERRIDE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => std::env::var_os("FLOCK_NO_FOLD_LOOKAHEAD").is_none(),
+        _ => var_os("FLOCK_NO_FOLD_LOOKAHEAD").is_none(),
     };
     let mut lookahead = round1_lookahead.filter(|_| {
         let kind_ok = virtual_basis.is_some() || (l0_jit_basis.is_none() && fold_block == 1);
         alternation && kind_ok && initial_k >= 2 && packed_witness.len() >= 8 * fold_block
     });
-    let _t = std::time::Instant::now();
+    let _t = Instant::now();
     for _ in 0..ood_count(0) {
         let z = challenger.sample_f128_vec(log_n);
         let mut ood_la = None;
@@ -1750,7 +1764,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         } else {
             // Same doubling recurrence as `build_eq_table`, parallel —
             // value-identical (seed ONE), and this table is 2^log_n words.
-            let eq_z = crate::pcs::ring_switch::build_eq_scaled_parallel(&z, F128::ONE);
+            let eq_z = build_eq_scaled_parallel(&z, F128::ONE);
             let (msg, y) = if lookahead.is_some() {
                 // Same sweep, plus the (f, eq_z) pair's own round-1
                 // coefficients so the lookahead survives the β-glue below.
@@ -1795,7 +1809,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         t_l0_ood += _t.elapsed();
     }
 
-    let _t = std::time::Instant::now();
+    let _t = Instant::now();
     let first = match first_msg {
         Some(msg) => msg,
         None => {
@@ -1821,8 +1835,8 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // deferred fold DRAINS message-free into the switch.
     let mut pending_r0: Option<F256> = None;
     let mut la_mid: Option<La256> = None;
-    let _t = std::time::Instant::now();
-    let mut t_fold_j = std::time::Instant::now();
+    let _t = Instant::now();
+    let mut t_fold_j = Instant::now();
     for j in 0..initial_k {
         let challenge = challenger.sample_f256();
         lane_challenges.push(challenge);
@@ -1965,7 +1979,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 fold_block,
                 t_fold_j.elapsed().as_secs_f64() * 1e3
             );
-            t_fold_j = std::time::Instant::now();
+            t_fold_j = Instant::now();
         }
     }
     if trace {
@@ -1990,7 +2004,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         )
     };
 
-    let _t = std::time::Instant::now();
+    let _t = Instant::now();
     let mut previous = commit_split(sumcheck.f(), 1, current_split_dim);
     let mut recursive_caps = vec![previous.cap(cap_depth(1)).to_vec()];
     challenger.observe_bytes(recursive_caps[0].as_flattened());
@@ -1998,12 +2012,10 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         t_commits += _t.elapsed();
     }
 
-    let _t = std::time::Instant::now();
+    let _t = Instant::now();
     for _ in 0..ood_count(1) {
         let z = challenger.sample_f128_vec(current_split_dim);
-        let (msg, y) = sumcheck.introduce_ood_with_eval(
-            crate::pcs::ring_switch::build_eq_scaled_parallel(&z, F128::ONE),
-        );
+        let (msg, y) = sumcheck.introduce_ood_with_eval(build_eq_scaled_parallel(&z, F128::ONE));
         challenger.observe_f128(y);
         ood_values.push(y);
         observe_message(challenger, msg);
@@ -2015,7 +2027,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         t_ood += _t.elapsed();
     }
 
-    let _t = std::time::Instant::now();
+    let _t = Instant::now();
     let (nonce, queries_0) = grind_and_sample_queries(
         challenger,
         config.grinding_bits[0] as u32,
@@ -2030,7 +2042,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_grind += _t.elapsed();
     }
-    let _t = std::time::Instant::now();
+    let _t = Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
     let initial_proof = RecursiveProof {
         opened_rows: opened_rows_0.clone(),
@@ -2039,7 +2051,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_opens += _t.elapsed();
     }
-    let _t = std::time::Instant::now();
+    let _t = Instant::now();
     let basis_0 = induced_basis(n1, log_inv_rate_0, &queries_0, &alpha_0);
     let enforced_0 = induce_enforced_sum(&opened_rows_0, &lane_challenges, &alpha_0);
     let msg = sumcheck.introduce_presplit_basis(basis_0, enforced_0);
@@ -2056,7 +2068,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let k = config.recursive_ks[i];
         assert!(current_split_dim >= k);
         let mut level_challenges = Vec::with_capacity(k);
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         // The level's alternating schedule. j = 0 is the entry: the fbase
         // fold pass (which runs AFTER every glue, so its coefficients are
         // always fresh) also emits the next round's La256 → j = 1 skips,
@@ -2123,7 +2135,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
             for &value in &yr {
                 challenger.observe_f128(value);
             }
-            let _t = std::time::Instant::now();
+            let _t = Instant::now();
             let (nonce, queries) = grind_and_sample_queries(
                 challenger,
                 config.grinding_bits[level] as u32,
@@ -2142,7 +2154,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
             if trace {
                 t_grind += _t.elapsed();
             }
-            let _t = std::time::Instant::now();
+            let _t = Instant::now();
             let opened_rows = queries.iter().map(|&q| previous.row(q).to_vec()).collect();
             if trace {
                 t_opens += _t.elapsed();
@@ -2214,7 +2226,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
         current_split_dim = extension_dim + 1;
         let next_level = i + 2;
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         let next = commit_split(sumcheck.f(), next_level, current_split_dim);
         let cap = next.cap(cap_depth(next_level)).to_vec();
         challenger.observe_bytes(cap.as_flattened());
@@ -2223,12 +2235,11 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
             t_commits += _t.elapsed();
         }
 
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         for _ in 0..ood_count(next_level) {
             let z = challenger.sample_f128_vec(current_split_dim);
-            let (msg, y) = sumcheck.introduce_ood_with_eval(
-                crate::pcs::ring_switch::build_eq_scaled_parallel(&z, F128::ONE),
-            );
+            let (msg, y) =
+                sumcheck.introduce_ood_with_eval(build_eq_scaled_parallel(&z, F128::ONE));
             challenger.observe_f128(y);
             ood_values.push(y);
             observe_message(challenger, msg);
@@ -2240,7 +2251,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
             t_ood += _t.elapsed();
         }
 
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         let (nonce, queries) = grind_and_sample_queries(
             challenger,
             config.grinding_bits[level] as u32,
@@ -2257,7 +2268,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_grind += _t.elapsed();
         }
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         let opened_rows: Vec<Vec<F128>> =
             queries.iter().map(|&q| previous.row(q).to_vec()).collect();
         recursive_proofs.push(RecursiveProof {
@@ -2272,7 +2283,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_opens += _t.elapsed();
         }
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         let basis = induced_basis(extension_dim, config.log_inv_rates[level], &queries, &alpha);
         let enforced = induce_enforced_sum(&opened_rows, &level_challenges, &alpha);
         let msg = sumcheck.introduce_presplit_basis(basis, enforced);
@@ -2917,8 +2928,16 @@ pub(super) fn induce_enforced_sum(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::{Challenger, RandomChallenger};
+    use crate::{
+        challenger::{Challenger, RandomChallenger},
+        pcs::ligerito::extension::{
+            F128, F256, VirtualEqBasis, VirtualEqBasis256, build_eq_table, build_eq_table256,
+            fold_base, fold_extension, fused_first_fold_virtual, fused_fold_applies,
+            fused_fold_msg_base, fused_fold_msg_ext, fused_fold_msg_fbase, induce_enforced_sum,
+            next_round_msg, round_msg, round_msg_fbase, split_basis, split_coordinates,
+            split_inner_product,
+        },
+    };
 
     fn random_f256(challenger: &mut RandomChallenger) -> F256 {
         F256::new(challenger.sample_f128(), challenger.sample_f128())

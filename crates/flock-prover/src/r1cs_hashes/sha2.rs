@@ -45,17 +45,38 @@
 //!   each Ch / Maj AND row would blow up to thousands of terms.
 //! - `H_out[w]` — the public output of the compression.
 
-use super::common::{
-    BitRecord, add_carry_parts, const_add_parts, fused_add3_parts, fused_add4_parts, or_bit_at,
-    or_u32_at_bit,
+use std::array::from_fn;
+
+use flock_core::{
+    lincheck::LincheckCircuit,
+    pcs::{
+        Commitment, PcsParams,
+        ligerito::{LigeritoProfile, embedded_initial_k_or_default},
+    },
+    proof::{R1csClaim, R1csProofMergedLigerito},
+    r1cs::{BlockR1cs, SparseBinaryMatrix},
+    scratch::prewarm_prover,
+    union::{SlotWitnessDest, UnionInstance},
+    verifier::{FlockVerifyError, verify_ligerito_union},
 };
-use flock_core::field::F128;
-use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
+use flock_field::F128;
+use flock_transcript::challenger::Challenger;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Compile-time slot layout
 // ───────────────────────────────────────────────────────────────────────────
-
+use crate::r1cs_hashes::common::{BM_V, BmRow, add_carry_parts_v, or_bit_row, or_u32_row};
+use crate::{
+    prover::{UnionSlotProverInput, prove_fast_ligerito_union},
+    r1cs_hashes::common::{
+        BitRecord, add_carry_parts, build_block_r1cs_with_matrices, const_add_parts,
+        drive_witness_batch_major, drive_witness_batch_major_into,
+        drive_witness_batch_major_partial, drive_witness_batch_major_partial_into,
+        drive_witness_packed_and_lincheck, fused_add3_parts, fused_add4_parts, or_bit_at,
+        or_u32_at_bit,
+    },
+    schedule::{Registry, TableType},
+};
 /// Inner-dimension log: `K = 2^15 = 32,768` rows per block.
 pub const K_LOG: usize = 15;
 pub const K: usize = 1 << K_LOG;
@@ -175,15 +196,8 @@ pub const SC_MAJ1: usize = 0;
 pub const SC_MAJ2: usize = CARRIES_PER_ADD; // 31
 pub const SC_RIP: usize = 2 * CARRIES_PER_ADD; // 62
 
-// Lin-id discipline (measured 2026-08-14 with the since-deleted
-// `sha2_linid_drop_sim` probe, bloat ledger §E): W is
-// never materialized (the schedule cascade stays shallow — 19.7M nnz),
-// and E_NEW/A_NEW materialize only every OTHER round (`EA_PERIOD` = 2):
-// an inlined round's state expressions are cut one round later, bounding
-// the σ/Σ fan-out at 47.4M template nnz / max row ~8.9k — the same
-// density envelope blake3's Option-E full cascade already lives in. The
-// zk.golf record's FULL inlining measures 184M nnz here and does not
-// price in against the CSC fold + cached-template costs.
+// W is not materialized. E_NEW and A_NEW are materialized every other round
+// to limit expression growth.
 pub const EA_PERIOD: usize = 2;
 /// Rounds whose E_NEW/A_NEW are materialized (r % EA_PERIOD == 1).
 pub const N_EA_SLOTS: usize = N_ROUNDS / EA_PERIOD; // 32
@@ -804,9 +818,7 @@ pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
 
 /// Read the 8-word post-compression hash out of a single block of witness.
 pub fn read_h_out(z: &[bool]) -> [u32; 8] {
-    std::array::from_fn(|w| {
-        (0..WORD_BITS).fold(0u32, |acc, b| acc | ((z[h_out_bit(w, b)] as u32) << b))
-    })
+    from_fn(|w| (0..WORD_BITS).fold(0u32, |acc, b| acc | ((z[h_out_bit(w, b)] as u32) << b)))
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -818,7 +830,7 @@ pub fn read_h_out(z: &[bool]) -> [u32; 8] {
 /// lincheck floor.
 pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
     let (a_0, b_0) = build_matrices();
-    super::common::build_block_r1cs_with_matrices(
+    build_block_r1cs_with_matrices(
         n_blocks_log,
         K_LOG,
         K_SKIP,
@@ -837,7 +849,7 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 
 pub struct Sha2LincheckCircuit;
 
-impl flock_core::lincheck::LincheckCircuit for Sha2LincheckCircuit {
+impl LincheckCircuit for Sha2LincheckCircuit {
     fn n_cols(&self) -> usize {
         K
     }
@@ -1131,18 +1143,13 @@ fn build_block_ab_packed_into(
 pub fn generate_witness_with_ab_packed_and_lincheck(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
-) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<u8>,
-) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid compression (of the all-zero input) so the constant cell is 1 in
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: ([u32; 8], [u32; 16]) = ([0u32; 8], [0u32; 16]);
-    super::common::drive_witness_packed_and_lincheck(
+    drive_witness_packed_and_lincheck(
         compressions,
         Some(&padding),
         n_blocks_log,
@@ -1173,8 +1180,8 @@ pub fn min_n_blocks_log(n_compressions: usize) -> usize {
 pub struct Sha256HybridSetup {
     pub n_compressions: usize,
     pub r1cs: BlockR1cs,
-    pub registry: crate::schedule::Registry,
-    pub pcs_params: flock_core::pcs::PcsParams,
+    pub registry: Registry,
+    pub pcs_params: PcsParams,
 }
 
 impl Sha256HybridSetup {
@@ -1185,25 +1192,22 @@ impl Sha256HybridSetup {
     pub fn with_log_inv_rate(n_compressions: usize, log_inv_rate: usize) -> Self {
         // Rate keys the legacy profiles: 1 -> Fast, 2 -> Slim.
         let profile = match log_inv_rate {
-            1 => flock_core::pcs::ligerito::LigeritoProfile::Fast,
-            2 => flock_core::pcs::ligerito::LigeritoProfile::Slim,
-            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // other rates default to Fast
+            1 => LigeritoProfile::Fast,
+            2 => LigeritoProfile::Slim,
+            _ => LigeritoProfile::Fast, // other rates default to Fast
         };
         Self::with_profile_and_rate(n_compressions, profile, log_inv_rate)
     }
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
-    pub fn with_profile(
-        n_compressions: usize,
-        profile: flock_core::pcs::ligerito::LigeritoProfile,
-    ) -> Self {
+    pub fn with_profile(n_compressions: usize, profile: LigeritoProfile) -> Self {
         Self::with_profile_and_rate(n_compressions, profile, profile.log_inv_rate())
     }
 
     fn with_profile_and_rate(
         n_compressions: usize,
-        profile: flock_core::pcs::ligerito::LigeritoProfile,
+        profile: LigeritoProfile,
         log_inv_rate: usize,
     ) -> Self {
         assert!(n_compressions >= 1, "n_compressions must be ≥ 1");
@@ -1213,16 +1217,13 @@ impl Sha256HybridSetup {
         // first prove/verify, and pre-fault the prove-cycle scratch buffers
         // so even the first prove performs no page faults.
         r1cs.csc_lincheck_circuit();
-        flock_core::scratch::prewarm_prover(r1cs.m);
-        let registry = crate::schedule::Registry::new(
-            vec![crate::schedule::TableType::from_block_r1cs(&r1cs)],
-            n_log,
-        );
+        prewarm_prover(r1cs.m);
+        let registry = Registry::new(vec![TableType::from_block_r1cs(&r1cs)], n_log);
         let pcs_params = {
-            let union = flock_core::union::UnionInstance::new(&registry, vec![n_compressions]);
+            let union = UnionInstance::new(&registry, vec![n_compressions]);
             let m = union.dense_m();
-            let batch = flock_core::pcs::ligerito::embedded_initial_k_or_default(m, profile);
-            flock_core::pcs::PcsParams {
+            let batch = embedded_initial_k_or_default(m, profile);
+            PcsParams {
                 m,
                 log_inv_rate,
                 log_batch_size: batch,
@@ -1252,36 +1253,30 @@ impl Sha256HybridSetup {
     /// Prove `n_compressions` over the single-slot UNION commit (dense
     /// stack + integer lanes; `PCS_TRACE=1` prints the per-phase
     /// breakdown). Counts below capacity leave zero dummy rows.
-    pub fn prove_fast<Ch: flock_core::challenger::Challenger>(
+    pub fn prove_fast<Ch: Challenger>(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
         challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProofMergedLigerito,
-        flock_core::pcs::Commitment,
-        flock_core::proof::R1csClaim,
-    ) {
+    ) -> (R1csProofMergedLigerito, Commitment, R1csClaim) {
         assert_eq!(compressions.len(), self.n_compressions);
-        let union =
-            flock_core::union::UnionInstance::new(&self.registry, vec![self.n_compressions]);
-        let slot = crate::prover::UnionSlotProverInput::new(
+        let union = UnionInstance::new(&self.registry, vec![self.n_compressions]);
+        let slot = UnionSlotProverInput::new(
             generate_witness_batch_major_partial(compressions, self.n_blocks_log()),
             self.r1cs.csc_lincheck_circuit(),
         );
-        crate::prover::prove_fast_ligerito_union(&union, &self.pcs_params, vec![slot], challenger)
+        prove_fast_ligerito_union(&union, &self.pcs_params, vec![slot], challenger)
     }
 
-    pub fn verify<Ch: flock_core::challenger::Challenger>(
+    pub fn verify<Ch: Challenger>(
         &self,
-        commitment: &flock_core::pcs::Commitment,
-        proof: &flock_core::proof::R1csProofMergedLigerito,
+        commitment: &Commitment,
+        proof: &R1csProofMergedLigerito,
         challenger: &mut Ch,
-    ) -> Result<flock_core::proof::R1csClaim, flock_core::verifier::VerifyError> {
-        let union =
-            flock_core::union::UnionInstance::new(&self.registry, vec![self.n_compressions]);
+    ) -> Result<R1csClaim, FlockVerifyError> {
+        let union = UnionInstance::new(&self.registry, vec![self.n_compressions]);
         let circuit = self.r1cs.csc_lincheck_circuit();
-        let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [circuit];
-        flock_core::verifier::verify_ligerito_union(
+        let circs: [&dyn LincheckCircuit; 1] = [circuit];
+        verify_ligerito_union(
             &union,
             &circs,
             commitment,
@@ -1377,19 +1372,17 @@ pub fn hash_to_phys_bits(h: &[u32; 8]) -> Vec<bool> {
 // `common::drive_witness_batch_major`.
 // ---------------------------------------------------------------------------
 
-use super::common::{BM_V, BmRow, add_carry_parts_v, or_bit_row, or_u32_row};
-
 #[inline(always)]
 fn map_v(x: &[u32; BM_V], f: impl Fn(u32) -> u32) -> [u32; BM_V] {
-    std::array::from_fn(|j| f(x[j]))
+    from_fn(|j| f(x[j]))
 }
 #[inline(always)]
 fn xor_v(x: &[u32; BM_V], y: &[u32; BM_V]) -> [u32; BM_V] {
-    std::array::from_fn(|j| x[j] ^ y[j])
+    from_fn(|j| x[j] ^ y[j])
 }
 #[inline(always)]
 fn and_v(x: &[u32; BM_V], y: &[u32; BM_V]) -> [u32; BM_V] {
-    std::array::from_fn(|j| x[j] & y[j])
+    from_fn(|j| x[j] & y[j])
 }
 
 struct BmRows<'a> {
@@ -1516,8 +1509,8 @@ fn build_group_batch_major(
         a: ra,
         b: rb,
     };
-    let h_in: [[u32; BM_V]; 8] = std::array::from_fn(|w| std::array::from_fn(|j| inputs[j].0[w]));
-    let m: [[u32; BM_V]; 16] = std::array::from_fn(|i| std::array::from_fn(|j| inputs[j].1[i]));
+    let h_in: [[u32; BM_V]; 8] = from_fn(|w| from_fn(|j| inputs[j].0[w]));
+    let m: [[u32; BM_V]; 16] = from_fn(|i| from_fn(|j| inputs[j].1[i]));
 
     or_bit_row(rows.z, Z_CONST_POS);
     or_bit_row(rows.a, Z_CONST_POS);
@@ -1621,14 +1614,9 @@ fn build_group_batch_major(
 pub fn generate_witness_batch_major(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
-) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<u8>,
-) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     let padding: ([u32; 8], [u32; 16]) = ([0u32; 8], [0u32; 16]);
-    super::common::drive_witness_batch_major(
+    drive_witness_batch_major(
         compressions,
         &padding,
         n_blocks_log,
@@ -1647,13 +1635,8 @@ pub fn generate_witness_batch_major(
 pub fn generate_witness_batch_major_partial(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
-) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<u8>,
-) {
-    super::common::drive_witness_batch_major_partial(
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+    drive_witness_batch_major_partial(
         compressions,
         n_blocks_log,
         K_LOG,
@@ -1668,10 +1651,10 @@ pub fn generate_witness_batch_major_partial(
 pub fn generate_witness_batch_major_into(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
-    dst: flock_core::union::SlotWitnessDest<'_>,
+    dst: SlotWitnessDest<'_>,
 ) -> Vec<u8> {
     let padding: ([u32; 8], [u32; 16]) = ([0u32; 8], [0u32; 16]);
-    super::common::drive_witness_batch_major_into(
+    drive_witness_batch_major_into(
         compressions,
         &padding,
         n_blocks_log,
@@ -1687,9 +1670,9 @@ pub fn generate_witness_batch_major_into(
 pub fn generate_witness_batch_major_partial_into(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
-    dst: flock_core::union::SlotWitnessDest<'_>,
+    dst: SlotWitnessDest<'_>,
 ) -> Vec<u8> {
-    super::common::drive_witness_batch_major_partial_into(
+    drive_witness_batch_major_partial_into(
         compressions,
         n_blocks_log,
         K_LOG,
@@ -1701,19 +1684,36 @@ pub fn generate_witness_batch_major_partial_into(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::array::from_fn;
 
+    use flock_core::{
+        lincheck::{CscCircuit, LincheckCircuit, SparseMatrixCircuit, pack_z_lincheck_from_packed},
+        test_rng::Rng,
+        union::UnionInstance,
+    };
+    use flock_field::F128;
+    use flock_transcript::challenger::FsChallenger;
+
+    use crate::{
+        prover::{UnionSlotProverInput, prove_fast_ligerito_union},
+        r1cs_hashes::sha2::{
+            A_NEW_BASE, CH_AND_BASE, E_NEW_BASE, FlockVerifyError, H_BASE, H_OUT_BASE, K, K_LOG,
+            M_BASE, MAJ_AND_BASE, N_ROUNDS, OUT_CARRY_BASE, ROUND_BASE, ROUND_CARRY_BASE,
+            SCHED_CARRY_BASE, SHA256_IV, Sha2LincheckCircuit, Sha256HybridSetup,
+            SparseBinaryMatrix, USEFUL_BITS, WORD_BITS, Z_CONST_POS, build_block_r1cs,
+            build_block_witness, build_matrices, generate_witness_batch_major,
+            generate_witness_batch_major_partial, generate_witness_with_ab_packed_and_lincheck,
+            hash_to_phys_bits, read_h_out, round_add_bits, sha256_compress,
+        },
+    };
     /// The walker's constant-wire pin must equal the pin the R1CS itself
     /// declares — see the blake3 twin of this test.
     #[test]
     fn walker_const_pin_matches_r1cs() {
-        use flock_core::lincheck::LincheckCircuit as _;
         let r1cs = build_block_r1cs(3);
         assert_eq!(Sha2LincheckCircuit.const_pin_col(), r1cs.const_pin);
         assert_eq!(r1cs.const_pin, Some(Z_CONST_POS));
     }
-
-    use flock_core::test_rng::Rng;
 
     /// Site-specific draws kept verbatim from this file's former local `Rng`.
     trait RngExt {
@@ -1721,7 +1721,7 @@ mod tests {
     }
     impl RngExt for Rng {
         fn next_block(&mut self) -> [u32; 16] {
-            std::array::from_fn(|_| self.next_u32())
+            from_fn(|_| self.next_u32())
         }
     }
 
@@ -1732,7 +1732,7 @@ mod tests {
         for (n_inputs, n_log) in [(8usize, 3usize), (11, 4)] {
             let mut rng = Rng::new(0xBA7C_5A + n_log as u64);
             let inputs: Vec<([u32; 8], [u32; 16])> = (0..n_inputs)
-                .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+                .map(|_| (from_fn(|_| rng.next_u32()), rng.next_block()))
                 .collect();
 
             let (z_r, a_r, b_r, stripe_r) =
@@ -1742,8 +1742,8 @@ mod tests {
             assert_eq!(stripe_b, stripe_r, "stripe diverged (n_log={n_log})");
 
             let chunks_per_block = K / 128;
-            let transpose = |row: &[flock_core::field::F128]| {
-                let mut out = vec![flock_core::field::F128::ZERO; row.len()];
+            let transpose = |row: &[F128]| {
+                let mut out = vec![F128::ZERO; row.len()];
                 for o in 0..1usize << n_log {
                     for c in 0..chunks_per_block {
                         out[(c << n_log) + o] = row[o * chunks_per_block + c];
@@ -1764,15 +1764,12 @@ mod tests {
     /// group boundary, fully-dummy trailing groups, and the empty count.
     #[test]
     fn batch_major_partial_zeroes_dummy_rows() {
-        use flock_core::field::F128;
-        use flock_core::lincheck::pack_z_lincheck_from_packed;
-
         let n_log = 4usize;
         let n_total = 1usize << n_log;
         let m = K_LOG + n_log;
         let mut rng = Rng::new(0xBA7C_5427);
         let inputs: Vec<([u32; 8], [u32; 16])> = (0..n_total)
-            .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+            .map(|_| (from_fn(|_| rng.next_u32()), rng.next_block()))
             .collect();
         let (z_f, a_f, b_f, _) = generate_witness_batch_major(&inputs, n_log);
 
@@ -1819,12 +1816,10 @@ mod tests {
     #[test]
     #[ignore]
     fn batch_major_prove_fast_roundtrip() {
-        use flock_core::challenger::FsChallenger;
-
         let setup = Sha256HybridSetup::new(128);
         let mut rng = Rng::new(0xBA7C_F012);
         let inputs: Vec<([u32; 8], [u32; 16])> = (0..128)
-            .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+            .map(|_| (from_fn(|_| rng.next_u32()), rng.next_block()))
             .collect();
 
         let mut ch_p = FsChallenger::new(b"flock-lig-batch-major-v0");
@@ -1940,7 +1935,7 @@ mod tests {
                 ],
             ),
             (SHA256_IV, rng.next_block()),
-            (std::array::from_fn(|_| rng.next_u32()), rng.next_block()),
+            (from_fn(|_| rng.next_u32()), rng.next_block()),
         ];
         for (h_in, m) in cases {
             let z = build_block_witness(&h_in, &m);
@@ -1963,8 +1958,6 @@ mod tests {
     /// `Sha2LincheckCircuit` walker matches sparse fold byte-for-byte.
     #[test]
     fn lincheck_circuit_matches_sparse() {
-        use flock_core::lincheck::{LincheckCircuit, SparseMatrixCircuit};
-
         let mut rng = Rng::new(0x5_4A2_CCA1);
         let (a_0, b_0) = build_matrices();
         let sparse = SparseMatrixCircuit::new(&a_0, &b_0);
@@ -1990,7 +1983,7 @@ mod tests {
         }
 
         // CSC gather (what prove_fast/verify actually use) matches too.
-        let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
+        let csc = CscCircuit::from_matrices(&a_0, &b_0);
         let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
         assert_eq!(expected, got_csc, "CSC fold mismatch");
     }
@@ -1999,7 +1992,6 @@ mod tests {
     #[test]
     #[ignore]
     fn prove_fast_ligerito_roundtrip() {
-        use flock_core::challenger::FsChallenger;
         let mut rng = Rng::new(0x5_a2_211e);
         let n = 128;
         let compressions: Vec<([u32; 8], [u32; 16])> =
@@ -2021,8 +2013,6 @@ mod tests {
     /// the walker.)
     #[test]
     fn const_pin_all_zero_rejected() {
-        use flock_core::challenger::FsChallenger;
-
         let n = 120; // 8 padding blocks at n_block_slots = 128 (m = 22)
         let setup = Sha256HybridSetup::new(n);
 
@@ -2043,29 +2033,19 @@ mod tests {
         let zeros: Vec<([u32; 8], [u32; 16])> = vec![([0u32; 8], [0u32; 16]); n];
         let (mut z, mut a, mut b, mut zlc) =
             generate_witness_batch_major_partial(&zeros, setup.n_blocks_log());
-        z.iter_mut()
-            .for_each(|v| *v = flock_core::field::F128::ZERO);
-        a.iter_mut()
-            .for_each(|v| *v = flock_core::field::F128::ZERO);
-        b.iter_mut()
-            .for_each(|v| *v = flock_core::field::F128::ZERO);
+        z.iter_mut().for_each(|v| *v = F128::ZERO);
+        a.iter_mut().for_each(|v| *v = F128::ZERO);
+        b.iter_mut().for_each(|v| *v = F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
-        let union = flock_core::union::UnionInstance::new(&setup.registry, vec![n]);
-        let slot = crate::prover::UnionSlotProverInput::new(
-            (z, a, b, zlc),
-            setup.r1cs.csc_lincheck_circuit(),
-        );
+        let union = UnionInstance::new(&setup.registry, vec![n]);
+        let slot = UnionSlotProverInput::new((z, a, b, zlc), setup.r1cs.csc_lincheck_circuit());
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commit, _) = crate::prover::prove_fast_ligerito_union(
-            &union,
-            &setup.pcs_params,
-            vec![slot],
-            &mut ch_p,
-        );
+        let (proof, commit, _) =
+            prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch_p);
         let mut ch_v = FsChallenger::new(b"poc");
         let res = setup.verify(&commit, &proof, &mut ch_v);
         assert!(
-            matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
+            matches!(res, Err(FlockVerifyError::Lincheck(_))),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
     }

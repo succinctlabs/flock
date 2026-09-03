@@ -21,50 +21,99 @@
 //! test-only `TOWER_CONFIG=chain100`) live in the `#[test]` harness; the
 //! production geometry is typed, never env-var-driven.
 
-use crate::challenger::FsChallenger;
-use crate::prover::{self, UnionSlotProverInput};
-use crate::r1cs_hashes::blake3;
-use crate::r1cs_hashes::merkle_r1cs::SLOT_WORDS;
+use flock_core::{
+    circuit::builder::{GateType, ShapeBuilder, SlotWitness, Wire},
+    matrix_fold::{MatrixClaim, Weight},
+    pcs::{PcsParams, ligerito::LigeritoProfile},
+};
+use flock_field::{F128, F256};
+use flock_merkle::HashKind;
 #[cfg(test)]
-use crate::r1cs_hashes::merkle_r1cs::{ChunkPathInput, MerkleTreeLayout, blake3_spec};
-use crate::schedule::TableType;
-use crate::union::UnionInstance;
-#[cfg(test)]
-use flock_core::circuit::builder::CircuitBuilder;
-use flock_core::circuit::builder::{GateType, ShapeBuilder, SlotWitness, Wire};
-use flock_core::field::{F128, F256};
-use flock_core::matrix_fold::{MatrixClaim, Weight};
-use flock_core::merkle::{self as core_merkle, HashKind};
-use flock_core::pcs::PcsParams;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::verifier;
+use {
+    crate::tower::config::test_config, crate::tower::fl_node::chain_jagged_params,
+    crate::tower::node::node_jagged_params,
+};
 
-// Module map (split from the former single-file tower.rs, 2026-08-27 —
-// pure code motion; item visibilities widened to pub(super) where the old
-// file-wide scope crossed the new file boundaries):
-//   config       TowerConfig, env knobs, fold grinding
-//   envelope     envelope shape, slots, padding
-//   online       per-stage timing + proof census (test-gated)
-//   gates_blake3 BLAKE3 consts/gate, MerklePathGate + Tree (test-gated), Rng
-//   gates_leaf   leaf arithmetic gates, F128 + F256
-//   fs_chain     transcript helpers, FS-chain emit, merged chain + replay
-//   gates_spine  spine/residual/prefix/MAC/assist/zc gates (F128 + F256)
-//   tape         recorded-op tape structs, parse_open_levels
-//   gates_glue   swap/spread/pow/family-transpose gate wrappers
-//   geometry     level geometry, cap wires, publics hash
-//   query        query phase, residual region + checker, pow checks, opening,
-//                LeafOuter
-//   real_walker  RealTape/RealRegion — the outer (envelope) walker
-//   chain        MixedProof, chain leaf shape, ChainProof + builder
-//   fl_node      FlNode + build_fl_node_k (2 chains -> first-level node)
-//   gkr          GKR recs, eq/reported/AG-binding emitters, recombination
-//   child_walker ChildTape/ChildSlots/ChildRegion — the child walker
-//   fold_region  sigma fold + jagged fold regions (uniform + jagged twins)
-//   node         SpineIn/NodeOut/ChainLane + build_node_outer_app (2 -> 1)
-//   e2e_tests    the ignored e2e suite incl. the m32 headline + online bench
+pub use crate::tower::{
+    chain::{ChainProof, build_chain_proof},
+    config::TowerConfig,
+    fl_node::{FlNode, build_fl_node, build_fl_node_k},
+    node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app},
+    query::LeafOuter,
+};
+use crate::{
+    challenger::FsChallenger,
+    prover::UnionSlotProverInput,
+    r1cs_hashes::merkle_r1cs::SLOT_WORDS,
+    schedule::TableType,
+    tower::{
+        chain::{MixedInner, MixedProof, native_chain},
+        child_walker::{
+            ChildSlots, ChildTape, ZskipTapeRec, ZskipWires, check_child_region, emit_child_region,
+        },
+        config::{leaf_zc_ag, outer_union, outer_zc_ag, pcs_batch_for, tower_fold_grinding},
+        envelope::{
+            ENV_ACC_MAIN_WORDS, EnvShape, EnvTail, declare_envelope_slots, env_acc_chain_base,
+            env_acc_main_base, env_app_base, env_pass_base, envelope_shape, outer_lanes,
+            pad_envelope_counts, slot_cached, steady_reps,
+        },
+        fl_node::chain_blake_r1cs,
+        fold_region::{
+            FoldPub, challenge_word_locs, check_ag_skip_publics, check_fold_publics,
+            check_jagged_fold_publics, emit_fold_region, emit_jagged_fold_region, fold_region_ops,
+            jagged_fold_region_ops, labeled_bytes_payloads, locate_and_pin_folds,
+            locate_and_pin_jagged_folds, read_acc_entry, replay_fold_endpoints,
+            replay_jagged_fold_endpoints,
+        },
+        fs_chain::{
+            MergedChain, ag_seed_bytes, assert_chain_replays, bytes_payload_mask, cw,
+            decode_ag_point, duplex_row_count_model, emit_fs_chain, emit_fs_chain_partitioned,
+            flatten_ops, merge_chain,
+        },
+        gates_blake3::{
+            Blake3Gate, CHUNK_END, CHUNK_START, DOMAIN, IV, PARENT, ROOT, digest_words,
+            hash_to_digest, pack_params, pack4, pack8, unpack8,
+        },
+        gates_glue::{
+            BitSpreadGate, BitSpreadTable, FamilyTransposeTileGate, FamilyTransposeTileTable,
+            PowMaskGate, PowMaskTable, SwapGate, SwapTable,
+        },
+        gates_leaf::{LeafEvalGate, LeafEvalGate256, build_mac256},
+        gates_spine::{
+            AssistLayerGate, MacGate, MacGate256, MergedRoundGate, PrefixGate, PrefixGate256,
+            ResidualAccGate256, ResidualPrefix3Gate256, ResidualWeightsGate256, SpineGate,
+            SpineGate256, ZcRoundGate, emit_mac256, emit_spine256, live_element_input_from_rows,
+        },
+        geometry::{
+            CollapsedSlots, Lvl, balance_extra_rows, cap_payloads, cap_wires, emit_publics_hash,
+            l0_ood_z_index, level_geometry, level_query_phase_b3_rows, level_sources,
+            observed_f256, payload_words, query_phase_b3_rows, replay_ligerito_spine256,
+            strat_scheds,
+        },
+        gkr::{
+            ElPiopRec, GkrLayerRec, GkrRec, assertion_mac, circuit_structure_claim_wires,
+            emit_ag_point_binding, emit_boolean_reported_check, emit_element_reported_check,
+            emit_lagrange_lows, emit_recombination, pin_recombination,
+        },
+        online::Online,
+        query::{
+            check_residual_publics, emit_pow_checks, emit_query_phase, emit_recorded_pow_checks,
+            emit_residual_region, leaf_boolean_lcs, leaf_boolean_mats,
+        },
+        real_walker::{
+            RealRegion, RealTape, check_real_child_region, emit_family_h, emit_real_child_region,
+        },
+        tape::{
+            InnerPd, MpRec, OpenLevel, PdRec, PiopRec, RoundRec, parse_open_levels,
+            squeeze_word_wire,
+        },
+    },
+    union::UnionInstance,
+};
 mod chain;
 mod child_walker;
 mod config;
+#[cfg(test)]
 mod e2e_tests;
 mod envelope;
 mod fl_node;
@@ -81,23 +130,3 @@ mod online;
 mod query;
 mod real_walker;
 mod tape;
-
-pub use chain::*;
-use child_walker::*;
-#[allow(unused_imports)]
-pub use config::*;
-use envelope::*;
-pub use fl_node::*;
-use fold_region::*;
-use fs_chain::*;
-use gates_blake3::*;
-use gates_glue::*;
-use gates_leaf::*;
-use gates_spine::*;
-use geometry::*;
-use gkr::*;
-pub use node::*;
-use online::*;
-pub use query::*;
-use real_walker::*;
-use tape::*;

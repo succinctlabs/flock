@@ -89,41 +89,56 @@
 //! rate, query count, cap and PoW change). Full workspace suite green;
 //! digests stable across two print runs.
 
-use ::sha2 as sha2_hash;
-use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
-use flock_prover::challenger::FsChallenger;
-use flock_prover::mixed::MixedRegistryId;
-use flock_prover::pcs::{Commitment, PcsParams};
-use flock_prover::proof_io::MixedProofBundleLigerito;
-use flock_prover::prover::{self, UnionSlotProverInput};
-use flock_prover::r1cs_hashes::{blake3, sha2};
-use flock_prover::schedule::{Registry, TableType};
-use flock_prover::union::UnionInstance;
-use sha2_hash::Digest as _;
+use std::{array::from_fn, env::var_os};
 
+use ::sha2 as sha2_hash;
+use bincode::serialize;
+use blake3::Blake3Setup;
+use flock_core::{
+    pcs::ligerito::LigeritoProfile,
+    proof::{R1csClaim, R1csProofMergedLigerito},
+    test_rng::Rng,
+};
+use flock_prover::{
+    challenger::FsChallenger,
+    mixed::MixedRegistryId,
+    pcs::{Commitment, PcsParams},
+    proof_io::MixedProofBundleLigerito,
+    prover::{self, UnionSlotProverInput},
+    r1cs_hashes::{
+        blake3,
+        blake3::{
+            Compression as Blake3Compression, build_block_r1cs as build_blake3_block_r1cs,
+            generate_witness_batch_major_partial as generate_blake3_witness_batch_major_partial,
+        },
+        sha2,
+        sha2::{
+            Compression as Sha2Compression, build_block_r1cs as build_sha2_block_r1cs,
+            generate_witness_batch_major_partial as generate_sha2_witness_batch_major_partial,
+        },
+    },
+    schedule::{Registry, TableType},
+    union::UnionInstance,
+};
+use prover::prove_fast_ligerito_union;
+use sha2::Sha256HybridSetup;
+use sha2_hash::{Digest as _, Sha256};
 const DOMAIN: &[u8] = b"flock-m6-fixture-v0";
 
-use flock_core::test_rng::Rng;
-
-fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
+fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<Blake3Compression> {
     (0..n)
         .map(|_| {
-            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = from_fn(|_| rng.next_u32());
             let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
             (cv, m, counter, 64u32, 11u32)
         })
         .collect()
 }
 
-fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
+fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<Sha2Compression> {
     (0..n)
-        .map(|_| {
-            (
-                std::array::from_fn(|_| rng.next_u32()),
-                std::array::from_fn(|_| rng.next_u32()),
-            )
-        })
+        .map(|_| (from_fn(|_| rng.next_u32()), from_fn(|_| rng.next_u32())))
         .collect()
 }
 
@@ -146,7 +161,7 @@ fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
 // declarations and the retained registry. The statement transcript changes
 // by design; two deterministic print runs agreed for all six fixtures.
 fn check(label: &str, expected: &str, got: String) {
-    if std::env::var_os("M6_FIXTURES_PRINT").is_some() {
+    if var_os("M6_FIXTURES_PRINT").is_some() {
         println!("(\"{label}\", \"{got}\"),");
         return;
     }
@@ -164,8 +179,8 @@ fn merged_bundle_digest(
     commitment: &Commitment,
     claim: &R1csClaim,
 ) -> String {
-    let mut h = sha2_hash::Sha256::new();
-    h.update(bincode::serialize(proof).expect("proof serializes"));
+    let mut h = Sha256::new();
+    h.update(serialize(proof).expect("proof serializes"));
     h.update(commitment.cap.as_flattened());
     for v in [claim.ab.value, claim.c.value] {
         h.update(v.lo.to_le_bytes());
@@ -211,8 +226,8 @@ fn m6_merged_union_proof_bytes_pinned() {
     ];
 
     let nu = 10usize;
-    let sha2_r1cs = sha2::build_block_r1cs(nu);
-    let blake3_r1cs = blake3::build_block_r1cs(nu);
+    let sha2_r1cs = build_sha2_block_r1cs(nu);
+    let blake3_r1cs = build_blake3_block_r1cs(nu);
     let registry = Registry::new(
         vec![
             TableType::from_block_r1cs(&blake3_r1cs),
@@ -230,7 +245,7 @@ fn m6_merged_union_proof_bytes_pinned() {
             m: union.dense_m(),
             log_inv_rate: 1,
             log_batch_size: 6,
-            profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+            profile: LigeritoProfile::Fast,
             // The shipped union configuration (integer-lane commit).
             num_lanes: union.commit_lanes(6),
             merkle_hash: Default::default(),
@@ -243,24 +258,24 @@ fn m6_merged_union_proof_bytes_pinned() {
 
         let slots = vec![
             UnionSlotProverInput::new(
-                sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                generate_sha2_witness_batch_major_partial(&sha2_inputs, nu),
                 s2_circuit,
             ),
             UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                generate_blake3_witness_batch_major_partial(&blake3_inputs, nu),
                 b3_circuit,
             ),
         ];
         let mut ch = FsChallenger::new(DOMAIN);
         let (proof, commitment, claim) =
-            prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
+            prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
         let bundle = MixedProofBundleLigerito {
             registry_id: MixedRegistryId::Blake3Sha2Nu10,
             counts: counts.iter().map(|&n| n as u64).collect(),
             commitment: commitment.clone(),
             proof: proof.clone(),
         };
-        let mut h = sha2_hash::Sha256::new();
+        let mut h = Sha256::new();
         h.update(bundle.to_bytes());
         for v in [claim.ab.value, claim.c.value] {
             h.update(v.lo.to_le_bytes());
@@ -286,7 +301,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
         let n_blocks = 256usize;
         // The setup API IS the shipped single-slot union path since the
         // 2026-08-14 consolidation — the anchor pins it directly.
-        let setup = blake3::Blake3Setup::new(n_blocks);
+        let setup = Blake3Setup::new(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
         let inputs = random_blake3_inputs(&mut rng, n_blocks);
         let mut ch = FsChallenger::new(DOMAIN);
@@ -302,7 +317,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     {
         const EXPECTED: &str = "703cc4d574a3bd29629cbe98a149ddbb0c73f851bb0bd03ae402c7dcf73ca936";
         let n_blocks = 128usize;
-        let setup = sha2::Sha256HybridSetup::new(n_blocks);
+        let setup = Sha256HybridSetup::new(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);
         let inputs = random_sha2_inputs(&mut rng, n_blocks);
         let mut ch = FsChallenger::new(DOMAIN);

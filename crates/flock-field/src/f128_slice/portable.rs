@@ -1,4 +1,4 @@
-use crate::field::F128;
+use crate::F128;
 
 #[inline]
 pub(super) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {

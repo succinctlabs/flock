@@ -1,4 +1,8 @@
-use super::*;
+use std::mem::take;
+
+use flock_transcript::transcript_record::{TranscriptOp, TranscriptOp as Op};
+
+use crate::{r1cs_hashes::fs_chain::FsChainTrace, tower::Wire};
 
 /// One packed-direct claim on the tape: its absorbed VALUE and gamma. The
 /// POINT is not on the stream since merged-open v1 — it is transcript-derived
@@ -16,7 +20,7 @@ pub(super) struct PdRec {
 #[inline]
 pub(super) fn squeeze_word_wire(
     outs: &[Vec<Wire>],
-    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &FsChainTrace,
     fin: usize,
     offset: usize,
 ) -> Wire {
@@ -64,7 +68,7 @@ pub(super) struct OodRec {
     pub(super) beta_ch: usize,
 }
 
-/// The multipoint region of the merged open, located on the tape (MVP-8):
+/// The multipoint region of the merged open, located on the tape:
 /// the group values' absorb, the batching gamma, the two-product sumcheck
 /// rounds, and the anchor assist's `v` + rounds. For a pure-element inner
 /// (R = 0) the RS values are absent and the sumcheck is the single
@@ -127,7 +131,7 @@ pub(super) struct InitialOodRec {
 /// not as a wrong wire.
 #[allow(clippy::type_complexity)]
 pub(super) fn parse_open_levels(
-    ops: &[flock_core::transcript_record::TranscriptOp],
+    ops: &[TranscriptOp],
     cap0_bytes: usize,
     r: usize,
 ) -> (
@@ -140,7 +144,6 @@ pub(super) fn parse_open_levels(
     usize,
     Vec<OpenLevel>,
 ) {
-    use flock_core::transcript_record::TranscriptOp as Op;
     struct Cur<'a> {
         ops: &'a [Op],
         i: usize,
@@ -304,8 +307,7 @@ pub(super) fn parse_open_levels(
         if in_pd {
             // Ring-switched claims front the intake on boolean-bearing
             // tapes: [label, s_hat_v slice, r_dprime slice] each, then the
-            // bare gamma squeezes — walk over them (mvp9 pins them
-            // separately).
+            // bare gamma squeezes.
             if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0") {
                 intake_rs += 1;
                 cur.bump(); // label
@@ -577,7 +579,7 @@ pub(super) fn parse_open_levels(
         cur.bump();
         levels.push(OpenLevel {
             initial_ood: if li == 0 {
-                std::mem::take(&mut initial_ood)
+                take(&mut initial_ood)
             } else {
                 Vec::new()
             },

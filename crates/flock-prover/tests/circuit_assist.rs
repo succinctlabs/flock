@@ -14,20 +14,30 @@
 //! replicated here — so a protocol change cannot silently drift the gate
 //! from the verifier it transcribes.
 
-use flock_core::circuit::builder::{GateType, ShapeBuilder, SlotWitness};
-use flock_core::field::F128;
-use flock_core::pcs::PcsParams;
-use flock_core::pcs::jagged::{STATE_INITIAL, STATE_SUCCESS, assist_sparse_transitions};
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::schedule::IoWord;
-use flock_core::verifier;
-use flock_prover::challenger::FsChallenger;
-use flock_prover::prover::{self, UnionElementSlotInput};
-use flock_prover::union::UnionInstance;
+use std::sync::Arc;
 
+use flock_core::{
+    circuit::builder::{GateType, ShapeBuilder, SlotWitness},
+    element_r1cs::{ElementTableBuilder, ElementTableType},
+    field::F128,
+    pcs::{
+        PcsParams,
+        jagged::{STATE_INITIAL, STATE_SUCCESS, assist_sparse_transitions},
+        ligerito::LigeritoProfile,
+    },
+    schedule::IoWord,
+    test_rng::Rng,
+    verifier,
+};
+use flock_prover::{
+    challenger::FsChallenger,
+    prover::{self, UnionElementSlotInput},
+    schedule::TableType,
+    union::UnionInstance,
+};
+use prover::prove_fast_ligerito_union_circuit;
+use verifier::verify_ligerito_union_circuit;
 const DOMAIN: &[u8] = b"flock-circuit-assist-v0";
-
-use flock_core::test_rng::Rng;
 
 /// `point_bit`'s convention: coordinate `layer`, zero past the end.
 fn pb(z: &[F128], layer: usize) -> F128 {
@@ -51,7 +61,7 @@ fn pb(z: &[F128], layer: usize) -> F128 {
 /// 53 columns — kappa 6. The sparse table is baked from
 /// [`assist_sparse_transitions`] at construction.
 struct AssistLayerGate {
-    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    ty: Arc<ElementTableType>,
 }
 
 const AL_IN: usize = 9; // g0..g3, za, rb, rc, rd, one
@@ -61,7 +71,6 @@ const AL_K: usize = 53;
 
 impl AssistLayerGate {
     fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let one = F128::ONE;
         let sparse = assist_sparse_transitions();
         let mut b = ElementTableBuilder::new(6);
@@ -106,7 +115,7 @@ impl AssistLayerGate {
             );
         }
         Self {
-            ty: std::sync::Arc::new(b.build().expect("assist layer gate is valid")),
+            ty: Arc::new(b.build().expect("assist layer gate is valid")),
         }
     }
 }
@@ -115,12 +124,12 @@ impl GateType for AssistLayerGate {
     type Row = Vec<F128>;
     type Hint = ();
 
-    fn table(&self) -> flock_prover::schedule::TableType {
+    fn table(&self) -> TableType {
         let mut schema: Vec<IoWord> = (0..AL_IN).map(IoWord::input).collect();
         for s in 0..4 {
             schema.push(IoWord::output(AL_OUT0 + s));
         }
-        flock_prover::schedule::TableType::element(self.ty.clone()).with_io_schema(schema)
+        TableType::element(self.ty.clone()).with_io_schema(schema)
     }
 
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
@@ -285,7 +294,7 @@ fn assist_layer_gate_chains_match_the_native_dp() {
         merkle_hash: Default::default(),
     };
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+    let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
         &union,
         &shape.circuit,
         &built.public,
@@ -297,7 +306,7 @@ fn assist_layer_gate_chains_match_the_native_dp() {
         &mut ch,
     );
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit(
+    verify_ligerito_union_circuit(
         &union,
         &shape.circuit,
         &built.public,
@@ -315,7 +324,7 @@ fn assist_layer_gate_chains_match_the_native_dp() {
     bad[last] += F128::ONE;
     let mut ch = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union_circuit(
+        verify_ligerito_union_circuit(
             &union,
             &shape.circuit,
             &bad,

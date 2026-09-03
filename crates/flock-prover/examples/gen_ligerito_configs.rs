@@ -15,7 +15,7 @@
 //!
 //! Run: `cargo run --release --example gen_ligerito_configs`
 
-use std::path::Path;
+use std::{fs::write, path::Path, process::exit};
 
 use flock_prover::pcs::ligerito::{LigeritoProfile, LigeritoSecurityConfig};
 
@@ -40,7 +40,7 @@ fn main() {
                     // Round-trip to be sure the written form re-validates.
                     LigeritoSecurityConfig::from_toml_str(&toml)
                         .unwrap_or_else(|e| panic!("m={m}: written toml fails reload: {e}"));
-                    std::fs::write(&path, &toml).expect("write toml");
+                    write(&path, &toml).expect("write toml");
                     let queries: usize = cfg.levels.iter().map(|l| l.queries).sum();
                     let ood: usize = cfg.levels.iter().map(|l| l.ood_samples).sum();
                     let max_fold_grind = cfg
@@ -64,6 +64,6 @@ fn main() {
         }
     }
     if failures > 0 {
-        std::process::exit(1);
+        exit(1);
     }
 }

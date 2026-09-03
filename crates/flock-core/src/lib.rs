@@ -17,6 +17,21 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+use std::{
+    alloc::{Layout, alloc_zeroed, handle_alloc_error},
+    env::var,
+    sync::OnceLock,
+    thread::available_parallelism,
+};
+
+pub use flock_parallel::all_core_pool;
+use rayon::{ThreadPoolBuilder, current_num_threads};
+#[cfg(target_os = "linux")]
+use {std::collections::HashSet, std::fs::read_dir, std::fs::read_to_string};
+#[cfg(target_os = "macos")]
+use {std::process::Command, std::str::from_utf8};
+
+use crate::field::F128;
 pub mod aggregate;
 pub mod bits;
 pub mod challenger;
@@ -24,7 +39,6 @@ pub mod circuit;
 pub mod element_r1cs;
 pub mod field;
 pub mod genus95_curve_code;
-pub mod hash;
 pub mod lincheck;
 pub mod matrix_fold;
 pub mod merkle;
@@ -62,11 +76,11 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
-    if std::env::var("RAYON_NUM_THREADS").is_ok() {
+    if var("RAYON_NUM_THREADS").is_ok() {
         return None;
     }
     let n = perf_core_count();
-    match rayon::ThreadPoolBuilder::new()
+    match ThreadPoolBuilder::new()
         .num_threads(n)
         // 8 MB workers (default 2 MB): the prover's kernels carry large NEON
         // frames (bitslice planes, encode/product scratch, unreduced
@@ -79,38 +93,6 @@ pub fn init_perf_thread_pool() -> Option<usize> {
         Ok(()) => Some(n),
         Err(_) => None, // pool already built
     }
-}
-
-/// Dedicated all-core (P+E) rayon pool for flat, fine-grained parallel-for
-/// passes. The global pool deliberately excludes efficiency cores (see
-/// [`init_perf_thread_pool`]) because they straggle at the synchronization
-/// barriers of NTT-shaped phases. Passes with many small independent work
-/// items and a single join (e.g. the PCS combine's block fold: 4096 blocks of
-/// ~4 µs each) let the work-stealing scheduler drain around slow cores, and
-/// measurably gain from the extra E-core throughput (open_combine_probe:
-/// 18.0 → 12.8 ms, −29% at m=30 on 4P+4E).
-///
-/// Built lazily on first use. Respects `RAYON_NUM_THREADS` (so single-thread
-/// parity tests and ST bench conventions stay single-threaded).
-pub fn all_core_pool() -> &'static rayon::ThreadPool {
-    use std::sync::OnceLock;
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let n = std::env::var("RAYON_NUM_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            });
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .stack_size(8 << 20)
-            .build()
-            .expect("all_core_pool: pool build failed")
-    })
 }
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
@@ -145,8 +127,8 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
 }
 
 /// Compatibility shim — same as `alloc_uninit_vec::<F128>(n)`.
-pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<crate::field::F128> {
-    alloc_uninit_vec::<crate::field::F128>(n)
+pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<F128> {
+    alloc_uninit_vec::<F128>(n)
 }
 
 /// At/above this round width (in summed elements) a sumcheck round uses the full
@@ -162,7 +144,7 @@ pub(crate) const SUMCHECK_PAR_THRESHOLD: usize = 1 << 12;
 /// 8-P-core M-series; the √-shape is machine-independent, only the constant
 /// shifts, so it degrades gracefully.
 pub(crate) fn round_fanout(pairs: usize) -> usize {
-    (pairs / 128).isqrt().clamp(1, rayon::current_num_threads())
+    (pairs / 128).isqrt().clamp(1, current_num_threads())
 }
 
 /// Rayon `with_min_len` value for parallelising a sumcheck round of `pairs`
@@ -184,19 +166,17 @@ pub(crate) fn sumcheck_round_min_len(pairs: usize, n_blocks: usize) -> Option<us
 /// At/above this fold width a fold uses the full thread pool; below it,
 /// [`fold_min_len`] caps the fan-out.
 ///
-/// Overridable via `FLOCK_FOLD_GATE` for tuning. Measured on M4 Max (10 P-core
-/// pool) with the since-deleted `product_gkr::tests::fold_scaling_probe`
-/// (bloat ledger §E): the full-split branch
-/// scales well (2^17 outputs run 3.2× faster than serial), but the capped
+/// Overridable via `FLOCK_FOLD_GATE` for tuning. On an M4 Max with ten
+/// performance cores, the full split ran 3.2× faster at 2^17 outputs. The capped
 /// fan-out branch below the gate *loses* to serial — 1.3× slower at 2^15
 /// outputs, 3× slower at 2^13. Lowering the gate hands those widths the
 /// full split instead of the cap.
 pub(crate) const FOLD_PAR_THRESHOLD_DEFAULT: usize = 1 << 16;
 
 pub(crate) fn fold_par_threshold() -> usize {
-    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static GATE: OnceLock<usize> = OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("FLOCK_FOLD_GATE")
+        var("FLOCK_FOLD_GATE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(FOLD_PAR_THRESHOLD_DEFAULT)
@@ -214,7 +194,7 @@ pub(crate) fn fold_min_len(half: usize) -> Option<usize> {
     if half >= fold_par_threshold() {
         Some(1)
     } else if fold_sqrt_rule() {
-        match (half / 1024).isqrt().clamp(1, rayon::current_num_threads()) {
+        match (half / 1024).isqrt().clamp(1, current_num_threads()) {
             0 | 1 => None,
             t => Some(half.div_ceil(t)),
         }
@@ -226,17 +206,12 @@ pub(crate) fn fold_min_len(half: usize) -> Option<usize> {
 /// Whether sub-gate folds use the capped √-rule fan-out (`FLOCK_FOLD_RULE=sqrt`)
 /// rather than running serial.
 ///
-/// Serial is the default because the cap measured *worse than serial* on this
-/// crate's only `fold_min_len` consumer, `product_gkr`: per the since-deleted
-/// `fold_scaling_probe` on a 10-P-core M4 Max, the capped branch is 1.3× slower
-/// than serial at 2^15 outputs and 3× slower at 2^13, and switching those
-/// widths to serial cut the end-to-end fold phase from ~5.0 ms to ~4.6 ms at
-/// μ=20. The √-rule was originally tuned for `logup_gkr`'s fold on an 8-P-core
-/// part; that module is not in this tree, so the knob preserves it rather than
-/// deleting it.
+/// Serial is the default because capped work was slower for `product_gkr`.
+/// Serial execution reduced the fold phase from about 5.0 ms to 4.6 ms at
+/// μ=20 on an M4 Max. The option remains available for machine-specific tuning.
 pub(crate) fn fold_sqrt_rule() -> bool {
-    static RULE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *RULE.get_or_init(|| std::env::var("FLOCK_FOLD_RULE").is_ok_and(|v| v == "sqrt"))
+    static RULE: OnceLock<bool> = OnceLock::new();
+    *RULE.get_or_init(|| var("FLOCK_FOLD_RULE").is_ok_and(|v| v == "sqrt"))
 }
 
 /// Types whose all-zero bit pattern is a valid, initialized value.
@@ -256,7 +231,7 @@ unsafe impl Zeroable for u16 {}
 unsafe impl Zeroable for u32 {}
 unsafe impl Zeroable for u64 {}
 unsafe impl Zeroable for usize {}
-unsafe impl Zeroable for field::F128 {}
+unsafe impl Zeroable for F128 {}
 unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
 
 /// A length-`n` all-zero vector from `alloc_zeroed` — LAZY zero pages from
@@ -269,16 +244,16 @@ pub fn alloc_zeroed_vec<T: Zeroable>(n: usize) -> Vec<T> {
     if n == 0 {
         return Vec::new();
     }
-    let layout = std::alloc::Layout::array::<T>(n).expect("allocation size overflows");
+    let layout = Layout::array::<T>(n).expect("allocation size overflows");
     // SAFETY:
     // - `alloc_zeroed` returns `n * size_of::<T>()` zeroed bytes with the
     //   layout's alignment (or null, handled below).
     // - T: Copy (no Drop), and `T: Zeroable` certifies the all-zero bit
     //   pattern is a valid T.
     unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
+        let ptr = alloc_zeroed(layout) as *mut T;
         if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
+            handle_alloc_error(layout);
         }
         Vec::from_raw_parts(ptr, n, n)
     }
@@ -288,7 +263,6 @@ pub fn alloc_zeroed_vec<T: Zeroable>(n: usize) -> Vec<T> {
 /// memoizes it so hot paths can cheaply ask "is the current rayon pool the
 /// homogeneous P-core pool?" (i.e. `current_num_threads() <= this`).
 pub(crate) fn perf_core_count_cached() -> usize {
-    use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(perf_core_count)
 }
@@ -306,10 +280,10 @@ pub(crate) fn perf_core_count_cached() -> usize {
 fn perf_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("sysctl")
+        if let Ok(out) = Command::new("sysctl")
             .args(["-n", "hw.perflevel0.physicalcpu"])
             .output()
-            && let Ok(s) = std::str::from_utf8(&out.stdout)
+            && let Ok(s) = from_utf8(&out.stdout)
             && let Ok(n) = s.trim().parse::<usize>()
             && n > 0
         {
@@ -321,15 +295,11 @@ fn perf_core_count() -> usize {
         if let Some(n) = linux_physical_cores()
             && n > 0
         {
-            let available = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
+            let available = available_parallelism().map(|n| n.get()).unwrap_or(1);
             return n.min(available);
         }
     }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 /// Count distinct physical cores via `/sys` topology: one entry per unique
@@ -337,9 +307,8 @@ fn perf_core_count() -> usize {
 /// `None` if the topology can't be read (caller falls back to logical count).
 #[cfg(target_os = "linux")]
 fn linux_physical_cores() -> Option<usize> {
-    use std::collections::HashSet;
     let mut cores: HashSet<(String, String)> = HashSet::new();
-    for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()? {
+    for entry in read_dir("/sys/devices/system/cpu").ok()? {
         let Ok(entry) = entry else {
             continue;
         };
@@ -352,8 +321,8 @@ fn linux_physical_cores() -> Option<usize> {
             continue; // skip "cpufreq", "cpuidle", etc.
         }
         let topo = path.join("topology");
-        let core_id = std::fs::read_to_string(topo.join("core_id")).ok();
-        let pkg = std::fs::read_to_string(topo.join("physical_package_id")).ok();
+        let core_id = read_to_string(topo.join("core_id")).ok();
+        let pkg = read_to_string(topo.join("physical_package_id")).ok();
         if let (Some(c), Some(p)) = (core_id, pkg) {
             cores.insert((p.trim().to_owned(), c.trim().to_owned()));
         }
@@ -371,10 +340,10 @@ fn linux_physical_cores() -> Option<usize> {
 fn efficiency_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("sysctl")
+        if let Ok(out) = Command::new("sysctl")
             .args(["-n", "hw.perflevel1.physicalcpu"])
             .output()
-            && let Ok(s) = std::str::from_utf8(&out.stdout)
+            && let Ok(s) = from_utf8(&out.stdout)
             && let Ok(n) = s.trim().parse::<usize>()
         {
             return n;
@@ -397,10 +366,8 @@ fn efficiency_core_count() -> usize {
 /// of topology (for re-measurement on new machines; pair against the sites'
 /// `*_PCORES_ONLY` switches for A/B).
 pub(crate) fn ecore_rich_topology() -> bool {
-    use std::sync::OnceLock;
     static B: OnceLock<bool> = OnceLock::new();
     *B.get_or_init(|| {
-        std::env::var("FLOCK_ALLCORE").is_ok()
-            || 2 * efficiency_core_count() >= perf_core_count_cached()
+        var("FLOCK_ALLCORE").is_ok() || 2 * efficiency_core_count() >= perf_core_count_cached()
     })
 }

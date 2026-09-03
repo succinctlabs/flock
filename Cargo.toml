@@ -1,5 +1,15 @@
 [workspace]
-members = ["crates/flock-core", "crates/flock-prover", "crates/flock-cuda-ffi"]
+members = [
+    "crates/flock-core",
+    "crates/flock-cuda-ffi",
+    "crates/flock-field",
+    "crates/flock-hash",
+    "crates/flock-merkle",
+    "crates/flock-multilinear",
+    "crates/flock-parallel",
+    "crates/flock-prover",
+    "crates/flock-transcript",
+]
 resolver = "2"
 
 [workspace.package]
@@ -9,6 +19,12 @@ license = "MIT OR Apache-2.0"
 authors = ["Succinct Labs", "Benedikt Bunz", "William Wang"]
 
 [workspace.dependencies]
+flock-field = { path = "crates/flock-field" }
+flock-hash = { path = "crates/flock-hash" }
+flock-merkle = { path = "crates/flock-merkle" }
+flock-multilinear = { path = "crates/flock-multilinear" }
+flock-parallel = { path = "crates/flock-parallel" }
+flock-transcript = { path = "crates/flock-transcript" }
 rayon = "1.10"
 sha2 = { version = "0.10", features = ["asm"] }
 rand_core = "0.9"
@@ -47,6 +63,7 @@ assertions_on_constants = "allow"
 doc_lazy_continuation = "allow"
 doc_overindented_list_items = "allow"
 unusual_byte_groupings = "allow"
+wildcard_imports = "deny"
 
 [profile.bench]
 # line-tables-only adds function names + line numbers for sampling profilers

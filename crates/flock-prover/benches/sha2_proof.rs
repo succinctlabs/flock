@@ -3,14 +3,22 @@
 //! Uses `Sha256HybridSetup::prove_fast` — the fused (z, a, b, c, z_lincheck)
 //! generator, mirroring `sha_packed::prove_fast`.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    array::from_fn,
+    env::var,
+    hint::black_box,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
+};
 
-use flock_prover::challenger::FsChallenger;
-use flock_prover::r1cs_hashes::sha2::{K_LOG, Sha256HybridSetup, USEFUL_BITS, min_n_blocks_log};
-
+use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    proof_io::R1csProofBundleLigerito,
+    r1cs_hashes::sha2::{K_LOG, Sha256HybridSetup, USEFUL_BITS, min_n_blocks_log},
+};
 // Peak-heap tracker (wraps System): records the high-water mark of currently
 // outstanding bytes, same notion as binius64's peakmem-alloc. Negligible
 // overhead (one relaxed atomic op per alloc/dealloc).
@@ -52,11 +60,9 @@ fn peak_mb() -> f64 {
     PEAK.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
 }
 
-use flock_core::test_rng::Rng;
-
 fn random_input(rng: &mut Rng) -> ([u32; 8], [u32; 16]) {
-    let h: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h: [u32; 8] = from_fn(|_| rng.next_u32());
+    let m: [u32; 16] = from_fn(|_| rng.next_u32());
     (h, m)
 }
 
@@ -145,7 +151,7 @@ fn bench_one(n_compressions: usize, n_runs: usize) {
             .expect("verify failed");
         println!("  verify: {}", fmt_ms(t.elapsed().as_secs_f64()));
 
-        let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
+        let bundle = R1csProofBundleLigerito { commitment, proof };
         let proof_size = bundle.to_bytes().len();
         println!(
             "  proof size: {} bytes ({:.2} KiB)",
@@ -161,7 +167,7 @@ fn bench_one(n_compressions: usize, n_runs: usize) {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes)");
     println!(
@@ -173,7 +179,7 @@ fn main() {
     // with SHA2_LOG2S (space/comma-separated log2 compression counts, e.g. "12 14") —
     // used by benchmarks/bench_sha256.sh to sweep at the same sizes as the
     // competitors; each listed size is benched best-of-3.
-    let specs: Vec<(usize, usize)> = match std::env::var("SHA2_LOG2S") {
+    let specs: Vec<(usize, usize)> = match var("SHA2_LOG2S") {
         Ok(s) => s
             .split([',', ' '])
             .filter(|t| !t.is_empty())

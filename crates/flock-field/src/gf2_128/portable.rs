@@ -1,4 +1,4 @@
-use super::{F128, F256Unreduced, ghash_reduce};
+use crate::gf2_128::{F128, F256Unreduced, ghash_reduce};
 
 /// 64×64 carry-less product into 128 bits (lo, hi).
 pub fn clmul64(a: u64, b: u64) -> (u64, u64) {

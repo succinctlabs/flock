@@ -1,0 +1,20 @@
+[package]
+name = "flock-merkle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Merkle commitments used by Flock protocols."
+
+[features]
+hash-count = []
+
+[dependencies]
+flock-hash = { workspace = true }
+flock-parallel = { workspace = true }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

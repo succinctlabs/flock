@@ -9,25 +9,30 @@ description = "Protocol library and verifier for the Flock R1CS-over-GF(2) PIOP.
 [features]
 # Count hash invocations (Merkle leaf/pair compressions, FS transcript
 # absorption and squeezes, PoW evaluations) via global relaxed atomics. Counts
-# whichever hash each component is configured with — see `hash::HashKind`. Off
+# whichever hash each component is configured with. See `flock_hash::HashKind`. Off
 # by default; used by flock-prover's benches/verifier_hash_count.rs.
-hash-count = []
+hash-count = ["flock-merkle/hash-count", "flock-transcript/hash-count"]
 
 # Count F128 multiplications and inversions via global relaxed atomics, so the
 # verifier's arithmetic can be attributed per routine. Reports BOTH the native
 # mul count (inversions are ~255 muls each) and the circuit constraint count
 # (an inversion is one witnessed constraint) -- they rank routines differently.
 # Off by default; used by flock-prover's benches/verifier_mul_count.rs.
-mul-count = []
+mul-count = ["flock-field/mul-count"]
 
 # Compile the insecure `RandomChallenger` (no Fiat-Shamir binding) into a
 # non-test build. Off by default so real proofs *cannot* reference it — see
-# `src/challenger.rs`. The crate's own `#[cfg(test)]` code gets it for free;
-# this feature only exists for bench/example isolation (flock-prover enables
-# it dev-only). NEVER enable it for a build that produces real proofs.
-unsound-challenger = []
+# `flock-transcript::challenger`. This feature supports benchmarks and examples only.
+# flock-prover enables it for development targets. Never use it for real proofs.
+unsound-challenger = ["flock-transcript/unsound-challenger"]
 
 [dependencies]
+flock-field = { workspace = true }
+flock-merkle = { workspace = true }
+flock-transcript = { workspace = true }
+flock-hash = { workspace = true }
+flock-multilinear = { workspace = true }
+flock-parallel = { workspace = true }
 rayon = { workspace = true }
 sha2 = { workspace = true }
 rand_core = { workspace = true }
@@ -39,6 +44,7 @@ toml = { workspace = true }
 [dev-dependencies]
 # Used by `LigeritoSecurityConfig` serde round-trip tests.
 serde_json = { workspace = true }
+flock-transcript = { workspace = true, features = ["unsound-challenger"] }
 
 [lints]
 workspace = true

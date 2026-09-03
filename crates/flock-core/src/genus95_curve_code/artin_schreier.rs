@@ -1,4 +1,4 @@
-use super::field::{F128, F128Ext};
+use crate::genus95_curve_code::field::{F128, F128Ext};
 
 #[derive(Clone)]
 pub(crate) struct ArtinSchreierSolver {

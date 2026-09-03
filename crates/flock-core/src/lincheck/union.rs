@@ -1,8 +1,8 @@
-//! Union-column lincheck — multi-table Phase 2, milestone M2.
+//! Union-column lincheck for multi-table proofs.
 //!
 //! Generalizes the single-table lincheck (`super`) from one slot to the `T`
-//! aligned slot subcubes of a registry instance (design doc §"Lincheck over
-//! the union"): ONE product sumcheck over the **union column domain** — the
+//! aligned slot subcubes of a registry instance. One product sumcheck over
+//! the **union column domain** — the
 //! seven in-word coordinates plus every chunk-and-prefix coordinate, i.e.
 //! everything except the shared row block `R` — proves the α-batched claim
 //! `α·â(r) + b̂(r)` left by the union zerocheck.
@@ -59,17 +59,20 @@
 //! bind inside the lincheck. At full utilization the sum is exactly `1`
 //! (the eq-sum identity), reproducing today's `target += β` byte for byte.
 
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::matrix_fold::{MatrixClaim, Weight};
-use crate::schedule::Registry;
-use crate::union::UnionInstance;
-use crate::zerocheck::K_SKIP;
+use std::{env::var, time::Instant};
 
-use super::{
-    LincheckCircuit, LincheckClaim, LincheckGrinding, LincheckProof, QuirkyPoint, SkipPoint,
-    VerifyError, build_eq_table, build_quirky_eq_table_from_weights, column_sumcheck_prove,
-    inner_product, partial_fold_packed_z_rows_best,
+use crate::{
+    challenger::Challenger,
+    field::F128,
+    lincheck::{
+        LincheckCircuit, LincheckClaim, LincheckError, LincheckGrinding, LincheckProof,
+        QuirkyPoint, SkipPoint, build_eq_table, build_quirky_eq_table_from_weights,
+        column_sumcheck_prove, inner_product, partial_fold_packed_z_rows_best,
+    },
+    matrix_fold::{MatrixClaim, Weight},
+    schedule::Registry,
+    union::UnionInstance,
+    zerocheck::K_SKIP,
 };
 
 /// One slot's lincheck inputs, in slot order — the union counterpart of the
@@ -239,7 +242,7 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     }
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let trace = var("LINCHECK_TRACE").is_ok();
     let mut grinding_nonces = Vec::with_capacity(
         grinding.nonce_count(
             inner_rest_len,
@@ -273,11 +276,7 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     // slot to FILL the boolean region — true for every single-type registry,
     // and for no multi-slot one.
     let single = registry.num_boolean() == 1 && registry.slots()[0].m_slot == registry.m_bool();
-    let t_comb = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t_comb = if trace { Some(Instant::now()) } else { None };
     let mut comb_vec: Vec<F128> = if single {
         Vec::new()
     } else {
@@ -347,11 +346,7 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     //    single partial fold. Dummy rows are honest zeros, so folding only
     //    the DECLARED rows equals the full-capacity fold byte for byte —
     //    the row-aware dispatch makes the fold count-proportional (M6).
-    let t_fold = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
+    let t_fold = if trace { Some(Instant::now()) } else { None };
     let eq_x_outer = build_eq_table(&x_ab.x_outer);
     let mut z_vec: Vec<F128> = if single {
         Vec::new()
@@ -535,10 +530,10 @@ impl MatrixAssertion {
     /// Discharge the assertion: rebuild the per-type combs (`O(Σ_t nnz_t)`,
     /// the only place the base matrices are read) and check the closed-form
     /// Comb-hat collapse against [`Self::target`].
-    pub fn check_reported(&self, registry: &Registry) -> Result<(), VerifyError> {
+    pub fn check_reported(&self, registry: &Registry) -> Result<(), LincheckError> {
         let k_skip = K_SKIP;
         if self.evals.len() != registry.num_boolean() {
-            return Err(VerifyError::BadVectorLength {
+            return Err(LincheckError::BadVectorLength {
                 which: "matrix_evals",
                 expected: registry.num_boolean(),
                 got: self.evals.len(),
@@ -565,7 +560,7 @@ impl MatrixAssertion {
             }
         }
         if acc != self.target {
-            return Err(VerifyError::ConsistencyFailed {
+            return Err(LincheckError::ConsistencyFailed {
                 which: "matrix-evals",
             });
         }
@@ -580,7 +575,7 @@ impl MatrixAssertion {
         &self,
         union: &UnionInstance<'_>,
         circuits: &[&dyn LincheckCircuit],
-    ) -> Result<(), VerifyError> {
+    ) -> Result<(), LincheckError> {
         let registry = union.registry();
         let k_skip = K_SKIP;
         assert_eq!(
@@ -618,7 +613,7 @@ impl MatrixAssertion {
 
         let comb_partial = union_comb_partial(registry, &combs, &self.rr, k_skip);
         if self.target != inner_product(&comb_partial, &self.z_partial) {
-            return Err(VerifyError::ConsistencyFailed {
+            return Err(LincheckError::ConsistencyFailed {
                 which: "sumcheck-final",
             });
         }
@@ -645,7 +640,7 @@ pub fn verify_union<Ch: Challenger>(
     v_b: F128,
     proof: &LincheckProof,
     challenger: &mut Ch,
-) -> Result<LincheckClaim, VerifyError> {
+) -> Result<LincheckClaim, LincheckError> {
     verify_union_with_grinding(
         union,
         circuits,
@@ -668,7 +663,7 @@ pub fn verify_union_with_grinding<Ch: Challenger>(
     proof: &LincheckProof,
     grinding: LincheckGrinding,
     challenger: &mut Ch,
-) -> Result<LincheckClaim, VerifyError> {
+) -> Result<LincheckClaim, LincheckError> {
     let (claim, assertion) = verify_union_deferred_with_grinding(
         union, circuits, x_ab, v_a, v_b, proof, grinding, challenger,
     )?;
@@ -694,7 +689,7 @@ pub fn verify_union_deferred<Ch: Challenger>(
     v_b: F128,
     proof: &LincheckProof,
     challenger: &mut Ch,
-) -> Result<(LincheckClaim, MatrixAssertion), VerifyError> {
+) -> Result<(LincheckClaim, MatrixAssertion), LincheckError> {
     verify_union_deferred_with_grinding(
         union,
         circuits,
@@ -717,7 +712,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     proof: &LincheckProof,
     grinding: LincheckGrinding,
     challenger: &mut Ch,
-) -> Result<(LincheckClaim, MatrixAssertion), VerifyError> {
+) -> Result<(LincheckClaim, MatrixAssertion), LincheckError> {
     let registry = union.registry();
     let k_skip = K_SKIP;
     let nu = union.n_log();
@@ -733,7 +728,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     for (ty, circuit) in registry.boolean_types().iter().zip(circuits) {
         let k = 1usize << ty.k_log;
         if circuit.n_cols() != k {
-            return Err(VerifyError::BadMatrixShape {
+            return Err(LincheckError::BadMatrixShape {
                 which: "circuit",
                 expected: k,
                 got_rows: k,
@@ -747,28 +742,28 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
         );
     }
     if x_ab.x_inner_rest.len() != inner_rest_len {
-        return Err(VerifyError::BadInnerRestLength {
+        return Err(LincheckError::BadInnerRestLength {
             which: "x_ab",
             expected: inner_rest_len,
             got: x_ab.x_inner_rest.len(),
         });
     }
     if x_ab.x_outer.len() != nu {
-        return Err(VerifyError::BadOuterLength {
+        return Err(LincheckError::BadOuterLength {
             which: "x_ab",
             expected: nu,
             got: x_ab.x_outer.len(),
         });
     }
     if proof.rounds.len() != inner_rest_len {
-        return Err(VerifyError::BadVectorLength {
+        return Err(LincheckError::BadVectorLength {
             which: "rounds",
             expected: inner_rest_len,
             got: proof.rounds.len(),
         });
     }
     if proof.z_partial.len() != n_skip {
-        return Err(VerifyError::BadVectorLength {
+        return Err(LincheckError::BadVectorLength {
             which: "z_partial",
             expected: n_skip,
             got: proof.z_partial.len(),
@@ -783,7 +778,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
         k_skip,
     );
     if proof.grinding_nonces.len() != expected_nonces {
-        return Err(VerifyError::BadGrindingNonceCount {
+        return Err(LincheckError::BadGrindingNonceCount {
             expected: expected_nonces,
             got: proof.grinding_nonces.len(),
         });
@@ -796,7 +791,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     let alpha = if let Some(bits) = grinding.alpha_bits() {
         let alpha = challenger
             .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-            .ok_or(VerifyError::InvalidGrindingNonce { which: "alpha" })?;
+            .ok_or(LincheckError::InvalidGrindingNonce { which: "alpha" })?;
         nonce_idx += 1;
         alpha
     } else {
@@ -832,7 +827,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
             let beta = if let Some(bits) = grinding.beta_bits() {
                 let beta = challenger
                     .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-                    .ok_or(VerifyError::InvalidGrindingNonce { which: "beta" })?;
+                    .ok_or(LincheckError::InvalidGrindingNonce { which: "beta" })?;
                 nonce_idx += 1;
                 beta
             } else {
@@ -859,7 +854,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
         let r = if let Some(bits) = grinding.multilinear_round_bits() {
             let r = challenger
                 .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-                .ok_or(VerifyError::InvalidGrindingNonce {
+                .ok_or(LincheckError::InvalidGrindingNonce {
                     which: "sumcheck-round",
                 })?;
             nonce_idx += 1;
@@ -908,7 +903,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
                 let nonce = proof.grinding_nonces[nonce_idx];
                 nonce_idx += 1;
                 let r = challenger.verify_pow_and_sample_f128(nonce, bits).ok_or(
-                    VerifyError::InvalidGrindingNonce {
+                    LincheckError::InvalidGrindingNonce {
                         which: "inner-skip",
                     },
                 )?;
@@ -924,7 +919,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
                 nonce_idx += 1;
                 x_ab.z_skip
                     .sample_fresh_pow_verifier(challenger, nonce, bits)
-                    .ok_or(VerifyError::InvalidGrindingNonce {
+                    .ok_or(LincheckError::InvalidGrindingNonce {
                         which: "inner-skip",
                     })?
             }
@@ -947,11 +942,15 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::r1cs::SparseBinaryMatrix;
-    use crate::schedule::{TableClass, TableType};
-
-    use crate::test_rng::Rng;
+    use crate::{
+        lincheck::union::{
+            F128, K_SKIP, Registry, build_eq_table, eq_prefix_sum, eq_prefix_weight,
+            union_comb_partial,
+        },
+        r1cs::SparseBinaryMatrix,
+        schedule::{TableClass, TableType},
+        test_rng::Rng,
+    };
 
     fn stub() -> SparseBinaryMatrix {
         SparseBinaryMatrix {

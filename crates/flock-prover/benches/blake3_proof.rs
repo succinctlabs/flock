@@ -2,15 +2,24 @@
 //! timing breakdown. Times the fast prover path (`Blake3Setup::prove_fast`);
 //! the slow `prove` path is exercised by unit tests in `src/blake3.rs`.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    array::from_fn,
+    env::var,
+    hint::black_box,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
+};
 
-use flock_prover::challenger::FsChallenger;
-use flock_prover::merkle::HashKind;
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log};
-
+use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    merkle::HashKind,
+    pcs::ligerito::LigeritoProfile,
+    proof_io::R1csProofBundleLigerito,
+    r1cs_hashes::blake3::{Blake3Setup, Compression, K_LOG, min_n_blocks_log},
+};
 // Peak-heap tracker (wraps System), as in keccak_proof/sha2_proof — lets the
 // BLAKE3_LOG2S report emit a "peak memory:" line for bench_blake3.sh.
 struct PeakAlloc;
@@ -51,11 +60,9 @@ fn peak_mb() -> f64 {
     PEAK.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
 }
 
-use flock_core::test_rng::Rng;
-
 fn random_compression(rng: &mut Rng) -> Compression {
-    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+    let m: [u32; 16] = from_fn(|_| rng.next_u32());
     // counter varies per instance; block_len = 64 (full block), flags = a
     // typical CHUNK_START|CHUNK_END|ROOT for a single-block chunk.
     (cv, m, rng.next_u32() as u64, 64u32, 11u32)
@@ -84,14 +91,9 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     );
 
     // BLAKE3_PROFILE=fast|slim|secure selects the Ligerito profile (default fast).
-    let mut setup = match std::env::var("BLAKE3_PROFILE").as_deref() {
-        Ok("slim") => {
-            Blake3Setup::with_profile(n_blocks, flock_prover::pcs::ligerito::LigeritoProfile::Slim)
-        }
-        Ok("secure") => Blake3Setup::with_profile(
-            n_blocks,
-            flock_prover::pcs::ligerito::LigeritoProfile::Secure,
-        ),
+    let mut setup = match var("BLAKE3_PROFILE").as_deref() {
+        Ok("slim") => Blake3Setup::with_profile(n_blocks, LigeritoProfile::Slim),
+        Ok("secure") => Blake3Setup::with_profile(n_blocks, LigeritoProfile::Secure),
         Ok("fast") | Err(_) => Blake3Setup::new(n_blocks),
         Ok(p) => panic!("BLAKE3_PROFILE must be fast, slim, or secure (got {p})"),
     };
@@ -99,14 +101,14 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     // sha256). Setting it on `pcs_params` is enough: the Ligerito prover and
     // verifier configs are derived from those params, so the L0 commitment and
     // every recursive level follow.
-    if let Ok(h) = std::env::var("FLOCK_MERKLE_HASH") {
+    if let Ok(h) = var("FLOCK_MERKLE_HASH") {
         setup.pcs_params.merkle_hash =
             HashKind::parse(&h).expect("FLOCK_MERKLE_HASH must be sha256 or blake3");
     }
     let setup = setup;
     // FLOCK_FS_HASH=sha256|blake3 selects the Fiat-Shamir transcript hash
     // (default sha256), independently of the Merkle hash above.
-    let fs_hash = match std::env::var("FLOCK_FS_HASH") {
+    let fs_hash = match var("FLOCK_FS_HASH") {
         Ok(h) => HashKind::parse(&h).expect("FLOCK_FS_HASH must be sha256 or blake3"),
         Err(_) => HashKind::default(),
     };
@@ -174,7 +176,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
             .expect("verify failed");
         println!("  verify: {}", fmt_ms(t.elapsed().as_secs_f64()));
 
-        let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
+        let bundle = R1csProofBundleLigerito { commitment, proof };
         let proof_size = bundle.to_bytes().len();
         println!(
             "  proof size: {} bytes ({:.2} KiB)",
@@ -190,7 +192,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes)");
     println!("BLAKE3 compression-function R1CS proof timings (prove_fast).");
@@ -200,7 +202,7 @@ fn main() {
     // to sweep at the same sizes as the competitors; each listed size is benched
     // best-of-3. Default: small-scale context + the SHA-256/Keccak baseline sizes.
     // n_blocks → m: K_LOG=14, so m = 14 + ceil_log2(max(n_blocks, 8)).
-    let specs: Vec<(usize, usize)> = match std::env::var("BLAKE3_LOG2S") {
+    let specs: Vec<(usize, usize)> = match var("BLAKE3_LOG2S") {
         Ok(s) => s
             .split([',', ' '])
             .filter(|t| !t.is_empty())

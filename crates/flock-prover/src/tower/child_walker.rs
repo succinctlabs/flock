@@ -1,10 +1,64 @@
-use super::*;
+use std::{array::from_fn, env::var, iter::repeat_n};
+
+use flock_core::{
+    circuit::{SigmaAssertion, builder::SlotId},
+    element_r1cs::union::ElementAssertion,
+    lincheck::{LincheckCircuit, MatrixAssertion, SkipPoint, build_eq_table},
+    matrix_fold::{JaggedAssertion, JaggedRowWeight},
+    pcs::{
+        jagged::{
+            JaggedParams, STATE_INITIAL, STATE_SUCCESS, assist_boundaries,
+            assist_sparse_transitions, frob_inv,
+        },
+        ring_switch::{
+            build_fold_byte_table, inner_product, linearized_coefficients, tensor_algebra_transpose,
+        },
+    },
+    product_gkr::s_id_basis,
+    zerocheck::{
+        ag_skip::friendly_challenges,
+        univariate_skip::build_eq,
+        univariate_skip_optimized::{medium_challenges_ghash, small_challenges_ghash},
+    },
+};
+use flock_transcript::transcript_record::{
+    RecordingChallenger, Stream, StreamWord, TranscriptOp as Op,
+};
+#[cfg(test)]
+use {
+    crate::tower::{
+        AssistLayerGate, BitSpreadGate, BitSpreadTable, Blake3Gate, FamilyTransposeTileGate,
+        MacGate256, MergedRoundGate, PowMaskGate, SpineGate, SpineGate256, SwapGate, ZcRoundGate,
+        digest_words, gates_blake3::Rng, gates_blake3::Tree, gates_blake3::leaf_word,
+        hash_to_digest, query::emit_opening,
+    },
+    std::any::Any,
+};
+
+use crate::{
+    r1cs_hashes::{
+        blake3::build_block_r1cs,
+        fs_chain::{FsChainTrace, IV},
+    },
+    tower::{
+        CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrLayerRec, GkrRec,
+        HashKind, InnerPd, LeafEvalGate, LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner,
+        MixedProof, MpRec, OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance,
+        Wire, ag_seed_bytes, assert_chain_replays, assertion_mac, bytes_payload_mask, cap_payloads,
+        cap_wires, check_residual_publics, circuit_structure_claim_wires, cw,
+        declare_envelope_slots, decode_ag_point, duplex_row_count_model,
+        emit_boolean_reported_check, emit_element_reported_check, emit_family_h, emit_fs_chain,
+        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region,
+        emit_spine256, flatten_ops, level_geometry, level_query_phase_b3_rows, level_sources,
+        merge_chain, observed_f256, pack8, parse_open_levels, payload_words, pin_recombination,
+        query_phase_b3_rows, replay_ligerito_spine256, squeeze_word_wire, strat_scheds,
+    },
+    verifier::{verify_ligerito_union_circuit, verify_ligerito_union_circuit_ag},
+};
 
 /// One recorded child verification, parsed: the tape pinned op-for-op, every
 /// region located, and every native replica the emitter and checker consume.
-/// This is mvp10's step-1 parsing as a reusable unit — `new` runs the
-/// RECORDING verify itself, so instantiating a child region for the mvp11
-/// merge node re-asserts the whole map on that child's tape.
+/// `new` records the verification and checks the map for that tape.
 pub(super) struct ChildTape<'p> {
     pub(super) inner: &'p MixedInner,
     // the recorded tape
@@ -15,8 +69,8 @@ pub(super) struct ChildTape<'p> {
     /// Per level, the absorbed cap's payload index ([`cap_payloads`]).
     pub(super) cap_pays: Vec<usize>,
     // chain materials
-    pub(super) trace: crate::r1cs_hashes::fs_chain::FsChainTrace,
-    pub(super) stream: flock_core::transcript_record::Stream,
+    pub(super) trace: FsChainTrace,
+    pub(super) stream: Stream,
     pub(super) bytes: Vec<u8>,
     /// The fork's four cross-link wires ([`MergedChain::cross`]).
     pub(super) cross: Vec<Option<(usize, usize)>>,
@@ -29,12 +83,12 @@ pub(super) struct ChildTape<'p> {
     pub(super) gkr: GkrRec,
     pub(super) el: Option<ElPiopRec>,
     pub(super) start_v: usize,
-    pub(super) gammas_o: Vec<PdRec>,
+    gammas_o: Vec<PdRec>,
     pub(super) w_rounds: Vec<RoundRec>,
     pub(super) w_resid: Vec<RoundRec>,
-    pub(super) mp_o: MpRec,
-    pub(super) inner_pd2: InnerPd,
-    pub(super) yr_v2: usize,
+    mp_o: MpRec,
+    inner_pd2: InnerPd,
+    yr_v2: usize,
     pub(super) yr_len: usize,
     pub(super) levels: Vec<OpenLevel>,
     pub(super) lvl_src: Vec<(&'p [[u8; 32]], &'p Vec<Vec<F128>>, &'p Vec<[u8; 32]>)>,
@@ -52,7 +106,7 @@ pub(super) struct ChildTape<'p> {
     pub(super) bl_alpha: (usize, usize),
     pub(super) betas_b: Vec<(usize, usize)>,
     pub(super) zc_finals_v: usize,
-    pub(super) lc_msg_vs: Vec<usize>,
+    lc_msg_vs: Vec<usize>,
     pub(super) lc_rounds_b: Vec<(usize, usize)>,
     pub(super) eps_n: Vec<F128>,
     // The z_skip transcript surface, by flavor (the boolean claims' row
@@ -61,19 +115,19 @@ pub(super) struct ChildTape<'p> {
     pub(super) zskip: ZskipTapeRec,
     pub(super) zp_v: usize,
     // published chain ordinals
-    pub(super) ga_c: usize,
-    pub(super) ga_fin: usize,
-    pub(super) mg_c: usize,
-    pub(super) mg_fin: usize,
+    ga_c: usize,
+    ga_fin: usize,
+    mg_c: usize,
+    mg_fin: usize,
     /// The two ring-switch regions: `(s_hat_v, r_dprime finalization,
     /// r_dprime challenge)`, plus each batching coefficient's location in
     /// their shared vector squeeze. These are the family-H source wires.
     pub(super) rs_recs: Vec<(usize, usize, usize)>,
     pub(super) rs_gam_fins: Vec<(usize, usize)>,
     // native references + replicas
-    pub(super) bool_assert: flock_core::lincheck::MatrixAssertion,
-    pub(super) el_assert: Option<flock_core::element_r1cs::union::ElementAssertion>,
-    pub(super) sigma_native: flock_core::circuit::SigmaAssertion,
+    pub(super) bool_assert: MatrixAssertion,
+    pub(super) el_assert: Option<ElementAssertion>,
+    pub(super) sigma_native: SigmaAssertion,
     pub(super) el_g0: Vec<F128>,
     pub(super) el_run_n: F128,
     pub(super) a_sum_n: F128,
@@ -90,10 +144,6 @@ pub(super) struct ChildTape<'p> {
     pub(super) k_cols_i: usize,
     pub(super) m_mp2: usize,
     pub(super) bounds_i: Vec<(u64, u64, u32)>,
-    #[allow(dead_code)] // Run start columns — the run-weight era's consumer; kept as shape data.
-    pub(super) run_y0: Vec<usize>,
-    #[allow(dead_code)] // The complement run — likewise.
-    pub(super) comp_ix: usize,
     pub(super) x_ab_n: Vec<F128>,
     pub(super) x_c_n: Vec<F128>,
     pub(super) groups_ix: Vec<Vec<usize>>,
@@ -103,7 +153,7 @@ pub(super) struct ChildTape<'p> {
     /// independent reference for the W-value publics the region publishes
     /// instead of rebuilding — tied member-for-member to the native expect
     /// replica in the constructor.
-    pub(super) jag: flock_core::matrix_fold::JaggedAssertion,
+    pub(super) jag: JaggedAssertion,
 }
 
 /// The boolean z_skip's transcript surface, by flavor. RS: the one fused
@@ -134,17 +184,15 @@ pub(super) enum ZskipTapeRec {
 
 impl<'p> ChildTape<'p> {
     pub(super) fn new(inner: &'p MixedInner, domain: &'static [u8]) -> Self {
-        use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-
         let built = &inner.built;
         let proof = &inner.proof;
         let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
-        let blake_r1cs = blake3::build_block_r1cs(inner.nu);
+        let blake_r1cs = build_block_r1cs(inner.nu);
         let blake_lc = blake_r1cs.csc_lincheck_circuit();
-        let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+        let lcs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
         let all_claims = match proof {
-            MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit(
+            MixedProof::Rs(p) => verify_ligerito_union_circuit(
                 &union,
                 &built.shape.circuit,
                 &built.witness.public,
@@ -154,7 +202,7 @@ impl<'p> ChildTape<'p> {
                 &inner.pcs,
                 &mut rec,
             ),
-            MixedProof::Ag(p) => verifier::verify_ligerito_union_circuit_ag(
+            MixedProof::Ag(p) => verify_ligerito_union_circuit_ag(
                 &union,
                 &built.shape.circuit,
                 &built.witness.public,
@@ -436,7 +484,7 @@ impl<'p> ChildTape<'p> {
             assert_eq!(r_pt.len(), mu2, "the GKR point spans the cell space");
             let alpha2 = chals[c_alpha];
             let beta2 = chals[c_alpha + 1];
-            let basis = flock_core::product_gkr::s_id_basis(mu2);
+            let basis = s_id_basis(mu2);
             // Masked input checks under the live-identity padding.
             let mask_w = built.shape.circuit.live_mask();
             let tail_w2 = (beta2 + F128::ONE) * mask_w.live_eval(&r_pt) + F128::ONE;
@@ -752,7 +800,7 @@ impl<'p> ChildTape<'p> {
             &strat_scheds(&inner.pcs),
         );
         let b3_rows = trace.rows.len() + h_rows + query_phase_b3_rows(&geo);
-        if std::env::var("B3_CENSUS").is_ok() {
+        if var("B3_CENSUS").is_ok() {
             let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
             let blocks = trace.rows.len() - parents;
             eprintln!(
@@ -844,8 +892,6 @@ impl<'p> ChildTape<'p> {
 
         // ---- the merged intake's natives (target, running, boundary) ----
         let (native_target, native_running) = {
-            use flock_core::pcs::ring_switch as rs;
-            use flock_core::zerocheck::univariate_skip::build_eq;
             let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch + k]).collect();
             let mut target = F128::ZERO;
             let mut coeffs: Vec<Vec<F128>> = Vec::new();
@@ -853,11 +899,9 @@ impl<'p> ChildTape<'p> {
                 let shv = &vals_rec[sv..sv + 128];
                 let rdp: Vec<F128> = (0..7).map(|j| chals[rc + j]).collect();
                 let eq = build_eq(&rdp);
-                target += gs[k] * rs::inner_product(&rs::tensor_algebra_transpose(shv), &eq);
+                target += gs[k] * inner_product(&tensor_algebra_transpose(shv), &eq);
                 let scaled: Vec<F128> = eq.iter().map(|x| gs[k] * *x).collect();
-                coeffs.push(rs::linearized_coefficients(&rs::build_fold_byte_table(
-                    &scaled,
-                )));
+                coeffs.push(linearized_coefficients(&build_fold_byte_table(&scaled)));
             }
             // A MIXED tape's target carries the packed-direct claims too —
             // each absorbed value against its own gamma squeeze.
@@ -939,8 +983,7 @@ impl<'p> ChildTape<'p> {
             let (a_sum_n, b_sum_n) = {
                 let mt = MacGate::new();
                 let kappa = mt.ty.kappa();
-                let eq_con =
-                    flock_core::zerocheck::univariate_skip::build_eq(&el_assert.r_con[..kappa]);
+                let eq_con = build_eq(&el_assert.r_con[..kappa]);
                 // Single slot at the region start: the prefix bits are all
                 // zero, so the region weight is the all-zero eq pattern.
                 let w = el_assert.r_con[kappa..]
@@ -962,7 +1005,7 @@ impl<'p> ChildTape<'p> {
         // ---- the GKR input-check advice (masked M̂ and livê) ----
         let mu_i = built.shape.circuit.cells().mu();
         let (mid_n, live_n) = {
-            let basis_i = flock_core::product_gkr::s_id_basis(mu_i);
+            let basis_i = s_id_basis(mu_i);
             let mask_i = built.shape.circuit.live_mask();
             (
                 mask_i.masked_id_eval(&basis_i, &gkr_rec.r_pt),
@@ -979,9 +1022,7 @@ impl<'p> ChildTape<'p> {
         );
         assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
         let n_log_i = union.n_log();
-        // ROUND 4: the recombination + f == g, replayed from located words
-        // (the emitter binds these; until it landed they rode only this
-        // constructor's scaffolding verify).
+        // Recompute the recombination and f == g from located words.
         let n_pub_slots_c = pin_recombination(
             inner.built.shape.circuit.cells(),
             n_log_i,
@@ -993,13 +1034,9 @@ impl<'p> ChildTape<'p> {
             &gkr_rec.r_pt,
             gkr_rec.fgs_v,
         );
-        let params_i = flock_core::pcs::jagged::JaggedParams::from_heights(
-            &union.jagged_heights(),
-            n_log_i,
-            m_mp2,
-        );
+        let params_i = JaggedParams::from_heights(&union.jagged_heights(), n_log_i, m_mp2);
         let k_cols_i = params_i.k;
-        let bounds_i = flock_core::pcs::jagged::assist_boundaries(&params_i);
+        let bounds_i = assist_boundaries(&params_i);
         let n_runs = bounds_i.len();
         // A run longer than one column is ALWAYS a zero-height run, and the
         // mixed inner has INTERIOR zero runs — the per-run weight is the
@@ -1165,11 +1202,10 @@ impl<'p> ChildTape<'p> {
         // indices, not layout assumptions. The mlv rounds follow the
         // BATCH-MAJOR packing [k_skip | dim6 | rows | high col vars]:
         // round 0 binds x_inner_rest[0] (the dim-6 var), rounds 1..1+ν bind
-        // x_outer (the rows — what mvp10's RS-point composition uses), and
+        // x_outer (the rows used by the RS-point composition), and
         // the remaining rounds bind x_inner_rest[1..]. rr is the lc rounds
         // REVERSED; z_skip is the located squeeze; z_partial the located
-        // slice. (Two wrong layout guesses died on these asserts before
-        // this mapping — the method-note discipline earning its keep.)
+        // slice.
         {
             let inner_b = bool_assert.x_inner_rest.len();
             assert_eq!(
@@ -1214,7 +1250,7 @@ impl<'p> ChildTape<'p> {
                     );
                     assert_eq!(
                         bool_assert.z_skip,
-                        flock_core::lincheck::SkipPoint::Ag(pt),
+                        SkipPoint::Ag(pt),
                         "z_skip is the r1 point decoded from the located seed + nonce"
                     );
                 }
@@ -1359,7 +1395,7 @@ impl<'p> ChildTape<'p> {
                 for (j, &gp) in gpow_n.iter().enumerate().take(128) {
                     if j > 0 {
                         for x in rinv.iter_mut() {
-                            *x = flock_core::pcs::jagged::frob_inv(*x);
+                            *x = frob_inv(*x);
                         }
                     }
                     let mut prod = gp;
@@ -1385,10 +1421,10 @@ impl<'p> ChildTape<'p> {
                     p
                 })
                 .collect();
-            let sparse_t = flock_core::pcs::jagged::assist_sparse_transitions();
+            let sparse_t = assist_sparse_transitions();
             let dp_native = |z_row: &[F128]| -> F128 {
                 let mut gdp = [F128::ZERO; 4];
-                gdp[flock_core::pcs::jagged::STATE_SUCCESS] = F128::ONE;
+                gdp[STATE_SUCCESS] = F128::ONE;
                 for layer in (0..=m_mp2).rev() {
                     let za = if layer < n_log_i {
                         z_row[layer]
@@ -1400,7 +1436,7 @@ impl<'p> ChildTape<'p> {
                     } else {
                         F128::ZERO
                     };
-                    let eq4 = flock_core::lincheck::build_eq_table(&[za, rb]);
+                    let eq4 = build_eq_table(&[za, rb]);
                     let (rc, rd) = (sig_n[2 * layer], sig_n[2 * layer + 1]);
                     let e = [
                         (F128::ONE + rc) * (F128::ONE + rd),
@@ -1418,7 +1454,7 @@ impl<'p> ChildTape<'p> {
                     }
                     gdp = prev;
                 }
-                gdp[flock_core::pcs::jagged::STATE_INITIAL]
+                gdp[STATE_INITIAL]
             };
             let run_weights_n = |z_col: &[F128]| -> Vec<F128> {
                 let mut w_at = vec![F128::ZERO; n_runs];
@@ -1595,8 +1631,6 @@ impl<'p> ChildTape<'p> {
             k_cols_i,
             m_mp2,
             bounds_i,
-            run_y0,
-            comp_ix,
             x_ab_n,
             x_c_n,
             groups_ix,
@@ -1606,9 +1640,8 @@ impl<'p> ChildTape<'p> {
     }
 }
 
-/// The gate slots a child-tape region emits into. Created ONCE by the outer
-/// test and shared by every region in the builder — the mvp11 merge outer
-/// instantiates two child regions (and the fold region) over shared slots.
+/// The gate slots a child-tape region emits into. The builder shares these
+/// slots across all child regions.
 /// The recursion envelope and strict Fast nodes place the two independent
 /// child BLAKE workloads in identical slots; the other families still add
 /// rows, not columns. The `le`/`resid` caches fill on demand during emission;
@@ -1617,14 +1650,14 @@ impl<'p> ChildTape<'p> {
 pub(super) struct ChildSlots {
     pub(super) nu: usize,
     pub(super) q: CollapsedSlots,
-    pub(super) macs: flock_core::circuit::builder::SlotId,
-    pub(super) fold_macs: flock_core::circuit::builder::SlotId,
-    pub(super) zcr: flock_core::circuit::builder::SlotId,
-    pub(super) mrs: flock_core::circuit::builder::SlotId,
-    pub(super) spine: flock_core::circuit::builder::SlotId,
-    pub(super) spine256: flock_core::circuit::builder::SlotId,
-    pub(super) alslot: flock_core::circuit::builder::SlotId,
-    pub(super) le: Vec<(usize, flock_core::circuit::builder::SlotId)>,
+    pub(super) macs: SlotId,
+    pub(super) fold_macs: SlotId,
+    pub(super) zcr: SlotId,
+    pub(super) mrs: SlotId,
+    pub(super) spine: SlotId,
+    pub(super) spine256: SlotId,
+    pub(super) alslot: SlotId,
+    pub(super) le: Vec<(usize, SlotId)>,
     /// The residual region's keyed slot cache (`emit_residual_region`'s
     /// `leaf_slot`). Key scheme: `600` = the shared MacGate (pre-seeded,
     /// so close-out rows land on `macs` instead of a duplicate type);
@@ -1632,7 +1665,7 @@ pub(super) struct ChildSlots {
     /// ResidualGate at that suffix-fold count; `310 + width` and
     /// `1000 + width` = base/extension prefix gates; and `880..=882` = the
     /// three shared extension-field residual relations.
-    pub(super) resid: Vec<(usize, flock_core::circuit::builder::SlotId)>,
+    pub(super) resid: Vec<(usize, SlotId)>,
 }
 
 impl ChildSlots {
@@ -1687,7 +1720,7 @@ impl ChildSlots {
     /// demand caches; emission that would need a slot OUTSIDE the envelope
     /// set creates a new type and fails the digest pin loudly.
     pub(super) fn new_env(sb: &mut ShapeBuilder, nu2: usize, env: &EnvShape) -> Self {
-        let mut cache: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+        let mut cache: Vec<(usize, SlotId)> = Vec::new();
         let q = declare_envelope_slots(sb, nu2, &mut cache, env);
         let take = |k: usize| {
             cache
@@ -1726,7 +1759,7 @@ impl ChildSlots {
 
     /// The keyed cache view `pad_envelope_counts` consumes — envelope path
     /// only (`new_env`).
-    pub(super) fn env_cache(&self) -> Vec<(usize, flock_core::circuit::builder::SlotId)> {
+    pub(super) fn env_cache(&self) -> Vec<(usize, SlotId)> {
         let mut v = vec![
             (600, self.macs),
             (602, self.fold_macs),
@@ -1742,7 +1775,7 @@ impl ChildSlots {
     }
 
     /// Every element-class slot, for the outer prover's slot inputs.
-    pub(super) fn element_slot_ids(&self) -> Vec<flock_core::circuit::builder::SlotId> {
+    pub(super) fn element_slot_ids(&self) -> Vec<SlotId> {
         let mut v = vec![
             self.macs,
             self.fold_macs,
@@ -1780,8 +1813,7 @@ pub(super) enum ZskipWires {
 }
 
 /// What one emitted child region hands back: where its public block starts,
-/// the walk counts the checker needs, and the assertion-emission wires the
-/// mvp11 merge node CONNECTS the fold region's claim words to.
+/// the walk counts the checker needs, and the assertion-emission wires.
 pub(super) struct ChildRegion {
     pub(super) pub_base: usize,
     pub(super) n_query_pub: usize,
@@ -1812,7 +1844,7 @@ pub(super) struct ChildRegion {
     pub(super) zskip: ZskipWires,
     /// The residual close-out's prefix slot (and width) — reusable by a
     /// caller emitting more prefix products into the same builder.
-    pub(super) pf: (flock_core::circuit::builder::SlotId, usize),
+    pub(super) pf: (SlotId, usize),
     /// The child's PUBLIC SEGMENT as witness wires (the H(publics) region's
     /// inputs, in the child's declaration order). Application-statement
     /// plumbing — the hash-chain adjacency connect — reads through these.
@@ -1822,13 +1854,11 @@ pub(super) struct ChildRegion {
 /// Emit ONE child's complete deferred-verifier region — chain, query phase,
 /// wiring GKR, element PIOP, multipoint intake + anchor expect, W-rounds,
 /// spine, residual, sigma emission — into `sb`, publishing exactly what
-/// [`check_child_region`] walks. This is mvp10's assembly (steps 1-8),
-/// extracted verbatim; the tape supplies every located ordinal and native
-/// replica.
+/// [`check_child_region`] walks. The tape supplies each ordinal and native value.
 pub(super) fn emit_child_region(
     sb: &mut ShapeBuilder,
     cs: &mut ChildSlots,
-    b3_slot: flock_core::circuit::builder::SlotId,
+    b3_slot: SlotId,
     ct: &ChildTape<'_>,
     vals: &mut Vec<F128>,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
@@ -1871,7 +1901,7 @@ pub(super) fn emit_child_region(
             }
         })
         .collect();
-    let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&IV);
     vals.extend_from_slice(&iv_w);
     let iv2 = [
         sb.fixed_public_input(iv_w[0]),
@@ -1932,7 +1962,7 @@ pub(super) fn emit_child_region(
     // ---- the WIRING GKR in-circuit ----
     let mut vmap: Vec<Option<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
-        if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+        if let StreamWord::Value(vi) = *w {
             if vmap.len() <= vi {
                 vmap.resize(vi + 1, None);
             }
@@ -2243,23 +2273,23 @@ pub(super) fn emit_child_region(
     // recombination are all recursive-circuit arithmetic. Every source is
     // an existing transcript/proof wire; the native target is retained only
     // as a published test oracle below.
-    let shv_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+    let shv_w: [Vec<Wire>; 2] = from_fn(|k| {
         let sv = ct.rs_recs[k].0;
         (0..128).map(|i| wv(sv + i)).collect()
     });
-    let value_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+    let value_w: [Vec<Wire>; 2] = from_fn(|k| {
         mp_o.val_vs[128 * k..128 * (k + 1)]
             .iter()
             .map(|&vi| wv(vi))
             .collect()
     });
-    let rdp_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+    let rdp_w: [Vec<Wire>; 2] = from_fn(|k| {
         let fin = ct.rs_recs[k].1;
         (0..7)
             .map(|j| squeeze_word_wire(&outs, trace, fin, j))
             .collect()
     });
-    let gamma_w: [Wire; 2] = std::array::from_fn(|k| {
+    let gamma_w: [Wire; 2] = from_fn(|k| {
         let (fin, offset) = ct.rs_gam_fins[k];
         squeeze_word_wire(&outs, trace, fin, offset)
     });
@@ -2349,15 +2379,12 @@ pub(super) fn emit_child_region(
     // (baked constants are free in-circuit either way).
     let t_vals_b: Vec<F128> = match &ct.zskip {
         ZskipTapeRec::Rs { .. } => {
-            use flock_core::zerocheck::univariate_skip_optimized::{
-                medium_challenges_ghash, small_challenges_ghash,
-            };
             let mut v: Vec<F128> = Vec::new();
             v.extend_from_slice(&small_challenges_ghash());
             v.extend_from_slice(&medium_challenges_ghash());
             v
         }
-        ZskipTapeRec::Ag { .. } => flock_core::zerocheck::ag_skip::friendly_challenges().to_vec(),
+        ZskipTapeRec::Ag { .. } => friendly_challenges().to_vec(),
     };
     assert_eq!(t_vals_b.len(), 7, "the seven baked inner constants");
 
@@ -2424,11 +2451,11 @@ pub(super) fn emit_child_region(
             for (a, _) in chunk {
                 g_in.push(*a);
             }
-            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
             for (_, b) in chunk {
                 g_in.push(*b);
             }
-            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
             g_in.push(ow);
             seed = sb.gate(pfslot, &g_in)[0];
         }
@@ -2448,7 +2475,7 @@ pub(super) fn emit_child_region(
         if j > 0 {
             let mut lvl_w = Vec::with_capacity(m_mp2);
             for t2 in 0..m_mp2 {
-                let y = flock_core::pcs::jagged::frob_inv(rinv_n2[t2]);
+                let y = frob_inv(rinv_n2[t2]);
                 rinv_n2[t2] = y;
                 vals.push(y);
                 let yw = sb.input();
@@ -2547,7 +2574,7 @@ pub(super) fn emit_child_region(
                         squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset)
                     })
                     .collect();
-                if let flock_core::matrix_fold::JaggedRowWeight::Combo(t) = &c.row {
+                if let JaggedRowWeight::Combo(t) = &c.row {
                     assert_eq!(t.len(), gws.len(), "combo terms == hot members");
                 }
                 jag_row_w.push(gws);
@@ -2751,8 +2778,8 @@ pub(super) fn emit_child_region(
     );
 
     // Everything publishes HERE, after every public input is declared
-    // (`built.public` lists entries in DECLARATION order — the recorded
-    // MVP-7 gotcha). Tail order: [query phase (alphas), accs | ga, mg |
+    // (`built.public` lists entries in declaration order). Tail order:
+    // [query phase (alphas), accs | ga, mg |
     // gkr deltas | el deltas, el zc end, el lc end | mp_delta, anc,
     // t_final, tgt, runw | resid | inner | s_sigma | rho... | sqrt deltas |
     // anchor delta].
@@ -2830,7 +2857,7 @@ pub(super) fn emit_child_region(
                     .position(|w| {
                         matches!(
                             w,
-                            flock_core::transcript_record::StreamWord::Bytes { payload, word: 0 }
+                            StreamWord::Bytes { payload, word: 0 }
                                 if *payload == *nonce_payload
                         )
                     })
@@ -2850,7 +2877,7 @@ pub(super) fn emit_child_region(
 }
 
 /// Walk one emitted child region's public block and hold every published
-/// value against the tape's native replicas — mvp10's checker, extracted.
+/// value against the tape's native replicas.
 /// Returns the number of public entries consumed (the region's publish
 /// tail), so a multi-region caller can walk region after region.
 pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> usize {
@@ -2962,7 +2989,7 @@ pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildR
         // The emitted pair IS a SigmaAssertion, rebuilt from the outer's
         // PUBLIC SEGMENT ALONE — equal to the deferred verify's own, and it
         // discharges against the inner circuit's sigma table.
-        let sa = flock_core::circuit::SigmaAssertion {
+        let sa = SigmaAssertion {
             rho: sig_rho.to_vec(),
             nu: ct.inner.built.shape.circuit.cells().nu(),
             base_bits: ct.sigma_native.base_bits,
@@ -3019,9 +3046,7 @@ pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildR
 /// This is the shape a MIXED CIRCUIT union produces: it commits `num_lanes`
 /// ACTIVE lanes, `dense_words.div_ceil(2^log_dim)`, an arbitrary integer
 /// (the top lanes are definitionally zero and never encoded — see
-/// `ligerito`'s "high-bit-lane commit"). MVP-7 and MVP-9 never met it
-/// because their inners' lane counts were powers of two by luck of
-/// `dense_words`; MVP-10's realistic mixed inner opens 61-word rows.
+/// `ligerito`'s high-bit-lane commit).
 ///
 /// BLAKE3 hashes 61 words = 976 bytes as one chunk of 16 blocks whose last
 /// carries `b = 16`, and the compression's `b` is a free input to the gate,
@@ -3072,10 +3097,8 @@ pub(super) fn partial_block_leaves_hash_correctly() {
         sb.publish(root[1]);
         let shape = sb.finish().expect("the opening circuit builds");
         let hints: Vec<[u32; SLOT_WORDS]> = tree.siblings(pos);
-        let hint_refs: Vec<&(dyn std::any::Any + Sync)> = hints
-            .iter()
-            .map(|h| h as &(dyn std::any::Any + Sync))
-            .collect();
+        let hint_refs: Vec<&(dyn Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
         let built = shape.run(&vals, &hint_refs);
 
         // The in-circuit chunk chain reproduces `hash_leaf` on a leaf that

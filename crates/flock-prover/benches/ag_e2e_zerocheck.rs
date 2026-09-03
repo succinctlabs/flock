@@ -15,6 +15,8 @@
 //!
 //!   AG_E2E_MS=30,32 cargo bench --bench ag_e2e_zerocheck
 
+#[cfg(target_arch = "aarch64")]
+use aarch64_only::run;
 // The AG round-1 kernel (and the ag_skip prover entry points this bench
 // drives) are aarch64-only; on other arches the bench is a no-op stub.
 #[cfg(not(target_arch = "aarch64"))]
@@ -24,37 +26,40 @@ fn main() {
 
 #[cfg(target_arch = "aarch64")]
 fn main() {
-    aarch64_only::run()
+    run()
 }
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64_only {
-    use std::hint::black_box;
-    use std::time::Instant;
-
-    use flock_prover::challenger::{Challenger, FsChallenger};
-    use flock_prover::field::{F8, F128};
-    use flock_prover::genus95_curve_code::round1::round1_slp_packed;
-    use flock_prover::genus95_curve_code::{
-        Sha256Rng, base_evaluation_functional, sample_random_evaluation_point,
-    };
-    use flock_prover::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
-    use flock_prover::zerocheck::ag_skip::{d_inv, fold_and_first_round, friendly_challenges};
-    use flock_prover::zerocheck::multilinear::{
-        UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
-        fold1_lookahead_into, fold2_lookahead_into, lookahead_msg_first, lookahead_msg_second,
-        round_pair_naive, uni_skip_fold_and_round_pair_optimized_packed,
-    };
-    use flock_prover::zerocheck::univariate_skip::build_eq;
-    use flock_prover::zerocheck::univariate_skip_optimized::{
-        c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed,
-        small_challenges_ghash,
-    };
-
-    const K_SKIP: usize = 6;
-    const N_INNER: usize = 7;
+    use std::{env::var, hint::black_box, mem::swap, time::Instant};
 
     use flock_core::test_rng::Rng;
+    use flock_prover::{
+        challenger::{Challenger, FsChallenger},
+        field::{F8, F128},
+        genus95_curve_code::{
+            Sha256Rng, base_evaluation_functional, round1::round1_slp_packed,
+            sample_random_evaluation_point,
+        },
+        init_perf_thread_pool,
+        ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8},
+        zerocheck::{
+            ag_skip::{d_inv, fold_and_first_round, friendly_challenges},
+            multilinear::{
+                UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
+                fold1_lookahead_into, fold2_lookahead_into, lookahead_msg_first,
+                lookahead_msg_second, round_pair_naive,
+                uni_skip_fold_and_round_pair_optimized_packed,
+            },
+            univariate_skip::build_eq,
+            univariate_skip_optimized::{
+                c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed,
+                small_challenges_ghash,
+            },
+        },
+    };
+    const K_SKIP: usize = 6;
+    const N_INNER: usize = 7;
 
     /// Site-specific draws kept verbatim from this file's former local `Rng`.
     trait RngExt {
@@ -80,7 +85,7 @@ mod aarch64_only {
     /// Keeps a paper-facing run lean (no extra fold regenerations, less thermal load)
     /// at the cost of the cross-schedule parity checks. Default times all three.
     fn tails_all() -> bool {
-        !matches!(std::env::var("AG_E2E_TAILS").as_deref(), Ok("classic"))
+        !matches!(var("AG_E2E_TAILS").as_deref(), Ok("classic"))
     }
 
     /// Cross-schedule parity. All three bind `rho_at(0), rho_at(1), …` in the same
@@ -196,8 +201,8 @@ mod aarch64_only {
                             &r_rest[i + 2..],
                         )
                     };
-                    std::mem::swap(&mut a_mlv, &mut a_nxt);
-                    std::mem::swap(&mut b_mlv, &mut b_nxt);
+                    swap(&mut a_mlv, &mut a_nxt);
+                    swap(&mut b_mlv, &mut b_nxt);
                     a_mlv.truncate(out_len);
                     b_mlv.truncate(out_len);
                     let rho_a = rho_at(i);
@@ -227,8 +232,8 @@ mod aarch64_only {
                         rho_prev,
                         &r_next,
                     );
-                    std::mem::swap(&mut a_mlv, &mut a_nxt);
-                    std::mem::swap(&mut b_mlv, &mut b_nxt);
+                    swap(&mut a_mlv, &mut a_nxt);
+                    swap(&mut b_mlv, &mut b_nxt);
                     a_mlv.truncate(half);
                     b_mlv.truncate(half);
                     pair
@@ -377,9 +382,9 @@ mod aarch64_only {
     }
 
     pub(super) fn run() {
-        let _ = flock_prover::init_perf_thread_pool();
+        let _ = init_perf_thread_pool();
         // `AG_E2E_MS=31,32` overrides the default sweep (comma/space-separated).
-        let ms: Vec<usize> = match std::env::var("AG_E2E_MS") {
+        let ms: Vec<usize> = match var("AG_E2E_MS") {
             Ok(s) => s
                 .split(|c: char| c.is_whitespace() || c == ',')
                 .filter(|t| !t.is_empty())

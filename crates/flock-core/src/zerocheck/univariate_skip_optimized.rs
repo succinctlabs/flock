@@ -32,20 +32,15 @@
 
 use std::sync::OnceLock;
 
-use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
-use crate::ntt::InvNttTableByteSingleGf8;
-
-use super::PaddingSpec;
-use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
-
-mod kernels;
-
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 #[cfg(all(test, target_arch = "aarch64"))]
-use kernels::aarch64::{
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
+use {
+    crate::zerocheck::univariate_skip_optimized::kernels::aarch64::{
+        bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
+    },
+    crate::zerocheck::univariate_skip_optimized::kernels::bit_transpose_64bytes_scalar,
 };
-#[cfg(all(test, target_arch = "aarch64"))]
-use kernels::bit_transpose_64bytes_scalar;
+
 #[cfg(all(
     test,
     any(
@@ -53,7 +48,7 @@ use kernels::bit_transpose_64bytes_scalar;
         all(target_arch = "x86_64", target_feature = "gfni")
     )
 ))]
-use kernels::shift_reduce_inner_ab_scalar;
+use crate::zerocheck::univariate_skip_optimized::kernels::shift_reduce_inner_ab_scalar;
 #[cfg(all(
     test,
     target_arch = "x86_64",
@@ -61,9 +56,23 @@ use kernels::shift_reduce_inner_ab_scalar;
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
-use kernels::x86_64::shift_reduce_inner_ab_x86_avx512;
+use crate::zerocheck::univariate_skip_optimized::kernels::x86_64::shift_reduce_inner_ab_x86_avx512;
 #[cfg(all(test, target_arch = "x86_64", target_feature = "gfni"))]
-use kernels::x86_64::shift_reduce_inner_ab_x86_sse;
+use crate::zerocheck::univariate_skip_optimized::kernels::x86_64::shift_reduce_inner_ab_x86_sse;
+use crate::{
+    field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8},
+    ntt::InvNttTableByteSingleGf8,
+    zerocheck::{
+        PaddingSpec,
+        univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits},
+        univariate_skip_optimized::kernels::{
+            accumulate_convert, accumulate_convert_with_s_hat_v,
+            bit_transpose_64bytes as kernel_bit_transpose_64bytes,
+            shift_reduce_inner_ab as kernel_shift_reduce_inner_ab,
+        },
+    },
+};
+mod kernels;
 
 // ---------------------------------------------------------------------------
 // Protocol constants — fixed by the optimization design.
@@ -223,7 +232,7 @@ fn convert_table() -> &'static [F128] {
 
 #[inline]
 pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
-    kernels::bit_transpose_64bytes(input, output);
+    kernel_bit_transpose_64bytes(input, output);
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +257,7 @@ fn shift_reduce_inner_ab(
     a_col: &mut [F8],
     b_col: &mut [F8],
 ) {
-    kernels::shift_reduce_inner_ab(
+    kernel_shift_reduce_inner_ab(
         a_packed,
         b_packed,
         inv_table,
@@ -394,7 +403,7 @@ fn process_one_x_hi(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            kernels::accumulate_convert(
+            accumulate_convert(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 1 << N_MEDIUM,
@@ -426,7 +435,7 @@ fn process_one_x_hi(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            kernels::accumulate_convert(
+            accumulate_convert(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 n_b_med,
@@ -550,7 +559,7 @@ fn process_one_x_hi_with_s_hat_v(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            kernels::accumulate_convert_with_s_hat_v(
+            accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 1 << N_MEDIUM,
@@ -579,7 +588,7 @@ fn process_one_x_hi_with_s_hat_v(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            kernels::accumulate_convert_with_s_hat_v(
+            accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 n_b_med,
@@ -714,8 +723,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>) {
-    use rayon::prelude::*;
-
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -806,8 +813,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
-    use rayon::prelude::*;
-
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -948,10 +953,46 @@ fn round1_shift_reduce_extract_c_packed_serial(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ntt::AdditiveNttGf8;
-    use crate::zerocheck::univariate_skip::round1_naive;
-
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "gfni")
+    ))]
+    use crate::zerocheck::univariate_skip_optimized::N_CHUNKS;
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "gfni")
+    ))]
+    use crate::zerocheck::univariate_skip_optimized::shift_reduce_inner_ab_scalar;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    use crate::zerocheck::univariate_skip_optimized::shift_reduce_inner_ab_x86_avx512;
+    #[cfg(all(target_arch = "x86_64", target_feature = "gfni"))]
+    use crate::zerocheck::univariate_skip_optimized::shift_reduce_inner_ab_x86_sse;
+    #[cfg(target_arch = "aarch64")]
+    use crate::zerocheck::univariate_skip_optimized::{
+        bit_transpose_64bytes_neon, bit_transpose_64bytes_scalar, shift_reduce_inner_ab_fused_neon,
+        shift_reduce_inner_ab_neon,
+    };
+    use crate::{
+        ntt::AdditiveNttGf8,
+        test_rng::Rng,
+        zerocheck::{
+            PaddingSpec,
+            univariate_skip::{pack_bits, round1_extract_c_packed_with_s_hat_v, round1_naive},
+            univariate_skip_optimized::{
+                ELL, F8, F128, InvNttTableByteSingleGf8, K_SKIP, N_INNER, PHI_8_TABLE,
+                SMALL_CHAL_F8, c_s_f128, convert_table, d_inv, medium_challenges_ghash, mul_by_x,
+                phi8, round1_shift_reduce_extract_c, round1_shift_reduce_extract_c_packed,
+                round1_shift_reduce_extract_c_packed_padded,
+                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v,
+                round1_shift_reduce_extract_c_packed_serial, small_challenges_ghash,
+            },
+        },
+    };
     /// **Soundness assumption.** Zerocheck and the Ligerito PCS opening at
     /// L0 both depend on the seven "friendly" constants — three small
     /// (`φ_8(SMALL_CHAL_F8[k])`, k ∈ 0..3) and four medium
@@ -1009,8 +1050,6 @@ mod tests {
              zerocheck and Ligerito L0 soundness depend on it"
         );
     }
-
-    use crate::test_rng::Rng;
 
     /// Build the full `r` vector with the protocol-fixed constants in the
     /// small/medium slots. Only `r[k_skip + N_INNER..]` is the actual
@@ -1142,8 +1181,6 @@ mod tests {
 
     #[test]
     fn parallel_matches_serial() {
-        use crate::zerocheck::univariate_skip::pack_bits;
-
         // At small m the parallel overhead dominates, but the *output* must
         // still match the serial version bit-for-bit. F128 XOR-sum reduction
         // is commutative + associative, so any thread-scheduling order yields
@@ -1184,9 +1221,6 @@ mod tests {
     ///     (this is the only shape that exercises the full-skip case.)
     #[test]
     fn padded_matches_dense_with_zero_padding() {
-        use crate::zerocheck::PaddingSpec;
-        use crate::zerocheck::univariate_skip::pack_bits;
-
         // (k_log, useful_bits, n_blocks_log) — pick n_blocks_log so
         // m = k_log + n_blocks_log is small enough to keep the test fast
         // while still exercising the kernel's parallel + boundary paths.
@@ -1273,8 +1307,8 @@ mod tests {
         let table = make_inv_table();
         let a_bits = rng.bits(1 << m);
         let b_bits = rng.bits(1 << m);
-        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
-        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+        let a_packed = pack_bits(&a_bits);
+        let b_packed = pack_bits(&b_bits);
 
         let mut a_col = vec![F8::ZERO; ELL];
         let mut b_col = vec![F8::ZERO; ELL];
@@ -1320,8 +1354,8 @@ mod tests {
         let table = make_inv_table();
         let a_bits = rng.bits(1 << m);
         let b_bits = rng.bits(1 << m);
-        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
-        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+        let a_packed = pack_bits(&a_bits);
+        let b_packed = pack_bits(&b_bits);
 
         let mut a_col = vec![F8::ZERO; ELL];
         let mut b_col = vec![F8::ZERO; ELL];
@@ -1376,8 +1410,8 @@ mod tests {
         let table = make_inv_table();
         let a_bits = rng.bits(1 << m);
         let b_bits = rng.bits(1 << m);
-        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
-        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+        let a_packed = pack_bits(&a_bits);
+        let b_packed = pack_bits(&b_bits);
         let mut a_col = vec![F8::ZERO; ELL];
         let mut b_col = vec![F8::ZERO; ELL];
 
@@ -1427,8 +1461,8 @@ mod tests {
         let _ = n_chunks;
         let a_bits = rng.bits(1 << m);
         let b_bits = rng.bits(1 << m);
-        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
-        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+        let a_packed = pack_bits(&a_bits);
+        let b_packed = pack_bits(&b_bits);
 
         let mut a_col = vec![F8::ZERO; ELL];
         let mut b_col = vec![F8::ZERO; ELL];
@@ -1488,8 +1522,6 @@ mod tests {
     /// the scalar-oracle's canonical form.
     #[test]
     fn fusion_matches_existing_and_scalar_oracle() {
-        use crate::zerocheck::univariate_skip::round1_extract_c_packed_with_s_hat_v;
-
         for &m in &[13usize, 14, 15] {
             let mut rng = Rng::new(0xF00D_u64.wrapping_add(m as u64));
             let a = pack_bits(&rng.bits(1 << m));
@@ -1501,7 +1533,7 @@ mod tests {
             for i in 0..3 {
                 r[K_SKIP + i] = phi8(F8(SMALL_CHAL_F8[i]));
             }
-            let medium = crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash();
+            let medium = medium_challenges_ghash();
             for i in 0..4 {
                 r[K_SKIP + 3 + i] = medium[i];
             }
@@ -1513,8 +1545,8 @@ mod tests {
             }
 
             let inv_table = {
-                let ntt_s = crate::ntt::AdditiveNttGf8::new(K_SKIP, F8::ZERO);
-                let ntt_l = crate::ntt::AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
+                let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
+                let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
                 InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
             };
 
