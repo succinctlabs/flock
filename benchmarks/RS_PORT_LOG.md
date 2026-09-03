@@ -5467,3 +5467,35 @@ NOT LANDED. The complete change (rule, TOMLs, re-pins) is preserved as
 `scratchpad/four_levels.patch` (33 files); the tree is back at HEAD.
 Decision pending: revert (keep five), pay the envelope, or redesign
 the residual gate.
+
+### LANDED: the seeded term's block statistics come from the merged sumcheck — ladder sweep 10.6 → 6.6 ms MT — 2026-09-03
+
+Benedikt: keep five levels, keep pushing the open. Under this protocol
+the open's implementation floor is ~120 ms against ~144 now; this is
+the largest certain piece of that slack. The inner open's claim sits
+at the merged sumcheck's own point ρ (`PackedDirectClaim { point: rho,
+eq_ind: EqPoint(rho) }`), in the same coordinate convention the
+statistics ladder uses (coordinate j ↔ index bit j, LSB pairing), so
+the merged sumcheck's folded witness after `log_n − initial_k = 19` of
+its 25 rounds — the 64-entry `a` array before round 19 — IS
+`Σ_h f[e,h]·eq(ρ_{0..19}, h)` per lane block: the seeded term's block
+statistics, which the ladder had been sweeping the 512 MB witness a
+second time to recompute. Dead blocks past the live prefix are honest
+zeros of `q` (the trimmed fold never writes them), so the capture
+zeroes the untouched tail. The 64 values ride
+`open_batch_mixed_ligerito_seeded` → the prover impl →
+`init_phase_statistics`, whose sweep then covers the OOD term alone
+(one multiply per element instead of two). Exact: the same field
+elements by reassociation, so proof bytes are identical (m6 pins;
+the stats-ladder oracle still exercises the sweep path, which the
+microbench's claim without a merged sumcheck takes).
+
+Alternating vs the HEAD binary, m=32 MT, warm min, box at load 8–13:
+
+| | seeded stats | HEAD |
+|---|---|---|
+| ladder sweep | 6.68 / 6.84 / 6.43 | 10.41 / 10.96 / 10.38 |
+
+−3.9 ms, 3/3; the rest of the ladder (fold ~8.7, switch 5–17 under
+load) and the totals are noise at this load. Workspace, fmt, x86 gates
+below.
