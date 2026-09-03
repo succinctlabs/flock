@@ -127,6 +127,7 @@ unsafe fn compress2(
     ma: &[uint32x4_t; 16],
     mb: &[uint32x4_t; 16],
     flags: uint32x4_t,
+    blen: uint32x4_t,
     tbl: uint8x16_t,
 ) {
     let iv0 = vdupq_n_u32(BLAKE3_IV[0]);
@@ -134,7 +135,6 @@ unsafe fn compress2(
     let iv2 = vdupq_n_u32(BLAKE3_IV[2]);
     let iv3 = vdupq_n_u32(BLAKE3_IV[3]);
     let zero = vdupq_n_u32(0);
-    let blen = vdupq_n_u32(64);
 
     let mut va = [
         cva[0], cva[1], cva[2], cva[3], cva[4], cva[5], cva[6], cva[7], iv0, iv1, iv2, iv3, zero,
@@ -197,28 +197,69 @@ unsafe fn store_cvs(cv: &[uint32x4_t; 8], out: *mut u8, first: usize) {
     }
 }
 
-/// Hash eight contiguous `stride`-byte messages (`n_blocks` whole 64-byte
-/// blocks each) into eight 32-byte chaining values at `out`.
+/// [`load_block_transposed`] for a PARTIAL final block: each lane's `len`
+/// bytes (`1..64`) are copied into a zeroed 64-byte block first, exactly
+/// the zero padding BLAKE3 specifies for a short last block.
+#[inline(always)]
+unsafe fn load_block_transposed_partial(
+    base: *const u8,
+    stride: usize,
+    first: usize,
+    b: usize,
+    len: usize,
+) -> [uint32x4_t; 16] {
+    let mut bufs = [[0u8; 64]; 4];
+    for (lane, buf) in bufs.iter_mut().enumerate() {
+        core::ptr::copy_nonoverlapping(
+            base.add((first + lane) * stride + b * 64),
+            buf.as_mut_ptr(),
+            len,
+        );
+    }
+    let mut m = [vdupq_n_u32(0); 16];
+    for g in 0..4 {
+        let t = transpose4(
+            vld1q_u32(bufs[0].as_ptr().add(16 * g) as *const u32),
+            vld1q_u32(bufs[1].as_ptr().add(16 * g) as *const u32),
+            vld1q_u32(bufs[2].as_ptr().add(16 * g) as *const u32),
+            vld1q_u32(bufs[3].as_ptr().add(16 * g) as *const u32),
+        );
+        m[4 * g] = t[0];
+        m[4 * g + 1] = t[1];
+        m[4 * g + 2] = t[2];
+        m[4 * g + 3] = t[3];
+    }
+    m
+}
+
+/// Hash eight contiguous `stride`-byte messages (`n_blocks` 64-byte blocks
+/// each, the last one `last_block_len` bytes long, `1..=64`) into eight
+/// 32-byte chaining values at `out`.
 ///
 /// Equivalent to `hash_many` with the IV key, counter 0 and no increment:
-/// block 0 carries `flags | flags_start`, the last block `flags | flags_end`.
+/// block 0 carries `flags | flags_start`, the last block `flags | flags_end`
+/// and its true byte length (a short last block is zero-padded, as BLAKE3
+/// specifies) — so any message of `1..=1024` bytes gets its exact chunk CV.
 ///
 /// # Safety
-/// `data` must hold at least `7 * stride + n_blocks * 64` readable bytes
-/// (`stride >= n_blocks * 64`); `out` must hold 256 writable bytes. NEON
-/// must be available (aarch64).
+/// `data` must hold at least `7 * stride + (n_blocks - 1) * 64 +
+/// last_block_len` readable bytes (`stride` at least that per message);
+/// `out` must hold 256 writable bytes. NEON must be available (aarch64).
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn hash8(
     data: *const u8,
     stride: usize,
     n_blocks: usize,
+    last_block_len: usize,
     flags: u8,
     flags_start: u8,
     flags_end: u8,
     out: *mut u8,
 ) {
-    debug_assert!(n_blocks >= 1);
-    debug_assert!(stride >= n_blocks * 64);
+    debug_assert!(n_blocks >= 1 && (1..=64).contains(&last_block_len));
+    debug_assert!(stride >= (n_blocks - 1) * 64 + last_block_len);
     let tbl = vld1q_u8(ROT8_TABLE.as_ptr());
+    let full = vdupq_n_u32(64);
     let mut cva = [vdupq_n_u32(0); 8];
     let mut cvb = [vdupq_n_u32(0); 8];
     for i in 0..8 {
@@ -230,13 +271,21 @@ pub(super) unsafe fn hash8(
         if b == 0 {
             fl |= flags_start;
         }
-        if b == n_blocks - 1 {
+        let last = b == n_blocks - 1;
+        if last {
             fl |= flags_end;
         }
         let flv = vdupq_n_u32(fl as u32);
-        let ma = load_block_transposed(data, stride, 0, b);
-        let mb = load_block_transposed(data, stride, 4, b);
-        compress2(&mut cva, &mut cvb, &ma, &mb, flv, tbl);
+        if last && last_block_len < 64 {
+            let ma = load_block_transposed_partial(data, stride, 0, b, last_block_len);
+            let mb = load_block_transposed_partial(data, stride, 4, b, last_block_len);
+            let blen = vdupq_n_u32(last_block_len as u32);
+            compress2(&mut cva, &mut cvb, &ma, &mb, flv, blen, tbl);
+        } else {
+            let ma = load_block_transposed(data, stride, 0, b);
+            let mb = load_block_transposed(data, stride, 4, b);
+            compress2(&mut cva, &mut cvb, &ma, &mb, flv, full, tbl);
+        }
     }
     store_cvs(&cva, out, 0);
     store_cvs(&cvb, out, 4);

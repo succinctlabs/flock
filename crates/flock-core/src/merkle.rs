@@ -337,6 +337,7 @@ fn blake3_hash_many<const N: usize>(
                     data.as_ptr().add(i * N),
                     N,
                     N / 64,
+                    64,
                     flags,
                     flags_start,
                     flags_end,
@@ -379,37 +380,52 @@ fn blake3_hash_many<const N: usize>(
 }
 
 /// Batched BLAKE3 leaves: `out.len()` messages of `leaf_size` bytes, laid out
-/// contiguously in `data`. Equivalent to [`blake3_leaf_cv`] per leaf.
-///
-/// The batched entry point compresses whole 64-byte blocks of a single chunk,
-/// so it applies only when `leaf_size` is a multiple of 64 and at most
-/// `CHUNK_LEN` (1024) — which covers the real commit geometry, where a leaf is
-/// `16 << log_batch_size` bytes. Returns `false` for any other size, leaving
-/// the caller to hash leaves one at a time.
+/// contiguously in `data`. Equivalent to [`blake3_leaf_cv`] per leaf, for
+/// ANY single-chunk leaf size (`1..=1024`): eight leaves per NEON call, the
+/// last block carrying its true length. The integer-lane commit's leaves
+/// are `lanes × 16` bytes — 736 at the BLAKE3 union's m=32 (46 lanes) — and
+/// the old power-of-two-only dispatch sent every one of them to the generic
+/// per-leaf hasher at half the hash roofline. Tail leaves (fewer than
+/// eight) take the generic path, which computes the same chunk CV.
 fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> bool {
-    macro_rules! dispatch {
-        ($($n:literal),+ $(,)?) => {
-            match leaf_size {
-                $($n => {
-                    blake3_hash_many::<$n>(
-                        data, out, 0, BLAKE3_CHUNK_START, BLAKE3_CHUNK_END,
-                    );
-                    true
-                })+
-                _ => false,
-            }
-        };
+    if !blake3_leaf_size_is_batchable(leaf_size) {
+        return false;
     }
-    // Leaf sizes are `16 << log_batch_size`, so only powers of two arise.
-    dispatch!(64, 128, 256, 512, 1024)
+    debug_assert_eq!(data.len(), out.len() * leaf_size);
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    let (data, out) = {
+        let n_blocks = leaf_size.div_ceil(64);
+        let last = leaf_size - 64 * (n_blocks - 1);
+        let full = (out.len() / 8) * 8;
+        for i in (0..full).step_by(8) {
+            // SAFETY: eight whole leaves of `leaf_size` bytes start at
+            // `i * leaf_size`; the kernel reads within each leaf only.
+            unsafe {
+                blake3_neon::hash8(
+                    data.as_ptr().add(i * leaf_size),
+                    leaf_size,
+                    n_blocks,
+                    last,
+                    0,
+                    BLAKE3_CHUNK_START,
+                    BLAKE3_CHUNK_END,
+                    out.as_mut_ptr().add(i) as *mut u8,
+                );
+            }
+        }
+        (&data[full * leaf_size..], &mut out[full..])
+    };
+    for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
+        *o = blake3_leaf_cv(leaf);
+    }
+    true
 }
 
-/// Whether [`blake3_hash_many_leaves`] can batch this leaf size. Must list
-/// exactly the sizes that function dispatches on — `blake3_batch_dispatch_agrees`
-/// holds the two together.
+/// Whether [`blake3_hash_many_leaves`] batches this leaf size — any single
+/// BLAKE3 chunk. `blake3_batch_dispatch_agrees` holds the two together.
 #[inline]
 fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
-    matches!(leaf_size, 64 | 128 | 256 | 512 | 1024)
+    (1..=1024).contains(&leaf_size)
 }
 
 /// Batched BLAKE3 parent nodes: `data` is `out.len()` contiguous 64-byte
@@ -472,9 +488,8 @@ pub(crate) fn hash_parents_serial(read: &[Hash], out: &mut [Hash]) {
         use std::sync::atomic::Ordering::Relaxed;
         hash_count::PAIR_CALLS.fetch_add(out.len() as u64, Relaxed);
     }
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32)
-    };
+    let bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
     for (outs, pairs) in out
         .chunks_mut(BLAKE3_GROUP)
         .zip(bytes.chunks(BLAKE3_GROUP * 64))
@@ -894,7 +909,13 @@ mod tests {
             blake3_hash_many::<N>(&data[..count * N], &mut out, f, fs, fe);
             out
         }
-        fn reference<const N: usize>(data: &[u8], count: usize, f: u8, fs: u8, fe: u8) -> Vec<Hash> {
+        fn reference<const N: usize>(
+            data: &[u8],
+            count: usize,
+            f: u8,
+            fs: u8,
+            fe: u8,
+        ) -> Vec<Hash> {
             let mut out = vec![[0u8; 32]; count];
             for (o, msg) in out.iter_mut().zip(data.chunks(N)) {
                 let input: &[u8; N] = msg.try_into().unwrap();
@@ -1044,8 +1065,12 @@ mod tests {
             }
         }
 
-        // Leaves, at every size the batched path claims to handle.
-        for leaf_size in [64usize, 128, 256, 512, 1024] {
+        // Leaves, at every size the batched path claims to handle —
+        // including the integer-lane commit's `lanes × 16` (736 at m=32)
+        // and short/odd last blocks.
+        for leaf_size in [
+            1usize, 16, 32, 48, 63, 64, 100, 128, 256, 512, 736, 1000, 1024,
+        ] {
             for n in counts {
                 let data: Vec<u8> = (0..=255u8).cycle().take(n * leaf_size).collect();
                 let mut batched = vec![[0u8; 32]; n];
