@@ -19,8 +19,7 @@
 //! the root artifacts whole.
 
 use flock_core::{
-    aggregate::Accumulator, circuit::Circuit, lincheck::LincheckCircuit,
-    pcs::jagged::JaggedParams,
+    aggregate::Accumulator, circuit::Circuit, lincheck::LincheckCircuit, pcs::jagged::JaggedParams,
 };
 
 use crate::tower::{
@@ -208,7 +207,10 @@ impl Tower {
                 }
                 cur = Some(n); // the folded spine node drops here
             }
-            (Some(base), cur.expect("k > 2 built at least one spine node"))
+            (
+                Some(base),
+                cur.expect("k > 2 built at least one spine node"),
+            )
         };
 
         let fl = fls.into_iter().next().expect("FL 0");

@@ -1028,7 +1028,12 @@ pub(super) fn tower_driver_e2e() {
         Err(RootDischargeFailure::ChainLaneBoolean),
         "a doctored lane claim must be refused"
     );
-    tower.root.lane_acc.as_mut().expect("the lane rides").per_type[0]
+    tower
+        .root
+        .lane_acc
+        .as_mut()
+        .expect("the lane rides")
+        .per_type[0]
         .0
         .value = saved;
 

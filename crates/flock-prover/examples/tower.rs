@@ -20,9 +20,9 @@ fn main() {
     let n_leaves: usize = args
         .next()
         .map_or(8, |v| v.parse().expect("n_leaves: an even integer >= 4"));
-    let blocks_per_leaf: usize = args
-        .next()
-        .map_or(256, |v| v.parse().expect("blocks_per_leaf: a positive integer"));
+    let blocks_per_leaf: usize = args.next().map_or(256, |v| {
+        v.parse().expect("blocks_per_leaf: a positive integer")
+    });
     let cfg = match args.next().as_deref() {
         None | Some("chain128") => TowerConfig::Chain128,
         Some("chain100") => TowerConfig::Chain100,
