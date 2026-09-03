@@ -13,9 +13,10 @@ use flock_core::{
 use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
-        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, SpineIn,
-        UnionInstance, build_chain_proof, build_fl_node, build_node_outer_app, chain_blake_r1cs,
-        chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
+        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online,
+        RootDischargeFailure, SpineIn, Tower, UnionInstance, build_chain_proof, build_fl_node,
+        build_node_outer_app, chain_blake_r1cs, chain_jagged_params, env_acc_chain_base,
+        env_acc_main_base, env_app_base, env_pass_base,
         envelope::STEADY_OVERRIDE,
         envelope_shape,
         gates_blake3::Rng,
@@ -976,4 +977,72 @@ pub(super) fn tower_online_bench() {
         per_leaf,
         n_blocks as f64 / per_leaf,
     );
+}
+
+/// **THE DRIVER, END TO END.** [`Tower::prove`] runs the same 8-leaf
+/// steady tower `chain_spine_converges` hand-assembles — sequential
+/// leaves, four FLs, the base plus two spine folds, the lane threaded,
+/// convergence asserted inside the loop — and the root-side residue
+/// discharges. Then the falsifiability legs: a doctored statement word, a
+/// doctored lane claim, and a killed passenger must each turn
+/// [`Tower::discharge_root`] away.
+#[test]
+#[ignore] // Heavy — eight chain proofs and seven outers via the driver.
+pub(super) fn tower_driver_e2e() {
+    let cfg = test_config();
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xD41_4E12);
+    let h0: [u32; 16] = from_fn(|_| rng.next_u32());
+
+    let mut tower = Tower::prove(cfg, h0, n_blocks, 8);
+    assert_eq!(
+        tower.statement().h_start,
+        h0,
+        "the statement starts where the caller did"
+    );
+    assert_eq!(
+        tower.statement().h_end,
+        native_chain(&h0, 8 * n_blocks),
+        "the driver's statement IS the chain"
+    );
+    assert_eq!(tower.statement().n_blocks, 8 * n_blocks);
+    tower.discharge_root().expect("the honest root discharges");
+
+    // (a) a doctored statement word (the root's published h_end).
+    let at = tower.app_base + 4;
+    let saved = tower.root.lo.public[at];
+    tower.root.lo.public[at] += F128::ONE;
+    assert_eq!(
+        tower.discharge_root(),
+        Err(RootDischargeFailure::Statement),
+        "a doctored statement word must be refused"
+    );
+    tower.root.lo.public[at] = saved;
+
+    // (b) a doctored lane claim.
+    let lane = tower.root.lane_acc.as_mut().expect("the lane rides");
+    let saved = lane.per_type[0].0.value;
+    lane.per_type[0].0.value += F128::ONE;
+    assert_eq!(
+        tower.discharge_root(),
+        Err(RootDischargeFailure::ChainLaneBoolean),
+        "a doctored lane claim must be refused"
+    );
+    tower.root.lane_acc.as_mut().expect("the lane rides").per_type[0]
+        .0
+        .value = saved;
+
+    // (c) a killed passenger: a steady root OWES its orphan.
+    let saved = tower.root.block.passenger[0].1.row.low[0];
+    tower.root.block.passenger[0].1.row.low[0] = F128::ZERO;
+    assert_eq!(
+        tower.discharge_root(),
+        Err(RootDischargeFailure::Passenger),
+        "a steady root without its orphan must be refused"
+    );
+    tower.root.block.passenger[0].1.row.low[0] = saved;
+
+    tower
+        .discharge_root()
+        .expect("restored, the root discharges again");
 }

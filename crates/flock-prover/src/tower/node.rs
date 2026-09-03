@@ -3024,7 +3024,6 @@ pub(super) fn internal_node_over_two_fl_nodes() {
 /// One node's own JAGGED LAYOUT — the table its published claims are
 /// about, keyed by its circuit digest. Heights are a shape constant of
 /// that circuit, which is why the key names the table.
-#[cfg(test)]
 pub(super) fn node_jagged_params(lo: &LeafOuter) -> JaggedParams {
     let u = outer_union(&lo.shape.registry, lo.shape.counts.clone());
     JaggedParams::from_heights(

@@ -17,6 +17,9 @@
 //!   and the spine inheriting its base's accumulator toward the converged
 //!   fixed point (`chain_spine_converges` gates the ONE-digest property).
 //!
+//! [`Tower::prove`] drives the three end to end — the production caller —
+//! and [`Tower::discharge_root`] settles the root-side residue.
+//!
 //! Bench knobs (`CHAIN_BLOCKS`, `BENCH_RUNS`, `TOWER_STEADY`, and the
 //! test-only `TOWER_CONFIG=chain100`) live in the `#[test]` harness; the
 //! production geometry is typed, never env-var-driven.
@@ -37,6 +40,7 @@ use {
 pub use crate::tower::{
     chain::{ChainProof, build_chain_proof},
     config::TowerConfig,
+    driver::{ChainStatement, RootDischargeFailure, Tower},
     fl_node::{FlNode, build_fl_node, build_fl_node_k},
     node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app},
     query::LeafOuter,
@@ -113,6 +117,7 @@ use crate::{
 mod chain;
 mod child_walker;
 mod config;
+mod driver;
 #[cfg(test)]
 mod e2e_tests;
 mod envelope;

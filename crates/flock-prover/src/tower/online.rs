@@ -1,11 +1,9 @@
+use {bincode::serialize, serde::Serialize};
+
 #[cfg(test)]
-use {
-    bincode::serialize,
-    flock_core::{
-        pcs::{MergedOpenProof, ligerito::RecursiveProof},
-        proof::R1csProofCircuitMerged,
-    },
-    serde::Serialize,
+use flock_core::{
+    pcs::{MergedOpenProof, ligerito::RecursiveProof},
+    proof::R1csProofCircuitMerged,
 };
 
 #[allow(unused_imports)] // used only under cfg(test)
@@ -92,7 +90,6 @@ pub(super) fn median_total(runs: &[Online]) -> f64 {
 /// parent replays the child's transcript through its b3 slot at one
 /// compression per 64 bytes, so at the measured ~6.1 µs per b3 row a KiB of
 /// child proof is ~0.1 ms of parent per child.
-#[cfg(test)]
 pub(super) fn census_kib<T: Serialize + ?Sized>(v: &T) -> f64 {
     serialize(v).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0
 }
