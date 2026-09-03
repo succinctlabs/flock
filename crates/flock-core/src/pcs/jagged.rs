@@ -1600,82 +1600,102 @@ pub(crate) fn build_merged_weight_and_prime(
     // dependence on the full prime rules out any single-pass scheme.
     const CHUNK: usize = 1 << 14;
     let ps = &params.col_prefix_sums;
-    let prime = w
-        .par_chunks_mut(CHUNK)
-        .enumerate()
-        .map(|(ci, out)| {
-            let base = (ci * CHUNK) as u64;
-            let end = base + out.len() as u64;
-            if base >= area as u64 {
-                // Wholly past the jagged area: W is identically zero there
-                // and the merged sumcheck's trimmed folds never read it —
-                // leave the scratch chunk dirty (the caller zeroes the few
-                // guard slots its rounded-up round-0 read can touch).
-                return (F128::ZERO, F128::ZERO);
-            }
-            let live_end = end.min(area as u64);
-            // Zero the dead tail of this chunk (past the jagged area).
-            out[(live_end - base) as usize..].fill(F128::ZERO);
-            let mut first_claim = true;
-            for (eq_r, side) in tabs.iter() {
-                let mut col = ps.partition_point(|&t| t <= base) - 1;
-                let mut e = base;
-                while e < live_end {
-                    while ps[col + 1] <= e {
-                        col += 1;
-                    }
-                    let seg_end = ps[col + 1].min(live_end);
-                    let row0 = (e - ps[col]) as usize;
-                    let dst = &mut out[(e - base) as usize..(seg_end - base) as usize];
-                    let rows = &eq_r[row0..row0 + dst.len()];
-                    match side {
-                        ColSide::Baked(all) => {
-                            let tab_c = &all[col * TAB..(col + 1) * TAB];
-                            if first_claim {
-                                for (slot, &r) in dst.iter_mut().zip(rows) {
-                                    *slot = fold_one_slot(r, tab_c);
-                                }
-                            } else {
-                                for (slot, &r) in dst.iter_mut().zip(rows) {
-                                    *slot += fold_one_slot(r, tab_c);
-                                }
-                            }
-                        }
-                        ColSide::Combined(cols) => {
-                            let c_hoist = cols[col];
-                            if first_claim {
-                                for (slot, &r) in dst.iter_mut().zip(rows) {
-                                    *slot = r * c_hoist;
-                                }
-                            } else {
-                                for (slot, &r) in dst.iter_mut().zip(rows) {
-                                    *slot += r * c_hoist;
-                                }
-                            }
-                        }
-                    }
-                    e = seg_end;
+    let chunk_prime = |ci: usize, out: &mut [F128]| -> (F128, F128) {
+        let base = (ci * CHUNK) as u64;
+        let end = base + out.len() as u64;
+        if base >= area as u64 {
+            // Wholly past the jagged area: W is identically zero there
+            // and the merged sumcheck's trimmed folds never read it —
+            // leave the scratch chunk dirty (the caller zeroes the few
+            // guard slots its rounded-up round-0 read can touch).
+            return (F128::ZERO, F128::ZERO);
+        }
+        let live_end = end.min(area as u64);
+        // Zero the dead tail of this chunk (past the jagged area).
+        out[(live_end - base) as usize..].fill(F128::ZERO);
+        let mut first_claim = true;
+        for (eq_r, side) in tabs.iter() {
+            let mut col = ps.partition_point(|&t| t <= base) - 1;
+            let mut e = base;
+            while e < live_end {
+                while ps[col + 1] <= e {
+                    col += 1;
                 }
-                first_claim = false;
+                let seg_end = ps[col + 1].min(live_end);
+                let row0 = (e - ps[col]) as usize;
+                let dst = &mut out[(e - base) as usize..(seg_end - base) as usize];
+                let rows = &eq_r[row0..row0 + dst.len()];
+                match side {
+                    ColSide::Baked(all) => {
+                        let tab_c = &all[col * TAB..(col + 1) * TAB];
+                        if first_claim {
+                            for (slot, &r) in dst.iter_mut().zip(rows) {
+                                *slot = fold_one_slot(r, tab_c);
+                            }
+                        } else {
+                            for (slot, &r) in dst.iter_mut().zip(rows) {
+                                *slot += fold_one_slot(r, tab_c);
+                            }
+                        }
+                    }
+                    ColSide::Combined(cols) => {
+                        let c_hoist = cols[col];
+                        if first_claim {
+                            for (slot, &r) in dst.iter_mut().zip(rows) {
+                                *slot = r * c_hoist;
+                            }
+                        } else {
+                            for (slot, &r) in dst.iter_mut().zip(rows) {
+                                *slot += r * c_hoist;
+                            }
+                        }
+                    }
+                }
+                e = seg_end;
             }
-            let qc = &q[base as usize..end as usize];
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            for (qp, wp) in qc
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(out.as_chunks::<2>().0.iter())
-            {
-                u0 += qp[0] * wp[0];
-                u2 += (qp[0] + qp[1]) * (wp[0] + wp[1]);
-            }
-            (u0, u2)
-        })
-        .reduce(
+            first_claim = false;
+        }
+        let qc = &q[base as usize..end as usize];
+        let mut u0 = F128::ZERO;
+        let mut u2 = F128::ZERO;
+        for (qp, wp) in qc
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(out.as_chunks::<2>().0.iter())
+        {
+            u0 += qp[0] * wp[0];
+            u2 += (qp[0] + qp[1]) * (wp[0] + wp[1]);
+        }
+        (u0, u2)
+    };
+    // Chunks drain on the shared P+E queue (`run_hetero_chunks_stateful`,
+    // per-worker prime partials): the pass is lookup/evaluation-bound, and
+    // the two E-cores measured −0.4 / −1.8 / −1.6 ms MT (3/3) at m=32.
+    let prime = {
+        let wp = w.as_mut_ptr() as usize;
+        let n_chunks = n_total.div_ceil(CHUNK);
+        let states = crate::run_hetero_chunks_stateful(
+            n_chunks,
             || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            |s: &mut (F128, F128), ci| {
+                let start = ci * CHUNK;
+                // SAFETY: chunk `ci` owns `w[start..start+len]` exclusively.
+                let out = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (wp as *mut F128).add(start),
+                        CHUNK.min(n_total - start),
+                    )
+                };
+                let (a, b) = chunk_prime(ci, out);
+                s.0 += a;
+                s.1 += b;
+            },
         );
+        states
+            .into_iter()
+            .fold((F128::ZERO, F128::ZERO), |(a, b), (c, d)| (a + c, b + d))
+    };
     (w, prime)
 }
 

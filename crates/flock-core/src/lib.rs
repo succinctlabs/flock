@@ -159,7 +159,7 @@ pub(crate) fn run_hetero_chunks<F: Fn(usize) + Sync>(n_chunks: usize, f: F) {
 /// through its chunks — for drains that accumulate per-worker partials the
 /// caller merges afterwards. Collected states are returned in no particular
 /// order.
-pub(crate) fn run_hetero_chunks_stateful<S, I, F>(n_chunks: usize, init: I, f: F) -> Vec<S>
+pub fn run_hetero_chunks_stateful<S, I, F>(n_chunks: usize, init: I, f: F) -> Vec<S>
 where
     S: Send,
     I: Fn() -> S + Sync,

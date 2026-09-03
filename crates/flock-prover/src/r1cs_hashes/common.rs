@@ -1007,84 +1007,87 @@ where
     const WG: usize = 8;
     let wg = WG;
     let n_super = n_groups.div_ceil(wg);
-    (0..n_super).into_par_iter().for_each_init(
-        || {
-            (
-                vec![[0u64; BM_V]; wg * u64_per_block],
-                vec![[0u64; BM_V]; wg * u64_per_block],
-                vec![[0u64; BM_V]; wg * u64_per_block],
-            )
-        },
-        move |(rz_all, ra_all, rb_all), sg| {
-            let g0 = sg * wg;
-            let n_in = wg.min(n_groups - g0);
-            for i in 0..n_in {
-                let g = g0 + i;
-                let rz = &mut rz_all[i * u64_per_block..(i + 1) * u64_per_block];
-                let ra = &mut ra_all[i * u64_per_block..(i + 1) * u64_per_block];
-                let rb = &mut rb_all[i * u64_per_block..(i + 1) * u64_per_block];
-                rz[..useful_words].fill([0u64; BM_V]);
-                ra[..useful_words].fill([0u64; BM_V]);
-                rb[..useful_words].fill([0u64; BM_V]);
-                let o0 = g * BM_V;
-                let live = n_declared.saturating_sub(o0).min(BM_V);
-                if live > 0 {
-                    // Dead lanes get the group's first real input as a
-                    // placeholder — their rows are zeroed below, so the
-                    // placeholder's data never reaches the buffers.
-                    let group: [&S; BM_V] =
-                        std::array::from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(&inputs_ref[o0]));
-                    per_group(group, rz, ra, rb);
-                    if live < BM_V {
-                        for rows in [&mut *rz, &mut *ra, &mut *rb] {
-                            for row in rows[..useful_words].iter_mut() {
-                                for lane in row[live..].iter_mut() {
-                                    *lane = 0;
-                                }
+    let init = || {
+        (
+            vec![[0u64; BM_V]; wg * u64_per_block],
+            vec![[0u64; BM_V]; wg * u64_per_block],
+            vec![[0u64; BM_V]; wg * u64_per_block],
+        )
+    };
+    type Staging = (Vec<BmRow>, Vec<BmRow>, Vec<BmRow>);
+    let body = move |(rz_all, ra_all, rb_all): &mut Staging, sg: usize| {
+        let g0 = sg * wg;
+        let n_in = wg.min(n_groups - g0);
+        for i in 0..n_in {
+            let g = g0 + i;
+            let rz = &mut rz_all[i * u64_per_block..(i + 1) * u64_per_block];
+            let ra = &mut ra_all[i * u64_per_block..(i + 1) * u64_per_block];
+            let rb = &mut rb_all[i * u64_per_block..(i + 1) * u64_per_block];
+            rz[..useful_words].fill([0u64; BM_V]);
+            ra[..useful_words].fill([0u64; BM_V]);
+            rb[..useful_words].fill([0u64; BM_V]);
+            let o0 = g * BM_V;
+            let live = n_declared.saturating_sub(o0).min(BM_V);
+            if live > 0 {
+                // Dead lanes get the group's first real input as a
+                // placeholder — their rows are zeroed below, so the
+                // placeholder's data never reaches the buffers.
+                let group: [&S; BM_V] =
+                    std::array::from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(&inputs_ref[o0]));
+                per_group(group, rz, ra, rb);
+                if live < BM_V {
+                    for rows in [&mut *rz, &mut *ra, &mut *rb] {
+                        for row in rows[..useful_words].iter_mut() {
+                            for lane in row[live..].iter_mut() {
+                                *lane = 0;
                             }
                         }
                     }
                 }
-                // Fully-dummy groups (live == 0) flush the pre-zeroed rows:
-                // the dummy region must be written, not skipped — see above.
-                // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
-                unsafe {
-                    stripe_from_rows(rz, sp.get() as *mut u8, o0, u64_per_block, useful_words);
-                }
             }
-            // SAFETY: the staged groups own rows [g0·8, (g0+n_in)·8) of every
-            // chunk-column; super-groups are disjoint.
+            // Fully-dummy groups (live == 0) flush the pre-zeroed rows:
+            // the dummy region must be written, not skipped — see above.
+            // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
             unsafe {
-                flush_rows_nt_burst(
-                    rz_all,
-                    n_in,
-                    u64_per_block,
-                    zp.get(),
-                    g0 * BM_V,
-                    n_blocks_log,
-                    useful_chunks,
-                );
-                flush_rows_nt_burst(
-                    ra_all,
-                    n_in,
-                    u64_per_block,
-                    ap.get(),
-                    g0 * BM_V,
-                    n_blocks_log,
-                    useful_chunks,
-                );
-                flush_rows_nt_burst(
-                    rb_all,
-                    n_in,
-                    u64_per_block,
-                    bp.get(),
-                    g0 * BM_V,
-                    n_blocks_log,
-                    useful_chunks,
-                );
+                stripe_from_rows(rz, sp.get() as *mut u8, o0, u64_per_block, useful_words);
             }
-        },
-    );
+        }
+        // SAFETY: the staged groups own rows [g0·8, (g0+n_in)·8) of every
+        // chunk-column; super-groups are disjoint.
+        unsafe {
+            flush_rows_nt_burst(
+                rz_all,
+                n_in,
+                u64_per_block,
+                zp.get(),
+                g0 * BM_V,
+                n_blocks_log,
+                useful_chunks,
+            );
+            flush_rows_nt_burst(
+                ra_all,
+                n_in,
+                u64_per_block,
+                ap.get(),
+                g0 * BM_V,
+                n_blocks_log,
+                useful_chunks,
+            );
+            flush_rows_nt_burst(
+                rb_all,
+                n_in,
+                u64_per_block,
+                bp.get(),
+                g0 * BM_V,
+                n_blocks_log,
+                useful_chunks,
+            );
+        }
+    };
+    // Super-groups drain on the shared P+E queue with per-worker staging:
+    // the BLAKE3 builder is compute-bound, and the two E-cores measured
+    // witgen −2.6 / −1.3 / −2.1 ms MT (3/3, twice) at m=32.
+    let _ = flock_core::run_hetero_chunks_stateful(n_super, init, |s, sg| body(s, sg));
 
     stripe
 }
