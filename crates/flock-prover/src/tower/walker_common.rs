@@ -8,7 +8,7 @@
 use std::{array::from_fn, iter::repeat_n};
 
 use flock_core::{
-    circuit::builder::SlotId,
+    circuit::{Circuit, builder::SlotId},
     product_gkr::{LiveMask, ProductGkrBatchedProof, s_id_basis},
     zerocheck::{
         ag_skip::friendly_challenges,
@@ -20,9 +20,10 @@ use flock_transcript::transcript_record::{TranscriptOp as Op, TranscriptShape};
 use crate::{
     r1cs_hashes::fs_chain::FsChainTrace,
     tower::{
-        F128, GkrLayerRec, GkrRec, InnerPd, Lvl, MergedChain, OpenLevel, ShapeBuilder, Wire,
-        ZskipTapeRec, assert_chain_replays, duplex_row_count_model, emit_spine256,
-        level_query_phase_b3_rows, merge_chain, squeeze_word_wire,
+        ChildSlots, F128, GkrLayerRec, GkrRec, InnerPd, Lvl, MergedChain, MixedProof, MpRec,
+        OpenLevel, RoundRec, ShapeBuilder, Wire, ZskipTapeRec, assert_chain_replays,
+        duplex_row_count_model, emit_spine256, level_query_phase_b3_rows, merge_chain,
+        squeeze_word_wire,
     },
 };
 
@@ -31,7 +32,7 @@ use crate::{
 /// the assembly wires against and the per-round `g0` advice), the masked
 /// input checks — the rhs consuming the DEFERRED s_sigma — and the
 /// (f, g, s_sigma) triple observed last. BOTH walkers must stay on this
-/// exact walk; `span_msg` is each side's r_pt-span assertion message.
+/// exact walk.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn walk_wiring_gkr_core(
     ops: &[Op],
@@ -41,7 +42,6 @@ pub(super) fn walk_wiring_gkr_core(
     gkr_l0: usize,
     mu: usize,
     mask_w: &LiveMask,
-    span_msg: &str,
     vc_at: &impl Fn(usize) -> (usize, usize),
     fin_at: &impl Fn(usize) -> usize,
 ) -> GkrRec {
@@ -138,7 +138,7 @@ pub(super) fn walk_wiring_gkr_core(
     // PROOF — the deferred value the assertion carries. Masked input
     // checks under the live-identity padding: leaves are w +
     // α·(live⊙s_id) + (β+1)·live + 1 (dead cells = 1).
-    assert_eq!(r_pt.len(), mu, "{span_msg}");
+    assert_eq!(r_pt.len(), mu, "the GKR point spans the inner cell space");
     let alpha2 = chals[c_alpha];
     let beta2 = chals[c_alpha + 1];
     let basis = s_id_basis(mu);
@@ -190,6 +190,60 @@ pub(super) fn merge_and_replay_chain(
     );
     assert_chain_replays(ops, &mc.trace, chals);
     mc
+}
+
+/// The residual pairing's rotation (lane-major inners): a pow2-lane inner
+/// (row_words == lanes — e.g. the m28-k4 slim node whose 16-of-16 lanes
+/// make the commit exactly full) takes the IDENTITY pairing, same as the
+/// native side's rotate gate. BOTH walkers must rotate identically.
+pub(super) fn parse_residual_rotation(
+    proof: &MixedProof,
+    geo: &[Lvl],
+    levels: &[OpenLevel],
+    w_rounds: &[RoundRec],
+) -> (usize, Vec<RoundRec>) {
+    let yr_len = proof.pcs_open().inner.ligerito.final_proof.yr.len() / 2;
+    let lane_major = geo[0].row_words < geo[0].lanes;
+    let w_resid: Vec<RoundRec> = if lane_major {
+        let k_rot = w_rounds.len() - levels[0].fold_fins.len();
+        let mut v = w_rounds[k_rot..].to_vec();
+        v.extend_from_slice(&w_rounds[..k_rot]);
+        v
+    } else {
+        w_rounds.to_vec()
+    };
+    (yr_len, w_resid)
+}
+
+/// The anchor's native endpoint: the anchor's claimed v folded through its
+/// own rounds. BOTH walkers must replay this exact fold.
+pub(super) fn parse_anchor_native_endpoint(vals_rec: &[F128], chals: &[F128], mp: &MpRec) -> F128 {
+    let mut t = vals_rec[mp.anchor_v];
+    for rr in &mp.anchor_rounds {
+        let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
+        let r = chals[rr.ch];
+        let g0 = t + g1;
+        t = g0 + (g1 + g0 + gi) * r + gi * r * r;
+    }
+    t
+}
+
+/// The GKR input-check advice (masked M̂ and livê) at the inner circuit's
+/// GKR endpoint. BOTH walkers must evaluate the same masks.
+pub(super) fn parse_gkr_input_check_advice(
+    circuit: &Circuit,
+    r_pt: &[F128],
+) -> (usize, F128, F128) {
+    let mu_i = circuit.cells().mu();
+    let (mid_n, live_n) = {
+        let basis_i = s_id_basis(mu_i);
+        let mask_i = circuit.live_mask();
+        (
+            mask_i.masked_id_eval(&basis_i, r_pt),
+            mask_i.live_eval(r_pt),
+        )
+    };
+    (mu_i, mid_n, live_n)
 }
 
 /// The `B3_CENSUS` per-level row report plus the chain-decomposition
@@ -270,6 +324,62 @@ pub(super) fn census_levels_and_chain_rows(
     }
 }
 
+/// The multipoint intake at R = 2 AND P > 0: the T0 gamma-power fold over
+/// the absorbed claim values, the m two-product rounds folding to the
+/// anchor's claimed v (a copy constraint), then the anchor's own rounds
+/// folding that v to the endpoint the expect consumes — the squeezes are
+/// the sigma wires. The gamma-power wires are KEPT: the anchor expect
+/// consumes mp_pws[j] (j < 128) for ĝ, mp_pws[128] for the second RS
+/// statement, and mp_pws[256 + k] for the P group coefficients. BOTH
+/// walkers must emit this exact intake.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_multipoint_intake(
+    sb: &mut ShapeBuilder,
+    cs: &ChildSlots,
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    mp: &MpRec,
+    m_mp2: usize,
+    zw: Wire,
+    ow: Wire,
+) -> (Vec<Wire>, Vec<Wire>, Vec<Wire>, Wire) {
+    let macs = cs.macs;
+    let mrs = cs.mrs;
+    let mp_gamma_w = outs[trace.squeezes[mp.gamma_fin][0]][0];
+    let mut t0_w = zw;
+    let mut pw_w = ow;
+    let mut mp_pws: Vec<Wire> = vec![ow];
+    for (k, &vi) in mp.val_vs.iter().enumerate() {
+        t0_w = sb.gate(macs, &[t0_w, pw_w, wv(vi)])[0];
+        if k + 1 < mp.val_vs.len() {
+            pw_w = sb.gate(macs, &[zw, pw_w, mp_gamma_w])[0];
+            mp_pws.push(pw_w);
+        }
+    }
+    let mut tm_w = t0_w;
+    let mut mp_rho2_w: Vec<Wire> = Vec::new();
+    for rr in &mp.rounds {
+        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+        mp_rho2_w.push(rho_w);
+        tm_w = sb.gate(mrs, &[tm_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+    }
+    sb.connect(tm_w, wv(mp.anchor_v));
+    let mut anc_w = wv(mp.anchor_v);
+    let mut mp_sig_w: Vec<Wire> = Vec::new();
+    for rr in &mp.anchor_rounds {
+        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+        mp_sig_w.push(rho_w);
+        anc_w = sb.gate(mrs, &[anc_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+    }
+    assert_eq!(
+        mp_sig_w.len(),
+        2 * (m_mp2 + 1),
+        "sigma spans the anchor layers"
+    );
+    (mp_pws, mp_rho2_w, mp_sig_w, anc_w)
+}
+
 /// The ligerito SPINE walk: start gamma'·q_eval, the initial-OOD folds,
 /// the start message, then per level the eval/build fold pairs and the
 /// intro-folds consuming the query phase's accumulator wires. Returns the
@@ -285,10 +395,10 @@ pub(super) fn emit_ligerito_spine_walk(
     inner_pd: &InnerPd,
     start_v: usize,
     level_accs: &[[Wire; 2]],
-    r_lvl: usize,
     zw: Wire,
     ow: Wire,
 ) -> [Wire; 2] {
+    let r_lvl = levels.len() - 1;
     let gpw = outs[trace.squeezes[inner_pd.fin][0]][0];
     let z2 = [zw, zw];
     let tw0 = emit_spine256(
@@ -463,10 +573,16 @@ pub(super) fn extend_const_coords(pw: &mut Vec<(F128, Wire)>, xn: &[F128], zw: W
     }
 }
 
-/// The c-point's 7 baked inner constants: the zerocheck's friendly
-/// challenges — the RS ghash set or the AG set, by the tape's flavor
-/// (baked constants are free in-circuit either way). BOTH walkers must
-/// bake the same seven.
+/// How many inner t-values [`baked_inner_t_vals`] bakes: the seven
+/// friendly zerocheck challenges every inner flavor fixes. The
+/// anchor-expect's c-point branches on this count — coordinates below it
+/// ride baked constants, the rest are r_outer squeeze words.
+pub(super) const N_BAKED_T_VALS: usize = 7;
+
+/// The c-point's [`N_BAKED_T_VALS`] baked inner constants: the zerocheck's
+/// friendly challenges — the RS ghash set or the AG set, by the tape's
+/// flavor (baked constants are free in-circuit either way). BOTH walkers
+/// must bake the same seven.
 pub(super) fn baked_inner_t_vals(zskip: &ZskipTapeRec) -> Vec<F128> {
     let t_vals_b: Vec<F128> = match zskip {
         ZskipTapeRec::Rs { .. } => {
@@ -477,7 +593,11 @@ pub(super) fn baked_inner_t_vals(zskip: &ZskipTapeRec) -> Vec<F128> {
         }
         ZskipTapeRec::Ag { .. } => friendly_challenges().to_vec(),
     };
-    assert_eq!(t_vals_b.len(), 7, "the seven baked inner constants");
+    assert_eq!(
+        t_vals_b.len(),
+        N_BAKED_T_VALS,
+        "the seven baked inner constants"
+    );
     t_vals_b
 }
 

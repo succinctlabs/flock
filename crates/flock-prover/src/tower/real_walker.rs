@@ -15,7 +15,7 @@ use flock_core::{
             tensor_algebra_transpose,
         },
     },
-    product_gkr::{LiveMask, s_id_basis},
+    product_gkr::LiveMask,
     proof::UnionClassClaims,
     zerocheck::univariate_skip::build_eq,
 };
@@ -383,14 +383,16 @@ impl<'p> RealTape<'p> {
             &native_sums,
         );
 
-        let (yr_len, w_resid) = rotate_residual_pairing(lo, &geo, &w_rounds, &levels);
+        let (yr_len, w_resid) =
+            walker_common::parse_residual_rotation(&lo.proof, &geo, &levels, &w_rounds);
 
         let (a_sum_n, b_sum_n, el_g0, el_run_n, z_ix) =
             element_piop_natives(&union_i, &piop_i, &el_assert, &gammas_i, &vals_rec, &chals);
 
-        let anc_end_n = anchor_native_endpoint(&mp_i, &vals_rec, &chals);
+        let anc_end_n = walker_common::parse_anchor_native_endpoint(&vals_rec, &chals, &mp_i);
 
-        let (mu_i, mid_n, live_n) = gkr_input_check_advice(lo, &gkr_rec.r_pt);
+        let (mu_i, mid_n, live_n) =
+            walker_common::parse_gkr_input_check_advice(&lo.shape.circuit, &gkr_rec.r_pt);
 
         let AnchorBooleanRec {
             m_mp2,
@@ -525,7 +527,6 @@ fn walk_wiring_gkr(
         gkr_l0,
         lo.shape.circuit.cells().mu(),
         &lo.shape.circuit.live_mask(),
-        "the GKR point spans the inner cell space",
         vc_at,
         fin_at,
     )
@@ -751,31 +752,6 @@ fn parse_rs_regions_and_two_halves(
     (rs_recs2, rs_gam_fin2, native_target, native_running)
 }
 
-/// the residual pairing's rotation (lane-major inners)
-///
-/// A pow2-lane inner (row_words == lanes — e.g. the m28-k4 slim node
-/// whose 16-of-16 lanes make the commit exactly full) takes the
-/// IDENTITY pairing, same as the native side's rotate gate and
-/// ChildTape's conditional.
-fn rotate_residual_pairing(
-    lo: &LeafOuter,
-    geo: &[Lvl],
-    w_rounds: &[RoundRec],
-    levels: &[OpenLevel],
-) -> (usize, Vec<RoundRec>) {
-    let yr_len = lo.proof.pcs_open().inner.ligerito.final_proof.yr.len() / 2;
-    let lane_major = geo[0].row_words < geo[0].lanes;
-    let w_resid: Vec<RoundRec> = if lane_major {
-        let k_rot = w_rounds.len() - levels[0].fold_fins.len();
-        let mut v = w_rounds[k_rot..].to_vec();
-        v.extend_from_slice(&w_rounds[..k_rot]);
-        v
-    } else {
-        w_rounds.to_vec()
-    };
-    (yr_len, w_resid)
-}
-
 /// the element PIOP's natives: the GENERAL strip + g0 chain
 fn element_piop_natives(
     union_i: &UnionInstance<'_>,
@@ -842,32 +818,6 @@ fn element_piop_natives(
         .position(|pd| vals_rec[pd.val_v] == el_assert.z_eval)
         .expect("z_eval is one of the absorbed pd values");
     (a_sum_n, b_sum_n, el_g0, el_run_n, z_ix)
-}
-
-/// the anchor's native endpoint
-fn anchor_native_endpoint(mp_i: &MpRec, vals_rec: &[F128], chals: &[F128]) -> F128 {
-    let mut t2 = vals_rec[mp_i.anchor_v];
-    for rr in &mp_i.anchor_rounds {
-        let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
-        let r3 = chals[rr.ch];
-        let g0 = t2 + g1;
-        t2 = g0 + (g1 + g0 + gi) * r3 + gi * r3 * r3;
-    }
-    t2
-}
-
-/// the GKR input-check advice (masked M̂ and livê)
-fn gkr_input_check_advice(lo: &LeafOuter, r_pt: &[F128]) -> (usize, F128, F128) {
-    let mu_i = lo.shape.circuit.cells().mu();
-    let (mid_n, live_n) = {
-        let basis_i = s_id_basis(mu_i);
-        let mask_i = lo.shape.circuit.live_mask();
-        (
-            mask_i.masked_id_eval(&basis_i, r_pt),
-            mask_i.live_eval(r_pt),
-        )
-    };
-    (mu_i, mid_n, live_n)
 }
 
 /// What [`parse_anchor_boolean_replica`] hands back — field-for-field the
@@ -1867,9 +1817,30 @@ pub(super) fn emit_real_child_region(
         .collect();
     emit_pow_checks(sb, b3_slot, cs.q.pow, iv2, &pow_checks, vals, consts);
 
-    let (cd_w, pub_w, to_publish, level_accs, query_positions) = emit_h_publics_region(
-        sb, cs, child_q, iv2, rt, &ww, &outs, &leafeval, &mut cen, vals, consts, hints,
+    let (cd_w, pub_w) =
+        emit_h_publics_region(sb, cs, child_q, iv2, rt, &ww, &mut cen, vals, consts);
+    let cap_w = cap_wires(stream, &ww, &rt.cap_pays);
+    let (to_publish, level_accs, query_positions) = emit_query_phase(
+        sb,
+        child_q,
+        iv2,
+        &leafeval,
+        levels,
+        geo,
+        &rt.lvl_src,
+        trace,
+        &outs,
+        &rt.chals,
+        &cap_w,
+        vals,
+        consts,
+        hints,
     );
+    cen.push((
+        "query phase decl",
+        sb.public_len(),
+        sb.rows_in_slot(cs.macs),
+    ));
     let IntakeSpineResidual {
         vmap,
         zw,
@@ -1915,8 +1886,9 @@ pub(super) fn emit_real_child_region(
         bsum_w,
         el_lcw,
     } = emit_element_piop(sb, cs, rt, &outs, &wv, vals, zw, ow, zassert, &mut cen);
-    let (mp_pws, mp_rho2_w, mp_sig_w, anc_w) =
-        emit_multipoint_intake(sb, cs, rt, &outs, &wv, zw, ow);
+    let (mp_pws, mp_rho2_w, mp_sig_w, anc_w) = walker_common::emit_multipoint_intake(
+        sb, cs, trace, &outs, &wv, &rt.mp_i, rt.m_mp2, zw, ow,
+    );
 
     let (jag_w, jag_row_w, mlv_pw, lc_pw) = emit_anchor_expect(
         sb, cs, rt, &outs, &mp_pws, &mp_rho2_w, &mp_sig_w, &pt_w, anc_w, pfslot, pf_w, zw, ow,
@@ -2070,24 +2042,11 @@ fn emit_h_publics_region(
     iv2: [Wire; 2],
     rt: &RealTape<'_>,
     ww: &[Option<Wire>],
-    outs: &[Vec<Wire>],
-    leafeval: &[SlotId],
     cen: &mut Vec<(&'static str, usize, usize)>,
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
-    hints: &mut Vec<[u32; SLOT_WORDS]>,
-) -> (
-    [Wire; 2],
-    Vec<Wire>,
-    Vec<Vec<Wire>>,
-    Vec<[Wire; 2]>,
-    Vec<Vec<Wire>>,
-) {
-    let trace = &rt.trace;
+) -> ([Wire; 2], Vec<Wire>) {
     let stream = &rt.stream;
-    let chals = &rt.chals[..];
-    let levels = &rt.levels[..];
-    let geo = &rt.geo[..];
     let pays = payload_words(stream);
     assert_eq!(pays[3].len(), 2, "the circuit digest payload is 32 bytes");
     let cd_w = [
@@ -2107,30 +2066,7 @@ fn emit_h_publics_region(
         sb.public_len(),
         sb.rows_in_slot(cs.macs),
     ));
-    let cap_w = cap_wires(stream, ww, &rt.cap_pays);
-    let (to_publish, level_accs, query_positions) = emit_query_phase(
-        sb,
-        child_q,
-        iv2,
-        leafeval,
-        levels,
-        geo,
-        &rt.lvl_src,
-        trace,
-        outs,
-        chals,
-        &cap_w,
-        vals,
-        consts,
-        hints,
-    );
-
-    cen.push((
-        "query phase decl",
-        sb.public_len(),
-        sb.rows_in_slot(cs.macs),
-    ));
-    (cd_w, pub_w, to_publish, level_accs, query_positions)
+    (cd_w, pub_w)
 }
 
 /// What [`emit_intake_spine_residual`] threads forward to the later
@@ -2171,7 +2107,6 @@ fn emit_intake_spine_residual(
     let mp_i = &rt.mp_i;
     let inner_pd_i = &rt.inner_pd_i;
     let gammas_i = &rt.gammas_i[..];
-    let r = levels.len() - 1;
     let mut vmap: Vec<Option<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
         if let StreamWord::Value(vi) = *w {
@@ -2212,7 +2147,6 @@ fn emit_intake_spine_residual(
         inner_pd_i,
         rt.start_v_i,
         level_accs,
-        r,
         zw,
         ow,
     );
@@ -2537,55 +2471,6 @@ fn emit_element_piop(
     }
 }
 
-/// the multipoint intake at R=2, P>0
-fn emit_multipoint_intake(
-    sb: &mut ShapeBuilder,
-    cs: &ChildSlots,
-    rt: &RealTape<'_>,
-    outs: &[Vec<Wire>],
-    wv: &impl Fn(usize) -> Wire,
-    zw: Wire,
-    ow: Wire,
-) -> (Vec<Wire>, Vec<Wire>, Vec<Wire>, Wire) {
-    let trace = &rt.trace;
-    let mp_i = &rt.mp_i;
-    let m_mp2 = rt.m_mp2;
-    let macs = cs.macs;
-    let mrslot = cs.mrs;
-    let mp_gamma_w = outs[trace.squeezes[mp_i.gamma_fin][0]][0];
-    let mut t0_w = zw;
-    let mut pw_w = ow;
-    let mut mp_pws: Vec<Wire> = vec![ow];
-    for (k, &vi) in mp_i.val_vs.iter().enumerate() {
-        t0_w = sb.gate(macs, &[t0_w, pw_w, wv(vi)])[0];
-        if k + 1 < mp_i.val_vs.len() {
-            pw_w = sb.gate(macs, &[zw, pw_w, mp_gamma_w])[0];
-            mp_pws.push(pw_w);
-        }
-    }
-    let mut tm_w = t0_w;
-    let mut mp_rho2_w: Vec<Wire> = Vec::new();
-    for rr in &mp_i.rounds {
-        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
-        mp_rho2_w.push(rho_w);
-        tm_w = sb.gate(mrslot, &[tm_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
-    }
-    sb.connect(tm_w, wv(mp_i.anchor_v));
-    let mut anc_w = wv(mp_i.anchor_v);
-    let mut mp_sig_w: Vec<Wire> = Vec::new();
-    for rr in &mp_i.anchor_rounds {
-        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
-        mp_sig_w.push(rho_w);
-        anc_w = sb.gate(mrslot, &[anc_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
-    }
-    assert_eq!(
-        mp_sig_w.len(),
-        2 * (m_mp2 + 1),
-        "sigma spans the anchor layers"
-    );
-    (mp_pws, mp_rho2_w, mp_sig_w, anc_w)
-}
-
 /// the anchor EXPECT at real-inner scale
 #[allow(clippy::too_many_arguments)]
 fn emit_anchor_expect(
@@ -2641,13 +2526,13 @@ fn emit_anchor_expect(
     let (outer_ch_b, outer_fin_b) = rt.outer_b;
     let mut xc_pw: Vec<(F128, Wire)> = (0..rt.zc_rounds_b.len())
         .map(|k2| {
-            if k2 < 7 {
+            if k2 < walker_common::N_BAKED_T_VALS {
                 (t_vals_b[k2], cw(sb, vals, consts, t_vals_b[k2]))
             } else {
                 // The exact (row, word) map — a FUSED slice squeeze (the
                 // AG r_outer grind) reserves one word per row for the PoW
                 // predicate, so the naive 4-per-row split misaddresses.
-                let j = k2 - 7;
+                let j = k2 - walker_common::N_BAKED_T_VALS;
                 (
                     chals[outer_ch_b + j],
                     squeeze_word_wire(outs, trace, outer_fin_b, j),
