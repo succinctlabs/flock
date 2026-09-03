@@ -1576,9 +1576,9 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
 /// exact, so `eq_lo[i_lo] * eq_hi[i_hi]` has the same bits as the
 /// materialized entry).
 /// Number of bytes in an `F128` (= lookup tables for the fold).
-const FOLD_N_BYTES: usize = 16;
+pub(crate) const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
-const FOLD_TABLE_SIZE: usize = 256;
+pub(crate) const FOLD_TABLE_SIZE: usize = 256;
 
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,

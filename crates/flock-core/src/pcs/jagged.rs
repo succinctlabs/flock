@@ -1527,9 +1527,40 @@ pub(crate) fn build_merged_weight_and_prime(
     let area = params.area() as usize;
     let n_total = 1usize << params.m;
     enum ColSide<'a> {
-        Fold(Vec<F128>, &'a [F128]),
+        /// A ring-switched claim's fold map with the COLUMN FACTOR BAKED IN,
+        /// one 16×256 byte table per column: `Ψ_c = φ ∘ (x ↦ eq_col[c]·x)`,
+        /// so a slot costs the 16 lookups only — no field multiply. Exact:
+        /// `x ↦ φ(eq_col[c]·x)` is F₂-linear, so its byte decomposition IS
+        /// the map. Measured at m=32 against the per-slot multiply: W build
+        /// 32.1 → 25.3 ms MT (3/3), 227 → 167 ST; the bake is ~1 ms MT.
+        Baked(Vec<F128>),
         Combined(&'a [F128]),
     }
+    use crate::pcs::ring_switch::{FOLD_N_BYTES, FOLD_TABLE_SIZE, fold_one_slot};
+    const TAB: usize = FOLD_N_BYTES * FOLD_TABLE_SIZE;
+    let ps_ref = &params.col_prefix_sums;
+    let bake = |eq_c: &[F128], tab: &[F128]| -> Vec<F128> {
+        let n_cols = ps_ref.len() - 1;
+        let mut out = vec![F128::ZERO; n_cols * TAB];
+        out.par_chunks_mut(TAB).enumerate().for_each(|(c, t)| {
+            if ps_ref[c + 1] == ps_ref[c] {
+                return; // empty column: never visited
+            }
+            let cf = eq_c[c];
+            for k in 0..FOLD_N_BYTES {
+                for b in 0..FOLD_TABLE_SIZE {
+                    let v = (b as u64) << (8 * (k % 8));
+                    let elem = if k < 8 {
+                        F128 { lo: v, hi: 0 }
+                    } else {
+                        F128 { lo: 0, hi: v }
+                    };
+                    t[k * FOLD_TABLE_SIZE + b] = fold_one_slot(elem * cf, tab);
+                }
+            }
+        });
+        out
+    };
     let tabs: Vec<(Vec<F128>, ColSide<'_>)> = claims
         .iter()
         .map(|c| match c {
@@ -1539,7 +1570,7 @@ pub(crate) fn build_merged_weight_and_prime(
                 table,
             } => (
                 build_eq_table(z_row),
-                ColSide::Fold(build_eq_table(z_col), table),
+                ColSide::Baked(bake(&build_eq_table(z_col), table)),
             ),
             MergedWeightClaim::Scalar { z_row, cols } => {
                 (build_eq_table(z_row), ColSide::Combined(cols))
@@ -1598,17 +1629,15 @@ pub(crate) fn build_merged_weight_and_prime(
                     let dst = &mut out[(e - base) as usize..(seg_end - base) as usize];
                     let rows = &eq_r[row0..row0 + dst.len()];
                     match side {
-                        ColSide::Fold(eq_c, tab) => {
-                            let c_hoist = eq_c[col];
+                        ColSide::Baked(all) => {
+                            let tab_c = &all[col * TAB..(col + 1) * TAB];
                             if first_claim {
                                 for (slot, &r) in dst.iter_mut().zip(rows) {
-                                    *slot =
-                                        crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                                    *slot = fold_one_slot(r, tab_c);
                                 }
                             } else {
                                 for (slot, &r) in dst.iter_mut().zip(rows) {
-                                    *slot +=
-                                        crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                                    *slot += fold_one_slot(r, tab_c);
                                 }
                             }
                         }
