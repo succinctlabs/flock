@@ -5253,3 +5253,36 @@ saved is repaid in PMULLs, and at ST it is pure loss. The zerocheck
 ladder won because its per-element compute (eq-weighted products)
 dwarfed the lookahead; the transport sumcheck has no such cover.
 Reverted; do not retry without a cheaper lookahead.
+
+### LANDED: mixed-field intake for the level OOD and induced bases — level OODs −5.7 MT, induce −3.3 MT (−24 / −13 ST) — 2026-09-03
+
+The recursive levels' OOD bases (`eq(z, ·)`, 2^20 at level 1, two per
+level) and the induced query basis (2^19, transported across the split
+as the pairs `(B_j, 0), (0, B_j)`) are base-valued, and so is the table
+`f` they meet — every level's OOD and induce run right after a code
+switch, on the split coordinate words. The intake nevertheless promoted
+each basis to F256 (a 32 MB allocation and write), formed the round
+message with F256×F256 products (three F128 multiplies each), split the
+induced basis into a second 64 MB array, and glued with F256×F128
+products into both limbs. Sub-bucket probe: OOD introduce 6.4, induce
+introduce 2.8, glue 3.4 ms MT — and these three scaled only ~3.5× ST→MT
+(page faults on the fresh 32–64 MB promotions).
+
+Now (`PendingBasis::{Base, PresplitBase}`): the OOD evaluation and its
+`(u_0, u_2)` are three F128 products per pair in one sweep; the
+presplit message is `u_0 = Σ f_0·B_j`, `u_2 = (S, S)` with
+`S = Σ (f_0+f_1)·B_j` (two products per pair, since `u·B = (0, B)` and
+`(1+u)·s = (s, s)` for base `s`); glue adds `B_j·β` into `c0` (Base) or
+into `c0` of the even slot and `c1` of the odd slot (PresplitBase).
+Same field elements, no promotion, no split array. Alternating against
+the saved baseline binary, m=32, warm min:
+
+| | level OODs | induce |
+|---|---|---|
+| MT new / base (3 pairs) | 5.6 / 4.7 / 4.6 vs 10.3 / 10.6 / 10.4 | 7.3 / 6.9 / 7.0 vs 11.0 / 10.0 / 10.0 |
+| ST new / base | 11.7 vs 35.9 | 23.0 vs 36.2 |
+
+Open (pairs 2–3) −17 / −16 ms; **best prove 601.4 ms**. Bit-identical:
+m6 merged-union proof-bytes pins, prover roundtrips, core pcs suite,
+the stats-ladder and fold-lookahead oracles. The promoted intake
+(`introduce_extension`) is deleted.
