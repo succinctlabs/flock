@@ -1,28 +1,26 @@
-use std::{array::from_fn, env::var, iter::repeat_n};
+use std::env::var;
 
 use flock_core::{
-    circuit::{SigmaAssertion, builder::SlotId},
-    element_r1cs::union::ElementAssertion,
+    circuit::{
+        SigmaAssertion,
+        builder::{BuiltCircuit, SlotId},
+    },
+    element_r1cs::union::{ElementAssertion, region_slots},
     lincheck::{LincheckCircuit, MatrixAssertion, SkipPoint, build_eq_table},
     matrix_fold::{JaggedAssertion, JaggedRowWeight},
     pcs::{
         jagged::{
-            JaggedParams, STATE_INITIAL, STATE_SUCCESS, assist_boundaries,
+            JaggedParams, MultipointTwistedProof, STATE_INITIAL, STATE_SUCCESS, assist_boundaries,
             assist_sparse_transitions, frob_inv,
         },
         ring_switch::{
             build_fold_byte_table, inner_product, linearized_coefficients, tensor_algebra_transpose,
         },
     },
-    product_gkr::s_id_basis,
-    zerocheck::{
-        ag_skip::friendly_challenges,
-        univariate_skip::build_eq,
-        univariate_skip_optimized::{medium_challenges_ghash, small_challenges_ghash},
-    },
+    zerocheck::univariate_skip::build_eq,
 };
 use flock_transcript::transcript_record::{
-    RecordingChallenger, Stream, StreamWord, TranscriptOp as Op,
+    RecordingChallenger, Stream, StreamWord, TranscriptOp as Op, TranscriptShape,
 };
 #[cfg(test)]
 use {
@@ -41,17 +39,16 @@ use crate::{
         fs_chain::{FsChainTrace, IV},
     },
     tower::{
-        CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrLayerRec, GkrRec,
-        HashKind, InnerPd, LeafEvalGate, LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner,
-        MixedProof, MpRec, OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance,
-        Wire, ag_seed_bytes, assert_chain_replays, assertion_mac, bytes_payload_mask, cap_payloads,
-        cap_wires, check_residual_publics, circuit_structure_claim_wires, cw,
-        declare_envelope_slots, decode_ag_point, duplex_row_count_model,
+        CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind, InnerPd,
+        LeafEvalGate, LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner, MixedProof, MpRec,
+        OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ag_seed_bytes,
+        assertion_mac, bytes_payload_mask, cap_payloads, cap_wires, check_residual_publics,
+        circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
         emit_boolean_reported_check, emit_element_reported_check, emit_family_h, emit_fs_chain,
-        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region,
-        emit_spine256, flatten_ops, level_geometry, level_query_phase_b3_rows, level_sources,
-        merge_chain, observed_f256, pack8, parse_open_levels, payload_words, pin_recombination,
-        query_phase_b3_rows, replay_ligerito_spine256, squeeze_word_wire, strat_scheds,
+        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region, flatten_ops,
+        level_geometry, level_sources, observed_f256, pack8, parse_open_levels, payload_words,
+        pin_recombination, query_phase_b3_rows, replay_ligerito_spine256, squeeze_word_wire,
+        strat_scheds, walker_common,
     },
     verifier::{verify_ligerito_union_circuit, verify_ligerito_union_circuit_ag},
 };
@@ -182,6 +179,41 @@ pub(super) enum ZskipTapeRec {
     },
 }
 
+/// The label map: the region order the assembly builds against
+/// ([`ChildTape::parse_label_map`]).
+struct LabelMap {
+    zc_l: Vec<usize>,
+    lc_l: Vec<usize>,
+    elzc_l: Vec<usize>,
+    el_l: Vec<usize>,
+    gkr_l: Vec<usize>,
+    mo_l: Vec<usize>,
+    mp_l: Vec<usize>,
+}
+
+/// Everything the chain-materials + open-phase walk hands the tape:
+/// the merged chain, the located open-phase records, and the geometry
+/// ([`ChildTape::parse_chain_and_open_phase`]).
+struct ChainOpenParse<'p> {
+    stream: Stream,
+    bytes: Vec<u8>,
+    trace: FsChainTrace,
+    cross: Vec<Option<(usize, usize)>>,
+    lvl_src: Vec<(&'p [[u8; 32]], &'p Vec<Vec<F128>>, &'p Vec<[u8; 32]>)>,
+    start_v: usize,
+    gammas_o: Vec<PdRec>,
+    w_rounds: Vec<RoundRec>,
+    mp_o: MpRec,
+    inner_pd2: InnerPd,
+    yr_v2: usize,
+    levels: Vec<OpenLevel>,
+    geo: Vec<Lvl>,
+    native_sums: Vec<F256>,
+    b3_rows: usize,
+    spread_w: usize,
+    cap_pays: Vec<usize>,
+}
+
 impl<'p> ChildTape<'p> {
     pub(super) fn new(inner: &'p MixedInner, domain: &'static [u8]) -> Self {
         let built = &inner.built;
@@ -236,422 +268,27 @@ impl<'p> ChildTape<'p> {
         let ops: Vec<Op> = flatten_ops(t_shape.ops()).to_vec();
         let mut pub_payloads = bytes_payload_mask(&ops);
 
-        // ---- the label map: the region order the assembly builds against ----
-        let find = |label: &[u8]| -> Vec<usize> {
-            ops.iter()
-                .enumerate()
-                .filter_map(|(i, op)| match op {
-                    Op::Label(l) if l.as_slice() == label => Some(i),
-                    _ => None,
-                })
-                .collect()
-        };
-        // The boolean zerocheck region's anchor is flavor-specific; the
-        // OTHER flavor's label must be absent (one boolean zerocheck).
-        let zc_l = match proof {
-            MixedProof::Rs(_) => {
-                assert!(
-                    find(b"flock-ag-skip-v1").is_empty(),
-                    "an RS tape carries no AG-skip region"
-                );
-                find(b"flock-zerocheck-v0")
-            }
-            MixedProof::Ag(_) => {
-                assert!(
-                    find(b"flock-zerocheck-v0").is_empty(),
-                    "an AG tape carries no RS zerocheck region"
-                );
-                find(b"flock-ag-skip-v1")
-            }
-        };
-        let lc_l = find(b"flock-lincheck-v0");
-        let elzc_l = find(b"flock-element-union-zc-v0");
-        let el_l = find(b"flock-element-union-lc-v0");
-        let gkr_l = find(b"flock-product-gkr-batched-v0");
-        let mo_l = find(b"flock-merged-open-v1");
-        let rs_l = find(b"flock-ring-switch-v0");
-        let mp_l = find(b"flock-multipoint-twisted-v1");
-        let fa_l = find(b"flock-frobenius-assist-v0");
-        assert_eq!(zc_l.len(), 1, "one boolean zerocheck");
-        assert_eq!(lc_l.len(), 1, "one boolean lincheck");
-        if has_el {
-            assert_eq!(elzc_l.len(), 1, "one element zerocheck");
-            assert_eq!(el_l.len(), 1, "one element lincheck region");
-            assert!(elzc_l[0] < el_l[0], "element zc before element lc");
-            assert!(lc_l[0] < el_l[0], "boolean PIOP before element PIOP");
-        } else {
-            assert!(
-                elzc_l.is_empty() && el_l.is_empty(),
-                "a boolean-only tape carries NO element region"
-            );
-        }
-        // THE FORKED ORDER: the wiring argument's chain is spliced in at the
-        // fork point, so its region precedes the boolean PIOP's.
-        assert!(
-            gkr_l[0] < zc_l[0],
-            "the wiring fork precedes the boolean PIOP"
-        );
-        assert_eq!(gkr_l.len(), 1, "one batched wiring GKR");
-        assert_eq!(mo_l.len(), 1, "one merged open");
-        assert_eq!(
-            rs_l.len(),
-            2,
-            "rs x 2 — one ab/c pair for the boolean class"
-        );
-        assert_eq!(mp_l.len(), 1, "one multipoint region");
-        assert_eq!(fa_l.len(), 1, "one anchor region");
-        assert!(zc_l[0] < lc_l[0], "boolean zc before boolean lc");
-        assert!(gkr_l[0] < mo_l[0], "wiring GKR before the merged open");
-        assert!(mo_l[0] < rs_l[0] && rs_l[1] < mp_l[0] && mp_l[0] < fa_l[0]);
+        let LabelMap {
+            zc_l,
+            lc_l,
+            elzc_l,
+            el_l,
+            gkr_l,
+            mo_l,
+            mp_l,
+        } = Self::parse_label_map(&ops, proof, has_el);
 
-        // (v, c) counters up to an op index — the walker every pin shares.
-        let vc_at = |end: usize| -> (usize, usize) {
-            let (mut v, mut c) = (0usize, 0usize);
-            for op in &ops[..end] {
-                match op {
-                    Op::SqueezeScalar => c += 1,
-                    Op::SqueezeSlice(n) => c += n,
-                    Op::ObserveScalar => v += 1,
-                    Op::ObserveSlice(n) => v += n,
-                    _ => {}
-                }
-            }
-            (v, c)
-        };
-        // fin ordinal of the op at `end` = finalizing ops strictly before it.
-        let fin_at = |end: usize| ops[..end].iter().filter(|o| o.finalizes()).count();
+        let vc_at = |end: usize| vc_at(&ops, end);
+        let fin_at = |end: usize| fin_at(&ops, end);
 
-        // ---- the boolean zerocheck slices, same shape as the leaf ----
-        assert_eq!(
-            proof.element().is_some(),
-            has_el,
-            "the element proof section mirrors the union's classes"
-        );
-        match proof {
-            MixedProof::Rs(p) => {
-                let bp = p.boolean.as_ref().expect("boolean side present");
-                let mut i = zc_l[0] + 1;
-                while matches!(ops[i], Op::Pow { .. }) {
-                    i += 1;
-                }
-                assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau lo");
-                i += 1;
-                assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau hi");
-                i += 1;
-                assert!(matches!(ops[i], Op::ObserveSlice(64)), "round1_ab");
-                let (v0, _) = vc_at(i);
-                assert_eq!(
-                    &vals_rec[v0..v0 + 64],
-                    &bp.zerocheck.round1_ab[..],
-                    "round1_ab on the stream"
-                );
-                i += 1;
-                assert!(matches!(ops[i], Op::ObserveSlice(64)), "round1_c");
-                let (v1, _) = vc_at(i);
-                assert_eq!(
-                    &vals_rec[v1..v1 + 64],
-                    &bp.zerocheck.round1_c[..],
-                    "round1_c on the stream"
-                );
-            }
-            MixedProof::Ag(p) => {
-                let bp = p.boolean.as_ref().expect("boolean side present");
-                let mut i = zc_l[0] + 1;
-                while matches!(ops[i], Op::Pow { .. }) {
-                    i += 1;
-                }
-                assert!(matches!(ops[i], Op::SqueezeSlice(_)), "ag r_outer");
-                i += 1;
-                assert!(matches!(ops[i], Op::ObserveSlice(158)), "ag round1_ab");
-                let (v0, _) = vc_at(i);
-                assert_eq!(
-                    &vals_rec[v0..v0 + 158],
-                    &bp.ag.round1_ab[..],
-                    "ag round1_ab on the stream"
-                );
-                i += 1;
-                assert!(matches!(ops[i], Op::ObserveSlice(64)), "ag round1_c");
-                let (v1, _) = vc_at(i);
-                assert_eq!(
-                    &vals_rec[v1..v1 + 64],
-                    &bp.ag.round1_c[..],
-                    "ag round1_c on the stream"
-                );
-            }
-        }
+        Self::check_boolean_zerocheck_slices(&ops, &vals_rec, proof, has_el, &zc_l);
 
-        // ---- the wiring GKR region, walked op by op ----
-        // The transcription map: [alpha, beta squeezes | top pair observed |
-        // per layer k: lambda squeeze, k x (2 obs + squeeze) rounds — the
-        // ZcRoundGate shape VERBATIM — then (vl0, vl1, vr0, vr1) observed,
-        // the layer check, and the c_k squeeze folding the claims | the
-        // (f, g, s_sigma) triple observed last]. The walk also RECORDS the
-        // ordinals the assembly wires against, and the per-round `g0` advice.
-        let gkr_rec = {
-            let gkr = &proof.wiring().gkr;
-            let mut i = gkr_l[0] + 1;
-            while matches!(ops[i], Op::Pow { .. }) {
-                i += 1;
-            }
-            assert!(matches!(ops[i], Op::SqueezeScalar), "gkr alpha");
-            let (_, c_alpha) = vc_at(i);
-            let alpha_fin = fin_at(i);
-            i += 1;
-            assert!(matches!(ops[i], Op::SqueezeScalar), "gkr beta");
-            let beta_fin = fin_at(i);
-            i += 1;
-            assert!(matches!(ops[i], Op::ObserveScalar), "top lhs");
-            let (tv, _) = vc_at(i);
-            assert_eq!(vals_rec[tv], gkr.top_lhs, "top_lhs on the stream");
-            assert_eq!(vals_rec[tv + 1], gkr.top_rhs, "top_rhs on the stream");
-            assert_eq!(gkr.top_lhs, gkr.top_rhs, "the grand products agree");
-            i += 2;
-            // The layer walk + native replay in lockstep.
-            let (mut claim_l, mut claim_r) = (gkr.top_lhs, gkr.top_rhs);
-            let mut r_pt: Vec<F128> = Vec::new();
-            let mut lrecs: Vec<GkrLayerRec> = Vec::new();
-            for (k, layer) in gkr.layers.iter().enumerate() {
-                assert_eq!(layer.rounds.len(), k, "layer {k} has k rounds");
-                while matches!(ops[i], Op::Pow { .. }) {
-                    i += 1;
-                }
-                assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} lambda");
-                let (_, lc2) = vc_at(i);
-                let lambda = chals[lc2];
-                let lam_fin = fin_at(i);
-                i += 1;
-                let mut c_run = claim_l + lambda * claim_r;
-                let mut r_prime = Vec::with_capacity(k + 1);
-                let mut rrecs: Vec<(usize, usize)> = Vec::new();
-                let mut g0s: Vec<F128> = Vec::new();
-                for (t2, &(g1, gi)) in layer.rounds.iter().enumerate() {
-                    assert!(matches!(ops[i], Op::ObserveScalar), "round obs g1");
-                    let (gv, _) = vc_at(i);
-                    assert_eq!(vals_rec[gv], g1, "layer {k} round {t2} g1");
-                    assert_eq!(vals_rec[gv + 1], gi, "layer {k} round {t2} g_inf");
-                    let mut rho_i = i + 2;
-                    while matches!(ops[rho_i], Op::Pow { .. }) {
-                        rho_i += 1;
-                    }
-                    assert!(matches!(ops[rho_i], Op::SqueezeScalar), "round rho");
-                    let (_, rc2) = vc_at(rho_i);
-                    let rho = chals[rc2];
-                    rrecs.push((gv, fin_at(rho_i)));
-                    i = rho_i + 1;
-                    let r_eq = r_pt[t2];
-                    let g0 = (c_run + r_eq * g1) * (F128::ONE + r_eq).inv();
-                    g0s.push(g0);
-                    c_run = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
-                    r_prime.push(rho);
-                }
-                let (vv, _) = vc_at(i);
-                for (j, want) in [layer.vl0, layer.vl1, layer.vr0, layer.vr1]
-                    .into_iter()
-                    .enumerate()
-                {
-                    assert!(matches!(ops[i], Op::ObserveScalar), "layer value obs");
-                    assert_eq!(vals_rec[vv + j], want, "layer {k} value {j}");
-                    i += 1;
-                }
-                assert_eq!(
-                    c_run,
-                    layer.vl0 * layer.vl1 + lambda * (layer.vr0 * layer.vr1),
-                    "layer {k} closes"
-                );
-                while matches!(ops[i], Op::Pow { .. }) {
-                    i += 1;
-                }
-                assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} c_k");
-                let (_, cc2) = vc_at(i);
-                let c_k = chals[cc2];
-                let ck_fin = fin_at(i);
-                i += 1;
-                claim_l = (F128::ONE + c_k) * layer.vl0 + c_k * layer.vl1;
-                claim_r = (F128::ONE + c_k) * layer.vr0 + c_k * layer.vr1;
-                r_prime.push(c_k);
-                r_pt = r_prime;
-                lrecs.push(GkrLayerRec {
-                    lam_fin,
-                    rounds: rrecs,
-                    g0s,
-                    v_v: vv,
-                    ck_fin,
-                });
-            }
-            // The input checks: s_id(rho) closed-form NATIVE, s_sigma from
-            // the PROOF — the deferred value the assertion carries.
-            let mu2 = built.shape.circuit.cells().mu();
-            assert_eq!(r_pt.len(), mu2, "the GKR point spans the cell space");
-            let alpha2 = chals[c_alpha];
-            let beta2 = chals[c_alpha + 1];
-            let basis = s_id_basis(mu2);
-            // Masked input checks under the live-identity padding.
-            let mask_w = built.shape.circuit.live_mask();
-            let tail_w2 = (beta2 + F128::ONE) * mask_w.live_eval(&r_pt) + F128::ONE;
-            assert_eq!(
-                claim_l,
-                gkr.f_eval + alpha2 * mask_w.masked_id_eval(&basis, &r_pt) + tail_w2,
-                "lhs input check replays (masked)"
-            );
-            assert_eq!(
-                claim_r,
-                gkr.g_eval + alpha2 * gkr.s_sigma_eval + tail_w2,
-                "rhs input check replays with the DEFERRED (masked) sigma value"
-            );
-            // The triple observed last — the assertion's value wire.
-            let (fv, _) = vc_at(i);
-            assert!(matches!(ops[i], Op::ObserveScalar), "f_eval obs");
-            assert_eq!(vals_rec[fv], gkr.f_eval, "f_eval on the stream");
-            assert_eq!(vals_rec[fv + 1], gkr.g_eval, "g_eval on the stream");
-            assert_eq!(vals_rec[fv + 2], gkr.s_sigma_eval, "s_sigma on the stream");
-            GkrRec {
-                alpha_fin,
-                beta_fin,
-                top_v: tv,
-                layers: lrecs,
-                fgs_v: fv,
-                r_pt,
-            }
-        };
+        let gkr_rec = Self::parse_wiring_gkr_region(&ops, &vals_rec, &chals, proof, built, &gkr_l);
 
-        // ---- the ELEMENT PIOP region, located (mixed inners only) ----
-        // Shape, per `parse_open_levels`' element branch: [tau slice |
-        // tau_len rounds | ea, eb, ec | lc label | alpha | lc rounds].
-        let el_rec = has_el.then(|| {
-            let mut i = elzc_l[0] + 1;
-            while matches!(ops[i], Op::Pow { .. }) {
-                i += 1;
-            }
-            let (tau_fin, tau_ch, tau_len) = match ops[i] {
-                Op::SqueezeSlice(n) => (fin_at(i), vc_at(i).1, n),
-                ref o => panic!("element tau, got {o:?}"),
-            };
-            i += 1;
-            let mut zc_rounds = Vec::with_capacity(tau_len);
-            for _ in 0..tau_len {
-                let (gv, _) = vc_at(i);
-                assert!(matches!(ops[i], Op::ObserveScalar), "el zc msg");
-                assert!(matches!(ops[i + 1], Op::ObserveScalar), "el zc msg");
-                let mut squeeze_i = i + 2;
-                while matches!(ops[squeeze_i], Op::Pow { .. }) {
-                    squeeze_i += 1;
-                }
-                assert!(matches!(ops[squeeze_i], Op::SqueezeScalar), "el zc rho");
-                zc_rounds.push((gv, fin_at(squeeze_i), vc_at(squeeze_i).1));
-                i = squeeze_i + 1;
-            }
-            let (eab_v, _) = vc_at(i);
-            for _ in 0..3 {
-                assert!(matches!(ops[i], Op::ObserveScalar), "el zc final");
-                i += 1;
-            }
-            assert_eq!(i, el_l[0], "the lc label follows the finals");
-            i += 1;
-            while matches!(ops[i], Op::Pow { .. }) {
-                i += 1;
-            }
-            assert!(matches!(ops[i], Op::SqueezeScalar), "el lc alpha");
-            let (alpha_fin, alpha_ch) = (fin_at(i), vc_at(i).1);
-            i += 1;
-            let mut lc_rounds = Vec::new();
-            while matches!(ops[i], Op::ObserveScalar) && matches!(ops[i + 1], Op::ObserveScalar) {
-                let mut squeeze_i = i + 2;
-                while matches!(ops[squeeze_i], Op::Pow { .. }) {
-                    squeeze_i += 1;
-                }
-                if !matches!(ops[squeeze_i], Op::SqueezeScalar) {
-                    break;
-                }
-                let (gv, _) = vc_at(i);
-                lc_rounds.push((gv, fin_at(squeeze_i), vc_at(squeeze_i).1));
-                i = squeeze_i + 1;
-            }
-            assert!(!zc_rounds.is_empty() && !lc_rounds.is_empty(), "el rounds");
-            ElPiopRec {
-                tau_fin,
-                tau_ch,
-                zc_rounds,
-                eab_v,
-                alpha_fin,
-                alpha_ch,
-                lc_rounds,
-            }
-        });
+        let el_rec = Self::parse_element_piop_region(&ops, has_el, &elzc_l, &el_l);
 
-        // ---- the merged open: rs x 2, then PD values, then one coefficient vector ----
-        let (pd_recs, mp_val_v, rs_recs, rs_gam_ch, rs_gam_fins) = {
-            let mut i = mo_l[0] + 1;
-            let mut rs_recs: Vec<(usize, usize, usize)> = Vec::new();
-            for k in 0..2 {
-                assert!(
-                    matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0"),
-                    "rs region {k}"
-                );
-                i += 1;
-                assert!(matches!(ops[i], Op::ObserveSlice(128)), "s_hat_v slice");
-                let (sv, _) = vc_at(i);
-                assert_eq!(
-                    &vals_rec[sv..sv + 128],
-                    &proof.pcs_open().ring_switches[k].s_hat_v[..],
-                    "s_hat_v {k} on the stream"
-                );
-                i += 1;
-                while matches!(ops[i], Op::Pow { .. }) {
-                    i += 1;
-                }
-                assert!(matches!(ops[i], Op::SqueezeSlice(7)), "r_dprime");
-                rs_recs.push((sv, fin_at(i), vc_at(i).1));
-                i += 1;
-            }
-            // Packed-direct claims contribute just their values.  Their
-            // coefficients share the vector squeeze with both RS claims.
-            let mut pd_recs: Vec<usize> = Vec::new(); // value index
-            while matches!(ops[i], Op::ObserveScalar) {
-                let (pv, _) = vc_at(i);
-                i += 1;
-                pd_recs.push(pv);
-            }
-            while matches!(ops[i], Op::Pow { .. }) {
-                i += 1;
-            }
-            assert!(
-                matches!(ops[i], Op::SqueezeSlice(n) if n == 2 + pd_recs.len()),
-                "mixed coefficient vector"
-            );
-            let rs_gam_ch = vc_at(i).1;
-            let rs_gam_fin = fin_at(i);
-            i += 1;
-            // W rounds until the multipoint label.
-            let mut w_rounds = 0usize;
-            while matches!(ops[i], Op::ObserveScalar) {
-                assert!(matches!(ops[i + 1], Op::ObserveScalar), "w round pair");
-                i += 2;
-                while matches!(ops[i], Op::Pow { .. }) {
-                    i += 1;
-                }
-                assert!(matches!(ops[i], Op::SqueezeScalar), "w round squeeze");
-                i += 1;
-                w_rounds += 1;
-            }
-            assert_eq!(
-                w_rounds,
-                proof.pcs_open().merged_rounds.len(),
-                "the W rounds fill the dense domain"
-            );
-            while !matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-multipoint-twisted-v1")
-            {
-                i += 1;
-            }
-            i += 1;
-            let (mv, _) = vc_at(i);
-            (
-                pd_recs,
-                mv,
-                rs_recs,
-                rs_gam_ch,
-                vec![(rs_gam_fin, 0), (rs_gam_fin, 1)],
-            )
-        };
+        let (pd_recs, mp_val_v, rs_recs, rs_gam_ch, rs_gam_fins) =
+            Self::parse_merged_open(&ops, &vals_rec, proof, &mo_l);
         // The pd claims are the element class's two (c, lc) — when the
         // class exists — plus one per wiring GATHER; every gather value is
         // absorbed, in proof order.
@@ -669,277 +306,42 @@ impl<'p> ChildTape<'p> {
             );
         }
 
-        // ---- the multipoint: the R=2 + P>0 schedule, pinned ----
         let fro = &proof.pcs_open().frobenius;
         let n_p = fro.group_values.len();
         assert!(n_p > 0, "a circuit inner carries scalar groups (P > 0)");
-        {
-            let mut i = mp_l[0] + 1;
-            let mut n_vals = 0usize;
-            while matches!(ops[i], Op::ObserveScalar) {
-                n_vals += 1;
-                i += 1;
-            }
-            assert_eq!(n_vals, 256 + n_p, "2x128 RS dual values + P group values");
-            while matches!(ops[i], Op::Pow { .. }) {
-                i += 1;
-            }
-            assert!(matches!(ops[i], Op::SqueezeScalar), "multipoint gamma");
-            let (_, gc) = vc_at(i);
-            let gamma = chals[gc];
-            i += 1;
-            // The located values ARE the proof's, in schedule order.
-            for k in 0..n_vals {
-                let want = if k < 256 {
-                    fro.values[k / 128][k % 128]
-                } else {
-                    fro.group_values[k - 256]
-                };
-                assert_eq!(vals_rec[mp_val_v + k], want, "mp value {k}");
-            }
-            // T0 under the R=2 + P schedule folds through the rounds to the
-            // anchor's claimed v — consecutive gamma powers across BOTH kinds.
-            let mut t = F128::ZERO;
-            let mut pw = F128::ONE;
-            for k in 0..n_vals {
-                t += pw * vals_rec[mp_val_v + k];
-                pw *= gamma;
-            }
-            let mut rounds = 0usize;
-            while matches!(ops[i], Op::ObserveScalar) && matches!(ops[i + 1], Op::ObserveScalar) {
-                let (gv, _) = vc_at(i);
-                i += 2;
-                while matches!(ops[i], Op::Pow { .. }) {
-                    i += 1;
-                }
-                if !matches!(ops[i], Op::SqueezeScalar) {
-                    break;
-                }
-                let (_, rc) = vc_at(i);
-                let (g1, gi) = (vals_rec[gv], vals_rec[gv + 1]);
-                let r = chals[rc];
-                let g0 = t + g1;
-                t = g0 + (g1 + g0 + gi) * r + gi * r * r;
-                i += 1;
-                rounds += 1;
-            }
-            assert_eq!(rounds, fro.rounds.len(), "mp round count");
-            assert!(
-                matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-frobenius-assist-v0"),
-                "anchor label follows the rounds"
-            );
-            assert_eq!(t, fro.anchor.v, "T_m == anchor.v under the R=2+P schedule");
-        }
+        Self::check_multipoint_schedule(&ops, &vals_rec, &chals, fro, n_p, &mp_l, mp_val_v);
 
-        // ---- the published chain ordinals (GKR alpha, multipoint gamma) ----
-        let mut ga_i = gkr_l[0] + 1;
-        while matches!(ops[ga_i], Op::Pow { .. }) {
-            ga_i += 1;
-        }
-        assert!(matches!(ops[ga_i], Op::SqueezeScalar), "GKR fingerprint");
-        let ga_fin = fin_at(ga_i);
-        let (_, ga_c) = vc_at(ga_i);
-        let mut mp_i = mp_l[0] + 1;
-        while matches!(ops[mp_i], Op::ObserveScalar) {
-            mp_i += 1;
-        }
-        while matches!(ops[mp_i], Op::Pow { .. }) {
-            mp_i += 1;
-        }
-        assert!(matches!(ops[mp_i], Op::SqueezeScalar), "mp gamma op");
-        let mg_fin = fin_at(mp_i);
-        let (_, mg_c) = vc_at(mp_i);
-        // ROUND 2: the H(publics) region's rows — a chunk chain per 1 KiB
-        // leaf of the child's public segment plus the left-fold parents.
-        let n_pub_i = inner.built.witness.public.len();
-        let h_rows = n_pub_i.div_ceil(4) + 2 * n_pub_i.div_ceil(64);
+        let (ga_c, ga_fin, mg_c, mg_fin, h_rows) =
+            Self::parse_published_chain_ordinals(&ops, inner, &gkr_l, &mp_l);
 
-        // ---- the chain materials ----
-        // The transcript is FORKED (the wiring runs on its own chain);
-        // `merge_chain` splices the child's rows in at the fork point and
-        // hands back one linear numbering plus the four cross-link wires.
-        let MergedChain {
+        let ChainOpenParse {
             stream,
             bytes,
             trace,
             cross,
-            ..
-        } = merge_chain(
-            t_shape.ops(),
-            &t_shape.stream_words_duplex(domain),
-            rec.values(),
-            rec.payloads(),
+            lvl_src,
+            start_v,
+            gammas_o,
+            w_rounds,
+            mp_o,
+            inner_pd2,
+            yr_v2,
+            levels,
+            geo,
+            native_sums,
+            b3_rows,
+            spread_w,
+            cap_pays,
+        } = Self::parse_chain_and_open_phase(
+            inner, &rec, &t_shape, domain, &ops, &chals, has_el, &pd_recs, h_rows,
         );
-        assert_chain_replays(&ops, &trace, &chals);
-
-        // ---- the open-phase walk + geometry ----
-        let lig = &proof.pcs_open().inner.ligerito;
-        assert_eq!(
-            inner.commitment.cap, lig.initial_cap,
-            "commitment IS the L0 cap"
-        );
-        let r_lvl = lig.recursive_caps.len();
-        let lvl_src = level_sources(lig);
-        let (start_v, piop_o, gammas_o, w_rounds, mp_o, inner_pd2, yr_v2, levels) =
-            parse_open_levels(&ops, 32 * lig.initial_cap.len(), r_lvl);
-        assert_eq!(
-            piop_o.is_some(),
-            has_el,
-            "the parser sees the element PIOP iff the class exists"
-        );
-        assert_eq!(
-            gammas_o.len(),
-            pd_recs.len(),
-            "the parser and the region walk agree on the pd claims"
-        );
-        let (geo, native_sums) = level_geometry(
-            &levels,
-            &lvl_src,
-            &chals,
-            HashKind::Blake3,
-            &strat_scheds(&inner.pcs),
-        );
-        let b3_rows = trace.rows.len() + h_rows + query_phase_b3_rows(&geo);
-        if var("B3_CENSUS").is_ok() {
-            let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
-            let blocks = trace.rows.len() - parents;
-            eprintln!(
-                "  [b3 census] chain {} (data blocks {} | parent/fork {}; absorbed {} B, {} squeezes) | H(publics) {} | openings+caps {} = {}",
-                trace.rows.len(),
-                blocks,
-                parents,
-                bytes.len(),
-                trace.squeezes.len(),
-                h_rows,
-                b3_rows - trace.rows.len() - h_rows,
-                b3_rows
-            );
-            for g in geo.iter() {
-                let (leaf, path, cap) = level_query_phase_b3_rows(g);
-                eprintln!(
-                    "    level: q {} depth {} row_words {} -> leaf {} + path {} + cap {}",
-                    g.q, g.depth, g.raw_row_words, leaf, path, cap,
-                );
-            }
-            // CHAIN DECOMPOSITION + an independent row-count model of the
-            // duplex discipline (transcript-v3), asserted against the
-            // sponge trace: a squeeze row absorbs the pending partial
-            // block as its MESSAGE, mutates cv, and has no header word.
-            {
-                let pad16 = |n: usize| n.div_ceil(16) * 16;
-                let (mut hdr_w, mut pay_w, mut n_obs, mut n_sq) = (0usize, 0usize, 0usize, 0usize);
-                for op in ops.iter() {
-                    match op {
-                        Op::Label(l) => {
-                            hdr_w += 1;
-                            pay_w += pad16(l.len()) / 16;
-                            n_obs += 1;
-                        }
-                        Op::ObserveScalar => {
-                            hdr_w += 1;
-                            pay_w += 1;
-                            n_obs += 1;
-                        }
-                        Op::ObserveSlice(n) => {
-                            hdr_w += 1;
-                            pay_w += n;
-                            n_obs += 1;
-                        }
-                        Op::ObserveBytes(len) => {
-                            hdr_w += 1;
-                            pay_w += pad16(*len) / 16;
-                            n_obs += 1;
-                        }
-                        Op::Forked { .. } | Op::Merge { .. } => {}
-                        Op::Pow { .. } => {
-                            pay_w += 1;
-                        }
-                        Op::LegacyPow { .. } => {
-                            n_sq += 1;
-                        }
-                        Op::SqueezeScalar | Op::SqueezeSlice(_) => {
-                            n_sq += 1;
-                        }
-                    }
-                }
-                let v3_rows =
-                    duplex_row_count_model(t_shape.ops(), &t_shape.stream_words_duplex(domain));
-                eprintln!(
-                    "  [chain census] ops {} (obs {} / sq {}) | header words {} ({} B) | payload words {} | duplex rows {}",
-                    ops.len(),
-                    n_obs,
-                    n_sq,
-                    hdr_w,
-                    16 * hdr_w,
-                    pay_w,
-                    trace.rows.len(),
-                );
-                assert_eq!(
-                    v3_rows,
-                    trace.rows.len(),
-                    "the duplex row model diverged from the sponge trace"
-                );
-            }
-        }
-        let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
-        // Recursive caps are PROOF BODY — the in-circuit cap trees bind them
-        // (chain + root connects, nothing checker-read); only the L0 cap —
-        // the commitment — stays a statement public.
-        let cap_pays = cap_payloads(&stream, &bytes, &lvl_src);
         for &p in &cap_pays[1..] {
             pub_payloads[p] = false;
         }
 
-        // ---- the merged intake's natives (target, running, boundary) ----
-        let (native_target, native_running) = {
-            let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch + k]).collect();
-            let mut target = F128::ZERO;
-            let mut coeffs: Vec<Vec<F128>> = Vec::new();
-            for (k, &(sv, _, rc)) in rs_recs.iter().enumerate() {
-                let shv = &vals_rec[sv..sv + 128];
-                let rdp: Vec<F128> = (0..7).map(|j| chals[rc + j]).collect();
-                let eq = build_eq(&rdp);
-                target += gs[k] * inner_product(&tensor_algebra_transpose(shv), &eq);
-                let scaled: Vec<F128> = eq.iter().map(|x| gs[k] * *x).collect();
-                coeffs.push(linearized_coefficients(&build_fold_byte_table(&scaled)));
-            }
-            // A MIXED tape's target carries the packed-direct claims too —
-            // each absorbed value against its own gamma squeeze.
-            for pd in &gammas_o {
-                target += chals[pd.ch] * vals_rec[pd.val_v];
-            }
-            let mut running = target;
-            for rr in &w_rounds {
-                let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
-                let r = chals[rr.ch];
-                let g0 = running + g1;
-                running = g0 + (g1 + g0 + gi) * r + gi * r * r;
-            }
-            // The R = 2 recombination plus the P group values, against the
-            // same q_eval the spine starts from.
-            let mut big_v = F128::ZERO;
-            for (k, cs) in coeffs.iter().enumerate() {
-                for (j, &cj) in cs.iter().enumerate() {
-                    if cj.is_zero() {
-                        continue;
-                    }
-                    let mut x = fro.values[k][j];
-                    for _ in 0..j {
-                        x = x * x;
-                    }
-                    big_v += cj * x;
-                }
-            }
-            for &v in &fro.group_values {
-                big_v += v;
-            }
-            assert_eq!(
-                running,
-                vals_rec[inner_pd2.q_v] * big_v,
-                "the R=2 + P merged boundary replays"
-            );
-            (target, running)
-        };
+        let (native_target, native_running) = Self::parse_merged_intake_natives(
+            &vals_rec, &chals, &rs_recs, rs_gam_ch, &gammas_o, &w_rounds, fro, &inner_pd2,
+        );
 
         // ---- the spine's native quad replay ----
         let t_final_n = replay_ligerito_spine256(
@@ -951,67 +353,13 @@ impl<'p> ChildTape<'p> {
             &native_sums,
         );
 
-        // ---- the anchor's native endpoint ----
-        let anc_end_n = {
-            let mut t = vals_rec[mp_o.anchor_v];
-            for rr in &mp_o.anchor_rounds {
-                let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
-                let r = chals[rr.ch];
-                let g0 = t + g1;
-                t = g0 + (g1 + g0 + gi) * r + gi * r * r;
-            }
-            t
-        };
+        let anc_end_n = walker_common::parse_anchor_native_endpoint(&vals_rec, &chals, &mp_o);
 
-        // ---- the element PIOP's native chain + strip sums (mixed only) ----
-        let (el_g0, el_run_n, a_sum_n, b_sum_n) = if let Some(el_rec) = &el_rec {
-            let el_assert = el_assert.as_ref().expect("element assertion");
-            let mut el_g0: Vec<F128> = Vec::new();
-            let mut el_run_n = F128::ZERO;
-            for (k, &(gv, _, ch)) in el_rec.zc_rounds.iter().enumerate() {
-                let (g1, gi) = (vals_rec[gv], vals_rec[gv + 1]);
-                let t = chals[el_rec.tau_ch + k];
-                let rho = chals[ch];
-                let g0 = (el_run_n + t * g1) * (F128::ONE + t).inv();
-                el_g0.push(g0);
-                el_run_n = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
-            }
-            assert_eq!(
-                el_assert.alpha, chals[el_rec.alpha_ch],
-                "the located alpha is the assertion's"
-            );
-            let (a_sum_n, b_sum_n) = {
-                let mt = MacGate::new();
-                let kappa = mt.ty.kappa();
-                let eq_con = build_eq(&el_assert.r_con[..kappa]);
-                // Single slot at the region start: the prefix bits are all
-                // zero, so the region weight is the all-zero eq pattern.
-                let w = el_assert.r_con[kappa..]
-                    .iter()
-                    .fold(F128::ONE, |acc, &x| acc * (F128::ONE + x));
-                let dot = |c: &[F128]| -> F128 {
-                    eq_con
-                        .iter()
-                        .zip(c)
-                        .fold(F128::ZERO, |acc, (e, v)| acc + *e * *v)
-                };
-                (w * dot(mt.ty.a_const()), w * dot(mt.ty.b_const()))
-            };
-            (el_g0, el_run_n, a_sum_n, b_sum_n)
-        } else {
-            (Vec::new(), F128::ZERO, F128::ZERO, F128::ZERO)
-        };
+        let (el_g0, el_run_n, a_sum_n, b_sum_n) =
+            Self::parse_element_piop_natives(&union, &vals_rec, &chals, &el_rec, &el_assert);
 
-        // ---- the GKR input-check advice (masked M̂ and livê) ----
-        let mu_i = built.shape.circuit.cells().mu();
-        let (mid_n, live_n) = {
-            let basis_i = s_id_basis(mu_i);
-            let mask_i = built.shape.circuit.live_mask();
-            (
-                mask_i.masked_id_eval(&basis_i, &gkr_rec.r_pt),
-                mask_i.live_eval(&gkr_rec.r_pt),
-            )
-        };
+        let (mu_i, mid_n, live_n) =
+            walker_common::parse_gkr_input_check_advice(&built.shape.circuit, &gkr_rec.r_pt);
 
         // ---- the anchor-expect geometry + its FULL native replica ----
         let m_mp2 = mp_o.rounds.len();
@@ -1548,17 +896,8 @@ impl<'p> ChildTape<'p> {
             );
         }
 
-        // ---- the residual pairing's rotation (lane-major inners) ----
-        let yr_len = proof.pcs_open().inner.ligerito.final_proof.yr.len() / 2;
-        let lane_major = geo[0].row_words < geo[0].lanes;
-        let w_resid: Vec<RoundRec> = if lane_major {
-            let k_rot = w_rounds.len() - levels[0].fold_fins.len();
-            let mut v = w_rounds[k_rot..].to_vec();
-            v.extend_from_slice(&w_rounds[..k_rot]);
-            v
-        } else {
-            w_rounds.to_vec()
-        };
+        let (yr_len, w_resid) =
+            walker_common::parse_residual_rotation(proof, &geo, &levels, &w_rounds);
 
         let z_ix = el_assert.as_ref().map(|assertion| {
             gammas_o
@@ -1638,6 +977,692 @@ impl<'p> ChildTape<'p> {
             jag: inner.work.jagged.clone(),
         }
     }
+
+    /// ---- the label map: the region order the assembly builds against ----
+    fn parse_label_map(ops: &[Op], proof: &MixedProof, has_el: bool) -> LabelMap {
+        let find = |label: &[u8]| -> Vec<usize> {
+            ops.iter()
+                .enumerate()
+                .filter_map(|(i, op)| match op {
+                    Op::Label(l) if l.as_slice() == label => Some(i),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The boolean zerocheck region's anchor is flavor-specific; the
+        // OTHER flavor's label must be absent (one boolean zerocheck).
+        let zc_l = match proof {
+            MixedProof::Rs(_) => {
+                assert!(
+                    find(b"flock-ag-skip-v1").is_empty(),
+                    "an RS tape carries no AG-skip region"
+                );
+                find(b"flock-zerocheck-v0")
+            }
+            MixedProof::Ag(_) => {
+                assert!(
+                    find(b"flock-zerocheck-v0").is_empty(),
+                    "an AG tape carries no RS zerocheck region"
+                );
+                find(b"flock-ag-skip-v1")
+            }
+        };
+        let lc_l = find(b"flock-lincheck-v0");
+        let elzc_l = find(b"flock-element-union-zc-v0");
+        let el_l = find(b"flock-element-union-lc-v0");
+        let gkr_l = find(b"flock-product-gkr-batched-v0");
+        let mo_l = find(b"flock-merged-open-v1");
+        let rs_l = find(b"flock-ring-switch-v0");
+        let mp_l = find(b"flock-multipoint-twisted-v1");
+        let fa_l = find(b"flock-frobenius-assist-v0");
+        assert_eq!(zc_l.len(), 1, "one boolean zerocheck");
+        assert_eq!(lc_l.len(), 1, "one boolean lincheck");
+        if has_el {
+            assert_eq!(elzc_l.len(), 1, "one element zerocheck");
+            assert_eq!(el_l.len(), 1, "one element lincheck region");
+            assert!(elzc_l[0] < el_l[0], "element zc before element lc");
+            assert!(lc_l[0] < el_l[0], "boolean PIOP before element PIOP");
+        } else {
+            assert!(
+                elzc_l.is_empty() && el_l.is_empty(),
+                "a boolean-only tape carries NO element region"
+            );
+        }
+        // THE FORKED ORDER: the wiring argument's chain is spliced in at the
+        // fork point, so its region precedes the boolean PIOP's.
+        assert!(
+            gkr_l[0] < zc_l[0],
+            "the wiring fork precedes the boolean PIOP"
+        );
+        assert_eq!(gkr_l.len(), 1, "one batched wiring GKR");
+        assert_eq!(mo_l.len(), 1, "one merged open");
+        assert_eq!(
+            rs_l.len(),
+            2,
+            "rs x 2 — one ab/c pair for the boolean class"
+        );
+        assert_eq!(mp_l.len(), 1, "one multipoint region");
+        assert_eq!(fa_l.len(), 1, "one anchor region");
+        assert!(zc_l[0] < lc_l[0], "boolean zc before boolean lc");
+        assert!(gkr_l[0] < mo_l[0], "wiring GKR before the merged open");
+        assert!(mo_l[0] < rs_l[0] && rs_l[1] < mp_l[0] && mp_l[0] < fa_l[0]);
+        LabelMap {
+            zc_l,
+            lc_l,
+            elzc_l,
+            el_l,
+            gkr_l,
+            mo_l,
+            mp_l,
+        }
+    }
+
+    /// ---- the boolean zerocheck slices, same shape as the leaf ----
+    fn check_boolean_zerocheck_slices(
+        ops: &[Op],
+        vals_rec: &[F128],
+        proof: &MixedProof,
+        has_el: bool,
+        zc_l: &[usize],
+    ) {
+        let vc_at = |end: usize| vc_at(ops, end);
+        assert_eq!(
+            proof.element().is_some(),
+            has_el,
+            "the element proof section mirrors the union's classes"
+        );
+        match proof {
+            MixedProof::Rs(p) => {
+                let bp = p.boolean.as_ref().expect("boolean side present");
+                let mut i = zc_l[0] + 1;
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
+                assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau lo");
+                i += 1;
+                assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau hi");
+                i += 1;
+                assert!(matches!(ops[i], Op::ObserveSlice(64)), "round1_ab");
+                let (v0, _) = vc_at(i);
+                assert_eq!(
+                    &vals_rec[v0..v0 + 64],
+                    &bp.zerocheck.round1_ab[..],
+                    "round1_ab on the stream"
+                );
+                i += 1;
+                assert!(matches!(ops[i], Op::ObserveSlice(64)), "round1_c");
+                let (v1, _) = vc_at(i);
+                assert_eq!(
+                    &vals_rec[v1..v1 + 64],
+                    &bp.zerocheck.round1_c[..],
+                    "round1_c on the stream"
+                );
+            }
+            MixedProof::Ag(p) => {
+                let bp = p.boolean.as_ref().expect("boolean side present");
+                let mut i = zc_l[0] + 1;
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
+                assert!(matches!(ops[i], Op::SqueezeSlice(_)), "ag r_outer");
+                i += 1;
+                assert!(matches!(ops[i], Op::ObserveSlice(158)), "ag round1_ab");
+                let (v0, _) = vc_at(i);
+                assert_eq!(
+                    &vals_rec[v0..v0 + 158],
+                    &bp.ag.round1_ab[..],
+                    "ag round1_ab on the stream"
+                );
+                i += 1;
+                assert!(matches!(ops[i], Op::ObserveSlice(64)), "ag round1_c");
+                let (v1, _) = vc_at(i);
+                assert_eq!(
+                    &vals_rec[v1..v1 + 64],
+                    &bp.ag.round1_c[..],
+                    "ag round1_c on the stream"
+                );
+            }
+        }
+    }
+
+    /// ---- the wiring GKR region, walked op by op ----
+    /// The transcription map: [alpha, beta squeezes | top pair observed |
+    /// per layer k: lambda squeeze, k x (2 obs + squeeze) rounds — the
+    /// ZcRoundGate shape VERBATIM — then (vl0, vl1, vr0, vr1) observed,
+    /// the layer check, and the c_k squeeze folding the claims | the
+    /// (f, g, s_sigma) triple observed last]. The walk also RECORDS the
+    /// ordinals the assembly wires against, and the per-round `g0` advice.
+    fn parse_wiring_gkr_region(
+        ops: &[Op],
+        vals_rec: &[F128],
+        chals: &[F128],
+        proof: &MixedProof,
+        built: &BuiltCircuit,
+        gkr_l: &[usize],
+    ) -> GkrRec {
+        let vc_at = |end: usize| vc_at(ops, end);
+        let fin_at = |end: usize| fin_at(ops, end);
+        walker_common::walk_wiring_gkr_core(
+            ops,
+            vals_rec,
+            chals,
+            &proof.wiring().gkr,
+            gkr_l[0],
+            built.shape.circuit.cells().mu(),
+            &built.shape.circuit.live_mask(),
+            &vc_at,
+            &fin_at,
+        )
+    }
+
+    /// ---- the ELEMENT PIOP region, located (mixed inners only) ----
+    /// Shape, per `parse_open_levels`' element branch: [tau slice |
+    /// tau_len rounds | ea, eb, ec | lc label | alpha | lc rounds].
+    fn parse_element_piop_region(
+        ops: &[Op],
+        has_el: bool,
+        elzc_l: &[usize],
+        el_l: &[usize],
+    ) -> Option<ElPiopRec> {
+        let vc_at = |end: usize| vc_at(ops, end);
+        let fin_at = |end: usize| fin_at(ops, end);
+        has_el.then(|| {
+            let mut i = elzc_l[0] + 1;
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
+            let (tau_fin, tau_ch, tau_len) = match ops[i] {
+                Op::SqueezeSlice(n) => (fin_at(i), vc_at(i).1, n),
+                ref o => panic!("element tau, got {o:?}"),
+            };
+            i += 1;
+            let mut zc_rounds = Vec::with_capacity(tau_len);
+            for _ in 0..tau_len {
+                let (gv, _) = vc_at(i);
+                assert!(matches!(ops[i], Op::ObserveScalar), "el zc msg");
+                assert!(matches!(ops[i + 1], Op::ObserveScalar), "el zc msg");
+                let mut squeeze_i = i + 2;
+                while matches!(ops[squeeze_i], Op::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                assert!(matches!(ops[squeeze_i], Op::SqueezeScalar), "el zc rho");
+                zc_rounds.push((gv, fin_at(squeeze_i), vc_at(squeeze_i).1));
+                i = squeeze_i + 1;
+            }
+            let (eab_v, _) = vc_at(i);
+            for _ in 0..3 {
+                assert!(matches!(ops[i], Op::ObserveScalar), "el zc final");
+                i += 1;
+            }
+            assert_eq!(i, el_l[0], "the lc label follows the finals");
+            i += 1;
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
+            assert!(matches!(ops[i], Op::SqueezeScalar), "el lc alpha");
+            let (alpha_fin, alpha_ch) = (fin_at(i), vc_at(i).1);
+            i += 1;
+            let mut lc_rounds = Vec::new();
+            while matches!(ops[i], Op::ObserveScalar) && matches!(ops[i + 1], Op::ObserveScalar) {
+                let mut squeeze_i = i + 2;
+                while matches!(ops[squeeze_i], Op::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops[squeeze_i], Op::SqueezeScalar) {
+                    break;
+                }
+                let (gv, _) = vc_at(i);
+                lc_rounds.push((gv, fin_at(squeeze_i), vc_at(squeeze_i).1));
+                i = squeeze_i + 1;
+            }
+            assert!(!zc_rounds.is_empty() && !lc_rounds.is_empty(), "el rounds");
+            ElPiopRec {
+                tau_fin,
+                tau_ch,
+                zc_rounds,
+                eab_v,
+                alpha_fin,
+                alpha_ch,
+                lc_rounds,
+            }
+        })
+    }
+
+    /// ---- the merged open: rs x 2, then PD values, then one coefficient vector ----
+    #[allow(clippy::type_complexity)]
+    fn parse_merged_open(
+        ops: &[Op],
+        vals_rec: &[F128],
+        proof: &MixedProof,
+        mo_l: &[usize],
+    ) -> (
+        Vec<usize>,
+        usize,
+        Vec<(usize, usize, usize)>,
+        usize,
+        Vec<(usize, usize)>,
+    ) {
+        let vc_at = |end: usize| vc_at(ops, end);
+        let fin_at = |end: usize| fin_at(ops, end);
+        let mut i = mo_l[0] + 1;
+        let mut rs_recs: Vec<(usize, usize, usize)> = Vec::new();
+        for k in 0..2 {
+            assert!(
+                matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0"),
+                "rs region {k}"
+            );
+            i += 1;
+            assert!(matches!(ops[i], Op::ObserveSlice(128)), "s_hat_v slice");
+            let (sv, _) = vc_at(i);
+            assert_eq!(
+                &vals_rec[sv..sv + 128],
+                &proof.pcs_open().ring_switches[k].s_hat_v[..],
+                "s_hat_v {k} on the stream"
+            );
+            i += 1;
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
+            assert!(matches!(ops[i], Op::SqueezeSlice(7)), "r_dprime");
+            rs_recs.push((sv, fin_at(i), vc_at(i).1));
+            i += 1;
+        }
+        // Packed-direct claims contribute just their values.  Their
+        // coefficients share the vector squeeze with both RS claims.
+        let mut pd_recs: Vec<usize> = Vec::new(); // value index
+        while matches!(ops[i], Op::ObserveScalar) {
+            let (pv, _) = vc_at(i);
+            i += 1;
+            pd_recs.push(pv);
+        }
+        while matches!(ops[i], Op::Pow { .. }) {
+            i += 1;
+        }
+        assert!(
+            matches!(ops[i], Op::SqueezeSlice(n) if n == 2 + pd_recs.len()),
+            "mixed coefficient vector"
+        );
+        let rs_gam_ch = vc_at(i).1;
+        let rs_gam_fin = fin_at(i);
+        i += 1;
+        // W rounds until the multipoint label.
+        let mut w_rounds = 0usize;
+        while matches!(ops[i], Op::ObserveScalar) {
+            assert!(matches!(ops[i + 1], Op::ObserveScalar), "w round pair");
+            i += 2;
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
+            assert!(matches!(ops[i], Op::SqueezeScalar), "w round squeeze");
+            i += 1;
+            w_rounds += 1;
+        }
+        assert_eq!(
+            w_rounds,
+            proof.pcs_open().merged_rounds.len(),
+            "the W rounds fill the dense domain"
+        );
+        while !matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-multipoint-twisted-v1") {
+            i += 1;
+        }
+        i += 1;
+        let (mv, _) = vc_at(i);
+        (
+            pd_recs,
+            mv,
+            rs_recs,
+            rs_gam_ch,
+            vec![(rs_gam_fin, 0), (rs_gam_fin, 1)],
+        )
+    }
+
+    /// ---- the multipoint: the R=2 + P>0 schedule, pinned ----
+    fn check_multipoint_schedule(
+        ops: &[Op],
+        vals_rec: &[F128],
+        chals: &[F128],
+        fro: &MultipointTwistedProof,
+        n_p: usize,
+        mp_l: &[usize],
+        mp_val_v: usize,
+    ) {
+        let vc_at = |end: usize| vc_at(ops, end);
+        let mut i = mp_l[0] + 1;
+        let mut n_vals = 0usize;
+        while matches!(ops[i], Op::ObserveScalar) {
+            n_vals += 1;
+            i += 1;
+        }
+        assert_eq!(n_vals, 256 + n_p, "2x128 RS dual values + P group values");
+        while matches!(ops[i], Op::Pow { .. }) {
+            i += 1;
+        }
+        assert!(matches!(ops[i], Op::SqueezeScalar), "multipoint gamma");
+        let (_, gc) = vc_at(i);
+        let gamma = chals[gc];
+        i += 1;
+        // The located values ARE the proof's, in schedule order.
+        for k in 0..n_vals {
+            let want = if k < 256 {
+                fro.values[k / 128][k % 128]
+            } else {
+                fro.group_values[k - 256]
+            };
+            assert_eq!(vals_rec[mp_val_v + k], want, "mp value {k}");
+        }
+        // T0 under the R=2 + P schedule folds through the rounds to the
+        // anchor's claimed v — consecutive gamma powers across BOTH kinds.
+        let mut t = F128::ZERO;
+        let mut pw = F128::ONE;
+        for k in 0..n_vals {
+            t += pw * vals_rec[mp_val_v + k];
+            pw *= gamma;
+        }
+        let mut rounds = 0usize;
+        while matches!(ops[i], Op::ObserveScalar) && matches!(ops[i + 1], Op::ObserveScalar) {
+            let (gv, _) = vc_at(i);
+            i += 2;
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
+            if !matches!(ops[i], Op::SqueezeScalar) {
+                break;
+            }
+            let (_, rc) = vc_at(i);
+            let (g1, gi) = (vals_rec[gv], vals_rec[gv + 1]);
+            let r = chals[rc];
+            let g0 = t + g1;
+            t = g0 + (g1 + g0 + gi) * r + gi * r * r;
+            i += 1;
+            rounds += 1;
+        }
+        assert_eq!(rounds, fro.rounds.len(), "mp round count");
+        assert!(
+            matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-frobenius-assist-v0"),
+            "anchor label follows the rounds"
+        );
+        assert_eq!(t, fro.anchor.v, "T_m == anchor.v under the R=2+P schedule");
+    }
+
+    /// ---- the published chain ordinals (GKR alpha, multipoint gamma) ----
+    fn parse_published_chain_ordinals(
+        ops: &[Op],
+        inner: &MixedInner,
+        gkr_l: &[usize],
+        mp_l: &[usize],
+    ) -> (usize, usize, usize, usize, usize) {
+        let vc_at = |end: usize| vc_at(ops, end);
+        let fin_at = |end: usize| fin_at(ops, end);
+        let mut ga_i = gkr_l[0] + 1;
+        while matches!(ops[ga_i], Op::Pow { .. }) {
+            ga_i += 1;
+        }
+        assert!(matches!(ops[ga_i], Op::SqueezeScalar), "GKR fingerprint");
+        let ga_fin = fin_at(ga_i);
+        let (_, ga_c) = vc_at(ga_i);
+        let mut mp_i = mp_l[0] + 1;
+        while matches!(ops[mp_i], Op::ObserveScalar) {
+            mp_i += 1;
+        }
+        while matches!(ops[mp_i], Op::Pow { .. }) {
+            mp_i += 1;
+        }
+        assert!(matches!(ops[mp_i], Op::SqueezeScalar), "mp gamma op");
+        let mg_fin = fin_at(mp_i);
+        let (_, mg_c) = vc_at(mp_i);
+        // ROUND 2: the H(publics) region's rows — a chunk chain per 1 KiB
+        // leaf of the child's public segment plus the left-fold parents.
+        let n_pub_i = inner.built.witness.public.len();
+        let h_rows = n_pub_i.div_ceil(4) + 2 * n_pub_i.div_ceil(64);
+        (ga_c, ga_fin, mg_c, mg_fin, h_rows)
+    }
+
+    /// ---- the chain materials ----
+    /// The transcript is FORKED (the wiring runs on its own chain);
+    /// `merge_chain` splices the child's rows in at the fork point and
+    /// hands back one linear numbering plus the four cross-link wires.
+    /// ---- the open-phase walk + geometry ----
+    #[allow(clippy::too_many_arguments)]
+    fn parse_chain_and_open_phase<'q>(
+        inner: &'q MixedInner,
+        rec: &RecordingChallenger<FsChallenger>,
+        t_shape: &TranscriptShape,
+        domain: &'static [u8],
+        ops: &[Op],
+        chals: &[F128],
+        has_el: bool,
+        pd_recs: &[usize],
+        h_rows: usize,
+    ) -> ChainOpenParse<'q> {
+        let proof = &inner.proof;
+        let MergedChain {
+            stream,
+            bytes,
+            trace,
+            cross,
+            ..
+        } = walker_common::merge_and_replay_chain(
+            t_shape,
+            domain,
+            rec.values(),
+            rec.payloads(),
+            ops,
+            chals,
+        );
+        let lig = &proof.pcs_open().inner.ligerito;
+        assert_eq!(
+            inner.commitment.cap, lig.initial_cap,
+            "commitment IS the L0 cap"
+        );
+        let r_lvl = lig.recursive_caps.len();
+        let lvl_src = level_sources(lig);
+        let (start_v, piop_o, gammas_o, w_rounds, mp_o, inner_pd2, yr_v2, levels) =
+            parse_open_levels(ops, 32 * lig.initial_cap.len(), r_lvl);
+        assert_eq!(
+            piop_o.is_some(),
+            has_el,
+            "the parser sees the element PIOP iff the class exists"
+        );
+        assert_eq!(
+            gammas_o.len(),
+            pd_recs.len(),
+            "the parser and the region walk agree on the pd claims"
+        );
+        let (geo, native_sums) = level_geometry(
+            &levels,
+            &lvl_src,
+            chals,
+            HashKind::Blake3,
+            &strat_scheds(&inner.pcs),
+        );
+        let b3_rows = trace.rows.len() + h_rows + query_phase_b3_rows(&geo);
+        if var("B3_CENSUS").is_ok() {
+            let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
+            let blocks = trace.rows.len() - parents;
+            eprintln!(
+                "  [b3 census] chain {} (data blocks {} | parent/fork {}; absorbed {} B, {} squeezes) | H(publics) {} | openings+caps {} = {}",
+                trace.rows.len(),
+                blocks,
+                parents,
+                bytes.len(),
+                trace.squeezes.len(),
+                h_rows,
+                b3_rows - trace.rows.len() - h_rows,
+                b3_rows
+            );
+            walker_common::census_levels_and_chain_rows(ops, t_shape, domain, &geo, &trace);
+        }
+        let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
+        // Recursive caps are PROOF BODY — the in-circuit cap trees bind them
+        // (chain + root connects, nothing checker-read); only the L0 cap —
+        // the commitment — stays a statement public.
+        let cap_pays = cap_payloads(&stream, &bytes, &lvl_src);
+        ChainOpenParse {
+            stream,
+            bytes,
+            trace,
+            cross,
+            lvl_src,
+            start_v,
+            gammas_o,
+            w_rounds,
+            mp_o,
+            inner_pd2,
+            yr_v2,
+            levels,
+            geo,
+            native_sums,
+            b3_rows,
+            spread_w,
+            cap_pays,
+        }
+    }
+
+    /// ---- the merged intake's natives (target, running, boundary) ----
+    #[allow(clippy::too_many_arguments)]
+    fn parse_merged_intake_natives(
+        vals_rec: &[F128],
+        chals: &[F128],
+        rs_recs: &[(usize, usize, usize)],
+        rs_gam_ch: usize,
+        gammas_o: &[PdRec],
+        w_rounds: &[RoundRec],
+        fro: &MultipointTwistedProof,
+        inner_pd2: &InnerPd,
+    ) -> (F128, F128) {
+        let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch + k]).collect();
+        let mut target = F128::ZERO;
+        let mut coeffs: Vec<Vec<F128>> = Vec::new();
+        for (k, &(sv, _, rc)) in rs_recs.iter().enumerate() {
+            let shv = &vals_rec[sv..sv + 128];
+            let rdp: Vec<F128> = (0..7).map(|j| chals[rc + j]).collect();
+            let eq = build_eq(&rdp);
+            target += gs[k] * inner_product(&tensor_algebra_transpose(shv), &eq);
+            let scaled: Vec<F128> = eq.iter().map(|x| gs[k] * *x).collect();
+            coeffs.push(linearized_coefficients(&build_fold_byte_table(&scaled)));
+        }
+        // A MIXED tape's target carries the packed-direct claims too —
+        // each absorbed value against its own gamma squeeze.
+        for pd in gammas_o {
+            target += chals[pd.ch] * vals_rec[pd.val_v];
+        }
+        let mut running = target;
+        for rr in w_rounds {
+            let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
+            let r = chals[rr.ch];
+            let g0 = running + g1;
+            running = g0 + (g1 + g0 + gi) * r + gi * r * r;
+        }
+        // The R = 2 recombination plus the P group values, against the
+        // same q_eval the spine starts from.
+        let mut big_v = F128::ZERO;
+        for (k, cs) in coeffs.iter().enumerate() {
+            for (j, &cj) in cs.iter().enumerate() {
+                if cj.is_zero() {
+                    continue;
+                }
+                let mut x = fro.values[k][j];
+                for _ in 0..j {
+                    x = x * x;
+                }
+                big_v += cj * x;
+            }
+        }
+        for &v in &fro.group_values {
+            big_v += v;
+        }
+        assert_eq!(
+            running,
+            vals_rec[inner_pd2.q_v] * big_v,
+            "the R=2 + P merged boundary replays"
+        );
+        (target, running)
+    }
+
+    /// ---- the element PIOP's native chain + strip sums (mixed only) ----
+    fn parse_element_piop_natives(
+        union: &UnionInstance<'_>,
+        vals_rec: &[F128],
+        chals: &[F128],
+        el_rec: &Option<ElPiopRec>,
+        el_assert: &Option<ElementAssertion>,
+    ) -> (Vec<F128>, F128, F128, F128) {
+        if let Some(el_rec) = &el_rec {
+            let el_assert = el_assert.as_ref().expect("element assertion");
+            // This strip-sum arm HARD-CODES the single-slot zero-prefix
+            // degenerate case of the REAL side's general region loop
+            // (`real_walker::element_piop_natives` walks every element
+            // slot with its own kappa and region prefix). Assert the
+            // shape it assumes, so a multi-slot or offset element union
+            // fails HERE instead of silently mis-summing — port the
+            // general loop when this fires.
+            let slots_el = region_slots(union);
+            assert_eq!(
+                slots_el.len(),
+                1,
+                "one element slot type (else port real_walker's general strip loop)"
+            );
+            assert_eq!(
+                slots_el[0].layout.region_prefix(union.n_log()),
+                0,
+                "the element region starts the space (else port real_walker's general strip loop)"
+            );
+            let mut el_g0: Vec<F128> = Vec::new();
+            let mut el_run_n = F128::ZERO;
+            for (k, &(gv, _, ch)) in el_rec.zc_rounds.iter().enumerate() {
+                let (g1, gi) = (vals_rec[gv], vals_rec[gv + 1]);
+                let t = chals[el_rec.tau_ch + k];
+                let rho = chals[ch];
+                let g0 = (el_run_n + t * g1) * (F128::ONE + t).inv();
+                el_g0.push(g0);
+                el_run_n = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
+            }
+            assert_eq!(
+                el_assert.alpha, chals[el_rec.alpha_ch],
+                "the located alpha is the assertion's"
+            );
+            let (a_sum_n, b_sum_n) = {
+                let mt = MacGate::new();
+                let kappa = mt.ty.kappa();
+                let eq_con = build_eq(&el_assert.r_con[..kappa]);
+                // Single slot at the region start: the prefix bits are all
+                // zero, so the region weight is the all-zero eq pattern.
+                let w = el_assert.r_con[kappa..]
+                    .iter()
+                    .fold(F128::ONE, |acc, &x| acc * (F128::ONE + x));
+                let dot = |c: &[F128]| -> F128 {
+                    eq_con
+                        .iter()
+                        .zip(c)
+                        .fold(F128::ZERO, |acc, (e, v)| acc + *e * *v)
+                };
+                (w * dot(mt.ty.a_const()), w * dot(mt.ty.b_const()))
+            };
+            (el_g0, el_run_n, a_sum_n, b_sum_n)
+        } else {
+            (Vec::new(), F128::ZERO, F128::ZERO, F128::ZERO)
+        }
+    }
+}
+
+/// (v, c) counters up to an op index — the walker every pin shares.
+fn vc_at(ops: &[Op], end: usize) -> (usize, usize) {
+    let (mut v, mut c) = (0usize, 0usize);
+    for op in &ops[..end] {
+        match op {
+            Op::SqueezeScalar => c += 1,
+            Op::SqueezeSlice(n) => c += n,
+            Op::ObserveScalar => v += 1,
+            Op::ObserveSlice(n) => v += n,
+            _ => {}
+        }
+    }
+    (v, c)
+}
+
+/// fin ordinal of the op at `end` = finalizing ops strictly before it.
+fn fin_at(ops: &[Op], end: usize) -> usize {
+    ops[..end].iter().filter(|o| o.finalizes()).count()
 }
 
 /// The gate slots a child-tape region emits into. The builder shares these
@@ -1873,18 +1898,11 @@ pub(super) fn emit_child_region(
     let chals = &ct.chals[..];
     let levels = &ct.levels[..];
     let geo = &ct.geo[..];
-    let w_rounds = &ct.w_rounds[..];
-    let mp_o = &ct.mp_o;
-    let inner_pd2 = &ct.inner_pd2;
     // `None` for a boolean-only (chain) child: the element PIOP emission,
     // its two publics and its ChildRegion wires all vanish together.
     let el_rec = ct.el.as_ref();
     let n_el_pd = if el_rec.is_some() { 2 } else { 0 };
-    let r_lvl = levels.len() - 1;
-    let n_p = ct.n_p;
-    let m_mp2 = ct.m_mp2;
     let n_log_i = ct.n_log_i;
-    let k_cols_i = ct.k_cols_i;
     let _n_runs = ct.bounds_i.len();
 
     let leafeval: Vec<_> = geo
@@ -1919,26 +1937,7 @@ pub(super) fn emit_child_region(
         &ct.pub_payloads,
         &ct.cross,
     );
-    // ---- ROUND 2: the H(publics) region (v2 statement binding) ----
-    // The returned wires ARE the child's public segment — the recombination
-    // folds them.
-    let pub_w = {
-        let pays = payload_words(stream);
-        assert_eq!(pays[4].len(), 2, "the publics digest payload is 32 bytes");
-        let dw = [
-            ww[pays[4][0]].expect("digest word wired"),
-            ww[pays[4][1]].expect("digest word wired"),
-        ];
-        emit_publics_hash(
-            sb,
-            child_q,
-            iv2,
-            &ct.inner.built.witness.public,
-            dw,
-            vals,
-            consts,
-        )
-    };
+    let pub_w = emit_h_publics_region(sb, child_q, iv2, ct, stream, &ww, vals, consts);
     let cap_w = cap_wires(stream, &ww, &ct.cap_pays);
     let (to_publish, level_accs, query_positions) = emit_query_phase(
         sb,
@@ -1959,7 +1958,6 @@ pub(super) fn emit_child_region(
     let ga_w = outs[trace.squeezes[ct.ga_fin][0]][0];
     let mg_w = outs[trace.squeezes[ct.mg_fin][0]][0];
 
-    // ---- the WIRING GKR in-circuit ----
     let mut vmap: Vec<Option<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
         if let StreamWord::Value(vi) = *w {
@@ -1974,9 +1972,8 @@ pub(super) fn emit_child_region(
     let zw = sb.public_input();
     vals.push(F128::ONE);
     let ow = sb.public_input();
-    let macs = cs.macs;
-    let zcr = cs.zcr;
     let mrs = cs.mrs;
+    let spine = cs.spine;
     // The assert-zero anchor: a dedicated zero public NO gate consumes,
     // so the zero-delta outputs connected into its class add no
     // dataflow edges (connecting them to the ubiquitous `zw` creates
@@ -1984,665 +1981,60 @@ pub(super) fn emit_child_region(
     vals.push(F128::ZERO);
     let zassert = sb.public_input();
 
-    let g = &ct.gkr;
-    let alpha_w = outs[trace.squeezes[g.alpha_fin][0]][0];
-    let beta_w = outs[trace.squeezes[g.beta_fin][0]][0];
-    // The grand products agree: a COPY CONSTRAINT on the tops (every
-    // former published-zero delta in this region is now a connect — the
-    // proof itself fails on a broken identity; no public, no checker item).
-    let (mut cl_w, mut cr_w) = (wv(g.top_v), wv(g.top_v + 1));
-    sb.connect(cl_w, cr_w);
-    let mut pt_w: Vec<Wire> = Vec::new();
-    for lr in &g.layers {
-        let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
-        let mut run_w = sb.gate(macs, &[cl_w, lam_w, cr_w])[0];
-        let mut pt_next: Vec<Wire> = Vec::with_capacity(lr.rounds.len() + 1);
-        for (t2, &(gv, rfin)) in lr.rounds.iter().enumerate() {
-            let rho_w = outs[trace.squeezes[rfin][0]][0];
-            vals.push(lr.g0s[t2]);
-            let g0w = sb.input();
-            let o = sb.gate(zcr, &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow]);
-            sb.connect(o[0], zassert);
-            run_w = o[1];
-            pt_next.push(rho_w);
-        }
-        // The layer close: run == vl0·vl1 + lambda·(vr0·vr1).
-        let (vl0, vl1) = (wv(lr.v_v), wv(lr.v_v + 1));
-        let (vr0, vr1) = (wv(lr.v_v + 2), wv(lr.v_v + 3));
-        let pl = sb.gate(macs, &[zw, vl0, vl1])[0];
-        let pr = sb.gate(macs, &[zw, vr0, vr1])[0];
-        let gate_w = sb.gate(macs, &[pl, lam_w, pr])[0];
-        sb.connect(gate_w, run_w);
-        // The claim fold: claim' = v0 + c·(v0 + v1).
-        let ck_w = outs[trace.squeezes[lr.ck_fin][0]][0];
-        let sl = sb.gate(macs, &[vl0, vl1, ow])[0];
-        let sr = sb.gate(macs, &[vr0, vr1, ow])[0];
-        cl_w = sb.gate(macs, &[vl0, ck_w, sl])[0];
-        cr_w = sb.gate(macs, &[vr0, ck_w, sr])[0];
-        pt_next.push(ck_w);
-        pt_w = pt_next;
-    }
-    assert_eq!(
-        pt_w.len(),
-        ct.mu_i,
-        "the GKR point spans the inner cell space"
-    );
-    // The input checks under the LIVE-IDENTITY padding: M̂(ρ) and livê(ρ),
-    // bound through the digest-keyed circuit-structure claims folded by the
-    // parent.
-    vals.push(ct.mid_n);
-    let mid_w = sb.public_input();
-    vals.push(ct.live_n);
-    let live_w = sb.public_input();
-    // The two input checks, as published-zero deltas.
-    let (f_w, g_w, sig_w) = (wv(g.fgs_v), wv(g.fgs_v + 1), wv(g.fgs_v + 2));
-    let l1 = sb.gate(macs, &[f_w, alpha_w, mid_w])[0];
-    let l2 = sb.gate(macs, &[l1, beta_w, live_w])[0];
-    let l3 = sb.gate(macs, &[l2, ow, live_w])[0];
-    let l4 = sb.gate(macs, &[l3, ow, ow])[0];
-    sb.connect(l4, cl_w);
-    let r1 = sb.gate(macs, &[g_w, alpha_w, sig_w])[0];
-    let r2 = sb.gate(macs, &[r1, beta_w, live_w])[0];
-    let r3 = sb.gate(macs, &[r2, ow, live_w])[0];
-    let r4 = sb.gate(macs, &[r3, ow, ow])[0];
-    sb.connect(r4, cr_w);
-
-    // ---- ROUND 4: the recombination + f == g, in-circuit ----
-    let le8 = match cs.le.iter().find(|&&(n, _)| n == 8) {
-        Some(&(_, s)) => s,
-        None => {
-            let s = sb.slot(LeafEvalGate::new(8));
-            cs.le.push((8, s));
-            s
-        }
-    };
-    let gather_w: Vec<Wire> = (0..ct.n_pd - n_el_pd)
-        .map(|i| wv(ct.gammas_o[n_el_pd + i].val_v))
-        .collect();
-    emit_recombination(
-        sb,
-        cs.fold_macs,
-        le8,
-        &pub_w,
-        &gather_w,
-        &pt_w,
-        n_log_i,
-        ct.n_pub_slots_c,
-        f_w,
-        g_w,
-        zw,
-        ow,
+    let (pt_w, mid_w, live_w, sig_w) = emit_wiring_gkr_and_recombination(
+        sb, cs, ct, trace, &outs, &wv, &pub_w, n_el_pd, vals, zw, ow, zassert,
     );
 
-    // ---- the MULTIPOINT intake at R = 2 AND P > 0 ----
-    let mp_gamma_w = outs[trace.squeezes[mp_o.gamma_fin][0]][0];
     assert_eq!(
-        mp_o.val_vs.len(),
-        256 + n_p,
+        ct.mp_o.val_vs.len(),
+        256 + ct.n_p,
         "the R=2 + P schedule spans both claim kinds"
     );
-    let mut t0_w = zw;
-    let mut pw_w = ow;
-    // The gamma-power wires are KEPT: the anchor expect consumes mp_pws[j]
-    // (j < 128) for ĝ, mp_pws[128] for the second RS statement, and
-    // mp_pws[256 + k] for the P group coefficients.
-    let mut mp_pws: Vec<Wire> = vec![ow];
-    for (k, &vi) in mp_o.val_vs.iter().enumerate() {
-        t0_w = sb.gate(macs, &[t0_w, pw_w, wv(vi)])[0];
-        if k + 1 < mp_o.val_vs.len() {
-            pw_w = sb.gate(macs, &[zw, pw_w, mp_gamma_w])[0];
-            mp_pws.push(pw_w);
-        }
-    }
-    let mut tm_w = t0_w;
-    let mut mp_rho2_w: Vec<Wire> = Vec::new();
-    for rr in &mp_o.rounds {
-        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
-        mp_rho2_w.push(rho_w);
-        tm_w = sb.gate(mrs, &[tm_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
-    }
-    sb.connect(tm_w, wv(mp_o.anchor_v));
-    // The anchor's own rounds fold its claimed v to an endpoint, which
-    // publishes and is held against the native replay; the squeezes are the
-    // sigma wires the expect consumes below.
-    let mut anc_w = wv(mp_o.anchor_v);
-    let mut mp_sig_w: Vec<Wire> = Vec::new();
-    for rr in &mp_o.anchor_rounds {
-        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
-        mp_sig_w.push(rho_w);
-        anc_w = sb.gate(mrs, &[anc_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
-    }
-    assert_eq!(
-        mp_sig_w.len(),
-        2 * (m_mp2 + 1),
-        "sigma spans the anchor layers"
+    let (mp_pws, mp_rho2_w, mp_sig_w, anc_w) = walker_common::emit_multipoint_intake(
+        sb, cs, trace, &outs, &wv, &ct.mp_o, ct.m_mp2, zw, ow,
     );
 
-    // ---- the LIGERITO SPINE ----
-    let spine = cs.spine;
-    let spine256 = cs.spine256;
-    let gpw = outs[trace.squeezes[inner_pd2.fin][0]][0];
-    let z2 = [zw, zw];
-    let tw0 = emit_spine256(
-        sb,
-        spine256,
-        z2,
-        z2,
-        z2,
-        z2,
-        z2,
-        z2,
-        [wv(inner_pd2.q_v), zw],
-        gpw,
-        z2,
-    );
-    let mut tsp = tw0[3];
-    for od in &levels[0].initial_ood {
-        let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-        tsp = emit_spine256(
-            sb,
-            spine256,
-            z2,
-            z2,
-            z2,
-            tsp,
-            z2,
-            z2,
-            [wv(od.y_v), zw],
-            bw,
-            z2,
-        )[3];
-    }
-    let st = emit_spine256(
-        sb,
-        spine256,
-        z2,
-        z2,
-        z2,
-        z2,
-        [wv(ct.start_v), wv(ct.start_v + 1)],
-        [wv(ct.start_v + 2), wv(ct.start_v + 3)],
-        tsp,
-        ow,
-        z2,
-    );
-    let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
-    for (li, lvl) in levels.iter().enumerate() {
-        for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
-            let rw = [
-                squeeze_word_wire(&outs, trace, lvl.fold_fins[j], 0),
-                squeeze_word_wire(&outs, trace, lvl.fold_fins[j], 1),
-            ];
-            let ev = emit_spine256(sb, spine256, qc, qb, qa, z2, z2, z2, z2, zw, rw);
-            tsp = ev[4];
-            let bld = emit_spine256(
-                sb,
-                spine256,
-                z2,
-                z2,
-                z2,
-                z2,
-                [wv(mv), wv(mv + 1)],
-                [wv(mv + 2), wv(mv + 3)],
-                tsp,
-                ow,
-                z2,
-            );
-            (qc, qb, qa) = (bld[0], bld[1], bld[2]);
-        }
-        if li < r_lvl {
-            for od in &lvl.ood {
-                let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-                let f = emit_spine256(
-                    sb,
-                    spine256,
-                    qc,
-                    qb,
-                    qa,
-                    tsp,
-                    [wv(od.intro_v), wv(od.intro_v + 1)],
-                    [wv(od.intro_v + 2), wv(od.intro_v + 3)],
-                    [wv(od.y_v), zw],
-                    bw,
-                    z2,
-                );
-                (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
-            }
-            let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-            let f = emit_spine256(
-                sb,
-                spine256,
-                qc,
-                qb,
-                qa,
-                tsp,
-                [wv(lvl.intro_v), wv(lvl.intro_v + 1)],
-                [wv(lvl.intro_v + 2), wv(lvl.intro_v + 3)],
-                level_accs[li],
-                bw,
-                z2,
-            );
-            (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
-        } else {
-            let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-            let f = emit_spine256(
-                sb,
-                spine256,
-                z2,
-                z2,
-                z2,
-                tsp,
-                z2,
-                z2,
-                level_accs[li],
-                bw,
-                z2,
-            );
-            tsp = f[3];
-        }
-    }
-    let t_final = tsp;
+    let t_final = emit_ligerito_spine(sb, cs, ct, trace, &outs, &wv, &level_accs, zw, ow);
 
-    // ---- the RESIDUAL region (shared emitter) ----
-    let yr_wires: Vec<[Wire; 2]> = (0..ct.yr_len)
-        .map(|y| [wv(ct.yr_v2 + 2 * y), wv(ct.yr_v2 + 2 * y + 1)])
-        .collect();
-    let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region(
+    let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region_shared(
         sb,
-        &mut cs.resid,
-        levels,
-        geo,
-        &to_publish,
-        &query_positions,
-        &ct.w_resid,
-        inner_pd2.fin,
-        &yr_wires,
+        cs,
+        ct,
         trace,
         &outs,
+        &wv,
+        &to_publish,
+        &query_positions,
+        t_final,
         zw,
         ow,
     );
-    // THE CLOSURE, in-circuit: the residual side's inner and the spine's
-    // t_r are the same statement scalar — a copy constraint, not a
-    // checker item (both stay published as test cross-checks).
-    sb.connect(inner_w[0], t_final[0]);
-    sb.connect(inner_w[1], t_final[1]);
 
-    // ---- FAMILY H + the merged intake boundary ----
-    // The transpose/equality dot products and inverse-Moore/Frobenius
-    // recombination are all recursive-circuit arithmetic. Every source is
-    // an existing transcript/proof wire; the native target is retained only
-    // as a published test oracle below.
-    let shv_w: [Vec<Wire>; 2] = from_fn(|k| {
-        let sv = ct.rs_recs[k].0;
-        (0..128).map(|i| wv(sv + i)).collect()
-    });
-    let value_w: [Vec<Wire>; 2] = from_fn(|k| {
-        mp_o.val_vs[128 * k..128 * (k + 1)]
-            .iter()
-            .map(|&vi| wv(vi))
-            .collect()
-    });
-    let rdp_w: [Vec<Wire>; 2] = from_fn(|k| {
-        let fin = ct.rs_recs[k].1;
-        (0..7)
-            .map(|j| squeeze_word_wire(&outs, trace, fin, j))
-            .collect()
-    });
-    let gamma_w: [Wire; 2] = from_fn(|k| {
-        let (fin, offset) = ct.rs_gam_fins[k];
-        squeeze_word_wire(&outs, trace, fin, offset)
-    });
-    let (rsh_w, vrs_w) = emit_family_h(
+    let (tgt_w, runw) = emit_family_h_and_intake_boundary(
+        sb, cs, ct, trace, &outs, &wv, pfslot, pf_w, vals, consts, zw, ow,
+    );
+
+    let el_pub = emit_element_piop_rounds(sb, cs, ct, trace, &outs, &wv, vals, zw, ow, zassert);
+
+    let (jag_w, jag_row_w, mlv_pw, lc_pw) = emit_anchor_expect(
         sb,
-        cs.q.family.expect("family-H slot"),
-        cs.macs,
-        cs.fold_macs,
-        cs.spine,
-        cs.spine256,
-        cs.resid
-            .iter()
-            .find(|&&(key, _)| key == 701)
-            .expect("the child slots declare an F256 MAC slot")
-            .1,
-        1usize << cs.nu,
-        &shv_w,
-        &value_w,
-        &rdp_w,
-        gamma_w,
-        pfslot,
-        pf_w,
-        zw,
-        ow,
+        cs,
+        ct,
+        trace,
+        &outs,
+        &mp_pws,
+        &mp_rho2_w,
+        &mp_sig_w,
+        anc_w,
+        &pt_w,
+        (pfslot, pf_w),
+        n_el_pd,
         vals,
         consts,
+        zw,
+        ow,
+        zassert,
     );
-    let mut pdh_w = zw;
-    for pd in &ct.gammas_o {
-        let gw = squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset);
-        pdh_w = sb.gate(macs, &[pdh_w, gw, wv(pd.val_v)])[0];
-    }
-    let tgt_w = sb.gate(macs, &[rsh_w, ow, pdh_w])[0];
-    let mut runw = tgt_w;
-    for rr in w_rounds {
-        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
-        runw = sb.gate(mrs, &[runw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
-    }
-    let mut vgrp_w = zw;
-    for &vi in &mp_o.val_vs[256..] {
-        vgrp_w = sb.gate(macs, &[vgrp_w, ow, wv(vi)])[0];
-    }
-    let v_w = sb.gate(macs, &[vrs_w, ow, vgrp_w])[0];
-    let rhs_v_w = sb.gate(macs, &[zw, wv(inner_pd2.q_v), v_w])[0];
-    sb.connect(runw, rhs_v_w);
-
-    // ---- the ELEMENT PIOP rounds in-circuit (mixed children only) ----
-    // Zerocheck rounds are ZcRoundGate rows (tau slice wires as eq weights,
-    // g0 advice + zero deltas); lincheck rounds are MergedRoundGate rows.
-    // The entry is DERIVED: va = ea + a_sum, vb = eb + b_sum, entry =
-    // va + alpha·vb — only the two constant-strip sums are advice.
-    let el_pub = el_rec.map(|el_rec| {
-        let mut el_zr = zw;
-        for (k, &(gv, rfin, _)) in el_rec.zc_rounds.iter().enumerate() {
-            let t_w = squeeze_word_wire(&outs, trace, el_rec.tau_fin, k);
-            let rho_w = outs[trace.squeezes[rfin][0]][0];
-            vals.push(ct.el_g0[k]);
-            let g0w = sb.input();
-            let o = sb.gate(zcr, &[el_zr, wv(gv), wv(gv + 1), t_w, rho_w, g0w, ow]);
-            sb.connect(o[0], zassert);
-            el_zr = o[1];
-        }
-        let el_alpha_w = outs[trace.squeezes[el_rec.alpha_fin][0]][0];
-        let ea_w = wv(el_rec.eab_v);
-        let eb_w = wv(el_rec.eab_v + 1);
-        vals.push(ct.a_sum_n);
-        let asum_w = sb.public_input();
-        vals.push(ct.b_sum_n);
-        let bsum_w = sb.public_input();
-        let va_w = sb.gate(macs, &[ea_w, asum_w, ow])[0];
-        let vb_w = sb.gate(macs, &[eb_w, bsum_w, ow])[0];
-        let mut el_lcw = sb.gate(macs, &[va_w, el_alpha_w, vb_w])[0];
-        for &(gv, rfin, _) in &el_rec.lc_rounds {
-            let rho_w = outs[trace.squeezes[rfin][0]][0];
-            el_lcw = sb.gate(mrs, &[el_lcw, wv(gv), wv(gv + 1), rho_w])[0];
-        }
-        (el_zr, el_lcw, asum_w, bsum_w, el_alpha_w)
-    });
-
-    // ---- the anchor EXPECT in-circuit, at R = 2 AND P > 0 ----
-    // expect = Σ_i γ^{128i}·ĝ(ρ″)·(w_i·DP_i) over the RS statements + Σ_k
-    // γ^{256+k}·eq(ρ,ρ″)·(w_k·DP_k) over the P groups; claim == expect
-    // publishes as a zero-delta. ĝ's inverse-Frobenius points ride as advice
-    // bound by forward squaring deltas.
-    // The c-point's 7 baked inner constants are the zerocheck's friendly
-    // challenges — the RS ghash set or the AG set, by the tape's flavor
-    // (baked constants are free in-circuit either way).
-    let t_vals_b: Vec<F128> = match &ct.zskip {
-        ZskipTapeRec::Rs { .. } => {
-            let mut v: Vec<F128> = Vec::new();
-            v.extend_from_slice(&small_challenges_ghash());
-            v.extend_from_slice(&medium_challenges_ghash());
-            v
-        }
-        ZskipTapeRec::Ag { .. } => friendly_challenges().to_vec(),
-    };
-    assert_eq!(t_vals_b.len(), 7, "the seven baked inner constants");
-
-    // The statements' points as (native value, wire) pairs, pinned against
-    // the native claims: ab = [LAST lc round | zc mlv rounds 1..1+ν | lc
-    // rounds REVERSED tail], c = the zerocheck's r_rest verbatim.
-    let mlv_pw: Vec<(F128, Wire)> = ct
-        .zc_rounds_b
-        .iter()
-        .map(|&(ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
-        .collect();
-    let lc_pw: Vec<(F128, Wire)> = ct
-        .lc_rounds_b
-        .iter()
-        .rev()
-        .map(|&(ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
-        .collect();
-    let extend_const = |pw: &mut Vec<(F128, Wire)>, xn: &[F128]| {
-        for &cv2 in &xn[pw.len()..] {
-            let w = if cv2 == F128::ZERO {
-                zw
-            } else {
-                assert_eq!(cv2, F128::ONE, "constant point coord is a slot-prefix bit");
-                ow
-            };
-            pw.push((cv2, w));
-        }
-    };
-    let mut xab_pw: Vec<(F128, Wire)> = vec![lc_pw[0]];
-    xab_pw.extend_from_slice(&mlv_pw[1..1 + n_log_i]);
-    xab_pw.extend_from_slice(&lc_pw[1..]);
-    extend_const(&mut xab_pw, &ct.x_ab_n);
-    let (outer_ch_b, outer_fin_b) = ct.outer_b;
-    let mut xc_pw: Vec<(F128, Wire)> = (0..ct.zc_rounds_b.len())
-        .map(|k2| {
-            if k2 < 7 {
-                (t_vals_b[k2], cw(sb, vals, consts, t_vals_b[k2]))
-            } else {
-                // The exact (row, word) map — a FUSED slice squeeze (the
-                // AG r_outer grind) reserves one word per row for the PoW
-                // predicate, so the naive 4-per-row split misaddresses.
-                let j = k2 - 7;
-                (
-                    chals[outer_ch_b + j],
-                    squeeze_word_wire(&outs, trace, outer_fin_b, j),
-                )
-            }
-        })
-        .collect();
-    extend_const(&mut xc_pw, &ct.x_c_n);
-    for (i2, (&(nv, _), &xn)) in xab_pw.iter().zip(&ct.x_ab_n).enumerate() {
-        assert_eq!(nv, xn, "ab point coord {i2} is the located wire");
-    }
-    for (i2, (&(nv, _), &xn)) in xc_pw.iter().zip(&ct.x_c_n).enumerate() {
-        assert_eq!(nv, xn, "c point coord {i2} is the located wire");
-    }
-
-    // The residual region's prefix slot (width pf_w) carries every chunked
-    // (1 + a + b) product.
-    let prefix_product = |sb: &mut ShapeBuilder, factors: &[(Wire, Wire)]| -> Wire {
-        let mut seed = ow;
-        for chunk in factors.chunks(pf_w) {
-            let mut g_in = vec![seed];
-            for (a, _) in chunk {
-                g_in.push(*a);
-            }
-            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
-            for (_, b) in chunk {
-                g_in.push(*b);
-            }
-            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
-            g_in.push(ow);
-            seed = sb.gate(pfslot, &g_in)[0];
-        }
-        seed
-    };
-    // ĝ(ρ″): advice square-root chains for ρ^(2^-j), bound by forward
-    // squaring deltas y·y + prev = 0.
-    let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
-    let rho_mrg_w: Vec<Wire> = w_rounds
-        .iter()
-        .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
-        .collect();
-    let mut rinv_n2: Vec<F128> = rho_mrg_n.clone();
-    let mut rinv_w: Vec<Wire> = rho_mrg_w.clone();
-    let mut ghat = zw;
-    for j in 0..128 {
-        if j > 0 {
-            let mut lvl_w = Vec::with_capacity(m_mp2);
-            for t2 in 0..m_mp2 {
-                let y = frob_inv(rinv_n2[t2]);
-                rinv_n2[t2] = y;
-                vals.push(y);
-                let yw = sb.input();
-                let d = sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3];
-                sb.connect(d, zassert);
-                lvl_w.push(yw);
-            }
-            rinv_w = lvl_w;
-        }
-        let factors: Vec<(Wire, Wire)> = rinv_w
-            .iter()
-            .copied()
-            .zip(mp_rho2_w.iter().copied())
-            .collect();
-        let eqj = prefix_product(sb, &factors);
-        ghat = sb.gate(spine, &[zw, zw, zw, ghat, zw, zw, mp_pws[j], eqj, zw])[3];
-    }
-    // e_at = eq(ρ, ρ″) for the group coefficients.
-    let e_at_w = {
-        let factors: Vec<(Wire, Wire)> = rho_mrg_w
-            .iter()
-            .copied()
-            .zip(mp_rho2_w.iter().copied())
-            .collect();
-        prefix_product(sb, &factors)
-    };
-    // THE COUNT WIN: the counts used to enter the parent's circuit HERE —
-    // per-run boundary eq products with the jagged run boundaries (the
-    // prefix sums of the child's per-type heights) baked as ow/zw, then
-    // per-statement run-weight enumerations consuming them. All of it is
-    // gone: each statement's raw W arrives as a PUBLISHED CLAIM VALUE on
-    // the jagged layout table (the deferred verify's own export, keyed by
-    // the child digest), checker-held here and discharged at the ROOT of
-    // the accumulation tree — the eps discipline, ported. The claim's
-    // points are wires this region already carries (σ = the anchor round
-    // squeezes, z_cols = statement point wires, γ_pd = squeezes); nothing
-    // count-shaped remains in the circuit.
-    let mut jag_w: Vec<Wire> = Vec::new();
-    // The claims' IDENTITY wires (the points-connect): σ shared per
-    // region, and per claim — in jag_w order — the row-identity wires the
-    // merge fold's absorbed words connect to.
-    let mut jag_row_w: Vec<Vec<Wire>> = Vec::new();
-    // Per RS statement: the published w, the DP, the coefficient.
-    let alslot = cs.alslot;
-    let mut expect_w = zw;
-    for (si, xs) in [&xab_pw, &xc_pw].iter().enumerate() {
-        let z_row_w: Vec<Wire> = xs[1..1 + n_log_i].iter().map(|&(_, w)| w).collect();
-        vals.push(ct.jag.rs[si].value);
-        let w_st = sb.input();
-        jag_w.push(w_st);
-        jag_row_w.push(xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect());
-        let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
-        for layer in (0..=m_mp2).rev() {
-            let za = if layer < n_log_i { z_row_w[layer] } else { zw };
-            let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
-            let mut a_in = gdp.to_vec();
-            a_in.extend_from_slice(&[za, rb, mp_sig_w[2 * layer], mp_sig_w[2 * layer + 1], ow]);
-            let o = sb.gate(alslot, &a_in);
-            gdp = [o[0], o[1], o[2], o[3]];
-        }
-        let coeff = if si == 0 {
-            ghat
-        } else {
-            sb.gate(spine, &[zw, zw, zw, zw, zw, zw, mp_pws[128], ghat, zw])[3]
-        };
-        let wd = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, w_st, gdp[0], zw])[3];
-        expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
-    }
-    // Per group: the γ-baked one-hot combo publishes as ONE value; each
-    // dense (element) member publishes its raw eq value with its γ_pd
-    // applied by a MAC on the squeeze wire — the exported decomposition,
-    // reassembled in wires. Coefficient γ^{256+k}·e_at as before.
-    for (g_ix, members) in ct.groups_ix.iter().enumerate() {
-        let (combo, dense) = &ct.jag.groups[g_ix];
-        let hots: Vec<bool> = members
-            .iter()
-            .map(|&i2| {
-                ct.pd_pts[i2][n_log_i..]
-                    .iter()
-                    .all(|&x| x == F128::ZERO || x == F128::ONE)
-            })
-            .collect();
-        let mut w_st = match combo {
-            Some(c) => {
-                vals.push(c.value);
-                let w = sb.input();
-                jag_w.push(w);
-                // The combo's identity: the hot members' γ_pd squeeze
-                // wires, in member order == the assertion's term order.
-                let gws: Vec<Wire> = members
-                    .iter()
-                    .zip(&hots)
-                    .filter(|&(_, &h)| h)
-                    .map(|(&i2, _)| {
-                        let pd = &ct.gammas_o[i2];
-                        squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset)
-                    })
-                    .collect();
-                if let JaggedRowWeight::Combo(t) = &c.row {
-                    assert_eq!(t.len(), gws.len(), "combo terms == hot members");
-                }
-                jag_row_w.push(gws);
-                w
-            }
-            None => zw,
-        };
-        let mut d_it = dense.iter();
-        for (&i2, &hot) in members.iter().zip(&hots) {
-            if hot {
-                continue;
-            }
-            let (_, c) = d_it.next().expect("a dense entry per non-hot member");
-            let pd = &ct.gammas_o[i2];
-            let gpd_w = squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset);
-            vals.push(c.value);
-            let d_w = sb.input();
-            jag_w.push(d_w);
-            // The dense claim's identity: its z_col coordinate wires —
-            // constant coords ride zw/ow, the rest are the element PIOP's
-            // own squeeze wires (the mapping the constructor pinned).
-            jag_row_w.push(
-                (0..k_cols_i)
-                    .map(|jj| {
-                        let coord = ct.pd_pts[i2][n_log_i + jj];
-                        if coord == F128::ZERO {
-                            zw
-                        } else if coord == F128::ONE {
-                            ow
-                        } else {
-                            let el_rec = el_rec.expect("element pd claim");
-                            if i2 == 0 {
-                                outs[trace.squeezes[el_rec.zc_rounds[n_log_i + jj].1][0]][0]
-                            } else {
-                                let n_lc = el_rec.lc_rounds.len();
-                                outs[trace.squeezes[el_rec.lc_rounds[n_lc - 1 - jj].1][0]][0]
-                            }
-                        }
-                    })
-                    .collect(),
-            );
-            w_st = sb.gate(macs, &[w_st, gpd_w, d_w])[0];
-        }
-        assert!(d_it.next().is_none(), "every dense entry consumed");
-        let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
-        for layer in (0..=m_mp2).rev() {
-            let za = if layer < n_log_i {
-                if members[0] >= n_el_pd {
-                    pt_w[layer]
-                } else {
-                    let el_rec = el_rec.expect("element pd claim");
-                    outs[trace.squeezes[el_rec.zc_rounds[layer].1][0]][0]
-                }
-            } else {
-                zw
-            };
-            let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
-            let mut a_in = gdp.to_vec();
-            a_in.extend_from_slice(&[za, rb, mp_sig_w[2 * layer], mp_sig_w[2 * layer + 1], ow]);
-            let o = sb.gate(alslot, &a_in);
-            gdp = [o[0], o[1], o[2], o[3]];
-        }
-        let coeff = sb.gate(macs, &[zw, mp_pws[256 + g_ix], e_at_w])[0];
-        let wd = sb.gate(macs, &[zw, w_st, gdp[0]])[0];
-        expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
-    }
-    // The join: the anchor's folded claim equals the in-circuit expect.
-    sb.connect(anc_w, expect_w);
 
     // The aggregate verifier's scalar closures are part of the recursive
     // relation too.  The reported A/B values below become fold claims; these
@@ -2874,6 +2266,623 @@ pub(super) fn emit_child_region(
         pf: (pfslot, pf_w),
         child_pub_w: pub_w,
     }
+}
+
+/// ---- ROUND 2: the H(publics) region (v2 statement binding) ----
+/// The returned wires ARE the child's public segment — the recombination
+/// folds them.
+#[allow(clippy::too_many_arguments)]
+fn emit_h_publics_region(
+    sb: &mut ShapeBuilder,
+    child_q: CollapsedSlots,
+    iv2: [Wire; 2],
+    ct: &ChildTape<'_>,
+    stream: &Stream,
+    ww: &[Option<Wire>],
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+) -> Vec<Wire> {
+    let pays = payload_words(stream);
+    assert_eq!(pays[4].len(), 2, "the publics digest payload is 32 bytes");
+    let dw = [
+        ww[pays[4][0]].expect("digest word wired"),
+        ww[pays[4][1]].expect("digest word wired"),
+    ];
+    emit_publics_hash(
+        sb,
+        child_q,
+        iv2,
+        &ct.inner.built.witness.public,
+        dw,
+        vals,
+        consts,
+    )
+}
+
+/// ---- the WIRING GKR in-circuit ----
+/// ---- ROUND 4: the recombination + f == g, in-circuit ----
+#[allow(clippy::too_many_arguments)]
+fn emit_wiring_gkr_and_recombination(
+    sb: &mut ShapeBuilder,
+    cs: &mut ChildSlots,
+    ct: &ChildTape<'_>,
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    pub_w: &[Wire],
+    n_el_pd: usize,
+    vals: &mut Vec<F128>,
+    zw: Wire,
+    ow: Wire,
+    zassert: Wire,
+) -> (Vec<Wire>, Wire, Wire, Wire) {
+    let macs = cs.macs;
+    let zcr = cs.zcr;
+    let n_log_i = ct.n_log_i;
+    let g = &ct.gkr;
+    let alpha_w = outs[trace.squeezes[g.alpha_fin][0]][0];
+    let beta_w = outs[trace.squeezes[g.beta_fin][0]][0];
+    // The grand products agree: a COPY CONSTRAINT on the tops (every
+    // former published-zero delta in this region is now a connect — the
+    // proof itself fails on a broken identity; no public, no checker item).
+    let (mut cl_w, mut cr_w) = (wv(g.top_v), wv(g.top_v + 1));
+    sb.connect(cl_w, cr_w);
+    let mut pt_w: Vec<Wire> = Vec::new();
+    for lr in &g.layers {
+        let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
+        let mut run_w = sb.gate(macs, &[cl_w, lam_w, cr_w])[0];
+        let mut pt_next: Vec<Wire> = Vec::with_capacity(lr.rounds.len() + 1);
+        for (t2, &(gv, rfin)) in lr.rounds.iter().enumerate() {
+            let rho_w = outs[trace.squeezes[rfin][0]][0];
+            vals.push(lr.g0s[t2]);
+            let g0w = sb.input();
+            let o = sb.gate(zcr, &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow]);
+            sb.connect(o[0], zassert);
+            run_w = o[1];
+            pt_next.push(rho_w);
+        }
+        // The layer close: run == vl0·vl1 + lambda·(vr0·vr1).
+        let (vl0, vl1) = (wv(lr.v_v), wv(lr.v_v + 1));
+        let (vr0, vr1) = (wv(lr.v_v + 2), wv(lr.v_v + 3));
+        let pl = sb.gate(macs, &[zw, vl0, vl1])[0];
+        let pr = sb.gate(macs, &[zw, vr0, vr1])[0];
+        let gate_w = sb.gate(macs, &[pl, lam_w, pr])[0];
+        sb.connect(gate_w, run_w);
+        // The claim fold: claim' = v0 + c·(v0 + v1).
+        let ck_w = outs[trace.squeezes[lr.ck_fin][0]][0];
+        let sl = sb.gate(macs, &[vl0, vl1, ow])[0];
+        let sr = sb.gate(macs, &[vr0, vr1, ow])[0];
+        cl_w = sb.gate(macs, &[vl0, ck_w, sl])[0];
+        cr_w = sb.gate(macs, &[vr0, ck_w, sr])[0];
+        pt_next.push(ck_w);
+        pt_w = pt_next;
+    }
+    assert_eq!(
+        pt_w.len(),
+        ct.mu_i,
+        "the GKR point spans the inner cell space"
+    );
+    // The input checks under the LIVE-IDENTITY padding: M̂(ρ) and livê(ρ),
+    // bound through the digest-keyed circuit-structure claims folded by the
+    // parent.
+    vals.push(ct.mid_n);
+    let mid_w = sb.public_input();
+    vals.push(ct.live_n);
+    let live_w = sb.public_input();
+    // The two input checks, as published-zero deltas.
+    let (f_w, g_w, sig_w) = (wv(g.fgs_v), wv(g.fgs_v + 1), wv(g.fgs_v + 2));
+    let l1 = sb.gate(macs, &[f_w, alpha_w, mid_w])[0];
+    let l2 = sb.gate(macs, &[l1, beta_w, live_w])[0];
+    let l3 = sb.gate(macs, &[l2, ow, live_w])[0];
+    let l4 = sb.gate(macs, &[l3, ow, ow])[0];
+    sb.connect(l4, cl_w);
+    let r1 = sb.gate(macs, &[g_w, alpha_w, sig_w])[0];
+    let r2 = sb.gate(macs, &[r1, beta_w, live_w])[0];
+    let r3 = sb.gate(macs, &[r2, ow, live_w])[0];
+    let r4 = sb.gate(macs, &[r3, ow, ow])[0];
+    sb.connect(r4, cr_w);
+
+    let le8 = match cs.le.iter().find(|&&(n, _)| n == 8) {
+        Some(&(_, s)) => s,
+        None => {
+            let s = sb.slot(LeafEvalGate::new(8));
+            cs.le.push((8, s));
+            s
+        }
+    };
+    let gather_w: Vec<Wire> = (0..ct.n_pd - n_el_pd)
+        .map(|i| wv(ct.gammas_o[n_el_pd + i].val_v))
+        .collect();
+    emit_recombination(
+        sb,
+        cs.fold_macs,
+        le8,
+        pub_w,
+        &gather_w,
+        &pt_w,
+        n_log_i,
+        ct.n_pub_slots_c,
+        f_w,
+        g_w,
+        zw,
+        ow,
+    );
+    (pt_w, mid_w, live_w, sig_w)
+}
+
+/// ---- the LIGERITO SPINE ----
+#[allow(clippy::too_many_arguments)]
+fn emit_ligerito_spine(
+    sb: &mut ShapeBuilder,
+    cs: &ChildSlots,
+    ct: &ChildTape<'_>,
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    level_accs: &[[Wire; 2]],
+    zw: Wire,
+    ow: Wire,
+) -> [Wire; 2] {
+    walker_common::emit_ligerito_spine_walk(
+        sb,
+        cs.spine256,
+        outs,
+        trace,
+        wv,
+        &ct.levels,
+        &ct.inner_pd2,
+        ct.start_v,
+        level_accs,
+        zw,
+        ow,
+    )
+}
+
+/// ---- the RESIDUAL region (shared emitter) ----
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+fn emit_residual_region_shared(
+    sb: &mut ShapeBuilder,
+    cs: &mut ChildSlots,
+    ct: &ChildTape<'_>,
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    to_publish: &[Vec<Wire>],
+    query_positions: &[Vec<Wire>],
+    t_final: [Wire; 2],
+    zw: Wire,
+    ow: Wire,
+) -> (Vec<Vec<[Wire; 2]>>, [Wire; 2], (SlotId, usize)) {
+    let levels = &ct.levels[..];
+    let geo = &ct.geo[..];
+    let inner_pd2 = &ct.inner_pd2;
+    let yr_wires: Vec<[Wire; 2]> = (0..ct.yr_len)
+        .map(|y| [wv(ct.yr_v2 + 2 * y), wv(ct.yr_v2 + 2 * y + 1)])
+        .collect();
+    let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region(
+        sb,
+        &mut cs.resid,
+        levels,
+        geo,
+        to_publish,
+        query_positions,
+        &ct.w_resid,
+        inner_pd2.fin,
+        &yr_wires,
+        trace,
+        outs,
+        zw,
+        ow,
+    );
+    // THE CLOSURE, in-circuit: the residual side's inner and the spine's
+    // t_r are the same statement scalar — a copy constraint, not a
+    // checker item (both stay published as test cross-checks).
+    sb.connect(inner_w[0], t_final[0]);
+    sb.connect(inner_w[1], t_final[1]);
+    (resid_pub, inner_w, (pfslot, pf_w))
+}
+
+/// ---- FAMILY H + the merged intake boundary ----
+/// The transpose/equality dot products and inverse-Moore/Frobenius
+/// recombination are all recursive-circuit arithmetic. Every source is
+/// an existing transcript/proof wire; the native target is retained only
+/// as a published test oracle below.
+#[allow(clippy::too_many_arguments)]
+fn emit_family_h_and_intake_boundary(
+    sb: &mut ShapeBuilder,
+    cs: &ChildSlots,
+    ct: &ChildTape<'_>,
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    pfslot: SlotId,
+    pf_w: usize,
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+    zw: Wire,
+    ow: Wire,
+) -> (Wire, Wire) {
+    let macs = cs.macs;
+    let mrs = cs.mrs;
+    let mp_o = &ct.mp_o;
+    let w_rounds = &ct.w_rounds[..];
+    let inner_pd2 = &ct.inner_pd2;
+    let (shv_w, value_w, rdp_w, gamma_w) = walker_common::family_h_source_wires(
+        outs,
+        trace,
+        wv,
+        &ct.rs_recs,
+        &ct.rs_gam_fins,
+        &mp_o.val_vs,
+    );
+    let (rsh_w, vrs_w) = emit_family_h(
+        sb,
+        cs.q.family.expect("family-H slot"),
+        cs.macs,
+        cs.fold_macs,
+        cs.spine,
+        cs.spine256,
+        cs.resid
+            .iter()
+            .find(|&&(key, _)| key == 701)
+            .expect("the child slots declare an F256 MAC slot")
+            .1,
+        1usize << cs.nu,
+        &shv_w,
+        &value_w,
+        &rdp_w,
+        gamma_w,
+        pfslot,
+        pf_w,
+        zw,
+        ow,
+        vals,
+        consts,
+    );
+    let mut pdh_w = zw;
+    for pd in &ct.gammas_o {
+        let gw = squeeze_word_wire(outs, trace, pd.fin, pd.squeeze_offset);
+        pdh_w = sb.gate(macs, &[pdh_w, gw, wv(pd.val_v)])[0];
+    }
+    let tgt_w = sb.gate(macs, &[rsh_w, ow, pdh_w])[0];
+    let mut runw = tgt_w;
+    for rr in w_rounds {
+        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+        runw = sb.gate(mrs, &[runw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+    }
+    let mut vgrp_w = zw;
+    for &vi in &mp_o.val_vs[256..] {
+        vgrp_w = sb.gate(macs, &[vgrp_w, ow, wv(vi)])[0];
+    }
+    let v_w = sb.gate(macs, &[vrs_w, ow, vgrp_w])[0];
+    let rhs_v_w = sb.gate(macs, &[zw, wv(inner_pd2.q_v), v_w])[0];
+    sb.connect(runw, rhs_v_w);
+    (tgt_w, runw)
+}
+
+/// ---- the ELEMENT PIOP rounds in-circuit (mixed children only) ----
+/// Zerocheck rounds are ZcRoundGate rows (tau slice wires as eq weights,
+/// g0 advice + zero deltas); lincheck rounds are MergedRoundGate rows.
+/// The entry is DERIVED: va = ea + a_sum, vb = eb + b_sum, entry =
+/// va + alpha·vb — only the two constant-strip sums are advice.
+#[allow(clippy::too_many_arguments)]
+fn emit_element_piop_rounds(
+    sb: &mut ShapeBuilder,
+    cs: &ChildSlots,
+    ct: &ChildTape<'_>,
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    vals: &mut Vec<F128>,
+    zw: Wire,
+    ow: Wire,
+    zassert: Wire,
+) -> Option<(Wire, Wire, Wire, Wire, Wire)> {
+    let macs = cs.macs;
+    let zcr = cs.zcr;
+    let mrs = cs.mrs;
+    let el_rec = ct.el.as_ref();
+    el_rec.map(|el_rec| {
+        let mut el_zr = zw;
+        for (k, &(gv, rfin, _)) in el_rec.zc_rounds.iter().enumerate() {
+            let t_w = squeeze_word_wire(outs, trace, el_rec.tau_fin, k);
+            let rho_w = outs[trace.squeezes[rfin][0]][0];
+            vals.push(ct.el_g0[k]);
+            let g0w = sb.input();
+            let o = sb.gate(zcr, &[el_zr, wv(gv), wv(gv + 1), t_w, rho_w, g0w, ow]);
+            sb.connect(o[0], zassert);
+            el_zr = o[1];
+        }
+        let el_alpha_w = outs[trace.squeezes[el_rec.alpha_fin][0]][0];
+        let ea_w = wv(el_rec.eab_v);
+        let eb_w = wv(el_rec.eab_v + 1);
+        vals.push(ct.a_sum_n);
+        let asum_w = sb.public_input();
+        vals.push(ct.b_sum_n);
+        let bsum_w = sb.public_input();
+        let va_w = sb.gate(macs, &[ea_w, asum_w, ow])[0];
+        let vb_w = sb.gate(macs, &[eb_w, bsum_w, ow])[0];
+        let mut el_lcw = sb.gate(macs, &[va_w, el_alpha_w, vb_w])[0];
+        for &(gv, rfin, _) in &el_rec.lc_rounds {
+            let rho_w = outs[trace.squeezes[rfin][0]][0];
+            el_lcw = sb.gate(mrs, &[el_lcw, wv(gv), wv(gv + 1), rho_w])[0];
+        }
+        (el_zr, el_lcw, asum_w, bsum_w, el_alpha_w)
+    })
+}
+
+/// ---- the anchor EXPECT in-circuit, at R = 2 AND P > 0 ----
+/// expect = Σ_i γ^{128i}·ĝ(ρ″)·(w_i·DP_i) over the RS statements + Σ_k
+/// γ^{256+k}·eq(ρ,ρ″)·(w_k·DP_k) over the P groups; claim == expect
+/// publishes as a zero-delta. ĝ's inverse-Frobenius points ride as advice
+/// bound by forward squaring deltas.
+/// The c-point's 7 baked inner constants are the zerocheck's friendly
+/// challenges — the RS ghash set or the AG set, by the tape's flavor
+/// (baked constants are free in-circuit either way).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+fn emit_anchor_expect(
+    sb: &mut ShapeBuilder,
+    cs: &ChildSlots,
+    ct: &ChildTape<'_>,
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    mp_pws: &[Wire],
+    mp_rho2_w: &[Wire],
+    mp_sig_w: &[Wire],
+    anc_w: Wire,
+    pt_w: &[Wire],
+    pf: (SlotId, usize),
+    n_el_pd: usize,
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+    zw: Wire,
+    ow: Wire,
+    zassert: Wire,
+) -> (
+    Vec<Wire>,
+    Vec<Vec<Wire>>,
+    Vec<(F128, Wire)>,
+    Vec<(F128, Wire)>,
+) {
+    let (pfslot, pf_w) = pf;
+    let macs = cs.macs;
+    let spine = cs.spine;
+    let chals = &ct.chals[..];
+    let w_rounds = &ct.w_rounds[..];
+    let el_rec = ct.el.as_ref();
+    let m_mp2 = ct.m_mp2;
+    let n_log_i = ct.n_log_i;
+    let k_cols_i = ct.k_cols_i;
+    let t_vals_b = walker_common::baked_inner_t_vals(&ct.zskip);
+
+    // The statements' points as (native value, wire) pairs, pinned against
+    // the native claims: ab = [LAST lc round | zc mlv rounds 1..1+ν | lc
+    // rounds REVERSED tail], c = the zerocheck's r_rest verbatim.
+    let mlv_pw: Vec<(F128, Wire)> = ct
+        .zc_rounds_b
+        .iter()
+        .map(|&(ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
+        .collect();
+    let lc_pw: Vec<(F128, Wire)> = ct
+        .lc_rounds_b
+        .iter()
+        .rev()
+        .map(|&(ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
+        .collect();
+    let mut xab_pw: Vec<(F128, Wire)> = vec![lc_pw[0]];
+    xab_pw.extend_from_slice(&mlv_pw[1..1 + n_log_i]);
+    xab_pw.extend_from_slice(&lc_pw[1..]);
+    walker_common::extend_const_coords(&mut xab_pw, &ct.x_ab_n, zw, ow);
+    let (outer_ch_b, outer_fin_b) = ct.outer_b;
+    let mut xc_pw: Vec<(F128, Wire)> = (0..ct.zc_rounds_b.len())
+        .map(|k2| {
+            if k2 < walker_common::N_BAKED_T_VALS {
+                (t_vals_b[k2], cw(sb, vals, consts, t_vals_b[k2]))
+            } else {
+                // The exact (row, word) map — a FUSED slice squeeze (the
+                // AG r_outer grind) reserves one word per row for the PoW
+                // predicate, so the naive 4-per-row split misaddresses.
+                let j = k2 - walker_common::N_BAKED_T_VALS;
+                (
+                    chals[outer_ch_b + j],
+                    squeeze_word_wire(outs, trace, outer_fin_b, j),
+                )
+            }
+        })
+        .collect();
+    walker_common::extend_const_coords(&mut xc_pw, &ct.x_c_n, zw, ow);
+    for (i2, (&(nv, _), &xn)) in xab_pw.iter().zip(&ct.x_ab_n).enumerate() {
+        assert_eq!(nv, xn, "ab point coord {i2} is the located wire");
+    }
+    for (i2, (&(nv, _), &xn)) in xc_pw.iter().zip(&ct.x_c_n).enumerate() {
+        assert_eq!(nv, xn, "c point coord {i2} is the located wire");
+    }
+
+    // ĝ(ρ″): advice square-root chains for ρ^(2^-j), bound by forward
+    // squaring deltas y·y + prev = 0.
+    let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
+    let rho_mrg_w: Vec<Wire> = w_rounds
+        .iter()
+        .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
+        .collect();
+    let mut rinv_n2: Vec<F128> = rho_mrg_n.clone();
+    let mut rinv_w: Vec<Wire> = rho_mrg_w.clone();
+    let mut ghat = zw;
+    for j in 0..128 {
+        if j > 0 {
+            let mut lvl_w = Vec::with_capacity(m_mp2);
+            for t2 in 0..m_mp2 {
+                let y = frob_inv(rinv_n2[t2]);
+                rinv_n2[t2] = y;
+                vals.push(y);
+                let yw = sb.input();
+                let d = sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3];
+                sb.connect(d, zassert);
+                lvl_w.push(yw);
+            }
+            rinv_w = lvl_w;
+        }
+        let factors: Vec<(Wire, Wire)> = rinv_w
+            .iter()
+            .copied()
+            .zip(mp_rho2_w.iter().copied())
+            .collect();
+        let eqj = walker_common::prefix_product(sb, pfslot, pf_w, zw, ow, &factors);
+        ghat = sb.gate(spine, &[zw, zw, zw, ghat, zw, zw, mp_pws[j], eqj, zw])[3];
+    }
+    // e_at = eq(ρ, ρ″) for the group coefficients.
+    let e_at_w = {
+        let factors: Vec<(Wire, Wire)> = rho_mrg_w
+            .iter()
+            .copied()
+            .zip(mp_rho2_w.iter().copied())
+            .collect();
+        walker_common::prefix_product(sb, pfslot, pf_w, zw, ow, &factors)
+    };
+    // THE COUNT WIN: the counts used to enter the parent's circuit HERE —
+    // per-run boundary eq products with the jagged run boundaries (the
+    // prefix sums of the child's per-type heights) baked as ow/zw, then
+    // per-statement run-weight enumerations consuming them. All of it is
+    // gone: each statement's raw W arrives as a PUBLISHED CLAIM VALUE on
+    // the jagged layout table (the deferred verify's own export, keyed by
+    // the child digest), checker-held here and discharged at the ROOT of
+    // the accumulation tree — the eps discipline, ported. The claim's
+    // points are wires this region already carries (σ = the anchor round
+    // squeezes, z_cols = statement point wires, γ_pd = squeezes); nothing
+    // count-shaped remains in the circuit.
+    let mut jag_w: Vec<Wire> = Vec::new();
+    // The claims' IDENTITY wires (the points-connect): σ shared per
+    // region, and per claim — in jag_w order — the row-identity wires the
+    // merge fold's absorbed words connect to.
+    let mut jag_row_w: Vec<Vec<Wire>> = Vec::new();
+    // Per RS statement: the published w, the DP, the coefficient.
+    let alslot = cs.alslot;
+    let mut expect_w = zw;
+    for (si, xs) in [&xab_pw, &xc_pw].iter().enumerate() {
+        let z_row_w: Vec<Wire> = xs[1..1 + n_log_i].iter().map(|&(_, w)| w).collect();
+        vals.push(ct.jag.rs[si].value);
+        let w_st = sb.input();
+        jag_w.push(w_st);
+        jag_row_w.push(xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect());
+        let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
+        for layer in (0..=m_mp2).rev() {
+            let za = if layer < n_log_i { z_row_w[layer] } else { zw };
+            let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
+            let mut a_in = gdp.to_vec();
+            a_in.extend_from_slice(&[za, rb, mp_sig_w[2 * layer], mp_sig_w[2 * layer + 1], ow]);
+            let o = sb.gate(alslot, &a_in);
+            gdp = [o[0], o[1], o[2], o[3]];
+        }
+        let coeff = if si == 0 {
+            ghat
+        } else {
+            sb.gate(spine, &[zw, zw, zw, zw, zw, zw, mp_pws[128], ghat, zw])[3]
+        };
+        let wd = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, w_st, gdp[0], zw])[3];
+        expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
+    }
+    // Per group: the γ-baked one-hot combo publishes as ONE value; each
+    // dense (element) member publishes its raw eq value with its γ_pd
+    // applied by a MAC on the squeeze wire — the exported decomposition,
+    // reassembled in wires. Coefficient γ^{256+k}·e_at as before.
+    for (g_ix, members) in ct.groups_ix.iter().enumerate() {
+        let (combo, dense) = &ct.jag.groups[g_ix];
+        let hots: Vec<bool> = members
+            .iter()
+            .map(|&i2| {
+                ct.pd_pts[i2][n_log_i..]
+                    .iter()
+                    .all(|&x| x == F128::ZERO || x == F128::ONE)
+            })
+            .collect();
+        let mut w_st = match combo {
+            Some(c) => {
+                vals.push(c.value);
+                let w = sb.input();
+                jag_w.push(w);
+                // The combo's identity: the hot members' γ_pd squeeze
+                // wires, in member order == the assertion's term order.
+                let gws: Vec<Wire> = members
+                    .iter()
+                    .zip(&hots)
+                    .filter(|&(_, &h)| h)
+                    .map(|(&i2, _)| {
+                        let pd = &ct.gammas_o[i2];
+                        squeeze_word_wire(outs, trace, pd.fin, pd.squeeze_offset)
+                    })
+                    .collect();
+                if let JaggedRowWeight::Combo(t) = &c.row {
+                    assert_eq!(t.len(), gws.len(), "combo terms == hot members");
+                }
+                jag_row_w.push(gws);
+                w
+            }
+            None => zw,
+        };
+        let mut d_it = dense.iter();
+        for (&i2, &hot) in members.iter().zip(&hots) {
+            if hot {
+                continue;
+            }
+            let (_, c) = d_it.next().expect("a dense entry per non-hot member");
+            let pd = &ct.gammas_o[i2];
+            let gpd_w = squeeze_word_wire(outs, trace, pd.fin, pd.squeeze_offset);
+            vals.push(c.value);
+            let d_w = sb.input();
+            jag_w.push(d_w);
+            // The dense claim's identity: its z_col coordinate wires —
+            // constant coords ride zw/ow, the rest are the element PIOP's
+            // own squeeze wires (the mapping the constructor pinned).
+            jag_row_w.push(
+                (0..k_cols_i)
+                    .map(|jj| {
+                        let coord = ct.pd_pts[i2][n_log_i + jj];
+                        if coord == F128::ZERO {
+                            zw
+                        } else if coord == F128::ONE {
+                            ow
+                        } else {
+                            let el_rec = el_rec.expect("element pd claim");
+                            if i2 == 0 {
+                                outs[trace.squeezes[el_rec.zc_rounds[n_log_i + jj].1][0]][0]
+                            } else {
+                                let n_lc = el_rec.lc_rounds.len();
+                                outs[trace.squeezes[el_rec.lc_rounds[n_lc - 1 - jj].1][0]][0]
+                            }
+                        }
+                    })
+                    .collect(),
+            );
+            w_st = sb.gate(macs, &[w_st, gpd_w, d_w])[0];
+        }
+        assert!(d_it.next().is_none(), "every dense entry consumed");
+        let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
+        for layer in (0..=m_mp2).rev() {
+            let za = if layer < n_log_i {
+                if members[0] >= n_el_pd {
+                    pt_w[layer]
+                } else {
+                    let el_rec = el_rec.expect("element pd claim");
+                    outs[trace.squeezes[el_rec.zc_rounds[layer].1][0]][0]
+                }
+            } else {
+                zw
+            };
+            let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
+            let mut a_in = gdp.to_vec();
+            a_in.extend_from_slice(&[za, rb, mp_sig_w[2 * layer], mp_sig_w[2 * layer + 1], ow]);
+            let o = sb.gate(alslot, &a_in);
+            gdp = [o[0], o[1], o[2], o[3]];
+        }
+        let coeff = sb.gate(macs, &[zw, mp_pws[256 + g_ix], e_at_w])[0];
+        let wd = sb.gate(macs, &[zw, w_st, gdp[0]])[0];
+        expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
+    }
+    // The join: the anchor's folded claim equals the in-circuit expect.
+    sb.connect(anc_w, expect_w);
+    (jag_w, jag_row_w, mlv_pw, lc_pw)
 }
 
 /// Walk one emitted child region's public block and hold every published

@@ -2689,6 +2689,234 @@ pub fn build_node_outer_app(
     }
 }
 
+/// **The REAL-side tape pin** (walker plan, Phase A0 — the sibling of
+/// [`chain_tape_regions_pinned`]): [`RealTape::new`] — the SAME constructor
+/// the internal-node machinery instantiates per child — walks one FL
+/// leaf-outer's tape. Every pin here holds a STORED field against a
+/// reference computed OUTSIDE the constructor, so a parse that stores the
+/// wrong value FAILS: the tape verbatim against an independent recorded
+/// deferred verify of the same leaf outer, the assertion replicas against
+/// that run's exports (with the constructor's own natives — strip sums,
+/// mask evals, eps terms, the GKR endpoint — cross-checked against the
+/// export fields the verifier computed by its own route), the structural
+/// counts against the PROOF OBJECT (ladder levels, yr pairs, ring
+/// switches, wiring gathers, frobenius groups), and the PoW schedule
+/// against the reference tape's own op stream. The e2e node tests prove
+/// the values downstream; this localizes a break to the constructor.
+#[test]
+#[ignore] // Heavier — builds two chain leaves + one FL node.
+pub(super) fn real_tape_regions_pinned() {
+    let cfg = test_config();
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_0007);
+    let h0: [u32; 16] = from_fn(|_| rng.next_u32());
+    let cp0 = build_chain_proof(cfg, h0, n_blocks);
+    let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
+    let fl = build_fl_node(cfg, &cp0, &cp1);
+    let rt = RealTape::new(&fl.lo, DOMAIN);
+
+    // The INDEPENDENT reference run: the same deferred verify the
+    // constructor records, re-run here — its recorded tape and exported
+    // assertions are references the parse under test never touched.
+    let union = outer_union(&fl.lo.shape.registry, fl.lo.shape.counts.clone());
+    let lcs = leaf_boolean_lcs(&fl.lo);
+    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(DOMAIN));
+    let (_claims, work, sigma) = fl
+        .lo
+        .proof
+        .verify_circuit_deferred(
+            &union,
+            &fl.lo.shape.circuit,
+            &fl.lo.public,
+            &lcs,
+            &fl.lo.commitment,
+            &fl.lo.pcs,
+            &mut rec,
+        )
+        .expect("the reference deferred verify accepts the leaf outer");
+
+    // The stored tape IS the reference run's tape, word for word.
+    assert_eq!(rt.chals, rec.challenges(), "the tape's challenges");
+    assert_eq!(rt.vals_rec, rec.values(), "the tape's observed values");
+
+    // The stored assertion replicas ARE the reference run's exports.
+    assert_eq!(
+        rt.sigma_native, sigma,
+        "the sigma reference is the deferred verify's"
+    );
+    assert_eq!(
+        rt.mat_assert,
+        work.boolean.expect("boolean matrix work"),
+        "the boolean reference is the deferred verify's"
+    );
+    let el = work.element.expect("element work travels on an outer");
+    assert_eq!(
+        rt.el_assert, el,
+        "the element reference is the deferred verify's"
+    );
+    assert_eq!(
+        rt.jag, work.jagged,
+        "the jagged reference is the deferred verify's"
+    );
+
+    // The constructor's OWN natives against the exports' fields — two
+    // routes to one value: the general strip loop vs the verifier's
+    // affine-constant evals, the live-mask evals and the GKR endpoint vs
+    // the sigma export, the count-derived eps terms vs the exported
+    // boolean pin values.
+    assert_eq!(
+        rt.a_sum_n, el.a_const_eval,
+        "the A strip sum is the exported affine-constant eval"
+    );
+    assert_eq!(
+        rt.b_sum_n, el.b_const_eval,
+        "the B strip sum is the exported affine-constant eval"
+    );
+    assert_eq!(
+        rt.gkr.r_pt, sigma.rho,
+        "the walked GKR endpoint is the exported sigma point"
+    );
+    assert_eq!(
+        rt.mid_n, sigma.masked_id_value,
+        "masked M̂ replays to the exported value"
+    );
+    assert_eq!(
+        rt.live_n, sigma.live_value,
+        "livê replays to the exported value"
+    );
+    assert_eq!(
+        rt.eps_n.len(),
+        sigma.boolean_pins.len(),
+        "one count-derived eps per exported boolean pin"
+    );
+    assert_eq!(
+        rt.betas_b.len(),
+        rt.eps_n.len(),
+        "one const-pin beta per eps term"
+    );
+    for (k, (_, _, v)) in sigma.boolean_pins.iter().enumerate() {
+        assert_eq!(rt.eps_n[k], *v, "eps {k} is the exported pin value");
+    }
+
+    // Structural counts against the PROOF OBJECT, not the parse.
+    let open = fl.lo.proof.pcs_open();
+    let lig = &open.inner.ligerito;
+    assert_eq!(
+        rt.levels.len(),
+        lig.recursive_caps.len() + 1,
+        "one open level per recursive cap plus the base"
+    );
+    assert_eq!(rt.levels.len(), rt.geo.len(), "one geometry per open level");
+    assert_eq!(
+        rt.levels.len(),
+        rt.lvl_src.len(),
+        "one source triple per level"
+    );
+    assert_eq!(
+        rt.levels.len(),
+        rt.cap_pays.len(),
+        "one public cap payload per level"
+    );
+    assert_eq!(
+        rt.yr_len,
+        lig.final_proof.yr.len() / 2,
+        "the residual length is the proof's yr pairs"
+    );
+    assert_eq!(
+        rt.rs_recs.len(),
+        open.ring_switches.len(),
+        "one rs region per proof ring switch"
+    );
+    assert_eq!(
+        rt.rs_gam_fins.len(),
+        rt.rs_recs.len(),
+        "one rs gamma per rs region"
+    );
+    assert_eq!(
+        rt.pd_pts.len(),
+        2 + fl.lo.proof.wiring().gather.len(),
+        "pd points = the element (c, lc) pair + the wiring gathers"
+    );
+    assert_eq!(
+        rt.groups_ix.len(),
+        open.frobenius.group_values.len(),
+        "one scalar group per frobenius group value"
+    );
+    assert_eq!(
+        rt.m_mp2,
+        fl.lo.pcs.m - LOG_PACKING,
+        "the merged domain spans the dense floor"
+    );
+    assert_eq!(
+        rt.mu_i,
+        fl.lo.shape.circuit.cells().mu(),
+        "mu is the inner cell space's"
+    );
+
+    // The grinding schedule against the reference run's own op stream:
+    // the (fin, payload, bits) triples relocated on a tape the
+    // constructor never saw.
+    let ops = flatten_ops(rec.shape().ops());
+    let want_pows: Vec<(usize, usize, u32)> = {
+        let mut out = Vec::new();
+        let (mut fin, mut pay) = (0usize, 0usize);
+        for op in &ops {
+            if let Op::Pow { bits } = op {
+                out.push((fin, pay, *bits));
+            }
+            if op.finalizes() {
+                fin += 1;
+            }
+            if op.carries_payload() {
+                pay += 1;
+            }
+        }
+        out
+    };
+    assert!(!want_pows.is_empty(), "the strict profile grinds");
+    assert_eq!(
+        rt.pows, want_pows,
+        "the parsed PoW schedule is the reference tape's, op for op"
+    );
+
+    // Reading-value shape asserts: transcript order and dimensionality.
+    assert!(
+        rt.cap_pays.windows(2).all(|w| w[0] < w[1]),
+        "cap payloads appear in transcript order"
+    );
+    assert!(
+        rt.zc_rounds_b.windows(2).all(|w| w[0].0 < w[1].0),
+        "boolean zerocheck rounds are transcript-ordered"
+    );
+    assert!(
+        rt.lc_rounds_b.windows(2).all(|w| w[0].1 < w[1].1),
+        "boolean lincheck rounds are transcript-ordered"
+    );
+    assert!(
+        rt.pd_pts.windows(2).all(|w| w[0].len() == w[1].len()),
+        "one merged-open point dimensionality"
+    );
+
+    println!(
+        "\nREAL TAPE (FL leaf-outer as inner)\n           inner: dense_m {} | open levels {} | pows {} | yr {} | mu {}\n           zc rounds {} | lc rounds {} | betas {} | pd pts {} x {} | groups {}\n           b3 rows (tape model) {} | L0 lanes {} x {} words | pub slots (child) {}\n",
+        union.dense_m(),
+        rt.levels.len(),
+        rt.pows.len(),
+        rt.yr_len,
+        rt.mu_i,
+        rt.zc_rounds_b.len(),
+        rt.lc_rounds_b.len(),
+        rt.betas_b.len(),
+        rt.pd_pts.len(),
+        rt.pd_pts.first().map(|p| p.len()).unwrap_or(0),
+        rt.groups_ix.len(),
+        rt.b3_rows,
+        rt.geo[0].lanes,
+        rt.geo[0].row_words,
+        rt.n_pub_slots_c,
+    );
+}
+
 /// **Task 5: THE INTERNAL NODE carries the chain statement.** Four chain
 /// segments → two first-level nodes → ONE internal node, built by
 /// [`build_node_outer_app`]'s own machinery over the FL [`LeafOuter`]s
