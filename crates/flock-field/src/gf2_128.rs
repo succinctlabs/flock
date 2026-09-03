@@ -408,6 +408,11 @@ mod tests {
     };
     #[cfg(feature = "mul-count")]
     use crate::gf2_128::op_count::{MULS_PER_INV, measure};
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    ))]
+    use crate::gf2_128::software::ghash_mul as ghash_mul_software;
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -423,7 +428,7 @@ mod tests {
         ghash_mul_unreduced_x86 as ghash_mul_unreduced_x86_64,
     };
     use crate::{
-        gf2_128::{F128, F256Unreduced, mul_by_x, software::ghash_mul as ghash_mul_software},
+        gf2_128::{F128, F256Unreduced, mul_by_x},
         test_rng::Rng,
     };
 

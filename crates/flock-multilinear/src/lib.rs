@@ -62,7 +62,9 @@ where
     table[0].write(seed);
 
     const PARALLEL_THRESHOLD: usize = 1 << 12;
+    let mut yielded = 0usize;
     for (variable, coordinate) in coordinates.enumerate() {
+        yielded += 1;
         let half = 1usize << variable;
         let (low, high) = table.split_at_mut(half);
         let high = &mut high[..half];
@@ -84,7 +86,14 @@ where
             });
         }
     }
-    // SAFETY: The final level initializes all items. `T: Copy` has no destructor.
+    assert_eq!(
+        yielded, num_variables,
+        "the coordinates iterator yielded fewer items than its len()"
+    );
+    // SAFETY: The loop ran once per variable (asserted above), doubling the
+    // initialized prefix each pass, so the final level initialized every item
+    // — independent of `ExactSizeIterator::len`'s honesty. `T: Copy` has no
+    // destructor.
     unsafe {
         let pointer = table.as_mut_ptr().cast::<T>();
         let len = table.len();

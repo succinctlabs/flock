@@ -187,10 +187,9 @@ pub const fn g_block_bits(g: usize) -> usize {
     2 * FADD_BITS + CARRY_BITS_PER_ADD + g_c1_rows(g)
 }
 
-/// BLAKE3 initial hash values (identical to SHA-256 IV).
-pub const BLAKE3_IV: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-];
+/// BLAKE3 initial hash values (identical to SHA-256 IV). One definition,
+/// owned by `flock-hash`; the circuit uses the same words the hashers do.
+pub use flock_hash::BLAKE3_IV;
 
 /// BLAKE3 message permutation applied between rounds.
 pub const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];

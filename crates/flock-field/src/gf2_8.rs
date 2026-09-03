@@ -13,7 +13,7 @@
 //! Reduction: x^8 ≡ x^4 + x^3 + x + 1, so the upper byte h folds back as
 //!   h ^ (h<<1) ^ (h<<3) ^ (h<<4).
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use core::arch::aarch64::{vdup_n_p8, vgetq_lane_u16, vmull_p8, vreinterpretq_u16_p16};
 use core::ops::{Add, AddAssign, Mul, MulAssign};
 

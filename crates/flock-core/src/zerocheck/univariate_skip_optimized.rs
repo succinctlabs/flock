@@ -957,6 +957,11 @@ mod tests {
         target_arch = "aarch64",
         all(target_arch = "x86_64", target_feature = "gfni")
     ))]
+    use crate::zerocheck::univariate_skip_optimized::N_CHUNKS;
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "gfni")
+    ))]
     use crate::zerocheck::univariate_skip_optimized::shift_reduce_inner_ab_scalar;
     #[cfg(all(
         target_arch = "x86_64",
@@ -979,7 +984,7 @@ mod tests {
             PaddingSpec,
             univariate_skip::{pack_bits, round1_extract_c_packed_with_s_hat_v, round1_naive},
             univariate_skip_optimized::{
-                ELL, F8, F128, InvNttTableByteSingleGf8, K_SKIP, N_CHUNKS, N_INNER, PHI_8_TABLE,
+                ELL, F8, F128, InvNttTableByteSingleGf8, K_SKIP, N_INNER, PHI_8_TABLE,
                 SMALL_CHAL_F8, c_s_f128, convert_table, d_inv, medium_challenges_ghash, mul_by_x,
                 phi8, round1_shift_reduce_extract_c, round1_shift_reduce_extract_c_packed,
                 round1_shift_reduce_extract_c_packed_padded,

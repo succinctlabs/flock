@@ -41,18 +41,29 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
+use std::sync::atomic::AtomicBool;
+// The deep-fused all-core path exists only where a carryless multiply does;
+// its imports go with it.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq")
+))]
 use std::{
     env::{var, var_os},
     mem::size_of_val,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::Ordering,
 };
 
-#[cfg(target_arch = "aarch64")]
-use rayon::prelude::{IntoParallelRefIterator, ParallelSlice};
-use rayon::{
-    current_num_threads,
-    prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut},
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq")
+))]
+use rayon::current_num_threads;
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
 };
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use rayon::prelude::{IntoParallelRefIterator, ParallelSlice};
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use {
     crate::ntt::additive_ntt_f128::kernels::{
@@ -61,8 +72,12 @@ use {
     core::arch::aarch64::{vgetq_lane_u64, vmull_p64, vreinterpretq_u64_p128},
 };
 
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq")
+))]
+use crate::all_core_pool;
 use crate::{
-    all_core_pool,
     field::F128,
     ntt::additive_ntt_f128::kernels::{
         butterfly_fused_2layer, butterfly_fused_3layer, butterfly_fused_4layer_row,

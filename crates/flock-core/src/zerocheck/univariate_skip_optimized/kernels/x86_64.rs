@@ -1,10 +1,30 @@
+// Every fn below is feature-gated, so the imports carry the union of their
+// users' predicates — a featureless x86_64 build must stay warning-free.
+#[cfg(target_feature = "gfni")]
 use core::arch::x86_64::{
-    __m128i, __m512i, _mm_gf2p8mul_epi8, _mm_loadu_si128, _mm_set1_epi8, _mm_setzero_si128,
-    _mm_storeu_si128, _mm_xor_si128, _mm512_and_si512, _mm512_gf2p8mul_epi8, _mm512_loadu_si512,
-    _mm512_permutexvar_epi8, _mm512_set1_epi8, _mm512_set1_epi64, _mm512_setzero_si512,
-    _mm512_slli_epi64, _mm512_srli_epi64, _mm512_storeu_si512, _mm512_xor_si512,
+    __m128i, _mm_gf2p8mul_epi8, _mm_loadu_si128, _mm_set1_epi8, _mm_setzero_si128,
+    _mm_storeu_si128, _mm_xor_si128,
+};
+#[cfg(any(
+    all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ),
+    all(
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ),
+    all(target_feature = "avx512f", target_feature = "vpclmulqdq")
+))]
+use core::arch::x86_64::{
+    __m512i, _mm512_and_si512, _mm512_gf2p8mul_epi8, _mm512_loadu_si512, _mm512_permutexvar_epi8,
+    _mm512_set1_epi8, _mm512_set1_epi64, _mm512_setzero_si512, _mm512_slli_epi64,
+    _mm512_srli_epi64, _mm512_storeu_si512, _mm512_xor_si512,
 };
 
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 use crate::zerocheck::univariate_skip_optimized::{ELL, F128, N_MEDIUM};

@@ -8,15 +8,14 @@
 
 use std::array::from_fn;
 
-use blake3::BLAKE3_IV;
 use flock_core::{
     r1cs::BlockR1cs,
     schedule::{IoDirection, IoWord},
     test_rng::Rng,
 };
+use flock_hash::BLAKE3_IV;
 use flock_hash::blake3_compress;
 use flock_prover::r1cs_hashes::{
-    blake3,
     blake3::build_matrices,
     merkle_glue::{
         BitSpreadInput, BitSpreadTable, PowMaskInput, PowMaskTable, SwapInput, SwapTable,

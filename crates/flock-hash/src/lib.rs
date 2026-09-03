@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 pub type Digest = [u8; 32];
 
-/// A hash implementation for binary Merkle trees.
 /// A supported hash function.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
