@@ -2689,6 +2689,118 @@ pub fn build_node_outer_app(
     }
 }
 
+/// **The REAL-side tape pin** (walker plan, Phase A0 — the sibling of
+/// [`chain_tape_regions_pinned`]): [`RealTape::new`] — the SAME constructor
+/// the internal-node machinery instantiates per child — walks one FL
+/// leaf-outer's tape. Pins the parse's region geometry and ordinal
+/// discipline, so a walker refactor that moves a parse cannot silently
+/// shift a region: the rs×2 structure, the open-level coherence
+/// (levels/geometry/sources/cap payloads in lockstep), the grinding
+/// schedule's presence and transcript order, the zerocheck/lincheck round
+/// ordinals' monotonicity, the per-pinned-type beta/eps pairing, and the
+/// pd-point census. The e2e node tests prove the values; this pins the
+/// SHAPE, and localizes a break to the constructor.
+#[test]
+#[ignore] // Heavier — builds two chain leaves + one FL node.
+pub(super) fn real_tape_regions_pinned() {
+    let cfg = test_config();
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_0007);
+    let h0: [u32; 16] = from_fn(|_| rng.next_u32());
+    let cp0 = build_chain_proof(cfg, h0, n_blocks);
+    let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
+    let fl = build_fl_node(cfg, &cp0, &cp1);
+    let rt = RealTape::new(&fl.lo, DOMAIN);
+
+    // The rs×2 family-H structure.
+    assert_eq!(rt.rs_recs.len(), 2, "rs×2: two ring-switch regions");
+    assert_eq!(rt.rs_gam_fins.len(), 2, "rs×2: two rs gammas");
+
+    // Open-level coherence: one geometry, source and public cap payload
+    // per level, and live geometry at every level.
+    assert_eq!(rt.levels.len(), rt.geo.len(), "one geometry per open level");
+    assert_eq!(
+        rt.levels.len(),
+        rt.lvl_src.len(),
+        "one source triple per level"
+    );
+    assert_eq!(
+        rt.levels.len(),
+        rt.cap_pays.len(),
+        "one public cap payload per level"
+    );
+    assert!(!rt.levels.is_empty(), "the outer opens through the ladder");
+    for (i, g) in rt.geo.iter().enumerate() {
+        assert!(g.lanes > 0 && g.row_words > 0, "level {i} geometry is live");
+    }
+    assert!(
+        rt.cap_pays.windows(2).all(|w| w[0] < w[1]),
+        "cap payloads appear in transcript order"
+    );
+
+    // The grinding schedule: present (the strict profile grinds) and in
+    // transcript order on both ordinal axes.
+    assert!(!rt.pows.is_empty(), "the strict profile grinds");
+    assert!(
+        rt.pows
+            .windows(2)
+            .all(|w| w[0].0 <= w[1].0 && w[0].1 < w[1].1),
+        "PoW (fin, payload) ordinals are transcript-ordered"
+    );
+
+    // Round-ordinal monotonicity: a shifted parse breaks these first.
+    assert!(
+        rt.zc_rounds_b.windows(2).all(|w| w[0].0 < w[1].0),
+        "boolean zerocheck rounds are transcript-ordered"
+    );
+    assert!(
+        rt.lc_rounds_b.windows(2).all(|w| w[0].1 < w[1].1),
+        "boolean lincheck rounds are transcript-ordered"
+    );
+
+    // Per-pinned-boolean-type pairing: one beta squeeze, one eps term.
+    assert_eq!(
+        rt.betas_b.len(),
+        rt.eps_n.len(),
+        "one count-derived eps per const-pin beta"
+    );
+
+    // The element PIOP travels on an outer (unlike the chain tape).
+    assert!(!rt.el_g0.is_empty(), "the element PIOP travels on outers");
+
+    // The pd census: derived points exist and share one dimensionality.
+    assert!(!rt.pd_pts.is_empty(), "the pd claims derive points");
+    assert!(
+        rt.pd_pts.windows(2).all(|w| w[0].len() == w[1].len()),
+        "one merged-open point dimensionality"
+    );
+    assert!(!rt.groups_ix.is_empty(), "the gathers form scalar groups");
+
+    // The recombination tail exists.
+    assert!(rt.n_pub_slots_c > 0, "the child cell space publishes");
+    assert!(rt.yr_len > 0, "the ladder leaves a residual");
+
+    let union = outer_union(&fl.lo.shape.registry, fl.lo.shape.counts.clone());
+    println!(
+        "\nREAL TAPE (FL leaf-outer as inner)\n           inner: dense_m {} | open levels {} | pows {} | yr {} | mu {}\n           zc rounds {} | lc rounds {} | betas {} | pd pts {} x {} | groups {}\n           b3 rows (tape model) {} | L0 lanes {} x {} words | pub slots (child) {}\n",
+        union.dense_m(),
+        rt.levels.len(),
+        rt.pows.len(),
+        rt.yr_len,
+        rt.mu_i,
+        rt.zc_rounds_b.len(),
+        rt.lc_rounds_b.len(),
+        rt.betas_b.len(),
+        rt.pd_pts.len(),
+        rt.pd_pts.first().map(|p| p.len()).unwrap_or(0),
+        rt.groups_ix.len(),
+        rt.b3_rows,
+        rt.geo[0].lanes,
+        rt.geo[0].row_words,
+        rt.n_pub_slots_c,
+    );
+}
+
 /// **Task 5: THE INTERNAL NODE carries the chain statement.** Four chain
 /// segments → two first-level nodes → ONE internal node, built by
 /// [`build_node_outer_app`]'s own machinery over the FL [`LeafOuter`]s
