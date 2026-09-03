@@ -984,8 +984,9 @@ pub(super) fn tower_online_bench() {
 /// leaves, four FLs, the base plus two spine folds, the lane threaded,
 /// convergence asserted inside the loop — and the root-side residue
 /// discharges. Then the falsifiability legs: a doctored statement word, a
-/// doctored lane claim, and a killed passenger must each turn
-/// [`Tower::discharge_root`] away.
+/// doctored lane claim, a killed passenger, a doctored sigma claim, and a
+/// doctored lane jagged claim must each turn [`Tower::discharge_root`]
+/// away.
 #[test]
 #[ignore] // Heavy — eight chain proofs and seven outers via the driver.
 pub(super) fn tower_driver_e2e() {
@@ -1046,6 +1047,31 @@ pub(super) fn tower_driver_e2e() {
         "a steady root without its orphan must be refused"
     );
     tower.root.block.passenger[0].1.row.low[0] = saved;
+
+    // (d) a doctored main-fold sigma claim.
+    let saved = tower.root.acc.sigma[0].1.value;
+    tower.root.acc.sigma[0].1.value += F128::ONE;
+    assert_eq!(
+        tower.discharge_root(),
+        Err(RootDischargeFailure::Sigma),
+        "a doctored sigma claim must be refused"
+    );
+    tower.root.acc.sigma[0].1.value = saved;
+
+    // (e) a doctored lane JAGGED claim — the discharge leg the
+    // hand-built root sections never ran; prove it can refuse.
+    let lane = tower.root.lane_acc.as_mut().expect("the lane rides");
+    assert!(!lane.jagged.is_empty(), "the lane carries jagged claims");
+    let saved = lane.jagged[0].1.value;
+    lane.jagged[0].1.value += F128::ONE;
+    assert_eq!(
+        tower.discharge_root(),
+        Err(RootDischargeFailure::ChainLaneJagged),
+        "a doctored lane jagged claim must be refused"
+    );
+    tower.root.lane_acc.as_mut().expect("the lane rides").jagged[0]
+        .1
+        .value = saved;
 
     tower
         .discharge_root()

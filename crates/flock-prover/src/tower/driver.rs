@@ -15,8 +15,8 @@
 //! base's own tables, the statement against the root's publics. It does
 //! NOT verify the root's own proof — that is the consuming verifier's
 //! call (`verify_circuit` over the root outer, the statement-tier helper
-//! the e2e tamper legs assemble); the driver's job ends at handing back
-//! the root artifacts whole.
+//! the e2e tamper legs assemble). The root artifacts stay crate-internal
+//! until the standalone-verifier milestone decides what a consumer sees.
 
 use flock_core::{
     aggregate::Accumulator, circuit::Circuit, lincheck::LincheckCircuit, pcs::jagged::JaggedParams,
@@ -104,9 +104,11 @@ impl Tower {
     /// `n_leaves` must be even and at least 4 (leaves pair into 2-ary FLs
     /// and the tower roots at a node; the k-ary FL door stays open but is
     /// not driven here). Leaves build sequentially — each segment's walk
-    /// IS the chain compute — and each level's inputs drop once folded;
-    /// what stays resident is the FL row (built forward, folded backward
-    /// from the tail) plus the current spine node.
+    /// IS the chain compute — and every input drops once folded: a
+    /// segment pair drops when its FL takes it (leaf 0 stays as the
+    /// lane's material owner), so what stays resident is one leaf pair,
+    /// the FL row (built forward, folded backward from the tail), and the
+    /// current spine node.
     pub fn prove(
         cfg: TowerConfig,
         h_start: [u32; 16],
@@ -118,30 +120,30 @@ impl Tower {
             "the tower pairs leaves into 2-ary FLs and roots at a node: \
              n_leaves must be even and >= 4, got {n_leaves}"
         );
-        // ---- LEAVES, sequential: each segment starts at the last h_end ----
-        let mut cps: Vec<ChainProof> = Vec::with_capacity(n_leaves);
+        // ---- LEAVES + FIRST LEVEL, interleaved: prove a segment pair
+        // (each segment starts at the last h_end), fold it into its FL,
+        // drop the pair ----
+        let mut chain: Option<ChainProof> = None;
+        let mut fls: Vec<FlNode> = Vec::with_capacity(n_leaves / 2);
         let mut h = h_start;
-        for _ in 0..n_leaves {
-            let cp = build_chain_proof(cfg, h, blocks_per_leaf);
-            h = cp.h_end;
-            cps.push(cp);
+        for _ in 0..n_leaves / 2 {
+            let cp0 = build_chain_proof(cfg, h, blocks_per_leaf);
+            let cp1 = build_chain_proof(cfg, cp0.h_end, blocks_per_leaf);
+            h = cp1.h_end;
+            fls.push(build_fl_node(cfg, &cp0, &cp1));
+            // Leaf 0 survives as the lane's chain-side material owner
+            // (one shape for every leaf); every other leaf drops here.
+            chain.get_or_insert(cp0);
         }
         let statement = ChainStatement {
             h_start,
             h_end: h,
             n_blocks: n_leaves * blocks_per_leaf,
         };
-
-        // ---- FIRST LEVEL: adjacent pairs ----
-        let fls: Vec<FlNode> = (0..n_leaves / 2)
-            .map(|i| build_fl_node(cfg, &cps[2 * i], &cps[2 * i + 1]))
-            .collect();
         let app_base = fls[0].stmt_base;
         let claims_base = fls[0].fold_pub_base;
 
-        // Leaf 0 owns the lane's chain-side materials (one shape for
-        // every leaf); the other leaves fold and drop here.
-        let chain = cps.into_iter().next().expect("leaf 0");
+        let chain = chain.expect("leaf 0");
         let registry = &chain.inner.built.shape.registry;
         let blake = chain_blake_r1cs(chain.inner.nu);
         let blake_lc = blake.csc_lincheck_circuit();

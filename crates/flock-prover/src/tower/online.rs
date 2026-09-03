@@ -91,7 +91,7 @@ pub(super) fn median_total(runs: &[Online]) -> f64 {
 /// compression per 64 bytes, so at the measured ~6.1 µs per b3 row a KiB of
 /// child proof is ~0.1 ms of parent per child.
 pub(super) fn census_kib<T: Serialize + ?Sized>(v: &T) -> f64 {
-    serialize(v).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0
+    serialize(v).expect("proof component serializes").len() as f64 / 1024.0
 }
 
 #[cfg(test)]
