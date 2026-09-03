@@ -5317,8 +5317,11 @@ chunk CVs, same roots.
 | prove TOTAL MT | 583.8 / 554.4 / 540.4 | 651.1 / 643.5 / 625.7 |
 | merkle / commit / total ST | 314 / 1008 / 3206 | 941 / 1640 / 3938 |
 
-1 GB in 39 ms = 25.6 GB/s on the all-core pool. **Best prove 540.4 ms
-under load 17** — the previous best was 601. Certified: 24 merkle unit
+Yukon's correction on the bytes: the integer-lane L0 codeword stores
+only the 46 live lanes — 46 × 2^20 × 16 B = 736 MiB, not 1 GB — so the
+old merkle ran at 6.3 GB/s and the new one at 19.8 GB/s on the all-core
+pool, the same rate as theirs (21.6). **Best prove 540.4 ms under load
+17** — the previous best was 601. Certified: 24 merkle unit
 tests including the new sizes (1, 16, 32, 48, 63, 100, 736, 1000), m6
 merged-union proof-bytes pins (roots identical), roundtrips; workspace,
 fmt, x86 and m=32 verify below.
@@ -5362,3 +5365,38 @@ The TOTAL cannot resolve a −3.5 ms bucket effect at load 7–13 (run 2:
 +14 / +3 / −5); run 1's +12..+21 on the total is the sweep's loss plus
 noise. Kept on the same evidence standard as round 1's queue (−2.8,
 3/3 on its bucket).
+
+### Three-way, refreshed: pre-merge close vs the challenge tree vs now — 2026-09-03
+
+Yukon's column is their verified-quiet-window warm min (±2%); ours is
+today's traced run at load 6–10 (±5%; best clean total today 540).
+m=32, CPU-only, grinding off.
+
+| MT (ms) | pre-merge (08-27, old protocol) | Yukon (100-bit class, no union) | now (128-bit f256 split, union) |
+|---|---:|---:|---:|
+| witness | 30 | 28.6 | 35.4 |
+| commit | 262–266 (~130 of RS round-1 prep hidden inside) | 229.1 (ntt 175.6, merkle 49.7; 83 of round-1 A/B precompute hidden inside) | 151.4 (ntt 93.9, merkle 40.4, fill 16) |
+| zerocheck | ~120 (35 visible round 1) | 110.5 (round 1 30.8 visible, ≈114 true; round 2 48.2; tail 30.5) | round 1 48 + fold 41–67 + tail 46–72 |
+| lincheck | 19 | 17.2 | 14–18 |
+| open | 28–30 | 22.1 (recursive commits L1 7.1, L2 2.0) | 144.2 (ladder 34, W 25, merged SC 19, rec commits 48.5) |
+| **total** | **464.5** | **381.2 (687.7k c/s)** | **570 this run / 540 best (485k c/s)** |
+
+| ST (ms) | pre-merge | Yukon | now |
+|---|---:|---:|---:|
+| witness | 231 | 205 | 258 |
+| commit | 1268 | 1670 (ntt 733, merkle 383, A/B 552) | 1000 (ntt 630, merkle 312) |
+| zerocheck + lincheck | 1467 + 124 | 767 + 117 | 994 |
+| open | 147 | 101 | 760 |
+| **total** | **3230** | **2860** | **3149** |
+
+Reading: single-threaded we are now under pre-merge (3149 vs 3230) on
+the stronger protocol and within 10% of the challenge tree; the commit
+is the cheapest of the three at both widths (their ntt is 175.6 on 1.36×
+fewer element-updates — our NTT's ~2.5× per-update lead is now the
+largest single kernel difference in our favour, still unexplained on
+their side); zerocheck + lincheck at MT is ~165–175 clean against their
+127 visible / ~210 true; the open is the whole remaining gap (144 vs
+22) and is protocol: the f256 two-point-OOD split with per-level OOD
+binding and the union transport, whose five recursive commits alone
+(48.5) exceed their entire open. Ratios on the best total: 1.16× vs
+pre-merge (1.89× at merge time), 1.42× vs Yukon (2.1× at merge time).
