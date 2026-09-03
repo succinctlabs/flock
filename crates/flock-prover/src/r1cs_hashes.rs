@@ -1,13 +1,12 @@
-//! Monolithic per-block R1CS encoders for cryptographic hashes (BLAKE3,
-//! SHA-2). Each submodule packages: per-instance witness
-//! layout, sparse `(A_0, B_0)` matrix construction (`C_0 = I`), `prove_fast`
-//! helpers (the c-aliased fast path), and a `*Setup` convenience type
-//! wrapping R1CS + PCS params.
+//! Per-block R1CS encoders for cryptographic hashes.
 //!
-//! Submodules share low-level bit-packing / matrix-row utilities via
-//! [`common`].
+//! The legacy [`blake3`] and [`sha2`] modules provide optimized encoders and
+//! proving helpers. Their `*_dsl` counterparts define the same relations with
+//! the typed Boolean circuit DSL for reference lowering and structural walks.
+//! The legacy encoders share low-level row utilities through [`common`].
 
 pub mod blake3;
+pub mod blake3_dsl;
 /// Shared low-level bit-packing / R1CS-row utilities (carry-save adders,
 /// fused adders, lin-id slot helpers) used by the per-hash encoders.
 pub mod common;
@@ -23,3 +22,4 @@ pub mod merkle_glue;
 /// [`merkle_glue`] build on.
 pub mod merkle_r1cs;
 pub mod sha2;
+pub mod sha2_dsl;

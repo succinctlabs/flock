@@ -1,5 +1,6 @@
 use crate::circuit::boolean::{BooleanCircuit, CircuitBuilder, LinearExpr, WalkError};
 use crate::field::F128;
+use crate::lincheck::LincheckCircuit;
 use crate::r1cs::SparseBinaryMatrix;
 
 fn next(state: &mut u64) -> u64 {
@@ -76,7 +77,7 @@ fn dot_bits(bits: &[bool], weights: &[F128]) -> F128 {
 fn forward_walk_matches_sparse_matrices_on_random_circuits() {
     for seed in 0..16 {
         let circuit = random_circuit(0x51a7_0000 + seed);
-        let plan = circuit.walk_plan();
+        let plan = circuit.walk_plan().unwrap();
         let k_log = capacity_log(plan.useful_bits());
         let capacity = 1 << k_log;
         let inputs: Vec<bool> = (0..circuit.inputs().len())
@@ -109,10 +110,10 @@ fn edge_case_xors_and_nested_general_c_match_sparse_walks() {
     builder.output("output", outputs);
     let circuit = builder.finish();
 
-    assert_eq!(circuit.support(empty.id()), Some(&[][..]));
+    assert_eq!(circuit.support(empty.id()), Some(vec![]));
     assert_eq!(
         circuit.support(duplicate.id()),
-        Some(&[inputs[1].value_id()][..])
+        Some(vec![inputs[1].value_id()])
     );
     assert_eq!(
         circuit.support(single.id()),
@@ -120,7 +121,7 @@ fn edge_case_xors_and_nested_general_c_match_sparse_walks() {
     );
     assert_eq!(circuit.support(nested_c.id()), circuit.support(shared.id()));
 
-    let plan = circuit.walk_plan();
+    let plan = circuit.walk_plan().unwrap();
     let k_log = capacity_log(plan.useful_bits());
     let capacity = 1 << k_log;
     let r1cs = circuit.to_block_r1cs(k_log, 0, 0).unwrap();
@@ -292,7 +293,7 @@ fn forward_walk_enforces_general_constraints() {
     let mut builder = CircuitBuilder::new();
     let input = builder.input();
     let row = builder.assert_zero(input);
-    let plan = builder.finish().walk_plan();
+    let plan = builder.finish().walk_plan().unwrap();
     let error = plan.forward(&[true], capacity_log(plan.useful_bits()));
     assert_eq!(error, Err(WalkError::UnsatisfiedRow(row)));
 }
@@ -300,7 +301,7 @@ fn forward_walk_enforces_general_constraints() {
 #[test]
 fn reverse_walk_satisfies_each_transpose_identity() {
     let circuit = random_circuit(0x7a4e_5e00);
-    let plan = circuit.walk_plan();
+    let plan = circuit.walk_plan().unwrap();
     let k_log = capacity_log(plan.useful_bits());
     let capacity = 1 << k_log;
     let inputs = [true, false, true, true, false, false, true, false];
@@ -323,6 +324,29 @@ fn reverse_walk_satisfies_each_transpose_identity() {
 }
 
 #[test]
+fn lincheck_adapter_matches_sparse_fold_and_carries_the_pin() {
+    let circuit = random_circuit(0x11c0_0001);
+    let plan = circuit.walk_plan().unwrap();
+    let k_log = capacity_log(plan.useful_bits());
+    let r1cs = circuit.to_block_r1cs(k_log, 0, 0).unwrap();
+    let adapter = plan.lincheck_circuit(k_log).unwrap();
+    let sparse = r1cs.sparse_lincheck_circuit();
+    let eq = weights(1 << k_log, 0x11c0_e001);
+    let alpha = F128::new(0x1234, 0x5678);
+
+    assert_eq!(adapter.n_cols(), sparse.n_cols());
+    assert_eq!(adapter.const_pin_col(), r1cs.const_pin);
+    assert_eq!(
+        adapter.fold_alpha_batched(alpha, &eq),
+        sparse.fold_alpha_batched(alpha, &eq)
+    );
+    assert!(matches!(
+        plan.lincheck_circuit(k_log - 1),
+        Err(WalkError::Capacity { .. })
+    ));
+}
+
+#[test]
 fn identity_c_specialization_is_explicit_and_equivalent() {
     let circuit = {
         let mut builder = CircuitBuilder::new();
@@ -334,7 +358,7 @@ fn identity_c_specialization_is_explicit_and_equivalent() {
         builder.output("output", [output]);
         builder.finish()
     };
-    let plan = circuit.walk_plan();
+    let plan = circuit.walk_plan().unwrap();
     assert!(plan.c_is_identity());
     let k_log = capacity_log(plan.useful_bits());
     let capacity = 1 << k_log;
@@ -393,7 +417,7 @@ fn identity_c_specialization_is_explicit_and_equivalent() {
             .c0_is_identity()
     );
 
-    let non_identity = random_circuit(0xdead_beef).walk_plan();
+    let non_identity = random_circuit(0xdead_beef).walk_plan().unwrap();
     assert!(!non_identity.c_is_identity());
     let k_log = capacity_log(non_identity.useful_bits());
     let weights = weights(1 << k_log, 44);
@@ -439,7 +463,7 @@ fn deep_and_reused_xors_follow_structural_edges_and_liveness() {
     let output = builder.materialize(expression);
     builder.output("output", [output]);
     let deep = builder.finish();
-    let deep_plan = deep.walk_plan();
+    let deep_plan = deep.walk_plan().unwrap();
     assert_eq!(deep_plan.stats().xor_nodes, 20_000);
     assert_eq!(deep_plan.stats().max_live_temporaries, 1);
     let deep_k_log = capacity_log(deep_plan.useful_bits());
@@ -477,7 +501,7 @@ fn deep_and_reused_xors_follow_structural_edges_and_liveness() {
     let output = builder.materialize(shared);
     builder.output("output", [output]);
     let reused = builder.finish();
-    let plan = reused.walk_plan();
+    let plan = reused.walk_plan().unwrap();
     let k_log = capacity_log(plan.useful_bits());
     let r1cs = reused.to_block_r1cs(k_log, 0, 0).unwrap();
     let sparse_nonzeros: usize = r1cs

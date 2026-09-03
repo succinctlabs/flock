@@ -5,6 +5,7 @@ use std::collections::BinaryHeap;
 use std::fmt;
 
 use crate::field::F128;
+use crate::lincheck::LincheckCircuit;
 
 use super::{
     BooleanCircuit, CircuitId, ExpressionNode, LayoutError, LinearExprId, PhysicalLayout, RowId,
@@ -29,6 +30,12 @@ pub struct WalkPlan {
     stats: WalkStats,
 }
 
+/// Capacity-bound lincheck view of a structural [`WalkPlan`].
+pub struct WalkLincheckCircuit<'a> {
+    plan: &'a WalkPlan,
+    n_cols: usize,
+}
+
 /// Structural cost and temporary-memory bounds for a [`WalkPlan`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalkStats {
@@ -40,6 +47,13 @@ pub struct WalkStats {
     pub actions: usize,
     /// Reusable slots needed for all simultaneously live virtual values.
     pub max_live_temporaries: usize,
+    /// Bytes occupied by action records and XOR-term payloads, excluding
+    /// allocator metadata and spare vector capacity.
+    pub action_bytes: usize,
+    /// Bytes occupied by the boxed XOR-term payloads within `action_bytes`.
+    pub xor_term_bytes: usize,
+    /// One boxed term allocation is currently retained per XOR action.
+    pub xor_term_allocations: usize,
 }
 
 /// Values produced by one forward walk, in physical R1CS order.
@@ -128,9 +142,8 @@ enum RawAction {
 
 impl BooleanCircuit {
     /// Compile a source-order structural walk.
-    pub fn walk_plan(&self) -> WalkPlan {
+    pub fn walk_plan(&self) -> Result<WalkPlan, LayoutError> {
         WalkPlan::compile(self, &PhysicalLayout::source_order(self))
-            .expect("source-order layout must be valid")
     }
 
     /// Compile a structural walk for an explicit physical layout.
@@ -256,8 +269,10 @@ impl WalkPlan {
         let c_is_identity = circuit.rows.iter().all(|row| {
             let position = layout.row_positions[row.id.index];
             let support = &circuit.expressions[row.result.index].support;
-            support.len() == 1 && layout.value_positions[support[0].index] == position
+            support.len() == 1 && layout.value_positions[support[0].index()] == position
         }) && row_positions == value_positions;
+        let xor_term_bytes = xor_edges * std::mem::size_of::<Source>();
+        let action_bytes = actions.len() * std::mem::size_of::<Action>() + xor_term_bytes;
 
         Ok(Self {
             circuit: circuit.id,
@@ -277,6 +292,9 @@ impl WalkPlan {
                 structural_edges: xor_edges + circuit.rows.len() * 3,
                 actions: circuit.rows.len() + xor_nodes,
                 max_live_temporaries,
+                action_bytes,
+                xor_term_bytes,
+                xor_term_allocations: xor_nodes,
             },
         })
     }
@@ -302,6 +320,12 @@ impl WalkPlan {
             return None;
         }
         self.expression_fanout.get(expression.index).copied()
+    }
+
+    /// Bind this layout-specific plan to a lincheck column capacity. The
+    /// adapter always carries the plan's statement-level ONE pin.
+    pub fn lincheck_circuit(&self, k_log: usize) -> Result<WalkLincheckCircuit<'_>, WalkError> {
+        WalkLincheckCircuit::new(self, k_log)
     }
 
     /// Generate `z`, `A z`, `B z`, and `C z` without sparse matrix products.
@@ -453,6 +477,81 @@ impl WalkPlan {
         }
         debug_assert!(temporaries.iter().all(|value| value.is_zero()));
         Ok(z)
+    }
+
+    fn fold_alpha_batched(&self, alpha: F128, eq: &[F128]) -> Result<Vec<F128>, WalkError> {
+        if !eq.len().is_power_of_two() {
+            return Err(WalkError::InvalidTransposeSize(eq.len()));
+        }
+        if eq.len() < self.useful_bits {
+            return Err(WalkError::Capacity {
+                required: self.useful_bits,
+                actual: eq.len(),
+            });
+        }
+
+        let mut columns = vec![F128::ZERO; eq.len()];
+        let mut temporaries = vec![F128::ZERO; self.stats.max_live_temporaries];
+        for action in self.actions.iter().rev() {
+            match action {
+                Action::Row {
+                    physical_row,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    add_f128(
+                        *lhs,
+                        alpha * eq[*physical_row],
+                        &mut columns,
+                        &mut temporaries,
+                    );
+                    add_f128(*rhs, eq[*physical_row], &mut columns, &mut temporaries);
+                }
+                Action::Xor { output, terms } => {
+                    let adjoint = std::mem::replace(&mut temporaries[*output], F128::ZERO);
+                    for &term in terms.iter() {
+                        add_f128(term, adjoint, &mut columns, &mut temporaries);
+                    }
+                }
+            }
+        }
+        debug_assert!(temporaries.iter().all(|value| value.is_zero()));
+        Ok(columns)
+    }
+}
+
+impl<'a> WalkLincheckCircuit<'a> {
+    pub fn new(plan: &'a WalkPlan, k_log: usize) -> Result<Self, WalkError> {
+        let n_cols = checked_capacity(k_log).ok_or(WalkError::InvalidKLog(k_log))?;
+        if n_cols < plan.useful_bits {
+            return Err(WalkError::Capacity {
+                required: plan.useful_bits,
+                actual: n_cols,
+            });
+        }
+        Ok(Self { plan, n_cols })
+    }
+}
+
+impl LincheckCircuit for WalkLincheckCircuit<'_> {
+    fn n_cols(&self) -> usize {
+        self.n_cols
+    }
+
+    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+        assert_eq!(
+            eq_inner.len(),
+            self.n_cols,
+            "eq_inner length must equal n_cols"
+        );
+        self.plan
+            .fold_alpha_batched(alpha, eq_inner)
+            .expect("adapter construction validated the lincheck capacity")
+    }
+
+    fn const_pin_col(&self) -> Option<usize> {
+        Some(self.plan.one_position)
     }
 }
 

@@ -109,3 +109,14 @@ jobs:
       # adds only the two pins' runtime (~15 s).
       - name: tower tape pins (ignored)
         run: cargo test --release -p flock-prover --lib -- tower::chain::chain_tape_regions_pinned tower::node::real_tape_regions_pinned --ignored
+
+      # These large ignored tests are architecture-independent. Run them once,
+      # sequentially, on the provisioned x86_64 runner.
+      - name: Hash DSL exact compatibility and proofs
+        if: matrix.arch == 'x86_64-avx512'
+        shell: bash
+        run: |
+          cargo test --release -p flock-prover --lib r1cs_hashes::sha2_dsl::tests::dsl_matches_legacy_relation_and_witness -- --ignored --exact
+          cargo test --release -p flock-prover --lib r1cs_hashes::sha2_dsl::tests::dsl_relation_proves_and_verifies_with_walk_adapter -- --ignored --exact
+          cargo test --release -p flock-prover --lib r1cs_hashes::blake3_dsl::tests::dsl_matches_legacy_relation_and_witness -- --ignored --exact
+          cargo test --release -p flock-prover --lib r1cs_hashes::blake3_dsl::tests::dsl_relation_proves_and_verifies_with_walk_adapter -- --ignored --exact

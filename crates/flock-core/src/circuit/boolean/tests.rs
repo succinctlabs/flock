@@ -50,7 +50,7 @@ fn structural_dag_survives_normalization_and_cancellation() {
         circuit.expression(nested_id),
         Some(&ExpressionNode::Xor(vec![ab_id, a.expr().id()]))
     );
-    assert_eq!(circuit.support(nested_id), Some(&[b.value_id()][..]));
+    assert_eq!(circuit.support(nested_id), Some(vec![b.value_id()]));
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn changing_materialization_changes_only_the_requested_boundary() {
     assert_eq!(virtual_product.kind(), RowKind::And);
     assert_eq!(
         virtual_sum.support(virtual_product.lhs()),
-        Some(&[virtual_sum.inputs()[0], virtual_sum.inputs()[1],][..])
+        Some(vec![virtual_sum.inputs()[0], virtual_sum.inputs()[1]])
     );
     let copy = &materialized_sum.rows()[3];
     let materialized_product = &materialized_sum.rows()[4];
@@ -126,11 +126,14 @@ fn changing_materialization_changes_only_the_requested_boundary() {
     assert_eq!(materialized_product.kind(), RowKind::And);
     assert_eq!(
         materialized_sum.support(copy.lhs()),
-        Some(&[materialized_sum.inputs()[0], materialized_sum.inputs()[1],][..])
+        Some(vec![
+            materialized_sum.inputs()[0],
+            materialized_sum.inputs()[1]
+        ])
     );
     assert_eq!(
         materialized_sum.support(materialized_product.lhs()),
-        Some(&[copy.defined_value().unwrap()][..])
+        Some(vec![copy.defined_value().unwrap()])
     );
     assert_ne!(
         virtual_sum.structure_digest(),
@@ -424,7 +427,7 @@ fn fixed_words_are_named_and_constrained() {
 }
 
 #[test]
-fn word_ports_record_encoding_and_enforce_layout_alignment() {
+fn word_ports_enforce_contiguous_aligned_layout() {
     let mut builder = CircuitBuilder::new();
     let word = builder.input_word_aligned::<8>("word", 8);
     let bits = builder.input_bits::<8>("bits");
@@ -445,6 +448,14 @@ fn word_ports_record_encoding_and_enforce_layout_alignment() {
             }
         )) if name == "word"
     ));
+    assert!(matches!(
+        circuit.walk_plan(),
+        Err(LayoutError::MisalignedPort {
+            ref name,
+            start: 1,
+            alignment_bits: 8,
+        }) if name == "word"
+    ));
 
     let mut layout = circuit.layout();
     assert!(matches!(
@@ -458,8 +469,26 @@ fn word_ports_record_encoding_and_enforce_layout_alignment() {
     layout.place_port("word", 8).unwrap();
     layout.place_port("bits", 24).unwrap();
     let layout = layout.finish().unwrap();
-    assert_eq!(layout.value_position(word[0].value_id()), Some(8));
+    for (offset, bit) in word.iter().enumerate() {
+        assert_eq!(layout.value_position(bit.value_id()), Some(8 + offset));
+    }
     assert_eq!(layout.value_position(bits[0].value_id()), Some(24));
+
+    let mut scattered = circuit.layout();
+    for (offset, bit) in word.iter().enumerate() {
+        scattered
+            .place_definition(bit.value_id(), 8 + 2 * offset)
+            .unwrap();
+    }
+    assert!(matches!(
+        scattered.finish(),
+        Err(LayoutError::NonContiguousPort {
+            ref name,
+            offset: 1,
+            expected: 9,
+            actual: 10,
+        }) if name == "word"
+    ));
 }
 
 #[test]
@@ -588,7 +617,7 @@ fn capacity_boundaries_are_exact_across_backends() {
     }
     let circuit = builder.finish();
     let inputs = [false; 7];
-    let plan = circuit.walk_plan();
+    let plan = circuit.walk_plan().unwrap();
 
     assert!(circuit.evaluate_r1cs(&inputs, 3).is_ok());
     assert!(circuit.to_block_r1cs(3, 0, 0).is_ok());

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     Bit, BooleanCircuit, CircuitId, Expression, ExpressionNode, LinearExpr, LinearExprId, Port,
-    PortDirection, PortEncoding, Row, RowId, RowKind, ValueId,
+    PortDirection, PortEncoding, Row, RowId, RowKind, ValueId, ValueIndex,
 };
 
 static NEXT_CIRCUIT_ID: AtomicU64 = AtomicU64::new(1);
@@ -62,7 +62,7 @@ impl CircuitBuilder {
                 },
                 Expression {
                     node: ExpressionNode::Value(one_value),
-                    support: vec![one_value],
+                    support: vec![ValueIndex::new(one_value.index)],
                 },
             ],
             rows: vec![Row {
@@ -492,7 +492,6 @@ impl CircuitBuilder {
         assert_eq!(self.one.expression.index, 1);
         assert!(matches!(self.rows[0].kind, RowKind::One));
 
-        let mut recomputed_supports: Vec<Vec<ValueId>> = Vec::with_capacity(self.expressions.len());
         let mut value_expressions = vec![None; self.value_count];
         for (index, expression) in self.expressions.iter().enumerate() {
             let expected = match &expression.node {
@@ -511,7 +510,7 @@ impl CircuitBuilder {
                             .is_none(),
                         "materialized value has multiple boundary expressions"
                     );
-                    vec![*value]
+                    vec![ValueIndex::new(value.index)]
                 }
                 ExpressionNode::Xor(terms) => {
                     let mut support = Vec::new();
@@ -524,7 +523,10 @@ impl CircuitBuilder {
                             term.index < index,
                             "structural expression DAG contains a cycle"
                         );
-                        support = symmetric_difference(&support, &recomputed_supports[term.index]);
+                        // Earlier nodes have already passed this same check,
+                        // so their stored supports are valid by induction.
+                        support =
+                            symmetric_difference(&support, &self.expressions[term.index].support);
                     }
                     support
                 }
@@ -533,7 +535,6 @@ impl CircuitBuilder {
                 expression.support, expected,
                 "stored normalized support disagrees with structural DAG"
             );
-            recomputed_supports.push(expected);
         }
         assert!(
             value_expressions.iter().all(Option::is_some),
@@ -612,8 +613,10 @@ impl CircuitBuilder {
             for (expression, is_result) in [(row.lhs, false), (row.rhs, false), (row.result, true)]
             {
                 for value in &self.expressions[expression.index].support {
-                    let definition = definition_rows[value.index];
-                    let self_reference = row.defined_value == Some(*value)
+                    let definition = definition_rows[value.index()];
+                    let self_reference = row
+                        .defined_value
+                        .is_some_and(|defined| defined.index == value.index())
                         && (matches!(row.kind, RowKind::One | RowKind::Input) || is_result);
                     assert!(
                         definition.index < row.id.index || self_reference,
@@ -691,7 +694,7 @@ impl CircuitBuilder {
         };
         self.expressions.push(Expression {
             node: ExpressionNode::Value(value),
-            support: vec![value],
+            support: vec![ValueIndex::new(value.index)],
         });
         id
     }
@@ -713,7 +716,7 @@ impl CircuitBuilder {
 }
 
 /// Symmetric difference of sorted, duplicate-free lists.
-fn symmetric_difference(lhs: &[ValueId], rhs: &[ValueId]) -> Vec<ValueId> {
+fn symmetric_difference(lhs: &[ValueIndex], rhs: &[ValueIndex]) -> Vec<ValueIndex> {
     let mut result = Vec::with_capacity(lhs.len() + rhs.len());
     let (mut i, mut j) = (0, 0);
     while i < lhs.len() && j < rhs.len() {

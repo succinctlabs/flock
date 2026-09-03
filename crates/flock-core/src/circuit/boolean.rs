@@ -26,10 +26,24 @@ mod walk;
 pub use builder::CircuitBuilder;
 pub use layout::{LayoutBuilder, LayoutError, PhysicalLayout, PositionKind};
 pub use lowering::{EvaluationError, R1csBuildError};
-pub use walk::{ForwardTrace, WalkError, WalkPlan, WalkStats};
+pub use walk::{ForwardTrace, WalkError, WalkLincheckCircuit, WalkPlan, WalkStats};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct CircuitId(u64);
+
+/// Compact circuit-local index used in normalized support storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ValueIndex(u32);
+
+impl ValueIndex {
+    fn new(index: usize) -> Self {
+        Self(u32::try_from(index).expect("Boolean circuits support at most 2^32 values"))
+    }
+
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 /// An identifier for a structural linear-expression node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -142,9 +156,8 @@ pub enum PortDirection {
 /// The statement-facing encoding of a named port.
 ///
 /// Words always use little-endian bit order: `values()[0]` is the least
-/// significant bit. `alignment_bits` constrains that value's physical
-/// position; [`LayoutBuilder::place_port`] places the remaining bits
-/// contiguously from there.
+/// significant bit. Their physical values form one contiguous region whose
+/// start is aligned to `alignment_bits`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortEncoding {
     /// An ordered collection of bits with no numeric interpretation.
@@ -252,7 +265,7 @@ impl Row {
 struct Expression {
     node: ExpressionNode,
     /// Sorted, duplicate-free materialized values with odd coefficient.
-    support: Vec<ValueId>,
+    support: Vec<ValueIndex>,
 }
 
 /// A completed, deterministic Boolean circuit artifact.

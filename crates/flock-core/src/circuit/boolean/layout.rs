@@ -32,7 +32,9 @@ impl PartialEq for PhysicalLayout {
 impl Eq for PhysicalLayout {}
 
 impl PhysicalLayout {
-    /// Logical source-order placement. This preserves the pre-layout DSL
+    /// Logical source-order placement. This is a deterministic candidate: an
+    /// aligned word port may make it invalid, which semantic consumers report
+    /// as a [`LayoutError`]. When valid, it preserves the pre-layout DSL
     /// behavior and gives identity C when every row defines its same-index
     /// value.
     pub fn source_order(circuit: &BooleanCircuit) -> Self {
@@ -83,6 +85,20 @@ impl PhysicalLayout {
                         start,
                         alignment_bits,
                     });
+                }
+                for (offset, value) in port.values.iter().enumerate() {
+                    let expected = start
+                        .checked_add(offset)
+                        .ok_or(LayoutError::PositionOverflow)?;
+                    let actual = self.value_positions[value.index];
+                    if actual != expected {
+                        return Err(LayoutError::NonContiguousPort {
+                            name: port.name.clone(),
+                            offset,
+                            expected,
+                            actual,
+                        });
+                    }
                 }
             }
         }
@@ -359,6 +375,12 @@ pub enum LayoutError {
         start: usize,
         alignment_bits: usize,
     },
+    NonContiguousPort {
+        name: String,
+        offset: usize,
+        expected: usize,
+        actual: usize,
+    },
     InvalidIndex {
         kind: PositionKind,
         index: usize,
@@ -394,6 +416,15 @@ impl fmt::Display for LayoutError {
             } => write!(
                 f,
                 "port `{name}` starts at {start}, which is not aligned to {alignment_bits} bits"
+            ),
+            Self::NonContiguousPort {
+                name,
+                offset,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "port `{name}` bit {offset} is at {actual}, not contiguous position {expected}"
             ),
             Self::InvalidIndex { kind, index } => write!(f, "invalid {kind} id {index}"),
             Self::InvalidRange => f.write_str("layout reservation has start greater than end"),

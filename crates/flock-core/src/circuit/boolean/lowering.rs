@@ -7,7 +7,7 @@ use crate::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 
 use super::{
     BooleanCircuit, ExpressionNode, LayoutBuilder, LayoutError, LinearExprId, PhysicalLayout, Port,
-    PortDirection, PortEncoding, Row, RowId, RowKind, ValueId,
+    PortDirection, PortEncoding, Row, RowId, RowKind, ValueId, ValueIndex,
 };
 
 impl BooleanCircuit {
@@ -15,6 +15,20 @@ impl BooleanCircuit {
     /// node and each materialized value's boundary node.
     pub fn expression_count(&self) -> usize {
         self.expressions.len()
+    }
+
+    /// Total number of materialized-value references retained across all
+    /// canonical normalized supports.
+    pub fn normalized_support_terms(&self) -> usize {
+        self.expressions
+            .iter()
+            .map(|expression| expression.support.len())
+            .sum()
+    }
+
+    /// Payload bytes occupied by all compact normalized-support entries.
+    pub fn normalized_support_bytes(&self) -> usize {
+        self.normalized_support_terms() * std::mem::size_of::<ValueIndex>()
     }
 
     /// Number of materialized values.
@@ -85,7 +99,7 @@ impl BooleanCircuit {
             }
             absorb_usize(&mut hasher, expression.support.len());
             for value in &expression.support {
-                absorb_usize(&mut hasher, value.index);
+                absorb_usize(&mut hasher, value.index());
             }
         }
         absorb_usize(&mut hasher, self.rows.len());
@@ -175,14 +189,22 @@ impl BooleanCircuit {
     }
 
     /// The canonical sorted support of one expression over materialized
-    /// values. Duplicate terms have cancelled by parity.
-    pub fn support(&self, id: LinearExprId) -> Option<&[ValueId]> {
+    /// values. Duplicate terms have cancelled by parity. The returned typed
+    /// IDs are reconstructed from compact circuit-local storage.
+    pub fn support(&self, id: LinearExprId) -> Option<Vec<ValueId>> {
         if id.circuit != self.id {
             return None;
         }
-        self.expressions
-            .get(id.index)
-            .map(|expression| expression.support.as_slice())
+        self.expressions.get(id.index).map(|expression| {
+            expression
+                .support
+                .iter()
+                .map(|value| ValueId {
+                    circuit: self.id,
+                    index: value.index(),
+                })
+                .collect()
+        })
     }
 
     /// Evaluate the circuit in logical source order.
@@ -366,7 +388,7 @@ impl BooleanCircuit {
         let mut support: Vec<usize> = self.expressions[id.index]
             .support
             .iter()
-            .map(|value| layout.value_positions[value.index])
+            .map(|value| layout.value_positions[value.index()])
             .collect();
         support.sort_unstable();
         support
@@ -376,7 +398,7 @@ impl BooleanCircuit {
         self.expressions[id.index]
             .support
             .iter()
-            .fold(false, |sum, value| sum ^ values[value.index])
+            .fold(false, |sum, value| sum ^ values[value.index()])
     }
 }
 
