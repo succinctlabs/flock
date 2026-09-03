@@ -97,7 +97,6 @@ pub struct FlNode {
 /// discharges both groups.
 /// The chain layout's jagged params — the count win's per-digest table
 /// owner for the lane, rebuilt exactly as the opening verifier reads it.
-#[cfg(test)]
 pub(super) fn chain_jagged_params(cp: &ChainProof) -> JaggedParams {
     let u = UnionInstance::new(
         &cp.inner.built.shape.registry,
