@@ -5499,3 +5499,31 @@ Alternating vs the HEAD binary, m=32 MT, warm min, box at load 8–13:
 −3.9 ms, 3/3; the rest of the ladder (fold ~8.7, switch 5–17 under
 load) and the totals are noise at this load. Workspace, fmt, x86 gates
 below.
+
+### LANDED: the code switch fused into the ladder's fold and basis — switch 7.7 → 0.7 ms MT — 2026-09-03
+
+After the ladder's one fused fold, the code switch still ran three
+conversions before its message: `split_coordinates` (2^19 F256 → 2^20
+F128 words, 16 MB), the promotion back to F256 (32 MB), and
+`split_basis` (2^19 → 2^20 F256, 32 MB) — each a fresh allocation and
+a pass. The fold now writes its output directly in the switch's form
+(`fold_blocks_by_eq_split`: the split coordinate words `(c0, 0),
+(c1, 0)` at `2h, 2h+1`, promoted) and the basis is materialized already
+split (`materialize_folded_basis_split`: `B'[h], u·B'[h]`), so the
+switch is `round_msg_fbase` alone. Same field elements (m6 pins, the
+stats oracle).
+
+Alternating vs the seeded-statistics binary, m=32 MT, warm min, box
+at load 11–15:
+
+| | fused | HEAD |
+|---|---|---|
+| switch | 0.77 / 0.61 / 0.69 | 7.74 / 7.71 / 10.04 |
+| fold (now writes 32 MB split) | 11.6 / 11.1 / 9.5 | 8.6 / 8.6 / 9.6 |
+| basis | 0.56 / 0.56 / 0.59 | 0.43 / 0.32 / 0.54 |
+
+Switch −7 (3/3), fold +1..+3 at this load (pair 3 a wash; the extra
+16 MB of writes cannot cost 2 ms on a compute-bound pass, so most of
+that is the load), net ≈ −4 on the ladder; the open bucket resolved
+−0.4 / −1.0 in the two clean pairs, and the prove's best total is now
+**521.2 ms**. Workspace, fmt, x86 gates below.
