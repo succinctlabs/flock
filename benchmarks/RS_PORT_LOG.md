@@ -5165,3 +5165,28 @@ merged sumcheck 19.5 (an alternating skip/fold2 schedule would cut its
 traffic ~45%, ≈ −8 MT / −40 ST), level OODs + induce ~21 (F256
 promotions of base-valued 2^20 bases: ~−6 with mixed-field kernels),
 switch 11.
+
+### LANDED: W build with the column factor baked into per-column fold tables — −7 ms MT, −60 ST — 2026-09-03
+
+Benedikt: "there was a big win taking advantage of the eq tensor
+structure during open?" — that was the statistics ladder (and, before
+the merge, the virtual basis and the JIT W_rho: the same principle,
+never materialize an eq tensor). The one place left where an eq tensor
+was still multiplied element by element: the merged transport's weight
+`W[d] = Σ_i φ_i(eq_row_i[r]·eq_col_i[c])` — per element and per RS
+claim, one field multiply by the hoisted column factor, then the
+16-lookup byte-table map φ_i. The column factor is constant across a
+whole column segment and `x ↦ φ_i(eq_col[c]·x)` is F₂-linear, so its
+byte decomposition IS a fold table: bake `Ψ_c = φ_i ∘ (eq_col[c]·)` per
+column (92 live × 64 KB per claim, ~1 ms MT to build, parallel over
+columns) and the slot costs the 16 lookups only.
+
+| W build, m=32 | baked | multiply |
+|---|---:|---:|
+| MT (3 pairs) | 25.4 / 25.1 / 25.4 | 32.2 / 31.7 / 32.4 |
+| ST (1 pair) | 166.9 | 227.1 |
+
+Same field elements, so W and everything downstream are identical: the
+m6 merged-union proof-bytes pins pass, workspace 638/0, x86 check
+clean, m=32 verify passes. The probe knob and the multiply path were
+deleted (the baked form is unconditional).
