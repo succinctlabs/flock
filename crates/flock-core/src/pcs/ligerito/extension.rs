@@ -1278,10 +1278,10 @@ impl SumcheckProver256 {
         }
     }
 
-    /// State entering the code switch from the statistics ladder: `f` and
-    /// the combined basis already folded by every L0 challenge, the
-    /// transcript holding the round-0 message plus the `initial_k − 1`
-    /// round messages the ladder produced.
+    /// State right after the code switch from the statistics ladder: the
+    /// split, promoted `f`, the split combined basis, and the transcript
+    /// holding the round-0 message, the `initial_k − 1` round messages the
+    /// ladder produced, and the switch message.
     pub(super) fn from_folded(
         f: Vec<F256>,
         combined_basis: Vec<F256>,
@@ -1810,36 +1810,48 @@ fn fold_block_pairs(v: &mut Vec<F256>, r: F256) {
 
 /// `f'[h] = Σ_e w[e]·f[e·d + h]` — the `initial_k` incremental block folds
 /// composed into one pass (each is `x_0 + r(x_1 + x_0) = (1+r)x_0 + r·x_1`,
-/// and their composition is the eq-tensor weight `w = eq(r, ·)`).
-fn fold_blocks_by_eq(f: &[F128], w: &[F256], d: usize) -> Vec<F256> {
+/// and their composition is the eq-tensor weight `w = eq(r, ·)`) — written
+/// directly in the CODE SWITCH's form: the split coordinate words
+/// `(f'[h].c0, 0), (f'[h].c1, 0)` at `2h, 2h+1`, i.e. what
+/// `split_coordinates` and the promotion produced from a materialized `f'`,
+/// minus those two passes and their allocations.
+fn fold_blocks_by_eq_split(f: &[F128], w: &[F256], d: usize) -> Vec<F256> {
     debug_assert_eq!(f.len(), w.len() * d);
-    let mut out = crate::scratch::take_f256(d);
+    let mut out = crate::scratch::take_f256(2 * d);
     const CH: usize = 1 << 11;
-    out.par_chunks_mut(CH).enumerate().for_each(|(c, oc)| {
+    out.par_chunks_mut(2 * CH).enumerate().for_each(|(c, oc)| {
         let h0 = c * CH;
-        oc.fill(F256::ZERO);
+        let n = oc.len() / 2;
+        let mut acc = [F256::ZERO; CH];
         for (e, &we) in w.iter().enumerate() {
-            let fs = &f[e * d + h0..e * d + h0 + oc.len()];
-            for (o, &x) in oc.iter_mut().zip(fs) {
-                *o += we * x;
+            let fs = &f[e * d + h0..e * d + h0 + n];
+            for (a, &x) in acc[..n].iter_mut().zip(fs) {
+                *a += we * x;
             }
+        }
+        for (pair, a) in oc.as_chunks_mut::<2>().0.iter_mut().zip(&acc[..n]) {
+            pair[0] = F256::from(a.c0);
+            pair[1] = F256::from(a.c1);
         }
     });
     out
 }
 
-/// The combined basis at the switch: `B'[h] = Σ_t s_t·blk_t[0]·within_t[h]`.
-fn materialize_folded_basis(terms: &[StatTerm], d: usize) -> Vec<F256> {
+/// The combined basis at the switch, already SPLIT: `B'[h] = Σ_t
+/// s_t·blk_t[0]·within_t[h]` at `2h` and `u·B'[h]` at `2h+1` — the pairs
+/// `split_basis` produced from a materialized `B'`.
+fn materialize_folded_basis_split(terms: &[StatTerm], d: usize) -> Vec<F256> {
     let coef: Vec<F256> = terms.iter().map(|t| t.scale * t.blk[0]).collect();
-    let mut out = crate::scratch::take_f256(d);
-    out.par_chunks_mut(1 << 12).enumerate().for_each(|(c, oc)| {
+    let mut out = crate::scratch::take_f256(2 * d);
+    out.par_chunks_mut(1 << 13).enumerate().for_each(|(c, oc)| {
         let h0 = c << 12;
-        for (i, o) in oc.iter_mut().enumerate() {
+        for (i, pair) in oc.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let mut v = F256::ZERO;
             for (t, &cf) in terms.iter().zip(&coef) {
                 v += cf * t.within[h0 + i];
             }
-            *o = v;
+            pair[0] = v;
+            pair[1] = F256::U * v;
         }
     });
     out
@@ -1993,16 +2005,20 @@ fn init_phase_statistics<Ch: Challenger>(
     let t_rounds = t1.elapsed();
     let t2 = std::time::Instant::now();
     let w = build_eq_table256(&lane_challenges);
-    let f = fold_blocks_by_eq(&packed_witness, &w, d);
+    let f = fold_blocks_by_eq_split(&packed_witness, &w, d);
     crate::scratch::give_f128(packed_witness);
     let t_fold = t2.elapsed();
     let t3 = std::time::Instant::now();
-    let basis = materialize_folded_basis(&terms, d);
+    let basis = materialize_folded_basis_split(&terms, d);
     let t_basis = t3.elapsed();
     let t4 = std::time::Instant::now();
-    let mut sumcheck = SumcheckProver256::from_folded(f, basis, transcript);
-    let msg = sumcheck.code_switch_and_push_message();
+    // The code switch on the already-split state: only its message is
+    // left (`code_switch_message` = split words, promote, split basis,
+    // then exactly this).
+    let msg = round_msg_fbase(&f, &basis);
+    transcript.push(msg);
     observe_message(challenger, msg);
+    let sumcheck = SumcheckProver256::from_folded(f, basis, transcript);
     if trace {
         eprintln!(
             "    stats ladder (d {d}, {} terms): sweep {:.2} | rounds {:.2} | fold {:.2} | basis {:.2} | switch {:.2} ms",
