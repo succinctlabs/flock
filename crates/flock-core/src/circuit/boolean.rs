@@ -21,10 +21,12 @@
 mod builder;
 mod layout;
 mod lowering;
+mod walk;
 
 pub use builder::CircuitBuilder;
 pub use layout::{LayoutBuilder, LayoutError, PhysicalLayout, PositionKind};
 pub use lowering::{EvaluationError, R1csBuildError};
+pub use walk::{ForwardTrace, WalkError, WalkPlan, WalkStats};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct CircuitId(u64);
@@ -137,15 +139,26 @@ pub enum PortDirection {
     Fixed,
 }
 
-/// A named ordered group of materialized bits.
+/// The statement-facing encoding of a named port.
 ///
-/// Bit order is exactly the order supplied by the circuit author. Encoding a
-/// word as little- or big-endian is therefore an explicit helper-level choice,
-/// not hidden layout behavior.
+/// Words always use little-endian bit order: `values()[0]` is the least
+/// significant bit. `alignment_bits` constrains that value's physical
+/// position; [`LayoutBuilder::place_port`] places the remaining bits
+/// contiguously from there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortEncoding {
+    /// An ordered collection of bits with no numeric interpretation.
+    Bits,
+    /// A little-endian word with an explicit physical alignment requirement.
+    LittleEndianWord { alignment_bits: usize },
+}
+
+/// A named ordered group of materialized bits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Port {
     name: String,
     direction: PortDirection,
+    encoding: PortEncoding,
     values: Vec<ValueId>,
 }
 
@@ -156,6 +169,10 @@ impl Port {
 
     pub const fn direction(&self) -> PortDirection {
         self.direction
+    }
+
+    pub const fn encoding(&self) -> PortEncoding {
+        self.encoding
     }
 
     pub fn values(&self) -> &[ValueId] {

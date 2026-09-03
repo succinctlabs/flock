@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     Bit, BooleanCircuit, CircuitId, Expression, ExpressionNode, LinearExpr, LinearExprId, Port,
-    PortDirection, Row, RowId, RowKind, ValueId,
+    PortDirection, PortEncoding, Row, RowId, RowKind, ValueId,
 };
 
 static NEXT_CIRCUIT_ID: AtomicU64 = AtomicU64::new(1);
@@ -121,6 +121,30 @@ impl CircuitBuilder {
     /// Allocate a named input bit-array. The returned array is in the same
     /// order recorded by the port.
     pub fn input_bits<const N: usize>(&mut self, name: impl Into<String>) -> [Bit; N] {
+        self.input_port(name, PortEncoding::Bits)
+    }
+
+    /// Allocate a little-endian input word with no alignment beyond one bit.
+    pub fn input_word<const N: usize>(&mut self, name: impl Into<String>) -> [Bit; N] {
+        self.input_word_aligned(name, 1)
+    }
+
+    /// Allocate a little-endian input word with an explicit physical
+    /// alignment requirement.
+    pub fn input_word_aligned<const N: usize>(
+        &mut self,
+        name: impl Into<String>,
+        alignment_bits: usize,
+    ) -> [Bit; N] {
+        assert!(alignment_bits > 0, "word alignment must be nonzero");
+        self.input_port(name, PortEncoding::LittleEndianWord { alignment_bits })
+    }
+
+    fn input_port<const N: usize>(
+        &mut self,
+        name: impl Into<String>,
+        encoding: PortEncoding,
+    ) -> [Bit; N] {
         let name = name.into();
         self.assert_new_port_name(&name);
         assert!(N > 0, "port `{name}` must contain at least one bit");
@@ -128,15 +152,10 @@ impl CircuitBuilder {
         self.ports.push(Port {
             name,
             direction: PortDirection::Input,
+            encoding,
             values: bits.iter().map(|bit| bit.value).collect(),
         });
         bits
-    }
-
-    /// Word-oriented spelling of [`Self::input_bits`]. Bit index zero is the
-    /// least-significant bit for the rotate/shift helpers below.
-    pub fn input_word<const N: usize>(&mut self, name: impl Into<String>) -> [Bit; N] {
-        self.input_bits(name)
     }
 
     /// Allocate a named verifier-derived fixed bit-array. Each bit is
@@ -145,6 +164,38 @@ impl CircuitBuilder {
         &mut self,
         name: impl Into<String>,
         values: [bool; N],
+    ) -> [Bit; N] {
+        self.fixed_port(name, values, PortEncoding::Bits)
+    }
+
+    /// Allocate a named little-endian fixed word with no alignment beyond one
+    /// bit.
+    pub fn fixed_word<const N: usize>(&mut self, name: impl Into<String>, value: u64) -> [Bit; N] {
+        self.fixed_word_aligned(name, 1, value)
+    }
+
+    /// Allocate a named little-endian fixed word with an explicit physical
+    /// alignment requirement.
+    pub fn fixed_word_aligned<const N: usize>(
+        &mut self,
+        name: impl Into<String>,
+        alignment_bits: usize,
+        value: u64,
+    ) -> [Bit; N] {
+        assert!(N <= 64, "fixed_word supports at most 64 bits");
+        assert!(alignment_bits > 0, "word alignment must be nonzero");
+        self.fixed_port(
+            name,
+            std::array::from_fn(|i| value >> i & 1 == 1),
+            PortEncoding::LittleEndianWord { alignment_bits },
+        )
+    }
+
+    fn fixed_port<const N: usize>(
+        &mut self,
+        name: impl Into<String>,
+        values: [bool; N],
+        encoding: PortEncoding,
     ) -> [Bit; N] {
         let name = name.into();
         self.assert_new_port_name(&name);
@@ -160,20 +211,46 @@ impl CircuitBuilder {
         self.ports.push(Port {
             name,
             direction: PortDirection::Fixed,
+            encoding,
             values: bits.iter().map(|bit| bit.value).collect(),
         });
         bits
     }
 
-    /// Word-oriented spelling of [`Self::fixed_bits`].
-    pub fn fixed_word<const N: usize>(&mut self, name: impl Into<String>, value: u64) -> [Bit; N] {
-        assert!(N <= 64, "fixed_word supports at most 64 bits");
-        self.fixed_bits(name, std::array::from_fn(|i| value >> i & 1 == 1))
-    }
-
     /// Declare an ordered group of already-materialized bits as a named output.
     /// Virtual expressions must be explicitly materialized before this call.
     pub fn output(&mut self, name: impl Into<String>, bits: impl IntoIterator<Item = Bit>) {
+        self.output_port(name, bits, PortEncoding::Bits);
+    }
+
+    /// Declare an already-materialized little-endian word as a named output,
+    /// with no alignment beyond one bit.
+    pub fn output_word<const N: usize>(&mut self, name: impl Into<String>, bits: [Bit; N]) {
+        self.output_word_aligned(name, 1, bits);
+    }
+
+    /// Declare an already-materialized little-endian word as a named output
+    /// with an explicit physical alignment requirement.
+    pub fn output_word_aligned<const N: usize>(
+        &mut self,
+        name: impl Into<String>,
+        alignment_bits: usize,
+        bits: [Bit; N],
+    ) {
+        assert!(alignment_bits > 0, "word alignment must be nonzero");
+        self.output_port(
+            name,
+            bits,
+            PortEncoding::LittleEndianWord { alignment_bits },
+        );
+    }
+
+    fn output_port(
+        &mut self,
+        name: impl Into<String>,
+        bits: impl IntoIterator<Item = Bit>,
+        encoding: PortEncoding,
+    ) {
         let name = name.into();
         self.assert_new_port_name(&name);
         let bits: Vec<Bit> = bits.into_iter().collect();
@@ -193,6 +270,7 @@ impl CircuitBuilder {
         self.ports.push(Port {
             name,
             direction: PortDirection::Output,
+            encoding,
             values: bits.into_iter().map(|bit| bit.value).collect(),
         });
     }
@@ -546,6 +624,9 @@ impl CircuitBuilder {
         }
         for (index, port) in self.ports.iter().enumerate() {
             assert!(!port.name.is_empty(), "port name must not be empty");
+            if let PortEncoding::LittleEndianWord { alignment_bits } = port.encoding {
+                assert!(alignment_bits > 0, "word alignment must be nonzero");
+            }
             assert!(
                 self.ports[..index]
                     .iter()
@@ -655,3 +736,7 @@ fn symmetric_difference(lhs: &[ValueId], rhs: &[ValueId]) -> Vec<ValueId> {
     result.extend_from_slice(&rhs[j..]);
     result
 }
+
+#[cfg(test)]
+#[path = "builder/tests.rs"]
+mod tests;

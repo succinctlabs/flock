@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 
-use super::{BooleanCircuit, CircuitId, RowId, ValueId};
+use super::{BooleanCircuit, CircuitId, PortEncoding, RowId, ValueId};
 
 /// Deterministic mapping from logical circuit identifiers to physical R1CS
 /// columns and rows.
@@ -74,6 +74,18 @@ impl PhysicalLayout {
         }
         validate_unique_positions(&self.value_positions, PositionKind::Column)?;
         validate_unique_positions(&self.row_positions, PositionKind::Row)?;
+        for port in &circuit.ports {
+            if let PortEncoding::LittleEndianWord { alignment_bits } = port.encoding {
+                let start = self.value_positions[port.values[0].index];
+                if !start.is_multiple_of(alignment_bits) {
+                    return Err(LayoutError::MisalignedPort {
+                        name: port.name.clone(),
+                        start,
+                        alignment_bits,
+                    });
+                }
+            }
+        }
         let required = self
             .value_positions
             .iter()
@@ -187,12 +199,20 @@ impl<'a> LayoutBuilder<'a> {
 
     /// Place a named port contiguously and co-locate each bit's defining row.
     pub fn place_port(&mut self, name: &str, start: usize) -> Result<&mut Self, LayoutError> {
-        let values = self
+        let port = self
             .circuit
             .port(name)
-            .ok_or_else(|| LayoutError::UnknownPort(name.to_owned()))?
-            .values
-            .clone();
+            .ok_or_else(|| LayoutError::UnknownPort(name.to_owned()))?;
+        if let PortEncoding::LittleEndianWord { alignment_bits } = port.encoding
+            && !start.is_multiple_of(alignment_bits)
+        {
+            return Err(LayoutError::MisalignedPort {
+                name: name.to_owned(),
+                start,
+                alignment_bits,
+            });
+        }
+        let values = port.values.clone();
         let placements: Vec<(ValueId, usize)> = values
             .into_iter()
             .enumerate()
@@ -334,6 +354,11 @@ impl fmt::Display for PositionKind {
 pub enum LayoutError {
     WrongCircuit,
     UnknownPort(String),
+    MisalignedPort {
+        name: String,
+        start: usize,
+        alignment_bits: usize,
+    },
     InvalidIndex {
         kind: PositionKind,
         index: usize,
@@ -362,6 +387,14 @@ impl fmt::Display for LayoutError {
         match self {
             Self::WrongCircuit => f.write_str("layout belongs to another circuit shape"),
             Self::UnknownPort(name) => write!(f, "unknown port `{name}`"),
+            Self::MisalignedPort {
+                name,
+                start,
+                alignment_bits,
+            } => write!(
+                f,
+                "port `{name}` starts at {start}, which is not aligned to {alignment_bits} bits"
+            ),
             Self::InvalidIndex { kind, index } => write!(f, "invalid {kind} id {index}"),
             Self::InvalidRange => f.write_str("layout reservation has start greater than end"),
             Self::PositionOverflow => f.write_str("physical position overflows usize"),

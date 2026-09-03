@@ -7,7 +7,7 @@ use crate::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 
 use super::{
     BooleanCircuit, ExpressionNode, LayoutBuilder, LayoutError, LinearExprId, PhysicalLayout, Port,
-    PortDirection, Row, RowId, RowKind, ValueId,
+    PortDirection, PortEncoding, Row, RowId, RowKind, ValueId,
 };
 
 impl BooleanCircuit {
@@ -62,9 +62,9 @@ impl BooleanCircuit {
 
     /// Deterministic digest of the authored structure. Runtime circuit IDs are
     /// excluded.
-    pub fn artifact_digest(&self) -> [u8; 32] {
+    pub fn structure_digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"flock-boolean-circuit-v1");
+        hasher.update(b"flock-boolean-structure-v1");
         absorb_usize(&mut hasher, self.expressions.len());
         for expression in &self.expressions {
             match &expression.node {
@@ -120,6 +120,15 @@ impl BooleanCircuit {
                 PortDirection::Output => 1,
                 PortDirection::Fixed => 2,
             }]);
+            match port.encoding {
+                PortEncoding::Bits => {
+                    hasher.update(&[0]);
+                }
+                PortEncoding::LittleEndianWord { alignment_bits } => {
+                    hasher.update(&[1]);
+                    absorb_usize(&mut hasher, alignment_bits);
+                }
+            }
             absorb_usize(&mut hasher, port.values.len());
             for value in &port.values {
                 absorb_usize(&mut hasher, value.index);
@@ -129,15 +138,15 @@ impl BooleanCircuit {
         *hasher.finalize().as_bytes()
     }
 
-    /// Artifact digest extended with one physical lowering configuration.
-    pub fn artifact_digest_with_layout(
+    /// Structural digest extended with one physical layout.
+    pub fn structure_layout_digest(
         &self,
         layout: &PhysicalLayout,
     ) -> Result<[u8; 32], LayoutError> {
         layout.validate_for(self)?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"flock-boolean-layout-v1");
-        hasher.update(&self.artifact_digest());
+        hasher.update(b"flock-boolean-structure-layout-v1");
+        hasher.update(&self.structure_digest());
         absorb_usize(&mut hasher, layout.value_positions.len());
         for &position in &layout.value_positions {
             absorb_usize(&mut hasher, position);

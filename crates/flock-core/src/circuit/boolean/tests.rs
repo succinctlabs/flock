@@ -114,25 +114,123 @@ fn changing_materialization_changes_only_the_requested_boundary() {
             .count(),
         1
     );
+    let virtual_product = &virtual_sum.rows()[3];
+    assert_eq!(virtual_product.kind(), RowKind::And);
+    assert_eq!(
+        virtual_sum.support(virtual_product.lhs()),
+        Some(&[virtual_sum.inputs()[0], virtual_sum.inputs()[1],][..])
+    );
+    let copy = &materialized_sum.rows()[3];
+    let materialized_product = &materialized_sum.rows()[4];
+    assert_eq!(copy.kind(), RowKind::Materialize);
+    assert_eq!(materialized_product.kind(), RowKind::And);
+    assert_eq!(
+        materialized_sum.support(copy.lhs()),
+        Some(&[materialized_sum.inputs()[0], materialized_sum.inputs()[1],][..])
+    );
+    assert_eq!(
+        materialized_sum.support(materialized_product.lhs()),
+        Some(&[copy.defined_value().unwrap()][..])
+    );
+    assert_ne!(
+        virtual_sum.structure_digest(),
+        materialized_sum.structure_digest()
+    );
+    assert_ne!(
+        virtual_sum
+            .to_block_r1cs(3, 0, 0)
+            .unwrap()
+            .statement_digest(),
+        materialized_sum
+            .to_block_r1cs(3, 0, 0)
+            .unwrap()
+            .statement_digest()
+    );
 }
 
 #[test]
 fn constant_is_pinned_and_padding_is_forced_to_zero() {
+    use crate::challenger::FsChallenger;
+    use crate::field::F128;
+    use crate::lincheck::{self, LincheckCircuit, QuirkyPoint, SkipPoint};
+
     let mut builder = CircuitBuilder::new();
     let input = builder.input();
     builder.materialize(input.expr());
     let circuit = builder.finish();
-    let r1cs = circuit.to_block_r1cs(2, 0, 0).unwrap();
+    let r1cs = circuit.to_block_r1cs(3, 0, 0).unwrap();
 
     assert_eq!(r1cs.const_pin, Some(circuit.one().index()));
     assert!(r1cs.c0_is_identity());
     assert!(r1cs.a_0.rows[3].is_empty());
     assert!(r1cs.b_0.rows[3].is_empty());
 
-    let mut witness = circuit.evaluate_r1cs(&[true], 2).unwrap();
+    let mut witness = circuit.evaluate_r1cs(&[true], 3).unwrap();
     assert!(r1cs.satisfies(&witness));
     witness[3] = true;
     assert!(!r1cs.satisfies(&witness));
+
+    let lincheck_r1cs = circuit.to_block_r1cs(3, 0, 3).unwrap();
+    let lincheck_circuit = lincheck_r1cs.sparse_lincheck_circuit();
+    assert_eq!(lincheck_circuit.const_pin_col(), lincheck_r1cs.const_pin);
+    let point = QuirkyPoint {
+        z_skip: SkipPoint::Phi8(F128::ZERO),
+        x_inner_rest: vec![F128::ZERO; lincheck_r1cs.k_log],
+        x_outer: vec![F128::ZERO; lincheck_r1cs.n_log()],
+    };
+    let all_zero_witness = vec![0u8; 1 << (lincheck_r1cs.m - 3)];
+
+    let unpinned = lincheck::SparseMatrixCircuit::new(&lincheck_r1cs.a_0, &lincheck_r1cs.b_0);
+    let mut unpinned_prover = FsChallenger::new(b"dsl-without-const-pin");
+    let (unpinned_proof, _) = lincheck::prove(
+        &all_zero_witness,
+        lincheck_r1cs.m,
+        lincheck_r1cs.k_log,
+        0,
+        &unpinned,
+        &point,
+        &mut unpinned_prover,
+    );
+    let mut unpinned_verifier = FsChallenger::new(b"dsl-without-const-pin");
+    lincheck::verify(
+        lincheck_r1cs.m,
+        lincheck_r1cs.k_log,
+        0,
+        &unpinned,
+        &point,
+        F128::ZERO,
+        F128::ZERO,
+        &unpinned_proof,
+        &mut unpinned_verifier,
+    )
+    .expect("the all-zero relation is valid without the statement-level pin");
+
+    let mut prover_challenger = FsChallenger::new(b"dsl-const-pin");
+    let (proof, _) = lincheck::prove(
+        &all_zero_witness,
+        lincheck_r1cs.m,
+        lincheck_r1cs.k_log,
+        0,
+        &lincheck_circuit,
+        &point,
+        &mut prover_challenger,
+    );
+    let mut verifier_challenger = FsChallenger::new(b"dsl-const-pin");
+    assert!(
+        lincheck::verify(
+            lincheck_r1cs.m,
+            lincheck_r1cs.k_log,
+            0,
+            &lincheck_circuit,
+            &point,
+            F128::ZERO,
+            F128::ZERO,
+            &proof,
+            &mut verifier_challenger,
+        )
+        .is_err(),
+        "the ONE pin must reject an all-zero lincheck witness"
+    );
 }
 
 #[test]
@@ -278,8 +376,16 @@ fn word_helpers_are_virtual_until_materialize_word() {
     let output = builder.materialize_word(mixed);
     assert_eq!(builder.value_count(), values_before + 8);
     assert_eq!(builder.row_count(), rows_before + 8);
-    builder.output("output", output);
+    builder.output_word("output", output);
     let circuit = builder.finish();
+    assert_eq!(
+        circuit.port("input").unwrap().encoding(),
+        PortEncoding::LittleEndianWord { alignment_bits: 1 }
+    );
+    assert_eq!(
+        circuit.port("output").unwrap().encoding(),
+        PortEncoding::LittleEndianWord { alignment_bits: 1 }
+    );
     let r1cs = circuit.to_block_r1cs(5, 0, 0).unwrap();
 
     for value in 0u8..=u8::MAX {
@@ -302,6 +408,10 @@ fn fixed_words_are_named_and_constrained() {
         circuit.port("iv").unwrap().direction(),
         PortDirection::Fixed
     );
+    assert_eq!(
+        circuit.port("iv").unwrap().encoding(),
+        PortEncoding::LittleEndianWord { alignment_bits: 1 }
+    );
     let r1cs = circuit.to_block_r1cs(4, 0, 0).unwrap();
     let witness = circuit.evaluate_r1cs(&[], 4).unwrap();
     assert!(r1cs.satisfies(&witness));
@@ -311,6 +421,76 @@ fn fixed_words_are_named_and_constrained() {
     let mut mutated = witness;
     mutated[fixed[3].value_id().index()] ^= true;
     assert!(!r1cs.satisfies(&mutated));
+}
+
+#[test]
+fn word_ports_record_encoding_and_enforce_layout_alignment() {
+    let mut builder = CircuitBuilder::new();
+    let word = builder.input_word_aligned::<8>("word", 8);
+    let bits = builder.input_bits::<8>("bits");
+    let circuit = builder.finish();
+
+    assert_eq!(
+        circuit.port("word").unwrap().encoding(),
+        PortEncoding::LittleEndianWord { alignment_bits: 8 }
+    );
+    assert_eq!(circuit.port("bits").unwrap().encoding(), PortEncoding::Bits);
+    assert!(matches!(
+        circuit.to_block_r1cs(5, 0, 0),
+        Err(R1csBuildError::InvalidLayout(
+            LayoutError::MisalignedPort {
+                ref name,
+                start: 1,
+                alignment_bits: 8,
+            }
+        )) if name == "word"
+    ));
+
+    let mut layout = circuit.layout();
+    assert!(matches!(
+        layout.place_port("word", 4),
+        Err(LayoutError::MisalignedPort {
+            ref name,
+            start: 4,
+            alignment_bits: 8,
+        }) if name == "word"
+    ));
+    layout.place_port("word", 8).unwrap();
+    layout.place_port("bits", 24).unwrap();
+    let layout = layout.finish().unwrap();
+    assert_eq!(layout.value_position(word[0].value_id()), Some(8));
+    assert_eq!(layout.value_position(bits[0].value_id()), Some(24));
+}
+
+#[test]
+fn port_encoding_is_structural_but_not_arithmetic() {
+    fn bits() -> BooleanCircuit {
+        let mut builder = CircuitBuilder::new();
+        builder.input_bits::<8>("value");
+        builder.finish()
+    }
+
+    fn word(alignment_bits: usize) -> BooleanCircuit {
+        let mut builder = CircuitBuilder::new();
+        builder.input_word_aligned::<8>("value", alignment_bits);
+        builder.finish()
+    }
+
+    let bits = bits();
+    let unaligned_word = word(1);
+    let aligned_word = word(8);
+    assert_ne!(bits.structure_digest(), unaligned_word.structure_digest());
+    assert_ne!(
+        unaligned_word.structure_digest(),
+        aligned_word.structure_digest()
+    );
+    assert_eq!(
+        bits.to_block_r1cs(4, 0, 0).unwrap().statement_digest(),
+        unaligned_word
+            .to_block_r1cs(4, 0, 0)
+            .unwrap()
+            .statement_digest()
+    );
 }
 
 #[test]
@@ -395,6 +575,55 @@ fn rejects_unrepresentable_total_dimension() {
     assert!(matches!(
         circuit.to_block_r1cs(0, 0, usize::BITS as usize),
         Err(R1csBuildError::DimensionOverflow)
+    ));
+}
+
+#[test]
+fn capacity_boundaries_are_exact_across_backends() {
+    use crate::field::F128;
+
+    let mut builder = CircuitBuilder::new();
+    for _ in 0..7 {
+        builder.input();
+    }
+    let circuit = builder.finish();
+    let inputs = [false; 7];
+    let plan = circuit.walk_plan();
+
+    assert!(circuit.evaluate_r1cs(&inputs, 3).is_ok());
+    assert!(circuit.to_block_r1cs(3, 0, 0).is_ok());
+    assert!(plan.forward(&inputs, 3).is_ok());
+    let weights = vec![F128::ZERO; 8];
+    assert!(plan.transpose(&weights, &weights, &weights).is_ok());
+
+    assert!(matches!(
+        circuit.evaluate_r1cs(&inputs, 2),
+        Err(EvaluationError::Capacity {
+            required: 8,
+            actual: 4,
+        })
+    ));
+    assert!(matches!(
+        circuit.to_block_r1cs(2, 0, 0),
+        Err(R1csBuildError::Capacity {
+            required: 8,
+            actual: 4,
+        })
+    ));
+    assert!(matches!(
+        plan.forward(&inputs, 2),
+        Err(WalkError::Capacity {
+            required: 8,
+            actual: 4,
+        })
+    ));
+    let too_small = vec![F128::ZERO; 4];
+    assert!(matches!(
+        plan.transpose(&too_small, &too_small, &too_small),
+        Err(WalkError::Capacity {
+            required: 8,
+            actual: 4,
+        })
     ));
 }
 
@@ -505,7 +734,7 @@ fn deterministic_random_circuits_agree_with_bool_and_packed_matrices() {
 }
 
 #[test]
-fn artifact_and_relation_digests_are_deterministic_and_golden() {
+fn structure_and_relation_digests_are_deterministic_and_golden() {
     fn build() -> BooleanCircuit {
         let mut builder = CircuitBuilder::new();
         let input = builder.input_bits::<2>("input");
@@ -518,23 +747,23 @@ fn artifact_and_relation_digests_are_deterministic_and_golden() {
 
     let first = build();
     let second = build();
-    assert_eq!(first.artifact_digest(), second.artifact_digest());
+    assert_eq!(first.structure_digest(), second.structure_digest());
     let first_layout = PhysicalLayout::source_order(&first);
     let second_layout = PhysicalLayout::source_order(&second);
     assert_eq!(first_layout, second_layout);
     assert_eq!(
-        first.artifact_digest_with_layout(&first_layout).unwrap(),
-        second.artifact_digest_with_layout(&second_layout).unwrap()
+        first.structure_layout_digest(&first_layout).unwrap(),
+        second.structure_layout_digest(&second_layout).unwrap()
     );
     assert_eq!(
         first.to_block_r1cs(3, 0, 0).unwrap().statement_digest(),
         second.to_block_r1cs(3, 0, 0).unwrap().statement_digest()
     );
     assert_eq!(
-        first.artifact_digest(),
+        first.structure_digest(),
         [
-            220, 145, 201, 55, 159, 192, 185, 157, 57, 116, 56, 72, 204, 91, 248, 3, 63, 199, 152,
-            230, 7, 139, 93, 187, 194, 187, 177, 77, 173, 92, 102, 252,
+            132, 17, 99, 150, 177, 225, 101, 6, 129, 196, 80, 54, 185, 56, 22, 18, 174, 130, 22,
+            164, 248, 233, 108, 114, 130, 93, 11, 188, 243, 65, 167, 185,
         ]
     );
     assert_eq!(
@@ -544,6 +773,48 @@ fn artifact_and_relation_digests_are_deterministic_and_golden() {
             235, 128, 224, 120, 125, 227, 239, 50, 114, 147, 168, 88, 148,
         ]
     );
+}
+
+#[test]
+fn structure_digest_is_process_and_thread_deterministic() {
+    const CHILD_ENV: &str = "FLOCK_BOOLEAN_DIGEST_TEST_CHILD";
+    const MARKER: &str = "FLOCK_STRUCTURE_DIGEST=";
+
+    fn digest() -> [u8; 32] {
+        let mut builder = CircuitBuilder::new();
+        let input = builder.input_word_aligned::<8>("input", 8);
+        let mixed = builder.xor3(input[0], input[3], input[7]);
+        let output = builder.materialize(mixed);
+        builder.output("output", [output]);
+        builder.finish().structure_digest()
+    }
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        println!("{MARKER}{:?}", digest());
+        return;
+    }
+
+    let run = |rayon_threads: &str| {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "circuit::boolean::tests::structure_digest_is_process_and_thread_deterministic",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("RAYON_NUM_THREADS", rayon_threads)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        stdout
+            .split_once(MARKER)
+            .map(|(_, digest)| digest.lines().next().unwrap().to_owned())
+            .expect("child process did not print its structure digest")
+    };
+
+    assert_eq!(run("1"), run("4"));
+    assert_eq!(run("2"), format!("{:?}", digest()));
 }
 
 #[test]
