@@ -130,3 +130,4 @@ mod online;
 mod query;
 mod real_walker;
 mod tape;
+mod walker_common;

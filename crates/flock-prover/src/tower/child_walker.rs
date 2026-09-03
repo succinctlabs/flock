@@ -1,4 +1,4 @@
-use std::{array::from_fn, env::var, iter::repeat_n};
+use std::env::var;
 
 use flock_core::{
     circuit::{
@@ -18,11 +18,7 @@ use flock_core::{
         },
     },
     product_gkr::s_id_basis,
-    zerocheck::{
-        ag_skip::friendly_challenges,
-        univariate_skip::build_eq,
-        univariate_skip_optimized::{medium_challenges_ghash, small_challenges_ghash},
-    },
+    zerocheck::univariate_skip::build_eq,
 };
 use flock_transcript::transcript_record::{
     RecordingChallenger, Stream, StreamWord, TranscriptOp as Op, TranscriptShape,
@@ -44,17 +40,16 @@ use crate::{
         fs_chain::{FsChainTrace, IV},
     },
     tower::{
-        CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrLayerRec, GkrRec,
-        HashKind, InnerPd, LeafEvalGate, LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner,
-        MixedProof, MpRec, OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance,
-        Wire, ag_seed_bytes, assert_chain_replays, assertion_mac, bytes_payload_mask, cap_payloads,
-        cap_wires, check_residual_publics, circuit_structure_claim_wires, cw,
-        declare_envelope_slots, decode_ag_point, duplex_row_count_model,
+        CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind, InnerPd,
+        LeafEvalGate, LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner, MixedProof, MpRec,
+        OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ag_seed_bytes,
+        assertion_mac, bytes_payload_mask, cap_payloads, cap_wires, check_residual_publics,
+        circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
         emit_boolean_reported_check, emit_element_reported_check, emit_family_h, emit_fs_chain,
-        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region,
-        emit_spine256, flatten_ops, level_geometry, level_query_phase_b3_rows, level_sources,
-        merge_chain, observed_f256, pack8, parse_open_levels, payload_words, pin_recombination,
-        query_phase_b3_rows, replay_ligerito_spine256, squeeze_word_wire, strat_scheds,
+        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region, flatten_ops,
+        level_geometry, level_sources, observed_f256, pack8, parse_open_levels, payload_words,
+        pin_recombination, query_phase_b3_rows, replay_ligerito_spine256, squeeze_word_wire,
+        strat_scheds, walker_common,
     },
     verifier::{verify_ligerito_union_circuit, verify_ligerito_union_circuit_ag},
 };
@@ -1146,130 +1141,18 @@ impl<'p> ChildTape<'p> {
     ) -> GkrRec {
         let vc_at = |end: usize| vc_at(ops, end);
         let fin_at = |end: usize| fin_at(ops, end);
-        let gkr = &proof.wiring().gkr;
-        let mut i = gkr_l[0] + 1;
-        while matches!(ops[i], Op::Pow { .. }) {
-            i += 1;
-        }
-        assert!(matches!(ops[i], Op::SqueezeScalar), "gkr alpha");
-        let (_, c_alpha) = vc_at(i);
-        let alpha_fin = fin_at(i);
-        i += 1;
-        assert!(matches!(ops[i], Op::SqueezeScalar), "gkr beta");
-        let beta_fin = fin_at(i);
-        i += 1;
-        assert!(matches!(ops[i], Op::ObserveScalar), "top lhs");
-        let (tv, _) = vc_at(i);
-        assert_eq!(vals_rec[tv], gkr.top_lhs, "top_lhs on the stream");
-        assert_eq!(vals_rec[tv + 1], gkr.top_rhs, "top_rhs on the stream");
-        assert_eq!(gkr.top_lhs, gkr.top_rhs, "the grand products agree");
-        i += 2;
-        // The layer walk + native replay in lockstep.
-        let (mut claim_l, mut claim_r) = (gkr.top_lhs, gkr.top_rhs);
-        let mut r_pt: Vec<F128> = Vec::new();
-        let mut lrecs: Vec<GkrLayerRec> = Vec::new();
-        for (k, layer) in gkr.layers.iter().enumerate() {
-            assert_eq!(layer.rounds.len(), k, "layer {k} has k rounds");
-            while matches!(ops[i], Op::Pow { .. }) {
-                i += 1;
-            }
-            assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} lambda");
-            let (_, lc2) = vc_at(i);
-            let lambda = chals[lc2];
-            let lam_fin = fin_at(i);
-            i += 1;
-            let mut c_run = claim_l + lambda * claim_r;
-            let mut r_prime = Vec::with_capacity(k + 1);
-            let mut rrecs: Vec<(usize, usize)> = Vec::new();
-            let mut g0s: Vec<F128> = Vec::new();
-            for (t2, &(g1, gi)) in layer.rounds.iter().enumerate() {
-                assert!(matches!(ops[i], Op::ObserveScalar), "round obs g1");
-                let (gv, _) = vc_at(i);
-                assert_eq!(vals_rec[gv], g1, "layer {k} round {t2} g1");
-                assert_eq!(vals_rec[gv + 1], gi, "layer {k} round {t2} g_inf");
-                let mut rho_i = i + 2;
-                while matches!(ops[rho_i], Op::Pow { .. }) {
-                    rho_i += 1;
-                }
-                assert!(matches!(ops[rho_i], Op::SqueezeScalar), "round rho");
-                let (_, rc2) = vc_at(rho_i);
-                let rho = chals[rc2];
-                rrecs.push((gv, fin_at(rho_i)));
-                i = rho_i + 1;
-                let r_eq = r_pt[t2];
-                let g0 = (c_run + r_eq * g1) * (F128::ONE + r_eq).inv();
-                g0s.push(g0);
-                c_run = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
-                r_prime.push(rho);
-            }
-            let (vv, _) = vc_at(i);
-            for (j, want) in [layer.vl0, layer.vl1, layer.vr0, layer.vr1]
-                .into_iter()
-                .enumerate()
-            {
-                assert!(matches!(ops[i], Op::ObserveScalar), "layer value obs");
-                assert_eq!(vals_rec[vv + j], want, "layer {k} value {j}");
-                i += 1;
-            }
-            assert_eq!(
-                c_run,
-                layer.vl0 * layer.vl1 + lambda * (layer.vr0 * layer.vr1),
-                "layer {k} closes"
-            );
-            while matches!(ops[i], Op::Pow { .. }) {
-                i += 1;
-            }
-            assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} c_k");
-            let (_, cc2) = vc_at(i);
-            let c_k = chals[cc2];
-            let ck_fin = fin_at(i);
-            i += 1;
-            claim_l = (F128::ONE + c_k) * layer.vl0 + c_k * layer.vl1;
-            claim_r = (F128::ONE + c_k) * layer.vr0 + c_k * layer.vr1;
-            r_prime.push(c_k);
-            r_pt = r_prime;
-            lrecs.push(GkrLayerRec {
-                lam_fin,
-                rounds: rrecs,
-                g0s,
-                v_v: vv,
-                ck_fin,
-            });
-        }
-        // The input checks: s_id(rho) closed-form NATIVE, s_sigma from
-        // the PROOF — the deferred value the assertion carries.
-        let mu2 = built.shape.circuit.cells().mu();
-        assert_eq!(r_pt.len(), mu2, "the GKR point spans the cell space");
-        let alpha2 = chals[c_alpha];
-        let beta2 = chals[c_alpha + 1];
-        let basis = s_id_basis(mu2);
-        // Masked input checks under the live-identity padding.
-        let mask_w = built.shape.circuit.live_mask();
-        let tail_w2 = (beta2 + F128::ONE) * mask_w.live_eval(&r_pt) + F128::ONE;
-        assert_eq!(
-            claim_l,
-            gkr.f_eval + alpha2 * mask_w.masked_id_eval(&basis, &r_pt) + tail_w2,
-            "lhs input check replays (masked)"
-        );
-        assert_eq!(
-            claim_r,
-            gkr.g_eval + alpha2 * gkr.s_sigma_eval + tail_w2,
-            "rhs input check replays with the DEFERRED (masked) sigma value"
-        );
-        // The triple observed last — the assertion's value wire.
-        let (fv, _) = vc_at(i);
-        assert!(matches!(ops[i], Op::ObserveScalar), "f_eval obs");
-        assert_eq!(vals_rec[fv], gkr.f_eval, "f_eval on the stream");
-        assert_eq!(vals_rec[fv + 1], gkr.g_eval, "g_eval on the stream");
-        assert_eq!(vals_rec[fv + 2], gkr.s_sigma_eval, "s_sigma on the stream");
-        GkrRec {
-            alpha_fin,
-            beta_fin,
-            top_v: tv,
-            layers: lrecs,
-            fgs_v: fv,
-            r_pt,
-        }
+        walker_common::walk_wiring_gkr_core(
+            ops,
+            vals_rec,
+            chals,
+            &proof.wiring().gkr,
+            gkr_l[0],
+            built.shape.circuit.cells().mu(),
+            &built.shape.circuit.live_mask(),
+            "the GKR point spans the cell space",
+            &vc_at,
+            &fin_at,
+        )
     }
 
     /// ---- the ELEMENT PIOP region, located (mixed inners only) ----
@@ -1558,13 +1441,14 @@ impl<'p> ChildTape<'p> {
             trace,
             cross,
             ..
-        } = merge_chain(
-            t_shape.ops(),
-            &t_shape.stream_words_duplex(domain),
+        } = walker_common::merge_and_replay_chain(
+            t_shape,
+            domain,
             rec.values(),
             rec.payloads(),
+            ops,
+            chals,
         );
-        assert_chain_replays(ops, &trace, chals);
         let lig = &proof.pcs_open().inner.ligerito;
         assert_eq!(
             inner.commitment.cap, lig.initial_cap,
@@ -1606,72 +1490,7 @@ impl<'p> ChildTape<'p> {
                 b3_rows - trace.rows.len() - h_rows,
                 b3_rows
             );
-            for g in geo.iter() {
-                let (leaf, path, cap) = level_query_phase_b3_rows(g);
-                eprintln!(
-                    "    level: q {} depth {} row_words {} -> leaf {} + path {} + cap {}",
-                    g.q, g.depth, g.raw_row_words, leaf, path, cap,
-                );
-            }
-            // CHAIN DECOMPOSITION + an independent row-count model of the
-            // duplex discipline (transcript-v3), asserted against the
-            // sponge trace: a squeeze row absorbs the pending partial
-            // block as its MESSAGE, mutates cv, and has no header word.
-            {
-                let pad16 = |n: usize| n.div_ceil(16) * 16;
-                let (mut hdr_w, mut pay_w, mut n_obs, mut n_sq) = (0usize, 0usize, 0usize, 0usize);
-                for op in ops.iter() {
-                    match op {
-                        Op::Label(l) => {
-                            hdr_w += 1;
-                            pay_w += pad16(l.len()) / 16;
-                            n_obs += 1;
-                        }
-                        Op::ObserveScalar => {
-                            hdr_w += 1;
-                            pay_w += 1;
-                            n_obs += 1;
-                        }
-                        Op::ObserveSlice(n) => {
-                            hdr_w += 1;
-                            pay_w += n;
-                            n_obs += 1;
-                        }
-                        Op::ObserveBytes(len) => {
-                            hdr_w += 1;
-                            pay_w += pad16(*len) / 16;
-                            n_obs += 1;
-                        }
-                        Op::Forked { .. } | Op::Merge { .. } => {}
-                        Op::Pow { .. } => {
-                            pay_w += 1;
-                        }
-                        Op::LegacyPow { .. } => {
-                            n_sq += 1;
-                        }
-                        Op::SqueezeScalar | Op::SqueezeSlice(_) => {
-                            n_sq += 1;
-                        }
-                    }
-                }
-                let v3_rows =
-                    duplex_row_count_model(t_shape.ops(), &t_shape.stream_words_duplex(domain));
-                eprintln!(
-                    "  [chain census] ops {} (obs {} / sq {}) | header words {} ({} B) | payload words {} | duplex rows {}",
-                    ops.len(),
-                    n_obs,
-                    n_sq,
-                    hdr_w,
-                    16 * hdr_w,
-                    pay_w,
-                    trace.rows.len(),
-                );
-                assert_eq!(
-                    v3_rows,
-                    trace.rows.len(),
-                    "the duplex row model diverged from the sponge trace"
-                );
-            }
+            walker_common::census_levels_and_chain_rows(ops, t_shape, domain, &geo, &trace);
         }
         let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
         // Recursive caps are PROOF BODY — the in-circuit cap trees bind them
@@ -2689,130 +2508,20 @@ fn emit_ligerito_spine(
     zw: Wire,
     ow: Wire,
 ) -> [Wire; 2] {
-    let spine256 = cs.spine256;
-    let levels = &ct.levels[..];
-    let inner_pd2 = &ct.inner_pd2;
-    let gpw = outs[trace.squeezes[inner_pd2.fin][0]][0];
-    let z2 = [zw, zw];
-    let tw0 = emit_spine256(
+    walker_common::emit_ligerito_spine_walk(
         sb,
-        spine256,
-        z2,
-        z2,
-        z2,
-        z2,
-        z2,
-        z2,
-        [wv(inner_pd2.q_v), zw],
-        gpw,
-        z2,
-    );
-    let mut tsp = tw0[3];
-    for od in &levels[0].initial_ood {
-        let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-        tsp = emit_spine256(
-            sb,
-            spine256,
-            z2,
-            z2,
-            z2,
-            tsp,
-            z2,
-            z2,
-            [wv(od.y_v), zw],
-            bw,
-            z2,
-        )[3];
-    }
-    let st = emit_spine256(
-        sb,
-        spine256,
-        z2,
-        z2,
-        z2,
-        z2,
-        [wv(ct.start_v), wv(ct.start_v + 1)],
-        [wv(ct.start_v + 2), wv(ct.start_v + 3)],
-        tsp,
+        cs.spine256,
+        outs,
+        trace,
+        wv,
+        &ct.levels,
+        &ct.inner_pd2,
+        ct.start_v,
+        level_accs,
+        r_lvl,
+        zw,
         ow,
-        z2,
-    );
-    let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
-    for (li, lvl) in levels.iter().enumerate() {
-        for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
-            let rw = [
-                squeeze_word_wire(outs, trace, lvl.fold_fins[j], 0),
-                squeeze_word_wire(outs, trace, lvl.fold_fins[j], 1),
-            ];
-            let ev = emit_spine256(sb, spine256, qc, qb, qa, z2, z2, z2, z2, zw, rw);
-            tsp = ev[4];
-            let bld = emit_spine256(
-                sb,
-                spine256,
-                z2,
-                z2,
-                z2,
-                z2,
-                [wv(mv), wv(mv + 1)],
-                [wv(mv + 2), wv(mv + 3)],
-                tsp,
-                ow,
-                z2,
-            );
-            (qc, qb, qa) = (bld[0], bld[1], bld[2]);
-        }
-        if li < r_lvl {
-            for od in &lvl.ood {
-                let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-                let f = emit_spine256(
-                    sb,
-                    spine256,
-                    qc,
-                    qb,
-                    qa,
-                    tsp,
-                    [wv(od.intro_v), wv(od.intro_v + 1)],
-                    [wv(od.intro_v + 2), wv(od.intro_v + 3)],
-                    [wv(od.y_v), zw],
-                    bw,
-                    z2,
-                );
-                (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
-            }
-            let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-            let f = emit_spine256(
-                sb,
-                spine256,
-                qc,
-                qb,
-                qa,
-                tsp,
-                [wv(lvl.intro_v), wv(lvl.intro_v + 1)],
-                [wv(lvl.intro_v + 2), wv(lvl.intro_v + 3)],
-                level_accs[li],
-                bw,
-                z2,
-            );
-            (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
-        } else {
-            let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-            let f = emit_spine256(
-                sb,
-                spine256,
-                z2,
-                z2,
-                z2,
-                tsp,
-                z2,
-                z2,
-                level_accs[li],
-                bw,
-                z2,
-            );
-            tsp = f[3];
-        }
-    }
-    tsp
+    )
 }
 
 /// ---- the RESIDUAL region (shared emitter) ----
@@ -2885,26 +2594,14 @@ fn emit_family_h_and_intake_boundary(
     let mp_o = &ct.mp_o;
     let w_rounds = &ct.w_rounds[..];
     let inner_pd2 = &ct.inner_pd2;
-    let shv_w: [Vec<Wire>; 2] = from_fn(|k| {
-        let sv = ct.rs_recs[k].0;
-        (0..128).map(|i| wv(sv + i)).collect()
-    });
-    let value_w: [Vec<Wire>; 2] = from_fn(|k| {
-        mp_o.val_vs[128 * k..128 * (k + 1)]
-            .iter()
-            .map(|&vi| wv(vi))
-            .collect()
-    });
-    let rdp_w: [Vec<Wire>; 2] = from_fn(|k| {
-        let fin = ct.rs_recs[k].1;
-        (0..7)
-            .map(|j| squeeze_word_wire(outs, trace, fin, j))
-            .collect()
-    });
-    let gamma_w: [Wire; 2] = from_fn(|k| {
-        let (fin, offset) = ct.rs_gam_fins[k];
-        squeeze_word_wire(outs, trace, fin, offset)
-    });
+    let (shv_w, value_w, rdp_w, gamma_w) = walker_common::family_h_source_wires(
+        outs,
+        trace,
+        wv,
+        &ct.rs_recs,
+        &ct.rs_gam_fins,
+        &mp_o.val_vs,
+    );
     let (rsh_w, vrs_w) = emit_family_h(
         sb,
         cs.q.family.expect("family-H slot"),
@@ -3044,16 +2741,7 @@ fn emit_anchor_expect(
     let m_mp2 = ct.m_mp2;
     let n_log_i = ct.n_log_i;
     let k_cols_i = ct.k_cols_i;
-    let t_vals_b: Vec<F128> = match &ct.zskip {
-        ZskipTapeRec::Rs { .. } => {
-            let mut v: Vec<F128> = Vec::new();
-            v.extend_from_slice(&small_challenges_ghash());
-            v.extend_from_slice(&medium_challenges_ghash());
-            v
-        }
-        ZskipTapeRec::Ag { .. } => friendly_challenges().to_vec(),
-    };
-    assert_eq!(t_vals_b.len(), 7, "the seven baked inner constants");
+    let t_vals_b = walker_common::baked_inner_t_vals(&ct.zskip);
 
     // The statements' points as (native value, wire) pairs, pinned against
     // the native claims: ab = [LAST lc round | zc mlv rounds 1..1+ν | lc
@@ -3069,21 +2757,10 @@ fn emit_anchor_expect(
         .rev()
         .map(|&(ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
         .collect();
-    let extend_const = |pw: &mut Vec<(F128, Wire)>, xn: &[F128]| {
-        for &cv2 in &xn[pw.len()..] {
-            let w = if cv2 == F128::ZERO {
-                zw
-            } else {
-                assert_eq!(cv2, F128::ONE, "constant point coord is a slot-prefix bit");
-                ow
-            };
-            pw.push((cv2, w));
-        }
-    };
     let mut xab_pw: Vec<(F128, Wire)> = vec![lc_pw[0]];
     xab_pw.extend_from_slice(&mlv_pw[1..1 + n_log_i]);
     xab_pw.extend_from_slice(&lc_pw[1..]);
-    extend_const(&mut xab_pw, &ct.x_ab_n);
+    walker_common::extend_const_coords(&mut xab_pw, &ct.x_ab_n, zw, ow);
     let (outer_ch_b, outer_fin_b) = ct.outer_b;
     let mut xc_pw: Vec<(F128, Wire)> = (0..ct.zc_rounds_b.len())
         .map(|k2| {
@@ -3101,7 +2778,7 @@ fn emit_anchor_expect(
             }
         })
         .collect();
-    extend_const(&mut xc_pw, &ct.x_c_n);
+    walker_common::extend_const_coords(&mut xc_pw, &ct.x_c_n, zw, ow);
     for (i2, (&(nv, _), &xn)) in xab_pw.iter().zip(&ct.x_ab_n).enumerate() {
         assert_eq!(nv, xn, "ab point coord {i2} is the located wire");
     }
@@ -3109,25 +2786,6 @@ fn emit_anchor_expect(
         assert_eq!(nv, xn, "c point coord {i2} is the located wire");
     }
 
-    // The residual region's prefix slot (width pf_w) carries every chunked
-    // (1 + a + b) product.
-    let prefix_product = |sb: &mut ShapeBuilder, factors: &[(Wire, Wire)]| -> Wire {
-        let mut seed = ow;
-        for chunk in factors.chunks(pf_w) {
-            let mut g_in = vec![seed];
-            for (a, _) in chunk {
-                g_in.push(*a);
-            }
-            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
-            for (_, b) in chunk {
-                g_in.push(*b);
-            }
-            g_in.extend(repeat_n(zw, pf_w - chunk.len()));
-            g_in.push(ow);
-            seed = sb.gate(pfslot, &g_in)[0];
-        }
-        seed
-    };
     // ĝ(ρ″): advice square-root chains for ρ^(2^-j), bound by forward
     // squaring deltas y·y + prev = 0.
     let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
@@ -3157,7 +2815,7 @@ fn emit_anchor_expect(
             .copied()
             .zip(mp_rho2_w.iter().copied())
             .collect();
-        let eqj = prefix_product(sb, &factors);
+        let eqj = walker_common::prefix_product(sb, pfslot, pf_w, zw, ow, &factors);
         ghat = sb.gate(spine, &[zw, zw, zw, ghat, zw, zw, mp_pws[j], eqj, zw])[3];
     }
     // e_at = eq(ρ, ρ″) for the group coefficients.
@@ -3167,7 +2825,7 @@ fn emit_anchor_expect(
             .copied()
             .zip(mp_rho2_w.iter().copied())
             .collect();
-        prefix_product(sb, &factors)
+        walker_common::prefix_product(sb, pfslot, pf_w, zw, ow, &factors)
     };
     // THE COUNT WIN: the counts used to enter the parent's circuit HERE —
     // per-run boundary eq products with the jagged run boundaries (the
