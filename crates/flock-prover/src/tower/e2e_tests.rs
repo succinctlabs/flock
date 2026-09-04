@@ -13,10 +13,10 @@ use flock_core::{
 use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
-        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online,
-        RootDischargeFailure, SpineIn, Tower, UnionInstance, build_chain_proof, build_fl_node,
-        build_node_outer_app, chain_blake_r1cs, chain_jagged_params, env_acc_chain_base,
-        env_acc_main_base, env_app_base, env_pass_base,
+        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, RootBundle,
+        RootDischargeFailure, SpineIn, Tower, TowerVerifyError, TowerVk, UnionInstance,
+        build_chain_proof, build_fl_node, build_node_outer_app, chain_blake_r1cs,
+        chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
         envelope::STEADY_OVERRIDE,
         envelope_shape,
         gates_blake3::Rng,
@@ -25,6 +25,7 @@ use crate::{
         node_jagged_params,
         online::{median_total, proof_census_mixed, report_stage},
         outer_union, pack4, test_config, tower_fold_grinding,
+        verify::{reassemble, verify_root},
     },
 };
 
@@ -1076,4 +1077,105 @@ pub(super) fn tower_driver_e2e() {
     tower
         .discharge_root()
         .expect("restored, the root discharges again");
+}
+
+/// **THE STANDALONE VERIFIER, END TO END.** [`TowerVk::generate`] proves
+/// the six-leaf reference tower once, then [`verify_root`] checks roots
+/// it never built: the VK's own k = 3 root, a fresh k = 4 steady tower,
+/// and a fresh k = 2 base-rooted tower — every table from the VK, every
+/// accumulator REASSEMBLED from the bundle's publics and cross-checked
+/// against the prover's own objects. Then the consumer-side refusals: a
+/// doctored public word dies in the proof verify, a wrong statement dies
+/// on the binding, a truncated bundle and a misfit span die on the
+/// guards.
+#[test]
+#[ignore] // Heavy — three towers (6+8+4 leaves) end to end.
+pub(super) fn tower_verify_root_e2e() {
+    let cfg = test_config();
+    let n_blocks = 256usize;
+    let vk = TowerVk::generate(cfg, n_blocks);
+
+    // (0) the VK's own reference root (k = 3, steady shape) verifies
+    // through the consumer path.
+    let own = *vk.tower.statement();
+    verify_root(&vk, &own, &vk.tower.root_bundle()).expect("the reference root verifies");
+
+    // (1) a fresh k = 4 steady tower the VK never saw.
+    let mut rng = Rng(0xD41_4E13);
+    let h0: [u32; 16] = from_fn(|_| rng.next_u32());
+    let tower = Tower::prove(cfg, h0, n_blocks, 8);
+    let stmt = *tower.statement();
+    verify_root(&vk, &stmt, &tower.root_bundle()).expect("the k = 4 root verifies");
+
+    // The reassembly cross-check: publics-decoded == the prover's own
+    // objects, all three blocks.
+    let (main, passenger, lane) =
+        reassemble(&tower.root.lo.public, &vk).expect("the root's blocks decode");
+    assert_eq!(main, tower.root.acc, "main acc, from publics alone");
+    assert_eq!(
+        &lane,
+        tower.root.lane_acc.as_ref().expect("lane"),
+        "chain lane, from publics alone"
+    );
+    assert_eq!(
+        passenger, tower.root.block.passenger,
+        "the passenger, from publics alone"
+    );
+
+    // (2) consumer-side refusals.
+    // A doctored public word dies in the PROOF verify, before any
+    // discharge sees it.
+    let mut bad = tower.root.lo.public.clone();
+    bad[tower.app_base + 4] += F128::ONE;
+    let bundle = RootBundle {
+        public: &bad,
+        proof: &tower.root.lo.proof,
+        commitment: &tower.root.lo.commitment,
+    };
+    assert!(
+        matches!(
+            verify_root(&vk, &stmt, &bundle),
+            Err(TowerVerifyError::Proof(_))
+        ),
+        "a doctored public word must die in the proof verify"
+    );
+    // A wrong statement (honest proof, different claim) dies on the
+    // statement binding.
+    let mut wrong = stmt;
+    wrong.h_end[0] ^= 1;
+    assert!(
+        matches!(
+            verify_root(&vk, &wrong, &tower.root_bundle()),
+            Err(TowerVerifyError::Discharge(RootDischargeFailure::Statement))
+        ),
+        "a wrong statement must die on the binding"
+    );
+    // A truncated public segment dies on the length guard.
+    let short = &tower.root.lo.public[..tower.root.lo.public.len() - 1];
+    let bundle = RootBundle {
+        public: short,
+        proof: &tower.root.lo.proof,
+        commitment: &tower.root.lo.commitment,
+    };
+    assert!(
+        matches!(
+            verify_root(&vk, &stmt, &bundle),
+            Err(TowerVerifyError::PublicsLength)
+        ),
+        "a truncated bundle must die on the length guard"
+    );
+    // A span that is not a whole number of leaf pairs dies on geometry.
+    let mut misfit = stmt;
+    misfit.n_blocks += 1;
+    assert!(
+        matches!(
+            verify_root(&vk, &misfit, &tower.root_bundle()),
+            Err(TowerVerifyError::Geometry)
+        ),
+        "a misfit span must die on geometry"
+    );
+
+    // (3) a fresh k = 2 base-rooted tower — the other root shape.
+    let t2 = Tower::prove(cfg, native_chain(&h0, 64), n_blocks, 4);
+    verify_root(&vk, t2.statement(), &t2.root_bundle()).expect("the k = 2 root verifies");
 }

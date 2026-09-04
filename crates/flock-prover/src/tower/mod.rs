@@ -19,6 +19,9 @@
 //!
 //! [`Tower::prove`] drives the three end to end — the production caller —
 //! and [`Tower::discharge_root`] settles the root-side residue.
+//! [`verify_root`] checks a root STANDALONE: a consumer holds only the
+//! statement and [`Tower::root_bundle`]'s artifacts, and every table
+//! comes from a [`TowerVk`] derived from config.
 //!
 //! Bench knobs (`CHAIN_BLOCKS`, `BENCH_RUNS`, `TOWER_STEADY`, and the
 //! test-only `TOWER_CONFIG=chain100`) live in the `#[test]` harness; the
@@ -44,6 +47,7 @@ pub use crate::tower::{
     fl_node::{FlNode, build_fl_node, build_fl_node_k},
     node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app},
     query::LeafOuter,
+    verify::{RootBundle, TowerVerifyError, TowerVk, verify_root},
 };
 use crate::{
     challenger::FsChallenger,
@@ -135,4 +139,5 @@ mod online;
 mod query;
 mod real_walker;
 mod tape;
+mod verify;
 mod walker_common;
