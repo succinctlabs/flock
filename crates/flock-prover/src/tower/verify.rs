@@ -46,6 +46,29 @@ pub struct RootBundle<'a> {
     pub(super) commitment: &'a Commitment,
 }
 
+/// What a green [`verify_root`] CERTIFIED about the claimed span. The
+/// ENDPOINTS (`h_start`, `h_end`) are always bound — they ride the app
+/// block the proof pins. The COUNT is bound only where the root's shape
+/// pins it: a base root folds exactly two leaf pairs, and a
+/// passenger-less steady root is exactly three (a deeper spine always
+/// carries its live orphan — the match-gate adversarial matrix is what
+/// closes the forged-fold escape). From four pairs on, the steady shape
+/// is depth-independent BY DESIGN (the spine's one-digest convergence),
+/// and the app block carries no count word — so within that class the
+/// count is CONSISTENT but not pinned. Binding it exactly means a count
+/// word in the app block, composed child-to-parent like the hash
+/// endpoints: a recorded protocol follow-up, not a verifier-side patch.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SpanBound {
+    /// The claimed `n_blocks` is pinned by the root's shape (two or
+    /// three leaf pairs).
+    Exact,
+    /// The endpoints are pinned and the count is consistent (a whole
+    /// number of leaf pairs, at least four) but NOT pinned within that
+    /// class.
+    EndpointsOnly,
+}
+
 /// Why [`verify_root`] refused.
 #[derive(Debug)]
 pub enum TowerVerifyError {
@@ -248,15 +271,20 @@ pub(super) fn reassemble(
 }
 
 /// **VERIFY A TOWER ROOT, STANDALONE.** Consumer inputs: the VK, the
-/// claimed statement, and the root bundle. Everything else — circuits,
-/// r1cs tables, jagged layouts, union counts, pcs params, the decode
-/// plan — comes from the VK; nothing in the bundle steers the check but
-/// the proof bytes themselves.
+/// claimed statement, and the root bundle. Every verifier MATERIAL —
+/// circuits, r1cs tables, jagged layouts, union counts, pcs params, the
+/// decode plan — comes from the VK; the bundle's publics, proof and
+/// commitment are the CLAIM being checked, never the tables it is
+/// checked against.
+///
+/// A green result is qualified by [`SpanBound`]: the endpoints are
+/// always certified, the count only up to the root's depth class — read
+/// its doc before treating `n_blocks` as verified.
 pub fn verify_root(
     vk: &TowerVk,
     statement: &ChainStatement,
     bundle: &RootBundle<'_>,
-) -> Result<(), TowerVerifyError> {
+) -> Result<SpanBound, TowerVerifyError> {
     // (1) geometry: the depth this statement claims, and which of the two
     // node shapes roots it (k = 2 is the base's; k >= 3 the steady's).
     let per_pair = 2 * vk.blocks_per_leaf;
@@ -304,5 +332,14 @@ pub fn verify_root(
     // VK's reference tower as the table owner.
     vk.tower
         .discharge_with(bundle.public, &lane, &main, &passenger, statement, k >= 4)
-        .map_err(TowerVerifyError::Discharge)
+        .map_err(TowerVerifyError::Discharge)?;
+
+    // (5) what the shape actually pinned: k = 2 and 3 are exact (base
+    // shape; passenger-less steady); k >= 4 certifies the endpoints and
+    // the class, not the count — see [`SpanBound`].
+    Ok(if k <= 3 {
+        SpanBound::Exact
+    } else {
+        SpanBound::EndpointsOnly
+    })
 }

@@ -47,7 +47,7 @@ pub use crate::tower::{
     fl_node::{FlNode, build_fl_node, build_fl_node_k},
     node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app},
     query::LeafOuter,
-    verify::{RootBundle, TowerVerifyError, TowerVk, verify_root},
+    verify::{RootBundle, SpanBound, TowerVerifyError, TowerVk, verify_root},
 };
 use crate::{
     challenger::FsChallenger,

@@ -14,7 +14,7 @@ use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
         ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, RootBundle,
-        RootDischargeFailure, SpineIn, Tower, TowerVerifyError, TowerVk, UnionInstance,
+        RootDischargeFailure, SpanBound, SpineIn, Tower, TowerVerifyError, TowerVk, UnionInstance,
         build_chain_proof, build_fl_node, build_node_outer_app, chain_blake_r1cs,
         chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
         envelope::STEADY_OVERRIDE,
@@ -1080,32 +1080,45 @@ pub(super) fn tower_driver_e2e() {
 }
 
 /// **THE STANDALONE VERIFIER, END TO END.** [`TowerVk::generate`] proves
-/// the six-leaf reference tower once, then [`verify_root`] checks roots
-/// it never built: the VK's own k = 3 root, a fresh k = 4 steady tower,
-/// and a fresh k = 2 base-rooted tower — every table from the VK, every
-/// accumulator REASSEMBLED from the bundle's publics and cross-checked
-/// against the prover's own objects. Then the consumer-side refusals: a
-/// doctored public word dies in the proof verify, a wrong statement dies
-/// on the binding, a truncated bundle and a misfit span die on the
-/// guards.
+/// the six-leaf reference tower once, then [`verify_root`] checks FRESH
+/// towers it never built at every depth class — k = 4 (steady, live
+/// passenger, span [`SpanBound::EndpointsOnly`]), k = 3 (steady,
+/// passenger-less, exact) and k = 2 (base-rooted, exact) — plus the VK's
+/// own reference root; every table from the VK, every accumulator
+/// REASSEMBLED from the bundle's publics and cross-checked against the
+/// prover's own objects. Then the consumer-side refusals: a doctored
+/// public word dies in the proof verify, a wrong statement on the
+/// binding, a truncated bundle and a misfit span on the guards, an
+/// unknown slot key in the decode, and a CROSS-CLASS span lie on the
+/// passenger rule — while the k >= 4 in-class span degeneracy is pinned
+/// as exactly what [`SpanBound::EndpointsOnly`] declares.
 #[test]
-#[ignore] // Heavy — three towers (6+8+4 leaves) end to end.
+#[ignore] // Heavy — four towers (6+8+6+4 leaves) end to end.
 pub(super) fn tower_verify_root_e2e() {
     let cfg = test_config();
     let n_blocks = 256usize;
+    let env = envelope_shape();
     let vk = TowerVk::generate(cfg, n_blocks);
 
     // (0) the VK's own reference root (k = 3, steady shape) verifies
     // through the consumer path.
     let own = *vk.tower.statement();
-    verify_root(&vk, &own, &vk.tower.root_bundle()).expect("the reference root verifies");
+    assert_eq!(
+        verify_root(&vk, &own, &vk.tower.root_bundle()).expect("the reference root verifies"),
+        SpanBound::Exact,
+        "a passenger-less steady root pins its span"
+    );
 
     // (1) a fresh k = 4 steady tower the VK never saw.
     let mut rng = Rng(0xD41_4E13);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let tower = Tower::prove(cfg, h0, n_blocks, 8);
     let stmt = *tower.statement();
-    verify_root(&vk, &stmt, &tower.root_bundle()).expect("the k = 4 root verifies");
+    assert_eq!(
+        verify_root(&vk, &stmt, &tower.root_bundle()).expect("the k = 4 root verifies"),
+        SpanBound::EndpointsOnly,
+        "a steady root with a live passenger certifies endpoints + class"
+    );
 
     // The reassembly cross-check: publics-decoded == the prover's own
     // objects, all three blocks.
@@ -1174,8 +1187,62 @@ pub(super) fn tower_verify_root_e2e() {
         ),
         "a misfit span must die on geometry"
     );
+    // A doctored slot KEY word dies in the decode: reassembly refuses a
+    // live keyed entry naming a circuit the VK does not know.
+    {
+        let uni_w = |c: &MatrixClaim| 2 + c.col.point.len() + c.row.point.len();
+        let mut key_at = env_acc_main_base(&env);
+        for (a, b) in tower
+            .root
+            .acc
+            .per_type
+            .iter()
+            .chain(tower.root.acc.per_element.iter())
+        {
+            key_at += uni_w(a) + uni_w(b);
+        }
+        let mut bad = tower.root.lo.public.clone();
+        bad[key_at] += F128::ONE;
+        assert!(
+            matches!(reassemble(&bad, &vk), Err(TowerVerifyError::UnknownKey)),
+            "an unknown slot key must be refused, not skipped"
+        );
+    }
+    // THE IN-CLASS SPAN DEGENERACY, pinned: an inflated k >= 4 claim over
+    // an honest k = 4 bundle still verifies — which is exactly why a
+    // green k >= 4 result says EndpointsOnly, never Exact. The count word
+    // in the app block is the recorded protocol follow-up.
+    let mut inflated = stmt;
+    inflated.n_blocks += 2 * 2 * n_blocks;
+    assert_eq!(
+        verify_root(&vk, &inflated, &tower.root_bundle())
+            .expect("the in-class span lie is not detectable today"),
+        SpanBound::EndpointsOnly,
+        "and the result says so"
+    );
 
-    // (3) a fresh k = 2 base-rooted tower — the other root shape.
+    // (3) a fresh k = 3 tower — steady shape, passenger-less, exact span.
+    let t3 = Tower::prove(cfg, native_chain(&h0, 128), n_blocks, 6);
+    assert_eq!(
+        verify_root(&vk, t3.statement(), &t3.root_bundle()).expect("the k = 3 root verifies"),
+        SpanBound::Exact,
+    );
+    // A CROSS-CLASS span lie dies on the passenger rule: the k = 3
+    // bundle claimed as k = 4 owes an orphan it does not carry.
+    let mut lied = *t3.statement();
+    lied.n_blocks += 2 * n_blocks;
+    assert!(
+        matches!(
+            verify_root(&vk, &lied, &t3.root_bundle()),
+            Err(TowerVerifyError::Discharge(RootDischargeFailure::Passenger))
+        ),
+        "a k = 3 bundle claimed steady-deep must die on the passenger"
+    );
+
+    // (4) a fresh k = 2 base-rooted tower — the other root shape.
     let t2 = Tower::prove(cfg, native_chain(&h0, 64), n_blocks, 4);
-    verify_root(&vk, t2.statement(), &t2.root_bundle()).expect("the k = 2 root verifies");
+    assert_eq!(
+        verify_root(&vk, t2.statement(), &t2.root_bundle()).expect("the k = 2 root verifies"),
+        SpanBound::Exact,
+    );
 }

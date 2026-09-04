@@ -12,11 +12,12 @@
 //!
 //! [`Tower::discharge_root`] settles the ROOT-SIDE RESIDUE: the carried
 //! accumulators against the native tables, the passenger against the
-//! base's own tables, the statement against the root's publics. It does
-//! NOT verify the root's own proof — that is the consuming verifier's
-//! call (`verify_circuit` over the root outer, the statement-tier helper
-//! the e2e tamper legs assemble). The root artifacts stay crate-internal
-//! until the standalone-verifier milestone decides what a consumer sees.
+//! base's own tables, the statement against the root's publics. It is
+//! the PROVER'S SELF-CHECK over its own in-memory objects — the
+//! consumer's check is `verify_root` over [`Tower::root_bundle`]'s
+//! artifacts, which re-runs these same legs over accumulators
+//! REASSEMBLED from the bundle's publics, after the native circuit
+//! verify.
 
 use flock_core::{
     aggregate::Accumulator, circuit::Circuit, lincheck::LincheckCircuit, matrix_fold::MatrixClaim,
@@ -40,6 +41,12 @@ use crate::tower::{
 
 /// What a tower run attests: `h_end == H^{n_blocks}(h_start)` over the
 /// BLAKE3 compression chain.
+///
+/// A standalone verifier pins the ENDPOINTS unconditionally but the
+/// COUNT only up to the root's depth class — the steady shape is
+/// depth-independent by design and the app block carries no count word.
+/// See `SpanBound` in the verify module before treating a verified
+/// `n_blocks` as exact.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ChainStatement {
     pub h_start: [u32; 16],

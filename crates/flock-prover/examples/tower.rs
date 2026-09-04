@@ -70,11 +70,12 @@ fn main() {
         let vk = TowerVk::generate(cfg, blocks_per_leaf);
         let gen_s = t2.elapsed().as_secs_f64();
         let t3 = Instant::now();
-        verify_root(&vk, s, &tower.root_bundle()).expect("the root verifies standalone");
+        let bound =
+            verify_root(&vk, s, &tower.root_bundle()).expect("the root verifies standalone");
         let verify_s = t3.elapsed().as_secs_f64();
         println!(
             "  VERIFIED STANDALONE (consumer path): vk generate {gen_s:.1}s (one-time) \
-             | verify_root {verify_s:.3}s"
+             | verify_root {verify_s:.3}s | span bound: {bound:?}"
         );
     }
 }
