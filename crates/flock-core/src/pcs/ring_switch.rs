@@ -1683,7 +1683,7 @@ pub(crate) fn deferred_dense_value(
 
 /// The bit-basis element with bit `t` set.
 #[inline]
-fn bit_basis(t: usize) -> F128 {
+pub(crate) fn bit_basis(t: usize) -> F128 {
     if t < 64 {
         F128::new(1u64 << t, 0)
     } else {

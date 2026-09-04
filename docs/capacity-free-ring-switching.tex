@@ -483,6 +483,139 @@ byte-identical proofs at a marginal cost of $12 / 18 / 26$\,ms; net of
 the restructure's own cost the integrated opening saves
 ${\approx}5$--$8$\,ms over composing the standalone parts.
 
+\section{The prover's transport: block-first rounds from column
+statistics}\label{sec:blockfirst}
+
+Sections~\ref{sec:merged}--\ref{sec:protocol} price the
+\emph{verifier's} side of the merged reduction. On the prover's side
+the reduction as first implemented materializes $W$ over the dense cube
+and runs the $m$ product-sumcheck rounds on the pair $(q, W)$: at
+$m = 25$ (the BLAKE3 union of $2^{18}$ compressions) that is a
+$2^{25}$-word weight build ($\approx 25$~ms, one fold-table
+application per word and claim) plus $2^{25}$-length rounds
+($\approx 21$~ms). Both are avoidable. The weight is a sum of
+\emph{rank-one} terms across a block/row split of the dense index, and
+the sumcheck may bind the block coordinates first: those rounds then
+need only $O(2^{k})$ \emph{block statistics} per term --- a Frobenius
+transform of a column bit-bank the lincheck already produces --- and
+the row rounds that follow run on a $2^{n+1}$-length pair. This is the
+``direct fold'' of a per-claim opening (fold the committed data by the
+claim's tensor, then open) recovered inside the batched protocol: the
+statistics \emph{are} the folded data, taken over lane blocks instead of
+over the whole cube, and the batching across claims survives because
+every claim contributes its own rank-one terms to one sumcheck.
+
+\paragraph{Predicate.} The rank-one split needs the column boundaries
+to respect the row cube: the transport below is used exactly when the
+committed stack is a \emph{full-height column prefix} --- columns
+$0..p{-}1$ of height $2^{n}$, every later column empty (in the code,
+\texttt{rectangular\_prefix\_columns}). This is the union at full
+utilization (identity compaction). Under partial utilization the
+jagged twist cuts rows and the materialized path stays; the predicate
+is public data, so prover, verifier and the recursive verifier agree on
+which order was used.
+
+\paragraph{The split.} Write the dense index as
+$d = e\cdot 2^{n+1} + c_0\cdot 2^{n} + r$: a \emph{block} $e \in
+\{0,1\}^{k-1}$ of two adjacent lane columns (the column's bits
+$1..k{-}1$), the column's low bit $c_0$, and the row $r \in
+\{0,1\}^{n}$. Since $\eq(z_{\mathrm c}, c) = \eq(z_{\mathrm c,0},
+c_0)\,\eq(z_{\mathrm c,1..}, e)$, a ring-switch claim's weight
+(Lemma~\ref{lem:restriction}) is, by the linearized form of $\Phi$,
+\[
+  W[e, c_0, r]
+  \;=\;
+  \mathbb{1}[2e{+}c_0 < p]\,
+  \sum_{j=0}^{127} c_j\;
+  u(e)^{2^j}\; v_{c_0}(r)^{2^j},
+  \qquad
+  u(e) = \eq(z_{\mathrm c,1..}, e),\;\;
+  v_{c_0}(r) = \eq(z_{\mathrm c,0}, c_0)\,\eq(z_{\mathrm r}, r),
+\]
+a sum of $256$ terms (over $j$ and $c_0$), each a product of a
+function of $e$ and a function of $(c_0, r)$. The live-prefix mask is a
+function of $(e, c_0)$ alone and is absorbed into the $e$-side factor
+$A_{j,c_0}(e) := c_j\,u(e)^{2^j}\,\mathbb{1}[2e{+}c_0 < p]$. A
+packed-direct claim (a scalar weight $\mathrm{cols}[c]\,\eq(z_{\mathrm
+r}, r)$) is two such terms, one per $c_0$. The mask matters: the
+verifier's $\widehat W(\rho)$ is the multilinear extension of the
+weight that is \emph{zero} past the live area, and the product
+sumcheck's messages see the weight at dead columns through the cross
+terms of each fold pair even though $q$ vanishes there.
+
+\paragraph{Block statistics.} For a term with row factor $B(c_0, r)$
+the $k{-}1$ block rounds need only $S(e) := \sum_{c_0, r} q[e, c_0, r]\,
+B(c_0, r)$ --- $2^{k-1}$ field elements. Writing $q[c, r] = \sum_b
+\mathrm{bit}_b(q[c,r])\,\beta_b$ over the bit basis and using that
+Frobenius fixes $\Ftwo$ and is additive,
+\[
+  S_{j,c_0}(e)
+  \;=\;
+  \sum_r q[2e{+}c_0, r]\; v_{c_0}(r)^{2^j}
+  \;=\;
+  \Bigl(\eq(z_{\mathrm c,0}, c_0)\sum_{b} \beta_b^{\,2^{-j}}\;
+        T[2e{+}c_0][b]\Bigr)^{2^j},
+  \qquad
+  T[c][b] := \sum_r \eq(z_{\mathrm r}, r)\,\mathrm{bit}_b(q[c, r]).
+\]
+$T$ is the \emph{column bit-bank} at the claim's row point: $128$
+values per lane column, $2^{k+7}$ in all. For the AB claim it is
+exactly the lincheck's own partial fold (the vector from which the
+ring switch's $\hat s_v$ is read), so the AB statistics cost nothing
+beyond a $128 \times 128$ transform per block; the C claim's row point
+is the zerocheck's, and its bank is one more stripe fold with the
+lincheck's kernel ($\approx 13$~ms at $m = 25$, outside the open). Given
+$T$, the $256$ statistics vectors of a claim cost $2^{k-1}\cdot 128^2$
+multiplications plus Frobenius powers --- $3.6$~ms for two claims.
+
+\paragraph{Rounds.} Rounds $0..k{-}2$ bind the block coordinates
+(LSB-first within $e$): each message is $\sum_{\text{terms}} \sum_{e}
+A(e)\,S(e)$ restricted to the usual odd/cross sums, and each fold halves
+every $A$ and $S$ table --- $O(256 \cdot 2^{k-1})$ work per round, no
+pass over $q$. After them $q$ is folded once over the bound
+coordinates, $q'[c_0, r] = \sum_{e} \eq(r_{\mathrm{blk}}, e)\, q[e,
+c_0, r]$ (one read of $q$), and the row-side weight is written in
+closed form on $2^{n+1}$ entries: the block factor folds into the
+coefficients,
+$c'_{j,c_0} = c_j \sum_{e:\,2e+c_0<p} \eq(r_{\mathrm{blk}}, e)\,
+\eq(z_{\mathrm c,1..}^{\,2^j}, e)$, and $c_0$ bakes
+$\eq(z_{\mathrm c,0}, c_0)^{2^j}$ into a per-$c_0$ byte table, so that
+$W'[c_0, r] = \sum_{\text{claims}} \Psi'_{c_0}(\eq(z_{\mathrm r}, r))
++ \sum_{\text{groups}} \mathrm{cols}'[c_0]\,\eq(z_{\mathrm r}, r)$ with
+$\Psi'_{c_0}$ the $\Ftwo$-linear map of linearized coefficients
+$c'_{j,c_0}\,\eq(z_{\mathrm c,0}, c_0)^{2^j}$. The remaining $n{+}1$
+rounds are the ordinary ones on $(q', W')$. The final evaluations
+$\hat q(\rho)$ and $\widehat W(\rho)$ are order-independent, so the
+only change downstream is bookkeeping: the challenges arrive in round
+order $(r_{\mathrm{blk}}, r_{\mathrm{row}})$ and are rotated into
+coordinate order $\rho = (r_{\mathrm{row}}, r_{\mathrm{blk}})$ before
+the assist and the inner opening. The verifier's running-claim chain
+is order-free; it applies the same rotation under the same predicate,
+as does the recursive verifier's replay. Proof size and the verifier's
+work are unchanged.
+
+\paragraph{Cost at $m = 25$ (BLAKE3, $2^{18}$ compressions,
+M1~Max, all cores).} The weight build ($25$~ms) is gone; the merged
+sumcheck falls from $46$~ms to $14$~ms ($3.6$ statistics $+\ 9.5$ block
+rounds, $q'$ and $W'$ $+\ 1$ row rounds). Two costs move against it: the
+C claim's bit-bank fold ($13.6$~ms, outside the open) and the loss of
+the statistics-ladder seed (the ladder's seeded term was the merged
+sumcheck's fold at $2^{\mathrm{initial}\_k}$ in \emph{its} coordinate
+order, which the block-first order no longer produces: $+4$~ms sweep).
+Measured in a paired, alternating A/B against the previous binary
+(three pairs, min of two runs each): the open drops from $137$~ms to
+$109$~ms and the whole proof by $\approx 15$~ms net of the C fold.
+
+\paragraph{What remains.} The row rounds still fold $(q', W')$ at
+$2^{n+1}$ and the inner Ligerito opening of $\hat q(\rho)$ still runs
+on the committed data; a full fusion --- carrying the block-first fold
+into the opening's own ladder so that the merged sumcheck's fold
+\emph{is} the opening's seed again, or taking the inner opening at the
+$\F_{2^{256}}$ point directly --- is the remaining step, and requires
+the assist at that point. The partial-utilization case would need the
+rank-one split under the jagged twist, which the twist does not admit
+column by column; there the materialized weight stays.
+
 \section{Implementation}\label{sec:eval}
 
 The construction is implemented in the Flock proof system (batch-hash

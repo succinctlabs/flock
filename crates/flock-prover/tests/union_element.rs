@@ -1317,7 +1317,7 @@ fn mixed_class_merged_proof_bytes_pinned() {
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "f3245ccbba7ab820b1013a56499dbf8a76a64b87268ef37a04ba450670bd36f5",
+            "29c86f0b9211babda7a64cb57456b3b7c76341ce470c773d0ed08ed211a37205",
         ),
         (
             "elem-merged-nu12-2731",

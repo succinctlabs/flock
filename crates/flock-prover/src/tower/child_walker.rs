@@ -31,6 +31,7 @@ pub(super) struct ChildTape<'p> {
     pub(super) start_v: usize,
     pub(super) gammas_o: Vec<PdRec>,
     pub(super) w_rounds: Vec<RoundRec>,
+    pub(super) w_coords: Vec<RoundRec>,
     pub(super) w_resid: Vec<RoundRec>,
     pub(super) mp_o: MpRec,
     pub(super) inner_pd2: InnerPd,
@@ -998,6 +999,19 @@ impl<'p> ChildTape<'p> {
             n_log_i,
             m_mp2,
         );
+        // Block-first transport (`pcs::open_batch_merged`): under a
+        // full-height column prefix the prover bound the k−1 block
+        // coordinates first. `w_rounds` stays in round order for the
+        // running-claim chain; `w_coords` is ρ in coordinate order.
+        let w_coords: Vec<RoundRec> = {
+            let mut v = w_rounds.clone();
+            if flock_core::pcs::rectangular_prefix_columns(&union.jagged_heights(), n_log_i)
+                .is_some()
+            {
+                v.rotate_left(m_mp2 - n_log_i - 1);
+            }
+            v
+        };
         let k_cols_i = params_i.k;
         let bounds_i = flock_core::pcs::jagged::assist_boundaries(&params_i);
         let n_runs = bounds_i.len();
@@ -1349,7 +1363,7 @@ impl<'p> ChildTape<'p> {
             for j in 1..257 + n_p {
                 gpow_n.push(gpow_n[j - 1] * gamma_n);
             }
-            let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
+            let rho_mrg_n: Vec<F128> = w_coords.iter().map(|rr| chals[rr.ch]).collect();
             let point_n: Vec<F128> = mp_o.rounds.iter().map(|rr| chals[rr.ch]).collect();
             let sig_n: Vec<F128> = mp_o.anchor_rounds.iter().map(|rr| chals[rr.ch]).collect();
             let bit = |b: bool| if b { F128::ONE } else { F128::ZERO };
@@ -1516,12 +1530,12 @@ impl<'p> ChildTape<'p> {
         let yr_len = proof.pcs_open().inner.ligerito.final_proof.yr.len() / 2;
         let lane_major = geo[0].row_words < geo[0].lanes;
         let w_resid: Vec<RoundRec> = if lane_major {
-            let k_rot = w_rounds.len() - levels[0].fold_fins.len();
-            let mut v = w_rounds[k_rot..].to_vec();
-            v.extend_from_slice(&w_rounds[..k_rot]);
+            let k_rot = w_coords.len() - levels[0].fold_fins.len();
+            let mut v = w_coords[k_rot..].to_vec();
+            v.extend_from_slice(&w_coords[..k_rot]);
             v
         } else {
-            w_rounds.to_vec()
+            w_coords.clone()
         };
 
         let z_ix = el_assert.as_ref().map(|assertion| {
@@ -1548,6 +1562,7 @@ impl<'p> ChildTape<'p> {
             start_v,
             gammas_o,
             w_rounds,
+            w_coords,
             w_resid,
             mp_o,
             inner_pd2,
@@ -1844,6 +1859,7 @@ pub(super) fn emit_child_region(
     let levels = &ct.levels[..];
     let geo = &ct.geo[..];
     let w_rounds = &ct.w_rounds[..];
+    let w_coords = &ct.w_coords[..];
     let mp_o = &ct.mp_o;
     let inner_pd2 = &ct.inner_pd2;
     // `None` for a boolean-only (chain) child: the element PIOP emission,
@@ -2436,8 +2452,8 @@ pub(super) fn emit_child_region(
     };
     // ĝ(ρ″): advice square-root chains for ρ^(2^-j), bound by forward
     // squaring deltas y·y + prev = 0.
-    let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
-    let rho_mrg_w: Vec<Wire> = w_rounds
+    let rho_mrg_n: Vec<F128> = w_coords.iter().map(|rr| chals[rr.ch]).collect();
+    let rho_mrg_w: Vec<Wire> = w_coords
         .iter()
         .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
         .collect();

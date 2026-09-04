@@ -81,6 +81,22 @@ use crate::field::F128;
 use crate::lincheck::build_eq_table;
 use serde::{Deserialize, Serialize};
 
+/// The block-first transport predicate (`pcs::open_batch_merged`): `Some(p)`
+/// when the committed stack is a full-height column prefix — columns `0..p`
+/// of height `2^n`, every later column empty. Public data, so prover and
+/// verifier agree on the coordinate order of the merged sumcheck.
+pub fn rectangular_prefix_columns(heights: &[u64], n: usize) -> Option<usize> {
+    if heights.len() < 2 || !heights.len().is_power_of_two() {
+        return None;
+    }
+    let full = 1u64 << n;
+    let p = heights
+        .iter()
+        .position(|&h| h != full)
+        .unwrap_or(heights.len());
+    (p >= 1 && heights[p..].iter().all(|&h| h == 0)).then_some(p)
+}
+
 /// Configuration of a jagged function: the (zero-padded to `2^k`) column
 /// heights, summarized as the cumulative-height prefix sums.
 #[derive(Clone, Debug)]

@@ -285,7 +285,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "ae19c381659e84562c829383f6b01137741b4e2ed29890daa555c332199d2f72";
+        const EXPECTED: &str = "03894da62e6a1100e040a22b89d94592e2a5752ae7da5b6814c44ddc0f4ad820";
         let n_blocks = 256usize;
         // The setup API IS the shipped single-slot union path since the
         // 2026-08-14 consolidation — the anchor pins it directly.
@@ -303,7 +303,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "3bddd36713d2b607a662ff96ad2ef4ace93fd91f0014e7f7b2ab1f44c668338c";
+        const EXPECTED: &str = "a59bfee0bc6160a050b027ba9dcbdb6e8afde09199958b2110576990a9f2d260";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

@@ -1154,22 +1154,20 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
             // column domain against the per-slot stripes and circuits. On the M1
             // single-type registries it is byte-identical to invoking the slot's
             // own lincheck (the union of one slot has m = M_bool = M).
-            let (lc_proof, lc_claim, z_vec_pre) = {
-                let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
-                    .iter()
-                    .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
-                        z_lincheck: stripe,
-                        circuit: *circuit,
-                    })
-                    .collect();
-                lincheck::prove_union_capture_z_vec_with_grinding(
-                    union,
-                    &lc_slots,
-                    &x_ab,
-                    pcs_params.lincheck_grinding(),
-                    challenger,
-                )
-            };
+            let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
+                .iter()
+                .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
+                    z_lincheck: stripe,
+                    circuit: *circuit,
+                })
+                .collect();
+            let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_union_capture_z_vec_with_grinding(
+                union,
+                &lc_slots,
+                &x_ab,
+                pcs_params.lincheck_grinding(),
+                challenger,
+            );
 
             let ab = ZClaim {
                 point: union.ab_claim_point(
@@ -1228,7 +1226,26 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
                     })
                 }
             };
-            (piop, R1csClaim { ab, c }, s_hat_v_ab, s_hat_v_c)
+            // Block-first transport inputs (`pcs::open_batch_merged`): the
+            // column bit-banks at both ring-switch claims' row points. AB's is
+            // the lincheck's own fold; C's row point is the zerocheck's, so it
+            // costs one more stripe fold — spent only when the open will use it.
+            let nu = union.n_log();
+            let banks = if pcs::rectangular_prefix_columns(&union.jagged_heights(), nu).is_some() {
+                let t_b = std::time::Instant::now();
+                assert!(zc_r_rest.len() >= 1 + nu, "C claim point too short");
+                let bank_c = lincheck::union_bitbank_fold(union, &lc_slots, &zc_r_rest[1..1 + nu]);
+                if std::env::var("PCS_TRACE").is_ok() {
+                    eprintln!(
+                        "  [prove_union] C-claim bit-bank fold: {:6.2} ms",
+                        t_b.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                Some((z_vec_pre, bank_c))
+            } else {
+                None
+            };
+            (piop, R1csClaim { ab, c }, s_hat_v_ab, s_hat_v_c, banks)
         })
     };
     let (boolean, wiring_pre) = if par_transcript {
@@ -1379,12 +1396,17 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
     let heights = union.jagged_heights();
     let t_h = t.elapsed().as_secs_f64() * 1e3;
     let t = std::time::Instant::now();
-    let (z_claims, pre): (Vec<ZClaim>, Vec<Option<&[F128]>>) = match &boolean {
-        Some((_, claim, s_hat_v_ab, s_hat_v_c)) => (
+    type Pre<'a> = Vec<Option<&'a [F128]>>;
+    let (z_claims, pre, banks): (Vec<ZClaim>, Pre<'_>, Pre<'_>) = match &boolean {
+        Some((_, claim, s_hat_v_ab, s_hat_v_c, banks)) => (
             vec![claim.ab.clone(), claim.c.clone()],
             vec![s_hat_v_ab.as_deref(), Some(s_hat_v_c.as_slice())],
+            match banks {
+                Some((ab, c)) => vec![Some(ab.as_slice()), Some(c.as_slice())],
+                None => vec![None, None],
+            },
         ),
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
     let t_z = t.elapsed().as_secs_f64() * 1e3;
     let t = std::time::Instant::now();
@@ -1427,6 +1449,7 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
         &commitment,
         &x_refs,
         &pre,
+        &banks,
         &packed_direct,
         &padding,
         &heights,
@@ -1469,7 +1492,7 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
 
     (
         UnionProveOutput {
-            boolean: boolean.map(|(piop, claim, _, _)| (piop, claim)),
+            boolean: boolean.map(|(piop, claim, _, _, _)| (piop, claim)),
             element,
             wiring,
             pcs_open,

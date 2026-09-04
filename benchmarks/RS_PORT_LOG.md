@@ -5542,3 +5542,70 @@ under a load spike). The array is SLC-resident and the top layers stay
 single-layer anyway, so there was ~0.3 ms in it. Reverted; not worth
 its 40 lines. Prove best in this run: **500.2 ms** (both arms; load
 had dropped to ~8), open ~136 ms.
+
+### LANDED: block-first merged sumcheck from column statistics (stage 1 of the direct transport) — open 137 → 109 ms MT — 2026-09-04
+
+The merged reduction's prover side materialized the twisted weight W
+over the dense cube (2^25 words, 25 ms) and ran 25 rounds on (q, W)
+(21 ms). Neither is necessary when the committed stack is a
+full-height column prefix (identity compaction — the union at full
+utilization; `jagged::rectangular_prefix_columns`, public data):
+split the dense index as (block e of two lane columns | column bit c0
+| row r). Every ring-switch weight is then a sum of 256 RANK-1 terms
+`c_j · u(e)^{2^j} · (eq(z_col0,c0)·eq(z_row,r))^{2^j}` (linearized Φ +
+the eq tensor factoring over column bit 0 vs bits 1..6), masked to the
+live prefix on the e side, and a packed-direct group is two more. The
+first k−1 = 6 rounds bind the block coordinates from O(64) BLOCK
+STATISTICS per term, `S_{j,c0}[e] = (eq(z_col0,c0)·Σ_b β_b^{2^-j}
+T[2e+c0][b])^{2^j}`, where T is the column bit-bank
+`T[c][b] = Σ_r eq(z_row,r)·bit_b(q[c,r])` — for the AB claim exactly
+the lincheck's `z_vec` (free); for the C claim one more stripe fold at
+the zerocheck's row point (`lincheck::union_bitbank_fold`, 12.6 ms,
+outside the open). After the block rounds q is folded once over the
+bound coordinates (one read of q) and W′ is written in closed form on
+2^19 entries (block factor into the linearized coefficients, c0 into
+per-c0 byte tables); the 19 row rounds run on (q′, W′). ρ arrives in
+round order (blk, row) and is rotated into coordinate order before the
+assist/inner open; the verifier (`verify_batch_merged_core`) and the
+tower's replay (`child_walker.rs`: `w_coords` beside the round-order
+`w_rounds`) apply the same rotation under the same predicate. Proof
+size and verifier work unchanged. Doc: new §"The prover's transport:
+block-first rounds from column statistics" in
+`docs/capacity-free-ring-switching.tex`.
+
+Bug found on the way (caught by `element_only_union_roundtrip`,
+PcsOpen(VirtualOpen)): the scalar-group terms were unmasked past the
+live prefix. The verifier's Ŵ(ρ) is the MLE of the weight that is
+ZERO past the area, and the product sumcheck's messages see W at dead
+columns through each fold pair's cross terms even though q vanishes
+there — the mask is exact, not cosmetic. The prover's own debug oracle
+(`v == w_eval`) does not catch it; only the chain does.
+
+Costs (PCS_TRACE, m=32 MT): block statistics 3.6, block rounds + q′ +
+W′ 9.5, row rounds ~1 → merged sumcheck 14 ms (was 25 + 21). Against
+it: the C-claim bank fold 12.6 and the lost statistics-ladder seed
+(the seeded term was the merged sumcheck's fold at 2^19 in ITS
+coordinate order, which the block-first order no longer produces:
+ladder sweep 6.8 → 10.7).
+
+Alternating vs the HEAD binary (base4), m=32 MT, warm min, 3 pairs:
+
+| pair | new open / cfold / total | HEAD open / total |
+|---|---|---|
+| 1 | 109.5 / 12.6 / 510.8 | 137.3 / 539.4 |
+| 2 | 108.8 / 12.4 / 504.1 | 136.5 / 550.6 |
+| 3 | 108.2 / 12.7 / 511.1 | 136.7 / 518.5 |
+
+Open −28 ms 3/3; net of the C fold ≈ −15 expected, totals −27 mean
+(noisy at ±15). Prove best **504.1 ms**. Pins moved (full-utilization
+layouts only, as predicted): `merged-anchor-blake3-m22`,
+`merged-anchor-sha2-m22`, `elem-merged-nu12-full`; the partial
+fixtures and the transcript shape are byte-identical. Gates: fmt
+clean, workspace (release) 638 passed / 0 failed, tower e2e
+`chain_tower_e2e_with_lane` (--ignored) ok with the rotation, x86
+check ok.
+
+Next (stage 2, parked): re-seed the ladder from the block-first fold
+(the 2^19 q′ IS a fold of q over the top coordinates — the ladder
+wants the fold over its own initial coordinates; check which six it
+binds), and the full fusion (inner open at the F256 point).
