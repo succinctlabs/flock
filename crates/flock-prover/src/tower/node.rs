@@ -874,7 +874,7 @@ pub fn build_node_outer_app(
                 assert_eq!(
                     r.tail_schedule,
                     expected_real_tail_schedule(rt),
-                    "the real child's tail publishes on its declared schedule"
+                    "real child {i}'s tail publishes on its declared schedule"
                 );
                 r
             })

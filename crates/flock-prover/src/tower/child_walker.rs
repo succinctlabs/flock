@@ -1853,8 +1853,6 @@ pub(super) enum ZskipWires {
     Ag { seed_w: [Wire; 2], nonce_w: Wire },
 }
 
-/// What one emitted child region hands back: where its public block starts,
-/// the walk counts the checker needs, and the assertion-emission wires.
 /// The child tail's EXPECTED publish schedule, every width an expression
 /// over the TAPE's own geometry — the independent reference the emitted
 /// table ([`ChildRegion::tail_schedule`]) is held against at every build.
@@ -1883,6 +1881,8 @@ pub(super) fn expected_child_tail_schedule(ct: &ChildTape<'_>) -> Vec<(&'static 
     ]
 }
 
+/// What one emitted child region hands back: where its public block starts,
+/// the walk counts the checker needs, and the assertion-emission wires.
 pub(super) struct ChildRegion {
     pub(super) pub_base: usize,
     pub(super) n_query_pub: usize,
@@ -2034,7 +2034,7 @@ pub(super) fn emit_child_region(
 
     assert_eq!(
         ct.mp_o.val_vs.len(),
-        256 + ct.n_p,
+        2 * RS_SHAT_WORDS + ct.n_p,
         "the R=2 + P schedule spans both claim kinds"
     );
     let (mp_pws, mp_rho2_w, mp_sig_w, anc_w) = walker_common::emit_multipoint_intake(

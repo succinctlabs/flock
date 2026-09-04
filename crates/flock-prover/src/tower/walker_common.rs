@@ -540,10 +540,10 @@ pub(super) fn family_h_source_wires(
 ) -> ([Vec<Wire>; 2], [Vec<Wire>; 2], [Vec<Wire>; 2], [Wire; 2]) {
     let shv_w: [Vec<Wire>; 2] = from_fn(|k| {
         let sv = rs_recs[k].0;
-        (0..128).map(|i| wv(sv + i)).collect()
+        (0..RS_SHAT_WORDS).map(|i| wv(sv + i)).collect()
     });
     let value_w: [Vec<Wire>; 2] = from_fn(|k| {
-        val_vs[128 * k..128 * (k + 1)]
+        val_vs[RS_SHAT_WORDS * k..RS_SHAT_WORDS * (k + 1)]
             .iter()
             .map(|&vi| wv(vi))
             .collect()
@@ -643,8 +643,9 @@ pub(super) const RS_SHAT_WORDS: usize = 128;
 /// publishes, in order. A walker's tail is a `Vec<TailEntry>` — THE
 /// PUBLISH SCHEDULE AS DATA: [`publish_tail`] iterates it, `n_tail` is
 /// its width sum (never a hand-maintained closed form), and the schedule
-/// `(name, width)` list lands in the region output so the tape-pin tests
-/// hold it against independent width expressions. The two walkers keep
+/// `(name, width)` list lands in the region output, where EVERY BUILD
+/// asserts it against independent width expressions over the tape's own
+/// geometry (`expected_*_tail_schedule`). The two walkers keep
 /// SEPARATE tables (their publish orders differ deliberately), and the
 /// `check_*` walks stay positionally independent of the table — the
 /// checker re-deriving every offset by hand is the soundness backstop

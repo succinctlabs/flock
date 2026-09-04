@@ -1458,9 +1458,6 @@ fn parse_anchor_boolean_replica(
     }
 }
 
-/// What one emitted REAL child region hands back: where its public block
-/// starts, the walk counts, and the assertion-emission wires the 2→1 merge
-/// node CONNECTS the fold region's claim words to — all three families.
 /// The real tail's EXPECTED publish schedule, every width an expression
 /// over the TAPE's own geometry and the proof object — the same
 /// formulas the checker's positional walk consumes by — the independent
@@ -1503,6 +1500,9 @@ pub(super) fn expected_real_tail_schedule(rt: &RealTape<'_>) -> Vec<(&'static st
     ]
 }
 
+/// What one emitted REAL child region hands back: where its public block
+/// starts, the walk counts, and the assertion-emission wires the 2→1 merge
+/// node CONNECTS the fold region's claim words to — all three families.
 pub(super) struct RealRegion {
     pub(super) pub_base: usize,
     pub(super) n_query_pub: usize,
@@ -3119,7 +3119,10 @@ pub(super) fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &Re
     for (j, &z) in rt.mat_assert.z_partial.iter().enumerate() {
         assert_eq!(public[mq + j], z, "z_partial {j} published");
     }
-    mq += Z_PARTIAL_WORDS;
+    // The checker's offsets stay LITERAL on purpose: this walk is the
+    // backstop that falsifies a wrong schedule constant, so it must not
+    // share one with the emitter.
+    mq += 64;
     assert_eq!(
         public[mq], rt.mat_assert.target,
         "the in-circuit boolean lc replay ends at the assertion's target"
