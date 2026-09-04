@@ -1142,14 +1142,16 @@ pub(super) fn tower_verify_root_e2e() {
     assert_eq!(stmt_wire, stmt, "the statement rode the wire");
     assert_eq!(bound, SpanBound::EndpointsOnly);
     // A corrupted payload byte must not verify — the decode or the proof
-    // refuses, and both are refusals.
-    let mut corrupt = bytes.clone();
-    let mid = corrupt.len() / 2;
-    corrupt[mid] ^= 1;
-    assert!(
-        verify_root_bytes(&vk, &corrupt).is_err(),
-        "a corrupted wire bundle must be refused"
-    );
+    // refuses, and both are refusals. One flip in the proof body's
+    // region, one in the early tags/statement region.
+    for at in [bytes.len() / 2, 8usize] {
+        let mut corrupt = bytes.clone();
+        corrupt[at] ^= 1;
+        assert!(
+            verify_root_bytes(&vk, &corrupt).is_err(),
+            "a corrupted wire bundle (byte {at}) must be refused"
+        );
+    }
     // Truncation dies in the decode.
     assert!(
         matches!(

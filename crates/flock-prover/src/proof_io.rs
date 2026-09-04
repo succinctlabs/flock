@@ -1,9 +1,12 @@
 //! Serialize / deserialize proofs to bytes (and files).
 //!
-//! Two bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof and
-//! [`MixedProofBundleLigerito`] for the multi-table mixed proof. Both pair a
-//! proof with its commitment (which the verifier needs); the mixed bundle
-//! additionally carries its registry id + counts vector.
+//! Three bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof,
+//! [`MixedProofBundleLigerito`] for the multi-table mixed proof, and
+//! [`TowerRootBundle`] for a recursion-tower root. All pair a proof with its
+//! commitment (which the verifier needs); the mixed bundle additionally
+//! carries its registry id + counts vector, the tower bundle its statement
+//! and VK-selection tags (file transport for it lands with its CLI
+//! consumer — today it travels as bytes via `verify_root_bytes`).
 //!
 //! On-disk format:
 //! ```text
@@ -217,9 +220,10 @@ impl MixedProofBundleLigerito {
 /// outer's transportable part (publics, commitment, proof), tagged with
 /// the tower config and leaf size so a consumer selects — and
 /// cross-checks — the right verification key. The statement rides the
-/// payload for transport; `verify_root_bytes` re-checks every word of it
-/// against the proof, so nothing here is trusted (the span caveat of the
-/// verify module's `SpanBound` applies verbatim).
+/// payload for transport; NOTHING decoded here is trusted, and a bare
+/// `from_bytes` proves nothing — `verify_root_bytes` is the ONE entry
+/// that returns a statement with its qualification (the span caveat of
+/// the verify module's `SpanBound` applies verbatim).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TowerRootBundle {
     pub config: TowerConfig,
@@ -241,22 +245,6 @@ impl TowerRootBundle {
         let payload = parse_header(bytes, FLAVOR_TOWER_ROOT)?;
         deserialize_payload(payload)
     }
-}
-
-/// Write a tower-root bundle to `path`.
-pub fn write_tower_root_bundle_to_file<P: AsRef<Path>>(
-    path: P,
-    bundle: &TowerRootBundle,
-) -> IoResult<()> {
-    write_bytes_to_file(path, &bundle.to_bytes())
-}
-
-/// Read a tower-root bundle from `path`.
-pub fn read_tower_root_bundle_from_file<P: AsRef<Path>>(
-    path: P,
-) -> Result<TowerRootBundle, BundleReadError> {
-    let bytes = read_bytes_from_file(path).map_err(BundleReadError::Io)?;
-    TowerRootBundle::from_bytes(&bytes).map_err(BundleReadError::Deserialize)
 }
 
 /// Write a mixed bundle to `path`.
@@ -416,8 +404,9 @@ mod tests {
         mixed::{MixedCounts, MixedRegistryId, MixedSetup},
         proof_io::{
             BundleFlavor, DeserializeError, FLAVOR_MIXED_LIGERITO, FLAVOR_R1CS_LIGERITO,
-            HEADER_LEN, MAGIC, MAX_BUNDLE_BYTES, MixedProofBundleLigerito, R1csProofBundleLigerito,
-            VERSION, check_bundle_size, deserialize_payload, peek_flavor, read_bytes_from_file,
+            FLAVOR_TOWER_ROOT, HEADER_LEN, MAGIC, MAX_BUNDLE_BYTES, MixedProofBundleLigerito,
+            R1csProofBundleLigerito, TowerRootBundle, VERSION, check_bundle_size,
+            deserialize_payload, peek_flavor, read_bytes_from_file,
             read_mixed_bundle_ligerito_from_file, write_bytes_to_file,
             write_mixed_bundle_ligerito_to_file,
         },
@@ -653,6 +642,7 @@ mod tests {
         for (flavor, expect) in [
             (FLAVOR_R1CS_LIGERITO, BundleFlavor::R1cs),
             (FLAVOR_MIXED_LIGERITO, BundleFlavor::Mixed),
+            (FLAVOR_TOWER_ROOT, BundleFlavor::TowerRoot),
         ] {
             bytes[6] = flavor;
             assert!(matches!(peek_flavor(&bytes), Ok(f) if f == expect));
@@ -665,6 +655,16 @@ mod tests {
             Err(DeserializeError::FlavorMismatch {
                 expected: FLAVOR_MIXED_LIGERITO,
                 found: FLAVOR_R1CS_LIGERITO
+            })
+        ));
+
+        // Mixed-flavored header read as a tower root: flavor mismatch.
+        bytes[6] = FLAVOR_MIXED_LIGERITO;
+        assert!(matches!(
+            TowerRootBundle::from_bytes(&bytes),
+            Err(DeserializeError::FlavorMismatch {
+                expected: FLAVOR_TOWER_ROOT,
+                found: FLAVOR_MIXED_LIGERITO
             })
         ));
 
