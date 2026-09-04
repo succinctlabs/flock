@@ -9,7 +9,7 @@
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
 //!   byte  5       VERSION                  (currently 22)
-//!   bytes 6..7    flavor: 2 = R1cs, 4 = Mixed
+//!   bytes 6..7    flavor: 2 = R1cs, 4 = Mixed, 5 = TowerRoot
 //!                 (0/1 reserved: legacy BaseFold; 3 was the retired chain)
 //!   bytes 7..     bincode-serialized payload
 //! ```
@@ -40,9 +40,13 @@ use std::{
 
 use bincode::{DefaultOptions, Error as BincodeError, Options, serialize_into};
 use flock_core::{pcs::Commitment, proof::R1csProofMergedLigerito};
+use flock_field::F128;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::mixed::MixedRegistryId;
+use crate::{
+    mixed::MixedRegistryId,
+    tower::{ChainStatement, MixedProof, TowerConfig},
+};
 
 /// Magic bytes prepended to every serialized proof. Lets readers reject
 /// random binary data early.
@@ -69,6 +73,7 @@ const VERSION: u8 = 22;
 /// [`peek_flavor`]). Values 0, 1, and 3 are reserved.
 const FLAVOR_R1CS_LIGERITO: u8 = 2;
 const FLAVOR_MIXED_LIGERITO: u8 = 4;
+const FLAVOR_TOWER_ROOT: u8 = 5;
 
 /// What kind of bundle a byte buffer holds. Returned by [`peek_flavor`] so
 /// generic readers (the CLI) can dispatch before parsing the payload.
@@ -76,6 +81,9 @@ const FLAVOR_MIXED_LIGERITO: u8 = 4;
 pub enum BundleFlavor {
     R1cs,
     Mixed,
+    /// A recursion-tower ROOT: statement + root outer proof/publics/
+    /// commitment — what `verify_root_bytes` consumes.
+    TowerRoot,
 }
 
 /// Validate the header (magic + version) and return the bundle flavor,
@@ -94,6 +102,7 @@ pub fn peek_flavor(bytes: &[u8]) -> Result<BundleFlavor, DeserializeError> {
     match bytes[6] {
         FLAVOR_R1CS_LIGERITO => Ok(BundleFlavor::R1cs),
         FLAVOR_MIXED_LIGERITO => Ok(BundleFlavor::Mixed),
+        FLAVOR_TOWER_ROOT => Ok(BundleFlavor::TowerRoot),
         other => Err(DeserializeError::UnknownFlavor(other)),
     }
 }
@@ -109,8 +118,8 @@ pub enum DeserializeError {
     /// The version byte didn't match this build's `VERSION`. The number is
     /// the version found in the file.
     UnsupportedVersion(u8),
-    /// The flavor byte was neither `2` (R1cs Ligerito) nor `4` (Mixed
-    /// Ligerito).
+    /// The flavor byte was none of `2` (R1cs Ligerito), `4` (Mixed
+    /// Ligerito), `5` (TowerRoot).
     UnknownFlavor(u8),
     /// `from_bytes` was called with a slice shorter than `HEADER_LEN`.
     Truncated,
@@ -204,6 +213,52 @@ impl MixedProofBundleLigerito {
     }
 }
 
+/// Bundles a recursion-tower ROOT: the claimed statement plus the root
+/// outer's transportable part (publics, commitment, proof), tagged with
+/// the tower config and leaf size so a consumer selects — and
+/// cross-checks — the right verification key. The statement rides the
+/// payload for transport; `verify_root_bytes` re-checks every word of it
+/// against the proof, so nothing here is trusted (the span caveat of the
+/// verify module's `SpanBound` applies verbatim).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TowerRootBundle {
+    pub config: TowerConfig,
+    pub blocks_per_leaf: u64,
+    pub statement: ChainStatement,
+    pub public: Vec<F128>,
+    pub commitment: Commitment,
+    pub(crate) proof: MixedProof,
+}
+
+impl TowerRootBundle {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        write_header(&mut out, FLAVOR_TOWER_ROOT);
+        serialize_into(&mut out, self).expect("bincode serialize TowerRootBundle");
+        out
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
+        let payload = parse_header(bytes, FLAVOR_TOWER_ROOT)?;
+        deserialize_payload(payload)
+    }
+}
+
+/// Write a tower-root bundle to `path`.
+pub fn write_tower_root_bundle_to_file<P: AsRef<Path>>(
+    path: P,
+    bundle: &TowerRootBundle,
+) -> IoResult<()> {
+    write_bytes_to_file(path, &bundle.to_bytes())
+}
+
+/// Read a tower-root bundle from `path`.
+pub fn read_tower_root_bundle_from_file<P: AsRef<Path>>(
+    path: P,
+) -> Result<TowerRootBundle, BundleReadError> {
+    let bytes = read_bytes_from_file(path).map_err(BundleReadError::Io)?;
+    TowerRootBundle::from_bytes(&bytes).map_err(BundleReadError::Deserialize)
+}
+
 /// Write a mixed bundle to `path`.
 pub fn write_mixed_bundle_ligerito_to_file<P: AsRef<Path>>(
     path: P,
@@ -243,7 +298,10 @@ fn parse_header(bytes: &[u8], expected_flavor: u8) -> Result<&[u8], DeserializeE
         return Err(DeserializeError::UnsupportedVersion(v));
     }
     let flavor = bytes[6];
-    if flavor != FLAVOR_R1CS_LIGERITO && flavor != FLAVOR_MIXED_LIGERITO {
+    if flavor != FLAVOR_R1CS_LIGERITO
+        && flavor != FLAVOR_MIXED_LIGERITO
+        && flavor != FLAVOR_TOWER_ROOT
+    {
         return Err(DeserializeError::UnknownFlavor(flavor));
     }
     if flavor != expected_flavor {

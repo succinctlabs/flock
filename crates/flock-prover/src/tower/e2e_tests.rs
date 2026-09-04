@@ -14,8 +14,8 @@ use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
         ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, RootBundle,
-        RootDischargeFailure, SpanBound, SpineIn, Tower, TowerVerifyError, TowerVk, UnionInstance,
-        build_chain_proof, build_fl_node, build_node_outer_app, chain_blake_r1cs,
+        RootDischargeFailure, SpanBound, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
+        UnionInstance, build_chain_proof, build_fl_node, build_node_outer_app, chain_blake_r1cs,
         chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
         envelope::STEADY_OVERRIDE,
         envelope_shape,
@@ -25,7 +25,7 @@ use crate::{
         node_jagged_params,
         online::{median_total, proof_census_mixed, report_stage},
         outer_union, pack4, test_config, tower_fold_grinding,
-        verify::{reassemble, verify_root},
+        verify::{reassemble, verify_root, verify_root_bytes},
     },
 };
 
@@ -1135,6 +1135,30 @@ pub(super) fn tower_verify_root_e2e() {
         "the passenger, from publics alone"
     );
 
+    // THE WIRE: the same k = 4 root as bytes — decode, VK cross-check,
+    // full verify; the statement comes back with its qualification.
+    let bytes = tower.root_bundle_bytes();
+    let (stmt_wire, bound) = verify_root_bytes(&vk, &bytes).expect("the wire bundle verifies");
+    assert_eq!(stmt_wire, stmt, "the statement rode the wire");
+    assert_eq!(bound, SpanBound::EndpointsOnly);
+    // A corrupted payload byte must not verify — the decode or the proof
+    // refuses, and both are refusals.
+    let mut corrupt = bytes.clone();
+    let mid = corrupt.len() / 2;
+    corrupt[mid] ^= 1;
+    assert!(
+        verify_root_bytes(&vk, &corrupt).is_err(),
+        "a corrupted wire bundle must be refused"
+    );
+    // Truncation dies in the decode.
+    assert!(
+        matches!(
+            verify_root_bytes(&vk, &bytes[..bytes.len() - 9]),
+            Err(TowerVerifyError::Encoding(_))
+        ),
+        "a truncated wire bundle must die in the decode"
+    );
+
     // (2) consumer-side refusals.
     // A doctored public word dies in the PROOF verify, before any
     // discharge sees it.
@@ -1246,3 +1270,61 @@ pub(super) fn tower_verify_root_e2e() {
         SpanBound::Exact,
     );
 }
+
+/// **THE VK'S PUBLISHED IDENTITY, PINNED** (chain128 @ 256-block
+/// leaves): the digest fingerprint a consumer compares their locally
+/// generated VK against instead of trusting a shipped blob. Any
+/// deliberate shape change moves these — re-bless with
+/// `TOWER_VK_FP_PRINT=1 ... --nocapture`, two identical prints before
+/// committing, per the fixture discipline.
+#[test]
+#[ignore] // Heavy — one VK generation (a six-leaf reference tower).
+pub(super) fn tower_vk_fingerprint_pinned() {
+    let cfg = test_config();
+    if cfg != TowerConfig::Chain128 {
+        eprintln!("the fingerprint pin is chain128-only; skipping under {cfg:?}");
+        return;
+    }
+    let vk = TowerVk::generate(cfg, 256);
+    let fp = vk.fingerprint();
+    let hex = |d: &[u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    if var("TOWER_VK_FP_PRINT").is_ok() {
+        println!("chain_circuit:  {}", hex(&fp.chain_circuit));
+        println!("fl_circuit:     {}", hex(&fp.fl_circuit));
+        println!("base_circuit:   {}", hex(&fp.base_circuit));
+        println!("steady_circuit: {}", hex(&fp.steady_circuit));
+        println!("chain_registry: {}", hex(&fp.chain_registry));
+        println!("outer_registry: {}", hex(&fp.outer_registry));
+        println!("publics_len:    {}", fp.publics_len);
+    }
+    assert_eq!(fp.blocks_per_leaf, 256);
+    assert_eq!(hex(&fp.chain_circuit), PIN_CHAIN_CIRCUIT, "chain circuit");
+    assert_eq!(hex(&fp.fl_circuit), PIN_FL_CIRCUIT, "FL circuit");
+    assert_eq!(hex(&fp.base_circuit), PIN_BASE_CIRCUIT, "base circuit");
+    assert_eq!(
+        hex(&fp.steady_circuit),
+        PIN_STEADY_CIRCUIT,
+        "steady circuit"
+    );
+    assert_eq!(
+        hex(&fp.chain_registry),
+        PIN_CHAIN_REGISTRY,
+        "chain registry"
+    );
+    assert_eq!(
+        hex(&fp.outer_registry),
+        PIN_OUTER_REGISTRY,
+        "outer registry"
+    );
+    assert_eq!(fp.publics_len, PIN_PUBLICS_LEN, "publics length");
+}
+
+// The blessed chain128@256 fingerprint (see `tower_vk_fingerprint_pinned`).
+// Blessed 2026-09-04: two identical prints at the M3 wire-format tip.
+const PIN_CHAIN_CIRCUIT: &str = "b8f442da32b9961612ccaf9acb39cadcd4592e913b2b208a1b9740d01c10e9c9";
+const PIN_FL_CIRCUIT: &str = "d272428abed26bd2685078eca64f265c0a5362d6e42f4392e83c9c36af4fcfa1";
+const PIN_BASE_CIRCUIT: &str = "3cec36dc2c40c45020105e2144880623e4f87a0a8263922dde172006a3233e51";
+const PIN_STEADY_CIRCUIT: &str = "8ce5ce16dfb72069aa81e673bd0f0676c2271954a963b086d84a23574fc9c0e2";
+const PIN_CHAIN_REGISTRY: &str = "3126c5ce825e8fc3942843c0548ba43964b1daa5751a834fcbbc1c3ab58e40fe";
+const PIN_OUTER_REGISTRY: &str = "acfbc7354af8436af480ea66609bb9b1cd0856b27426db2b4d8a69fe9014c10e";
+const PIN_PUBLICS_LEN: usize = 5684;
