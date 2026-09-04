@@ -12,17 +12,20 @@
 //!
 //! [`Tower::discharge_root`] settles the ROOT-SIDE RESIDUE: the carried
 //! accumulators against the native tables, the passenger against the
-//! base's own tables, the statement against the root's publics. It does
-//! NOT verify the root's own proof — that is the consuming verifier's
-//! call (`verify_circuit` over the root outer, the statement-tier helper
-//! the e2e tamper legs assemble). The root artifacts stay crate-internal
-//! until the standalone-verifier milestone decides what a consumer sees.
+//! base's own tables, the statement against the root's publics. It is
+//! the PROVER'S SELF-CHECK over its own in-memory objects — the
+//! consumer's check is `verify_root` over [`Tower::root_bundle`]'s
+//! artifacts, which re-runs these same legs over accumulators
+//! REASSEMBLED from the bundle's publics, after the native circuit
+//! verify.
 
 use flock_core::{
-    aggregate::Accumulator, circuit::Circuit, lincheck::LincheckCircuit, pcs::jagged::JaggedParams,
+    aggregate::Accumulator, circuit::Circuit, lincheck::LincheckCircuit, matrix_fold::MatrixClaim,
+    pcs::jagged::JaggedParams,
 };
 
 use crate::tower::{
+    F128,
     chain::{ChainProof, build_chain_proof},
     config::TowerConfig,
     fl_node::{FlNode, build_fl_node, chain_blake_r1cs, chain_jagged_params},
@@ -33,10 +36,17 @@ use crate::tower::{
     },
     online::census_kib,
     query::leaf_boolean_mats,
+    verify::RootBundle,
 };
 
 /// What a tower run attests: `h_end == H^{n_blocks}(h_start)` over the
 /// BLAKE3 compression chain.
+///
+/// A standalone verifier pins the ENDPOINTS unconditionally but the
+/// COUNT only up to the root's depth class — the steady shape is
+/// depth-independent by design and the app block carries no count word.
+/// See `SpanBound` in the verify module before treating a verified
+/// `n_blocks` as exact.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ChainStatement {
     pub h_start: [u32; 16],
@@ -254,20 +264,60 @@ impl Tower {
     /// 4. the PASSENGER — the spine's single orphan — against the base's
     ///    own tables, owed exactly when the root is steady.
     pub fn discharge_root(&self) -> Result<(), RootDischargeFailure> {
+        self.discharge_with(
+            &self.root.lo.public,
+            self.root
+                .lane_acc
+                .as_ref()
+                .expect("the lane rides every level"),
+            &self.root.acc,
+            &self.root.block.passenger,
+            &self.statement,
+            self.expect_passenger,
+        )
+    }
+
+    /// The ROOT'S TRANSPORTABLE PART: what a consumer holds beside the
+    /// statement — publics, proof, commitment. Everything else the
+    /// standalone verifier derives from config via [`TowerVk`]; the
+    /// wire-format milestone gives this a byte form.
+    ///
+    /// [`TowerVk`]: crate::tower::TowerVk
+    pub fn root_bundle(&self) -> RootBundle<'_> {
+        RootBundle {
+            public: &self.root.lo.public,
+            proof: &self.root.lo.proof,
+            commitment: &self.root.lo.commitment,
+        }
+    }
+
+    /// The discharge legs over CALLER-SUPPLIED artifacts: the prover's
+    /// self-check hands in its own objects; the standalone verifier hands
+    /// in what it REASSEMBLED from a bundle's public segment. `self`
+    /// supplies only the native tables (leaf 0, FL 0, base, root) — one
+    /// superset covers every depth, since discharge looks tables up per
+    /// digest and unused entries are inert.
+    pub(super) fn discharge_with(
+        &self,
+        public: &[F128],
+        lane: &Accumulator,
+        main: &Accumulator,
+        passenger: &[([F128; 2], MatrixClaim)],
+        statement: &ChainStatement,
+        expect_passenger: bool,
+    ) -> Result<(), RootDischargeFailure> {
         use RootDischargeFailure::*;
-        let root = &self.root;
         // (1) the statement.
         let words =
             |h: &[u32; 16], j: usize| pack4(h[4 * j..4 * j + 4].try_into().expect("4 words"));
         for j in 0..4 {
-            if root.lo.public[self.app_base + j] != words(&self.statement.h_start, j)
-                || root.lo.public[self.app_base + 4 + j] != words(&self.statement.h_end, j)
+            if public[self.app_base + j] != words(&statement.h_start, j)
+                || public[self.app_base + 4 + j] != words(&statement.h_end, j)
             {
                 return Err(Statement);
             }
         }
         // (2) the chain lane vs the chain tables (leaf 0's shape).
-        let lane = root.lane_acc.as_ref().expect("the lane rides every level");
         let blake = chain_blake_r1cs(self.chain.inner.nu);
         let chain_mats = [(&blake.a_0, &blake.b_0)];
         let chain_circuit = &self.chain.inner.built.shape.circuit;
@@ -286,7 +336,7 @@ impl Tower {
         }
         // (3) the main fold vs the outer tables.
         let fl_lo = &self.fl.lo;
-        if !root.acc.discharge(&leaf_boolean_mats(fl_lo)) {
+        if !main.discharge(&leaf_boolean_mats(fl_lo)) {
             return Err(Boolean);
         }
         let el_mats: Vec<_> = fl_lo
@@ -299,51 +349,50 @@ impl Tower {
                 (e.a_0(), e.b_0())
             })
             .collect();
-        if !root.acc.discharge_element(&el_mats) {
+        if !main.discharge_element(&el_mats) {
             return Err(Element);
         }
         let fl_jp = node_jagged_params(fl_lo);
-        let root_jp = node_jagged_params(&root.lo);
+        let root_jp = node_jagged_params(&self.root.lo);
         let base_jp = self.base.as_ref().map(|b| node_jagged_params(&b.lo));
-        let mut circuits: Vec<&Circuit> = vec![&fl_lo.shape.circuit, &root.lo.shape.circuit];
+        let mut circuits: Vec<&Circuit> = vec![&fl_lo.shape.circuit, &self.root.lo.shape.circuit];
         let mut layouts: Vec<([u8; 32], &JaggedParams)> = vec![
             (fl_lo.shape.circuit.digest(), &fl_jp),
-            (root.lo.shape.circuit.digest(), &root_jp),
+            (self.root.lo.shape.circuit.digest(), &root_jp),
         ];
         if let (Some(b), Some(jp)) = (&self.base, &base_jp) {
             circuits.push(&b.lo.shape.circuit);
             layouts.push((b.lo.shape.circuit.digest(), jp));
         }
-        if !root.acc.discharge_sigma(&circuits) {
+        if !main.discharge_sigma(&circuits) {
             return Err(Sigma);
         }
-        if !root.acc.discharge_jagged(&layouts) {
+        if !main.discharge_jagged(&layouts) {
             return Err(Jagged);
         }
         // (4) the passenger: (sigma-shaped, jagged-shaped), keyed by the
         // base — the only orphan a spine ever makes.
-        let pass = &root.block.passenger;
-        let live = pass.iter().any(|(_, c)| entry_live(c));
-        if live != self.expect_passenger {
+        let live = passenger.iter().any(|(_, c)| entry_live(c));
+        if live != expect_passenger {
             return Err(Passenger);
         }
         if live {
             let base = self.base.as_ref().expect("a steady root keeps its base");
             let base_d = base.lo.shape.circuit.digest();
-            if pass.len() != 2
-                || pass[0].0 != digest_f128(&base_d)
-                || pass[1].0 != digest_f128(&base_d)
-                || !entry_live(&pass[0].1)
-                || !entry_live(&pass[1].1)
+            if passenger.len() != 2
+                || passenger[0].0 != digest_f128(&base_d)
+                || passenger[1].0 != digest_f128(&base_d)
+                || !entry_live(&passenger[0].1)
+                || !entry_live(&passenger[1].1)
             {
                 return Err(Passenger);
             }
             let pacc = Accumulator {
-                registry_digest: root.acc.registry_digest,
+                registry_digest: main.registry_digest,
                 per_type: Vec::new(),
                 per_element: Vec::new(),
-                sigma: vec![(base_d, pass[0].1.clone())],
-                jagged: vec![(base_d, pass[1].1.clone())],
+                sigma: vec![(base_d, passenger[0].1.clone())],
+                jagged: vec![(base_d, passenger[1].1.clone())],
             };
             let jp = base_jp.as_ref().expect("computed with the base");
             if !pacc.discharge_sigma(&[&base.lo.shape.circuit])

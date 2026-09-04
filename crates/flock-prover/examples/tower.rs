@@ -3,17 +3,21 @@
 //! residue.
 //!
 //! ```sh
-//! cargo run --release --example tower -- [n_leaves] [blocks_per_leaf] [chain128|chain100]
+//! cargo run --release --example tower -- [n_leaves] [blocks_per_leaf] [chain128|chain100] [verify]
 //! ```
 //!
 //! Defaults: 8 leaves x 256 compressions under the 128-bit tower — the
 //! smallest run that reaches the STEADY spine shape (a base plus two
 //! spine folds) and boards the passenger. The production leaf is 2^18
 //! compressions (`blocks_per_leaf = 262144`); expect minutes there.
+//!
+//! With `verify`, the run also generates a verification key (a one-time
+//! six-leaf reference tower) and checks the root STANDALONE through
+//! `verify_root` — the consumer path, nothing prover-side trusted.
 
 use std::{env, time::Instant};
 
-use flock_prover::tower::{Tower, TowerConfig};
+use flock_prover::tower::{Tower, TowerConfig, TowerVk, verify_root};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -27,6 +31,11 @@ fn main() {
         None | Some("chain128") => TowerConfig::Chain128,
         Some("chain100") => TowerConfig::Chain100,
         Some(other) => panic!("unknown tower config {other:?}: chain128 or chain100"),
+    };
+    let do_verify = match args.next().as_deref() {
+        None => false,
+        Some("verify") => true,
+        Some(other) => panic!("unknown flag {other:?}: only `verify`"),
     };
 
     // The demo chain starts at the zero state; a deployment starts at its
@@ -55,4 +64,18 @@ fn main() {
         s.n_blocks,
         tower.root_proof_kib(),
     );
+
+    if do_verify {
+        let t2 = Instant::now();
+        let vk = TowerVk::generate(cfg, blocks_per_leaf);
+        let gen_s = t2.elapsed().as_secs_f64();
+        let t3 = Instant::now();
+        let bound =
+            verify_root(&vk, s, &tower.root_bundle()).expect("the root verifies standalone");
+        let verify_s = t3.elapsed().as_secs_f64();
+        println!(
+            "  VERIFIED STANDALONE (consumer path): vk generate {gen_s:.1}s (one-time) \
+             | verify_root {verify_s:.3}s | span bound: {bound:?}"
+        );
+    }
 }
