@@ -61,6 +61,16 @@ impl PhysicalLayout {
         self.row_positions.get(row.index).copied()
     }
 
+    /// Physical columns indexed by source-order value ID.
+    pub fn value_positions(&self) -> &[usize] {
+        &self.value_positions
+    }
+
+    /// Physical rows indexed by source-order row ID.
+    pub fn row_positions(&self) -> &[usize] {
+        &self.row_positions
+    }
+
     /// Physical prefix containing all placed values and rows. Positions at or
     /// above this boundary are canonical zero padding.
     pub const fn useful_bits(&self) -> usize {

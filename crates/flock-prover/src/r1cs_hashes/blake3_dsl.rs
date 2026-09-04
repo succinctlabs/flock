@@ -3,14 +3,14 @@
 //! State words stay virtual across all seven rounds. Only carry products and
 //! the two output halves are materialized, matching the legacy relation.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use flock_core::circuit::boolean::{
     Bit, BooleanCircuit, CircuitBuilder, LinearExpr, PhysicalLayout, WalkPlan,
 };
 use flock_core::r1cs::BlockR1cs;
 
-use super::blake3;
+use super::{ProjectionCache, blake3};
 
 type Word = [LinearExpr; blake3::WORD_BITS];
 type MaterializedWord = [Bit; blake3::WORD_BITS];
@@ -77,6 +77,26 @@ impl Blake3DslCircuit {
 pub fn blake3_circuit() -> &'static Blake3DslCircuit {
     static CIRCUIT: OnceLock<Blake3DslCircuit> = OnceLock::new();
     CIRCUIT.get_or_init(build_blake3_circuit)
+}
+
+/// Cache only the compiled walk, dropping the construction artifact and its
+/// normalized supports after compilation.
+pub fn blake3_walk_projection() -> &'static WalkPlan {
+    static WALK: OnceLock<WalkPlan> = OnceLock::new();
+    WALK.get_or_init(|| build_blake3_circuit().walk_plan())
+}
+
+/// Return the cached relation for one batch shape without retaining the
+/// construction artifact or structural walk.
+pub fn blake3_relation_projection(n_blocks_log: usize) -> Arc<BlockR1cs> {
+    assert!(
+        n_blocks_log >= 3,
+        "lincheck needs n_outer >= 8; pick n_blocks_log >= 3"
+    );
+    static RELATION: ProjectionCache<BlockR1cs> = ProjectionCache::new();
+    RELATION.get_or_init(n_blocks_log, || {
+        build_blake3_circuit().to_block_r1cs(n_blocks_log)
+    })
 }
 
 fn block_inputs(

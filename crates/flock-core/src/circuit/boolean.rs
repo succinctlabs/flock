@@ -19,11 +19,16 @@
 //! implementation modules.
 
 mod builder;
+mod interface;
 mod layout;
 mod lowering;
 mod walk;
 
 pub use builder::CircuitBuilder;
+pub use interface::{
+    Component, Interaction, InteractionDirection, InteractionEncoding, InteractionField,
+    InteractionScope, PortOrigin, Selector,
+};
 pub use layout::{LayoutBuilder, LayoutError, PhysicalLayout, PositionKind};
 pub use lowering::{EvaluationError, R1csBuildError};
 pub use walk::{ForwardTrace, WalkError, WalkLincheckCircuit, WalkPlan, WalkStats};
@@ -172,6 +177,7 @@ pub struct Port {
     name: String,
     direction: PortDirection,
     encoding: PortEncoding,
+    origin: PortOrigin,
     values: Vec<ValueId>,
 }
 
@@ -186,6 +192,10 @@ impl Port {
 
     pub const fn encoding(&self) -> PortEncoding {
         self.encoding
+    }
+
+    pub fn origin(&self) -> &PortOrigin {
+        &self.origin
     }
 
     pub fn values(&self) -> &[ValueId] {
@@ -278,6 +288,8 @@ pub struct BooleanCircuit {
     value_count: usize,
     input_values: Vec<ValueId>,
     ports: Vec<Port>,
+    components: Vec<Component>,
+    interactions: Vec<Interaction>,
     one: ValueId,
 }
 

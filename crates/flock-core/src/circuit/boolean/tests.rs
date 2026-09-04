@@ -51,6 +51,17 @@ fn structural_dag_survives_normalization_and_cancellation() {
         Some(&ExpressionNode::Xor(vec![ab_id, a.expr().id()]))
     );
     assert_eq!(circuit.support(nested_id), Some(vec![b.value_id()]));
+
+    let expressions: Vec<_> = circuit.expressions().collect();
+    assert_eq!(expressions.len(), circuit.expression_count());
+    assert_eq!(
+        expressions[nested_id.index()],
+        circuit.expression(nested_id).unwrap()
+    );
+
+    let layout = PhysicalLayout::source_order(&circuit);
+    assert_eq!(layout.value_positions(), &[0, 1, 2]);
+    assert_eq!(layout.row_positions(), &[0, 1, 2]);
 }
 
 #[test]

@@ -12,6 +12,11 @@ use super::{
     RowKind,
 };
 
+mod forward;
+mod packed;
+
+pub use forward::ForwardTrace;
+
 /// A compiled, layout-specific structural circuit walk.
 ///
 /// The plan owns no witness data and can therefore be shared by prover and
@@ -56,24 +61,45 @@ pub struct WalkStats {
     pub xor_term_allocations: usize,
 }
 
-/// Values produced by one forward walk, in physical R1CS order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ForwardTrace {
-    pub z: Vec<bool>,
-    pub a_z: Vec<bool>,
-    pub b_z: Vec<bool>,
-    pub c_z: Vec<bool>,
-}
-
 /// A forward or transposed walk request that does not match its compiled plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WalkError {
-    InputCount { expected: usize, actual: usize },
+    InputCount {
+        expected: usize,
+        actual: usize,
+    },
     InvalidKLog(usize),
-    Capacity { required: usize, actual: usize },
+    Capacity {
+        required: usize,
+        actual: usize,
+    },
     UnsatisfiedRow(RowId),
-    WeightCount { a: usize, b: usize, c: usize },
+    WeightCount {
+        a: usize,
+        b: usize,
+        c: usize,
+    },
     InvalidTransposeSize(usize),
+    BatchSizeOverflow {
+        blocks: usize,
+        block_capacity: usize,
+    },
+    BatchCount {
+        capacity: usize,
+        actual: usize,
+    },
+    PackedKLog(usize),
+    InvalidBatchLog(usize),
+    PackedDestinationLength {
+        expected: usize,
+        z: usize,
+        a: usize,
+        b: usize,
+    },
+    UnsatisfiedBatchRow {
+        block: usize,
+        row: RowId,
+    },
     IdentityCRequired,
 }
 
@@ -98,6 +124,32 @@ impl fmt::Display for WalkError {
             Self::InvalidTransposeSize(size) => {
                 write!(f, "transpose weight count {size} is not a power of two")
             }
+            Self::BatchSizeOverflow {
+                blocks,
+                block_capacity,
+            } => write!(
+                f,
+                "{blocks} blocks of {block_capacity} bits exceed the addressable buffer size"
+            ),
+            Self::BatchCount { capacity, actual } => write!(
+                f,
+                "batch supplies {actual} blocks, but its capacity is {capacity}"
+            ),
+            Self::PackedKLog(k_log) => {
+                write!(f, "packed forward execution needs k_log >= 7, got {k_log}")
+            }
+            Self::InvalidBatchLog(n_blocks_log) => {
+                write!(f, "2^{n_blocks_log} batch rows do not fit in usize")
+            }
+            Self::PackedDestinationLength { expected, z, a, b } => write!(
+                f,
+                "packed destinations must each have {expected} words (z={z}, A={a}, B={b})"
+            ),
+            Self::UnsatisfiedBatchRow { block, row } => write!(
+                f,
+                "general constraint row {} is not satisfied in block {block}",
+                row.index()
+            ),
             Self::IdentityCRequired => {
                 f.write_str("identity-C walk requested for a non-identity C relation")
             }
@@ -326,71 +378,6 @@ impl WalkPlan {
     /// adapter always carries the plan's statement-level ONE pin.
     pub fn lincheck_circuit(&self, k_log: usize) -> Result<WalkLincheckCircuit<'_>, WalkError> {
         WalkLincheckCircuit::new(self, k_log)
-    }
-
-    /// Generate `z`, `A z`, `B z`, and `C z` without sparse matrix products.
-    pub fn forward(&self, inputs: &[bool], k_log: usize) -> Result<ForwardTrace, WalkError> {
-        if inputs.len() != self.input_positions.len() {
-            return Err(WalkError::InputCount {
-                expected: self.input_positions.len(),
-                actual: inputs.len(),
-            });
-        }
-        let capacity = checked_capacity(k_log).ok_or(WalkError::InvalidKLog(k_log))?;
-        if capacity < self.useful_bits {
-            return Err(WalkError::Capacity {
-                required: self.useful_bits,
-                actual: capacity,
-            });
-        }
-
-        let mut z = vec![false; capacity];
-        let mut a_z = vec![false; capacity];
-        let mut b_z = vec![false; capacity];
-        let mut c_z = vec![false; capacity];
-        let mut temporaries = vec![false; self.stats.max_live_temporaries];
-        z[self.one_position] = true;
-        for (&position, &input) in self.input_positions.iter().zip(inputs) {
-            z[position] = input;
-        }
-
-        for action in &self.actions {
-            match action {
-                Action::Xor { output, terms } => {
-                    let value = terms.iter().fold(false, |acc, source| {
-                        acc ^ read_bool(*source, &z, &temporaries)
-                    });
-                    temporaries[*output] = value;
-                }
-                Action::Row {
-                    id,
-                    physical_row,
-                    kind,
-                    lhs,
-                    rhs,
-                    result,
-                    output,
-                } => {
-                    let lhs = read_bool(*lhs, &z, &temporaries);
-                    let rhs = read_bool(*rhs, &z, &temporaries);
-                    match kind {
-                        RowKind::And | RowKind::Materialize => {
-                            z[output.expect("definitional row must have an output")] = lhs & rhs;
-                        }
-                        RowKind::One | RowKind::Input | RowKind::Constraint => {}
-                    }
-                    let result = read_bool(*result, &z, &temporaries);
-                    if lhs & rhs != result {
-                        return Err(WalkError::UnsatisfiedRow(*id));
-                    }
-                    a_z[*physical_row] = lhs;
-                    b_z[*physical_row] = rhs;
-                    c_z[*physical_row] = result;
-                }
-            }
-        }
-
-        Ok(ForwardTrace { z, a_z, b_z, c_z })
     }
 
     /// Compute `A^T e_a + B^T e_b + C^T e_c` by reversing the structural DAG.

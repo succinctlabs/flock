@@ -1,6 +1,7 @@
 use super::*;
 
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::prover::prove_ligerito;
@@ -100,7 +101,8 @@ fn assert_batch_major_block(
 #[ignore = "builds and compares large BLAKE3 artifacts; run explicitly"]
 fn dsl_matches_legacy_relation_and_witness() {
     let dsl = blake3_circuit();
-    let actual_r1cs = dsl.to_block_r1cs(3);
+    let actual_r1cs = blake3_relation_projection(3);
+    assert!(Arc::ptr_eq(&actual_r1cs, &blake3_relation_projection(3)));
     let expected_r1cs = blake3::build_block_r1cs(3);
 
     assert_eq!(actual_r1cs.m, expected_r1cs.m);
@@ -185,7 +187,8 @@ fn dsl_matches_legacy_relation_and_witness() {
         Some(blake3::Z_CONST_POS)
     );
 
-    let plan = dsl.walk_plan();
+    let plan = blake3_walk_projection();
+    assert!(std::ptr::eq(plan, blake3_walk_projection()));
     assert!(plan.c_is_identity());
     assert_eq!(plan.stats().actions + 1, dsl.circuit().expression_count());
     assert!(plan.stats().max_live_temporaries < 1_000);

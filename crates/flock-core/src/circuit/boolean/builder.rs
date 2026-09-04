@@ -1,11 +1,15 @@
-//! Author-facing circuit builder and invariant validation.
+//! Author-facing circuit construction.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    Bit, BooleanCircuit, CircuitId, Expression, ExpressionNode, LinearExpr, LinearExprId, Port,
-    PortDirection, PortEncoding, Row, RowId, RowKind, ValueId, ValueIndex,
+    Bit, BooleanCircuit, CircuitId, Component, Expression, ExpressionNode, Interaction, LinearExpr,
+    LinearExprId, Port, PortDirection, PortEncoding, PortOrigin, Row, RowId, RowKind, ValueId,
+    ValueIndex,
 };
+
+mod interface;
+mod validation;
 
 static NEXT_CIRCUIT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -18,6 +22,9 @@ pub struct CircuitBuilder {
     value_count: usize,
     input_values: Vec<ValueId>,
     ports: Vec<Port>,
+    components: Vec<Component>,
+    active_components: Vec<usize>,
+    interactions: Vec<Interaction>,
     one: Bit,
     zero: LinearExpr,
 }
@@ -79,6 +86,9 @@ impl CircuitBuilder {
             value_count: 1,
             input_values: Vec::new(),
             ports: Vec::new(),
+            components: Vec::new(),
+            active_components: Vec::new(),
+            interactions: Vec::new(),
             one,
             zero,
         }
@@ -121,7 +131,7 @@ impl CircuitBuilder {
     /// Allocate a named input bit-array. The returned array is in the same
     /// order recorded by the port.
     pub fn input_bits<const N: usize>(&mut self, name: impl Into<String>) -> [Bit; N] {
-        self.input_port(name, PortEncoding::Bits)
+        self.input_port(name, PortEncoding::Bits, PortOrigin::Witness)
     }
 
     /// Allocate a little-endian input word with no alignment beyond one bit.
@@ -137,13 +147,18 @@ impl CircuitBuilder {
         alignment_bits: usize,
     ) -> [Bit; N] {
         assert!(alignment_bits > 0, "word alignment must be nonzero");
-        self.input_port(name, PortEncoding::LittleEndianWord { alignment_bits })
+        self.input_port(
+            name,
+            PortEncoding::LittleEndianWord { alignment_bits },
+            PortOrigin::Witness,
+        )
     }
 
     fn input_port<const N: usize>(
         &mut self,
         name: impl Into<String>,
         encoding: PortEncoding,
+        origin: PortOrigin,
     ) -> [Bit; N] {
         let name = name.into();
         self.assert_new_port_name(&name);
@@ -153,6 +168,7 @@ impl CircuitBuilder {
             name,
             direction: PortDirection::Input,
             encoding,
+            origin,
             values: bits.iter().map(|bit| bit.value).collect(),
         });
         bits
@@ -212,6 +228,7 @@ impl CircuitBuilder {
             name,
             direction: PortDirection::Fixed,
             encoding,
+            origin: PortOrigin::Fixed,
             values: bits.iter().map(|bit| bit.value).collect(),
         });
         bits
@@ -271,6 +288,7 @@ impl CircuitBuilder {
             name,
             direction: PortDirection::Output,
             encoding,
+            origin: PortOrigin::Derived,
             values: bits.into_iter().map(|bit| bit.value).collect(),
         });
     }
@@ -481,188 +499,10 @@ impl CircuitBuilder {
             value_count: self.value_count,
             input_values: self.input_values,
             ports: self.ports,
+            components: self.components,
+            interactions: self.interactions,
             one: self.one.value,
         }
-    }
-
-    fn validate(&self) -> Vec<RowId> {
-        assert_eq!(self.zero.id.index, 0, "ZERO must be the first expression");
-        assert!(matches!(self.expressions[0].node, ExpressionNode::Zero));
-        assert_eq!(self.one.value.index, 0, "ONE must be the first value");
-        assert_eq!(self.one.expression.index, 1);
-        assert!(matches!(self.rows[0].kind, RowKind::One));
-
-        let mut value_expressions = vec![None; self.value_count];
-        for (index, expression) in self.expressions.iter().enumerate() {
-            let expected = match &expression.node {
-                ExpressionNode::Zero => Vec::new(),
-                ExpressionNode::Value(value) => {
-                    assert!(
-                        value.circuit == self.id && value.index < self.value_count,
-                        "expression has invalid value id"
-                    );
-                    assert!(
-                        value_expressions[value.index]
-                            .replace(LinearExprId {
-                                circuit: self.id,
-                                index,
-                            })
-                            .is_none(),
-                        "materialized value has multiple boundary expressions"
-                    );
-                    vec![ValueIndex::new(value.index)]
-                }
-                ExpressionNode::Xor(terms) => {
-                    let mut support = Vec::new();
-                    for term in terms {
-                        assert_eq!(
-                            term.circuit, self.id,
-                            "expression belongs to another circuit"
-                        );
-                        assert!(
-                            term.index < index,
-                            "structural expression DAG contains a cycle"
-                        );
-                        // Earlier nodes have already passed this same check,
-                        // so their stored supports are valid by induction.
-                        support =
-                            symmetric_difference(&support, &self.expressions[term.index].support);
-                    }
-                    support
-                }
-            };
-            assert_eq!(
-                expression.support, expected,
-                "stored normalized support disagrees with structural DAG"
-            );
-        }
-        assert!(
-            value_expressions.iter().all(Option::is_some),
-            "materialized value is missing its boundary expression"
-        );
-
-        let mut definitions = vec![None; self.value_count];
-        for (index, row) in self.rows.iter().enumerate() {
-            assert_eq!(row.id.circuit, self.id, "row belongs to another circuit");
-            assert_eq!(row.id.index, index, "non-canonical row order");
-            assert!(
-                row.lhs.circuit == self.id && row.lhs.index < self.expressions.len(),
-                "invalid lhs expression"
-            );
-            assert!(
-                row.rhs.circuit == self.id && row.rhs.index < self.expressions.len(),
-                "invalid rhs expression"
-            );
-            assert!(
-                row.result.circuit == self.id && row.result.index < self.expressions.len(),
-                "invalid result expression"
-            );
-            match row.kind {
-                RowKind::One => {
-                    assert_eq!(index, 0, "ONE must be the first row");
-                    assert_eq!(row.defined_value, Some(self.one.value));
-                    assert_eq!(row.lhs, self.one.expression);
-                    assert_eq!(row.rhs, self.one.expression);
-                    assert_eq!(row.result, self.one.expression);
-                }
-                RowKind::Input => {
-                    assert_eq!(row.lhs, row.result, "input row must be a tautology");
-                    assert_eq!(row.rhs, self.one.expression);
-                    assert!(row.defined_value.is_some());
-                }
-                RowKind::And => assert!(row.defined_value.is_some()),
-                RowKind::Materialize => {
-                    assert_eq!(row.rhs, self.one.expression);
-                    assert!(row.defined_value.is_some());
-                }
-                RowKind::Constraint => assert!(row.defined_value.is_none()),
-            }
-            if let Some(value) = row.defined_value {
-                assert!(
-                    value.circuit == self.id && value.index < self.value_count,
-                    "row defines an invalid value id"
-                );
-                assert!(
-                    definitions[value.index].replace(row.id).is_none(),
-                    "materialized value has multiple defining rows"
-                );
-                assert_eq!(
-                    Some(row.result),
-                    value_expressions[value.index],
-                    "defining row result is not its value boundary"
-                );
-            }
-        }
-        assert!(
-            definitions.iter().all(Option::is_some),
-            "materialized value is missing its defining row"
-        );
-        let definition_rows: Vec<RowId> = definitions.into_iter().map(Option::unwrap).collect();
-        let row_inputs: Vec<ValueId> = self
-            .rows
-            .iter()
-            .filter(|row| row.kind == RowKind::Input)
-            .map(|row| row.defined_value.unwrap())
-            .collect();
-        assert_eq!(
-            self.input_values, row_inputs,
-            "input list disagrees with rows"
-        );
-
-        for row in &self.rows {
-            for (expression, is_result) in [(row.lhs, false), (row.rhs, false), (row.result, true)]
-            {
-                for value in &self.expressions[expression.index].support {
-                    let definition = definition_rows[value.index()];
-                    let self_reference = row
-                        .defined_value
-                        .is_some_and(|defined| defined.index == value.index())
-                        && (matches!(row.kind, RowKind::One | RowKind::Input) || is_result);
-                    assert!(
-                        definition.index < row.id.index || self_reference,
-                        "row reads a value before it is defined"
-                    );
-                }
-            }
-        }
-        for (index, port) in self.ports.iter().enumerate() {
-            assert!(!port.name.is_empty(), "port name must not be empty");
-            if let PortEncoding::LittleEndianWord { alignment_bits } = port.encoding {
-                assert!(alignment_bits > 0, "word alignment must be nonzero");
-            }
-            assert!(
-                self.ports[..index]
-                    .iter()
-                    .all(|other| other.name != port.name),
-                "duplicate port name `{}`",
-                port.name
-            );
-            assert!(!port.values.is_empty(), "port `{}` is empty", port.name);
-            let mut values = port.values.clone();
-            values.sort_unstable();
-            assert!(
-                values.windows(2).all(|pair| pair[0] != pair[1]),
-                "port `{}` repeats a value",
-                port.name
-            );
-            assert!(
-                values
-                    .iter()
-                    .all(|value| value.circuit == self.id && value.index < self.value_count),
-                "port `{}` contains an invalid value",
-                port.name
-            );
-            if port.direction == PortDirection::Input {
-                assert!(
-                    port.values
-                        .iter()
-                        .all(|value| self.input_values.contains(value)),
-                    "input port `{}` contains a computed value",
-                    port.name
-                );
-            }
-        }
-        definition_rows
     }
 
     fn push_computed(&mut self, kind: RowKind, lhs: LinearExprId, rhs: LinearExprId) -> Bit {

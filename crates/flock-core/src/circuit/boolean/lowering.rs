@@ -6,8 +6,9 @@ use std::sync::OnceLock;
 use crate::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 
 use super::{
-    BooleanCircuit, ExpressionNode, LayoutBuilder, LayoutError, LinearExprId, PhysicalLayout, Port,
-    PortDirection, PortEncoding, Row, RowId, RowKind, ValueId, ValueIndex,
+    BooleanCircuit, Component, ExpressionNode, Interaction, LayoutBuilder, LayoutError,
+    LinearExprId, PhysicalLayout, Port, PortDirection, PortEncoding, Row, RowId, RowKind, ValueId,
+    ValueIndex,
 };
 
 impl BooleanCircuit {
@@ -15,6 +16,14 @@ impl BooleanCircuit {
     /// node and each materialized value's boundary node.
     pub fn expression_count(&self) -> usize {
         self.expressions.len()
+    }
+
+    /// Structural expression nodes in deterministic source order.
+    ///
+    /// This is the complete authored DAG, including nodes that are not used by
+    /// a row. Consumers can use each node's position as its stable local ID.
+    pub fn expressions(&self) -> impl ExactSizeIterator<Item = &ExpressionNode> {
+        self.expressions.iter().map(|expression| &expression.node)
     }
 
     /// Total number of materialized-value references retained across all
@@ -61,6 +70,17 @@ impl BooleanCircuit {
         self.ports.iter().find(|port| port.name == name)
     }
 
+    /// Named build-time component ranges. They organize the authored IR but
+    /// do not change its arithmetic.
+    pub fn components(&self) -> &[Component] {
+        &self.components
+    }
+
+    /// Deferred global interactions referenced by this local component.
+    pub fn interactions(&self) -> &[Interaction] {
+        &self.interactions
+    }
+
     /// The row that defines `value`.
     pub fn definition_row(&self, value: ValueId) -> Option<RowId> {
         if value.circuit != self.id {
@@ -74,8 +94,9 @@ impl BooleanCircuit {
         LayoutBuilder::new(self)
     }
 
-    /// Deterministic digest of the authored structure. Runtime circuit IDs are
-    /// excluded.
+    /// Deterministic digest of the authored local relation and port shape.
+    /// Runtime circuit IDs and higher-level interface metadata (advice origin,
+    /// component ranges, and interactions) are excluded.
     pub fn structure_digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"flock-boolean-structure-v1");
