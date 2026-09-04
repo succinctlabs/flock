@@ -47,15 +47,20 @@ pub use crate::tower::{
     fl_node::{FlNode, build_fl_node, build_fl_node_k},
     node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app},
     query::LeafOuter,
-    verify::{RootBundle, SpanBound, TowerVerifyError, TowerVk, verify_root},
+    verify::{
+        RootBundle, SpanBound, TowerVerifyError, TowerVk, TowerVkFingerprint, verify_root,
+        verify_root_bytes,
+    },
 };
+// The wire format (`proof_io`'s tower-root bundle) carries a `MixedProof`.
+pub(crate) use crate::tower::chain::MixedProof;
 use crate::{
     challenger::FsChallenger,
     prover::UnionSlotProverInput,
     r1cs_hashes::merkle_r1cs::SLOT_WORDS,
     schedule::TableType,
     tower::{
-        chain::{MixedInner, MixedProof, native_chain},
+        chain::{MixedInner, native_chain},
         child_walker::{
             ChildSlots, ChildTape, ZskipTapeRec, ZskipWires, check_child_region, emit_child_region,
         },

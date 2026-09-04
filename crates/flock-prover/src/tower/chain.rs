@@ -51,8 +51,10 @@ use crate::{
 
 /// A circuit-union proof by boolean-zerocheck FLAVOR — parallel arms so
 /// the chain leaf and envelope outers. Both forms share all other regions.
-#[derive(serde::Serialize)]
-pub(super) enum MixedProof {
+/// `pub(crate)` for the wire format's sake: `proof_io`'s tower-root
+/// bundle carries one.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum MixedProof {
     Rs(R1csProofCircuitMerged),
     /// Constructed only where the AG round-1 prover kernel exists
     /// (aarch64); the consuming arms are arch-independent.

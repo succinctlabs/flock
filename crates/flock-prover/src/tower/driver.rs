@@ -24,6 +24,7 @@ use flock_core::{
     pcs::jagged::JaggedParams,
 };
 
+use crate::proof_io::TowerRootBundle;
 use crate::tower::{
     F128,
     chain::{ChainProof, build_chain_proof},
@@ -47,7 +48,7 @@ use crate::tower::{
 /// depth-independent by design and the app block carries no count word.
 /// See `SpanBound` in the verify module before treating a verified
 /// `n_blocks` as exact.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChainStatement {
     pub h_start: [u32; 16],
     pub h_end: [u32; 16],
@@ -105,6 +106,9 @@ pub struct Tower {
     /// A STEADY root (two spine folds or more) owes the single orphan its
     /// transition made; a shallower root owes none.
     pub(super) expect_passenger: bool,
+    /// The leaf size this tower ran at — the wire bundle's VK-selection
+    /// tag.
+    pub(super) blocks_per_leaf: usize,
 }
 
 impl Tower {
@@ -235,6 +239,7 @@ impl Tower {
             base,
             root,
             expect_passenger: k >= 4,
+            blocks_per_leaf,
         }
     }
 
@@ -289,6 +294,24 @@ impl Tower {
             proof: &self.root.lo.proof,
             commitment: &self.root.lo.commitment,
         }
+    }
+
+    /// The root bundle ON THE WIRE: the proof-IO tower-root flavor
+    /// (statement + publics + commitment + proof, tagged with config and
+    /// leaf size for VK selection). `verify_root_bytes` is the consuming
+    /// end.
+    ///
+    /// [`verify_root_bytes`]: crate::tower::verify_root_bytes
+    pub fn root_bundle_bytes(&self) -> Vec<u8> {
+        TowerRootBundle {
+            config: self.cfg,
+            blocks_per_leaf: self.blocks_per_leaf as u64,
+            statement: self.statement,
+            public: self.root.lo.public.clone(),
+            commitment: self.root.lo.commitment.clone(),
+            proof: self.root.lo.proof.clone(),
+        }
+        .to_bytes()
     }
 
     /// The discharge legs over CALLER-SUPPLIED artifacts: the prover's

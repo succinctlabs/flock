@@ -30,7 +30,7 @@ pub(super) fn pcs_batch_for(union: &UnionInstance, profile: LigeritoProfile) -> 
 /// recursion balloons the FL's replayed transcript past the arity-2
 /// envelope), and the 128-bit aggressive recursion carries the aggressive
 /// Fast128 leaf (rate-1/2 on the rate+2 ladder; m32: Σq 675 → 527).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TowerConfig {
     /// The 100-bit tower: Fast100 leaf, Slim100 outers.
     Chain100,

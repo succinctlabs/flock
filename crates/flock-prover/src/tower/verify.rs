@@ -26,9 +26,9 @@ use flock_core::{
     aggregate::Accumulator, matrix_fold::MatrixClaim, pcs::Commitment, verifier::FlockVerifyError,
 };
 
+use crate::proof_io::{DeserializeError, TowerRootBundle};
 use crate::tower::{
-    DOMAIN, F128, FsChallenger, TowerConfig,
-    chain::MixedProof,
+    DOMAIN, F128, FsChallenger, MixedProof, TowerConfig,
     driver::{ChainStatement, RootDischargeFailure, Tower},
     env_acc_main_base, env_pass_base, envelope_shape,
     fold_region::read_acc_entry,
@@ -84,6 +84,12 @@ pub enum TowerVerifyError {
     /// A reassembled accumulator refused the native tables, or the
     /// statement binding failed.
     Discharge(RootDischargeFailure),
+    /// The wire bundle did not decode (bad header, wrong flavor,
+    /// corrupted payload).
+    Encoding(DeserializeError),
+    /// The wire bundle's config or leaf size is not this VK's — the
+    /// consumer selected the wrong verification key.
+    VkMismatch,
 }
 
 /// The published accumulator blocks' DECODE PLAN: base offsets and
@@ -342,4 +348,68 @@ pub fn verify_root(
     } else {
         SpanBound::EndpointsOnly
     })
+}
+
+/// **VERIFY A TOWER ROOT FROM ITS WIRE BYTES** (the proof-IO tower-root
+/// flavor, [`Tower::root_bundle_bytes`]'s output): decode, cross-check
+/// the bundle's VK-selection tags against this VK, then [`verify_root`]
+/// over the carried statement. Returns the statement WITH its
+/// [`SpanBound`] qualification — the statement traveled in the payload,
+/// and every word of it was re-checked against the proof.
+pub fn verify_root_bytes(
+    vk: &TowerVk,
+    bytes: &[u8],
+) -> Result<(ChainStatement, SpanBound), TowerVerifyError> {
+    let b = TowerRootBundle::from_bytes(bytes).map_err(TowerVerifyError::Encoding)?;
+    if b.config != vk.tower.cfg || b.blocks_per_leaf != vk.blocks_per_leaf as u64 {
+        return Err(TowerVerifyError::VkMismatch);
+    }
+    let bound = verify_root(
+        vk,
+        &b.statement,
+        &RootBundle {
+            public: &b.public,
+            proof: &b.proof,
+            commitment: &b.commitment,
+        },
+    )?;
+    Ok((b.statement, bound))
+}
+
+/// The VK'S IDENTITY, small enough to publish: the config, the leaf
+/// size, and the digests of every circuit and registry the verifier
+/// checks against. Two honestly generated VKs at the same
+/// `(cfg, blocks_per_leaf)` produce the same fingerprint (shapes are
+/// statement-independent), so a consumer regenerates locally and
+/// compares against a published fingerprint instead of trusting a
+/// shipped VK blob.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TowerVkFingerprint {
+    pub config: TowerConfig,
+    pub blocks_per_leaf: usize,
+    pub chain_circuit: [u8; 32],
+    pub fl_circuit: [u8; 32],
+    pub base_circuit: [u8; 32],
+    pub steady_circuit: [u8; 32],
+    pub chain_registry: [u8; 32],
+    pub outer_registry: [u8; 32],
+    pub publics_len: usize,
+}
+
+impl TowerVk {
+    pub fn fingerprint(&self) -> TowerVkFingerprint {
+        let t = &self.tower;
+        let base_lo = &t.base.as_ref().expect("the VK tower keeps its base").lo;
+        TowerVkFingerprint {
+            config: t.cfg,
+            blocks_per_leaf: self.blocks_per_leaf,
+            chain_circuit: t.chain.inner.built.shape.circuit.digest(),
+            fl_circuit: t.fl.lo.shape.circuit.digest(),
+            base_circuit: base_lo.shape.circuit.digest(),
+            steady_circuit: t.root.lo.shape.circuit.digest(),
+            chain_registry: t.chain.inner.built.shape.registry.digest(),
+            outer_registry: t.root.lo.shape.registry.digest(),
+            publics_len: t.root.lo.public.len(),
+        }
+    }
 }

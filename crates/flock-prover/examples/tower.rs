@@ -17,7 +17,7 @@
 
 use std::{env, time::Instant};
 
-use flock_prover::tower::{Tower, TowerConfig, TowerVk, verify_root};
+use flock_prover::tower::{Tower, TowerConfig, TowerVk, verify_root_bytes};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -69,13 +69,16 @@ fn main() {
         let t2 = Instant::now();
         let vk = TowerVk::generate(cfg, blocks_per_leaf);
         let gen_s = t2.elapsed().as_secs_f64();
+        let bytes = tower.root_bundle_bytes();
         let t3 = Instant::now();
-        let bound =
-            verify_root(&vk, s, &tower.root_bundle()).expect("the root verifies standalone");
+        let (stmt, bound) =
+            verify_root_bytes(&vk, &bytes).expect("the wire bundle verifies standalone");
         let verify_s = t3.elapsed().as_secs_f64();
+        assert_eq!(&stmt, s, "the statement rode the wire");
         println!(
-            "  VERIFIED STANDALONE (consumer path): vk generate {gen_s:.1}s (one-time) \
-             | verify_root {verify_s:.3}s | span bound: {bound:?}"
+            "  VERIFIED STANDALONE (consumer path, over the wire): bundle {:.1} KiB \
+             | vk generate {gen_s:.1}s (one-time) | verify {verify_s:.3}s | span bound: {bound:?}",
+            bytes.len() as f64 / 1024.0,
         );
     }
 }
