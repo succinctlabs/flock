@@ -63,6 +63,7 @@ use crate::{
         chain::{MixedInner, native_chain},
         child_walker::{
             ChildSlots, ChildTape, ZskipTapeRec, ZskipWires, check_child_region, emit_child_region,
+            expected_child_tail_schedule,
         },
         config::{leaf_zc_ag, outer_union, outer_zc_ag, pcs_batch_for, tower_fold_grinding},
         envelope::{
@@ -115,6 +116,7 @@ use crate::{
         },
         real_walker::{
             RealRegion, RealTape, check_real_child_region, emit_family_h, emit_real_child_region,
+            expected_real_tail_schedule,
         },
         tape::{
             InnerPd, MpRec, OpenLevel, PdRec, PiopRec, RoundRec, parse_open_levels,
