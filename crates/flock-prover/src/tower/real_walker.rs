@@ -38,6 +38,12 @@ use crate::{
         level_sources, observed_f256, outer_union, pack8, parse_open_levels, payload_words,
         pin_recombination, query_phase_b3_rows, replay_ligerito_spine256, squeeze_word_wire,
         strat_scheds, walker_common,
+        walker_common::{
+            LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
+            LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
+            LBL_RING_SWITCH, LBL_ZEROCHECK, RS_SHAT_WORDS, TailEntry, Z_PARTIAL_WORDS,
+            publish_tail, zskip_wires,
+        },
     },
 };
 
@@ -228,27 +234,27 @@ impl<'p> RealTape<'p> {
         let zc_l = match &lo.proof {
             MixedProof::Rs(_) => {
                 assert!(
-                    find(b"flock-ag-skip-v1").is_empty(),
+                    find(LBL_AG_SKIP).is_empty(),
                     "an RS tape carries no AG-skip region"
                 );
-                find(b"flock-zerocheck-v0")
+                find(LBL_ZEROCHECK)
             }
             MixedProof::Ag(_) => {
                 assert!(
-                    find(b"flock-zerocheck-v0").is_empty(),
+                    find(LBL_ZEROCHECK).is_empty(),
                     "an AG tape carries no RS zerocheck region"
                 );
-                find(b"flock-ag-skip-v1")
+                find(LBL_AG_SKIP)
             }
         };
-        let lc_l = find(b"flock-lincheck-v0");
-        let elzc_l = find(b"flock-element-union-zc-v0");
-        let el_l = find(b"flock-element-union-lc-v0");
-        let gkr_l = find(b"flock-product-gkr-batched-v0");
-        let mo_l = find(b"flock-merged-open-v1");
-        let rs_l = find(b"flock-ring-switch-v0");
-        let mp_l = find(b"flock-multipoint-twisted-v1");
-        let fa_l = find(b"flock-frobenius-assist-v0");
+        let lc_l = find(LBL_LINCHECK);
+        let elzc_l = find(LBL_ELEMENT_ZC);
+        let el_l = find(LBL_ELEMENT_LC);
+        let gkr_l = find(LBL_PRODUCT_GKR);
+        let mo_l = find(LBL_MERGED_OPEN);
+        let rs_l = find(LBL_RING_SWITCH);
+        let mp_l = find(LBL_MULTIPOINT);
+        let fa_l = find(LBL_FROBENIUS);
         assert_eq!(
             (
                 zc_l.len(),
@@ -310,7 +316,7 @@ impl<'p> RealTape<'p> {
         assert!(n_p > 0, "the mixed inner groups its pd claims");
         assert_eq!(
             mp_i.val_vs.len(),
-            256 + n_p,
+            2 * RS_SHAT_WORDS + n_p,
             "T0 spans the RS dual values then the P group values"
         );
         let gamma_mp = chals[mp_i.gamma_ch];
@@ -656,14 +662,17 @@ fn parse_rs_regions_and_two_halves(
         let mut recs: Vec<(usize, usize, usize)> = Vec::new();
         for k in 0..2 {
             assert!(
-                matches!(&ops[i2], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0"),
+                matches!(&ops[i2], Op::Label(l) if l.as_slice() == LBL_RING_SWITCH),
                 "rs region {k}"
             );
             i2 += 1;
-            assert!(matches!(ops[i2], Op::ObserveSlice(128)), "s_hat_v slice");
+            assert!(
+                matches!(ops[i2], Op::ObserveSlice(RS_SHAT_WORDS)),
+                "s_hat_v slice"
+            );
             let (sv, _) = vc_at(i2);
             assert_eq!(
-                &vals_rec[sv..sv + 128],
+                &vals_rec[sv..sv + RS_SHAT_WORDS],
                 &lo.proof.pcs_open().ring_switches[k].s_hat_v[..],
                 "s_hat_v {k} on the stream"
             );
@@ -706,7 +715,7 @@ fn parse_rs_regions_and_two_halves(
         let mut rs_half = F128::ZERO;
         let mut coeffs: Vec<Vec<F128>> = Vec::new();
         for (k, &(sv, _, rc)) in rs_recs2.iter().enumerate() {
-            let shv = &vals_rec[sv..sv + 128];
+            let shv = &vals_rec[sv..sv + RS_SHAT_WORDS];
             let rdp: Vec<F128> = (0..7).map(|j| chals[rc + j]).collect();
             let eq = build_eq(&rdp);
             rs_half += gs[k] * inner_product(&tensor_algebra_transpose(shv), &eq);
@@ -970,7 +979,7 @@ fn parse_anchor_boolean_replica(
                 assert!(matches!(ops[i2], Op::ObserveSlice(64)), "ag round1_c");
                 i2 += 1;
                 assert!(
-                    matches!(&ops[i2], Op::Label(l) if l.as_slice() == b"flock-ag-skip-r1-point"),
+                    matches!(&ops[i2], Op::Label(l) if l.as_slice() == LBL_AG_R1_POINT),
                     "ag r1 seed label"
                 );
                 i2 += 1;
@@ -983,7 +992,7 @@ fn parse_anchor_boolean_replica(
                 let seed_fin1 = fin_at(i2);
                 i2 += 1;
                 assert!(
-                    matches!(&ops[i2], Op::Label(l) if l.as_slice() == b"flock-ag-skip-r1-nonce"),
+                    matches!(&ops[i2], Op::Label(l) if l.as_slice() == LBL_AG_R1_NONCE),
                     "ag r1 nonce label"
                 );
                 i2 += 1;
@@ -1049,7 +1058,10 @@ fn parse_anchor_boolean_replica(
             lc_r.push((vc_at(i2).0, vc_at(squeeze_i).1, fin_at(squeeze_i)));
             i2 = squeeze_i + 1;
         }
-        assert!(matches!(ops[i2], Op::ObserveSlice(64)), "z_partial slice");
+        assert!(
+            matches!(ops[i2], Op::ObserveSlice(Z_PARTIAL_WORDS)),
+            "z_partial slice"
+        );
         let (zp, _) = vc_at(i2);
         (zc_r, zskip, outer, lc_alpha, betas, zcf, lc_r, zp)
     };
@@ -1449,10 +1461,55 @@ fn parse_anchor_boolean_replica(
 /// What one emitted REAL child region hands back: where its public block
 /// starts, the walk counts, and the assertion-emission wires the 2→1 merge
 /// node CONNECTS the fold region's claim words to — all three families.
+/// The real tail's EXPECTED publish schedule, every width an expression
+/// over the TAPE's own geometry and the proof object — the same
+/// formulas the checker's positional walk consumes by — the independent
+/// reference the emitted table ([`RealRegion::tail_schedule`]) is held
+/// against at every build.
+pub(super) fn expected_real_tail_schedule(rt: &RealTape<'_>) -> Vec<(&'static str, usize)> {
+    let lc_i = rt.lo.proof.boolean_lincheck();
+    let n_mat = 1
+        + rt.lc_rounds_b.len()
+        + 2 * lc_i.matrix_evals.len()
+        + rt.mat_assert.x_inner_rest.len()
+        + rt.n_log_i
+        + 2 * rt.betas_b.len()
+        + Z_PARTIAL_WORDS
+        + 1;
+    let n_ela = 1
+        + rt.piop_i.zc_rounds.len()
+        + rt.piop_i.lc_rounds.len()
+        + 3
+        + 2 * rt.el_assert.evals.len();
+    let jag_vals = rt.jag.rs.len()
+        + rt.jag
+            .groups
+            .iter()
+            .map(|(combo, dense)| usize::from(combo.is_some()) + dense.len())
+            .sum::<usize>();
+    vec![
+        ("spine t_final", 2),
+        ("intake target", 1),
+        ("intake running", 1),
+        ("residual accs", 2 * rt.levels.len() * rt.yr_len),
+        ("residual inner", 2),
+        ("sigma value", 1),
+        ("sigma point", rt.mu_i),
+        ("element zc+lc ends", 2),
+        ("anchor end", 1),
+        ("matrix assertion publics", n_mat),
+        ("element assertion publics", n_ela),
+        ("jagged claim values", jag_vals),
+    ]
+}
+
 pub(super) struct RealRegion {
     pub(super) pub_base: usize,
     pub(super) n_query_pub: usize,
     pub(super) n_tail: usize,
+    /// The published tail's `(name, width)` schedule, as emitted — held
+    /// against [`expected_real_tail_schedule`] at every build.
+    pub(super) tail_schedule: Vec<(&'static str, usize)>,
     n_mat_pub: usize,
     n_ela_pub: usize,
     /// Labeled `public_len` checkpoints through the emission — the publics
@@ -1905,7 +1962,7 @@ pub(super) fn emit_real_child_region(
         sb, cs, rt, &outs, &wv, &mlv_pw, &lc_pw, el_alpha_w, va_w, vb_w, el_lcw, pfslot, pf_w, zw,
         ow, vals, &mut cen,
     );
-    let pub_base = emit_publishes_in_swap_order(
+    let (pub_base, n_tail, tail_schedule) = emit_publishes_in_swap_order(
         sb,
         cs,
         &to_publish,
@@ -1922,21 +1979,11 @@ pub(super) fn emit_real_child_region(
         anc_w,
         &mat_pub,
         &ela_pub,
+        &jag_w,
         &mut cen,
     );
-    emit_jagged_assertion(sb, cs, &jag_w, &mut cen);
 
     let n_query_pub: usize = 2 * levels.len() + levels.iter().map(|l| l.a_count).sum::<usize>();
-    let n_tail = 4
-        + 2 * levels.len() * rt.yr_len
-        + 2
-        + 1
-        + rt.mu_i
-        + 2
-        + 1
-        + mat_pub.len()
-        + ela_pub.len()
-        + jag_w.len();
     let el_zc_rho_w: Vec<Wire> = piop_i
         .zc_rounds
         .iter()
@@ -1969,39 +2016,13 @@ pub(super) fn emit_real_child_region(
         pub_base,
         n_query_pub,
         n_tail,
+        tail_schedule,
         n_mat_pub: mat_pub.len(),
         census: cen,
         jag_w,
         jag_sig_w: mp_sig_w.clone(),
         jag_row_w,
-        zskip: match &rt.zskip {
-            ZskipTapeRec::Rs { fin, .. } => ZskipWires::Rs(outs[trace.squeezes[*fin][0]][0]),
-            ZskipTapeRec::Ag {
-                seed_fins,
-                nonce_payload,
-                ..
-            } => {
-                let nonce_wi = rt
-                    .stream
-                    .words
-                    .iter()
-                    .position(|w| {
-                        matches!(
-                            w,
-                            StreamWord::Bytes { payload, word: 0 }
-                                if *payload == *nonce_payload
-                        )
-                    })
-                    .expect("the r1 nonce rides one stream word");
-                ZskipWires::Ag {
-                    seed_w: [
-                        squeeze_word_wire(&outs, trace, seed_fins[0], 0),
-                        squeeze_word_wire(&outs, trace, seed_fins[1], 0),
-                    ],
-                    nonce_w: ww[nonce_wi].expect("the nonce payload word is wired"),
-                }
-            }
-        },
+        zskip: zskip_wires(&rt.zskip, &outs, trace, &rt.stream, &ww),
         n_ela_pub: ela_pub.len(),
         structure_claim_w,
         el_zc_rho_w,
@@ -2121,7 +2142,6 @@ fn emit_intake_spine_residual(
     let zw = sb.public_input();
     vals.push(F128::ONE);
     let ow = sb.public_input();
-    let mrslot = cs.mrs;
     let spine256 = cs.spine256;
     // The assert-zero anchor: a dedicated zero public NO gate consumes,
     // so the zero-delta outputs connected into its class add no
@@ -2177,57 +2197,25 @@ fn emit_intake_spine_residual(
     // The complete family-H relation.  All inputs below are already bound
     // transcript or proof wires; no target/V advice and no native checker are
     // part of the recursive statement anymore.
-    let (shv_w, value_w, rdp_w, gamma_w) = walker_common::family_h_source_wires(
-        outs,
+    let (tgt_w, runw) = walker_common::emit_family_h_boundary(
+        sb,
+        cs,
         trace,
+        outs,
         &wv,
         &rt.rs_recs,
         &rt.rs_gam_fins,
-        &mp_i.val_vs,
-    );
-    let (rsh_w, vrs_w) = emit_family_h(
-        sb,
-        cs.q.family.expect("family-H slot"),
-        cs.macs,
-        cs.fold_macs,
-        cs.spine,
-        cs.spine256,
-        cs.resid
-            .iter()
-            .find(|&&(key, _)| key == 701)
-            .expect("the child slots declare an F256 MAC slot")
-            .1,
-        1usize << cs.nu,
-        &shv_w,
-        &value_w,
-        &rdp_w,
-        gamma_w,
+        mp_i,
+        gammas_i,
+        w_rounds,
+        inner_pd_i,
         pfslot,
         pf_w,
-        zw,
-        ow,
         vals,
         consts,
+        zw,
+        ow,
     );
-
-    let mut pdh_w = zw;
-    for pd in gammas_i {
-        let gw = squeeze_word_wire(outs, trace, pd.fin, pd.squeeze_offset);
-        pdh_w = sb.gate(cs.macs, &[pdh_w, gw, wv(pd.val_v)])[0];
-    }
-    let tgt_w = sb.gate(cs.macs, &[rsh_w, ow, pdh_w])[0];
-    let mut runw = tgt_w;
-    for rr in w_rounds {
-        let r_w = outs[trace.squeezes[rr.fin][0]][0];
-        runw = sb.gate(mrslot, &[runw, wv(rr.g_v), wv(rr.g_v + 1), r_w])[0];
-    }
-    let mut vgrp_w = zw;
-    for &vi in &mp_i.val_vs[256..] {
-        vgrp_w = sb.gate(cs.macs, &[vgrp_w, ow, wv(vi)])[0];
-    }
-    let v_w = sb.gate(cs.macs, &[vrs_w, ow, vgrp_w])[0];
-    let rhs_v_w = sb.gate(cs.macs, &[zw, wv(inner_pd_i.q_v), v_w])[0];
-    sb.connect(runw, rhs_v_w);
 
     cen.push((
         "family-H + merged boundary",
@@ -2556,7 +2544,7 @@ fn emit_anchor_expect(
     let mut rinv_n2: Vec<F128> = rho_mrg_n.clone();
     let mut rinv_w: Vec<Wire> = rho_mrg_w.clone();
     let mut ghat = zw;
-    for j in 0..128 {
+    for j in 0..RS_SHAT_WORDS {
         if j > 0 {
             let mut lvl_w = Vec::with_capacity(m_mp2);
             for t3 in 0..m_mp2 {
@@ -2623,7 +2611,10 @@ fn emit_anchor_expect(
         let coeff = if si == 0 {
             ghat
         } else {
-            sb.gate(spine, &[zw, zw, zw, zw, zw, zw, mp_pws[128], ghat, zw])[3]
+            sb.gate(
+                spine,
+                &[zw, zw, zw, zw, zw, zw, mp_pws[RS_SHAT_WORDS], ghat, zw],
+            )[3]
         };
         let wd = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, w_st, gdp[0], zw])[3];
         expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
@@ -2718,7 +2709,7 @@ fn emit_anchor_expect(
             let o = sb.gate(alslot, &a_in);
             gdp = [o[0], o[1], o[2], o[3]];
         }
-        let coeff = sb.gate(macs, &[zw, mp_pws[256 + g_ix], e_at_w])[0];
+        let coeff = sb.gate(macs, &[zw, mp_pws[2 * RS_SHAT_WORDS + g_ix], e_at_w])[0];
         let wd = sb.gate(macs, &[zw, w_st, gdp[0]])[0];
         expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
     }
@@ -2817,7 +2808,7 @@ fn emit_assertion_families(
         mat_pub.push(mlv_pw[1 + j].1);
     }
     let mat_rr_w: Vec<Wire> = lc_pw.iter().map(|&(_, w)| w).collect();
-    let zpartial_ws: Vec<Wire> = (0..64).map(|i| wv(rt.zp_v + i)).collect();
+    let zpartial_ws: Vec<Wire> = (0..Z_PARTIAL_WORDS).map(|i| wv(rt.zp_v + i)).collect();
     let va_b = wv(rt.zc_finals_v);
     let vb_b = wv(rt.zc_finals_v + 1);
     let mut lcb_w = sb.gate(cs.macs, &[vb_b, bl_alpha_w, va_b])[0];
@@ -2916,7 +2907,14 @@ fn emit_assertion_families(
     }
 }
 
-/// the publishes, in the swap's recorded order
+/// the publishes, in the swap's recorded order: the query block, then
+/// THE TAIL SCHEDULE — the table below IS the real walker's published
+/// wire format (a DIFFERENT order from the child's, deliberately),
+/// `check_real_child_region`'s independent positional walk is its
+/// backstop, and the tape pin holds its `(name, width)` list. The jagged
+/// block (raw W claim values in emission order — rs, then per group
+/// combo + dense members, the fresh-claim surfaces a merge fold connects
+/// to) closes the tail.
 #[allow(clippy::too_many_arguments)]
 fn emit_publishes_in_swap_order(
     sb: &mut ShapeBuilder,
@@ -2935,8 +2933,9 @@ fn emit_publishes_in_swap_order(
     anc_w: Wire,
     mat_pub: &[Wire],
     ela_pub: &[Wire],
+    jag_w: &[Wire],
     cen: &mut Vec<(&'static str, usize, usize)>,
-) -> usize {
+) -> (usize, usize, Vec<(&'static str, usize)>) {
     let pub_base = sb.public_len();
     for a_wires in to_publish {
         for w in a_wires {
@@ -2952,71 +2951,33 @@ fn emit_publishes_in_swap_order(
         sb.public_len(),
         sb.rows_in_slot(cs.macs),
     ));
-    sb.publish(t_final[0]);
-    sb.publish(t_final[1]);
-    sb.publish(tgt_w);
-    sb.publish(runw);
-    for accs in resid_pub {
-        for w in accs {
-            sb.publish(w[0]);
-            sb.publish(w[1]);
-        }
-    }
-    cen.push((
-        "TAIL: chain ends + residual accs",
-        sb.public_len(),
-        sb.rows_in_slot(cs.macs),
-    ));
-    sb.publish(inner_w[0]);
-    sb.publish(inner_w[1]);
-    sb.publish(sig_w);
-    for w in pt_w {
-        sb.publish(*w);
-    }
-    cen.push((
-        "TAIL: sigma + GKR point",
-        sb.public_len(),
-        sb.rows_in_slot(cs.macs),
-    ));
-    sb.publish(el_zr);
-    sb.publish(el_lcw);
-    sb.publish(anc_w);
-    for w in mat_pub {
-        sb.publish(*w);
-    }
-    for w in ela_pub {
-        sb.publish(*w);
-    }
-    cen.push((
-        "TAIL: el ends + assertion publics",
-        sb.public_len(),
-        sb.rows_in_slot(cs.macs),
-    ));
+    let tail = [
+        TailEntry::new("spine t_final", t_final.to_vec()),
+        TailEntry::new("intake target", vec![tgt_w]),
+        TailEntry::new("intake running", vec![runw]),
+        TailEntry::new(
+            "residual accs",
+            resid_pub.iter().flatten().flatten().copied().collect(),
+        )
+        .with_census("TAIL: chain ends + residual accs"),
+        TailEntry::new("residual inner", inner_w.to_vec()),
+        TailEntry::new("sigma value", vec![sig_w]),
+        TailEntry::new("sigma point", pt_w.to_vec()).with_census("TAIL: sigma + GKR point"),
+        TailEntry::new("element zc+lc ends", vec![el_zr, el_lcw]),
+        TailEntry::new("anchor end", vec![anc_w]),
+        TailEntry::new("matrix assertion publics", mat_pub.to_vec()),
+        TailEntry::new("element assertion publics", ela_pub.to_vec())
+            .with_census("TAIL: el ends + assertion publics"),
+        TailEntry::new("jagged claim values", jag_w.to_vec())
+            .with_census("TAIL: jagged claim values"),
+    ];
     // Family H is now internal arithmetic.  Its source words are already
     // bound where they enter the transcript/proof stream, so no duplicate
     // public re-exposure or checker-only advice remains.
-    pub_base
-}
-
-/// the JAGGED ASSERTION emission (the count win)
-///
-/// Raw W claim values in emission order (rs, then per group combo +
-/// dense members), checker-held against the deferred export — the
-/// fresh-claim surfaces a merge fold connects to.
-fn emit_jagged_assertion(
-    sb: &mut ShapeBuilder,
-    cs: &ChildSlots,
-    jag_w: &[Wire],
-    cen: &mut Vec<(&'static str, usize, usize)>,
-) {
-    for w in jag_w {
-        sb.publish(*w);
-    }
-    cen.push((
-        "TAIL: jagged claim values",
-        sb.public_len(),
-        sb.rows_in_slot(cs.macs),
-    ));
+    let (n_tail, tail_schedule) = publish_tail(sb, &tail, |sb, label| {
+        cen.push((label, sb.public_len(), sb.rows_in_slot(cs.macs)));
+    });
+    (pub_base, n_tail, tail_schedule)
 }
 
 /// Walk one emitted REAL child region's public block and hold every
@@ -3158,7 +3119,7 @@ pub(super) fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &Re
     for (j, &z) in rt.mat_assert.z_partial.iter().enumerate() {
         assert_eq!(public[mq + j], z, "z_partial {j} published");
     }
-    mq += 64;
+    mq += Z_PARTIAL_WORDS;
     assert_eq!(
         public[mq], rt.mat_assert.target,
         "the in-circuit boolean lc replay ends at the assertion's target"

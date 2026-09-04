@@ -15,15 +15,17 @@ use flock_core::{
         univariate_skip_optimized::{medium_challenges_ghash, small_challenges_ghash},
     },
 };
-use flock_transcript::transcript_record::{TranscriptOp as Op, TranscriptShape};
+use flock_transcript::transcript_record::{
+    Stream, StreamWord, TranscriptOp as Op, TranscriptShape,
+};
 
 use crate::{
     r1cs_hashes::fs_chain::FsChainTrace,
     tower::{
         ChildSlots, F128, GkrLayerRec, GkrRec, InnerPd, Lvl, MergedChain, MixedProof, MpRec,
-        OpenLevel, RoundRec, ShapeBuilder, Wire, ZskipTapeRec, assert_chain_replays,
-        duplex_row_count_model, emit_spine256, level_query_phase_b3_rows, merge_chain,
-        squeeze_word_wire,
+        OpenLevel, PdRec, RoundRec, ShapeBuilder, Wire, ZskipTapeRec, ZskipWires,
+        assert_chain_replays, duplex_row_count_model, emit_family_h, emit_spine256,
+        level_query_phase_b3_rows, merge_chain, squeeze_word_wire,
     },
 };
 
@@ -329,8 +331,9 @@ pub(super) fn census_levels_and_chain_rows(
 /// anchor's claimed v (a copy constraint), then the anchor's own rounds
 /// folding that v to the endpoint the expect consumes — the squeezes are
 /// the sigma wires. The gamma-power wires are KEPT: the anchor expect
-/// consumes mp_pws[j] (j < 128) for ĝ, mp_pws[128] for the second RS
-/// statement, and mp_pws[256 + k] for the P group coefficients. BOTH
+/// consumes `mp_pws[j]` (`j < RS_SHAT_WORDS`) for ĝ,
+/// `mp_pws[RS_SHAT_WORDS]` for the second RS statement, and
+/// `mp_pws[2 * RS_SHAT_WORDS + k]` for the P group coefficients. BOTH
 /// walkers must emit this exact intake.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_multipoint_intake(
@@ -599,6 +602,208 @@ pub(super) fn baked_inner_t_vals(zskip: &ZskipTapeRec) -> Vec<F128> {
         "the seven baked inner constants"
     );
     t_vals_b
+}
+
+// ---- THE REGION-LABEL VOCABULARY ----
+// Every transcript region label the walkers and the tape parser locate
+// against, one name per label — matching the protocol's own absorb sites
+// in flock-core byte for byte. The REGION ORDER contract lives at the two
+// label maps (`child_walker::parse_label_map` and `RealTape::new`),
+// identical on both walkers: [zerocheck / AG skip | lincheck | element zc
+// | element lc | product GKR | merged open | ring switch | multipoint |
+// frobenius assist], with the opening-basis and inner packed-direct
+// labels inside the open phase (`tape::parse_open_levels`).
+pub(super) const LBL_ZEROCHECK: &[u8] = b"flock-zerocheck-v0";
+pub(super) const LBL_AG_SKIP: &[u8] = b"flock-ag-skip-v1";
+pub(super) const LBL_AG_R1_POINT: &[u8] = b"flock-ag-skip-r1-point";
+pub(super) const LBL_AG_R1_NONCE: &[u8] = b"flock-ag-skip-r1-nonce";
+pub(super) const LBL_LINCHECK: &[u8] = b"flock-lincheck-v0";
+pub(super) const LBL_ELEMENT_ZC: &[u8] = b"flock-element-union-zc-v0";
+pub(super) const LBL_ELEMENT_LC: &[u8] = b"flock-element-union-lc-v0";
+pub(super) const LBL_PRODUCT_GKR: &[u8] = b"flock-product-gkr-batched-v0";
+pub(super) const LBL_MERGED_OPEN: &[u8] = b"flock-merged-open-v1";
+pub(super) const LBL_RING_SWITCH: &[u8] = b"flock-ring-switch-v0";
+pub(super) const LBL_MULTIPOINT: &[u8] = b"flock-multipoint-twisted-v1";
+pub(super) const LBL_FROBENIUS: &[u8] = b"flock-frobenius-assist-v0";
+pub(super) const LBL_OPEN_BASIS: &[u8] = b"flock-ligerito-basis-f256-split-v0";
+pub(super) const LBL_INNER_PD: &[u8] = b"flock-pcs-packed-direct-v0";
+
+/// The boolean zerocheck's absorbed `z_partial` slice, in words. The
+/// checker's matrix block and the assertion publics count by it — BOTH
+/// walkers locate and re-emit exactly this many words.
+pub(super) const Z_PARTIAL_WORDS: usize = 64;
+
+/// One ring-switch claim's `s_hat` width, in words (the F128 basis).
+/// The multipoint gamma-power schedule spans `2 * RS_SHAT_WORDS` RS
+/// powers before the P group coefficients — the R=2+P schedule (see
+/// [`emit_multipoint_intake`]'s doc); BOTH walkers pin the same span.
+pub(super) const RS_SHAT_WORDS: usize = 128;
+
+/// One block of a walker's published TAIL: its name and the wires it
+/// publishes, in order. A walker's tail is a `Vec<TailEntry>` — THE
+/// PUBLISH SCHEDULE AS DATA: [`publish_tail`] iterates it, `n_tail` is
+/// its width sum (never a hand-maintained closed form), and the schedule
+/// `(name, width)` list lands in the region output so the tape-pin tests
+/// hold it against independent width expressions. The two walkers keep
+/// SEPARATE tables (their publish orders differ deliberately), and the
+/// `check_*` walks stay positionally independent of the table — the
+/// checker re-deriving every offset by hand is the soundness backstop
+/// that falsifies a wrong table.
+pub(super) struct TailEntry {
+    pub(super) name: &'static str,
+    pub(super) wires: Vec<Wire>,
+    /// A census checkpoint recorded after this block (the REAL walker's
+    /// bench instrumentation; `None` everywhere on the child).
+    pub(super) census_after: Option<&'static str>,
+}
+
+impl TailEntry {
+    pub(super) fn new(name: &'static str, wires: Vec<Wire>) -> TailEntry {
+        TailEntry {
+            name,
+            wires,
+            census_after: None,
+        }
+    }
+    pub(super) fn with_census(mut self, label: &'static str) -> TailEntry {
+        self.census_after = Some(label);
+        self
+    }
+}
+
+/// Publish a walker's tail per its schedule. Returns `(n_tail, schedule)`
+/// — the width sum and the `(name, width)` list the region exports for
+/// the tape pins.
+pub(super) fn publish_tail(
+    sb: &mut ShapeBuilder,
+    entries: &[TailEntry],
+    mut checkpoint: impl FnMut(&mut ShapeBuilder, &'static str),
+) -> (usize, Vec<(&'static str, usize)>) {
+    let mut schedule = Vec::with_capacity(entries.len());
+    for e in entries {
+        for w in &e.wires {
+            sb.publish(*w);
+        }
+        schedule.push((e.name, e.wires.len()));
+        if let Some(label) = e.census_after {
+            checkpoint(sb, label);
+        }
+    }
+    (schedule.iter().map(|&(_, n)| n).sum(), schedule)
+}
+
+/// Family-H plus the merged intake BOUNDARY, in-circuit: the complete
+/// family-H relation over the RS sources, the packed-direct gamma chain,
+/// the intake TARGET (`rsh + pd`), the W-rounds fold of the target to
+/// RUNNING, and the closure `running == q_eval · (v_rs + v_grp)` as a
+/// copy constraint. All inputs are already bound transcript or proof
+/// wires — no target/V advice and no native checker are part of the
+/// recursive statement. BOTH walkers must emit this exact block. Returns
+/// `(tgt_w, runw)`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_family_h_boundary(
+    sb: &mut ShapeBuilder,
+    cs: &ChildSlots,
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    rs_recs: &[(usize, usize, usize)],
+    rs_gam_fins: &[(usize, usize)],
+    mp: &MpRec,
+    gammas: &[PdRec],
+    w_rounds: &[RoundRec],
+    inner_pd: &InnerPd,
+    pfslot: SlotId,
+    pf_w: usize,
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+    zw: Wire,
+    ow: Wire,
+) -> (Wire, Wire) {
+    let (shv_w, value_w, rdp_w, gamma_w) =
+        family_h_source_wires(outs, trace, wv, rs_recs, rs_gam_fins, &mp.val_vs);
+    let (rsh_w, vrs_w) = emit_family_h(
+        sb,
+        cs.q.family.expect("family-H slot"),
+        cs.macs,
+        cs.fold_macs,
+        cs.spine,
+        cs.spine256,
+        cs.resid
+            .iter()
+            .find(|&&(key, _)| key == 701)
+            .expect("the child slots declare an F256 MAC slot")
+            .1,
+        1usize << cs.nu,
+        &shv_w,
+        &value_w,
+        &rdp_w,
+        gamma_w,
+        pfslot,
+        pf_w,
+        zw,
+        ow,
+        vals,
+        consts,
+    );
+    let mut pdh_w = zw;
+    for pd in gammas {
+        let gw = squeeze_word_wire(outs, trace, pd.fin, pd.squeeze_offset);
+        pdh_w = sb.gate(cs.macs, &[pdh_w, gw, wv(pd.val_v)])[0];
+    }
+    let tgt_w = sb.gate(cs.macs, &[rsh_w, ow, pdh_w])[0];
+    let mut runw = tgt_w;
+    for rr in w_rounds {
+        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+        runw = sb.gate(cs.mrs, &[runw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+    }
+    let mut vgrp_w = zw;
+    for &vi in &mp.val_vs[2 * RS_SHAT_WORDS..] {
+        vgrp_w = sb.gate(cs.macs, &[vgrp_w, ow, wv(vi)])[0];
+    }
+    let v_w = sb.gate(cs.macs, &[vrs_w, ow, vgrp_w])[0];
+    let rhs_v_w = sb.gate(cs.macs, &[zw, wv(inner_pd.q_v), v_w])[0];
+    sb.connect(runw, rhs_v_w);
+    (tgt_w, runw)
+}
+
+/// The z_skip flavor surface, materialized as wires: the RS rho squeeze,
+/// or the AG seed pair plus the r1 nonce's stream word. BOTH walkers
+/// materialize this exact surface for their region output.
+pub(super) fn zskip_wires(
+    zskip: &ZskipTapeRec,
+    outs: &[Vec<Wire>],
+    trace: &FsChainTrace,
+    stream: &Stream,
+    ww: &[Option<Wire>],
+) -> ZskipWires {
+    match zskip {
+        ZskipTapeRec::Rs { fin, .. } => ZskipWires::Rs(outs[trace.squeezes[*fin][0]][0]),
+        ZskipTapeRec::Ag {
+            seed_fins,
+            nonce_payload,
+            ..
+        } => {
+            let nonce_wi = stream
+                .words
+                .iter()
+                .position(|w| {
+                    matches!(
+                        w,
+                        StreamWord::Bytes { payload, word: 0 }
+                            if *payload == *nonce_payload
+                    )
+                })
+                .expect("the r1 nonce rides one stream word");
+            ZskipWires::Ag {
+                seed_w: [
+                    squeeze_word_wire(outs, trace, seed_fins[0], 0),
+                    squeeze_word_wire(outs, trace, seed_fins[1], 0),
+                ],
+                nonce_w: ww[nonce_wi].expect("the nonce payload word is wired"),
+            }
+        }
+    }
 }
 
 /// The residual region's prefix-slot product: every chunked (1 + a + b)

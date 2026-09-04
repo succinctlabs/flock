@@ -2,7 +2,16 @@ use std::mem::take;
 
 use flock_transcript::transcript_record::{TranscriptOp, TranscriptOp as Op};
 
-use crate::{r1cs_hashes::fs_chain::FsChainTrace, tower::Wire};
+use crate::{
+    r1cs_hashes::fs_chain::FsChainTrace,
+    tower::{
+        Wire,
+        walker_common::{
+            LBL_ELEMENT_LC, LBL_ELEMENT_ZC, LBL_FROBENIUS, LBL_INNER_PD, LBL_MERGED_OPEN,
+            LBL_MULTIPOINT, LBL_OPEN_BASIS, LBL_RING_SWITCH,
+        },
+    },
+};
 
 /// One packed-direct claim on the tape: its absorbed VALUE and gamma. The
 /// POINT is not on the stream since merged-open v1 — it is transcript-derived
@@ -203,9 +212,7 @@ pub(super) fn parse_open_levels(
     // enter the tape at the wrong level.
     let label = ops
         .iter()
-        .position(
-            |o| matches!(o, Op::Label(l) if l.as_slice() == b"flock-ligerito-basis-f256-split-v0"),
-        )
+        .position(|o| matches!(o, Op::Label(l) if l.as_slice() == LBL_OPEN_BASIS))
         .expect("Ligerito opening label");
     assert!(
         matches!(ops.get(label + 1), Some(Op::ObserveScalar)),
@@ -236,7 +243,7 @@ pub(super) fn parse_open_levels(
     let mut intake_rs = 0usize;
     let mut intake_pd_vals: Vec<usize> = Vec::new();
     while cur.i < start {
-        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-element-union-zc-v0") {
+        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == LBL_ELEMENT_ZC) {
             cur.bump();
             cur.skip_pows();
             let (tau_fin, tau_ch, tau_len) = match ops[cur.i] {
@@ -263,7 +270,7 @@ pub(super) fn parse_open_levels(
             cur.expect_obs_scalar(); // eb
             cur.expect_obs_scalar(); // ec
             assert!(
-                matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-element-union-lc-v0"),
+                matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == LBL_ELEMENT_LC),
                 "lc label"
             );
             cur.bump();
@@ -297,7 +304,7 @@ pub(super) fn parse_open_levels(
             });
             continue;
         }
-        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-merged-open-v1") {
+        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == LBL_MERGED_OPEN) {
             in_pd = true;
             intake_rs = 0;
             intake_pd_vals.clear();
@@ -308,7 +315,7 @@ pub(super) fn parse_open_levels(
             // Ring-switched claims front the intake on boolean-bearing
             // tapes: [label, s_hat_v slice, r_dprime slice] each, then the
             // bare gamma squeezes.
-            if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0") {
+            if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == LBL_RING_SWITCH) {
                 intake_rs += 1;
                 cur.bump(); // label
                 cur.bump(); // s_hat_v slice
@@ -370,7 +377,7 @@ pub(super) fn parse_open_levels(
             }
             continue;
         }
-        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-multipoint-twisted-v1") {
+        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == LBL_MULTIPOINT) {
             // The multipoint region: P group-value absorbs, the batching
             // gamma, m two-product rounds, then the anchor's label + v +
             // 2(m + 1) rounds. Each loop terminates on the next label /
@@ -400,7 +407,7 @@ pub(super) fn parse_open_levels(
                 cur.bump();
             }
             assert!(
-                matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-frobenius-assist-v0"),
+                matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == LBL_FROBENIUS),
                 "op {}: expected the anchor label, got {:?}",
                 cur.i,
                 ops[cur.i]
@@ -432,7 +439,7 @@ pub(super) fn parse_open_levels(
             });
             continue;
         }
-        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-pcs-packed-direct-v0") {
+        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == LBL_INNER_PD) {
             cur.bump();
             let q_v = cur.v;
             cur.expect_obs_scalar(); // q_eval

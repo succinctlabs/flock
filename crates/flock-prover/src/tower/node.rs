@@ -54,11 +54,11 @@ use crate::{
         check_real_child_region, emit_ag_point_binding, emit_fold_region, emit_fs_chain,
         emit_fs_chain_partitioned, emit_jagged_fold_region, emit_lagrange_lows,
         emit_real_child_region, emit_recorded_pow_checks, env_acc_chain_base, env_acc_main_base,
-        env_app_base, env_pass_base, envelope_shape, flatten_ops, fold_region_ops,
-        jagged_fold_region_ops, labeled_bytes_payloads, leaf_boolean_lcs, leaf_boolean_mats,
-        live_element_input_from_rows, locate_and_pin_folds, locate_and_pin_jagged_folds,
-        merge_chain, outer_lanes, outer_union, outer_zc_ag, pack8, pad_envelope_counts,
-        payload_words, pcs_batch_for, read_acc_entry, replay_fold_endpoints,
+        env_app_base, env_pass_base, envelope_shape, expected_real_tail_schedule, flatten_ops,
+        fold_region_ops, jagged_fold_region_ops, labeled_bytes_payloads, leaf_boolean_lcs,
+        leaf_boolean_mats, live_element_input_from_rows, locate_and_pin_folds,
+        locate_and_pin_jagged_folds, merge_chain, outer_lanes, outer_union, outer_zc_ag, pack8,
+        pad_envelope_counts, payload_words, pcs_batch_for, read_acc_entry, replay_fold_endpoints,
         replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
     },
 };
@@ -871,6 +871,11 @@ pub fn build_node_outer_app(
                 );
                 sb.end_island(isl);
                 mac_marks.push(sb.rows_in_slot(cs.macs));
+                assert_eq!(
+                    r.tail_schedule,
+                    expected_real_tail_schedule(rt),
+                    "the real child's tail publishes on its declared schedule"
+                );
                 r
             })
             .collect();
