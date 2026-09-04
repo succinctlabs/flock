@@ -5609,3 +5609,51 @@ Next (stage 2, parked): re-seed the ladder from the block-first fold
 (the 2^19 q′ IS a fold of q over the top coordinates — the ladder
 wants the fold over its own initial coordinates; check which six it
 binds), and the full fusion (inner open at the F256 point).
+
+### ADJUDICATED (blocked by the tower envelope, not built): stage 2 — the full fusion of the transport into the Ligerito open — 2026-09-04
+
+Design (the "direct fold" completed): drop the merged sumcheck
+entirely and make W the inner open's L0 basis. Under the rectangular
+predicate W is 256 rank-1 terms per RS claim (+2 per scalar group) —
+the stage-1 `(A, S)` tables — so the ladder's six F256 block rounds run
+off the same statistics (`stats_round_msg` over 512 terms: ~0.5 ms),
+the existing fused fold gives the level-1 witness in F256, and the
+level-1 basis is W′ in F256 in closed form (byte tables with F256
+weights, ~2.5 ms). The OOD term keeps its sweep. Prover ceiling from
+the measured pieces: merged sumcheck 14 + ladder seed-sweep share 4 +
+F128 q′ fold folded into the F256 fold → **≈ −11 ms on the open**
+(109 → ~98), the assist prover disappears (it was off the critical
+path), the assist proof leaves the transcript (smaller proof, cheaper
+native verify).
+
+Why it is blocked: the verifier must then evaluate Ŵ at the ladder's
+F256 point (the residual pairing's `eval_b_residual`), i.e.
+Σ_j c′_j·eq(z^{2^j}, σ) with σ ∈ F256^{m−yr}. Every form of that is F256
+work: the closed form is 128 × (m − yr_log) F256 multiplies per claim
+(~4k F256 ≈ 12k F128 MAC rows for two claims, plus 6.4k squaring
+chains); the assist re-run at an F256 point triples its 3.2k
+square-root chains and 3.2k prefix products. The Frobenius trick that
+keeps the residual side cheap (yr is F128-valued per split coordinate,
+so ŷr(z^{2^j}) = ŷr(z)^{2^j}) does not help the bound coordinates. In
+the recursive verifier those rows are extension-field
+multiply-accumulates — type el701 — and the live census of
+`chain_tower_e2e_with_lane` today reads
+`el701 16384/16384` (el0 spine 9708, el600 mac 12316, el700 126):
+the type is AT its 2^14 ceiling, the same ceiling the four-level ladder
+overflowed by 774 rows. The fusion needs thousands there. The union's
+ν is shared by every slot, so ν = 15 doubles the node. No F128-point
+formulation exists: the moment W (or W′) is the Ligerito basis, its MLE
+is needed at the F256 challenges; the 25 F128 transport rounds are
+exactly the price of keeping the assist at an F128 point.
+
+Net: −11 ms (2%) of prover against an unlandable recursive verifier at
+ν = 14. Not built; parked behind a residual-gate redesign or ν = 15.
+
+What is still open on the F128 side of the transport tax (~13 ms at
+m=32 after stage 1): the C-claim bit-bank fold (12.6 ms, the stripe
+kernel at its lookup rate) could share ONE sweep with the lincheck's
+AB fold via a two-point sum table (32-byte entries, one lookup per
+byte for both points) — a kernel variant, est. −8..−9 ms if the fused
+lookup costs ~1.3× a single one; the q′ fold (5 ms) and the ladder's
+seed sweep (4 ms) are at the F128-multiply rate and have no cheaper
+form.
