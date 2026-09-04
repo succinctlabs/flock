@@ -12,6 +12,8 @@
 \newcommand{\rowof}{\mathrm{row}}
 \newcommand{\colof}{\mathrm{col}}
 \newcommand{\fjag}{\hat f_{\mathrm{jag}}}
+\newcommand{\qpkd}{q_{\mathrm{pkd}}}
+\newcommand{\qbits}{q_{\mathrm{bits}}}
 
 \newtheorem{theorem}{Theorem}
 \newtheorem{lemma}[theorem]{Lemma}
@@ -19,7 +21,9 @@
 
 \title{Capacity-Free Ring Switching for Jagged\\ Polynomial Commitments}
 \author{DRAFT --- author list and references to be settled}
-\date{July 27, 2026}
+\date{July 27, 2026 --- revised September 3, 2026\\
+{\small (the shipped claim grouping, the coefficient closed form,
+pipeline status)}}
 
 \begin{document}
 \maketitle
@@ -48,15 +52,16 @@ $\F = \F_{2^{128}}$; $\eq(\tau, x) = \prod_i (\tau_i x_i +
 is the coordinate-wise Frobenius power of a point $z$.
 
 \paragraph{Ring switching.} A bit-level claim on an $\Ftwo$-valued
-witness, packed $128$ bits per $\F$-word, is reduced by ring switching
-to an inner-product claim over the $2^{\ell}$-word packed domain,
+witness $\qbits$, packed $128$ bits per $\F$-word into $\qpkd$, is
+reduced by ring switching to an inner-product claim over the
+$2^{\ell}$-word packed domain,
 \begin{equation}\label{eq:rs}
-  \textstyle\sum_{e \in \{0,1\}^{\ell}} f(e)\, b(e) = t,
+  \textstyle\sum_{e \in \{0,1\}^{\ell}} \qpkd(e)\, b(e) = t,
   \qquad
   b(e) = \Phi\bigl(\eq(z, e)\bigr),
 \end{equation}
-where $f$ is the packed witness, $z \in \F^{\ell}$ is the claim's
-word-level point, and $\Phi : \F \to \F$ is an $\Ftwo$-linear map
+where $z \in \F^{\ell}$ is the claim's
+word-level point and $\Phi : \F \to \F$ is an $\Ftwo$-linear map
 determined by the claim's in-word structure and fresh verifier
 randomness. We treat a single claim throughout;
 Remark~\ref{rem:multi} handles several. $\Phi$ does not commute with
@@ -69,7 +74,7 @@ prefix sums $T_y$; we assume $\sum_y h_y = 2^m$ (append a final
 zero-filled padding column otherwise --- no loss of generality, and it
 frees the exposition of tail cases). The commitment binds the dense
 stack $q \in \F^{2^m}$; $\colof(d)$ is the unique $y$ with
-$T_y \le d < T_{y+1}$ and $\rowof(d) = d - T_{\colof(d)}$. The witness of \eqref{eq:rs} is
+$T_y \le d < T_{y+1}$ and $\rowof(d) = d - T_{\colof(d)}$. The witness $\qpkd$ of \eqref{eq:rs} is
 the embedding of $q$ into the virtual word domain
 ($\ell = n + k$, $e = \rowof + 2^n\colof$), zero elsewhere.
 Accordingly we write the claim's point as
@@ -89,10 +94,23 @@ multilinear
     \eq(z_{\mathrm c}, \colof(d))
 \]
 admits a succinct delegated evaluation (the \emph{assist}
-\cite{jagged}): a sumcheck over the $2(m{+}1)$ bits of the boundary
-pairs $(T_{y-1}, T_y)$ against a width-$4$ read-once branching program,
-with a transparent boundary-indicator weight; verifier cost
-$O(\mathrm{cols}\cdot m)$, proof size $2(m{+}1)$ degree-$2$ rounds.
+\cite{jagged}). Call a pair $(u, v)$ of $(m{+}1)$-bit integers a
+\emph{candidate boundary pair}; a width-$4$ read-once branching
+program, reading the $2(m{+}1)$ bits interleaved, computes on the true
+pairs each column's row sum ---
+$g(T_{y-1}, T_y) = \sum_{d \in \colof^{-1}(y)}
+\eq(\rho, d)\, \eq(z_{\mathrm r}, \rowof(d))$ --- and the transparent
+weight
+$U(u, v) = \sum_y \eq(z_{\mathrm c}, y)\, \eq(u, T_{y-1})\,
+\eq(v, T_y)$ indicates the true pairs, carrying the column factor.
+The assist is the $2(m{+}1)$-round degree-$2$ sumcheck for
+\begin{equation}\label{eq:assist}
+  \fjag(z_{\mathrm r}, z_{\mathrm c}, \rho)
+  \;=\;
+  \sum_{(u,v)} U(u, v)\, \hat g(u, v),
+\end{equation}
+the verifier evaluating $U$ and $\hat g$ at the final point itself;
+cost $O(\mathrm{cols}\cdot m)$.
 
 In the standard pipeline, \eqref{eq:rs} is discharged by a product
 sumcheck over the \emph{virtual} domain, and the resulting evaluation
@@ -105,23 +123,32 @@ that cost.
 
 \section{The merged reduction}\label{sec:merged}
 
+Three views of one dataset are in play: $\qbits$, the $\Ftwo$-valued
+witness the original claim speaks about; $\qpkd$, its $128$-per-word
+packing on the virtual word domain $\{0,1\}^{\ell}$ --- the witness of
+\eqref{eq:rs}, zero off the in-stack addresses; and $q \in \F^{2^m}$,
+the committed dense stack --- the same words as $\qpkd$ with the
+capacity padding cut away and the columns stacked, $\rowof(d)$ and
+$\colof(d)$ recovering word $d$'s place in the layout. The reduction
+below restates \eqref{eq:rs} entirely in the third.
+
 \begin{lemma}[restriction]\label{lem:restriction}
-Let $f$ be the embedding of $q$, with $z_{\mathrm r} \in \F^{n}$ and
+Let $\qpkd$ be the embedding of $q$, with $z_{\mathrm r} \in \F^{n}$ and
 $z_{\mathrm c} \in \F^{k}$ the claim's row and column points. Define
 $W : \{0,1\}^m \to \F$ by
 \[
   W[d] = \Phi\bigl(\eq(z_{\mathrm r}, \rowof(d))\cdot
                    \eq(z_{\mathrm c}, \colof(d))\bigr).
 \]
-Then $\sum_{e} f(e)\, b(e) = \sum_{d} q[d]\, W[d]$.
+Then $\sum_{e} \qpkd(e)\, b(e) = \sum_{d} q[d]\, W[d]$.
 \end{lemma}
 
 \begin{proof}
 The map $d \mapsto e(d) := \rowof(d) + 2^n \colof(d)$ is a bijection
-from $\{0,1\}^m$ onto the in-stack addresses, with $f(e(d)) = q[d]$ and
-$f = 0$ at every other address. Hence
+from $\{0,1\}^m$ onto the in-stack addresses, with $\qpkd(e(d)) = q[d]$
+and $\qpkd = 0$ at every other address. Hence
 \[
-  \sum_{e} f(e)\, b(e)
+  \sum_{e} \qpkd(e)\, b(e)
   \;=\; \sum_{d} q[d]\; b\bigl(e(d)\bigr)
   \;=\; \sum_{d} q[d]\;
         \Phi\bigl(\eq(z_{\mathrm r}, \rowof(d))\,
@@ -198,7 +225,17 @@ product structure, so no $\Phi$-interior variable is ever bound.
 The $c_j$ are deterministic transcript functions: evaluating $\Phi$
 on the bit basis gives a linear system whose Moore matrix
 $M[t][j] = e_t^{2^j}$ is universal and precomputed once; per proof,
-$128$ evaluations of $\Phi$ plus one $128^2$-multiply matvec.
+$128$ evaluations of $\Phi$ plus one $128^2$-multiply matvec. For the
+instantiated $\Phi$ even the matvec collapses: ring switching's fold
+map takes basis bit $t$ to $\gamma\,\eq(r'', t)$ --- $r'' \in \F^{7}$
+the in-word fold challenges, $\gamma$ the batching scalar --- so
+$c_j = \gamma \sum_t M^{-1}[j][t]\, \eq(r'', t) =
+\gamma\, \widehat{M^{-1}_j}(r'')$: the $j$-th coefficient is the MLE
+of the \emph{constant} inverse matrix's $j$-th row at $r''$. The
+native path keeps the matvec; the closed form (pinned in-tree against
+it) needs no per-proof solve and no dense bit-matrix table, which is
+what makes the coefficients tractable \emph{inside the recursion
+circuit} --- constant-lane folds at a wired transcript point.
 \end{remark}
 
 \begin{remark}[dual form: a multipoint view]\label{rem:dual}
@@ -236,17 +273,29 @@ coefficients, boundary combinatorics, verifier chains) can be shared.
 
 \section{The batched assist}\label{sec:protocol}
 
-The $128$ statements share the boundary-bit domain and batch into
-\emph{one} sumcheck: the prover sends $V$ (claimed
-$\widehat W(\rho)$) and both parties run the $2(m{+}1)$-round sumcheck
-for
+What remains after the merged sumcheck is a single verifier
+obligation: the value $\widehat W(\rho)$, needed to close the product
+check $c^* = \hat q(\rho)\,\widehat W(\rho)$ --- and twisted, so no
+assist can deliver it directly. Theorem~\ref{thm:main} converts it
+into material the assist \emph{can} handle: $128$ ordinary
+statements, the $j$-th claiming
+$\fjag(z_{\mathrm r}^{2^j}, z_{\mathrm c}^{2^j}, \rho)$ --- an
+instance of the identity \eqref{eq:assist} with weight $U_j$ and
+program value $\hat g_j$ built from the powered points in place of
+$(z_{\mathrm r}, z_{\mathrm c})$ --- of which the verifier needs only
+one fixed combination, with the known coefficients $c_j$.
+
+Discharged separately, that is $128$ assists. But the $128$
+identities sum over the \emph{same} domain, the $2(m{+}1)$ boundary
+bits, so they combine summand by summand: by Theorem~\ref{thm:main},
 \[
-  \sum_{(u,v)} H(u,v) = V,
-  \qquad
+  \sum_{(u,v)} H(u,v) \;=\; \widehat W(\rho)
+  \qquad\text{for}\qquad
   H(u,v) = \sum_{j} c_{j}\; U_{j}(u,v)\; \hat g_{j}(u,v),
 \]
-with $U_{j}, \hat g_{j}$ the assist's boundary weight and
-branching-program value at the powered points. Two observations:
+and one $2(m{+}1)$-round sumcheck for this sum replaces all $128$:
+the prover sends $V$ (claimed $\widehat W(\rho)$) and both parties
+run the sumcheck for $\sum H = V$. Two observations:
 
 \begin{itemize}[nosep]
 \item \emph{Deterministic weights.} Only the combined scalar $V$ is
@@ -308,28 +357,19 @@ run-constant: one multiply per node against $2(m{+}1)$ per column.
 Everything here is distributivity and associativity over $\F$, so the
 transcript is bit-identical to the per-column form.
 
-Measured ($256$ statements, Apple silicon), against the per-column
-form: at $m = 16$ over $64$ columns of heights $300/700$, prove
-$1.8 \to 1.7$\,ms and verify $0.44 \to 0.29$\,ms; at $m = 21$ over
-$192$ columns of heights $2^{10}\!\ldots\!2^{13}$, $3.5 \to 2.8$ and
-$1.02 \to 0.45$; at $m = 23$ over $368$ full-height columns --- the
-worst case, $\log n_t$ within a factor $1.6$ of $m$ --- $5.3 \to 4.3$
-and $1.78 \to 0.54$. The single-statement assist of the unmerged path
-runs the same tree: $0.15 \to 0.06$\,ms at $m = 21$.
-
-At the width where \S\ref{sec:multipoint} takes over the collapse is
-sharper still, the verifier especially: $4096$ columns of height
-$2^{11}$ at $m = 23$ prove $68.5 \to 41.9$\,ms and verify
-$17.8 \to 3.5$\,ms ($57$K nodes against $102$K per-column slots, so
-$940$\,MB of suffix state across the $256$ statements rather than
-$1.7$\,GB); $4096$ columns of height $300$ at $m = 21$, $64.5 \to 33.6$
-and $15.8 \to 3.2$. That makes the batched assist merely expensive at
-$4$K rather than infeasible, but it does not move the crossover: the
-multipoint protocol proves the same $4096$-column statement in
-$24$\,ms in total. The single-statement assist is flat there
-($2.1 \to 2.2$\,ms) --- at thousands of columns its per-layer column
-pass already fills the pool, and the tree trades arithmetic for a less
-regular gather --- while its verifier still gains $2.8\times$.
+Measured ($256$ statements, Apple silicon) against the per-column
+form: prove $5.3 \to 4.3$\,ms and verify $1.78 \to 0.54$\,ms at the
+worst case ($m = 23$, $368$ full-height columns, $\log n_t$ within a
+factor $1.6$ of $m$), with proportionate gains at smaller shapes. At
+$4096$ columns the collapse is sharper, the verifier especially
+(prove $68.5 \to 41.9$\,ms, verify $17.8 \to 3.5$\,ms, suffix state
+$1.7$\,GB $\to 940$\,MB) --- merely expensive rather than infeasible,
+and the crossover stands: the multipoint protocol proves the same
+statement in $24$\,ms in total. The single-statement assist ---
+\S\ref{sec:multipoint}'s anchor --- runs the same tree: $0.15 \to
+0.06$\,ms at $m = 21$, flat at thousands of columns where its
+per-layer column pass already fills the pool, its verifier still
+gaining $2.8\times$.
 
 \begin{theorem}[soundness, sketch]\label{thm:soundness}
 Against the committed $q$: if the ring-switching statement is false
@@ -358,8 +398,13 @@ above extends coordinate-wise: $W$ and Theorem~\ref{thm:main} gain a
 sum over $i$, the assist's summand becomes
 $\sum_{i,j} c_{i,j}\, U_{i,j}\, \hat g_{i,j}$ --- still one sumcheck
 of the same length --- and the Moore extraction runs once per claim.
-Our instantiation has $K = 2$ (the two evaluation claims a PIOP leaves
-on the committed witness), hence $256$ statements in one sumcheck.
+Nor need a claim be ring-switched to join: a \emph{packed-direct}
+claim (an evaluation claim already on the packed word domain) enters
+with $\Phi_i$ the scalar map $x \mapsto \gamma_i x$ --- one statement,
+not $128$ --- with the mechanics in Remark~\ref{rem:grouping}. Our
+boolean instantiation has $K = 2$ (the two evaluation claims a PIOP
+leaves on the committed witness), hence $256$ statements in one
+sumcheck.
 \end{remark}
 
 \section{Scaling in the number of columns: a multipoint
@@ -437,6 +482,36 @@ $K$-statement untwisted assist with deterministic weights
 $\gamma^{128 i}$ (sound as in \S\ref{sec:protocol}: only the combined
 scalar is consumed).
 
+\begin{remark}[the shipped grouping]\label{rem:grouping}
+The deployed claim set is mixed: alongside the $K$ ring-switched
+claims, element and circuit proofs leave \emph{packed-direct} claims,
+whose fold map is the $\F$-scalar $\Phi(x) = \gamma x$ ---
+$\Ftwo$-linear, so they enter the merged reduction of
+\S\ref{sec:merged} through the same weight builder (one sweep against
+a pre-combined $\gamma$-summed column table serves a whole group), and
+the builder cannot tell them apart. In this protocol their batch width
+collapses: $c_j = 0$ past index $0$, so a packed-direct claim costs a
+single \emph{untwisted} value, and claims sharing a row point merge by
+$\F$-homogeneity into one \emph{scalar group} costing one value in
+total (a gate-rich circuit union's ${\sim}300$ gather claims share one
+row point: one group). The sumcheck gains a second product ---
+$\sum_d \bigl[\bar a(d)\, g(d) + \bar b(d)\, \eq(\rho, d)\bigr]$, with
+$\bar b$ the $\gamma$-weighted sum of the group weights; a group's
+``$g$'' degenerates to $\eq(\rho, \cdot)$ because its only Frobenius
+index is $0$ --- still degree-$2$ rounds. The batching weights stay
+the consecutive powers ($\gamma^{128 i + j}$ for values,
+$\gamma^{128 K + k}$ for groups), so one univariate Schwartz--Zippel
+still pins everything, and the single anchor still suffices: the two
+closed-form endpoint factors ($\hat g(\rho'')$ and
+$\eq(\rho, \rho'')$) are baked into its coefficients, so the accept
+check remains a plain equality and no extra scalar travels.
+Element-only proofs ($K = 0$) skip the twisted machinery entirely.
+This two-product form is the shipped transport; the full protocol and
+its soundness composition are in the companion note \emph{The
+multipoint twisted evaluation}
+(\texttt{docs/multipoint-twisted-assist.tex}).
+\end{remark}
+
 Prover cost: two dense passes, one $m$-round sumcheck, one untwisted
 assist, plus \emph{computing} the $128 K$ values --- a pure
 computation with no protocol coupling, $O(128\,K \cdot \mathrm{cols}
@@ -449,19 +524,14 @@ protocol's proof work is column-independent except for the single
 assist.
 
 For the value computation itself, runs of \emph{equal} heights ---
-the registry's actual shape: per type, $k_t$ consecutive columns of
-height $n_t$, any integer --- admit an evaluation far below the
-generic bound. The column value is the matrix product
-$e_I^{\!\top} M_0 \cdots M_m\, e_S$, splittable at any layer $\ell$
-into a low row-vector times the high suffix; within a run of stride
-$h$, the pair's low-$\ell$ bits are a function of $T_y \bmod 2^\ell$
-alone, so one table of $2^\ell$ row-vectors (doubling build,
-$16 \cdot 2^\ell$ multiplies, $\ell \approx \log h + 2$) serves the
-whole run, the high suffix changes rarely (amortized free), and each
-column costs one $4$-multiply dot --- $O(1)$ per column after an
-$O(h)$ table, a win whenever $k \gtrsim h/\log h$, chosen adaptively
-per run against the incremental fallback (recompute from the highest
-changed boundary bit, amortized $O(\log h)$ layers).
+the registry's actual shape --- do far better than the generic bound:
+the column value is the matrix product
+$e_I^{\!\top} M_0 \cdots M_m\, e_S$, splittable at layer
+$\ell \approx \log h + 2$ into a low row-vector --- a function of
+$T_y \bmod 2^\ell$ alone, so one table of $2^\ell$ row-vectors serves
+the whole run --- times a high suffix that changes rarely. That is
+$O(1)$ per column after an $O(h)$ table, a win whenever
+$k \gtrsim h/\log h$.
 
 A prototype confirms all of it ($m = 23$, $K = 2$, Apple silicon;
 exact-value tests against the brute-force twisted weight, including
@@ -474,27 +544,27 @@ $0.4 / 1.7 / 7$\,ms (column-parallelized past ${\sim}2^{14}$ columns,
 and now also run-collapsed by the tree of \S\ref{par:runtree}; the
 largest remaining column-linear term). Verification measures
 $0.3 / 0.6 / 1.7$\,ms. The batched assist measures $5.5$\,ms at $368$
-columns and is memory-infeasible past a few thousand. A fused variant
-shares its dense context with the surrounding merged opening ---
-$\eq(\rho,\cdot)$ with the final opening's combine, the per-claim
-untwisted weights with a restructured $W$ build ($W$ is their
-coordinate-wise $\Phi$-image), and warm sumcheck scratch --- producing
-byte-identical proofs at a marginal cost of $12 / 18 / 26$\,ms; net of
-the restructure's own cost the integrated opening saves
-${\approx}5$--$8$\,ms over composing the standalone parts.
+columns and is memory-infeasible past a few thousand. Fused into the
+surrounding merged opening (shared dense context, byte-identical
+proofs), the marginal cost is $12 / 18 / 26$\,ms --- a net
+${\approx}5$--$8$\,ms saving over composing the standalone parts.
 
 \section{Implementation}\label{sec:eval}
 
 The construction is implemented in the Flock proof system (batch-hash
 proving over $\F_{2^{128}}$, jagged integer-lane Ligerito commitment
-\cite{ligero,ligerito}), side by side with the standard pipeline.
+\cite{ligero,ligerito}) --- originally side by side with the standard
+pipeline, which supplied the comparison below and has since been
+retired: the merged reduction, opened through the two-product
+multipoint transport of Remark~\ref{rem:grouping}, is now the only
+path in-tree.
 Theorem~\ref{thm:main}, the coefficient extraction, and the batched
 assist are each pinned by exact tests against brute-force oracles
 (random non-power-of-two heights, zero-height columns, powers through
 $j = 40$); the full pipeline round-trips with a tamper matrix on real
 mixed instances. At a production-scale workload ($2^{30}$-bit virtual
 domain at the right-sized capacity tier), the standard pipeline's
-ring-switching stage measures $12.3 / 23.0 / 44.7$\,ms at
+ring-switching stage measured $12.3 / 23.0 / 44.7$\,ms at
 $100\%/50\%/25\%$ utilization --- linear in the virtual domain ---
 while the merged pipeline's corresponding stages
 ($\Phi$-pass ${\approx}4$\,ms, merged sumcheck ${\approx}4$\,ms,
