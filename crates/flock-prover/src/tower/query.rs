@@ -258,7 +258,9 @@ pub(super) fn emit_residual_region(
     alpha_wires: &[Vec<Wire>],
     query_positions: &[Vec<Wire>],
     w_rounds: &[RoundRec],
-    inner_pd_fin: usize,
+    // The eq(ρ) packed-direct claim's gamma squeeze; `None` under the fused
+    // transport, whose weight term the caller adds to `inner` itself.
+    inner_pd_fin: Option<usize>,
     yr_wires: &[[Wire; 2]],
     trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     outs: &[Vec<Wire>],
@@ -489,7 +491,7 @@ pub(super) fn emit_residual_region(
                 }
             }
         };
-    {
+    if let Some(inner_pd_fin) = inner_pd_fin {
         assert_eq!(
             w_rounds.len(),
             pl_full + yr_log,
@@ -592,7 +594,9 @@ pub(super) fn check_residual_publics(
     levels: &[OpenLevel],
     geo: &[Lvl],
     w_rounds: &[RoundRec],
-    inner_pd_ch: usize,
+    inner_pd_ch: Option<usize>,
+    // The fused transport's weight term (see `child_walker::fused_pairing_native`).
+    extra_inner: F256,
     yr_vals: &[F256],
     chals: &[F128],
 ) -> F256 {
@@ -674,19 +678,23 @@ pub(super) fn check_residual_publics(
     };
     let mut inner_n = F256::ZERO;
     for y in 0..yr_len {
-        let mut evb = F256::from(chals[inner_pd_ch]);
-        for j in 0..pl_full {
-            evb *= F256::ONE + F256::from(chals[w_rounds[j].ch]) + ris_v[j];
-        }
-        for j in 0..yr_log {
-            evb *= if (y >> j) & 1 == 1 {
-                F256::from(chals[w_rounds[pl_full + j].ch])
-            } else {
-                F256::from(F128::ONE + chals[w_rounds[pl_full + j].ch])
-            };
-        }
-        evb *= coordinate_scale(0);
-        let mut comb = evb;
+        let mut comb = match inner_pd_ch {
+            Some(inner_pd_ch) => {
+                let mut evb = F256::from(chals[inner_pd_ch]);
+                for j in 0..pl_full {
+                    evb *= F256::ONE + F256::from(chals[w_rounds[j].ch]) + ris_v[j];
+                }
+                for j in 0..yr_log {
+                    evb *= if (y >> j) & 1 == 1 {
+                        F256::from(chals[w_rounds[pl_full + j].ch])
+                    } else {
+                        F256::from(F128::ONE + chals[w_rounds[pl_full + j].ch])
+                    };
+                }
+                evb * coordinate_scale(0)
+            }
+            None => F256::ZERO,
+        };
         for od in &levels[0].initial_ood {
             let folded = od.z_len - yr_log;
             assert_eq!(folded, pl_full, "L0 OOD spans every fold");
@@ -738,6 +746,7 @@ pub(super) fn check_residual_publics(
         }
         inner_n += yr_vals[y] * comb;
     }
+    inner_n += extra_inner;
     assert_eq!(
         F256::new(public[at], public[at + 1]),
         inner_n,

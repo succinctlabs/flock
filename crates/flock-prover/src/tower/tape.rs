@@ -135,8 +135,10 @@ pub(super) fn parse_open_levels(
     Option<PiopRec>,
     Vec<PdRec>,
     Vec<RoundRec>,
-    MpRec,
-    InnerPd,
+    // `None` under the fused transport: no multipoint region, no
+    // packed-direct intake — the weight is the inner open's own basis.
+    Option<MpRec>,
+    Option<InnerPd>,
     usize,
     Vec<OpenLevel>,
 ) {
@@ -448,8 +450,11 @@ pub(super) fn parse_open_levels(
         }
         cur.bump();
     }
-    let inner_pd = inner_pd.expect("the inner ligerito intake");
-    let mp = mp.expect("the multipoint region");
+    assert_eq!(
+        inner_pd.is_none(),
+        mp.is_none(),
+        "the packed-direct intake and the multipoint region come together"
+    );
     cur.bump(); // the open-phase initial cap absorb
     let mut initial_ood = Vec::new();
     while matches!(cur.ops[cur.i], Op::SqueezeSlice(_)) {

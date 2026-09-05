@@ -5714,3 +5714,42 @@ the two yr-half MLEs per split coordinate and their Frobenius chains,
 and the F256×F128 sums as spine256 rows. Budget from the live census:
 el0 ≈ 9.7k − 6.4k + 7.6k, el700 ≈ 0.1k + 6.5k, el600 ≈ 12.3k (keep the
 F256×F128 products in el700), el701 unchanged.
+
+### IN PROGRESS: full fusion, phase B (recursive verifier) — the residual twist repriced — 2026-09-05
+
+Built so far (compiles; `chain_spine_converges` reaches the circuit
+witness): the tape parser returns the multipoint region and the
+packed-direct intake as `Option`s; the child walker takes fused chain
+children (native replay seeds the Ligerito spine from the merged target,
+no anchor, `m_mp2` from the commitment; the circuit skips the multipoint
+intake, the ĝ/e_at kernel and the anchor-expect, opens the spine on an
+advice target connected to the in-circuit `tgt_w`, and closes the
+residual with a new pairing gadget); the residual close-out takes an
+optional eq(ρ) term; `emit_family_h` exposes the γ-scaled coefficient
+wires; the deferred layout export keeps its claim structure (honest
+claims at a fixed zero column point) so the accumulator and merge shapes
+are unchanged — the first-level fold accepts it. Real (mixed) children
+are untouched.
+
+The finding: the residual side does NOT twist for free. I had assumed
+`ŷr(z^{2^j}) = ŷr(z)^{2^j}` for the residual witness's MLE (it is
+base-field valued per split coordinate); that needs its COEFFICIENTS in
+F2, and they are F128 words — Frobenius is F2-linear, not F128-linear.
+Confirmed with a native oracle in the walker (`TEMPORARY PROBE`): the
+Frobenius-trick twin disagrees with `pcs::fused_weight_residual`; the
+direct per-position form agrees for both children (rs and scalar-group
+parts separately). The cheapest exact in-circuit form is the monomial
+one: `ŷr(z^{2^j}) = Σ_S Y_S·m_S^{2^j}` with `Y_S` the F2-combinations
+of the yr words (free) and `m_S` the 2^{yr_log−1} residual monomials, so
+per claim `Σ_{c0,S} Y_{c0,S}·Σ_j g_j·(κ_{c0} m_S)^{2^j}`: 32 squaring
+chains (4.1k rows) + 4.1k F256×F128 MACs on top of the point chains
+(20 coords, 2.5k) and the bound prefixes. Two claims ≈ 23k new rows
+against the ≈ 14.5k the assist and merged rounds free (incl. the 8,128
+el701 value-twist rows): net ≈ +8.5k rows per chain child (≈ +12% of
+the region), and it fits the 2^14 type ceilings only by splitting the
+chains and MACs across el700/el701/el0 (el700 ≈ 12k of 16k, el701 ≈
+12.5k, el0 ≈ 9k) — feasible, tight, and still to be built and debugged.
+
+Against it: leaf prover −7..−11 ms est. (clean A/B pending a quiet
+machine), proof −8,263 B, native verify ≈ parity. Decision handed back
+to Benedikt; the tree holds phase A + this partial phase B as WIP.

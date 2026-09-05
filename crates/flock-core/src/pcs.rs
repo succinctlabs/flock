@@ -1779,6 +1779,25 @@ fn fused_weight_residual(spec: &FusedWeightSpec<'_>, ris: &[F256], yr_log_n: usi
     out
 }
 
+/// `fused_weight_residual` for external oracles (the tower's native twin
+/// checks itself against the verifier's own evaluation).
+pub fn fused_weight_residual_oracle(
+    n_log: usize,
+    k_cols: usize,
+    rs: &[(&[F128], &[F128], Vec<F128>)],
+    pd: &[(&[F128], Vec<F128>)],
+    ris: &[F256],
+    yr_log_n: usize,
+) -> Vec<F256> {
+    let spec = FusedWeightSpec {
+        n_log,
+        k_cols,
+        rs: rs.iter().map(|(a, b, c)| (*a, *b, c.clone())).collect(),
+        pd: pd.iter().map(|(a, c)| (*a, c.clone())).collect(),
+    };
+    fused_weight_residual(&spec, ris, yr_log_n)
+}
+
 /// The fused transport's inner verify (see `open_fused_ligerito`).
 fn verify_fused_ligerito<Ch: Challenger>(
     commitment: &Commitment,
@@ -2780,6 +2799,56 @@ fn assemble_jagged_assertion(
     n_log: usize,
     mp: &jagged::MultipointDefer,
 ) -> crate::matrix_fold::JaggedAssertion {
+    let out = assemble_jagged_claims(
+        params,
+        x_outers,
+        packed_direct,
+        gammas_pd,
+        pd_groups,
+        n_log,
+        &mp.sigma,
+    );
+    let (rs, groups) = (&out.rs, &out.groups);
+    let mut ws = mp.statement_ws.iter();
+    for (rc, &coeff) in rs.iter().zip(&mp.rs_coeffs) {
+        if coeff.is_zero() {
+            continue;
+        }
+        assert_eq!(
+            *ws.next().expect("a statement per live RS claim"),
+            coeff * rc.value,
+            "RS statement recombination"
+        );
+    }
+    for ((combo, dense), &coeff) in groups.iter().zip(&mp.group_coeffs) {
+        let raw = combo.as_ref().map_or(F128::ZERO, |c| c.value)
+            + dense
+                .iter()
+                .fold(F128::ZERO, |a, &(g, ref c)| a + g * c.value);
+        assert_eq!(
+            *ws.next().expect("a statement per group"),
+            coeff * raw,
+            "group statement recombination"
+        );
+    }
+    assert!(ws.next().is_none(), "every statement accounted for");
+
+    out
+}
+
+/// The layout export's claims at the column point `sigma` — the assist's
+/// final point for the jagged transport; under the fused transport (which
+/// needs no layout claim) a fixed zero point, so the tower's accumulator
+/// sees the same claim structure either way.
+fn assemble_jagged_claims(
+    params: &jagged::JaggedParams,
+    x_outers: &[&[F128]],
+    packed_direct: &[PackedDirectClaimRef<'_>],
+    gammas_pd: &[F128],
+    pd_groups: &[(&[F128], Vec<F128>)],
+    n_log: usize,
+    sigma: &[F128],
+) -> crate::matrix_fold::JaggedAssertion {
     use crate::matrix_fold::{JaggedClaim, JaggedRowWeight, JaggedTable};
     let table = JaggedTable::from_params(params);
 
@@ -2789,7 +2858,7 @@ fn assemble_jagged_assertion(
         .map(|x| {
             JaggedClaim::honest(
                 JaggedRowWeight::eq(x[1 + n_log..].to_vec()),
-                mp.sigma.clone(),
+                sigma.to_vec(),
                 &table,
             )
         })
@@ -2846,7 +2915,7 @@ fn assemble_jagged_assertion(
             let combo = (!m.combo.is_empty()).then(|| {
                 JaggedClaim::honest(
                     JaggedRowWeight::Combo(m.combo.clone()),
-                    mp.sigma.clone(),
+                    sigma.to_vec(),
                     &table,
                 )
             });
@@ -2858,7 +2927,7 @@ fn assemble_jagged_assertion(
                         g,
                         JaggedClaim::honest(
                             JaggedRowWeight::eq(zc.to_vec()),
-                            mp.sigma.clone(),
+                            sigma.to_vec(),
                             &table,
                         ),
                     )
@@ -2886,30 +2955,6 @@ fn assemble_jagged_assertion(
             );
         }
     }
-    let mut ws = mp.statement_ws.iter();
-    for (rc, &coeff) in rs.iter().zip(&mp.rs_coeffs) {
-        if coeff.is_zero() {
-            continue;
-        }
-        assert_eq!(
-            *ws.next().expect("a statement per live RS claim"),
-            coeff * rc.value,
-            "RS statement recombination"
-        );
-    }
-    for ((combo, dense), &coeff) in groups.iter().zip(&mp.group_coeffs) {
-        let raw = combo.as_ref().map_or(F128::ZERO, |c| c.value)
-            + dense
-                .iter()
-                .fold(F128::ZERO, |a, &(g, ref c)| a + g * c.value);
-        assert_eq!(
-            *ws.next().expect("a statement per group"),
-            coeff * raw,
-            "group statement recombination"
-        );
-    }
-    assert!(ws.next().is_none(), "every statement accounted for");
-
     crate::matrix_fold::JaggedAssertion {
         k: params.k,
         m: params.m,
@@ -3124,14 +3169,32 @@ fn verify_batch_merged_core<Ch: Challenger>(
                 .collect(),
             pd: pd_groups,
         };
-        return verify_fused_ligerito(
+        verify_fused_ligerito(
             commitment,
             target,
             &spec,
             &proof.inner,
             lig_config,
             challenger,
-        );
+        )?;
+        // The fused weight's evaluation is count-independent, so nothing
+        // NEEDS deferring; the layout export still carries the same claim
+        // structure (honest, at a fixed zero column point) so the tower's
+        // accumulator and merge shapes are the transport's, not the layout's.
+        if let Some(out) = defer {
+            let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
+            let sigma = vec![F128::ZERO; 2 * (dense_log + 1)];
+            *out = Some(assemble_jagged_claims(
+                &params,
+                x_outers,
+                packed_direct,
+                gammas_pd,
+                &spec.pd,
+                n_log,
+                &sigma,
+            ));
+        }
+        return Ok(());
     }
     if proof.merged_rounds.len() != dense_log {
         return Err(VerifyErrorOpen::VirtualOpen);
