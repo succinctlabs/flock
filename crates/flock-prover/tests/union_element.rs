@@ -299,26 +299,16 @@ fn strict_fast_profile_grinds_element_piops() {
         open.merged_rounds.len(),
         "one PoW before every dense quadratic-round challenge"
     );
-    // Under the fused transport (a full-height column prefix on a lane-major
-    // commitment) there are no merged rounds and no assist.
-    let fused = open.frobenius.is_none();
-    if let Some(fro) = open.frobenius.as_ref() {
-        assert_eq!(
-            fro.round_grinding_nonces.len(),
-            fro.rounds.len(),
-            "one PoW before every multipoint quadratic-round challenge"
-        );
-        assert_eq!(
-            fro.anchor.grinding_nonces.len(),
-            fro.anchor.rounds.len(),
-            "one PoW before every Frobenius-anchor quadratic-round challenge"
-        );
-    } else {
-        assert!(
-            open.merged_rounds.is_empty(),
-            "fused transport: no merged rounds"
-        );
-    }
+    assert_eq!(
+        open.frobenius.round_grinding_nonces.len(),
+        open.frobenius.rounds.len(),
+        "one PoW before every multipoint quadratic-round challenge"
+    );
+    assert_eq!(
+        open.frobenius.anchor.grinding_nonces.len(),
+        open.frobenius.anchor.rounds.len(),
+        "one PoW before every Frobenius-anchor quadratic-round challenge"
+    );
     assert!(opening_grinding.claim_batch_bits > 0);
     assert!(opening_grinding.merged_round_bits > 0);
     assert!(opening_grinding.multipoint.gamma_bits > 0);
@@ -353,21 +343,6 @@ fn strict_fast_profile_grinds_element_piops() {
         "missing PCS batching PoW must reject"
     );
 
-    if fused {
-        let mut missing_l0 = proof.clone();
-        missing_l0
-            .pcs_open
-            .inner
-            .ligerito
-            .claim_batch_grinding_nonces
-            .pop();
-        assert!(
-            verify(&missing_l0).is_err(),
-            "missing inner-open claim-batch PoW must reject"
-        );
-        return;
-    }
-
     let mut missing_merged = proof.clone();
     missing_merged.pcs_open.merged_round_nonces.pop();
     assert!(
@@ -379,8 +354,6 @@ fn strict_fast_profile_grinds_element_piops() {
     missing_multipoint
         .pcs_open
         .frobenius
-        .as_mut()
-        .expect("jagged transport")
         .round_grinding_nonces
         .pop();
     assert!(
@@ -392,8 +365,6 @@ fn strict_fast_profile_grinds_element_piops() {
     missing_anchor
         .pcs_open
         .frobenius
-        .as_mut()
-        .expect("jagged transport")
         .anchor
         .grinding_nonces
         .pop();
@@ -480,27 +451,22 @@ fn element_claims_are_bound_by_the_opening() {
     // the element claims' weight evaluation. An element-only proof has no
     // ring-switched claims, so its dual values are the scalar groups'
     // (`group_values`); `values` is empty.
-    // Under the fused transport there is no assist: the weight is the inner
-    // open's own basis and its evaluation is the verifier's closed form.
-    if let Some(fro) = proof.pcs_open.frobenius.as_ref() {
-        assert!(fro.values.is_empty());
-        let mut bad = proof.clone();
-        bad.pcs_open.frobenius.as_mut().unwrap().group_values[0] += F128::ONE;
-        assert!(verify(&bad).is_err(), "tampered frobenius V");
-        for i in 0..fro.rounds.len() {
-            for which in 0..2 {
-                let mut bad = proof.clone();
-                let rounds = &mut bad.pcs_open.frobenius.as_mut().unwrap().rounds;
-                if which == 0 {
-                    rounds[i].0 += F128::ONE;
-                } else {
-                    rounds[i].1 += F128::ONE;
-                }
-                assert!(
-                    verify(&bad).is_err(),
-                    "tampered frobenius round {i} msg {which}"
-                );
+    assert!(proof.pcs_open.frobenius.values.is_empty());
+    let mut bad = proof.clone();
+    bad.pcs_open.frobenius.group_values[0] += F128::ONE;
+    assert!(verify(&bad).is_err(), "tampered frobenius V");
+    for i in 0..proof.pcs_open.frobenius.rounds.len() {
+        for which in 0..2 {
+            let mut bad = proof.clone();
+            if which == 0 {
+                bad.pcs_open.frobenius.rounds[i].0 += F128::ONE;
+            } else {
+                bad.pcs_open.frobenius.rounds[i].1 += F128::ONE;
             }
+            assert!(
+                verify(&bad).is_err(),
+                "tampered frobenius round {i} msg {which}"
+            );
         }
     }
 
@@ -1351,39 +1317,39 @@ fn mixed_class_merged_proof_bytes_pinned() {
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "007297c218dc8d09c2fcff88d8d0c360aa2dd5e768d28fb2376beec8de280a19",
+            "29c86f0b9211babda7a64cb57456b3b7c76341ce470c773d0ed08ed211a37205",
         ),
         (
             "elem-merged-nu12-2731",
             2731,
-            "e6103eed30ceb63d2995f05a31c88d4b94afe42b6751221b072bc91f10122712",
+            "ad0497a7863b73cda94d3ca7463d0b91359262fc962ce8c9f12f19e69ed753d9",
         ),
         (
             "elem-merged-nu12-0",
             0,
-            "47811c2ddfe0d0caa7d4f55ed6e2d3975451a7ebe3dc9a44ad26a14189dfd87f",
+            "92e265b26dd16b274c0f4d985449efaad0020a9deb1d283cdf1cda2d2c29f813",
         ),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "adbd683ec5fae7e9afab0a885e6f0317bfbf00bb609496fe3e961d9f22db172a",
+            "a7df4157d729a14cebd2953784a87bb299244bb7204988eb6710d2a21e9447f6",
         ),
         (
             "mix-merged-nu7-100-90",
             [100, 90],
-            "b3a4cc7aa5305b8ac154849a9bbdd7d54bae8a6f25f1d307fee55c4b5bdc16b2",
+            "ecbfcfd4d98318e537b0b5090b3b9306ea142a2d88a5bb48f89498fdf3bbfff6",
         ),
         (
             "mix-merged-nu7-0-90",
             [0, 90],
-            "5e823cf54e4384eea67bf424d176107e6c9d03988a2f958b527e05619b6e335f",
+            "4fbd01dfdb65e0be475acef7dc8a728ba68af08f22a48c1ecc8599f12704dd57",
         ),
         (
             "mix-merged-nu7-100-0",
             [100, 0],
-            "3e1e686499a2f21f08a72c04af01262c22416350a053170b21b6d316a53e205a",
+            "bd1ed5ee049132b7950b8dedb667475d19d5f6fc977eab8b65b7774875c7719d",
         ),
     ];
 

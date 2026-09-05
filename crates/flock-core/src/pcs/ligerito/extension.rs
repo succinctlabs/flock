@@ -57,7 +57,7 @@ pub(super) fn split_inner_product(words: &[F128], basis: &[F256]) -> F256 {
         .reduce(|| F256::ZERO, |a, b| a + b)
 }
 
-pub(crate) fn build_eq_table256(point: &[F256]) -> Vec<F256> {
+fn build_eq_table256(point: &[F256]) -> Vec<F256> {
     let mut table = vec![F256::ONE];
     for &r in point {
         let old = table.len();
@@ -1733,19 +1733,6 @@ fn base_table(values: &[F256]) -> Vec<F128> {
 // ladder: contract the rank-1 basis once, never materialize or fold it.
 // ---------------------------------------------------------------------------
 
-/// The fused transport's level-0 basis (docs, "full fusion"): the merged
-/// weight W as rank-1 terms over the (block | within) split, and the
-/// closed-form builder of its level-1 image `W′[h] = Σ_e eq(σ_blk, e)·W[e, h]`.
-/// The terms ride the statistics ladder like the eq tensors do; only the
-/// basis after the fold is built differently (no `within` vectors exist).
-pub(crate) struct FusedL0 {
-    /// Per term `(A(e), S(e))`: the block-side factor and the block
-    /// statistics `Σ_h q[e, h]·B(h)`, both in F256 (the rounds fold them).
-    pub terms: Vec<(Vec<F256>, Vec<F256>)>,
-    /// `eq(σ_blk, ·)` over the blocks → the dense level-1 weight (length `d`).
-    pub level1: Box<dyn Fn(&[F256]) -> Vec<F256> + Send + Sync>,
-}
-
 /// One block-statistic term: `B[e·d + h] = scale · blk[e] · within[h]`.
 struct StatTerm {
     scale: F256,
@@ -1854,9 +1841,6 @@ fn fold_blocks_by_eq_split(f: &[F128], w: &[F256], d: usize) -> Vec<F256> {
 /// s_t·blk_t[0]·within_t[h]` at `2h` and `u·B'[h]` at `2h+1` — the pairs
 /// `split_basis` produced from a materialized `B'`.
 fn materialize_folded_basis_split(terms: &[StatTerm], d: usize) -> Vec<F256> {
-    // Fused-transport terms carry no `within` vector (their level-1 image
-    // is built in closed form by the caller); only the eq tensors sum here.
-    let terms: Vec<&StatTerm> = terms.iter().filter(|t| !t.within.is_empty()).collect();
     let coef: Vec<F256> = terms.iter().map(|t| t.scale * t.blk[0]).collect();
     let mut out = crate::scratch::take_f256(2 * d);
     out.par_chunks_mut(1 << 13).enumerate().for_each(|(c, oc)| {
@@ -1879,8 +1863,7 @@ fn materialize_folded_basis_split(terms: &[StatTerm], d: usize) -> Vec<F256> {
 #[allow(clippy::too_many_arguments)]
 fn init_phase_statistics<Ch: Challenger>(
     packed_witness: Vec<F128>,
-    seeded: Option<VirtualEqBasis>,
-    fused: Option<FusedL0>,
+    seeded: VirtualEqBasis,
     seeded_stats: Option<Vec<F128>>,
     target: &mut F128,
     ood_samples: usize,
@@ -1901,19 +1884,13 @@ fn init_phase_statistics<Ch: Challenger>(
         let blk = crate::pcs::ring_switch::build_eq_scaled_parallel(&point[n_within..], F128::ONE);
         (within, blk.into_iter().map(F256::from).collect())
     };
-    assert!(
-        seeded.is_some() != fused.is_some(),
-        "the L0 basis is either one seeded eq tensor or the fused weight terms"
+    assert_eq!(
+        seeded.terms.len(),
+        1,
+        "the seeded basis is one scaled eq tensor"
     );
-    let seeded_split = seeded.map(|seeded| {
-        assert_eq!(
-            seeded.terms.len(),
-            1,
-            "the seeded basis is one scaled eq tensor"
-        );
-        let (s_within, s_blk) = split(&seeded.terms[0].coords);
-        (s_within, s_blk, seeded.terms[0].scale)
-    });
+    let (s_within, s_blk) = split(&seeded.terms[0].coords);
+    let gamma = seeded.terms[0].scale;
     // OOD points: the first shares the seeded term's sweep, later ones (a
     // non-shipped config) sweep on their own since each `z` depends on the
     // previous `y`.
@@ -1953,10 +1930,8 @@ fn init_phase_statistics<Ch: Challenger>(
     // them (`seeded_stats`), leaving only the OOD term to sweep for.
     let n_e = packed_witness.len() / d;
     let mut withins: Vec<&[F128]> = Vec::with_capacity(2);
-    if let Some((s_within, _, _)) = seeded_split.as_ref() {
-        if seeded_stats.is_none() {
-            withins.push(s_within);
-        }
+    if seeded_stats.is_none() {
+        withins.push(&s_within);
     }
     if ood_samples > 0 {
         withins.push(&first_within);
@@ -1967,33 +1942,18 @@ fn init_phase_statistics<Ch: Challenger>(
         block_statistics(&packed_witness, &withins, d)
     };
     let t_sweep = t0.elapsed();
-    if let Some((s_within, s_blk, gamma)) = seeded_split {
-        let s_g = match seeded_stats {
-            Some(g) => {
-                assert_eq!(g.len(), n_e, "seeded statistics: one per lane block");
-                g
-            }
-            None => stats.remove(0),
-        };
-        terms.push(StatTerm {
-            scale: F256::from(gamma),
-            within: s_within,
-            blk: s_blk,
-            g: s_g.into_iter().map(F256::from).collect(),
-        });
-    }
-    let fused_level1 = fused.map(|fused| {
-        for (a, g) in fused.terms {
-            assert_eq!(a.len(), n_e, "fused term: one block factor per lane block");
-            assert_eq!(g.len(), n_e, "fused term: one statistic per lane block");
-            terms.push(StatTerm {
-                scale: F256::ONE,
-                within: Vec::new(),
-                blk: a,
-                g,
-            });
+    let s_g = match seeded_stats {
+        Some(g) => {
+            assert_eq!(g.len(), n_e, "seeded statistics: one per lane block");
+            g
         }
-        fused.level1
+        None => stats.remove(0),
+    };
+    terms.push(StatTerm {
+        scale: F256::from(gamma),
+        within: s_within,
+        blk: s_blk,
+        g: s_g.into_iter().map(F256::from).collect(),
     });
     if ood_samples > 0 {
         let g = stats.remove(0);
@@ -2049,22 +2009,7 @@ fn init_phase_statistics<Ch: Challenger>(
     crate::scratch::give_f128(packed_witness);
     let t_fold = t2.elapsed();
     let t3 = std::time::Instant::now();
-    let mut basis = materialize_folded_basis_split(&terms, d);
-    if let Some(level1) = fused_level1 {
-        // The fused weight's level-1 image, added in the switch's split
-        // form: `W′[h]` at `2h`, `u·W′[h]` at `2h+1`.
-        let wp = level1(&w);
-        assert_eq!(wp.len(), d);
-        basis
-            .par_chunks_mut(2 << 12)
-            .zip(wp.par_chunks(1 << 12))
-            .for_each(|(bc, wc)| {
-                for (pair, &x) in bc.as_chunks_mut::<2>().0.iter_mut().zip(wc) {
-                    pair[0] += x;
-                    pair[1] += F256::U * x;
-                }
-            });
-    }
+    let basis = materialize_folded_basis_split(&terms, d);
     let t_basis = t3.elapsed();
     let t4 = std::time::Instant::now();
     // The code switch on the already-split state: only its message is
@@ -2115,8 +2060,6 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // (the merged transport: its sumcheck's folded witness at the lane-block
     // round); `None` sweeps for them.
     seeded_stats: Option<Vec<F128>>,
-    // The fused transport's L0 basis (replaces the eq basis; lane-major only).
-    fused: Option<FusedL0>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -2192,21 +2135,13 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // THE STATISTICS LADDER (see `init_phase_statistics`): lane-major with
     // the factored basis. The combine skipped its O(L) sweep under the same
     // gate, so `first_msg`/`round1_lookahead` carry nothing here.
-    assert!(
-        fused.is_none() || (l0_lane_major && virtual_basis.is_none()),
-        "the fused L0 basis is lane-major and replaces the eq basis"
-    );
-    // The fused transport always rides the ladder (its terms exist only as
-    // block statistics); the eq basis takes it when enabled.
-    let stats_path = fused.is_some()
-        || (virtual_basis.is_some() && l0_lane_major && crate::pcs::stats_ladder_enabled());
+    let stats_path = virtual_basis.is_some() && l0_lane_major && crate::pcs::stats_ladder_enabled();
     let (mut sumcheck, lane_challenges) = if stats_path {
-        let seeded = virtual_basis.take();
+        let seeded = virtual_basis.take().expect("gated on Some");
         let _t = std::time::Instant::now();
         let out = init_phase_statistics(
             packed_witness,
             seeded,
-            fused,
             seeded_stats,
             &mut target,
             ood_count(0),

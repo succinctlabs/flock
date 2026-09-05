@@ -916,19 +916,10 @@ fn merged_transport_roundtrip_and_tamper() {
         bad.pcs_open.q_eval += F128::ONE;
         reject(&bad, "q_eval");
         let mut bad = proof.clone();
-        bad.pcs_open
-            .frobenius
-            .as_mut()
-            .expect("mixed-class layouts take the jagged transport")
-            .values[0][0] += F128::ONE;
+        bad.pcs_open.frobenius.values[0][0] += F128::ONE;
         reject(&bad, "frobenius V");
         let mut bad = proof.clone();
-        bad.pcs_open
-            .frobenius
-            .as_mut()
-            .expect("mixed-class layouts take the jagged transport")
-            .rounds[5]
-            .1 += F128::ONE;
+        bad.pcs_open.frobenius.rounds[5].1 += F128::ONE;
         reject(&bad, "frobenius round");
         let mut bad = proof.clone();
         bad.pcs_open.inner.ligerito.initial_cap = vec![[0u8; 32]];

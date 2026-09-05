@@ -212,15 +212,9 @@ pub(super) fn proof_census_parts(
         wiring_kib,
         sz(bincode::serialize(&pcs_open.merged_rounds)),
         sz(bincode::serialize(&pcs_open.ring_switches)),
-        sz(bincode::serialize(
-            &pcs_open.frobenius.as_ref().map(|f| &f.values)
-        )),
-        sz(bincode::serialize(
-            &pcs_open.frobenius.as_ref().map(|f| &f.rounds)
-        )),
-        sz(bincode::serialize(
-            &pcs_open.frobenius.as_ref().map(|f| &f.anchor)
-        )),
+        sz(bincode::serialize(&pcs_open.frobenius.values)),
+        sz(bincode::serialize(&pcs_open.frobenius.rounds)),
+        sz(bincode::serialize(&pcs_open.frobenius.anchor)),
         l0_rows,
         l0_paths,
         rec_rows,

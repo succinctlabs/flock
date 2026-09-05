@@ -271,9 +271,6 @@ impl<'p> RealTape<'p> {
         let lvl_src = level_sources(lig);
         let (start_v_i, piop_i, gammas_i, w_rounds, mp_i, inner_pd_i, yr_v_i, levels) =
             parse_open_levels(&ops, 32 * lig.initial_cap.len(), r);
-        // Real (mixed-class) children take the jagged transport.
-        let mp_i = mp_i.expect("real children carry the multipoint region");
-        let inner_pd_i = inner_pd_i.expect("real children carry the packed-direct intake");
         assert_eq!(levels.len(), r + 1);
         let piop_i = piop_i.expect("the real inner HAS an element PIOP");
         assert!(!piop_i.zc_rounds.is_empty() && !piop_i.lc_rounds.is_empty());
@@ -297,14 +294,7 @@ impl<'p> RealTape<'p> {
         );
 
         // The R=2 + P schedule replays to the anchor's claimed v.
-        let n_p = lo
-            .proof
-            .pcs_open()
-            .frobenius
-            .as_ref()
-            .expect("jagged child: assist present")
-            .group_values
-            .len();
+        let n_p = lo.proof.pcs_open().frobenius.group_values.len();
         assert!(n_p > 0, "the mixed inner groups its pd claims");
         assert_eq!(
             mp_i.val_vs.len(),
@@ -679,12 +669,7 @@ impl<'p> RealTape<'p> {
                 let g0 = running + g1;
                 running = g0 + (g1 + g0 + gi) * rc + gi * rc * rc;
             }
-            let fro = lo
-                .proof
-                .pcs_open()
-                .frobenius
-                .as_ref()
-                .expect("jagged child: assist present");
+            let fro = &lo.proof.pcs_open().frobenius;
             let mut vrs = F128::ZERO;
             for (k, cs) in coeffs.iter().enumerate() {
                 for (j, &cj) in cs.iter().enumerate() {
@@ -1569,9 +1554,7 @@ pub(super) fn emit_family_h(
     mac256: flock_core::circuit::builder::SlotId,
     row_capacity: usize,
     shv: &[Vec<Wire>; 2],
-    // The multipoint dual values; `None` under the fused transport, which
-    // wants only the coefficients (returned third) and the RS target.
-    values: Option<&[Vec<Wire>; 2]>,
+    values: &[Vec<Wire>; 2],
     r_dprime: &[Vec<Wire>; 2],
     gamma: [Wire; 2],
     pfslot: flock_core::circuit::builder::SlotId,
@@ -1580,13 +1563,11 @@ pub(super) fn emit_family_h(
     ow: Wire,
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
-) -> (Wire, Wire, [Vec<Wire>; 2]) {
+) -> (Wire, Wire) {
     assert_eq!(pf_w, 8, "the envelope family-H prefix width is eight");
     for k in 0..2 {
         assert_eq!(shv[k].len(), 128, "one full tensor-algebra row table");
-        if let Some(values) = values {
-            assert_eq!(values[k].len(), 128, "one Frobenius value per Moore row");
-        }
+        assert_eq!(values[k].len(), 128, "one Frobenius value per Moore row");
         assert_eq!(
             r_dprime[k].len(),
             7,
@@ -1715,9 +1696,6 @@ pub(super) fn emit_family_h(
     // existing slots in bounds without adding a table type.
     let mut vrs = zw;
     let mut k_j = F128::ZERO;
-    let Some(values) = values else {
-        return (rs_half, vrs, coeff_w);
-    };
     for j in 0..128 {
         let mut pair = [values[0][j], values[1][j]];
         for _ in 0..j {
@@ -1745,7 +1723,7 @@ pub(super) fn emit_family_h(
         vrs = sb.gate(macs, &[vrs, coeff_w[1][j], pair[1]])[0];
         k_j = k_j * k_j + flock_core::field::QUADRATIC_NONRESIDUE;
     }
-    (rs_half, vrs, coeff_w)
+    (rs_half, vrs)
 }
 
 /// Emit ONE real child's complete deferred-verifier region — the swap
@@ -2078,7 +2056,7 @@ pub(super) fn emit_real_child_region(
         &to_publish,
         &query_positions,
         &rt.w_resid,
-        Some(inner_pd_i.fin),
+        inner_pd_i.fin,
         &yr_wires,
         trace,
         &outs,
@@ -2112,7 +2090,7 @@ pub(super) fn emit_real_child_region(
         let (fin, offset) = rt.rs_gam_fins[k];
         squeeze_word_wire(&outs, trace, fin, offset)
     });
-    let (rsh_w, vrs_w, _) = emit_family_h(
+    let (rsh_w, vrs_w) = emit_family_h(
         sb,
         cs.q.family.expect("family-H slot"),
         cs.macs,
@@ -2126,7 +2104,7 @@ pub(super) fn emit_real_child_region(
             .1,
         1usize << cs.nu,
         &shv_w,
-        Some(&value_w),
+        &value_w,
         &rdp_w,
         gamma_w,
         pfslot,
@@ -2944,8 +2922,7 @@ pub(super) fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &Re
         &rt.levels,
         &rt.geo,
         &rt.w_resid,
-        Some(rt.inner_pd_i.ch),
-        F256::ZERO,
+        rt.inner_pd_i.ch,
         &observed_f256(&rt.vals_rec, rt.yr_v_i, rt.yr_len),
         chals,
     );

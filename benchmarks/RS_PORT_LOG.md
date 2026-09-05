@@ -5793,3 +5793,14 @@ Verdict on the fusion's leaf: open −5..−8 ms (≈ 1–1.5%), less than the
 the terms' F256 cast cost ≈ 5 ms the estimate underpriced. Proof
 −8,263 B, native verify at parity. The recursive-verifier gadget (above)
 would add ≈ +8.5k rows per chain child. Decision stays with Benedikt.
+
+### PARKED: the full fusion — code reverted to stage 1, patch saved — 2026-09-05
+
+Benedikt's call on the measured numbers: open −5..−8 ms (1–1.5%),
+proof −8 KB, native verify at parity, against ≈ +8.5k rows per chain
+child in the recursive verifier and several more hours to finish the
+monomial residual gadget. The code of phases A and B (25b62fd, caa80cd)
+is reverted to the stage-1 tree; the write-up stays here and in the
+LaTeX doc; the diff is saved as `fusion_phase_ab.patch` (scratchpad,
+2,976 lines) for a future tower with room in its extension row types.
+The bench's `BLAKE3_RUNS` knob and the cold-page lesson stay.

@@ -33,10 +33,8 @@ pub(super) struct ChildTape<'p> {
     pub(super) w_rounds: Vec<RoundRec>,
     pub(super) w_coords: Vec<RoundRec>,
     pub(super) w_resid: Vec<RoundRec>,
-    /// `None` under the fused transport (see `parse_open_levels`).
-    pub(super) mp_o: Option<MpRec>,
-    pub(super) inner_pd2: Option<InnerPd>,
-    pub(super) fused: bool,
+    pub(super) mp_o: MpRec,
+    pub(super) inner_pd2: InnerPd,
     pub(super) yr_v2: usize,
     pub(super) yr_len: usize,
     pub(super) levels: Vec<OpenLevel>,
@@ -66,8 +64,8 @@ pub(super) struct ChildTape<'p> {
     // published chain ordinals
     pub(super) ga_c: usize,
     pub(super) ga_fin: usize,
-    /// The multipoint gamma's (fin, ch); `None` under the fused transport.
-    pub(super) mg: Option<(usize, usize)>,
+    pub(super) mg_c: usize,
+    pub(super) mg_fin: usize,
     /// The two ring-switch regions: `(s_hat_v, r_dprime finalization,
     /// r_dprime challenge)`, plus each batching coefficient's location in
     /// their shared vector squeeze. These are the family-H source wires.
@@ -83,8 +81,6 @@ pub(super) struct ChildTape<'p> {
     pub(super) b_sum_n: F128,
     pub(super) native_target: F128,
     pub(super) native_running: F128,
-    /// The γ-scaled linearized coefficients per RS claim (the fused pairing's).
-    pub(super) rs_coeffs_n: Vec<Vec<F128>>,
     pub(super) t_final_n: F256,
     pub(super) anc_end_n: F128,
     pub(super) mid_n: F128,
@@ -255,18 +251,11 @@ impl<'p> ChildTape<'p> {
             2,
             "rs x 2 — one ab/c pair for the boolean class"
         );
-        // Under the fused transport (a full-height column prefix on a
-        // lane-major commitment) the merged open has no multipoint region
-        // and no anchor: the weight is the inner open's own basis.
-        let fused = mp_l.is_empty();
-        assert_eq!(mp_l.len(), fa_l.len(), "the anchor region rides the multipoint one");
-        assert!(mp_l.len() <= 1, "at most one multipoint region");
+        assert_eq!(mp_l.len(), 1, "one multipoint region");
+        assert_eq!(fa_l.len(), 1, "one anchor region");
         assert!(zc_l[0] < lc_l[0], "boolean zc before boolean lc");
         assert!(gkr_l[0] < mo_l[0], "wiring GKR before the merged open");
-        assert!(mo_l[0] < rs_l[0]);
-        if !fused {
-            assert!(rs_l[1] < mp_l[0] && mp_l[0] < fa_l[0]);
-        }
+        assert!(mo_l[0] < rs_l[0] && rs_l[1] < mp_l[0] && mp_l[0] < fa_l[0]);
 
         // (v, c) counters up to an op index — the walker every pin shares.
         let vc_at = |end: usize| -> (usize, usize) {
@@ -602,18 +591,12 @@ impl<'p> ChildTape<'p> {
                 proof.pcs_open().merged_rounds.len(),
                 "the W rounds fill the dense domain"
             );
-            // The multipoint values follow (jagged); under the fused
-            // transport the inner open follows directly and there are none.
-            let mv = if fused {
-                0
-            } else {
-                while !matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-multipoint-twisted-v1")
-                {
-                    i += 1;
-                }
+            while !matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-multipoint-twisted-v1")
+            {
                 i += 1;
-                vc_at(i).0
-            };
+            }
+            i += 1;
+            let (mv, _) = vc_at(i);
             (
                 pd_recs,
                 mv,
@@ -640,11 +623,10 @@ impl<'p> ChildTape<'p> {
         }
 
         // ---- the multipoint: the R=2 + P>0 schedule, pinned ----
-        let fro = proof.pcs_open().frobenius.as_ref();
-        assert_eq!(fro.is_none(), fused, "the assist rides the multipoint region");
-        let n_p = fro.map_or(0, |f| f.group_values.len());
-        if let Some(fro) = fro {
-            assert!(n_p > 0, "a circuit inner carries scalar groups (P > 0)");
+        let fro = &proof.pcs_open().frobenius;
+        let n_p = fro.group_values.len();
+        assert!(n_p > 0, "a circuit inner carries scalar groups (P > 0)");
+        {
             let mut i = mp_l[0] + 1;
             let mut n_vals = 0usize;
             while matches!(ops[i], Op::ObserveScalar) {
@@ -710,17 +692,16 @@ impl<'p> ChildTape<'p> {
         assert!(matches!(ops[ga_i], Op::SqueezeScalar), "GKR fingerprint");
         let ga_fin = fin_at(ga_i);
         let (_, ga_c) = vc_at(ga_i);
-        let mg: Option<(usize, usize)> = (!fused).then(|| {
-            let mut mp_i = mp_l[0] + 1;
-            while matches!(ops[mp_i], Op::ObserveScalar) {
-                mp_i += 1;
-            }
-            while matches!(ops[mp_i], Op::Pow { .. }) {
-                mp_i += 1;
-            }
-            assert!(matches!(ops[mp_i], Op::SqueezeScalar), "mp gamma op");
-            (fin_at(mp_i), vc_at(mp_i).1)
-        });
+        let mut mp_i = mp_l[0] + 1;
+        while matches!(ops[mp_i], Op::ObserveScalar) {
+            mp_i += 1;
+        }
+        while matches!(ops[mp_i], Op::Pow { .. }) {
+            mp_i += 1;
+        }
+        assert!(matches!(ops[mp_i], Op::SqueezeScalar), "mp gamma op");
+        let mg_fin = fin_at(mp_i);
+        let (_, mg_c) = vc_at(mp_i);
         // ROUND 2: the H(publics) region's rows — a chunk chain per 1 KiB
         // leaf of the child's public segment plus the left-fold parents.
         let n_pub_i = inner.built.witness.public.len();
@@ -754,8 +735,6 @@ impl<'p> ChildTape<'p> {
         let lvl_src = level_sources(lig);
         let (start_v, piop_o, gammas_o, w_rounds, mp_o, inner_pd2, yr_v2, levels) =
             parse_open_levels(&ops, 32 * lig.initial_cap.len(), r_lvl);
-        assert_eq!(mp_o.is_none(), fused, "the parser sees the multipoint region iff jagged");
-        assert_eq!(w_rounds.is_empty(), fused, "the fused transport has no merged rounds");
         assert_eq!(
             piop_o.is_some(),
             has_el,
@@ -865,7 +844,7 @@ impl<'p> ChildTape<'p> {
         }
 
         // ---- the merged intake's natives (target, running, boundary) ----
-        let (native_target, native_running, rs_coeffs_n) = {
+        let (native_target, native_running) = {
             use flock_core::pcs::ring_switch as rs;
             use flock_core::zerocheck::univariate_skip::build_eq;
             let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch + k]).collect();
@@ -895,30 +874,28 @@ impl<'p> ChildTape<'p> {
             }
             // The R = 2 recombination plus the P group values, against the
             // same q_eval the spine starts from.
-            if let (Some(fro), Some(ipd)) = (fro, inner_pd2.as_ref()) {
-                let mut big_v = F128::ZERO;
-                for (k, cs) in coeffs.iter().enumerate() {
-                    for (j, &cj) in cs.iter().enumerate() {
-                        if cj.is_zero() {
-                            continue;
-                        }
-                        let mut x = fro.values[k][j];
-                        for _ in 0..j {
-                            x = x * x;
-                        }
-                        big_v += cj * x;
+            let mut big_v = F128::ZERO;
+            for (k, cs) in coeffs.iter().enumerate() {
+                for (j, &cj) in cs.iter().enumerate() {
+                    if cj.is_zero() {
+                        continue;
                     }
+                    let mut x = fro.values[k][j];
+                    for _ in 0..j {
+                        x = x * x;
+                    }
+                    big_v += cj * x;
                 }
-                for &v in &fro.group_values {
-                    big_v += v;
-                }
-                assert_eq!(
-                    running,
-                    vals_rec[ipd.q_v] * big_v,
-                    "the R=2 + P merged boundary replays"
-                );
             }
-            (target, running, coeffs)
+            for &v in &fro.group_values {
+                big_v += v;
+            }
+            assert_eq!(
+                running,
+                vals_rec[inner_pd2.q_v] * big_v,
+                "the R=2 + P merged boundary replays"
+            );
+            (target, running)
         };
 
         // ---- the spine's native quad replay ----
@@ -927,28 +904,20 @@ impl<'p> ChildTape<'p> {
             &vals_rec,
             &chals,
             start_v,
-            // The inner open's target: γ_inner·q_eval for the eq-basis
-            // intake, the merged target itself under the fused transport.
-            match inner_pd2.as_ref() {
-                Some(ipd) => chals[ipd.ch] * vals_rec[ipd.q_v],
-                None => native_target,
-            },
+            chals[inner_pd2.ch] * vals_rec[inner_pd2.q_v],
             &native_sums,
         );
 
         // ---- the anchor's native endpoint ----
-        let anc_end_n = match mp_o.as_ref() {
-            Some(mp_o) => {
-                let mut t = vals_rec[mp_o.anchor_v];
-                for rr in &mp_o.anchor_rounds {
-                    let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
-                    let r = chals[rr.ch];
-                    let g0 = t + g1;
-                    t = g0 + (g1 + g0 + gi) * r + gi * r * r;
-                }
-                t
+        let anc_end_n = {
+            let mut t = vals_rec[mp_o.anchor_v];
+            for rr in &mp_o.anchor_rounds {
+                let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
+                let r = chals[rr.ch];
+                let g0 = t + g1;
+                t = g0 + (g1 + g0 + gi) * r + gi * r * r;
             }
-            None => F128::ZERO,
+            t
         };
 
         // ---- the element PIOP's native chain + strip sums (mixed only) ----
@@ -1003,16 +972,13 @@ impl<'p> ChildTape<'p> {
         };
 
         // ---- the anchor-expect geometry + its FULL native replica ----
-        let m_mp2 = inner.commitment.params.m - flock_core::pcs::LOG_PACKING;
-        if let Some(mp_o) = mp_o.as_ref() {
-            assert_eq!(mp_o.rounds.len(), m_mp2, "the multipoint rounds span the dense domain");
-            assert_eq!(
-                mp_o.anchor_rounds.len(),
-                2 * (m_mp2 + 1),
-                "sigma spans the anchor layers"
-            );
-            assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
-        }
+        let m_mp2 = mp_o.rounds.len();
+        assert_eq!(
+            mp_o.anchor_rounds.len(),
+            2 * (m_mp2 + 1),
+            "sigma spans the anchor layers"
+        );
+        assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
         let n_log_i = union.n_log();
         // ROUND 4: the recombination + f == g, replayed from located words
         // (the emitter binds these; until it landed they rode only this
@@ -1039,9 +1005,8 @@ impl<'p> ChildTape<'p> {
         // running-claim chain; `w_coords` is ρ in coordinate order.
         let w_coords: Vec<RoundRec> = {
             let mut v = w_rounds.clone();
-            if !v.is_empty()
-                && flock_core::pcs::rectangular_prefix_columns(&union.jagged_heights(), n_log_i)
-                    .is_some()
+            if flock_core::pcs::rectangular_prefix_columns(&union.jagged_heights(), n_log_i)
+                .is_some()
             {
                 v.rotate_left(m_mp2 - n_log_i - 1);
             }
@@ -1388,14 +1353,11 @@ impl<'p> ChildTape<'p> {
                 None => groups_ix.push(vec![i2]),
             }
         }
-        // The assist's P group values count the scalar groups; under the
-        // fused transport the groups exist without an assist.
-        let n_p = if fused { groups_ix.len() } else { n_p };
         assert_eq!(groups_ix.len(), n_p, "P scalar groups by shared row");
 
         // Native replica of the WHOLE anchor expect — validates the formula
         // against the accepted proof before any gate exists.
-        if let Some(mp_o) = mp_o.as_ref() {
+        {
             let gamma_n = chals[mp_o.gamma_ch];
             let mut gpow_n = vec![F128::ONE];
             for j in 1..257 + n_p {
@@ -1567,7 +1529,7 @@ impl<'p> ChildTape<'p> {
         // ---- the residual pairing's rotation (lane-major inners) ----
         let yr_len = proof.pcs_open().inner.ligerito.final_proof.yr.len() / 2;
         let lane_major = geo[0].row_words < geo[0].lanes;
-        let w_resid: Vec<RoundRec> = if lane_major && !w_coords.is_empty() {
+        let w_resid: Vec<RoundRec> = if lane_major {
             let k_rot = w_coords.len() - levels[0].fold_fins.len();
             let mut v = w_coords[k_rot..].to_vec();
             v.extend_from_slice(&w_coords[..k_rot]);
@@ -1576,69 +1538,6 @@ impl<'p> ChildTape<'p> {
             w_coords.clone()
         };
 
-        if fused {
-            // TEMPORARY PROBE: the native twin against the verifier's own evaluation.
-            let yr_vals = observed_f256(&vals_rec, yr_v2, yr_len);
-            let yr_log = yr_len.trailing_zeros() as usize;
-            let ris_v: Vec<F256> = levels[0]
-                .fold_chs
-                .iter()
-                .map(|&i| F256::new(chals[i], chals[i + 1]))
-                .chain(levels[1..].iter().flat_map(|l| {
-                    l.fold_chs
-                        .iter()
-                        .skip(1)
-                        .map(|&i| F256::new(chals[i], chals[i + 1]))
-                }))
-                .collect();
-            let coord_scale = levels[1..].iter().fold(F256::ONE, |acc, level| {
-                let at = level.fold_chs[0];
-                let r = F256::new(chals[at], chals[at + 1]);
-                acc * (F256::ONE + r * F256::new(F128::ONE, F128::ONE))
-            });
-            let rs: Vec<(&[F128], &[F128])> = [&x_ab_n, &x_c_n]
-                .iter()
-                .zip(&rs_coeffs_n)
-                .map(|(x, c)| (x.as_slice(), c.as_slice()))
-                .collect();
-            let pd: Vec<(&[F128], F128)> = (0..pd_recs.len())
-                .map(|i2| (pd_pts_n[i2].as_slice(), chals[gammas_o[i2].ch]))
-                .collect();
-            let twin = fused_pairing_native(&rs, &pd, &ris_v, coord_scale, &yr_vals, n_log_i, k_cols_i - 1);
-            let rs_o: Vec<(&[F128], &[F128], Vec<F128>)> = [&x_ab_n, &x_c_n]
-                .iter()
-                .zip(&rs_coeffs_n)
-                .map(|(x, c)| (&x[1..1 + n_log_i], &x[1 + n_log_i..], c.clone()))
-                .collect();
-            let pd_o: Vec<(&[F128], Vec<F128>)> = {
-                // scalar groups as the verifier regroups them
-                let mut g: Vec<(&[F128], Vec<F128>)> = Vec::new();
-                for i2 in 0..pd_recs.len() {
-                    let pt = &pd_pts_n[i2];
-                    let gpd = chals[gammas_o[i2].ch];
-                    let cols = flock_core::lincheck::build_eq_table(&pt[n_log_i..]);
-                    match g.iter_mut().find(|(zr, _)| *zr == &pt[..n_log_i]) {
-                        Some((_, c)) => {
-                            for (d, e) in c.iter_mut().zip(&cols) {
-                                *d += gpd * *e;
-                            }
-                        }
-                        None => g.push((&pt[..n_log_i], cols.iter().map(|e| gpd * *e).collect())),
-                    }
-                }
-                g
-            };
-            let b = flock_core::pcs::fused_weight_residual_oracle(n_log_i, k_cols_i, &rs_o, &pd_o, &ris_v, yr_log);
-            let oracle = yr_vals.iter().zip(&b).fold(F256::ZERO, |acc, (y, bv)| acc + *y * *bv) * coord_scale;
-            eprintln!("[fused probe] twin == oracle: {} (n_bound_rows {}, yr_log {})", twin == oracle, n_log_i + 1 - yr_log, yr_log);
-            let dot = |b: &[F256]| yr_vals.iter().zip(b).fold(F256::ZERO, |acc, (y, bv)| acc + *y * *bv) * coord_scale;
-            let twin_rs = fused_pairing_native(&rs, &[], &ris_v, coord_scale, &yr_vals, n_log_i, k_cols_i - 1);
-            let orc_rs = dot(&flock_core::pcs::fused_weight_residual_oracle(n_log_i, k_cols_i, &rs_o, &[], &ris_v, yr_log));
-            let twin_pd = fused_pairing_native(&[], &pd, &ris_v, coord_scale, &yr_vals, n_log_i, k_cols_i - 1);
-            let orc_pd = dot(&flock_core::pcs::fused_weight_residual_oracle(n_log_i, k_cols_i, &[], &pd_o, &ris_v, yr_log));
-            eprintln!("[fused probe] rs {} | pd {} | n_pd {} groups {} | pd col binary {:?}", twin_rs == orc_rs, twin_pd == orc_pd, pd_recs.len(), pd_o.len(), pd_pts_n.iter().map(|pt| pt[n_log_i..].iter().all(|&x| x == F128::ZERO || x == F128::ONE)).collect::<Vec<_>>());
-            assert_eq!(twin, oracle, "fused pairing: native twin vs verifier evaluation");
-        }
         let z_ix = el_assert.as_ref().map(|assertion| {
             gammas_o
                 .iter()
@@ -1667,7 +1566,6 @@ impl<'p> ChildTape<'p> {
             w_resid,
             mp_o,
             inner_pd2,
-            fused,
             yr_v2,
             yr_len,
             levels,
@@ -1690,7 +1588,8 @@ impl<'p> ChildTape<'p> {
             zp_v,
             ga_c,
             ga_fin,
-            mg,
+            mg_c,
+            mg_fin,
             rs_recs,
             rs_gam_fins,
             bool_assert,
@@ -1702,7 +1601,6 @@ impl<'p> ChildTape<'p> {
             b_sum_n,
             native_target,
             native_running,
-            rs_coeffs_n,
             t_final_n,
             anc_end_n,
             mid_n,
@@ -2045,7 +1943,7 @@ pub(super) fn emit_child_region(
         hints,
     );
     let ga_w = outs[trace.squeezes[ct.ga_fin][0]][0];
-    let mg_w: Option<Wire> = ct.mg.map(|(fin, _)| outs[trace.squeezes[fin][0]][0]);
+    let mg_w = outs[trace.squeezes[ct.mg_fin][0]][0];
 
     // ---- the WIRING GKR in-circuit ----
     let mut vmap: Vec<Option<usize>> = Vec::new();
@@ -2162,79 +2060,55 @@ pub(super) fn emit_child_region(
         ow,
     );
 
-    // ---- the MULTIPOINT intake at R = 2 AND P > 0 (jagged children only) ----
-    // Under the fused transport there is no multipoint region and no
-    // anchor: the anchor endpoint published below is zero.
-    let (mp_pws, mp_rho2_w, mp_sig_w, anc_w): (Vec<Wire>, Vec<Wire>, Vec<Wire>, Wire) =
-        match mp_o.as_ref() {
-            Some(mp_o) => {
-        let mp_gamma_w = outs[trace.squeezes[mp_o.gamma_fin][0]][0];
-        assert_eq!(
-            mp_o.val_vs.len(),
-            256 + n_p,
-            "the R=2 + P schedule spans both claim kinds"
-        );
-        let mut t0_w = zw;
-        let mut pw_w = ow;
-        // The gamma-power wires are KEPT: the anchor expect consumes mp_pws[j]
-        // (j < 128) for ĝ, mp_pws[128] for the second RS statement, and
-        // mp_pws[256 + k] for the P group coefficients.
-        let mut mp_pws: Vec<Wire> = vec![ow];
-        for (k, &vi) in mp_o.val_vs.iter().enumerate() {
-            t0_w = sb.gate(macs, &[t0_w, pw_w, wv(vi)])[0];
-            if k + 1 < mp_o.val_vs.len() {
-                pw_w = sb.gate(macs, &[zw, pw_w, mp_gamma_w])[0];
-                mp_pws.push(pw_w);
-            }
+    // ---- the MULTIPOINT intake at R = 2 AND P > 0 ----
+    let mp_gamma_w = outs[trace.squeezes[mp_o.gamma_fin][0]][0];
+    assert_eq!(
+        mp_o.val_vs.len(),
+        256 + n_p,
+        "the R=2 + P schedule spans both claim kinds"
+    );
+    let mut t0_w = zw;
+    let mut pw_w = ow;
+    // The gamma-power wires are KEPT: the anchor expect consumes mp_pws[j]
+    // (j < 128) for ĝ, mp_pws[128] for the second RS statement, and
+    // mp_pws[256 + k] for the P group coefficients.
+    let mut mp_pws: Vec<Wire> = vec![ow];
+    for (k, &vi) in mp_o.val_vs.iter().enumerate() {
+        t0_w = sb.gate(macs, &[t0_w, pw_w, wv(vi)])[0];
+        if k + 1 < mp_o.val_vs.len() {
+            pw_w = sb.gate(macs, &[zw, pw_w, mp_gamma_w])[0];
+            mp_pws.push(pw_w);
         }
-        let mut tm_w = t0_w;
-        let mut mp_rho2_w: Vec<Wire> = Vec::new();
-        for rr in &mp_o.rounds {
-            let rho_w = outs[trace.squeezes[rr.fin][0]][0];
-            mp_rho2_w.push(rho_w);
-            tm_w = sb.gate(mrs, &[tm_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
-        }
-        sb.connect(tm_w, wv(mp_o.anchor_v));
-        // The anchor's own rounds fold its claimed v to an endpoint, which
-        // publishes and is held against the native replay; the squeezes are the
-        // sigma wires the expect consumes below.
-        let mut anc_w = wv(mp_o.anchor_v);
-        let mut mp_sig_w: Vec<Wire> = Vec::new();
-        for rr in &mp_o.anchor_rounds {
-            let rho_w = outs[trace.squeezes[rr.fin][0]][0];
-            mp_sig_w.push(rho_w);
-            anc_w = sb.gate(mrs, &[anc_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
-        }
-        assert_eq!(
-            mp_sig_w.len(),
-            2 * (m_mp2 + 1),
-            "sigma spans the anchor layers"
-        );
-                (mp_pws, mp_rho2_w, mp_sig_w, anc_w)
-            }
-            None => (Vec::new(), Vec::new(), Vec::new(), zw),
-        };
+    }
+    let mut tm_w = t0_w;
+    let mut mp_rho2_w: Vec<Wire> = Vec::new();
+    for rr in &mp_o.rounds {
+        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+        mp_rho2_w.push(rho_w);
+        tm_w = sb.gate(mrs, &[tm_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+    }
+    sb.connect(tm_w, wv(mp_o.anchor_v));
+    // The anchor's own rounds fold its claimed v to an endpoint, which
+    // publishes and is held against the native replay; the squeezes are the
+    // sigma wires the expect consumes below.
+    let mut anc_w = wv(mp_o.anchor_v);
+    let mut mp_sig_w: Vec<Wire> = Vec::new();
+    for rr in &mp_o.anchor_rounds {
+        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+        mp_sig_w.push(rho_w);
+        anc_w = sb.gate(mrs, &[anc_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+    }
+    assert_eq!(
+        mp_sig_w.len(),
+        2 * (m_mp2 + 1),
+        "sigma spans the anchor layers"
+    );
 
     // ---- the LIGERITO SPINE ----
     let spine = cs.spine;
     let spine256 = cs.spine256;
+    let gpw = outs[trace.squeezes[inner_pd2.fin][0]][0];
     let z2 = [zw, zw];
-    // The spine's opening claim: γ_inner·q_eval for the eq-basis intake;
-    // under the fused transport the merged target itself, entered here as
-    // advice and connected to the in-circuit target once that is emitted.
-    let (start_y, start_beta, fused_target_pre): ([Wire; 2], Wire, Option<Wire>) =
-        match inner_pd2.as_ref() {
-            Some(ipd) => (
-                [wv(ipd.q_v), zw],
-                outs[trace.squeezes[ipd.fin][0]][0],
-                None,
-            ),
-            None => {
-                vals.push(ct.native_target);
-                let t = sb.input();
-                ([t, zw], ow, Some(t))
-            }
-        };
     let tw0 = emit_spine256(
         sb,
         spine256,
@@ -2244,8 +2118,8 @@ pub(super) fn emit_child_region(
         z2,
         z2,
         z2,
-        start_y,
-        start_beta,
+        [wv(inner_pd2.q_v), zw],
+        gpw,
         z2,
     );
     let mut tsp = tw0[3];
@@ -2359,7 +2233,7 @@ pub(super) fn emit_child_region(
     let yr_wires: Vec<[Wire; 2]> = (0..ct.yr_len)
         .map(|y| [wv(ct.yr_v2 + 2 * y), wv(ct.yr_v2 + 2 * y + 1)])
         .collect();
-    let (resid_pub, mut inner_w, (pfslot, pf_w)) = emit_residual_region(
+    let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region(
         sb,
         &mut cs.resid,
         levels,
@@ -2367,7 +2241,7 @@ pub(super) fn emit_child_region(
         &to_publish,
         &query_positions,
         &ct.w_resid,
-        inner_pd2.as_ref().map(|ipd| ipd.fin),
+        inner_pd2.fin,
         &yr_wires,
         trace,
         &outs,
@@ -2377,12 +2251,8 @@ pub(super) fn emit_child_region(
     // THE CLOSURE, in-circuit: the residual side's inner and the spine's
     // t_r are the same statement scalar — a copy constraint, not a
     // checker item (both stay published as test cross-checks).
-    // Jagged children close here; the fused transport adds its weight
-    // term to `inner` first (below, once the claim points are wired).
-    if !ct.fused {
-        sb.connect(inner_w[0], t_final[0]);
-        sb.connect(inner_w[1], t_final[1]);
-    }
+    sb.connect(inner_w[0], t_final[0]);
+    sb.connect(inner_w[1], t_final[1]);
 
     // ---- FAMILY H + the merged intake boundary ----
     // The transpose/equality dot products and inverse-Moore/Frobenius
@@ -2393,13 +2263,11 @@ pub(super) fn emit_child_region(
         let sv = ct.rs_recs[k].0;
         (0..128).map(|i| wv(sv + i)).collect()
     });
-    let value_w: Option<[Vec<Wire>; 2]> = mp_o.as_ref().map(|mp_o| {
-        std::array::from_fn(|k| {
-            mp_o.val_vs[128 * k..128 * (k + 1)]
-                .iter()
-                .map(|&vi| wv(vi))
-                .collect()
-        })
+    let value_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+        mp_o.val_vs[128 * k..128 * (k + 1)]
+            .iter()
+            .map(|&vi| wv(vi))
+            .collect()
     });
     let rdp_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
         let fin = ct.rs_recs[k].1;
@@ -2411,7 +2279,7 @@ pub(super) fn emit_child_region(
         let (fin, offset) = ct.rs_gam_fins[k];
         squeeze_word_wire(&outs, trace, fin, offset)
     });
-    let (rsh_w, vrs_w, coeff_w) = emit_family_h(
+    let (rsh_w, vrs_w) = emit_family_h(
         sb,
         cs.q.family.expect("family-H slot"),
         cs.macs,
@@ -2425,7 +2293,7 @@ pub(super) fn emit_child_region(
             .1,
         1usize << cs.nu,
         &shv_w,
-        value_w.as_ref(),
+        &value_w,
         &rdp_w,
         gamma_w,
         pfslot,
@@ -2446,24 +2314,13 @@ pub(super) fn emit_child_region(
         let rho_w = outs[trace.squeezes[rr.fin][0]][0];
         runw = sb.gate(mrs, &[runw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
     }
-    match (mp_o.as_ref(), inner_pd2.as_ref(), fused_target_pre) {
-        (Some(mp_o), Some(ipd), None) => {
-            let mut vgrp_w = zw;
-            for &vi in &mp_o.val_vs[256..] {
-                vgrp_w = sb.gate(macs, &[vgrp_w, ow, wv(vi)])[0];
-            }
-            let v_w = sb.gate(macs, &[vrs_w, ow, vgrp_w])[0];
-            let rhs_v_w = sb.gate(macs, &[zw, wv(ipd.q_v), v_w])[0];
-            sb.connect(runw, rhs_v_w);
-        }
-        (None, None, Some(pre)) => {
-            // Fused: no merged rounds — the running claim IS the target,
-            // and the spine opened on it.
-            sb.connect(runw, tgt_w);
-            sb.connect(pre, tgt_w);
-        }
-        _ => unreachable!("the multipoint region, the intake and the fused start agree"),
+    let mut vgrp_w = zw;
+    for &vi in &mp_o.val_vs[256..] {
+        vgrp_w = sb.gate(macs, &[vgrp_w, ow, wv(vi)])[0];
     }
+    let v_w = sb.gate(macs, &[vrs_w, ow, vgrp_w])[0];
+    let rhs_v_w = sb.gate(macs, &[zw, wv(inner_pd2.q_v), v_w])[0];
+    sb.connect(runw, rhs_v_w);
 
     // ---- the ELEMENT PIOP rounds in-circuit (mixed children only) ----
     // Zerocheck rounds are ZcRoundGate rows (tau slice wires as eq weights,
@@ -2595,53 +2452,44 @@ pub(super) fn emit_child_region(
     };
     // ĝ(ρ″): advice square-root chains for ρ^(2^-j), bound by forward
     // squaring deltas y·y + prev = 0.
-    // The jagged assertion's published claim surfaces (empty under the fusion).
-    let mut jag_w: Vec<Wire>;
-    let mut jag_row_w: Vec<Vec<Wire>>;
-    // The multipoint kernel ĝ(ρ″) and eq(ρ, ρ″) — jagged children only.
-    let (ghat, e_at_w) = if !ct.fused {
-        let rho_mrg_n: Vec<F128> = w_coords.iter().map(|rr| chals[rr.ch]).collect();
-        let rho_mrg_w: Vec<Wire> = w_coords
-            .iter()
-            .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
-            .collect();
-        let mut rinv_n2: Vec<F128> = rho_mrg_n.clone();
-        let mut rinv_w: Vec<Wire> = rho_mrg_w.clone();
-        let mut ghat = zw;
-        for j in 0..128 {
-            if j > 0 {
-                let mut lvl_w = Vec::with_capacity(m_mp2);
-                for t2 in 0..m_mp2 {
-                    let y = flock_core::pcs::jagged::frob_inv(rinv_n2[t2]);
-                    rinv_n2[t2] = y;
-                    vals.push(y);
-                    let yw = sb.input();
-                    let d = sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3];
-                    sb.connect(d, zassert);
-                    lvl_w.push(yw);
-                }
-                rinv_w = lvl_w;
+    let rho_mrg_n: Vec<F128> = w_coords.iter().map(|rr| chals[rr.ch]).collect();
+    let rho_mrg_w: Vec<Wire> = w_coords
+        .iter()
+        .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
+        .collect();
+    let mut rinv_n2: Vec<F128> = rho_mrg_n.clone();
+    let mut rinv_w: Vec<Wire> = rho_mrg_w.clone();
+    let mut ghat = zw;
+    for j in 0..128 {
+        if j > 0 {
+            let mut lvl_w = Vec::with_capacity(m_mp2);
+            for t2 in 0..m_mp2 {
+                let y = flock_core::pcs::jagged::frob_inv(rinv_n2[t2]);
+                rinv_n2[t2] = y;
+                vals.push(y);
+                let yw = sb.input();
+                let d = sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3];
+                sb.connect(d, zassert);
+                lvl_w.push(yw);
             }
-            let factors: Vec<(Wire, Wire)> = rinv_w
-                .iter()
-                .copied()
-                .zip(mp_rho2_w.iter().copied())
-                .collect();
-            let eqj = prefix_product(sb, &factors);
-            ghat = sb.gate(spine, &[zw, zw, zw, ghat, zw, zw, mp_pws[j], eqj, zw])[3];
+            rinv_w = lvl_w;
         }
-        // e_at = eq(ρ, ρ″) for the group coefficients.
-        let e_at_w = {
-            let factors: Vec<(Wire, Wire)> = rho_mrg_w
-                .iter()
-                .copied()
-                .zip(mp_rho2_w.iter().copied())
-                .collect();
-            prefix_product(sb, &factors)
-        };
-        (ghat, e_at_w)
-    } else {
-        (zw, zw)
+        let factors: Vec<(Wire, Wire)> = rinv_w
+            .iter()
+            .copied()
+            .zip(mp_rho2_w.iter().copied())
+            .collect();
+        let eqj = prefix_product(sb, &factors);
+        ghat = sb.gate(spine, &[zw, zw, zw, ghat, zw, zw, mp_pws[j], eqj, zw])[3];
+    }
+    // e_at = eq(ρ, ρ″) for the group coefficients.
+    let e_at_w = {
+        let factors: Vec<(Wire, Wire)> = rho_mrg_w
+            .iter()
+            .copied()
+            .zip(mp_rho2_w.iter().copied())
+            .collect();
+        prefix_product(sb, &factors)
     };
     // THE COUNT WIN: the counts used to enter the parent's circuit HERE —
     // per-run boundary eq products with the jagged run boundaries (the
@@ -2654,11 +2502,11 @@ pub(super) fn emit_child_region(
     // points are wires this region already carries (σ = the anchor round
     // squeezes, z_cols = statement point wires, γ_pd = squeezes); nothing
     // count-shaped remains in the circuit.
-    jag_w = Vec::new();
+    let mut jag_w: Vec<Wire> = Vec::new();
     // The claims' IDENTITY wires (the points-connect): σ shared per
     // region, and per claim — in jag_w order — the row-identity wires the
     // merge fold's absorbed words connect to.
-    jag_row_w = Vec::new();
+    let mut jag_row_w: Vec<Vec<Wire>> = Vec::new();
     // Per RS statement: the published w, the DP, the coefficient.
     let alslot = cs.alslot;
     let mut expect_w = zw;
@@ -2668,24 +2516,22 @@ pub(super) fn emit_child_region(
         let w_st = sb.input();
         jag_w.push(w_st);
         jag_row_w.push(xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect());
-        if !ct.fused {
-            let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
-            for layer in (0..=m_mp2).rev() {
-                let za = if layer < n_log_i { z_row_w[layer] } else { zw };
-                let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
-                let mut a_in = gdp.to_vec();
-                a_in.extend_from_slice(&[za, rb, mp_sig_w[2 * layer], mp_sig_w[2 * layer + 1], ow]);
-                let o = sb.gate(alslot, &a_in);
-                gdp = [o[0], o[1], o[2], o[3]];
-            }
-            let coeff = if si == 0 {
-                ghat
-            } else {
-                sb.gate(spine, &[zw, zw, zw, zw, zw, zw, mp_pws[128], ghat, zw])[3]
-            };
-            let wd = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, w_st, gdp[0], zw])[3];
-            expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
+        let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
+        for layer in (0..=m_mp2).rev() {
+            let za = if layer < n_log_i { z_row_w[layer] } else { zw };
+            let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
+            let mut a_in = gdp.to_vec();
+            a_in.extend_from_slice(&[za, rb, mp_sig_w[2 * layer], mp_sig_w[2 * layer + 1], ow]);
+            let o = sb.gate(alslot, &a_in);
+            gdp = [o[0], o[1], o[2], o[3]];
         }
+        let coeff = if si == 0 {
+            ghat
+        } else {
+            sb.gate(spine, &[zw, zw, zw, zw, zw, zw, mp_pws[128], ghat, zw])[3]
+        };
+        let wd = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, w_st, gdp[0], zw])[3];
+        expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
     }
     // Per group: the γ-baked one-hot combo publishes as ONE value; each
     // dense (element) member publishes its raw eq value with its γ_pd
@@ -2762,129 +2608,30 @@ pub(super) fn emit_child_region(
             w_st = sb.gate(macs, &[w_st, gpd_w, d_w])[0];
         }
         assert!(d_it.next().is_none(), "every dense entry consumed");
-        if !ct.fused {
-            let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
-            for layer in (0..=m_mp2).rev() {
-                let za = if layer < n_log_i {
-                    if members[0] >= n_el_pd {
-                        pt_w[layer]
-                    } else {
-                        let el_rec = el_rec.expect("element pd claim");
-                        outs[trace.squeezes[el_rec.zc_rounds[layer].1][0]][0]
-                    }
+        let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
+        for layer in (0..=m_mp2).rev() {
+            let za = if layer < n_log_i {
+                if members[0] >= n_el_pd {
+                    pt_w[layer]
                 } else {
-                    zw
-                };
-                let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
-                let mut a_in = gdp.to_vec();
-                a_in.extend_from_slice(&[za, rb, mp_sig_w[2 * layer], mp_sig_w[2 * layer + 1], ow]);
-                let o = sb.gate(alslot, &a_in);
-                gdp = [o[0], o[1], o[2], o[3]];
-            }
-            let coeff = sb.gate(macs, &[zw, mp_pws[256 + g_ix], e_at_w])[0];
-            let wd = sb.gate(macs, &[zw, w_st, gdp[0]])[0];
-            expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
+                    let el_rec = el_rec.expect("element pd claim");
+                    outs[trace.squeezes[el_rec.zc_rounds[layer].1][0]][0]
+                }
+            } else {
+                zw
+            };
+            let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
+            let mut a_in = gdp.to_vec();
+            a_in.extend_from_slice(&[za, rb, mp_sig_w[2 * layer], mp_sig_w[2 * layer + 1], ow]);
+            let o = sb.gate(alslot, &a_in);
+            gdp = [o[0], o[1], o[2], o[3]];
         }
+        let coeff = sb.gate(macs, &[zw, mp_pws[256 + g_ix], e_at_w])[0];
+        let wd = sb.gate(macs, &[zw, w_st, gdp[0]])[0];
+        expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
     }
     // The join: the anchor's folded claim equals the in-circuit expect.
-    if !ct.fused {
-        sb.connect(anc_w, expect_w);
-    }
-    if ct.fused {
-        // ---- the FUSED weight's residual term ----
-        // Ŵ at the ladder's point, paired with the residual witness: the
-        // count-independent closed form (docs, "full fusion"), added to the
-        // residual close-out's `inner` before it meets the spine's t_final.
-        let chw = |fin: usize| -> [Wire; 2] {
-            [
-                squeeze_word_wire(&outs, trace, fin, 0),
-                squeeze_word_wire(&outs, trace, fin, 1),
-            ]
-        };
-        let ris_w: Vec<[Wire; 2]> = levels[0]
-            .fold_fins
-            .iter()
-            .map(|&f| chw(f))
-            .chain(
-                levels[1..]
-                    .iter()
-                    .flat_map(|l| l.fold_fins.iter().skip(1).map(|&f| chw(f))),
-            )
-            .collect();
-        let mac256 = cs
-            .resid
-            .iter()
-            .find(|&&(key, _)| key == 701)
-            .expect("the child slots declare an F256 MAC slot")
-            .1;
-        let pf256 = slot_cached(sb, &mut cs.resid, 1000 + pf_w, || PrefixGate256::new(pf_w));
-        let coord_factors: Vec<([Wire; 2], [Wire; 2])> = levels[1..]
-            .iter()
-            .map(|level| {
-                let r = chw(level.fold_fins[0]);
-                let ru = emit_mac256(sb, mac256, [zw, zw], r, [zw, ow]);
-                (r, ru)
-            })
-            .collect();
-        let rs_claims: Vec<(Vec<Wire>, Vec<Wire>)> = [&xab_pw, &xc_pw]
-            .iter()
-            .zip(coeff_w.iter())
-            .map(|(xs, cw_j)| (xs.iter().map(|&(_, w)| w).collect(), cw_j.clone()))
-            .collect();
-        let pd_claims: Vec<(Vec<Wire>, Wire)> = (0..ct.n_pd)
-            .map(|i2| {
-                let pd = &ct.gammas_o[i2];
-                let gw = squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset);
-                let pt: Vec<Wire> = ct.pd_pts[i2]
-                    .iter()
-                    .enumerate()
-                    .map(|(jj, &coord)| {
-                        if jj < n_log_i {
-                            pt_w[jj]
-                        } else if coord == F128::ZERO {
-                            zw
-                        } else {
-                            assert_eq!(coord, F128::ONE, "fused chain children: one-hot columns");
-                            ow
-                        }
-                    })
-                    .collect();
-                (pt, gw)
-            })
-            .collect();
-        let pairing_w = emit_fused_pairing(
-            sb,
-            spine,
-            spine256,
-            pf256,
-            pf_w,
-            &rs_claims,
-            &pd_claims,
-            &ris_w,
-            &coord_factors,
-            &yr_wires,
-            n_log_i,
-            k_cols_i - 1,
-            zw,
-            ow,
-        );
-        let inner_total = emit_spine256(
-            sb,
-            spine256,
-            z2,
-            z2,
-            z2,
-            inner_w,
-            z2,
-            z2,
-            pairing_w,
-            ow,
-            z2,
-        )[3];
-        sb.connect(inner_total[0], t_final[0]);
-        sb.connect(inner_total[1], t_final[1]);
-        inner_w = inner_total;
-    }
+    sb.connect(anc_w, expect_w);
 
     // The aggregate verifier's scalar closures are part of the recursive
     // relation too.  The reported A/B values below become fold claims; these
@@ -3036,7 +2783,7 @@ pub(super) fn emit_child_region(
         sb.publish(w[1]);
     }
     sb.publish(ga_w);
-    sb.publish(mg_w.unwrap_or(zw));
+    sb.publish(mg_w);
     if let Some((el_zr, el_lcw, _, _, _)) = el_pub {
         sb.publish(el_zr);
         sb.publish(el_lcw);
@@ -3076,11 +2823,7 @@ pub(super) fn emit_child_region(
         n_tail,
         structure_claim_w,
         jag_w,
-        jag_sig_w: if ct.fused {
-            vec![zw; 2 * (m_mp2 + 1)]
-        } else {
-            mp_sig_w.clone()
-        },
+        jag_sig_w: mp_sig_w.clone(),
         jag_row_w,
         b_mlv_w: mlv_pw.iter().map(|&(_, w)| w).collect(),
         b_lc_w: ct
@@ -3126,245 +2869,6 @@ pub(super) fn emit_child_region(
 /// value against the tape's native replicas — mvp10's checker, extracted.
 /// Returns the number of public entries consumed (the region's publish
 /// tail), so a multi-region caller can walk region after region.
-
-/// The fused transport's weight term at the residual, paired with the
-/// residual witness (docs, "full fusion"; the native form is
-/// `pcs::fused_weight_residual`). Per ring-switch claim `k` with point
-/// `(z_row, z0, z_hi)` and γ-scaled linearized coefficients `c_j`:
-/// `P_k = Σ_j c_j · Π_t(1 + z_hi_t^{2^j} + σ_blk_t) · Π_{r bound}(1 + z_row_r^{2^j} + σ_r)
-///        · Σ_{c0} κ_{c0}^{2^j} · (Â_{c0}(z_res)^{2^j} + u·B̂_{c0}(z_res)^{2^j})`,
-/// where `(Â, B̂)_{c0}` are the residual witness halves' (split coordinate)
-/// multilinear extensions at the residual row point — the Frobenius
-/// powers act on base-field values only (the claim point and the two
-/// MLEs), so every twist is a base-field squaring chain and the
-/// extension-field work is one prefix product per `j`. A scalar group
-/// has no twist: `P_g = Σ_{c0} colfac_{c0} · Π_{r bound}(…) · (Â + u·B̂)_{c0}`
-/// with `colfac_{c0} = Σ_i γ_i · eq(z_col_i[0], c0) · Π_t(1 + z_col_i[1+t] + σ_blk_t)`.
-/// The sum over claims carries the coordinate-split scale of the later
-/// levels, as every level-0 term does.
-#[allow(clippy::too_many_arguments)]
-fn emit_fused_pairing(
-    sb: &mut ShapeBuilder,
-    spine: flock_core::circuit::builder::SlotId,
-    spine256: flock_core::circuit::builder::SlotId,
-    pf256: flock_core::circuit::builder::SlotId,
-    pf_w: usize,
-    rs_claims: &[(Vec<Wire>, Vec<Wire>)],
-    pd_claims: &[(Vec<Wire>, Wire)],
-    ris: &[[Wire; 2]],
-    coord_factors: &[([Wire; 2], [Wire; 2])],
-    yr_wires: &[[Wire; 2]],
-    n_log: usize,
-    kb: usize,
-    zw: Wire,
-    ow: Wire,
-) -> [Wire; 2] {
-    let z2 = [zw, zw];
-    let mac = |sb: &mut ShapeBuilder, acc: Wire, x: Wire, y: Wire| -> Wire {
-        sb.gate(spine, &[zw, zw, zw, acc, zw, zw, x, y, zw])[3]
-    };
-    let square = |sb: &mut ShapeBuilder, x: Wire| -> Wire {
-        sb.gate(spine, &[zw, zw, ow, zw, zw, zw, zw, zw, x])[4]
-    };
-    // `acc + y·beta` in F256 with a base-field `beta`.
-    let mac256_scalar = |sb: &mut ShapeBuilder, acc: [Wire; 2], y: [Wire; 2], beta: Wire| -> [Wire; 2] {
-        emit_spine256(sb, spine256, z2, z2, z2, acc, z2, z2, y, beta, z2)[3]
-    };
-    let prefix_chain =
-        |sb: &mut ShapeBuilder, seed: [Wire; 2], factors: &[([Wire; 2], [Wire; 2])]| -> [Wire; 2] {
-            let mut s = seed;
-            for chunk_f in factors.chunks(pf_w) {
-                let mut g_in = vec![s[0], s[1]];
-                for (a, _) in chunk_f {
-                    g_in.extend_from_slice(a);
-                }
-                g_in.extend(std::iter::repeat_n(zw, 2 * (pf_w - chunk_f.len())));
-                for (_, b) in chunk_f {
-                    g_in.extend_from_slice(b);
-                }
-                g_in.extend(std::iter::repeat_n(zw, 2 * (pf_w - chunk_f.len())));
-                g_in.push(ow);
-                g_in.push(zw);
-                let out = sb.gate(pf256, &g_in);
-                s = [out[0], out[1]];
-            }
-            s
-        };
-    let yr_len = yr_wires.len();
-    let yr_log = yr_len.trailing_zeros() as usize;
-    assert!(yr_log >= 1, "the column bit is the top residual coordinate");
-    let n_bound_rows = n_log + 1 - yr_log;
-    assert!(ris.len() >= kb + n_bound_rows, "the bound challenges cover the bound rows");
-    let half = yr_len / 2;
-    // (Â, B̂)_{c0} at a residual row point.
-    let mle_halves = |sb: &mut ShapeBuilder, z_res: &[Wire]| -> [[Wire; 2]; 2] {
-        std::array::from_fn(|c0| {
-            let mut a = zw;
-            let mut b = zw;
-            for y_low in 0..half {
-                let mut e = ow;
-                for (j, &z) in z_res.iter().enumerate() {
-                    let f = if (y_low >> j) & 1 == 1 {
-                        z
-                    } else {
-                        mac(sb, ow, z, ow)
-                    };
-                    e = mac(sb, zw, e, f);
-                }
-                let [ya, yb] = yr_wires[c0 * half + y_low];
-                a = mac(sb, a, e, ya);
-                b = mac(sb, b, e, yb);
-            }
-            [a, b]
-        })
-    };
-    let mut total = [zw, zw];
-    for (point, coeff_w) in rs_claims {
-        assert_eq!(point.len(), 1 + n_log + kb + 1, "claim point split");
-        let z_row = &point[1..1 + n_log];
-        let z0 = point[1 + n_log];
-        let z_hi = &point[2 + n_log..];
-        let mut zj_row: Vec<Wire> = z_row[..n_bound_rows].to_vec();
-        let mut zj_hi: Vec<Wire> = z_hi.to_vec();
-        let mut kappa = [mac(sb, ow, z0, ow), z0];
-        let mut ab = mle_halves(sb, &z_row[n_bound_rows..]);
-        let mut acc = [zw, zw];
-        for j in 0..128 {
-            let mut y = [zw, zw];
-            for c0 in 0..2 {
-                y = mac256_scalar(sb, y, ab[c0], kappa[c0]);
-            }
-            let factors: Vec<([Wire; 2], [Wire; 2])> = zj_hi
-                .iter()
-                .zip(&ris[..kb])
-                .chain(zj_row.iter().zip(&ris[kb..kb + n_bound_rows]))
-                .map(|(&z, &r)| ([z, zw], r))
-                .collect();
-            let prod = prefix_chain(sb, y, &factors);
-            acc = mac256_scalar(sb, acc, prod, coeff_w[j]);
-            if j + 1 < 128 {
-                for z in zj_row.iter_mut().chain(zj_hi.iter_mut()).chain(kappa.iter_mut()) {
-                    *z = square(sb, *z);
-                }
-                for pair in ab.iter_mut() {
-                    for w in pair.iter_mut() {
-                        *w = square(sb, *w);
-                    }
-                }
-            }
-        }
-        total = mac256_scalar(sb, total, acc, ow);
-    }
-    // Scalar groups: members sharing a row point could share the MLEs;
-    // chain children carry one group, so per claim is exact and simple.
-    for (point, gamma_w) in pd_claims {
-        assert_eq!(point.len(), n_log + kb + 1, "pd point split");
-        let z_row = &point[..n_log];
-        let z0 = point[n_log];
-        let z_hi = &point[n_log + 1..];
-        let ab = mle_halves(sb, &z_row[n_bound_rows..]);
-        let kappa = [mac(sb, ow, z0, ow), z0];
-        let mut y = [zw, zw];
-        for c0 in 0..2 {
-            y = mac256_scalar(sb, y, ab[c0], kappa[c0]);
-        }
-        let factors: Vec<([Wire; 2], [Wire; 2])> = z_hi
-            .iter()
-            .zip(&ris[..kb])
-            .chain(z_row[..n_bound_rows].iter().zip(&ris[kb..kb + n_bound_rows]))
-            .map(|(&z, &r)| ([z, zw], r))
-            .collect();
-        let prod = prefix_chain(sb, y, &factors);
-        total = mac256_scalar(sb, total, prod, *gamma_w);
-    }
-    prefix_chain(sb, total, coord_factors)
-}
-
-/// The native twin of [`emit_fused_pairing`].
-fn fused_pairing_native(
-    rs_claims: &[(&[F128], &[F128])],
-    pd_claims: &[(&[F128], F128)],
-    ris: &[F256],
-    coord_scale: F256,
-    yr: &[F256],
-    n_log: usize,
-    kb: usize,
-) -> F256 {
-    let yr_len = yr.len();
-    let yr_log = yr_len.trailing_zeros() as usize;
-    assert!(yr_log >= 1);
-    let n_bound_rows = n_log + 1 - yr_log;
-    let half = yr_len / 2;
-    let mle_halves = |z_res: &[F128]| -> [F256; 2] {
-        std::array::from_fn(|c0| {
-            let mut acc = F256::ZERO;
-            for y_low in 0..half {
-                let mut e = F128::ONE;
-                for (j, &z) in z_res.iter().enumerate() {
-                    e *= if (y_low >> j) & 1 == 1 { z } else { F128::ONE + z };
-                }
-                acc += yr[c0 * half + y_low] * e;
-            }
-            acc
-        })
-    };
-    let bound = |z_hi: &[F128], z_row: &[F128]| -> F256 {
-        z_hi.iter()
-            .zip(&ris[..kb])
-            .chain(z_row.iter().zip(&ris[kb..kb + n_bound_rows]))
-            .fold(F256::ONE, |acc, (&z, &r)| acc * (F256::ONE + F256::from(z) + r))
-    };
-    let mut total = F256::ZERO;
-    for (point, coeffs) in rs_claims {
-        let z_row = &point[1..1 + n_log];
-        let z0 = point[1 + n_log];
-        let z_hi = &point[2 + n_log..];
-        let mut zj_row: Vec<F128> = z_row[..n_bound_rows].to_vec();
-        let mut zj_hi: Vec<F128> = z_hi.to_vec();
-        let mut kappa = [F128::ONE + z0, z0];
-        let ab0 = mle_halves(&z_row[n_bound_rows..]);
-        let mut ab = [
-            [ab0[0].c0, ab0[0].c1],
-            [ab0[1].c0, ab0[1].c1],
-        ];
-        let _ = &mut ab;
-        // Direct form: the residual MLE at the TWISTED point per j (its
-        // coefficients are F128 values, so Frobenius does not pass through).
-        let mut zj_res: Vec<F128> = z_row[n_bound_rows..].to_vec();
-        let mut acc = F256::ZERO;
-        for j in 0..128 {
-            let abj = mle_halves(&zj_res);
-            let mut y = F256::ZERO;
-            for c0 in 0..2 {
-                y += abj[c0] * kappa[c0];
-            }
-            acc += (y * bound(&zj_hi, &zj_row)) * coeffs[j];
-            for z in zj_row
-                .iter_mut()
-                .chain(zj_hi.iter_mut())
-                .chain(kappa.iter_mut())
-                .chain(zj_res.iter_mut())
-            {
-                *z = z.square();
-            }
-        }
-        total += acc;
-    }
-    for (point, gamma) in pd_claims {
-        let z_row = &point[..n_log];
-        let z0 = point[n_log];
-        let z_hi = &point[n_log + 1..];
-        let ab = mle_halves(&z_row[n_bound_rows..]);
-        let kappa = [F128::ONE + z0, z0];
-        let mut y = F256::ZERO;
-        for c0 in 0..2 {
-            y += ab[c0] * kappa[c0];
-        }
-        total += (y * bound(z_hi, &z_row[..n_bound_rows])) * *gamma;
-    }
-    total * coord_scale
-}
-
 pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> usize {
     let chals = &ct.chals[..];
     // The query-phase boundary: published alphas are the recorded
@@ -3399,7 +2903,7 @@ pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildR
     );
     assert_eq!(
         public[base2 + 1],
-        ct.mg.map_or(F128::ZERO, |(_, c)| chals[c]),
+        chals[ct.mg_c],
         "the multipoint gamma derives in-circuit"
     );
     // The GKR round/close/input identities, the element zc round deltas,
@@ -3447,45 +2951,14 @@ pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildR
     // The residual region against the shared native replica — and THE
     // CLOSURE: the residual-side inner and the spine's t_r are the same
     // statement scalar, both held against published circuit outputs.
-    let yr_vals = observed_f256(&ct.vals_rec, ct.yr_v2, ct.yr_len);
-    let extra_inner = if ct.fused {
-        let ris_v: Vec<F256> = ct.levels[0]
-            .fold_chs
-            .iter()
-            .map(|&i| F256::new(chals[i], chals[i + 1]))
-            .chain(ct.levels[1..].iter().flat_map(|l| {
-                l.fold_chs
-                    .iter()
-                    .skip(1)
-                    .map(|&i| F256::new(chals[i], chals[i + 1]))
-            }))
-            .collect();
-        let coord_scale = ct.levels[1..].iter().fold(F256::ONE, |acc, level| {
-            let at = level.fold_chs[0];
-            let r = F256::new(chals[at], chals[at + 1]);
-            acc * (F256::ONE + r * F256::new(F128::ONE, F128::ONE))
-        });
-        let rs: Vec<(&[F128], &[F128])> = [&ct.x_ab_n, &ct.x_c_n]
-            .iter()
-            .zip(&ct.rs_coeffs_n)
-            .map(|(x, c)| (x.as_slice(), c.as_slice()))
-            .collect();
-        let pd: Vec<(&[F128], F128)> = (0..ct.n_pd)
-            .map(|i2| (ct.pd_pts[i2].as_slice(), chals[ct.gammas_o[i2].ch]))
-            .collect();
-        fused_pairing_native(&rs, &pd, &ris_v, coord_scale, &yr_vals, ct.n_log_i, ct.k_cols_i - 1)
-    } else {
-        F256::ZERO
-    };
     let inner_n = check_residual_publics(
         public,
         mp_base + 5,
         &ct.levels,
         &ct.geo,
         &ct.w_resid,
-        ct.inner_pd2.as_ref().map(|ipd| ipd.ch),
-        extra_inner,
-        &yr_vals,
+        ct.inner_pd2.ch,
+        &observed_f256(&ct.vals_rec, ct.yr_v2, ct.yr_len),
         chals,
     );
     assert_eq!(

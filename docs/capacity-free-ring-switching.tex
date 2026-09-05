@@ -606,31 +606,36 @@ Measured in a paired, alternating A/B against the previous binary
 (three pairs, min of two runs each): the open drops from $137$~ms to
 $109$~ms and the whole proof by $\approx 15$~ms net of the C fold.
 
-\paragraph{What remains, and why the fusion stops here.} The row
+\paragraph{What remains: the full fusion, built and parked.} The row
 rounds still fold $(q', W')$ at $2^{n+1}$ and the inner Ligerito
 opening of $\hat q(\rho)$ still runs on the committed data. The full
-fusion would drop the merged sumcheck altogether and make $W$ the
+fusion drops the merged sumcheck altogether and makes $W$ the
 opening's level-0 basis: its rank-one terms are exactly the statistics
 above, the opening's own six block rounds (extension-field challenges)
 bind the block coordinates, its fold yields the level-1 witness, and
 $W'$ is written in closed form with extension-field coefficients. The
-prover would save the remaining transport rounds and the ladder's seed
-sweep ($\approx 11$~ms at $m = 25$) and the assist would leave the
-transcript. But the verifier must then evaluate $\widehat W$ at the
-opening's \emph{extension-field} point: $\sum_j c'_j\,\eq(z^{2^j},
-\sigma)$ with $\sigma \in \F_{2^{256}}^{\,m}$. Every form of that is
-extension-field work --- the closed form costs $128\,(m - m_{\mathrm{res}})$
-extension multiplies per claim, and the assist at such a point triples
-its square-root chains and prefix products; the Frobenius commutation
-that keeps the residual side cheap (the residual witness is
-base-field-valued per split coordinate, so $\hat y(z^{2^j}) =
-\hat y(z)^{2^j}$) does not reach the bound coordinates. In the
-recursive verifier those are extension multiply-accumulate rows, and
-that row type sits at its $2^{14}$ ceiling today; the $25$ base-field
-transport rounds are precisely the price of keeping the assist at a
-base-field point. The partial-utilization case would need the
-rank-one split under the jagged twist, which the twist does not admit
-column by column; there the materialized weight stays.
+prover may then use the \emph{full-cube} weight (it defines the basis,
+and $q$ vanishes on dead columns), so the verifier's evaluation of
+$\widehat W$ at the opening's point is a plain product of twisted eq
+factors, count-independent, and the assist leaves the transcript. We
+built this (prover and native verifier): the open gains $5$--$8$~ms at
+$m = 25$ (the $513$-term extension-field ladder rounds and the
+extension-field $W'$ cost $\approx 5$~ms), the proof shrinks by $8$~KB,
+the native verifier is at parity. The recursive verifier is where it
+stops: at the opening's extension-field point every form of $\widehat W$
+is extension-field work with no prover-assisted batching of the $128$
+twists, and the residual pairing does not twist for free either --- the
+residual witness's multilinear extension has base-field
+\emph{coefficients}, and Frobenius is only $\F_2$-linear, so it must be
+evaluated at all $128$ twisted points (in monomial form, $2^{r}$ squaring
+chains and $128 \cdot 2^{r}$ multiply-accumulates per column bit for $r$
+residual rows). That is about $+8.5$k rows per chain child, twelve
+percent of the region, against the $14.5$k the assist and merged rounds
+free; it fits the row-type ceilings only by packing three extension
+types near full. For a one-percent leaf gain the trade was declined and
+the work is parked as a patch. The partial-utilization case would need
+the rank-one split under the jagged twist, which the twist does not
+admit column by column; there the materialized weight stays.
 
 \section{Implementation}\label{sec:eval}
 

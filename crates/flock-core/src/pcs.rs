@@ -411,7 +411,6 @@ pub fn open_batch_mixed_ligerito_seeded<Ch: Challenger>(
         jit,
         vbasis,
         seeded_stats,
-        None,
         challenger,
     );
     if trace {
@@ -1446,11 +1445,7 @@ pub struct MergedOpenProof {
     #[serde(default)]
     pub merged_round_nonces: Vec<u64>,
     pub q_eval: F128,
-    /// The Frobenius assist. `None` under the fused transport (a full-height
-    /// column prefix on a lane-major commitment), where the merged weight is
-    /// the inner open's own basis and its evaluation is in closed form.
-    #[serde(default)]
-    pub frobenius: Option<jagged::MultipointTwistedProof>,
+    pub frobenius: jagged::MultipointTwistedProof,
     pub inner: BatchOpeningProofLigerito,
 }
 
@@ -1507,327 +1502,6 @@ fn scalar_claim_groups<'a>(
         }
     }
     groups
-}
-
-/// The fused weight's level-1 image in closed form (docs, "full fusion"):
-/// given `eq(σ_blk, ·)` over the blocks (F256), `W′[(c0, r)] =
-/// Σ_{e live for c0} eq(σ_blk, e)·W[e, (c0, r)]` — the block factor folds
-/// into the linearized coefficients (now F256), `c0` into per-`c0` byte
-/// tables, exactly as `block_first_phase` does in F128.
-fn fused_level1_builder(
-    rs: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)>,
-    pd: Vec<(Vec<F128>, Vec<F128>)>,
-    n_log: usize,
-    k_cols: usize,
-) -> Box<dyn Fn(&[F256]) -> Vec<F256> + Send + Sync> {
-    Box::new(move |eq_blk: &[F256]| {
-        use rayon::prelude::*;
-        const NB: usize = 1 << LOG_PACKING;
-        let n_e = 1usize << (k_cols - 1);
-        assert_eq!(eq_blk.len(), n_e);
-        let blk = 1usize << (n_log + 1);
-        let n_rows = 1usize << n_log;
-        let pw = frobenius_bit_powers();
-        let eq_rows: Vec<Vec<F128>> = rs
-            .iter()
-            .map(|(z_row, _, _)| crate::lincheck::build_eq_table(z_row))
-            .collect();
-        let tabs: Vec<[(Vec<F128>, Vec<F128>); 2]> = rs
-            .iter()
-            .map(|(_, z_col, coeffs)| {
-                let z0 = z_col[0];
-                let z_hi = &z_col[1..];
-                let mut zj: Vec<F128> = z_hi.to_vec();
-                let eq_hi_j: Vec<Vec<F128>> = (0..NB)
-                    .map(|_| {
-                        let t = crate::lincheck::build_eq_table(&zj);
-                        for z in zj.iter_mut() {
-                            *z = z.square();
-                        }
-                        t
-                    })
-                    .collect();
-                [0usize, 1].map(|c0| {
-                    let mut kappa = if c0 == 0 { F128::ONE + z0 } else { z0 };
-                    let cp: Vec<F256> = (0..NB)
-                        .map(|j| {
-                            let s =
-                                (0..n_e).fold(F256::ZERO, |acc, e| acc + eq_blk[e] * eq_hi_j[j][e]);
-                            let out = s * (coeffs[j] * kappa);
-                            kappa = kappa.square();
-                            out
-                        })
-                        .collect();
-                    // The F256 weights split into two F128 byte tables (the
-                    // `c0`/`c1` components), so the fill is two base-field
-                    // folds per entry and no extension arithmetic.
-                    let w: Vec<F256> = (0..NB)
-                        .map(|b| (0..NB).fold(F256::ZERO, |acc, j| acc + cp[j] * pw[b][j]))
-                        .collect();
-                    let w0: Vec<F128> = w.iter().map(|x| x.c0).collect();
-                    let w1: Vec<F128> = w.iter().map(|x| x.c1).collect();
-                    (
-                        ring_switch::build_fold_byte_table(&w0),
-                        ring_switch::build_fold_byte_table(&w1),
-                    )
-                })
-            })
-            .collect();
-        let pdv: Vec<(Vec<F128>, [F256; 2])> = pd
-            .iter()
-            .map(|(z_row, cols)| {
-                let eq_row = crate::lincheck::build_eq_table(z_row);
-                let s = [0usize, 1].map(|c0| {
-                    (0..n_e).fold(F256::ZERO, |acc, e| acc + eq_blk[e] * cols[2 * e + c0])
-                });
-                (eq_row, s)
-            })
-            .collect();
-        let mut wp = vec![F256::ZERO; blk];
-        wp.par_chunks_mut(2048).enumerate().for_each(|(ci, chunk)| {
-            let off = ci * 2048;
-            for (i, slot) in chunk.iter_mut().enumerate() {
-                let h = off + i;
-                let c0 = h >> n_log;
-                let r = h & (n_rows - 1);
-                let mut acc = F256::ZERO;
-                for (eq_row, tab) in eq_rows.iter().zip(&tabs) {
-                    let (t0, t1) = &tab[c0];
-                    acc += F256 {
-                        c0: ring_switch::fold_one_slot(eq_row[r], t0),
-                        c1: ring_switch::fold_one_slot(eq_row[r], t1),
-                    };
-                }
-                for (eq_row, s) in &pdv {
-                    acc += s[c0] * eq_row[r];
-                }
-                *slot = acc;
-            }
-        });
-        wp
-    })
-}
-
-/// The fused transport's inner open: the Ligerito open of the committed
-/// stack whose level-0 basis is the merged weight (`FusedL0`), proving
-/// `Σ_d q[d]·W[d] = target` directly.
-fn open_fused_ligerito<Ch: Challenger>(
-    q: Vec<F128>,
-    prover_data: &ProverData,
-    commitment: &Commitment,
-    target: F128,
-    fused: ligerito::extension::FusedL0,
-    lig_config: &ligerito::ProverConfig,
-    challenger: &mut Ch,
-) -> BatchOpeningProofLigerito {
-    assert_eq!(
-        commitment.cap.len(),
-        1usize << lig_config.l0_cap_depth(),
-        "commitment cap size disagrees with the opener config's L0 query count"
-    );
-    assert_eq!(
-        lig_config.initial_k, commitment.params.log_batch_size,
-        "ligerito initial_k must match PcsParams.log_batch_size for L0 reuse"
-    );
-    assert_eq!(
-        lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
-        "ligerito log_inv_rates[0] must match PcsParams.log_inv_rate for L0 reuse"
-    );
-    let l0_num_lanes = commitment.params.num_ntts();
-    assert!(
-        l0_num_lanes < 1usize << lig_config.initial_k,
-        "the fused open is lane-major"
-    );
-    challenger.observe_label(b"flock-pcs-open-fused-v0");
-    let ligerito = ligerito::recursive_prover_with_basis_precomputed_round0_lanes(
-        lig_config,
-        q,
-        Vec::new(),
-        target,
-        &prover_data.codeword,
-        &prover_data.merkle_tree,
-        l0_num_lanes,
-        true,
-        (F128::ZERO, F128::ZERO),
-        None,
-        None,
-        None,
-        None,
-        Some(fused),
-        challenger,
-    );
-    BatchOpeningProofLigerito {
-        ring_switches: Vec::new(),
-        batching_nonces: Vec::new(),
-        ligerito,
-    }
-}
-
-/// What the verifier needs to evaluate the fused weight in closed form:
-/// per ring-switch claim its row/column points and γ-scaled linearized
-/// coefficients; per scalar group its row point and γ-scaled column table.
-struct FusedWeightSpec<'a> {
-    n_log: usize,
-    k_cols: usize,
-    rs: Vec<(&'a [F128], &'a [F128], Vec<F128>)>,
-    pd: Vec<(&'a [F128], Vec<F128>)>,
-}
-
-/// `Ŵ` at the inner open's residual positions: the bound coordinates `ris`
-/// (F256, in the ladder's ROTATED order — block coordinates first, then
-/// the low dense coordinates) and the `yr_log_n` residual coordinates as
-/// the bits of each position. The fused basis is the full-cube weight, so
-/// this is a plain product of twisted eq factors —
-/// `Σ_j c_j·κ_{c0}^{2^j}·eq(z_row^{2^j}, x_row)·eq(z_col[1..]^{2^j}, x_blk)` —
-/// with the Frobenius twists on the base-field claim point only; nothing
-/// here depends on the layout's counts.
-fn fused_weight_residual(spec: &FusedWeightSpec<'_>, ris: &[F256], yr_log_n: usize) -> Vec<F256> {
-    const NB: usize = 1 << LOG_PACKING;
-    let n = spec.n_log;
-    let kb = spec.k_cols - 1;
-    let total = n + spec.k_cols;
-    let prefix_len = ris.len();
-    assert_eq!(prefix_len + yr_log_n, total, "bound + residual = dense");
-    assert!(prefix_len >= kb, "the block coordinates are bound first");
-    let ris_blk = &ris[..kb];
-    let n_bound_rows = (prefix_len - kb).min(n);
-    let c0_bound = prefix_len == total;
-    let yr_len = 1usize << yr_log_n;
-    // Column bit `c0` (dense coordinate `n`, rotated `total − 1`): a bound
-    // coordinate weights both families by eq(σ, c0); a residual one is a
-    // bit of the position.
-    let c0_terms = |y: usize| -> [(usize, F256); 2] {
-        if c0_bound {
-            let x = ris[total - 1];
-            [(0, F256::ONE + x), (1, x)]
-        } else {
-            let c0 = (y >> (total - 1 - prefix_len)) & 1;
-            [(c0, F256::ONE), (c0, F256::ZERO)]
-        }
-    };
-    let res_row = |zr: &[F128], y: usize| -> F128 {
-        (n_bound_rows..n).fold(F128::ONE, |acc, k| {
-            let bit = (y >> (kb + k - prefix_len)) & 1;
-            acc * if bit == 1 { zr[k] } else { F128::ONE + zr[k] }
-        })
-    };
-    let eq_bound = |z: &[F128], sigma: &[F256]| -> F256 {
-        z.iter().zip(sigma).fold(F256::ONE, |acc, (&zk, &sk)| {
-            acc * (F256::ONE + F256::from(zk) + sk)
-        })
-    };
-    let mut out = vec![F256::ZERO; yr_len];
-    for (z_row, z_col, coeffs) in &spec.rs {
-        let z0 = z_col[0];
-        let z_hi = &z_col[1..];
-        let mut s = [vec![F256::ZERO; NB], vec![F256::ZERO; NB]];
-        let mut zj_rows: Vec<Vec<F128>> = Vec::with_capacity(NB);
-        // Frobenius powers of the claim point, one squaring per coordinate
-        // per `j` (`x^(2^(j+1)) = (x^(2^j))^2`).
-        let mut zj_row: Vec<F128> = z_row.to_vec();
-        let mut zj_hi: Vec<F128> = z_hi.to_vec();
-        let mut kappa_j = [F128::ONE + z0, z0];
-        for j in 0..NB {
-            if coeffs[j] != F128::ZERO {
-                let bound =
-                    eq_bound(&zj_hi, ris_blk) * eq_bound(&zj_row[..n_bound_rows], &ris[kb..]);
-                for c0 in 0..2 {
-                    s[c0][j] = bound * (coeffs[j] * kappa_j[c0]);
-                }
-            }
-            zj_rows.push(zj_row.clone());
-            for z in zj_row
-                .iter_mut()
-                .chain(zj_hi.iter_mut())
-                .chain(kappa_j.iter_mut())
-            {
-                *z = z.square();
-            }
-        }
-        for (y, slot) in out.iter_mut().enumerate() {
-            for (c0, w) in c0_terms(y) {
-                if w == F256::ZERO {
-                    continue;
-                }
-                let mut t = F256::ZERO;
-                for j in 0..NB {
-                    if coeffs[j] != F128::ZERO {
-                        t += s[c0][j] * res_row(&zj_rows[j], y);
-                    }
-                }
-                *slot += w * t;
-            }
-        }
-    }
-    if !spec.pd.is_empty() {
-        let eq_blk = ligerito::extension::build_eq_table256(ris_blk);
-        for (z_row, cols) in &spec.pd {
-            let colfac = [0usize, 1].map(|c0| {
-                (0..eq_blk.len()).fold(F256::ZERO, |acc, e| acc + eq_blk[e] * cols[2 * e + c0])
-            });
-            let br = eq_bound(&z_row[..n_bound_rows], &ris[kb..]);
-            for (y, slot) in out.iter_mut().enumerate() {
-                for (c0, w) in c0_terms(y) {
-                    if w == F256::ZERO {
-                        continue;
-                    }
-                    *slot += w * colfac[c0] * br * res_row(z_row, y);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// `fused_weight_residual` for external oracles (the tower's native twin
-/// checks itself against the verifier's own evaluation).
-pub fn fused_weight_residual_oracle(
-    n_log: usize,
-    k_cols: usize,
-    rs: &[(&[F128], &[F128], Vec<F128>)],
-    pd: &[(&[F128], Vec<F128>)],
-    ris: &[F256],
-    yr_log_n: usize,
-) -> Vec<F256> {
-    let spec = FusedWeightSpec {
-        n_log,
-        k_cols,
-        rs: rs.iter().map(|(a, b, c)| (*a, *b, c.clone())).collect(),
-        pd: pd.iter().map(|(a, c)| (*a, c.clone())).collect(),
-    };
-    fused_weight_residual(&spec, ris, yr_log_n)
-}
-
-/// The fused transport's inner verify (see `open_fused_ligerito`).
-fn verify_fused_ligerito<Ch: Challenger>(
-    commitment: &Commitment,
-    target: F128,
-    spec: &FusedWeightSpec<'_>,
-    proof: &BatchOpeningProofLigerito,
-    lig_config: &ligerito::VerifierConfig,
-    challenger: &mut Ch,
-) -> Result<(), VerifyErrorOpen> {
-    if !proof.ring_switches.is_empty() || !proof.batching_nonces.is_empty() {
-        return Err(VerifyErrorOpen::Ligerito);
-    }
-    challenger.observe_label(b"flock-pcs-open-fused-v0");
-    let log_n = commitment.params.m - LOG_PACKING;
-    let eval = |ris: &[F256], yr_log_n: usize| fused_weight_residual(spec, ris, yr_log_n);
-    let ok = ligerito::extension::recursive_verifier_with_basis_succinct(
-        lig_config,
-        &proof.ligerito,
-        log_n,
-        target,
-        &commitment.cap,
-        commitment.params.num_ntts(),
-        eval,
-        challenger,
-    );
-    if ok {
-        Ok(())
-    } else {
-        Err(VerifyErrorOpen::Ligerito)
-    }
 }
 
 /// One ring-switch claim's inputs to the block-first phase.
@@ -1922,10 +1596,46 @@ fn column_bitbank_reference(q: &[F128], z_row: &[F128], n_log: usize, k_cols: us
         .collect()
 }
 
-/// Frobenius powers of the bit basis: `pw[b][k] = β_b^(2^k)`.
-fn frobenius_bit_powers() -> Vec<Vec<F128>> {
+/// The block-first phase of the merged sumcheck (docs, "direct transport").
+///
+/// The dense index is `d = e·2^(n+1) + c0·2^n + r` (block `e` of two lane
+/// columns, column bit `c0`, row `r`). Every weight term is rank-1 across the
+/// `(e | c0, r)` split once the fold map is linearized:
+/// `W_i[e, (c0, r)] = Σ_j c_ij·u_i(e)^(2^j)·(eq(z_col[0], c0)·eq(z_row, r))^(2^j)`
+/// with `u_i(e) = eq(z_col[1..], e)`, masked to the live column prefix. The
+/// `k−1` block rounds therefore need only, per term, the block statistics
+/// `S_ij[e] = (eq(z_col[0], c0)·Σ_b β_b^(2^-j)·bank[(2e+c0)·128 + b])^(2^j)`
+/// — a Frobenius transform of the column bit-bank — against
+/// `A_ij[e] = c_ij·eq(z_col[1..]^(2^j), e)`. After them, `q` is folded over
+/// the bound block coordinates and the row-side weight `W'` is written in
+/// closed form (the block factor folds into the linearized coefficients, the
+/// `c0` bit into the byte tables), ready for the ordinary row rounds.
+#[allow(clippy::too_many_arguments)]
+fn block_first_phase<Ch: Challenger>(
+    q: &[F128],
+    n_log: usize,
+    k_cols: usize,
+    live_cols: usize,
+    rs: &[BlockFirstClaim<'_>],
+    pd_groups: &[(&[F128], Vec<F128>)],
+    grinding: OpeningGrinding,
+    challenger: &mut Ch,
+    merged_rounds: &mut Vec<(F128, F128)>,
+    merged_round_nonces: &mut Vec<u64>,
+    r_blk: &mut Vec<F128>,
+    trace: bool,
+) -> (Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
     const NB: usize = 1 << LOG_PACKING;
-    (0..NB)
+    let t = std::time::Instant::now();
+    let kb = k_cols - 1;
+    let n_e = 1usize << kb;
+    let blk = 1usize << (n_log + 1);
+    let n_rows = 1usize << n_log;
+    // Live blocks per column bit: column `2e + c0` is live iff `2e + c0 < p`.
+    let live_e = |c0: usize| (live_cols + 1 - c0) / 2;
+    // Frobenius powers of the bit basis: `pw[b][k] = β_b^(2^k)`.
+    let pw: Vec<Vec<F128>> = (0..NB)
         .map(|b| {
             let mut row = vec![F128::ZERO; NB];
             row[0] = ring_switch::bit_basis(b);
@@ -1934,42 +1644,9 @@ fn frobenius_bit_powers() -> Vec<Vec<F128>> {
             }
             row
         })
-        .collect()
-}
+        .collect();
 
-/// The rank-1 terms of the merged weight on the block cube (see
-/// `block_first_phase`): per ring-switch claim, Frobenius power `j` and
-/// column bit `c0`, the block factor `A_{j,c0}(e)` (masked to the live
-/// prefix) and the statistics `S_{j,c0}(e)` from the column bit-bank; per
-/// scalar group, one term per `c0`. `Σ_terms Σ_e A(e)·S(e)` is the target.
-fn block_first_terms(
-    q: &[F128],
-    n_log: usize,
-    k_cols: usize,
-    live_cols: usize,
-    // Mask the block factors to the live column prefix (the zero-tail
-    // weight the assist evaluates); the fused transport uses the full-cube
-    // weight and passes `false`.
-    masked: bool,
-    rs: &[BlockFirstClaim<'_>],
-    pd_groups: &[(&[F128], Vec<F128>)],
-    trace: bool,
-) -> Vec<(Vec<F128>, Vec<F128>)> {
-    use rayon::prelude::*;
-    const NB: usize = 1 << LOG_PACKING;
-    let t = std::time::Instant::now();
-    let kb = k_cols - 1;
-    let n_e = 1usize << kb;
-    let n_rows = 1usize << n_log;
-    // Live blocks per column bit: column `2e + c0` is live iff `2e + c0 < p`.
-    let live_e = |c0: usize| {
-        if masked {
-            (live_cols + 1 - c0) / 2
-        } else {
-            n_e
-        }
-    };
-    let pw = frobenius_bit_powers();
+    // Rank-1 terms on the block cube.
     let mut terms: Vec<(Vec<F128>, Vec<F128>)> = Vec::new();
     for cl in rs {
         let z0 = cl.z_col[0];
@@ -2047,46 +1724,6 @@ fn block_first_terms(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    terms
-}
-
-/// The block-first phase of the merged sumcheck (docs, "direct transport").
-///
-/// The dense index is `d = e·2^(n+1) + c0·2^n + r` (block `e` of two lane
-/// columns, column bit `c0`, row `r`). Every weight term is rank-1 across the
-/// `(e | c0, r)` split once the fold map is linearized:
-/// `W_i[e, (c0, r)] = Σ_j c_ij·u_i(e)^(2^j)·(eq(z_col[0], c0)·eq(z_row, r))^(2^j)`
-/// with `u_i(e) = eq(z_col[1..], e)`, masked to the live column prefix. The
-/// `k−1` block rounds therefore need only, per term, the block statistics
-/// `S_ij[e] = (eq(z_col[0], c0)·Σ_b β_b^(2^-j)·bank[(2e+c0)·128 + b])^(2^j)`
-/// — a Frobenius transform of the column bit-bank — against
-/// `A_ij[e] = c_ij·eq(z_col[1..]^(2^j), e)`. After them, `q` is folded over
-/// the bound block coordinates and the row-side weight `W'` is written in
-/// closed form (the block factor folds into the linearized coefficients, the
-/// `c0` bit into the byte tables), ready for the ordinary row rounds.
-#[allow(clippy::too_many_arguments)]
-fn block_first_phase<Ch: Challenger>(
-    q: &[F128],
-    n_log: usize,
-    k_cols: usize,
-    live_cols: usize,
-    rs: &[BlockFirstClaim<'_>],
-    pd_groups: &[(&[F128], Vec<F128>)],
-    grinding: OpeningGrinding,
-    challenger: &mut Ch,
-    merged_rounds: &mut Vec<(F128, F128)>,
-    merged_round_nonces: &mut Vec<u64>,
-    r_blk: &mut Vec<F128>,
-    trace: bool,
-) -> (Vec<F128>, Vec<F128>) {
-    use rayon::prelude::*;
-    const NB: usize = 1 << LOG_PACKING;
-    let kb = k_cols - 1;
-    let blk = 1usize << (n_log + 1);
-    let n_rows = 1usize << n_log;
-    let live_e = |c0: usize| (live_cols + 1 - c0) / 2;
-    let pw = frobenius_bit_powers();
-    let mut terms = block_first_terms(q, n_log, k_cols, live_cols, true, rs, pd_groups, trace);
 
     // The block rounds.
     let t = std::time::Instant::now();
@@ -2459,14 +2096,21 @@ pub fn open_batch_merged<Ch: Challenger>(
         })
         .collect();
 
-    // The block-first family (docs, "direct transport"): a full-height
-    // column prefix makes every weight term rank-1 across the
-    // (lane block | column bit, row) split, so the block coordinates can be
-    // bound from O(2^k) block statistics without a 2^m weight vector. The
-    // column bit-banks are the statistics' source.
-    let rect = jagged::rectangular_prefix_columns(heights, n_log);
-    let banks: Vec<std::borrow::Cow<'_, [F128]>> = if rect.is_some() {
-        x_outers
+    let t = std::time::Instant::now();
+    let mut merged_rounds = Vec::with_capacity(dense_log);
+    let mut merged_round_nonces =
+        Vec::with_capacity((grinding.merged_round_bits != 0) as usize * dense_log);
+    let mut rho = Vec::with_capacity(dense_log);
+    let seed_len = 1usize << lig_config.initial_k;
+    let (q_eval, w_eval, seeded_stats) = if let Some(live_cols) =
+        jagged::rectangular_prefix_columns(heights, n_log)
+    {
+        // Block-first transport (docs, "direct transport"): a full-height
+        // column prefix lets the lane-block coordinates be bound first
+        // from O(2^k) block statistics — no 2^m weight vector — and the
+        // row rounds then run on the block-folded pair. The verifier
+        // rotates ρ back into coordinate order under the same predicate.
+        let banks: Vec<std::borrow::Cow<'_, [F128]>> = x_outers
             .iter()
             .enumerate()
             .map(|(i, x)| match column_bitbanks.get(i).copied().flatten() {
@@ -2477,7 +2121,7 @@ pub fn open_batch_merged<Ch: Challenger>(
                     if trace {
                         eprintln!(
                             "  [open_merged] claim {i}: no column bit-bank supplied, \
-                             reference fold"
+                                 reference fold"
                         );
                     }
                     std::borrow::Cow::Owned(column_bitbank_reference(
@@ -2488,104 +2132,18 @@ pub fn open_batch_merged<Ch: Challenger>(
                     ))
                 }
             })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let rs_bf: Vec<BlockFirstClaim<'_>> = x_outers
-        .iter()
-        .zip(&coeffs)
-        .zip(&banks)
-        .map(|((x, c), b)| BlockFirstClaim {
-            z_row: &x[1..1 + n_log],
-            z_col: &x[1 + n_log..],
-            coeffs: c,
-            bank: b,
-        })
-        .collect();
-
-    // Full fusion (docs, "full fusion"): on a lane-major commitment whose
-    // ladder binds exactly the block coordinates, the weight's rank-1 terms
-    // ARE the inner open's level-0 basis — no merged sumcheck, no assist.
-    // The verifier evaluates Ŵ at the ladder's point in closed form.
-    let lane_major = commitment.params.num_ntts() < 1usize << lig_config.initial_k;
-    if let Some(live_cols) = rect.filter(|_| lane_major && lig_config.initial_k + 1 == k_cols) {
-        let t = std::time::Instant::now();
-        // The fused basis is the FULL-cube weight (q vanishes on dead columns,
-        // so the target is the same); its evaluation is then count-independent.
-        let terms = block_first_terms(
-            &q, n_log, k_cols, live_cols, false, &rs_bf, &pd_groups, trace,
-        );
-        let terms: Vec<(Vec<F256>, Vec<F256>)> = terms
-            .into_iter()
-            .map(|(a, s)| {
-                (
-                    a.into_iter().map(F256::from).collect(),
-                    s.into_iter().map(F256::from).collect(),
-                )
+            .collect();
+        let rs: Vec<BlockFirstClaim<'_>> = x_outers
+            .iter()
+            .zip(&coeffs)
+            .zip(&banks)
+            .map(|((x, c), b)| BlockFirstClaim {
+                z_row: &x[1..1 + n_log],
+                z_col: &x[1 + n_log..],
+                coeffs: c,
+                bank: b,
             })
             .collect();
-        let level1 = fused_level1_builder(
-            x_outers
-                .iter()
-                .zip(&coeffs)
-                .map(|(x, c)| (x[1..1 + n_log].to_vec(), x[1 + n_log..].to_vec(), c.clone()))
-                .collect(),
-            pd_groups
-                .iter()
-                .map(|(z, cols)| (z.to_vec(), cols.clone()))
-                .collect(),
-            n_log,
-            k_cols,
-        );
-        if trace {
-            eprintln!(
-                "  [open_merged] fused L0 terms ({}): {:6.2} ms",
-                terms.len(),
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        let t = std::time::Instant::now();
-        let inner = open_fused_ligerito(
-            q,
-            prover_data,
-            commitment,
-            target,
-            ligerito::extension::FusedL0 { terms, level1 },
-            lig_config,
-            challenger,
-        );
-        if trace {
-            eprintln!(
-                "  [open_merged] fused inner open: {:6.2} ms",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-            eprintln!(
-                "  [open_merged] TOTAL: {:6.2} ms",
-                t_total.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        return MergedOpenProof {
-            ring_switches: rs_results.into_iter().map(|(p, _)| p).collect(),
-            batching_nonces,
-            merged_rounds: Vec::new(),
-            merged_round_nonces: Vec::new(),
-            q_eval: F128::ZERO,
-            frobenius: None,
-            inner,
-        };
-    }
-
-    let t = std::time::Instant::now();
-    let mut merged_rounds = Vec::with_capacity(dense_log);
-    let mut merged_round_nonces =
-        Vec::with_capacity((grinding.merged_round_bits != 0) as usize * dense_log);
-    let mut rho = Vec::with_capacity(dense_log);
-    let seed_len = 1usize << lig_config.initial_k;
-    let (q_eval, w_eval, seeded_stats) = if let Some(live_cols) = rect {
-        // Block-first transport: the verifier rotates ρ back into
-        // coordinate order under the same predicate.
-        let rs = rs_bf;
         let (qp, wp) = block_first_phase(
             &q,
             n_log,
@@ -2778,7 +2336,7 @@ pub fn open_batch_merged<Ch: Challenger>(
         merged_rounds,
         merged_round_nonces,
         q_eval,
-        frobenius: Some(frobenius),
+        frobenius,
         inner,
     }
 }
@@ -2799,56 +2357,6 @@ fn assemble_jagged_assertion(
     n_log: usize,
     mp: &jagged::MultipointDefer,
 ) -> crate::matrix_fold::JaggedAssertion {
-    let out = assemble_jagged_claims(
-        params,
-        x_outers,
-        packed_direct,
-        gammas_pd,
-        pd_groups,
-        n_log,
-        &mp.sigma,
-    );
-    let (rs, groups) = (&out.rs, &out.groups);
-    let mut ws = mp.statement_ws.iter();
-    for (rc, &coeff) in rs.iter().zip(&mp.rs_coeffs) {
-        if coeff.is_zero() {
-            continue;
-        }
-        assert_eq!(
-            *ws.next().expect("a statement per live RS claim"),
-            coeff * rc.value,
-            "RS statement recombination"
-        );
-    }
-    for ((combo, dense), &coeff) in groups.iter().zip(&mp.group_coeffs) {
-        let raw = combo.as_ref().map_or(F128::ZERO, |c| c.value)
-            + dense
-                .iter()
-                .fold(F128::ZERO, |a, &(g, ref c)| a + g * c.value);
-        assert_eq!(
-            *ws.next().expect("a statement per group"),
-            coeff * raw,
-            "group statement recombination"
-        );
-    }
-    assert!(ws.next().is_none(), "every statement accounted for");
-
-    out
-}
-
-/// The layout export's claims at the column point `sigma` — the assist's
-/// final point for the jagged transport; under the fused transport (which
-/// needs no layout claim) a fixed zero point, so the tower's accumulator
-/// sees the same claim structure either way.
-fn assemble_jagged_claims(
-    params: &jagged::JaggedParams,
-    x_outers: &[&[F128]],
-    packed_direct: &[PackedDirectClaimRef<'_>],
-    gammas_pd: &[F128],
-    pd_groups: &[(&[F128], Vec<F128>)],
-    n_log: usize,
-    sigma: &[F128],
-) -> crate::matrix_fold::JaggedAssertion {
     use crate::matrix_fold::{JaggedClaim, JaggedRowWeight, JaggedTable};
     let table = JaggedTable::from_params(params);
 
@@ -2858,7 +2366,7 @@ fn assemble_jagged_claims(
         .map(|x| {
             JaggedClaim::honest(
                 JaggedRowWeight::eq(x[1 + n_log..].to_vec()),
-                sigma.to_vec(),
+                mp.sigma.clone(),
                 &table,
             )
         })
@@ -2915,7 +2423,7 @@ fn assemble_jagged_claims(
             let combo = (!m.combo.is_empty()).then(|| {
                 JaggedClaim::honest(
                     JaggedRowWeight::Combo(m.combo.clone()),
-                    sigma.to_vec(),
+                    mp.sigma.clone(),
                     &table,
                 )
             });
@@ -2927,7 +2435,7 @@ fn assemble_jagged_claims(
                         g,
                         JaggedClaim::honest(
                             JaggedRowWeight::eq(zc.to_vec()),
-                            sigma.to_vec(),
+                            mp.sigma.clone(),
                             &table,
                         ),
                     )
@@ -2955,6 +2463,30 @@ fn assemble_jagged_claims(
             );
         }
     }
+    let mut ws = mp.statement_ws.iter();
+    for (rc, &coeff) in rs.iter().zip(&mp.rs_coeffs) {
+        if coeff.is_zero() {
+            continue;
+        }
+        assert_eq!(
+            *ws.next().expect("a statement per live RS claim"),
+            coeff * rc.value,
+            "RS statement recombination"
+        );
+    }
+    for ((combo, dense), &coeff) in groups.iter().zip(&mp.group_coeffs) {
+        let raw = combo.as_ref().map_or(F128::ZERO, |c| c.value)
+            + dense
+                .iter()
+                .fold(F128::ZERO, |a, &(g, ref c)| a + g * c.value);
+        assert_eq!(
+            *ws.next().expect("a statement per group"),
+            coeff * raw,
+            "group statement recombination"
+        );
+    }
+    assert!(ws.next().is_none(), "every statement accounted for");
+
     crate::matrix_fold::JaggedAssertion {
         k: params.k,
         m: params.m,
@@ -3116,86 +2648,6 @@ fn verify_batch_merged_core<Ch: Challenger>(
     }
 
     let dense_log = commitment.params.m - LOG_PACKING;
-    // Full fusion (see the prover): the inner open's basis is the weight
-    // itself; no merged rounds, no assist, Ŵ in closed form at its point.
-    let k_cols_pub = dense_log - n_log;
-    let lane_major = commitment.params.num_ntts() < 1usize << lig_config.initial_k;
-    if jagged::rectangular_prefix_columns(heights, n_log)
-        .filter(|_| lane_major && lig_config.initial_k + 1 == k_cols_pub)
-        .is_some()
-    {
-        // Every field of the transport is bound: the fused proof carries no
-        // rounds, no assist and a zero `q_eval`.
-        if !proof.merged_rounds.is_empty()
-            || !proof.merged_round_nonces.is_empty()
-            || proof.frobenius.is_some()
-            || proof.q_eval != F128::ZERO
-        {
-            return Err(VerifyErrorOpen::VirtualOpen);
-        }
-        let coeffs: Vec<Vec<F128>> = rs_outputs
-            .iter()
-            .zip(gammas.iter())
-            .map(|(o, g)| {
-                let scaled: Vec<F128> = o.eq_r_dprime.iter().map(|x| *g * *x).collect();
-                ring_switch::linearized_coefficients(&ring_switch::build_fold_byte_table(&scaled))
-            })
-            .collect();
-        for c in packed_direct.iter() {
-            if c.point.len() != n_log + k_cols_pub {
-                return Err(VerifyErrorOpen::Assist);
-            }
-        }
-        let pd_groups = scalar_claim_groups(
-            packed_direct.iter().map(|c| c.point),
-            gammas_pd,
-            n_log,
-            k_cols_pub,
-        );
-        let spec = FusedWeightSpec {
-            n_log,
-            k_cols: k_cols_pub,
-            rs: x_outers
-                .iter()
-                .zip(coeffs)
-                .map(|(x, c)| {
-                    assert_eq!(
-                        x.len(),
-                        1 + n_log + k_cols_pub,
-                        "point/row/col split mismatch"
-                    );
-                    (&x[1..1 + n_log], &x[1 + n_log..], c)
-                })
-                .collect(),
-            pd: pd_groups,
-        };
-        verify_fused_ligerito(
-            commitment,
-            target,
-            &spec,
-            &proof.inner,
-            lig_config,
-            challenger,
-        )?;
-        // The fused weight's evaluation is count-independent, so nothing
-        // NEEDS deferring; the layout export still carries the same claim
-        // structure (honest, at a fixed zero column point) so the tower's
-        // accumulator and merge shapes are the transport's, not the layout's.
-        if let Some(out) = defer {
-            let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
-            let sigma = vec![F128::ZERO; 2 * (dense_log + 1)];
-            *out = Some(assemble_jagged_claims(
-                &params,
-                x_outers,
-                packed_direct,
-                gammas_pd,
-                &spec.pd,
-                n_log,
-                &sigma,
-            ));
-        }
-        return Ok(());
-    }
     if proof.merged_rounds.len() != dense_log {
         return Err(VerifyErrorOpen::VirtualOpen);
     }
@@ -3299,14 +2751,13 @@ fn verify_batch_merged_core<Ch: Challenger>(
     // held for the `running` check below, which moved past the merge.
     let mut ch_a = challenger.fork(b"flock-par-assist-v1");
     let mut mp_defer = None;
-    let frobenius = proof.frobenius.as_ref().ok_or(VerifyErrorOpen::Assist)?;
     let v = if defer.is_some() {
         let (v, mp) = jagged::verify_multipoint_twisted_deferred_with_grinding(
             &params,
             &fclaims,
             &gclaims,
             &rho,
-            frobenius,
+            &proof.frobenius,
             grinding.multipoint,
             &mut ch_a,
         )
@@ -3319,7 +2770,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
             &fclaims,
             &gclaims,
             &rho,
-            frobenius,
+            &proof.frobenius,
             grinding.multipoint,
             &mut ch_a,
         )
