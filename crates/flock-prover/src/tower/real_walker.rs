@@ -294,7 +294,14 @@ impl<'p> RealTape<'p> {
         );
 
         // The R=2 + P schedule replays to the anchor's claimed v.
-        let n_p = lo.proof.pcs_open().frobenius.group_values.len();
+        let n_p = lo
+            .proof
+            .pcs_open()
+            .frobenius
+            .as_ref()
+            .expect("jagged child: assist present")
+            .group_values
+            .len();
         assert!(n_p > 0, "the mixed inner groups its pd claims");
         assert_eq!(
             mp_i.val_vs.len(),
@@ -669,7 +676,12 @@ impl<'p> RealTape<'p> {
                 let g0 = running + g1;
                 running = g0 + (g1 + g0 + gi) * rc + gi * rc * rc;
             }
-            let fro = &lo.proof.pcs_open().frobenius;
+            let fro = lo
+                .proof
+                .pcs_open()
+                .frobenius
+                .as_ref()
+                .expect("jagged child: assist present");
             let mut vrs = F128::ZERO;
             for (k, cs) in coeffs.iter().enumerate() {
                 for (j, &cj) in cs.iter().enumerate() {

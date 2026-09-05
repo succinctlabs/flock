@@ -194,22 +194,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "c3d7b17119826833b218d05b2684f1b2a9c1a99c91507861a6bdf61834408ff9",
+            "8bacaae93104ac1be412ba211ad864f93bbe086f038b1055b7a604474ecd2fa2",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "0f15486ead29dbb3c27222522fa68dc4c24d240a688e2391dc0f4477ee4e0e8a",
+            "b44d030e95a1b7e6331cea94768e8606c21afdd5d25889ae75cd493d07f51587",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "16773ba2aece640a77de8712a2c0004bd0f0acfee548a1ff6ec56c436047cb96",
+            "8c32d1396df3be8df173735441d602de782bd44f64c35ebe9ef1581458ef8ffc",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "e0e6e9cdfc8dc7834b81bd3ad758630cc1a6e622835f3ec7c25ac81e66e1cb74",
+            "9e5ff89a0d8c08522f3f083c682c84c3acb20ddc5498e77bc83f64d8469b6321",
         ),
     ];
 
@@ -285,7 +285,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "03894da62e6a1100e040a22b89d94592e2a5752ae7da5b6814c44ddc0f4ad820";
+        const EXPECTED: &str = "e63d6b1ec4c574e3017e6d7bf42538cd5f35bc31a35e60264252abb34b00d3c5";
         let n_blocks = 256usize;
         // The setup API IS the shipped single-slot union path since the
         // 2026-08-14 consolidation — the anchor pins it directly.
@@ -303,7 +303,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "a59bfee0bc6160a050b027ba9dcbdb6e8afde09199958b2110576990a9f2d260";
+        const EXPECTED: &str = "35c4c3760a74334c6856d15568aac9f521d10f3125fabf1f68df6f7393ce65b6";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

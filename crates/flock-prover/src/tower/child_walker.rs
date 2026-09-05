@@ -623,7 +623,11 @@ impl<'p> ChildTape<'p> {
         }
 
         // ---- the multipoint: the R=2 + P>0 schedule, pinned ----
-        let fro = &proof.pcs_open().frobenius;
+        let fro = proof
+            .pcs_open()
+            .frobenius
+            .as_ref()
+            .expect("jagged child: assist present");
         let n_p = fro.group_values.len();
         assert!(n_p > 0, "a circuit inner carries scalar groups (P > 0)");
         {

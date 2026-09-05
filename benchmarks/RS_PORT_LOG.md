@@ -5657,3 +5657,60 @@ byte for both points) — a kernel variant, est. −8..−9 ms if the fused
 lookup costs ~1.3× a single one; the q′ fold (5 ms) and the ladder's
 seed sweep (4 ms) are at the F128-multiply rate and have no cheaper
 form.
+
+### IN PROGRESS: full fusion, phase A (prover + native verifier) — checkpoint 2026-09-05
+
+Reversal of the adjudication above, on the user's push: the recursive
+verifier CAN take the fusion. Two facts changed the picture. (1) el701 is
+the residual-consistency row type (per query per 8-word chunk) and the
+basis never enters the query checks, so it stays at 16384 untouched; the
+fused verifier's F256 products are multiply-adds in SPINE form (el700,
+126 live of 16384) and its Frobenius twists act on the base-field claim
+point only (F128 squaring chains, el0, roughly offset by the assist
+gadget they replace). (2) Under the fusion the prover DEFINES the basis,
+so it uses the FULL-cube weight (q vanishes on dead columns, the target
+is identical) — then Ŵ at the ladder's point is a plain product of
+twisted eq factors with NO live-prefix term, i.e. count-independent: the
+fused verifier needs none of the tower's deferred layout claims (today's
+"count win" defers exactly the count-dependent W-side evaluations).
+
+Built and verified (phase A): `ligerito::extension::FusedL0` (rank-1
+terms + a level-1 builder) rides the statistics ladder in place of the eq
+basis (`init_phase_statistics` takes `seeded: Option`, `fused: Option`;
+the OOD term keeps its sweep; W′ is added to the split basis); the prover
+branch in `open_batch_merged` under `rectangular_prefix ∧ lane_major ∧
+initial_k + 1 == k_cols` (public) builds the unmasked terms, W′ from two
+F128 byte tables (the F256 coefficients' components), and calls
+`open_fused_ligerito` (label `flock-pcs-open-fused-v0`, no packed-direct
+intake); the verifier branch (`verify_fused_ligerito`) evaluates Ŵ at the
+residual through `recursive_verifier_with_basis_succinct`'s residual
+closure (`fused_weight_residual`, Frobenius powers incremental). The
+proof carries no merged rounds, no assist (`frobenius: Option`,
+`q_eval = 0`, all bound by the verifier). Round trips: lib 50/50,
+element-only, mixed-class tamper oracles, m6 anchors (BLAKE3 m22 is
+fused; SHA2 m22 and the element fixtures stay on stage 1 — their ladder
+does not bind exactly the block coordinates).
+
+Measured so far (desktop load 30–90, NOT a clean window): proof
+462,052 → 453,789 B (−8,263, the assist); native verify at parity after
+the Frobenius fix (was +2.7 ms with per-j recomputation); open −3.6 ms in
+the two unpolluted pairs against an expected ≈ −7..−10 from the buckets
+(merged sumcheck 14 → 0; ladder sweep −4; W′ +2.5; terms' F256 cast
++0.7). Clean A/B pending a quiet machine.
+
+Phase B (recursive verifier, `child_walker.rs` only — `real_walker`
+serves the jagged tower children): tape parser with optional multipoint
+region / packed-direct intake (fused label); native replay with
+`running = target`, the Ligerito spine seeded from the target, no anchor;
+the deferred JaggedAssertion empty (`verify_batch_merged_deferred` must
+fill it — today it panics on the fused branch, which is exactly how
+`chain_spine_converges` fails now); circuit: drop the multipoint/anchor
+gadgets, the 25 merged-round gates and the two `alslot` descents; the
+residual close-out without the eq(ρ) pd term (`query.rs`); the new
+pairing gadget per RS claim from `xab_pw`/`xc_pw`: squaring chains of
+the claim point (26 × 127, el0), bound products with the ladder
+challenges (≈ 20 per j, el700), `s_{c0,j}` via family-H coefficients,
+the two yr-half MLEs per split coordinate and their Frobenius chains,
+and the F256×F128 sums as spine256 rows. Budget from the live census:
+el0 ≈ 9.7k − 6.4k + 7.6k, el700 ≈ 0.1k + 6.5k, el600 ≈ 12.3k (keep the
+F256×F128 products in el700), el701 unchanged.
