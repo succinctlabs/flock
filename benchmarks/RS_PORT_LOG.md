@@ -5753,3 +5753,43 @@ chains and MACs across el700/el701/el0 (el700 ≈ 12k of 16k, el701 ≈
 Against it: leaf prover −7..−11 ms est. (clean A/B pending a quiet
 machine), proof −8,263 B, native verify ≈ parity. Decision handed back
 to Benedikt; the tree holds phase A + this partial phase B as WIP.
+
+### MEASURED: the fusion's leaf number, and a witgen cold-page hazard on this desktop — 2026-09-05
+
+Quiet-window A/B (a waiter ran it at 1-min load 3.3; 5 pairs, grind-free,
+min of 3 proves), fused (phase A) vs stage 1 (`base5`):
+open 108.0/106.6/106.2/104.1/107.0 vs 115.8/118.6/110.8/106.6/110.1 —
+fused wins 5/5, mean −6.0 ms. Totals went the OTHER way 5/5 (+16 ms
+mean). Steady-state A/B (bench knob `BLAKE3_RUNS=8`, min over 8 proves;
+both arms rebuilt with the same bench file): witgen 56 vs 36 ms (3/3),
+open −5 mean, commit / zc+lc / C fold equal — the whole loss is witgen,
+whose code is identical in both trees.
+
+Hunt (all same-binary, a prover-only `FLOCK_NO_FUSION` probe since
+stripped): the pool's big-class takes and misses are identical in both
+modes at steady state (three witness takes from the 2^25.5/2^26 classes,
+four 2^25.5 misses in the open — 3 GB of fresh mappings per prove, same
+both ways); the eviction traces are identical (≈20 evictions per prove
+pair, 3–4 in the 2^25 class); kernel decompression deltas are within the
+desktop's noise. The discriminator was a page-touch probe on the three
+witness buffers right after witgen takes them: 3–4.5 ms after a stage-1
+open, 44–100 ms after a fused open, same binary, same process. The
+buffers arrive COLD: this box holds ≈ 27 GB in the memory compressor
+(34 GB RAM, load 10–90 all day), idle pooled pages get compressed, and
+`try_take_f128` hands out the OLDEST equal-capacity buffer. A one-line
+"most recently returned first" tie-break FLIPPED it (fused touch 22–25,
+stage-1 touch 55–65, totals reversed by 40–100 ms) — so this is a
+pool-order accident amplified by memory pressure, not a property of
+either transport; reverted, nothing to fix in the pool.
+
+LESSON (benchmark discipline): on this desktop the witgen phase can
+swing ±20–60 ms per prove from which pooled buffer it receives; a change
+that alters the open's buffer traffic changes that lottery. Compare the
+phase you changed (per-phase buckets), and use the page-touch probe when
+a phase you did not touch moves.
+
+Verdict on the fusion's leaf: open −5..−8 ms (≈ 1–1.5%), less than the
+−11 estimate — the 513-term F256 ladder rounds, the F256 W′ build and
+the terms' F256 cast cost ≈ 5 ms the estimate underpriced. Proof
+−8,263 B, native verify at parity. The recursive-verifier gadget (above)
+would add ≈ +8.5k rows per chain child. Decision stays with Benedikt.

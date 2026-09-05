@@ -290,7 +290,13 @@ fn main() {
                 let h: u32 = t
                     .parse()
                     .expect("BLAKE3_LOG2S: space/comma-separated integer log2 values");
-                (1usize << h, 3usize)
+                // `BLAKE3_RUNS` overrides the measured-run count (steady-state
+                // pool behaviour needs more than the default three).
+                let runs = std::env::var("BLAKE3_RUNS")
+                    .ok()
+                    .and_then(|r| r.parse().ok())
+                    .unwrap_or(3usize);
+                (1usize << h, runs)
             })
             .collect(),
         Err(_) => vec![(1usize, 3), (128, 2), (8192, 2), (32768, 2), (65536, 2)],
