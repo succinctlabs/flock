@@ -5804,3 +5804,40 @@ is reverted to the stage-1 tree; the write-up stays here and in the
 LaTeX doc; the diff is saved as `fusion_phase_ab.patch` (scratchpad,
 2,976 lines) for a future tower with room in its extension row types.
 The bench's `BLAKE3_RUNS` knob and the cold-page lesson stay.
+
+### LANDED: scratch-pool retention 24 → 48 — the zerocheck's giants stop re-faulting every prove — prove best 444.5 ms — 2026-09-06
+
+Found while chasing the fusion's witgen lottery (above). With
+`FLOCK_POOL_TRACE` on an 8-prove process, the pool at steady state
+holds ≈ 25 entries (a dozen small ladder/query buffers plus the big set:
+witness ×3, codeword, the zerocheck's four 2^25.5-word giants, the fold
+outputs), so at `MAX_POOLED = 24` it overflowed on EVERY prove and the
+most-populated-class rule evicted the 2^25-class giants during the open's
+gives; the next zerocheck then missed four times ("MISS (fresh)",
+2^25.5 words each) and re-mapped ≈ 3 GB of fresh pages per prove —
+≈ 197k page reclaims per prove in `/usr/bin/time -l`. Lifting the cap to
+48 keeps the working set; peak RSS is unchanged (7.2–7.9 GB in every
+configuration — the buffers exist during every prove anyway; retention
+only adds idle footprint). A warm-first (LIFO) tie-break was tried in the
+same experiment and is harmful in both settings (it re-routes the giants
+onto the 2^26 buffers and the codeword misses instead; with cap 24 it
+also cold-starts witgen at 87–101 ms): the pool keeps oldest-first.
+
+Same binary (`FLOCK_POOL_MAX` probe, since stripped), steady state
+(`BLAKE3_RUNS=8`, min), 4 alternating pairs, load 13–17:
+
+| pair | cap 48 total / zc+lc / open | cap 24 total / zc+lc / open |
+|---|---|---|
+| 1 | 444.5 / 150.9 / 106.8 | 540.1 / 213.7 / 111.8 |
+| 2 | 462.0 / 154.2 / 105.6 | 525.3 / 194.8 / 110.7 |
+| 3 | 490.2 / 165.8 / 108.9 | 545.5 / 206.3 / 114.1 |
+| 4 | 490.1 / 172.1 / 106.9 | 546.7 / 185.1 / 113.8 |
+
+Total −55..−96 (mean −68, 4/4), zerocheck+lincheck −39 mean, open −5.5
+mean, witgen and commit unchanged, misses 45 → 12 per 9 proves (the
+warm-up only), page reclaims ≈ 2.0M → 1.0M. Prove best **444.5 ms**.
+The 2026-07-28 byte-budget experiment recorded in `scratch.rs` moved
+nothing because it ranked eviction by bytes at the same COUNT cap; the
+count was the constraint. Gates: fmt clean, workspace (release) 638
+passed / 0 failed, tower e2e `chain_spine_converges` (84 s) and
+`chain_tower_e2e_with_lane` (28 s) ok, x86 check ok.

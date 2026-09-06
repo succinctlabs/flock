@@ -38,7 +38,19 @@ static POOL: Mutex<Vec<(Vec<F128>, u64)>> = Mutex::new(Vec::new());
 /// open stage would fault fresh pages every prove (the pool denies malloc
 /// the page reuse it would otherwise get from the freed early-phase
 /// buffers) — measured as a +24% open_batch regression on M4 before this.
-const MAX_POOLED: usize = 24;
+///
+/// 48, not 24 (2026-09-06): the m=32 union prove with the AG zerocheck
+/// cycles ~25 entries (a dozen small ladder/query buffers plus the big
+/// set), so at 24 the pool overflowed EVERY prove and the
+/// most-populated-class rule evicted the zerocheck's four
+/// capacity-scaled giants (2^25.5 words each) — re-mapped fresh next
+/// prove, ~3 GB of page faults per prove. Measured at steady state
+/// (`BLAKE3_RUNS=8`, min, same binary): misses 45 → 12 per 9 proves,
+/// page reclaims halved, zerocheck+lincheck −45 ms, prove total −47..−71
+/// ms; peak RSS unchanged (retention adds idle footprint, not peak).
+/// The 2026-07-28 byte-budget experiment below saw nothing because it
+/// ranked by bytes rather than lifting the count.
+const MAX_POOLED: usize = 48;
 
 /// Take a length-`n` `F128` vector, preferring a pooled buffer (smallest
 /// capacity ≥ `n`); falls back to a fresh uninitialized allocation.
