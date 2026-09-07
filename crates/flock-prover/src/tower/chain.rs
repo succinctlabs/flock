@@ -22,7 +22,7 @@ use {
         r1cs_hashes::blake3::{Compression, build_block_r1cs},
         tower::{
             ChildSlots, ChildTape, SLOT_WORDS, check_child_region, emit_child_region,
-            gates_blake3::Rng, test_config,
+            expected_child_tail_schedule, gates_blake3::Rng, test_config,
         },
     },
     flock_core::{
@@ -897,5 +897,10 @@ pub(super) fn chain_child_region_emits_alone() {
         region.pub_base + consumed,
         built2.public.len(),
         "the region's publics are the whole tail"
+    );
+    assert_eq!(
+        region.tail_schedule,
+        expected_child_tail_schedule(&ct),
+        "the lone child region's tail publishes on its declared schedule"
     );
 }

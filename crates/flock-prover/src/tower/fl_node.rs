@@ -50,11 +50,11 @@ use crate::{
         check_child_region, check_fold_publics, check_jagged_fold_publics, emit_ag_point_binding,
         emit_child_region, emit_fold_region, emit_fs_chain_partitioned, emit_jagged_fold_region,
         emit_lagrange_lows, emit_recorded_pow_checks, env_acc_chain_base, env_app_base,
-        envelope_shape, flatten_ops, fold_region_ops, jagged_fold_region_ops,
-        labeled_bytes_payloads, live_element_input_from_rows, locate_and_pin_folds,
-        locate_and_pin_jagged_folds, merge_chain, native_chain, outer_lanes, outer_union,
-        outer_zc_ag, pack4, pack8, pad_envelope_counts, pcs_batch_for, replay_fold_endpoints,
-        replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+        envelope_shape, expected_child_tail_schedule, flatten_ops, fold_region_ops,
+        jagged_fold_region_ops, labeled_bytes_payloads, live_element_input_from_rows,
+        locate_and_pin_folds, locate_and_pin_jagged_folds, merge_chain, native_chain, outer_lanes,
+        outer_union, outer_zc_ag, pack4, pack8, pad_envelope_counts, pcs_batch_for,
+        replay_fold_endpoints, replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
     },
     verifier::{verify_ligerito_union_circuit_ag_deferred, verify_ligerito_union_circuit_deferred},
 };
@@ -438,6 +438,11 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                     &mut consts,
                 );
                 sb.end_island(isl);
+                assert_eq!(
+                    r.tail_schedule,
+                    expected_child_tail_schedule(t),
+                    "child {i}'s tail publishes on its declared schedule"
+                );
                 r
             })
             .collect();
