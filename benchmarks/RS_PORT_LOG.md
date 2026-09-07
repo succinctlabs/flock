@@ -5841,3 +5841,20 @@ nothing because it ranked eviction by bytes at the same COUNT cap; the
 count was the constraint. Gates: fmt clean, workspace (release) 638
 passed / 0 failed, tower e2e `chain_spine_converges` (84 s) and
 `chain_tower_e2e_with_lane` (28 s) ok, x86 check ok.
+
+### MEASURED: no other leak — steady-state faults 660/prove, RSS flat; the storms are the compressor — 2026-09-06
+
+A per-phase probe (minor faults via `getrusage` + RSS via `ps`, since
+stripped) on the cap-48 tree, 5 proves: at steady state the whole prove
+takes ≈ 660 minor faults (≈ 10 MB: witgen 36, commit 2, zerocheck +
+lincheck 10, open 611 — the ladder's small transients), and RSS holds
+at 7.86–7.87 GB across proves (no drift, no leak). Zero pool misses
+after warm-up (one stray 2^25.5 take per ~7 proves when the count
+crosses 48 momentarily). The remaining fault load in `/usr/bin/time`'s
+per-process totals is storms: one prove in the run took +52,764 faults
+in witgen (824 MB, 165 ms) and +39,006 in commit (609 MB, 319 ms) while
+the desktop's load hit 34 — the kernel had compressed our resident
+buffers between proves and witgen/commit re-faulted them. That is the
+machine, not the prover: on a box without memory pressure it does not
+happen, and the only in-process mitigation (wiring the pool's ~7 GB
+with `mlock`) is a dedicated-box knob, not something to land blind.
