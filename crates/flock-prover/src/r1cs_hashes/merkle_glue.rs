@@ -297,11 +297,7 @@ impl SwapTable {
         a[gc] = vec![gc];
         b[gc] = vec![gc];
 
-        let m = |rows: Vec<Vec<usize>>| SparseBinaryMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows,
-        };
+        let m = |rows: Vec<Vec<usize>>| SparseBinaryMatrix::new(k, k, rows);
         (m(a), m(b))
     }
 
@@ -584,11 +580,7 @@ impl BitSpreadTable {
         a[gc] = vec![gc];
         b[gc] = vec![gc];
 
-        let m = |rows: Vec<Vec<usize>>| SparseBinaryMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows,
-        };
+        let m = |rows: Vec<Vec<usize>>| SparseBinaryMatrix::new(k, k, rows);
         (m(a), m(b))
     }
 
@@ -905,11 +897,7 @@ impl FamilyTransposeTileTable {
         a[gc] = vec![gc];
         b[gc] = vec![gc];
 
-        let m = |rows: Vec<Vec<usize>>| SparseBinaryMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows,
-        };
+        let m = |rows: Vec<Vec<usize>>| SparseBinaryMatrix::new(k, k, rows);
         (m(a), m(b))
     }
 
@@ -1096,11 +1084,7 @@ impl PowMaskTable {
         a[gc] = vec![gc];
         b[gc] = vec![gc];
 
-        let m = |rows: Vec<Vec<usize>>| SparseBinaryMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows,
-        };
+        let m = |rows: Vec<Vec<usize>>| SparseBinaryMatrix::new(k, k, rows);
         (m(a), m(b))
     }
 

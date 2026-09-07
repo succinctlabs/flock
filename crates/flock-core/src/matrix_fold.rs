@@ -1455,11 +1455,7 @@ mod tests {
                 cs
             })
             .collect();
-        SparseBinaryMatrix {
-            num_rows: n,
-            num_cols: n,
-            rows,
-        }
+        SparseBinaryMatrix::new(n, n, rows)
     }
 
     /// An honest claim at the lincheck's weight shape: `low(2^s) ⊗ eq(point)`.

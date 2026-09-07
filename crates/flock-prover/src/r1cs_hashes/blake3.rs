@@ -776,11 +776,7 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     // Padding rows [USEFUL_BITS..K): A = B = []. Constraint 0·0 = z[i]
     // forces z[i] = 0 for all padding bits.
 
-    let to_mat = |rows| SparseBinaryMatrix {
-        num_rows: K,
-        num_cols: K,
-        rows,
-    };
+    let to_mat = |rows| SparseBinaryMatrix::new(K, K, rows);
     (to_mat(a_rows), to_mat(b_rows))
 }
 

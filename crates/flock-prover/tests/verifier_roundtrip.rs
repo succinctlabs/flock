@@ -25,11 +25,7 @@ use {
 };
 
 fn identity(k: usize) -> SparseBinaryMatrix {
-    SparseBinaryMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows: (0..k).map(|i| vec![i]).collect(),
-    }
+    SparseBinaryMatrix::new(k, k, (0..k).map(|i| vec![i]).collect())
 }
 
 /// Build an identity-`C` R1CS with identity `A_0`/`B_0` at the given shape.
