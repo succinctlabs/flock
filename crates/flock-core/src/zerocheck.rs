@@ -1056,7 +1056,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         // Cascade needs TWO more message rounds and the fused-size floor;
         // it never runs under live-span compaction (`store` stays None on
         // every cascade-eligible flow).
-        if tail_cascade && i + 2 <= n_mlv - 1 && a_mlv.len() >= 1024 {
+        if tail_cascade && i + 2 < n_mlv && a_mlv.len() >= 1024 {
             debug_assert!(store.is_none(), "cascade is dense-only");
             let len = a_mlv.len();
             let out_len = if pending2.is_some() { len / 4 } else { len / 2 };

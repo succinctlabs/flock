@@ -474,12 +474,23 @@ pub fn clear() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use crate::scratch::{
         F128, MAX_POOLED, POOL, clear, give_f128, give_zeroed_f128, take_f128, take_zeroed_f128,
     };
 
+    /// The pool is process-global and these tests `clear()` it, so they must
+    /// not interleave with each other (one test's clear between another's
+    /// give and take hands back a fresh allocation — seen on the x86 CI leg).
+    fn serial() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn take_reuses_given_buffer() {
+        let _serial = serial();
         clear();
         let mut v = take_f128(1024);
         for slot in v.iter_mut() {
@@ -496,6 +507,7 @@ mod tests {
 
     #[test]
     fn zero_pool_round_trips_rezeroed_buffers() {
+        let _serial = serial();
         clear();
         let mut v = take_zeroed_f128(1024);
         assert!(v.iter().all(|w| w.is_zero()), "fresh take is zero");
@@ -520,6 +532,7 @@ mod tests {
 
     #[test]
     fn pool_is_bounded() {
+        let _serial = serial();
         clear();
         for _ in 0..(MAX_POOLED + 4) {
             give_f128(take_f128(16));
