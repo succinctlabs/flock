@@ -48,8 +48,7 @@ pub use crate::tower::{
     node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app},
     query::LeafOuter,
     verify::{
-        RootBundle, SpanBound, TowerVerifyError, TowerVk, TowerVkFingerprint, verify_root,
-        verify_root_bytes,
+        RootBundle, TowerVerifyError, TowerVk, TowerVkFingerprint, verify_root, verify_root_bytes,
     },
 };
 // The wire format (`proof_io`'s tower-root bundle) carries a `MixedProof`.
@@ -69,7 +68,7 @@ use crate::{
         envelope::{
             ENV_ACC_MAIN_WORDS, EnvShape, EnvTail, declare_envelope_slots, env_acc_chain_base,
             env_acc_main_base, env_app_base, env_pass_base, envelope_shape, outer_lanes,
-            pad_envelope_counts, slot_cached, steady_reps,
+            pad_envelope_counts, slot_cached, span_count_word, steady_reps,
         },
         fl_node::chain_blake_r1cs,
         fold_region::{

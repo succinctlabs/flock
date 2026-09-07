@@ -14,7 +14,7 @@ use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
         ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, RootBundle,
-        RootDischargeFailure, SpanBound, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
+        RootDischargeFailure, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
         UnionInstance, build_chain_proof, build_fl_node, build_node_outer_app, chain_blake_r1cs,
         chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
         envelope::STEADY_OVERRIDE,
@@ -1082,16 +1082,15 @@ pub(super) fn tower_driver_e2e() {
 /// **THE STANDALONE VERIFIER, END TO END.** [`TowerVk::generate`] proves
 /// the six-leaf reference tower once, then [`verify_root`] checks FRESH
 /// towers it never built at every depth class — k = 4 (steady, live
-/// passenger, span [`SpanBound::EndpointsOnly`]), k = 3 (steady,
-/// passenger-less, exact) and k = 2 (base-rooted, exact) — plus the VK's
-/// own reference root; every table from the VK, every accumulator
-/// REASSEMBLED from the bundle's publics and cross-checked against the
-/// prover's own objects. Then the consumer-side refusals: a doctored
-/// public word dies in the proof verify, a wrong statement on the
-/// binding, a truncated bundle and a misfit span on the guards, an
-/// unknown slot key in the decode, and a CROSS-CLASS span lie on the
-/// passenger rule — while the k >= 4 in-class span degeneracy is pinned
-/// as exactly what [`SpanBound::EndpointsOnly`] declares.
+/// passenger), k = 3 (steady, passenger-less) and k = 2 (base-rooted) —
+/// plus the VK's own reference root; every table from the VK, every
+/// accumulator REASSEMBLED from the bundle's publics and cross-checked
+/// against the prover's own objects. Then the consumer-side refusals: a
+/// doctored public word dies in the proof verify, a wrong statement on
+/// the binding, a truncated bundle and a misfit span on the guards, an
+/// unknown slot key in the decode — and the SPAN LIES: with the span
+/// counter in the app block, an inflated in-class claim and a
+/// cross-class claim BOTH die on the statement leg, at every depth.
 #[test]
 #[ignore] // Heavy — four towers (6+8+6+4 leaves) end to end.
 pub(super) fn tower_verify_root_e2e() {
@@ -1103,22 +1102,14 @@ pub(super) fn tower_verify_root_e2e() {
     // (0) the VK's own reference root (k = 3, steady shape) verifies
     // through the consumer path.
     let own = *vk.tower.statement();
-    assert_eq!(
-        verify_root(&vk, &own, &vk.tower.root_bundle()).expect("the reference root verifies"),
-        SpanBound::Exact,
-        "a passenger-less steady root pins its span"
-    );
+    verify_root(&vk, &own, &vk.tower.root_bundle()).expect("the reference root verifies");
 
     // (1) a fresh k = 4 steady tower the VK never saw.
     let mut rng = Rng(0xD41_4E13);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let tower = Tower::prove(cfg, h0, n_blocks, 8);
     let stmt = *tower.statement();
-    assert_eq!(
-        verify_root(&vk, &stmt, &tower.root_bundle()).expect("the k = 4 root verifies"),
-        SpanBound::EndpointsOnly,
-        "a steady root with a live passenger certifies endpoints + class"
-    );
+    verify_root(&vk, &stmt, &tower.root_bundle()).expect("the k = 4 root verifies");
 
     // The reassembly cross-check: publics-decoded == the prover's own
     // objects, all three blocks.
@@ -1138,9 +1129,8 @@ pub(super) fn tower_verify_root_e2e() {
     // THE WIRE: the same k = 4 root as bytes — decode, VK cross-check,
     // full verify; the statement comes back with its qualification.
     let bytes = tower.root_bundle_bytes();
-    let (stmt_wire, bound) = verify_root_bytes(&vk, &bytes).expect("the wire bundle verifies");
+    let stmt_wire = verify_root_bytes(&vk, &bytes).expect("the wire bundle verifies");
     assert_eq!(stmt_wire, stmt, "the statement rode the wire");
-    assert_eq!(bound, SpanBound::EndpointsOnly);
     // A corrupted payload byte must not verify — the decode or the proof
     // refuses, and both are refusals. One flip in the proof body's
     // region, one in the early tags/statement region.
@@ -1234,43 +1224,40 @@ pub(super) fn tower_verify_root_e2e() {
             "an unknown slot key must be refused, not skipped"
         );
     }
-    // THE IN-CLASS SPAN DEGENERACY, pinned: an inflated k >= 4 claim over
-    // an honest k = 4 bundle still verifies — which is exactly why a
-    // green k >= 4 result says EndpointsOnly, never Exact. The count word
-    // in the app block is the recorded protocol follow-up.
+    // THE IN-CLASS SPAN LIE DIES: an inflated k >= 4 claim over an
+    // honest k = 4 bundle now fails the statement leg — the span counter
+    // in the app block pins the count inside the class (this exact lie
+    // used to verify, which is why verify_root once answered
+    // EndpointsOnly).
     let mut inflated = stmt;
     inflated.n_blocks += 2 * 2 * n_blocks;
-    assert_eq!(
-        verify_root(&vk, &inflated, &tower.root_bundle())
-            .expect("the in-class span lie is not detectable today"),
-        SpanBound::EndpointsOnly,
-        "and the result says so"
+    assert!(
+        matches!(
+            verify_root(&vk, &inflated, &tower.root_bundle()),
+            Err(TowerVerifyError::Discharge(RootDischargeFailure::Statement))
+        ),
+        "an inflated in-class span must die on the counter"
     );
 
     // (3) a fresh k = 3 tower — steady shape, passenger-less, exact span.
     let t3 = Tower::prove(cfg, native_chain(&h0, 128), n_blocks, 6);
-    assert_eq!(
-        verify_root(&vk, t3.statement(), &t3.root_bundle()).expect("the k = 3 root verifies"),
-        SpanBound::Exact,
-    );
-    // A CROSS-CLASS span lie dies on the passenger rule: the k = 3
-    // bundle claimed as k = 4 owes an orphan it does not carry.
+    verify_root(&vk, t3.statement(), &t3.root_bundle()).expect("the k = 3 root verifies");
+    // A CROSS-CLASS span lie now dies on the statement leg too (the
+    // counter mismatches before the passenger rule is consulted; the
+    // passenger rule stays as structural defense-in-depth).
     let mut lied = *t3.statement();
     lied.n_blocks += 2 * n_blocks;
     assert!(
         matches!(
             verify_root(&vk, &lied, &t3.root_bundle()),
-            Err(TowerVerifyError::Discharge(RootDischargeFailure::Passenger))
+            Err(TowerVerifyError::Discharge(RootDischargeFailure::Statement))
         ),
-        "a k = 3 bundle claimed steady-deep must die on the passenger"
+        "a k = 3 bundle claimed steady-deep must die on the counter"
     );
 
     // (4) a fresh k = 2 base-rooted tower — the other root shape.
     let t2 = Tower::prove(cfg, native_chain(&h0, 64), n_blocks, 4);
-    assert_eq!(
-        verify_root(&vk, t2.statement(), &t2.root_bundle()).expect("the k = 2 root verifies"),
-        SpanBound::Exact,
-    );
+    verify_root(&vk, t2.statement(), &t2.root_bundle()).expect("the k = 2 root verifies");
 }
 
 /// **THE VK'S PUBLISHED IDENTITY, PINNED** (chain128 @ 256-block
@@ -1322,11 +1309,13 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 }
 
 // The blessed chain128@256 fingerprint (see `tower_vk_fingerprint_pinned`).
-// Blessed 2026-09-04: two identical prints at the M3 wire-format tip.
+// Blessed 2026-09-07: two identical prints at the span-counter tip
+// (chain circuit + registries UNCHANGED by design; the three outer
+// circuits moved with the nine-word app block).
 const PIN_CHAIN_CIRCUIT: &str = "b8f442da32b9961612ccaf9acb39cadcd4592e913b2b208a1b9740d01c10e9c9";
-const PIN_FL_CIRCUIT: &str = "d272428abed26bd2685078eca64f265c0a5362d6e42f4392e83c9c36af4fcfa1";
-const PIN_BASE_CIRCUIT: &str = "3cec36dc2c40c45020105e2144880623e4f87a0a8263922dde172006a3233e51";
-const PIN_STEADY_CIRCUIT: &str = "8ce5ce16dfb72069aa81e673bd0f0676c2271954a963b086d84a23574fc9c0e2";
+const PIN_FL_CIRCUIT: &str = "19adfce7b9e9be24a2bf11e19306aeee95544a34a9a5b8e7275004ad00d17910";
+const PIN_BASE_CIRCUIT: &str = "5c1e83f6b9ad8f07b1a2ef254db1cf42f0101e24cabd3c33b1179ab2943fdd82";
+const PIN_STEADY_CIRCUIT: &str = "e1598ff2c0f340f0b991df50b9c687188fb2a06b2dd2711985efd461bdd2bf6c";
 const PIN_CHAIN_REGISTRY: &str = "3126c5ce825e8fc3942843c0548ba43964b1daa5751a834fcbbc1c3ab58e40fe";
 const PIN_OUTER_REGISTRY: &str = "acfbc7354af8436af480ea66609bb9b1cd0856b27426db2b4d8a69fe9014c10e";
 const PIN_PUBLICS_LEN: usize = 5684;

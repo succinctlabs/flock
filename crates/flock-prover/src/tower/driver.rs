@@ -37,17 +37,15 @@ use crate::tower::{
     },
     online::census_kib,
     query::leaf_boolean_mats,
+    span_count_word,
     verify::RootBundle,
 };
 
 /// What a tower run attests: `h_end == H^{n_blocks}(h_start)` over the
-/// BLAKE3 compression chain.
-///
-/// A standalone verifier pins the ENDPOINTS unconditionally but the
-/// COUNT only up to the root's depth class — the steady shape is
-/// depth-independent by design and the app block carries no count word.
-/// See `SpanBound` in the verify module before treating a verified
-/// `n_blocks` as exact.
+/// BLAKE3 compression chain — endpoints AND count. The count rides the
+/// app block's ninth word as the span counter `g^{n_blocks}` (the FL
+/// bakes its shape-bound value; every node multiplies its children's),
+/// so a standalone verifier pins the whole statement at every depth.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChainStatement {
     pub h_start: [u32; 16],
@@ -339,6 +337,12 @@ impl Tower {
             {
                 return Err(Statement);
             }
+        }
+        // THE SPAN COUNTER: the ninth app word is g^{n_blocks}, composed
+        // multiplicatively child-to-parent — the count is proof-bound at
+        // EVERY depth (Ron's call: the number of hashes is statement).
+        if public[self.app_base + 8] != span_count_word(statement.n_blocks as u128) {
+            return Err(Statement);
         }
         // (2) the chain lane vs the chain tables (leaf 0's shape).
         let blake = chain_blake_r1cs(self.chain.inner.nu);

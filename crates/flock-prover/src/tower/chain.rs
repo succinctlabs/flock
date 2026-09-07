@@ -378,6 +378,10 @@ pub struct ChainProof {
     pub(super) inner: MixedInner,
     pub(super) h_start: [u32; 16],
     pub(super) h_end: [u32; 16],
+    /// The segment's compression count — what the FL's baked span
+    /// counter (`g^{Σ n_blocks}`) sums over. Shape-bound: a different
+    /// count is a different chain (and FL) circuit digest.
+    pub(super) n_blocks: usize,
     /// What the leaf cost, split SETUP vs ONLINE — see [`Online`]. The
     /// LAST online iteration under steady repetition. Read by the in-file
     /// `#[test]` benches only.
@@ -543,6 +547,7 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
             work,
             sigma,
         },
+        n_blocks,
         h_start,
         h_end,
         t: *onlines.last().expect("one online iteration"),

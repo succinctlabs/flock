@@ -47,14 +47,15 @@ use crate::{
         SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable, TowerConfig, UnionInstance,
         UnionSlotProverInput, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays,
         balance_extra_rows, bytes_payload_mask, challenge_word_locs, check_ag_skip_publics,
-        check_child_region, check_fold_publics, check_jagged_fold_publics, emit_ag_point_binding,
-        emit_child_region, emit_fold_region, emit_fs_chain_partitioned, emit_jagged_fold_region,
-        emit_lagrange_lows, emit_recorded_pow_checks, env_acc_chain_base, env_app_base,
-        envelope_shape, expected_child_tail_schedule, flatten_ops, fold_region_ops,
+        check_child_region, check_fold_publics, check_jagged_fold_publics, cw,
+        emit_ag_point_binding, emit_child_region, emit_fold_region, emit_fs_chain_partitioned,
+        emit_jagged_fold_region, emit_lagrange_lows, emit_recorded_pow_checks, env_acc_chain_base,
+        env_app_base, envelope_shape, expected_child_tail_schedule, flatten_ops, fold_region_ops,
         jagged_fold_region_ops, labeled_bytes_payloads, live_element_input_from_rows,
         locate_and_pin_folds, locate_and_pin_jagged_folds, merge_chain, native_chain, outer_lanes,
         outer_union, outer_zc_ag, pack4, pack8, pad_envelope_counts, pcs_batch_for,
-        replay_fold_endpoints, replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+        replay_fold_endpoints, replay_jagged_fold_endpoints, span_count_word, steady_reps,
+        tower_fold_grinding,
     },
     verifier::{verify_ligerito_union_circuit_ag_deferred, verify_ligerito_union_circuit_deferred},
 };
@@ -870,10 +871,16 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
         // declares the same count vector and segment length every other
         // envelope outer does, and both the app block and the accumulator
         // claims ride the envelope's fixed TAIL.
-        let app_w: Vec<Wire> = (0..4)
+        let mut app_w: Vec<Wire> = (0..4)
             .map(|j| regions[0].child_pub_w[3 + j])
             .chain((0..4).map(|j| regions[k_ary - 1].child_pub_w[11 - 4 + j]))
             .collect();
+        // THE SPAN COUNTER, baked: the FL's children are fixed-size chain
+        // segments, so g^{Σ n_blocks} is a SHAPE CONSTANT — a fixed public
+        // input, bound by the circuit digest (a different leaf size is a
+        // different FL circuit).
+        let span: u128 = cps.iter().map(|cp| cp.n_blocks as u128).sum();
+        app_w.push(cw(&mut sb, &mut vals, &mut consts, span_count_word(span)));
         let stmt_base = {
             pad_envelope_counts(
                 &mut sb,

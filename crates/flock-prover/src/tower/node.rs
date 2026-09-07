@@ -1676,10 +1676,19 @@ pub fn build_node_outer_app(
                 }
             }
             let last = &regions[n_kids - 1];
-            (0..4)
+            let mut out: Vec<Wire> = (0..4)
                 .map(|j| regions[0].child_pub_w[off + j])
                 .chain((0..4).map(|j| last.child_pub_w[off + 4 + j]))
-                .collect()
+                .collect();
+            // THE SPAN COUNTER composes MULTIPLICATIVELY: the node's word
+            // is the product of its children's (g^{a+b} = g^a · g^b), one
+            // MAC row per extra child — depth never enters the shape.
+            let mut e = regions[0].child_pub_w[off + 8];
+            for rk in &regions[1..] {
+                e = sb.gate(cs.macs, &[zw, e, rk.child_pub_w[off + 8]])[0];
+            }
+            out.push(e);
+            out
         });
         // The publish of the combined span rides the envelope's fixed tail
         // block (below, with the padding), never inline.
