@@ -338,10 +338,15 @@ impl Tower {
                 return Err(Statement);
             }
         }
-        // THE SPAN COUNTER: the ninth app word is g^{n_blocks}, composed
-        // multiplicatively child-to-parent — the count is proof-bound at
-        // EVERY depth (Ron's call: the number of hashes is statement).
-        if public[self.app_base + 8] != span_count_word(statement.n_blocks as u128) {
+        // THE SPAN COUNTER: app word 8 is g^{n_blocks}, composed
+        // multiplicatively child-to-parent, and word 9 is the counter
+        // BASE g^{blocks_per_leaf} — the root end of the grounding chain
+        // (each parent copy-constrains its children's base word; the
+        // root's is also pinned natively by check_public). Together the
+        // count is proof-bound at EVERY depth.
+        if public[self.app_base + 8] != span_count_word(statement.n_blocks as u128)
+            || public[self.app_base + 9] != span_count_word(self.blocks_per_leaf as u128)
+        {
             return Err(Statement);
         }
         // (2) the chain lane vs the chain tables (leaf 0's shape).

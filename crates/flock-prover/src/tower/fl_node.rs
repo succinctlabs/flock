@@ -875,12 +875,28 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
             .map(|j| regions[0].child_pub_w[3 + j])
             .chain((0..4).map(|j| regions[k_ary - 1].child_pub_w[11 - 4 + j]))
             .collect();
-        // THE SPAN COUNTER, baked: the FL's children are fixed-size chain
-        // segments, so g^{Σ n_blocks} is a SHAPE CONSTANT — a fixed public
-        // input, bound by the circuit digest (a different leaf size is a
-        // different FL circuit).
-        let span: u128 = cps.iter().map(|cp| cp.n_blocks as u128).sum();
-        app_w.push(cw(&mut sb, &mut vals, &mut consts, span_count_word(span)));
+        // THE SPAN COUNTER: the base C = g^{n_blocks} rides word 9 as a
+        // fixed public — GROUNDED by the parent chain (every parent
+        // copy-constrains it to its own, up to the root's native
+        // check_public) — and word 8 = C^k via mac rows, so the count is
+        // bound by proven relations, not by fixed-public metadata.
+        let per_leaf = cps[0].n_blocks;
+        assert!(
+            cps.iter().all(|cp| cp.n_blocks == per_leaf),
+            "one leaf size per FL"
+        );
+        let c_w = cw(
+            &mut sb,
+            &mut vals,
+            &mut consts,
+            span_count_word(per_leaf as u128),
+        );
+        let mut e_w = c_w;
+        for _ in 1..k_ary {
+            e_w = sb.gate(cs.macs, &[zw, e_w, c_w])[0];
+        }
+        app_w.push(e_w);
+        app_w.push(c_w);
         let stmt_base = {
             pad_envelope_counts(
                 &mut sb,

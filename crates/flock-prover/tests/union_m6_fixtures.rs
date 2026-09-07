@@ -199,7 +199,7 @@ fn merged_bundle_digest(
 /// registry id, counts vector, commitment, and the merged proof — plus the
 /// claim values. The registry here (BLAKE3+SHA-256 at ν = 10) IS the
 /// `Blake3Sha2Nu10` tier, so this pins exactly what `proof_io` puts on disk
-/// for the current v21 mixed proof. It retains the removed jagged fixture's
+/// for the current mixed proof (the header carries `proof_io::VERSION`). It retains the removed jagged fixture's
 /// statements and witness streams; the Ligerito query ladder intentionally
 /// changed with v18.
 #[test]

@@ -76,7 +76,7 @@ fn main() {
         assert_eq!(&stmt, s, "the statement rode the wire");
         println!(
             "  VERIFIED STANDALONE (consumer path, over the wire): bundle {:.1} KiB \
-             | vk generate {gen_s:.1}s (one-time) | verify {verify_s:.3}s | span: exact",
+             | vk generate {gen_s:.1}s (one-time) | verify {verify_s:.3}s | statement certified",
             bytes.len() as f64 / 1024.0,
         );
     }

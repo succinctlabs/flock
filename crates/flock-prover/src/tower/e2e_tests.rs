@@ -1021,6 +1021,17 @@ pub(super) fn tower_driver_e2e() {
     );
     tower.root.lo.public[at] = saved;
 
+    // (a') a doctored counter BASE word — the grounding chain's root end.
+    let at = tower.app_base + 9;
+    let saved = tower.root.lo.public[at];
+    tower.root.lo.public[at] += F128::ONE;
+    assert_eq!(
+        tower.discharge_root(),
+        Err(RootDischargeFailure::Statement),
+        "a doctored counter base must be refused"
+    );
+    tower.root.lo.public[at] = saved;
+
     // (b) a doctored lane claim.
     let lane = tower.root.lane_acc.as_mut().expect("the lane rides");
     let saved = lane.per_type[0].0.value;
@@ -1127,7 +1138,7 @@ pub(super) fn tower_verify_root_e2e() {
     );
 
     // THE WIRE: the same k = 4 root as bytes — decode, VK cross-check,
-    // full verify; the statement comes back with its qualification.
+    // full verify; the statement comes back verified, count included.
     let bytes = tower.root_bundle_bytes();
     let stmt_wire = verify_root_bytes(&vk, &bytes).expect("the wire bundle verifies");
     assert_eq!(stmt_wire, stmt, "the statement rode the wire");
@@ -1309,13 +1320,13 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 }
 
 // The blessed chain128@256 fingerprint (see `tower_vk_fingerprint_pinned`).
-// Blessed 2026-09-07: two identical prints at the span-counter tip
+// Blessed 2026-09-07 (second cut: the grounded counter-base word)
 // (chain circuit + registries UNCHANGED by design; the three outer
 // circuits moved with the nine-word app block).
 const PIN_CHAIN_CIRCUIT: &str = "b8f442da32b9961612ccaf9acb39cadcd4592e913b2b208a1b9740d01c10e9c9";
-const PIN_FL_CIRCUIT: &str = "19adfce7b9e9be24a2bf11e19306aeee95544a34a9a5b8e7275004ad00d17910";
-const PIN_BASE_CIRCUIT: &str = "5c1e83f6b9ad8f07b1a2ef254db1cf42f0101e24cabd3c33b1179ab2943fdd82";
-const PIN_STEADY_CIRCUIT: &str = "e1598ff2c0f340f0b991df50b9c687188fb2a06b2dd2711985efd461bdd2bf6c";
+const PIN_FL_CIRCUIT: &str = "45c54e4003df6692d180ac70187b3ce5c34be259a7174f328d9ab95b6acb2f2a";
+const PIN_BASE_CIRCUIT: &str = "0c8d7382f9824b4fe4894786494e5887e8cad3af262eaf6655cb2116a7830153";
+const PIN_STEADY_CIRCUIT: &str = "fafab0ced83b6f778e799c926041fad49625cce69075093fe3305b7ffb5e22c7";
 const PIN_CHAIN_REGISTRY: &str = "3126c5ce825e8fc3942843c0548ba43964b1daa5751a834fcbbc1c3ab58e40fe";
 const PIN_OUTER_REGISTRY: &str = "acfbc7354af8436af480ea66609bb9b1cd0856b27426db2b4d8a69fe9014c10e";
 const PIN_PUBLICS_LEN: usize = 5684;
