@@ -20,28 +20,26 @@
 //! Run:
 //!   cargo run --release --bin dump_introduce_glue_vectors -- cuda-ghash/introduce_glue_vectors.bin 12
 
-use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
 
-use flock_prover::field::F128;
-use flock_prover::pcs::ligerito::SumcheckProver;
-
+use env::args;
 use flock_core::test_rng::Rng;
+use flock_prover::{field::F128, pcs::ligerito::SumcheckProver};
 
-fn write_f128(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn write_f128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "introduce_glue_vectors.bin".to_string());
-    let log_len: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(12);
+    let log_len: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(12);
     let len = 1usize << log_len;
 
     let mut rng = Rng::new(0xC0FFEE);

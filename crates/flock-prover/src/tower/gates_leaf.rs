@@ -1,8 +1,12 @@
-use super::*;
+use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
-// MVP-3b: the leaf arithmetic
-// ---------------------------------------------------------------------------
+use flock_core::{
+    element_r1cs::{ElementTableBuilder, ElementTableType},
+    schedule::IoWord,
+};
+use flock_field::gf2_256::QUADRATIC_NONRESIDUE;
+
+use crate::tower::{F128, F256, GateType, SlotWitness, TableType};
 
 /// What the verifier actually computes from the opened leaves, at one level:
 ///
@@ -46,8 +50,8 @@ use super::*;
 /// rows that grow to 127 terms at the last level. Left for later on purpose:
 /// this is the MVP.
 pub(super) struct LeafEvalGate {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-    pub(super) lay: LeafLayout,
+    pub(super) ty: Arc<ElementTableType>,
+    lay: LeafLayout,
 }
 
 /// The column layout of a [`LeafEvalGate`] over `lanes` leaf words.
@@ -59,7 +63,7 @@ pub(super) struct LeafEvalGate {
 #[derive(Clone, Copy)]
 pub(super) struct LeafLayout {
     pub(super) lanes: usize,
-    pub(super) vars: usize,
+    vars: usize,
     pub(super) v: usize,
     pub(super) alpha: usize,
     pub(super) prev: usize,
@@ -117,7 +121,6 @@ impl LeafLayout {
 
 impl LeafEvalGate {
     pub(super) fn new(lanes: usize) -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let one = F128::ONE;
         let lay = LeafLayout::new(lanes);
         let mut b = ElementTableBuilder::new(lay.kappa);
@@ -135,7 +138,7 @@ impl LeafEvalGate {
         b.mult(lay.t, lay.alpha, lay.y());
         b.linear(lay.acc, &[(lay.prev, one), (lay.t, one)]);
         Self {
-            ty: std::sync::Arc::new(b.build().expect("leaf-eval block is valid")),
+            ty: Arc::new(b.build().expect("leaf-eval block is valid")),
             lay,
         }
     }
@@ -147,7 +150,6 @@ impl GateType for LeafEvalGate {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..self.lay.n_in).map(IoWord::input).collect();
         schema.push(IoWord::output(self.lay.acc));
         TableType::element(self.ty.clone()).with_io_schema(schema)
@@ -188,14 +190,14 @@ impl GateType for LeafEvalGate {
 /// products. L0 words enter as `(word, 0)`, while recursive commitment rows
 /// already contain adjacent `(c0, c1)` words.
 pub(super) struct LeafEvalGate256 {
-    pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-    pub(super) lay: LeafLayout256,
+    pub(super) ty: Arc<ElementTableType>,
+    lay: LeafLayout256,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct LeafLayout256 {
     pub(super) lanes: usize,
-    pub(super) vars: usize,
+    vars: usize,
     pub(super) v: usize,
     pub(super) alpha: usize,
     pub(super) prev: usize,
@@ -255,14 +257,14 @@ impl LeafLayout256 {
 /// Emit `out = add + a*b` over F256, returning the next unused column.
 /// The five emitted columns are the three Karatsuba products and two limbs.
 pub(super) fn build_mac256(
-    b: &mut flock_core::element_r1cs::ElementTableBuilder,
+    b: &mut ElementTableBuilder,
     at: usize,
     add: Option<[usize; 2]>,
     a: [usize; 2],
     rhs: [usize; 2],
 ) -> usize {
     let one = F128::ONE;
-    let nr = flock_core::field::gf2_256::QUADRATIC_NONRESIDUE;
+    let nr = QUADRATIC_NONRESIDUE;
     b.mult(at, a[0], rhs[0]);
     b.mult(at + 1, a[1], rhs[1]);
     b.mult_lin(
@@ -287,7 +289,6 @@ pub(super) fn eval_mac256(add: F256, a: F256, b: F256) -> F256 {
 
 impl LeafEvalGate256 {
     pub(super) fn new(lanes: usize) -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let one = F128::ONE;
         let lay = LeafLayout256::new(lanes);
         let mut b = ElementTableBuilder::new(lay.kappa);
@@ -300,7 +301,7 @@ impl LeafEvalGate256 {
                 let right = lay.prev_pair(l, 2 * i + 1);
                 let challenge = [lay.v + 2 * (l - 1), lay.v + 2 * (l - 1) + 1];
                 let at = lay.base(l) + 5 * i;
-                let nr = flock_core::field::gf2_256::QUADRATIC_NONRESIDUE;
+                let nr = QUADRATIC_NONRESIDUE;
                 b.mult_lin(
                     at,
                     &[(left[0], one), (right[0], one)],
@@ -333,7 +334,7 @@ impl LeafEvalGate256 {
             lay.y(),
         );
         Self {
-            ty: std::sync::Arc::new(b.build().expect("extension leaf-eval block is valid")),
+            ty: Arc::new(b.build().expect("extension leaf-eval block is valid")),
             lay,
         }
     }
@@ -344,7 +345,6 @@ impl GateType for LeafEvalGate256 {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..self.lay.n_in).map(IoWord::input).collect();
         schema.push(IoWord::output(self.lay.acc));
         schema.push(IoWord::output(self.lay.acc + 1));

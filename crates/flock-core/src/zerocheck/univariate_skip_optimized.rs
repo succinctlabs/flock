@@ -32,20 +32,15 @@
 
 use std::sync::OnceLock;
 
-use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
-use crate::ntt::InvNttTableByteSingleGf8;
-
-use super::PaddingSpec;
-use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
-
-mod kernels;
-
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 #[cfg(all(test, target_arch = "aarch64"))]
-use kernels::aarch64::{
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
+use {
+    crate::zerocheck::univariate_skip_optimized::kernels::aarch64::{
+        bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
+    },
+    crate::zerocheck::univariate_skip_optimized::kernels::bit_transpose_64bytes_scalar,
 };
-#[cfg(all(test, target_arch = "aarch64"))]
-use kernels::bit_transpose_64bytes_scalar;
+
 #[cfg(all(
     test,
     any(
@@ -53,7 +48,7 @@ use kernels::bit_transpose_64bytes_scalar;
         all(target_arch = "x86_64", target_feature = "gfni")
     )
 ))]
-use kernels::shift_reduce_inner_ab_scalar;
+use crate::zerocheck::univariate_skip_optimized::kernels::shift_reduce_inner_ab_scalar;
 #[cfg(all(
     test,
     target_arch = "x86_64",
@@ -61,9 +56,22 @@ use kernels::shift_reduce_inner_ab_scalar;
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
-use kernels::x86_64::shift_reduce_inner_ab_x86_avx512;
+use crate::zerocheck::univariate_skip_optimized::kernels::x86_64::shift_reduce_inner_ab_x86_avx512;
 #[cfg(all(test, target_arch = "x86_64", target_feature = "gfni"))]
-use kernels::x86_64::shift_reduce_inner_ab_x86_sse;
+use crate::zerocheck::univariate_skip_optimized::kernels::x86_64::shift_reduce_inner_ab_x86_sse;
+use crate::{
+    field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8},
+    ntt::InvNttTableByteSingleGf8,
+    zerocheck::{
+        PaddingSpec,
+        univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits},
+        univariate_skip_optimized::kernels::{
+            accumulate_convert, bit_transpose_64bytes as kernel_bit_transpose_64bytes,
+            shift_reduce_inner_ab as kernel_shift_reduce_inner_ab,
+        },
+    },
+};
+mod kernels;
 
 // ---------------------------------------------------------------------------
 // Protocol constants — fixed by the optimization design.
@@ -223,7 +231,7 @@ fn convert_table() -> &'static [F128] {
 
 #[inline]
 pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
-    kernels::bit_transpose_64bytes(input, output);
+    kernel_bit_transpose_64bytes(input, output);
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +256,7 @@ fn shift_reduce_inner_ab(
     a_col: &mut [F8],
     b_col: &mut [F8],
 ) {
-    kernels::shift_reduce_inner_ab(
+    kernel_shift_reduce_inner_ab(
         a_packed,
         b_packed,
         inv_table,
@@ -394,7 +402,7 @@ fn process_one_x_hi(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            kernels::accumulate_convert(
+            accumulate_convert(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 1 << N_MEDIUM,
@@ -426,7 +434,7 @@ fn process_one_x_hi(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            kernels::accumulate_convert(
+            accumulate_convert(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 n_b_med,
@@ -685,7 +693,10 @@ impl Round1AbPre {
         let off = x_outer * AB_PRE_PER_OUTER;
         // SAFETY: the storage holds `n_outer * AB_PRE_PER_OUTER` bytes and u8
         // has no alignment requirement; in-bounds by the debug_assert.
-        unsafe { &*((self.storage.as_ptr() as *const u8).add(off) as *const [[u8; AB_PRE_CHUNK]; 1 << N_MEDIUM]) }
+        unsafe {
+            &*((self.storage.as_ptr() as *const u8).add(off)
+                as *const [[u8; AB_PRE_CHUNK]; 1 << N_MEDIUM])
+        }
     }
 
     pub fn len_bytes(&self) -> usize {
@@ -710,7 +721,7 @@ pub fn precompute_round1_ab(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> Round1AbPre {
-    use rayon::prelude::*;
+    use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
     assert_eq!(k_skip, K_SKIP, "precompute is k_skip=6 only");
     assert!(m >= k_skip + N_INNER);
@@ -873,8 +884,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>) {
-    use rayon::prelude::*;
-
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -989,7 +998,10 @@ pub fn round1_c_banks_from_stripe(
     r: &[F128],
 ) -> ([F128; ELL], [F128; ELL]) {
     assert_eq!(r.len(), m);
-    assert!(k_log >= K_SKIP + 1 + 2, "need the parity dim + small dims in-block");
+    assert!(
+        k_log >= K_SKIP + 1 + 2,
+        "need the parity dim + small dims in-block"
+    );
     assert!(m - k_log >= 3, "stripe fold needs n_outer >= 8");
 
     // 1. The one O(witness) pass: fold the outer dims.
@@ -999,9 +1011,8 @@ pub fn round1_c_banks_from_stripe(
     // so every accumulate becomes an L2 round trip. The tiled kernels keep
     // BLOCK_K = 8 accumulators in registers across a stripe sweep, which is
     // why lincheck's own fold runs this shape at roughly half the cost.
-    let mut v = crate::lincheck::partial_fold_packed_z_best(
-        z_stripe, m, k_log, useful_bits, &eq_outer,
-    );
+    let mut v =
+        crate::lincheck::partial_fold_packed_z_best(z_stripe, m, k_log, useful_bits, &eq_outer);
 
     // 2. Fold dims k_log-1 down to 7 at their r values. All remaining data is
     //    tiny (<= 2^k_log F128s, halving each round).
@@ -1053,7 +1064,10 @@ pub fn round1_c_banks_from_stripe_with_banked(
     c_banks: usize,
 ) -> ([F128; ELL], [F128; ELL], Vec<Vec<F128>>) {
     assert_eq!(r.len(), m);
-    assert!(k_log >= K_SKIP + 1 + 2, "need the parity dim + small dims in-block");
+    assert!(
+        k_log >= K_SKIP + 1 + 2,
+        "need the parity dim + small dims in-block"
+    );
     assert!(m - k_log >= 3, "stripe fold needs n_outer >= 8");
     const LOG2_PACKED: usize = 7; // in-word bit dims (F_{2^128} packing)
     assert!(
@@ -1064,9 +1078,8 @@ pub fn round1_c_banks_from_stripe_with_banked(
     // 1. The one O(witness) pass: fold the outer dims (shared with the
     //    bank-only variant).
     let eq_outer = super::univariate_skip::build_eq(&r[k_log..]);
-    let mut v = crate::lincheck::partial_fold_packed_z_best(
-        z_stripe, m, k_log, useful_bits, &eq_outer,
-    );
+    let mut v =
+        crate::lincheck::partial_fold_packed_z_best(z_stripe, m, k_log, useful_bits, &eq_outer);
 
     // 2a. Fold the middle dims down to 7 + c_banks (kept: 7 in-word dims +
     //     the c_banks lowest suffix word dims).
@@ -1172,7 +1185,16 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_stripe_c(
     ab_pre: Option<&Round1AbPre>,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Option<Vec<Vec<F128>>>) {
     round1_with_s_hat_v_impl(
-        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, Some(stripe_c), ab_pre,
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        k_skip,
+        r,
+        inv_table,
+        padding,
+        Some(stripe_c),
+        ab_pre,
     )
 }
 
@@ -1189,7 +1211,6 @@ fn round1_with_s_hat_v_impl(
     stripe_c: Option<StripeC<'_>>,
     ab_pre: Option<&Round1AbPre>,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Option<Vec<Vec<F128>>>) {
-
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -1223,10 +1244,8 @@ fn round1_with_s_hat_v_impl(
     // they're on, so the merge never gates on them for long). Values are
     // identical under any work distribution: per-worker partials are F128
     // sums, order-free.
-    let (res_ab, res_c_s_0, res_c_s_1) = crate::run_hetero_chunks_stateful(
-        hi_size,
-        WorkerStateWithSHatV::new,
-        |state, x_hi| {
+    let (res_ab, res_c_s_0, res_c_s_1) =
+        crate::run_hetero_chunks_stateful(hi_size, WorkerStateWithSHatV::new, |state, x_hi| {
             let eq_hi_val = eq_hi[x_hi];
             process_one_x_hi_with_s_hat_v(
                 x_hi,
@@ -1245,21 +1264,20 @@ fn round1_with_s_hat_v_impl(
                 stripe_c.is_none(),
                 ab_pre,
             );
-        },
-    )
-    .into_iter()
-    .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
-    .fold(
-        ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-        |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
-            for i in 0..ELL {
-                ab1[i] += ab2[i];
-                c0_1[i] += c0_2[i];
-                c1_1[i] += c1_2[i];
-            }
-            (ab1, c0_1, c1_1)
-        },
-    );
+        })
+        .into_iter()
+        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+        .fold(
+            ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                    c0_1[i] += c0_2[i];
+                    c1_1[i] += c1_2[i];
+                }
+                (ab1, c0_1, c1_1)
+            },
+        );
 
     // With a stripe, the C banks come from the multilinear fold; the workers
     // above ran AB-only and left their C accumulators zero.
@@ -1374,10 +1392,51 @@ fn round1_shift_reduce_extract_c_packed_serial(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ntt::AdditiveNttGf8;
-    use crate::zerocheck::univariate_skip::round1_naive;
-
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "gfni")
+    ))]
+    use crate::zerocheck::univariate_skip_optimized::N_CHUNKS;
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "gfni")
+    ))]
+    use crate::zerocheck::univariate_skip_optimized::shift_reduce_inner_ab_scalar;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    use crate::zerocheck::univariate_skip_optimized::shift_reduce_inner_ab_x86_avx512;
+    #[cfg(all(target_arch = "x86_64", target_feature = "gfni"))]
+    use crate::zerocheck::univariate_skip_optimized::shift_reduce_inner_ab_x86_sse;
+    use crate::zerocheck::univariate_skip_optimized::{
+        StripeC, alpha_inv_f128, c_2_small_f128, ntt_extend_f128_vec_ghash, precompute_round1_ab,
+        round1_c_banks_from_stripe, round1_c_banks_from_stripe_with_banked,
+        round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_stripe_c,
+    };
+    #[cfg(target_arch = "aarch64")]
+    use crate::zerocheck::univariate_skip_optimized::{
+        bit_transpose_64bytes_neon, bit_transpose_64bytes_scalar, shift_reduce_inner_ab_fused_neon,
+        shift_reduce_inner_ab_neon,
+    };
+    use crate::{
+        ntt::AdditiveNttGf8,
+        test_rng::Rng,
+        zerocheck::{
+            PaddingSpec,
+            univariate_skip::{pack_bits, round1_extract_c_packed_with_s_hat_v, round1_naive},
+            univariate_skip_optimized::{
+                ELL, F8, F128, InvNttTableByteSingleGf8, K_SKIP, N_INNER, PHI_8_TABLE,
+                SMALL_CHAL_F8, c_s_f128, convert_table, d_inv, medium_challenges_ghash, mul_by_x,
+                phi8, round1_shift_reduce_extract_c, round1_shift_reduce_extract_c_packed,
+                round1_shift_reduce_extract_c_packed_padded,
+                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v,
+                round1_shift_reduce_extract_c_packed_serial, small_challenges_ghash,
+            },
+        },
+    };
     /// **Soundness assumption.** Zerocheck and the Ligerito PCS opening at
     /// L0 both depend on the seven "friendly" constants — three small
     /// (`φ_8(SMALL_CHAL_F8[k])`, k ∈ 0..3) and four medium
@@ -1435,8 +1494,6 @@ mod tests {
              zerocheck and Ligerito L0 soundness depend on it"
         );
     }
-
-    use crate::test_rng::Rng;
 
     /// Build the full `r` vector with the protocol-fixed constants in the
     /// small/medium slots. Only `r[k_skip + N_INNER..]` is the actual
@@ -1652,7 +1709,10 @@ mod tests {
                 None,
             );
             assert_eq!(classic.0, striped.0, "res_ab at m={m} useful={useful}");
-            assert_eq!(classic.1, striped.1, "res_c_lifted at m={m} useful={useful}");
+            assert_eq!(
+                classic.1, striped.1,
+                "res_c_lifted at m={m} useful={useful}"
+            );
             assert_eq!(classic.2, striped.2, "s_hat_v_c at m={m} useful={useful}");
 
             // The hoisted AB precompute must be bit-identical to inline prep.
@@ -1710,16 +1770,9 @@ mod tests {
                 round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                     &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
                 );
-            let (b0_ref, b1_ref) =
-                round1_c_banks_from_stripe(&stripe, m, k_log, 1 << k_log, &r);
-            let (b0, b1, banked) = round1_c_banks_from_stripe_with_banked(
-                &stripe,
-                m,
-                k_log,
-                1 << k_log,
-                &r,
-                c,
-            );
+            let (b0_ref, b1_ref) = round1_c_banks_from_stripe(&stripe, m, k_log, 1 << k_log, &r);
+            let (b0, b1, banked) =
+                round1_c_banks_from_stripe_with_banked(&stripe, m, k_log, 1 << k_log, &r, c);
             assert_eq!(b0, b0_ref, "flat bank0 at (m={m}, c={c})");
             assert_eq!(b1, b1_ref, "flat bank1 at (m={m}, c={c})");
 
@@ -1758,8 +1811,7 @@ mod tests {
                 round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                     &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
                 );
-            let (bank0, bank1) =
-                round1_c_banks_from_stripe(&stripe, m, k_log, 1 << k_log, &r);
+            let (bank0, bank1) = round1_c_banks_from_stripe(&stripe, m, k_log, 1 << k_log, &r);
 
             let c_2 = c_2_small_f128();
             let alpha_inv = alpha_inv_f128();
@@ -1786,8 +1838,6 @@ mod tests {
 
     #[test]
     fn parallel_matches_serial() {
-        use crate::zerocheck::univariate_skip::pack_bits;
-
         // At small m the parallel overhead dominates, but the *output* must
         // still match the serial version bit-for-bit. F128 XOR-sum reduction
         // is commutative + associative, so any thread-scheduling order yields
@@ -1828,9 +1878,6 @@ mod tests {
     ///     (this is the only shape that exercises the full-skip case.)
     #[test]
     fn padded_matches_dense_with_zero_padding() {
-        use crate::zerocheck::PaddingSpec;
-        use crate::zerocheck::univariate_skip::pack_bits;
-
         // (k_log, useful_bits, n_blocks_log) — pick n_blocks_log so
         // m = k_log + n_blocks_log is small enough to keep the test fast
         // while still exercising the kernel's parallel + boundary paths.
@@ -1980,8 +2027,8 @@ mod tests {
         let table = make_inv_table();
         let a_bits = rng.bits(1 << m);
         let b_bits = rng.bits(1 << m);
-        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
-        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+        let a_packed = pack_bits(&a_bits);
+        let b_packed = pack_bits(&b_bits);
 
         let mut a_col = vec![F8::ZERO; ELL];
         let mut b_col = vec![F8::ZERO; ELL];
@@ -2027,8 +2074,8 @@ mod tests {
         let table = make_inv_table();
         let a_bits = rng.bits(1 << m);
         let b_bits = rng.bits(1 << m);
-        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
-        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+        let a_packed = pack_bits(&a_bits);
+        let b_packed = pack_bits(&b_bits);
 
         let mut a_col = vec![F8::ZERO; ELL];
         let mut b_col = vec![F8::ZERO; ELL];
@@ -2083,8 +2130,8 @@ mod tests {
         let table = make_inv_table();
         let a_bits = rng.bits(1 << m);
         let b_bits = rng.bits(1 << m);
-        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
-        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+        let a_packed = pack_bits(&a_bits);
+        let b_packed = pack_bits(&b_bits);
         let mut a_col = vec![F8::ZERO; ELL];
         let mut b_col = vec![F8::ZERO; ELL];
 
@@ -2134,8 +2181,8 @@ mod tests {
         let _ = n_chunks;
         let a_bits = rng.bits(1 << m);
         let b_bits = rng.bits(1 << m);
-        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
-        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+        let a_packed = pack_bits(&a_bits);
+        let b_packed = pack_bits(&b_bits);
 
         let mut a_col = vec![F8::ZERO; ELL];
         let mut b_col = vec![F8::ZERO; ELL];
@@ -2195,8 +2242,6 @@ mod tests {
     /// the scalar-oracle's canonical form.
     #[test]
     fn fusion_matches_existing_and_scalar_oracle() {
-        use crate::zerocheck::univariate_skip::round1_extract_c_packed_with_s_hat_v;
-
         for &m in &[13usize, 14, 15] {
             let mut rng = Rng::new(0xF00D_u64.wrapping_add(m as u64));
             let a = pack_bits(&rng.bits(1 << m));
@@ -2208,7 +2253,7 @@ mod tests {
             for i in 0..3 {
                 r[K_SKIP + i] = phi8(F8(SMALL_CHAL_F8[i]));
             }
-            let medium = crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash();
+            let medium = medium_challenges_ghash();
             for i in 0..4 {
                 r[K_SKIP + 3 + i] = medium[i];
             }
@@ -2220,8 +2265,8 @@ mod tests {
             }
 
             let inv_table = {
-                let ntt_s = crate::ntt::AdditiveNttGf8::new(K_SKIP, F8::ZERO);
-                let ntt_l = crate::ntt::AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
+                let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
+                let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
                 InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
             };
 

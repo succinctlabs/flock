@@ -1,12 +1,10 @@
-use crate::field::F128;
+use crate::{F128, gf2_128::aarch64::ghash_mul_vec2_neon};
 
 /// Two-lane pair fold using NEON and PMULL.
 ///
 /// # Safety
 /// Requires the `aes` target feature.
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
-
     let lanes = dst.len() & !1;
     let mut t = 0;
     while t < lanes {

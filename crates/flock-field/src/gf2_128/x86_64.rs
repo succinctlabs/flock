@@ -1,5 +1,10 @@
-use super::{F128, F256Unreduced, ghash_reduce};
-use core::arch::x86_64::*;
+use core::arch::x86_64::{
+    __m128i, __m512i, _mm_clmulepi64_si128, _mm_extract_epi64, _mm_set_epi64x, _mm_slli_si128,
+    _mm_xor_si128, _mm512_bslli_epi128, _mm512_clmulepi64_epi128, _mm512_extracti32x4_epi32,
+    _mm512_loadu_si512, _mm512_set_epi64, _mm512_setzero_si512, _mm512_xor_si512,
+};
+
+use crate::gf2_128::{F128, F256Unreduced, ghash_reduce};
 
 /// 64×64 carry-less product, returned as a 128-bit vector {lo, hi}.
 ///

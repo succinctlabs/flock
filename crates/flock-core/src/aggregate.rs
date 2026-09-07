@@ -41,15 +41,28 @@
 //! So a leaf over two proofs folds `2 → 1`, and a `2 → 1` merge of two
 //! recursive proofs folds `4 → 1` (two inherited, two fresh).
 
+use matrix_fold::{
+    FoldError, FoldGrinding, FoldMatrix, JaggedAssertion, JaggedClaim, JaggedTable, col_marginal,
+    discharge_jagged, prove_fold_jagged_with_grinding, prove_fold_with_grinding,
+    verify_fold_jagged_with_grinding, verify_fold_with_grinding,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::challenger::Challenger;
-use crate::element_r1cs::union::ElementAssertion;
-use crate::field::F128;
-use crate::lincheck::{MatrixAssertion, VerifyError};
-use crate::matrix_fold::{self, FoldProof, MatrixClaim};
-use crate::r1cs::SparseBinaryMatrix;
-use crate::schedule::Registry;
+use crate::{
+    challenger::Challenger,
+    circuit::{Circuit, SigmaAssertion},
+    element_r1cs::{
+        SparseF128Matrix,
+        union::{ElementAssertion, ElementUnionError},
+    },
+    field::F128,
+    lincheck::{LincheckCircuit, LincheckError, MatrixAssertion},
+    matrix_fold::{self, FoldProof, MatrixClaim, bilinear},
+    pcs::jagged::JaggedParams,
+    r1cs::SparseBinaryMatrix,
+    schedule::Registry,
+    union::UnionInstance,
+};
 
 const DOMAIN: &[u8] = b"flock-aggregate-v0";
 
@@ -58,10 +71,7 @@ pub type TypeMatrices<'a> = (&'a SparseBinaryMatrix, &'a SparseBinaryMatrix);
 
 /// The base matrices of one element type, `(A₀, B₀)` — `F128` coefficients,
 /// not `GF(2)` supports.
-pub type ElementMatrices<'a> = (
-    &'a crate::element_r1cs::SparseF128Matrix,
-    &'a crate::element_r1cs::SparseF128Matrix,
-);
+pub type ElementMatrices<'a> = (&'a SparseF128Matrix, &'a SparseF128Matrix);
 
 /// Accumulated matrix claims: one `(A₀, B₀)` pair per boolean type, in slot
 /// order, tied to the registry they are about.
@@ -100,13 +110,8 @@ pub struct Accumulator {
 }
 
 impl Accumulator {
-    // (A `discharge_with_circuits` variant, since deleted per bloat ledger
-    // §A, through each type's tuned
-    // column-marginal `fold_split` kernel was MEASURED SLOWER than the raw
-    // k·nnz pass below — 17.3 vs 15.3 ms on the N=4 BLAKE3 batch — because
-    // the accumulated A and B claims fold under separate transcripts and
-    // carry different row points, so each `fold_split` call threw half its
-    // work away. Deleted 2026-08-27; don't re-derive.)
+    // Circuit-specific folds took 17.3 ms for an N=4 BLAKE3 batch. This raw
+    // matrix pass took 15.3 ms because A and B use different row points.
 
     /// Discharge every accumulated claim against the raw matrices — the
     /// generic `O(Σ_t nnz_t)` root check, for callers without circuits.
@@ -134,14 +139,12 @@ impl Accumulator {
     /// the layout per digest (the heights are shape constants of that
     /// digest's circuit). `true` when nothing jagged was accumulated; an
     /// entry whose key is missing from `tables` fails, never skips.
-    pub fn discharge_jagged(
-        &self,
-        tables: &[([u8; 32], &crate::pcs::jagged::JaggedParams)],
-    ) -> bool {
+    pub fn discharge_jagged(&self, tables: &[([u8; 32], &JaggedParams)]) -> bool {
         self.jagged.iter().all(|(d, c)| {
-            tables.iter().find(|(k, _)| k == d).is_some_and(|(_, p)| {
-                matrix_fold::discharge_jagged(c, &matrix_fold::JaggedTable::from_params(p))
-            })
+            tables
+                .iter()
+                .find(|(k, _)| k == d)
+                .is_some_and(|(_, p)| discharge_jagged(c, &JaggedTable::from_params(p)))
         })
     }
 
@@ -149,14 +152,10 @@ impl Accumulator {
     /// its own circuit's sigma table — `O(2^mu)` per key, once. The caller
     /// supplies the circuits; an entry whose digest is missing FAILS,
     /// never skips. `true` when nothing sigma was accumulated.
-    pub fn discharge_sigma(&self, circuits: &[&crate::circuit::Circuit]) -> bool {
+    pub fn discharge_sigma(&self, circuits: &[&Circuit]) -> bool {
         self.sigma.iter().all(|(d, claim)| {
             circuits.iter().find(|c| c.digest() == *d).is_some_and(|c| {
-                crate::matrix_fold::bilinear(
-                    &claim.row,
-                    &claim.col,
-                    &crate::circuit::SigmaAssertion::matrix(c),
-                ) == claim.value
+                bilinear(&claim.row, &claim.col, &SigmaAssertion::matrix(c)) == claim.value
             })
         })
     }
@@ -188,11 +187,11 @@ pub enum AggregateError {
     Malformed,
     /// An assertion's reported matrix evaluations do not reproduce its
     /// target (`MatrixAssertion::check_reported`).
-    Reported(VerifyError),
+    Reported(LincheckError),
     /// Likewise on the element side.
-    ReportedElement(crate::element_r1cs::union::VerifyError),
+    ReportedElement(ElementUnionError),
     /// A fold did not verify.
-    Fold(matrix_fold::FoldError),
+    Fold(FoldError),
     /// The accumulated claims did not hold against the real matrices.
     Discharge,
 }
@@ -253,7 +252,7 @@ fn check_priors(
 pub fn prove_aggregate<Ch: Challenger>(
     registry: &Registry,
     mats: &[TypeMatrices<'_>],
-    circuits: &[&dyn crate::lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     assertions: &[MatrixAssertion],
     priors: &[&Accumulator],
     ch: &mut Ch,
@@ -280,10 +279,10 @@ pub fn prove_aggregate<Ch: Challenger>(
 pub fn prove_aggregate_classes<Ch: Challenger>(
     registry: &Registry,
     mats: &[TypeMatrices<'_>],
-    circuits: &[&dyn crate::lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     assertions: &[MatrixAssertion],
     el_mats: &[ElementMatrices<'_>],
-    el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    el_assertions: &[(&UnionInstance<'_>, ElementAssertion)],
     sigma: &[SigmaKey<'_>],
     jagged: &[JaggedKeyProve<'_>],
     priors: &[&Accumulator],
@@ -299,7 +298,7 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
         sigma,
         jagged,
         priors,
-        matrix_fold::FoldGrinding::disabled(),
+        FoldGrinding::disabled(),
         ch,
     )
 }
@@ -310,14 +309,14 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
 pub fn prove_aggregate_classes_with_grinding<Ch: Challenger>(
     registry: &Registry,
     mats: &[TypeMatrices<'_>],
-    circuits: &[&dyn crate::lincheck::LincheckCircuit],
+    circuits: &[&dyn LincheckCircuit],
     assertions: &[MatrixAssertion],
     el_mats: &[ElementMatrices<'_>],
-    el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    el_assertions: &[(&UnionInstance<'_>, ElementAssertion)],
     sigma: &[SigmaKey<'_>],
     jagged: &[JaggedKeyProve<'_>],
     priors: &[&Accumulator],
-    grinding: matrix_fold::FoldGrinding,
+    grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
     // Sigma never travels alone: a circuit proof's deferred verify yields
@@ -349,15 +348,15 @@ pub fn prove_aggregate_classes_with_grinding<Ch: Challenger>(
                 circuits[t].fold_split(&qa.row.materialize())
             } else {
                 (
-                    matrix_fold::col_marginal(ma, &qa.row.materialize(), n_cols),
-                    matrix_fold::col_marginal(mb, &qb.row.materialize(), n_cols),
+                    col_marginal(ma, &qa.row.materialize(), n_cols),
+                    col_marginal(mb, &qb.row.materialize(), n_cols),
                 )
             };
             combs_a.push(xa);
             combs_b.push(xb);
         }
-        let (pa, out_a) = matrix_fold::prove_fold_with_grinding(*ma, &combs_a, &ca, grinding, ch);
-        let (pb, out_b) = matrix_fold::prove_fold_with_grinding(*mb, &combs_b, &cb, grinding, ch);
+        let (pa, out_a) = prove_fold_with_grinding(*ma, &combs_a, &ca, grinding, ch);
+        let (pb, out_b) = prove_fold_with_grinding(*mb, &combs_b, &cb, grinding, ch);
         folds.push((pa, pb));
         per_type.push((out_a, out_b));
     }
@@ -372,14 +371,14 @@ pub fn prove_aggregate_classes_with_grinding<Ch: Challenger>(
         let n_cols = ma.num_cols;
         let combs_a: Vec<Vec<F128>> = ca
             .iter()
-            .map(|q| matrix_fold::FoldMatrix::col_marginal(*ma, &q.row.materialize(), n_cols))
+            .map(|q| FoldMatrix::col_marginal(*ma, &q.row.materialize(), n_cols))
             .collect();
         let combs_b: Vec<Vec<F128>> = cb
             .iter()
-            .map(|q| matrix_fold::FoldMatrix::col_marginal(*mb, &q.row.materialize(), n_cols))
+            .map(|q| FoldMatrix::col_marginal(*mb, &q.row.materialize(), n_cols))
             .collect();
-        let (pa, out_a) = matrix_fold::prove_fold_with_grinding(*ma, &combs_a, &ca, grinding, ch);
-        let (pb, out_b) = matrix_fold::prove_fold_with_grinding(*mb, &combs_b, &cb, grinding, ch);
+        let (pa, out_a) = prove_fold_with_grinding(*ma, &combs_a, &ca, grinding, ch);
+        let (pb, out_b) = prove_fold_with_grinding(*mb, &combs_b, &cb, grinding, ch);
         el_folds.push((pa, pb));
         per_element.push((out_a, out_b));
     }
@@ -408,10 +407,7 @@ pub fn prove_aggregate_classes_with_grinding<Ch: Challenger>(
 /// the fold's prover reads, plus the fresh assertions about it. The
 /// verifier's replay reads NO table — it needs the circuit only for the
 /// digest and the shape checks.
-pub type SigmaKey<'a> = (
-    &'a crate::circuit::Circuit,
-    Vec<&'a crate::circuit::SigmaAssertion>,
-);
+pub type SigmaKey<'a> = (&'a Circuit, Vec<&'a SigmaAssertion>);
 
 // THE ZERO CLAIM lives in the PUBLISHED BLOCK, not here (wall 3, the
 // spine): an accumulator entry carries its own LIVE word as both weights'
@@ -429,8 +425,8 @@ const DOMAIN_SIGMA_GROUP: &[u8] = b"flock-aggregate-sigma-v1";
 /// canonical circuit-structure claim per assertion (shape-checked against
 /// the circuit).
 fn gather_sigma(
-    circuit: &crate::circuit::Circuit,
-    asserts: &[&crate::circuit::SigmaAssertion],
+    circuit: &Circuit,
+    asserts: &[&SigmaAssertion],
     priors: &[&Accumulator],
 ) -> Result<Vec<MatrixClaim>, AggregateError> {
     let digest = circuit.digest();
@@ -443,8 +439,8 @@ fn gather_sigma(
         }
     }
     for a in asserts {
-        let matrix = crate::circuit::SigmaAssertion::matrix(circuit);
-        let base_bits = (matrix_fold::FoldMatrix::n_cols(&matrix) / 8).trailing_zeros() as usize;
+        let matrix = SigmaAssertion::matrix(circuit);
+        let base_bits = (FoldMatrix::n_cols(&matrix) / 8).trailing_zeros() as usize;
         if a.nu != circuit.cells().nu()
             || a.rho.len() != circuit.cells().mu()
             || a.base_bits != base_bits
@@ -468,7 +464,7 @@ fn gather_sigma(
 fn fold_sigma_prove<Ch: Challenger>(
     sigma: &[SigmaKey<'_>],
     priors: &[&Accumulator],
-    grinding: matrix_fold::FoldGrinding,
+    grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<(Vec<FoldProof>, Vec<([u8; 32], MatrixClaim)>), AggregateError> {
     for p in priors {
@@ -488,8 +484,8 @@ fn fold_sigma_prove<Ch: Challenger>(
         let claims = gather_sigma(circuit, asserts, priors)?;
         ch.observe_label(DOMAIN_SIGMA_GROUP);
         ch.observe_bytes(&digest);
-        let m = crate::circuit::SigmaAssertion::matrix(circuit);
-        let n_cols = matrix_fold::FoldMatrix::n_cols(&m);
+        let m = SigmaAssertion::matrix(circuit);
+        let n_cols = FoldMatrix::n_cols(&m);
         // Several circuit-structure claims share row points. Reuse each
         // expensive marginal instead of streaming the child table again.
         let mut combs: Vec<Vec<F128>> = Vec::with_capacity(claims.len());
@@ -497,14 +493,10 @@ fn fold_sigma_prove<Ch: Challenger>(
             if let Some(j) = claims[..i].iter().position(|p| p.row == q.row) {
                 combs.push(combs[j].clone());
             } else {
-                combs.push(matrix_fold::FoldMatrix::col_marginal(
-                    &m,
-                    &q.row.materialize(),
-                    n_cols,
-                ));
+                combs.push(FoldMatrix::col_marginal(&m, &q.row.materialize(), n_cols));
             }
         }
-        let (pf, folded) = matrix_fold::prove_fold_with_grinding(&m, &combs, &claims, grinding, ch);
+        let (pf, folded) = prove_fold_with_grinding(&m, &combs, &claims, grinding, ch);
         folds.push(pf);
         out.push((digest, folded));
     }
@@ -516,7 +508,7 @@ fn fold_sigma_verify<Ch: Challenger>(
     sigma: &[SigmaKey<'_>],
     priors: &[&Accumulator],
     proofs: &[FoldProof],
-    grinding: matrix_fold::FoldGrinding,
+    grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<Vec<([u8; 32], MatrixClaim)>, AggregateError> {
     for p in priors {
@@ -538,8 +530,8 @@ fn fold_sigma_verify<Ch: Challenger>(
         let claims = gather_sigma(circuit, asserts, priors)?;
         ch.observe_label(DOMAIN_SIGMA_GROUP);
         ch.observe_bytes(&digest);
-        let folded = matrix_fold::verify_fold_with_grinding(&claims, pf, grinding, ch)
-            .map_err(AggregateError::Fold)?;
+        let folded =
+            verify_fold_with_grinding(&claims, pf, grinding, ch).map_err(AggregateError::Fold)?;
         out.push((digest, folded));
     }
     Ok(out)
@@ -547,15 +539,11 @@ fn fold_sigma_verify<Ch: Challenger>(
 
 /// The jagged group's per-key key list entry, prover side: the digest, the
 /// layout it names, and the fresh assertions carrying claims about it.
-pub type JaggedKeyProve<'a> = (
-    [u8; 32],
-    &'a crate::pcs::jagged::JaggedParams,
-    Vec<&'a matrix_fold::JaggedAssertion>,
-);
+pub type JaggedKeyProve<'a> = ([u8; 32], &'a JaggedParams, Vec<&'a JaggedAssertion>);
 
 /// The verifier's view of a key: digest and fresh assertions — no layout
 /// anywhere, which is what lets a circuit replay this half.
-pub type JaggedKeyVerify<'a> = ([u8; 32], Vec<&'a matrix_fold::JaggedAssertion>);
+pub type JaggedKeyVerify<'a> = ([u8; 32], Vec<&'a JaggedAssertion>);
 
 /// The jagged group's fold, prover side: for each key in the caller's order,
 /// [priors' entries with that key, in prior order | fresh claims, in
@@ -565,7 +553,7 @@ pub type JaggedKeyVerify<'a> = ([u8; 32], Vec<&'a matrix_fold::JaggedAssertion>)
 fn fold_jagged_prove<Ch: Challenger>(
     jagged: &[JaggedKeyProve<'_>],
     priors: &[&Accumulator],
-    grinding: matrix_fold::FoldGrinding,
+    grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<(Vec<FoldProof>, Vec<([u8; 32], MatrixClaim)>), AggregateError> {
     for p in priors {
@@ -581,12 +569,11 @@ fn fold_jagged_prove<Ch: Challenger>(
         if jagged[..i].iter().any(|(k, _, _)| k == digest) {
             return Err(AggregateError::Malformed);
         }
-        let table = matrix_fold::JaggedTable::from_params(params);
+        let table = JaggedTable::from_params(params);
         let claims = gather_jagged(digest, asserts, priors, table.k, table.m)?;
         ch.observe_label(DOMAIN_JAGGED_GROUP);
         ch.observe_bytes(digest);
-        let (pf, folded) =
-            matrix_fold::prove_fold_jagged_with_grinding(&table, &claims, grinding, ch);
+        let (pf, folded) = prove_fold_jagged_with_grinding(&table, &claims, grinding, ch);
         folds.push(pf);
         out.push((*digest, folded));
     }
@@ -599,18 +586,16 @@ fn fold_jagged_prove<Ch: Challenger>(
 /// fold itself.
 fn gather_jagged(
     digest: &[u8; 32],
-    asserts: &[&matrix_fold::JaggedAssertion],
+    asserts: &[&JaggedAssertion],
     priors: &[&Accumulator],
     k: usize,
     m: usize,
-) -> Result<Vec<matrix_fold::JaggedClaim>, AggregateError> {
-    let mut claims: Vec<matrix_fold::JaggedClaim> = Vec::new();
+) -> Result<Vec<JaggedClaim>, AggregateError> {
+    let mut claims: Vec<JaggedClaim> = Vec::new();
     for p in priors {
         for (d, c) in &p.jagged {
             if d == digest {
-                claims.push(
-                    matrix_fold::JaggedClaim::from_folded(c).ok_or(AggregateError::Malformed)?,
-                );
+                claims.push(JaggedClaim::from_folded(c).ok_or(AggregateError::Malformed)?);
             }
         }
     }
@@ -633,7 +618,7 @@ fn fold_jagged_verify<Ch: Challenger>(
     jagged: &[JaggedKeyVerify<'_>],
     priors: &[&Accumulator],
     proofs: &[FoldProof],
-    grinding: matrix_fold::FoldGrinding,
+    grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<Vec<([u8; 32], MatrixClaim)>, AggregateError> {
     for p in priors {
@@ -672,7 +657,7 @@ fn fold_jagged_verify<Ch: Challenger>(
         let claims = gather_jagged(digest, asserts, priors, k, m)?;
         ch.observe_label(DOMAIN_JAGGED_GROUP);
         ch.observe_bytes(digest);
-        let folded = matrix_fold::verify_fold_jagged_with_grinding(k, &claims, pf, grinding, ch)
+        let folded = verify_fold_jagged_with_grinding(k, &claims, pf, grinding, ch)
             .map_err(AggregateError::Fold)?;
         out.push((*digest, folded));
     }
@@ -682,7 +667,7 @@ fn fold_jagged_verify<Ch: Challenger>(
 /// Element claims to fold for one type: the priors' first (in order), then
 /// one per assertion — the same fixed order the boolean side uses.
 fn gather_element(
-    assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    assertions: &[(&UnionInstance<'_>, ElementAssertion)],
     priors: &[&Accumulator],
     t: usize,
 ) -> (Vec<MatrixClaim>, Vec<MatrixClaim>) {
@@ -725,7 +710,7 @@ pub fn verify_aggregate<Ch: Challenger>(
 pub fn verify_aggregate_classes<Ch: Challenger>(
     registry: &Registry,
     assertions: &[MatrixAssertion],
-    el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    el_assertions: &[(&UnionInstance<'_>, ElementAssertion)],
     sigma: &[SigmaKey<'_>],
     jagged: &[JaggedKeyVerify<'_>],
     priors: &[&Accumulator],
@@ -740,7 +725,7 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
         jagged,
         priors,
         proof,
-        matrix_fold::FoldGrinding::disabled(),
+        FoldGrinding::disabled(),
         ch,
     )
 }
@@ -750,12 +735,12 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
 pub fn verify_aggregate_classes_with_grinding<Ch: Challenger>(
     registry: &Registry,
     assertions: &[MatrixAssertion],
-    el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    el_assertions: &[(&UnionInstance<'_>, ElementAssertion)],
     sigma: &[SigmaKey<'_>],
     jagged: &[JaggedKeyVerify<'_>],
     priors: &[&Accumulator],
     proof: &AggregateProof,
-    grinding: matrix_fold::FoldGrinding,
+    grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<Accumulator, AggregateError> {
     // Sigma never travels alone: a circuit proof's deferred verify yields
@@ -778,10 +763,10 @@ pub fn verify_aggregate_classes_with_grinding<Ch: Challenger>(
     let mut per_type = Vec::with_capacity(registry.num_boolean());
     for (t, (pa, pb)) in proof.folds.iter().enumerate() {
         let (ca, cb) = gather(registry, assertions, priors, t);
-        let out_a = matrix_fold::verify_fold_with_grinding(&ca, pa, grinding, ch)
-            .map_err(AggregateError::Fold)?;
-        let out_b = matrix_fold::verify_fold_with_grinding(&cb, pb, grinding, ch)
-            .map_err(AggregateError::Fold)?;
+        let out_a =
+            verify_fold_with_grinding(&ca, pa, grinding, ch).map_err(AggregateError::Fold)?;
+        let out_b =
+            verify_fold_with_grinding(&cb, pb, grinding, ch).map_err(AggregateError::Fold)?;
         per_type.push((out_a, out_b));
     }
 
@@ -796,10 +781,10 @@ pub fn verify_aggregate_classes_with_grinding<Ch: Challenger>(
     let mut per_element = Vec::with_capacity(proof.el_folds.len());
     for (t, (pa, pb)) in proof.el_folds.iter().enumerate() {
         let (ca, cb) = gather_element(el_assertions, priors, t);
-        let out_a = matrix_fold::verify_fold_with_grinding(&ca, pa, grinding, ch)
-            .map_err(AggregateError::Fold)?;
-        let out_b = matrix_fold::verify_fold_with_grinding(&cb, pb, grinding, ch)
-            .map_err(AggregateError::Fold)?;
+        let out_a =
+            verify_fold_with_grinding(&ca, pa, grinding, ch).map_err(AggregateError::Fold)?;
+        let out_b =
+            verify_fold_with_grinding(&cb, pb, grinding, ch).map_err(AggregateError::Fold)?;
         per_element.push((out_a, out_b));
     }
 

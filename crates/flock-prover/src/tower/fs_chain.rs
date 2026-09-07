@@ -1,18 +1,16 @@
-use super::*;
+use flock_core::{
+    circuit::builder::SlotId,
+    genus95_curve_code::{
+        EvaluationPoint, evaluation_point_from_nonce, evaluation_point_from_nonce_pow,
+    },
+};
+use flock_hash::blake3_compress;
+use flock_transcript::transcript_record::{Stream, StreamWord, TranscriptOp, TranscriptOp as Op};
 
-// ---------------------------------------------------------------------------
-// MVP-4: the vertical slice
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// MVP-5: every level's query phase
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// The collapsed opening: wiring over ONE BLAKE3 table
-// ---------------------------------------------------------------------------
-// MVP-7: the query phase of a REAL inner proof
-// ---------------------------------------------------------------------------
+use crate::{
+    r1cs_hashes::fs_chain::{CvSource, FsChainTrace, Link, trace_duplex_forked},
+    tower::{F128, HashKind, ShapeBuilder, Wire, pack_params},
+};
 
 /// A shared-constant public: one public input PER DISTINCT VALUE, wired to
 /// every use through copy constraints — the `zw`/`ow` pattern generalized.
@@ -41,8 +39,7 @@ pub(super) fn cw(
 /// digest, counts, caps, a child's circuit digest + public words) and
 /// nothing else. PoW nonces share the payload counter but remain private
 /// witnesses constrained by the fused BLAKE3 and bit-spread rows.
-pub(super) fn bytes_payload_mask(ops: &[flock_core::transcript_record::TranscriptOp]) -> Vec<bool> {
-    use flock_core::transcript_record::TranscriptOp as Op;
+pub(super) fn bytes_payload_mask(ops: &[TranscriptOp]) -> Vec<bool> {
     let mut v = Vec::new();
     for op in ops {
         match op {
@@ -73,19 +70,10 @@ pub(super) fn decode_ag_point(
     seed: &[u8; 32],
     nonce: u32,
     pow_bits: Option<u32>,
-) -> flock_core::genus95_curve_code::EvaluationPoint {
+) -> EvaluationPoint {
     match pow_bits {
-        Some(bits) => flock_core::genus95_curve_code::evaluation_point_from_nonce_pow(
-            seed,
-            nonce,
-            HashKind::Blake3,
-            bits,
-        ),
-        None => flock_core::genus95_curve_code::evaluation_point_from_nonce(
-            seed,
-            nonce,
-            HashKind::Blake3,
-        ),
+        Some(bits) => evaluation_point_from_nonce_pow(seed, nonce, HashKind::Blake3, bits),
+        None => evaluation_point_from_nonce(seed, nonce, HashKind::Blake3),
     }
     .expect("the AG nonce decodes to a valid cover point")
 }
@@ -115,10 +103,10 @@ pub(super) fn decode_ag_point(
 /// That drops the two seed rows and takes the fork's cost to ~one row.
 pub(super) fn emit_fs_chain(
     sb: &mut ShapeBuilder,
-    b3: flock_core::circuit::builder::SlotId,
+    b3: SlotId,
     iv: [Wire; 2],
-    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
-    stream: &flock_core::transcript_record::Stream,
+    trace: &FsChainTrace,
+    stream: &Stream,
     bytes: &[u8],
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
@@ -145,19 +133,17 @@ pub(super) fn emit_fs_chain(
 /// boundary normally; the circuit's copy constraints preserve the chain.
 pub(super) fn emit_fs_chain_partitioned(
     sb: &mut ShapeBuilder,
-    b3: flock_core::circuit::builder::SlotId,
-    alternate: Option<(flock_core::circuit::builder::SlotId, usize)>,
+    b3: SlotId,
+    alternate: Option<(SlotId, usize)>,
     iv: [Wire; 2],
-    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
-    stream: &flock_core::transcript_record::Stream,
+    trace: &FsChainTrace,
+    stream: &Stream,
     bytes: &[u8],
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
     pub_payloads: &[bool],
     cross: &[Option<(usize, usize)>],
 ) -> (Vec<Vec<Wire>>, Vec<Option<Wire>>) {
-    use crate::r1cs_hashes::fs_chain::CvSource;
-    use flock_core::transcript_record::StreamWord;
     let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
     let mut gate_in: Vec<[Wire; 7]> = Vec::with_capacity(trace.rows.len());
@@ -288,10 +274,7 @@ pub(super) fn emit_fs_chain_partitioned(
 /// fork-time bases for exactly this reason), so on the flattened view every
 /// label is found and every ordinal is the GLOBAL one. No walker changes, no
 /// chain index anywhere.
-pub(super) fn flatten_ops(
-    ops: &[flock_core::transcript_record::TranscriptOp],
-) -> Vec<flock_core::transcript_record::TranscriptOp> {
-    use flock_core::transcript_record::TranscriptOp as Op;
+pub(super) fn flatten_ops(ops: &[TranscriptOp]) -> Vec<TranscriptOp> {
     let mut out = Vec::with_capacity(ops.len());
     for op in ops {
         match op {
@@ -322,9 +305,9 @@ pub(super) fn flatten_ops(
 /// sources are already emitted when their consumer's row comes up.
 pub(super) struct MergedChain {
     /// Parent words then child words, in the same order as `trace`'s rows.
-    pub(super) stream: flock_core::transcript_record::Stream,
+    pub(super) stream: Stream,
     pub(super) bytes: Vec<u8>,
-    pub(super) trace: crate::r1cs_hashes::fs_chain::FsChainTrace,
+    pub(super) trace: FsChainTrace,
     /// Per merged word: `Some((row, half))` iff the word is a cross-link.
     pub(super) cross: Vec<Option<(usize, usize)>>,
 }
@@ -332,13 +315,11 @@ pub(super) struct MergedChain {
 /// Build the merged view from a recorded shape's ops and its parent stream.
 /// With no fork this is the identity (the trace the sites built by hand).
 pub(super) fn merge_chain(
-    ops: &[flock_core::transcript_record::TranscriptOp],
-    stream: &flock_core::transcript_record::Stream,
+    ops: &[TranscriptOp],
+    stream: &Stream,
     values: &[F128],
     payloads: &[Vec<u8>],
 ) -> MergedChain {
-    use crate::r1cs_hashes::fs_chain::{CvSource, Link, trace_duplex_forked};
-    use flock_core::transcript_record::StreamWord;
     let chains = trace_duplex_forked(ops, stream, values, payloads);
     let parent_bytes = stream.to_bytes(values, payloads);
     if chains.children.is_empty() {
@@ -394,8 +375,7 @@ pub(super) fn merge_chain(
     };
 
     // Child streams and their word/byte offsets in the merged view.
-    let cstreams: Vec<&flock_core::transcript_record::Stream> =
-        stream.forks.iter().map(|f| &f.stream).collect();
+    let cstreams: Vec<&Stream> = stream.forks.iter().map(|f| &f.stream).collect();
     let woffs: Vec<usize> = (0..n_ch)
         .map(|i| stream.words.len() + cstreams[..i].iter().map(|s| s.words.len()).sum::<usize>())
         .collect();
@@ -500,7 +480,7 @@ pub(super) fn merge_chain(
             panic!("cross-link word {wi} is not an observed value");
         };
         let (cv, m, counter, blen, flags) = rows[row];
-        let out = crate::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
+        let out = blake3_compress(&cv, &m, counter, blen, flags);
         let mut b = [0u8; 16];
         for (i, w) in out[..4].iter().enumerate() {
             b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -535,13 +515,13 @@ pub(super) fn merge_chain(
         "each fork contributes exactly four cross-link words"
     );
     MergedChain {
-        stream: flock_core::transcript_record::Stream {
+        stream: Stream {
             words,
             finalize_after,
             forks: Vec::new(),
         },
         bytes,
-        trace: crate::r1cs_hashes::fs_chain::FsChainTrace {
+        trace: FsChainTrace {
             rows,
             links,
             squeezes,
@@ -561,12 +541,7 @@ pub(super) fn merge_chain(
 /// squeeze ordering AND the byte-offset shift to all be right at once, and the
 /// child's own challenges sit in the middle of the sequence — the run walks
 /// straight through the fork. Cheap enough to leave on at every real shape.
-pub(super) fn assert_chain_replays(
-    ops: &[flock_core::transcript_record::TranscriptOp],
-    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
-    chals: &[F128],
-) {
-    use flock_core::transcript_record::TranscriptOp as Op;
+pub(super) fn assert_chain_replays(ops: &[TranscriptOp], trace: &FsChainTrace, chals: &[F128]) {
     let (mut fin, mut ch, mut checked) = (0usize, 0usize, 0usize);
     for op in ops {
         let n = match op {
@@ -577,7 +552,7 @@ pub(super) fn assert_chain_replays(
         for j in 0..n {
             let (row, word) = trace.squeeze_words[fin][j];
             let (cv, m, counter, blen, flags) = trace.rows[row];
-            let out = crate::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
+            let out = blake3_compress(&cv, &m, counter, blen, flags);
             let mut b = [0u8; 16];
             for (i, w) in out[word * 4..word * 4 + 4].iter().enumerate() {
                 b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -610,12 +585,7 @@ pub(super) fn assert_chain_replays(
 /// Independent row count for the duplex transcript, including every fork as
 /// its own IV-rooted chain.  It deliberately derives absorption from the
 /// serialized stream rather than from [`FsChainTrace`].
-pub(super) fn duplex_row_count_model(
-    ops: &[flock_core::transcript_record::TranscriptOp],
-    stream: &flock_core::transcript_record::Stream,
-) -> usize {
-    use flock_core::transcript_record::TranscriptOp as Op;
-
+pub(super) fn duplex_row_count_model(ops: &[TranscriptOp], stream: &Stream) -> usize {
     let mut pending_pow = None;
     let mut finals: Vec<(&Op, Option<u32>)> = Vec::new();
     for op in ops {

@@ -28,37 +28,39 @@
 //! Run:
 //!   cargo run --release --bin dump_blake3_witness_vectors -- cuda-ghash/blake3_witness_vectors.bin 24 5
 
-use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::F128;
-use flock_prover::r1cs_hashes::blake3::{
-    Compression, K_LOG, generate_witness_with_ab_packed_and_lincheck, min_n_blocks_log,
+use std::{
+    array::from_fn,
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
 };
 
+use env::args;
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    r1cs_hashes::blake3::{
+        Compression, K_LOG, generate_witness_with_ab_packed_and_lincheck, min_n_blocks_log,
+    },
+};
 
-fn write_f128(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn write_f128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
-fn write_u32(w: &mut impl Write, v: u32) -> std::io::Result<()> {
+fn write_u32(w: &mut impl Write, v: u32) -> Result<()> {
     w.write_all(&v.to_le_bytes())
 }
-fn write_u64(w: &mut impl Write, v: u64) -> std::io::Result<()> {
+fn write_u64(w: &mut impl Write, v: u64) -> Result<()> {
     w.write_all(&v.to_le_bytes())
 }
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "blake3_witness_vectors.bin".to_string());
-    let n_blocks: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-    let n_blocks_log: usize = env::args()
+    let n_blocks: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(24);
+    let n_blocks_log: usize = args()
         .nth(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| min_n_blocks_log(n_blocks));
@@ -77,8 +79,8 @@ fn main() -> std::io::Result<()> {
     let mut rng = Rng::new(0xB1A3E3 ^ ((n_blocks as u64) << 8));
     let blocks: Vec<Compression> = (0..n_blocks)
         .map(|_| {
-            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = from_fn(|_| rng.next_u32());
             (cv, m, rng.next_u64(), rng.next_u32(), rng.next_u32())
         })
         .collect();

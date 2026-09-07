@@ -18,12 +18,14 @@
 //!
 //! Run: `cargo bench --bench fs_challenger`
 
-use std::hint::black_box;
-use std::time::Instant;
+use std::{hint::black_box, time::Instant};
 
-use flock_core::challenger::{Challenger, FsChallenger};
-use flock_core::field::F128;
-use flock_core::hash::HashKind;
+use blake3::hash;
+use flock_core::{
+    challenger::{Challenger, FsChallenger},
+    field::F128,
+};
+use flock_hash::HashKind;
 use sha2::{Digest, Sha256};
 
 const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
@@ -144,7 +146,7 @@ fn main() {
                         let mut pre = [0u8; 64];
                         pre[..32].copy_from_slice(&state);
                         pre[32..40].copy_from_slice(&nonce.to_le_bytes());
-                        *blake3::hash(&pre).as_bytes()
+                        *hash(&pre).as_bytes()
                     }
                 };
                 acc ^= h[0];

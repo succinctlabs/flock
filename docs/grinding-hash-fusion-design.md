@@ -142,7 +142,7 @@ standalone BLAKE3 PoW row in the recursive circuit.
 
 ## Code map
 
-- `crates/flock-core/src/challenger.rs`
+- `crates/flock-transcript/src/challenger.rs`
   - `pow_squeeze_counter` defines the domain-separated counter.
   - `B3Chain::pow_candidate_output` defines the raw fused compression.
   - `B3Chain::apply_pow_squeeze` verifies the predicate, allocates output
@@ -150,7 +150,7 @@ standalone BLAKE3 PoW row in the recursive circuit.
   - `B3Chain::grind_pow_squeeze_into` performs the SIMD/parallel nonce search.
   - the four `*_pow_and_sample_*` trait methods make the protected sample an
     atomic prover/verifier operation.
-- `crates/flock-core/src/transcript_record.rs`
+- `crates/flock-transcript/src/transcript_record.rs`
   - `TranscriptOp::Pow` is the fused nonce marker immediately preceding its
     squeeze; `LegacyPow` preserves the generic non-chained fallback.
 - `crates/flock-prover/src/r1cs_hashes/fs_chain.rs`

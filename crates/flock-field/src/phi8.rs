@@ -14,7 +14,7 @@
 //! cross-checked with binius's proptest `test_conversion_from_aes_consistency`.
 //! Verified here against the homomorphism property `phi8(a*b) = phi8(a)*phi8(b)`.
 
-use super::{F8, F128};
+use crate::{F8, F128};
 
 pub static PHI_8_TABLE: [F128; 256] = [
     F128 {
@@ -1050,7 +1050,7 @@ pub fn phi8(a: F8) -> F128 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::phi8::{F8, F128, phi8};
 
     #[test]
     fn zero_and_one_map_correctly() {

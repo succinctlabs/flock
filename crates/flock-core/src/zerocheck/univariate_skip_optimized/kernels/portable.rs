@@ -1,7 +1,9 @@
 #[cfg(not(target_arch = "aarch64"))]
-use super::super::F128;
-use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
-use crate::field::gf2_8::gf8_reduce;
+use crate::zerocheck::univariate_skip_optimized::F128;
+use crate::{
+    field::gf2_8::gf8_reduce,
+    zerocheck::univariate_skip_optimized::{F8, InvNttTableByteSingleGf8, N_CHUNKS},
+};
 
 /// Scalar bit transpose for C.
 ///

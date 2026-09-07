@@ -37,7 +37,7 @@
 //! `CHUNK_END` on the last, chaining through `h_in`, counter 0), whose final
 //! chaining value seeds `prev` in place of the leaf-digest global. One row
 //! then verifies one PCS L0 opening — leaf hash AND path — under exactly
-//! `flock_core::merkle`'s BLAKE3 tree semantics (leaf = non-root chunk CV of
+//! `flock_merkle`'s BLAKE3 tree semantics (leaf = non-root chunk CV of
 //! the leaf bytes, node = non-root PARENT compression). Chunk blocks need no
 //! gadget columns at all: the base encoder's free message region IS the leaf
 //! data, and its chaining-value rows are witness-identical to the pin (block
@@ -104,14 +104,25 @@
 //! Public-input binding, exactly as in the per-hash encoders: the leaf, the
 //! index bits and the root are free witness columns at fixed offsets
 //! ([`MerkleTreeLayout::leaf_bit`], [`MerkleTreeLayout::index_bit`],
-//! [`MerkleTreeLayout::root_bit`]). Binding them to public values is the job
-//! of the claim-level glue (or the planned lookup/bus layer — design doc
-//! §8, §11).
+//! [`MerkleTreeLayout::root_bit`]). The claim-level glue binds them to
+//! public values.
 
-use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
+use std::{array::from_fn, sync::OnceLock};
 
-use super::blake3;
-use super::common::{empty_matrix, identity};
+use flock_core::{
+    r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
+    schedule::IoWord,
+    zerocheck::K_SKIP,
+};
+use flock_hash::blake3_compress;
+
+use crate::r1cs_hashes::{
+    blake3::{
+        BLAKE3_IV, BLEN_BASE, CV_BASE, FLAGS_BASE, K_LOG, M_BASE, OUT_LO_BASE, T_HI_BASE,
+        T_LO_BASE, USEFUL_BITS, WORD_BITS,
+    },
+    common::{empty_matrix, identity},
+};
 
 /// Bits in one digest / chaining value. Both supported encoders lay their
 /// input and output chaining values out as aligned `2^8`-bit slots.
@@ -134,7 +145,7 @@ pub const NODE_BLOCK_LEN: u32 = 64;
 /// `depth` copies of one base block; set [`HashSpec::flags`] if you need the
 /// bit-exact BLAKE3 tree.
 ///
-/// This IS the semantics of `flock_core::merkle`'s BLAKE3 mode: its
+/// This IS the semantics of `flock_merkle`'s BLAKE3 mode: its
 /// internal nodes are non-root PARENT-flagged chaining values
 /// (`hazmat::merge_subtrees_non_root`), so the node levels here match the
 /// PCS commitment bit-for-bit with no `flags` override.
@@ -186,11 +197,11 @@ pub struct HashSpec {
 /// `compress(IV, left‖right, 0, 64, PARENT)`.
 pub fn blake3_spec() -> HashSpec {
     HashSpec {
-        k_log: blake3::K_LOG,
-        useful_bits: blake3::USEFUL_BITS,
-        in_cv_base: blake3::CV_BASE,
-        out_cv_base: blake3::OUT_LO_BASE,
-        msg_base: blake3::M_BASE,
+        k_log: K_LOG,
+        useful_bits: USEFUL_BITS,
+        in_cv_base: CV_BASE,
+        out_cv_base: OUT_LO_BASE,
+        msg_base: M_BASE,
         flags: BLAKE3_FLAG_PARENT,
         compress: blake3_compress_cv,
         fixed_bits: blake3_fixed_bits,
@@ -214,25 +225,25 @@ fn blake3_compress_cv(
     block_len: u32,
     flags: u32,
 ) -> [u32; SLOT_WORDS] {
-    let out = blake3::blake3_compress(cv, m, counter, block_len, flags);
+    let out = blake3_compress(cv, m, counter, block_len, flags);
     out[..SLOT_WORDS].try_into().expect("SLOT_WORDS ≤ 16")
 }
 
 /// BLAKE3's free inputs other than the message: `cv = IV`, `counter = 0`,
 /// `block_len = 64`, `flags = PARENT`.
 fn blake3_fixed_bits() -> Vec<(usize, bool)> {
-    let w = blake3::WORD_BITS;
+    let w = WORD_BITS;
     let mut out = Vec::with_capacity(SLOT_BITS + 4 * w);
-    for (word, iv) in blake3::BLAKE3_IV.iter().enumerate() {
+    for (word, iv) in BLAKE3_IV.iter().enumerate() {
         for b in 0..w {
-            out.push((blake3::CV_BASE + word * w + b, (iv >> b) & 1 == 1));
+            out.push((CV_BASE + word * w + b, (iv >> b) & 1 == 1));
         }
     }
     for (base, val) in [
-        (blake3::T_LO_BASE, NODE_COUNTER as u32),
-        (blake3::T_HI_BASE, (NODE_COUNTER >> 32) as u32),
-        (blake3::BLEN_BASE, NODE_BLOCK_LEN),
-        (blake3::FLAGS_BASE, BLAKE3_FLAG_PARENT),
+        (T_LO_BASE, NODE_COUNTER as u32),
+        (T_HI_BASE, (NODE_COUNTER >> 32) as u32),
+        (BLEN_BASE, NODE_BLOCK_LEN),
+        (FLAGS_BASE, BLAKE3_FLAG_PARENT),
     ] {
         for b in 0..w {
             out.push((base + b, (val >> b) & 1 == 1));
@@ -276,7 +287,7 @@ impl MerkleTreeLayout {
     /// single BLAKE3 chunk (a chain of `leaf_bytes/64` compressions,
     /// `CHUNK_START` on the first block and `CHUNK_END` on the last, chaining
     /// through `h_in`), followed by `depth` PARENT-node levels with the swap
-    /// gadget. This is exactly `flock_core::merkle`'s BLAKE3 mode — leaf =
+    /// gadget. This is exactly `flock_merkle`'s BLAKE3 mode — leaf =
     /// non-root chaining value of the leaf bytes, node = non-root
     /// PARENT-flagged compression — so one row verifies one PCS L0 opening
     /// bit-for-bit.
@@ -430,8 +441,7 @@ impl MerkleTreeLayout {
     /// Everything that IS here has an outside claimant: the leaf data is read
     /// by whatever proves the opened values, the index binds to the
     /// Fiat–Shamir query, and the root binds to the committed root.
-    pub fn io_schema(&self) -> Vec<flock_core::schedule::IoWord> {
-        use flock_core::schedule::IoWord;
+    pub fn io_schema(&self) -> Vec<IoWord> {
         assert!(
             self.leaf_blocks > 0,
             "io_schema is chunk-leaf only: the digest-leaf layout packs its \
@@ -492,15 +502,15 @@ impl MerkleTreeLayout {
         BlockR1cs {
             m: n_paths_log + self.k_log,
             k_log: self.k_log,
-            k_skip: flock_core::zerocheck::K_SKIP,
+            k_skip: K_SKIP,
             useful_bits: self.useful_bits,
             a_0,
             b_0,
             c_0: identity(self.k()),
             layout: WitnessLayout::BatchMajor,
             const_pin: Some(self.const_pos()),
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
+            digest_cache: OnceLock::new(),
+            csc_cache: OnceLock::new(),
         }
     }
 
@@ -605,7 +615,7 @@ pub struct ChunkPathInput {
 /// Chunk block `i`'s 16-word message: bytes `[64i, 64(i+1))` of the leaf
 /// data as little-endian words, per the BLAKE3 spec.
 fn leaf_msg_words(data: &[u8], block: usize) -> [u32; 16] {
-    std::array::from_fn(|w| {
+    from_fn(|w| {
         let o = block * 64 + 4 * w;
         u32::from_le_bytes(data[o..o + 4].try_into().unwrap())
     })

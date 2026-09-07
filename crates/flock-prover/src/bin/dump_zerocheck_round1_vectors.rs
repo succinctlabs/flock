@@ -2,42 +2,44 @@
 //!
 //! The canonical CUDA round-one test uses this output.
 
-use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::{F8, F128};
-use flock_prover::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
-use flock_prover::zerocheck::PaddingSpec;
-use flock_prover::zerocheck::univariate_skip::{pack_bits, round1_naive};
-use flock_prover::zerocheck::univariate_skip_optimized::{
-    c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
-    small_challenges_ghash,
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
 };
 
+use env::args;
+use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::{F8, F128},
+    ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8},
+    zerocheck::{
+        PaddingSpec,
+        univariate_skip::{pack_bits, round1_naive},
+        univariate_skip_optimized::{
+            c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
+            small_challenges_ghash,
+        },
+    },
+};
 const K_SKIP: usize = 6;
 const N_INNER: usize = 7;
 
-use flock_core::test_rng::Rng;
-
-fn write_f128(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn write_f128(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
-fn write_u32(w: &mut impl Write, v: u32) -> std::io::Result<()> {
+fn write_u32(w: &mut impl Write, v: u32) -> Result<()> {
     w.write_all(&v.to_le_bytes())
 }
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "zc_cpustyle_vectors.bin".to_string());
-    let m: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(15);
-    let k_log: usize = env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(m);
-    let useful_bits: usize = env::args()
+    let m: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(15);
+    let k_log: usize = args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(m);
+    let useful_bits: usize = args()
         .nth(4)
         .and_then(|s| s.parse().ok())
         .unwrap_or(1usize << k_log);

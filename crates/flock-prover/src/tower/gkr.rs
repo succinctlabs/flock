@@ -1,4 +1,21 @@
-use super::*;
+use std::{array::from_fn, iter::repeat_n};
+
+use flock_core::{
+    circuit::{CellSlot, CellSpace, SigmaAssertion, builder::SlotId},
+    genus95_curve_code::EvaluationPoint,
+    zerocheck::{K_SKIP, univariate_skip::build_eq},
+};
+use flock_field::PHI_8_TABLE;
+use flock_hash::blake3_compress;
+use flock_transcript::challenger::has_leading_zero_bits;
+
+use crate::{
+    schedule::Registry,
+    tower::{
+        CHUNK_END, CHUNK_START, F128, IV, PdRec, ROOT, ShapeBuilder, UnionInstance, Wire,
+        ag_seed_bytes, cw, emit_pow_checks, pack_params,
+    },
+};
 
 /// One wiring-GKR layer, located on the tape (the assembly's wire map).
 pub(super) struct GkrLayerRec {
@@ -31,7 +48,7 @@ pub(super) struct GkrRec {
 /// Returns `num_public_slots` (the emitters derive everything else from the
 /// gather count and `n_log_i`; `cells.nu()` is asserted against it here).
 pub(super) fn pin_recombination(
-    cells: &flock_core::circuit::CellSpace,
+    cells: &CellSpace,
     n_log_i: usize,
     public: &[F128],
     gather: &[F128],
@@ -41,8 +58,6 @@ pub(super) fn pin_recombination(
     r_pt: &[F128],
     fgs_v: usize,
 ) -> usize {
-    use flock_core::circuit::CellSlot;
-    use flock_core::zerocheck::univariate_skip::build_eq;
     let (nu_c, c_bits) = (cells.nu(), cells.c_bits());
     assert_eq!(nu_c, n_log_i, "the cell space's row vars are the union's");
     assert_eq!(r_pt.len(), nu_c + c_bits, "ρ spans the cell space");
@@ -102,7 +117,7 @@ pub(super) fn pin_recombination(
 /// prefix (low bits), so level `i` builds `min(2^i, live)` entries.
 pub(super) fn emit_eq_prefix(
     sb: &mut ShapeBuilder,
-    macs: flock_core::circuit::builder::SlotId,
+    macs: SlotId,
     point_w: &[Wire],
     live: usize,
     zw: Wire,
@@ -131,7 +146,7 @@ pub(super) fn emit_eq_prefix(
 /// values, and element affine-constant strips under one child digest.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn circuit_structure_claim_wires(
-    sigma: &flock_core::circuit::SigmaAssertion,
+    sigma: &SigmaAssertion,
     gkr_point: &[Wire],
     masked_id_w: Wire,
     live_w: Wire,
@@ -199,7 +214,7 @@ pub(super) fn circuit_structure_claim_wires(
 /// the transcript circuit.
 pub(super) fn emit_eq_product(
     sb: &mut ShapeBuilder,
-    pfslot: flock_core::circuit::builder::SlotId,
+    pfslot: SlotId,
     pf_w: usize,
     seed: Wire,
     left: &[Wire],
@@ -212,9 +227,9 @@ pub(super) fn emit_eq_product(
     for (aa, bb) in left.chunks(pf_w).zip(right.chunks(pf_w)) {
         let mut inputs = vec![acc];
         inputs.extend_from_slice(aa);
-        inputs.extend(std::iter::repeat_n(zw, pf_w - aa.len()));
+        inputs.extend(repeat_n(zw, pf_w - aa.len()));
         inputs.extend_from_slice(bb);
-        inputs.extend(std::iter::repeat_n(zw, pf_w - bb.len()));
+        inputs.extend(repeat_n(zw, pf_w - bb.len()));
         inputs.push(ow);
         acc = sb.gate(pfslot, &inputs)[0];
     }
@@ -232,7 +247,7 @@ pub(super) fn prefix_bit_wires(bits: usize, n: usize, zw: Wire, ow: Wire) -> Vec
 /// they do not push the recursion envelope's main MAC slot over `2^nu`.
 pub(super) fn assertion_mac(
     sb: &mut ShapeBuilder,
-    spine: flock_core::circuit::builder::SlotId,
+    spine: SlotId,
     acc: Wire,
     x: Wire,
     y: Wire,
@@ -249,10 +264,10 @@ pub(super) fn assertion_mac(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_boolean_reported_check(
     sb: &mut ShapeBuilder,
-    spine: flock_core::circuit::builder::SlotId,
-    pfslot: flock_core::circuit::builder::SlotId,
+    spine: SlotId,
+    pfslot: SlotId,
     pf_w: usize,
-    registry: &crate::schedule::Registry,
+    registry: &Registry,
     alpha_w: Wire,
     x_inner_w: &[Wire],
     rr_w: &[Wire],
@@ -263,8 +278,6 @@ pub(super) fn emit_boolean_reported_check(
     zw: Wire,
     ow: Wire,
 ) {
-    use flock_core::zerocheck::K_SKIP;
-
     assert_eq!(eval_w.len(), registry.num_boolean(), "Boolean eval count");
     assert_eq!(beta_w.len(), registry.num_boolean(), "Boolean beta count");
     assert_eq!(z_partial_w.len(), 1usize << K_SKIP, "Boolean low weight");
@@ -327,8 +340,8 @@ pub(super) fn emit_boolean_reported_check(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_element_reported_check(
     sb: &mut ShapeBuilder,
-    spine: flock_core::circuit::builder::SlotId,
-    pfslot: flock_core::circuit::builder::SlotId,
+    spine: SlotId,
+    pfslot: SlotId,
     pf_w: usize,
     union: &UnionInstance<'_>,
     alpha_w: Wire,
@@ -388,23 +401,22 @@ pub(super) fn emit_element_reported_check(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_ag_point_binding(
     sb: &mut ShapeBuilder,
-    b3: flock_core::circuit::builder::SlotId,
-    pow: flock_core::circuit::builder::SlotId,
-    macs: flock_core::circuit::builder::SlotId,
+    b3: SlotId,
+    pow: SlotId,
+    macs: SlotId,
     iv: [Wire; 2],
     seed_w: [Wire; 2],
     nonce_w: Wire,
     pt_w: &[Wire; 5],
     seed_n: [F128; 2],
     nonce_n: u32,
-    pt_n: &flock_core::genus95_curve_code::EvaluationPoint,
+    pt_n: &EvaluationPoint,
     ag_r1_bits: Option<u32>,
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
     zw: Wire,
     ow: Wire,
 ) {
-    use crate::r1cs_hashes::blake3 as b3m;
     let flags = CHUNK_START | CHUNK_END | ROOT;
     // ---- native replicas of the decode chain the rows must reproduce ----
     let seed_bytes = ag_seed_bytes(seed_n[0], seed_n[1]);
@@ -412,14 +424,14 @@ pub(super) fn emit_ag_point_binding(
     block36[..32].copy_from_slice(&seed_bytes);
     block36[32..36].copy_from_slice(&nonce_n.to_le_bytes());
     let words36: [u32; 16] =
-        std::array::from_fn(|i| u32::from_le_bytes(block36[4 * i..4 * i + 4].try_into().unwrap()));
-    let ns16 = b3m::blake3_compress(&IV, &words36, 0, 36, flags);
-    let ns_bytes: [u8; 32] = std::array::from_fn(|i| (ns16[i / 4] >> (8 * (i % 4))) as u8);
+        from_fn(|i| u32::from_le_bytes(block36[4 * i..4 * i + 4].try_into().unwrap()));
+    let ns16 = blake3_compress(&IV, &words36, 0, 36, flags);
+    let ns_bytes: [u8; 32] = from_fn(|i| (ns16[i / 4] >> (8 * (i % 4))) as u8);
     let mut block32 = [0u8; 64];
     block32[..32].copy_from_slice(&ns_bytes);
     let words32: [u32; 16] =
-        std::array::from_fn(|i| u32::from_le_bytes(block32[4 * i..4 * i + 4].try_into().unwrap()));
-    let xof16 = b3m::blake3_compress(&IV, &words32, 0, 32, flags);
+        from_fn(|i| u32::from_le_bytes(block32[4 * i..4 * i + 4].try_into().unwrap()));
+    let xof16 = blake3_compress(&IV, &words32, 0, 32, flags);
     let x_native = F128::new(
         u64::from(xof16[0]) | (u64::from(xof16[1]) << 32),
         u64::from(xof16[2]) | (u64::from(xof16[3]) << 32),
@@ -427,7 +439,7 @@ pub(super) fn emit_ag_point_binding(
     assert_eq!(x_native, pt_n.x, "the XOF x is the point's x");
     if let Some(bits) = ag_r1_bits {
         assert!(
-            flock_core::challenger::has_leading_zero_bits(&ns_bytes[16..32], bits),
+            has_leading_zero_bits(&ns_bytes[16..32], bits),
             "the honest nonce clears the fused target"
         );
     }
@@ -643,7 +655,7 @@ pub(super) fn emit_ag_point_binding(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_lagrange_lows(
     sb: &mut ShapeBuilder,
-    macs: flock_core::circuit::builder::SlotId,
+    macs: SlotId,
     lam_w: &[Wire],
     deninv_w: Wire,
     zskip_w: Wire,
@@ -653,7 +665,6 @@ pub(super) fn emit_lagrange_lows(
     ow: Wire,
     zassert: Wire,
 ) -> Vec<Wire> {
-    use flock_core::field::PHI_8_TABLE;
     let ell = lam_w.len();
     let mut t_w = Vec::with_capacity(ell);
     let mut z_acc = ow;
@@ -693,8 +704,8 @@ pub(super) fn emit_lagrange_lows(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_recombination(
     sb: &mut ShapeBuilder,
-    macs: flock_core::circuit::builder::SlotId,
-    le8: flock_core::circuit::builder::SlotId,
+    macs: SlotId,
+    le8: SlotId,
     pub_w: &[Wire],
     gather_w: &[Wire],
     pt_w: &[Wire],

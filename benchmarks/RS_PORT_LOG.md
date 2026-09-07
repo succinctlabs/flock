@@ -5919,3 +5919,108 @@ kernel that is not bandwidth-bound. Reverted; the diff is saved as
 C-claim fold (12.6 ms) is at the lookup rate and has no cheaper form;
 with the q′ fold (5) and the ladder's seed sweep (4) at the multiply
 rate, the remaining ≈ 13 ms of stage 1's tax is protocol-shaped.
+
+### MEASURED: three-way breakdown — pre-merge f035ddb / post-merge 0e973e3 / current, single- and multi-thread — 2026-09-06
+
+Asked for before merging main again: where the time went between the
+branch tip before the first main merge (f035ddb, 2026-08-27, the old
+`prove_fast` R1CS-Ligerito pipeline), the tip right after it (0e973e3,
+"merge main step 8", 2026-08-31, the union pipeline as merged) and the
+current tip (616f322 + cap-48, `blake3_proof_base7`). Three saved
+binaries from their own worktrees, m=32 BLAKE3, run in a quiet window
+(load 3.5–4.7, after the desktop's heavy processes were closed), 3
+measured proves each, per-phase minimum; grind off unless noted. The
+pre-merge pipeline is a different protocol (one direct Ligerito open,
+no ring switches, 24 KB smaller proof), so its phase labels are its own.
+
+Multi-thread (default pool), ms:
+
+| phase | pre f035ddb | post 0e973e3 | current |
+|---|---|---|---|
+| witness generation | 30.6 | ≈ 70 (outside the prove timer: bench best − prove total) | 35.0 |
+| commit | 262.6 | 233.0 | 151.8 |
+| zerocheck + lincheck | 118.1 + 22.1 = 140.2 | 284.1 | 149.4 + 12.7 (C-claim bank) = 162.1 |
+| open | 29.5 | 240.4 | 105.3 |
+| prove, bench best | **458.9** | **853.8** | **452.4** |
+| prove, grind on / verify | 470.4 / 5.1 | 867.1 / 6.9 | 453.2 / 6.1 |
+| proof bytes | 437,679 | 460,552 | 462,052 |
+
+Single-thread (`RAYON_NUM_THREADS=1`), ms:
+
+| phase | pre f035ddb | post 0e973e3 | current |
+|---|---|---|---|
+| witness generation | 234.2 | ≈ 335 (as above) | 263.3 |
+| commit | 1,310 | 1,711 | 1,017 |
+| zerocheck + lincheck | 1,510 + 125.5 = 1,635.5 | 1,566 (later runs ≈ 1,750) | 1,064.5 + 86.8 = 1,151.3 |
+| open | 148.0 | 1,377 | 571.6 |
+| prove, bench best | **3,280** | **5,250** | **2,920** |
+
+Reading. The union pipeline arrived at 1.86× the old pipeline's prove
+time (854 vs 459 ms MT; 5.25 vs 3.28 s ST) — every phase but commit
+slower, the open 8× (two ring-switched claims plus the merged open
+where the old path had one direct open). The campaign since took the
+union prove to 452 ms MT / 2.92 s ST: −47% / −44% against its own
+starting point, and now under the old pipeline on both threads (−1.4%
+MT, −11% ST) while carrying the union protocol's larger proof (+5.6%).
+Per phase against the old pipeline: commit −42% (leaf pipeline, 8-way
+NEON BLAKE3, any-size leaf batching), zerocheck + lincheck +16% (the AG
+zerocheck is faster than the old packed one, but the union lincheck and
+the C-claim bank are new work), open 3.6× (the transport that the
+block-first rounds and the ladder cut from 240 to 105 — the remaining
+gap to a single open is the protocol, see the stage-2 adjudication).
+Single-thread is the cleaner picture of work done: commit and zerocheck
+both under the old pipeline; open the one phase that costs more.
+
+### LANDED: origin/main (43f0eee) merged into the branch — phase-0 crate split absorbed, no prover regression — 2026-09-07
+
+Main moved on by 36 commits since the last merge (8a36c91): the phase-0
+refactor that splits `flock-core` into `flock-field`, `flock-hash`,
+`flock-merkle`, `flock-multilinear`, `flock-parallel`,
+`flock-transcript` (with re-export shims left in core), a repo-wide
+import normalization (explicit import lists, `wildcard_imports = deny`
+in the workspace lints, clippy `-D warnings` in CI), and the tower PRs
+#44–#47 (walker_common, driver, root verifier, wire). Thirty files
+conflicted; every conflict was import-shaped except the rename targets.
+What had to be re-homed by hand:
+
+- `run_hetero_chunks`, `run_hetero_chunks_stateful`, `set_utility_qos`
+  → `flock-parallel` (which owns the all-core pool), re-exported from
+  core so the eight call sites are unchanged.
+- The 8-message NEON BLAKE3 kernel (`blake3_neon.rs`) and the any-size
+  leaf batcher, serial leaf/parent hashers and prehashed-level tree
+  finisher → `flock-merkle::hashing` (+ its crate-parity test);
+  main's power-of-two-only dispatch replaced.
+- `FLOCK_NO_GRIND` and the BLAKE3 default in `FsChallenger::new` →
+  `flock-transcript`; `HashKind::default()` stays BLAKE3 in
+  `flock-hash` (the one semantic divergence from main, kept).
+- Stage 1's `w_coords` rotation re-applied in main's restructured
+  child walker (three sites + the residual-rotation parse).
+- Proof flavor: main's `FLAVOR_TOWER_ROOT = 5` collides with our AG
+  flavor, now `FLAVOR_R1CS_LIGERITO_AG = 6`.
+- Our benches taken whole where main only re-styled their imports.
+
+Gates: fmt; `cargo check --workspace --all-targets` clean (0 warnings);
+CI's `clippy --release --workspace --all-targets -- -D warnings` clean
+(25 function-local wildcard imports of ours rewritten to explicit
+lists; `-A unknown_lints` locally because CI's newer clippy knows a
+lint this toolchain doesn't); x86 leg (`--target x86_64-apple-darwin`,
+`-C target-cpu=sapphirerapids`) clean; workspace release tests
+644 passed / 0 failed / 78 ignored; tower `chain_spine_converges`
+(100 s), `chain_tower_e2e_with_lane` (30 s), and CI's two tape pins ok.
+All proof-byte pins unchanged (no fixture regeneration).
+
+Merged binary vs `blake3_proof_base7` (pre-merge control), m=32, grind
+off, 8-prove steady state, min, 4 alternating pairs:
+
+| pair | merged | control |
+|---|---|---|
+| 1 | 439.2 | 448.2 |
+| 2 | 463.5 | 460.2 |
+| 3 | 475.0 | 478.7 |
+| 4 | 479.5 | 476.4 |
+
+Mean −1.6 ms, mixed signs; every phase within ±4 ms with mixed signs
+(witgen 34.3–35.2 both; commit, zerocheck + lincheck, open all paired
+within noise). The box was not quiet (load 9–12), which the pairing
+absorbs. The merge costs nothing; `blake3_proof_merged` is the new
+control.

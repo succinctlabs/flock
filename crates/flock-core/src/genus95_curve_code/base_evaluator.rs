@@ -1,11 +1,12 @@
-use std::ops::Index;
-use std::sync::OnceLock;
+use std::{ops::Index, slice::Iter, sync::OnceLock};
 
-use super::constants::{BASE_FUNCTIONAL_BITS, BASE_FUNCTIONAL_BYTES, BASE_X_POWER_COUNT};
-use super::evaluator::{EvaluationPoint, build_functional, build_functional_byte_dot_tables};
-use super::field::{F128, F128Ext};
-use super::messages::BaseMessage;
-use super::tables::TABLES;
+use crate::genus95_curve_code::{
+    constants::{BASE_FUNCTIONAL_BITS, BASE_FUNCTIONAL_BYTES, BASE_X_POWER_COUNT},
+    evaluator::{EvaluationPoint, build_functional, build_functional_byte_dot_tables},
+    field::{F128, F128Ext},
+    messages::BaseMessage,
+    tables::TABLES,
+};
 
 /// The 64 GF(2^128) coordinates of the direct base-code evaluation functional
 /// at a point.  Dotting a 64-bit base message against it gives `C(m)(P)`
@@ -24,7 +25,7 @@ impl BaseFunctional {
     }
 
     #[inline(always)]
-    pub fn iter(&self) -> std::slice::Iter<'_, F128> {
+    pub fn iter(&self) -> Iter<'_, F128> {
         self.coordinates.iter()
     }
 

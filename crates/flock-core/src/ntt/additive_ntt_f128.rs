@@ -41,11 +41,45 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
-use crate::field::F128;
+// The deep-fused all-core path exists only where a carryless multiply does;
+// its imports go with it.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq")
+))]
+use std::env::var_os;
 
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq")
+))]
+use rayon::current_num_threads;
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use rayon::prelude::{IntoParallelRefIterator, ParallelSlice};
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use {
+    crate::ntt::additive_ntt_f128::kernels::{
+        butterfly_neon_block, butterfly_neon_block_pair, butterfly_neon_block_pair_chunk,
+    },
+    core::arch::aarch64::{vgetq_lane_u64, vmull_p64, vreinterpretq_u64_p128},
+};
+
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq")
+))]
+use crate::all_core_pool;
+use crate::{
+    field::F128,
+    ntt::additive_ntt_f128::kernels::{
+        butterfly_fused_2layer, butterfly_fused_3layer, butterfly_fused_4layer_row,
+        butterfly_row_pair,
+    },
+};
 mod kernels;
-
-
 
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
@@ -241,8 +275,7 @@ impl AdditiveNttF128 {
         cfg!(all(target_arch = "aarch64", target_feature = "aes"))
             && reps == 2
             && log_d >= 13
-            && num_ntts >= 2
-            && num_ntts <= 64
+            && (2..=64).contains(&num_ntts)
             && num_ntts.is_power_of_two()
     }
 
@@ -402,11 +435,8 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ));
-        let fuse_fill = !fused4_ok
-            && log_d >= 8
-            && n_top > 0
-            && start_layer + 2 <= n_top
-            && block_size >= 4;
+        let fuse_fill =
+            !fused4_ok && log_d >= 8 && n_top > 0 && start_layer + 2 <= n_top && block_size >= 4;
         if !fuse_fill {
             replicate_interleaved(data, msg);
             self.forward_transform_interleaved_parallel_from_layer_with(
@@ -639,7 +669,6 @@ impl AdditiveNttF128 {
         start_layer: usize,
         on_sub: Option<&(dyn Fn(usize, &[F128]) + Sync)>,
     ) {
-        use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
 
@@ -681,7 +710,7 @@ impl AdditiveNttF128 {
         // + 7 twiddles in flight (the 16-point kernel's register pressure is
         // what lost on this target). `FLOCK_NTT_NO_FUSED3=1` disables — the
         // A/B knob.
-        let fused3_ok = std::env::var_os("FLOCK_NTT_NO_FUSED3").is_none();
+        let fused3_ok = var_os("FLOCK_NTT_NO_FUSED3").is_none();
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -777,7 +806,6 @@ impl AdditiveNttF128 {
             }
         }
 
-
         // Deep layers: process each sub-NTT-group cache-resident.
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
@@ -850,20 +878,18 @@ impl AdditiveNttF128 {
         // drain (≥ 4× workers) and ≥ 64 MB of data so the pool switch and
         // E-core L2 pressure can't hurt small/recursive commits.
         let n_subs = data.len() / sub_bytes;
-        let use_all_cores = std::mem::size_of_val(data) >= (64 << 20)
-            && {
-                let pool = crate::all_core_pool();
-                pool.current_num_threads() > rayon::current_num_threads()
-                    && n_subs >= 4 * pool.current_num_threads()
-            };
+        let use_all_cores = std::mem::size_of_val(data) >= (64 << 20) && {
+            let pool = all_core_pool();
+            pool.current_num_threads() > current_num_threads()
+                && n_subs >= 4 * pool.current_num_threads()
+        };
         if use_all_cores {
-            crate::all_core_pool().install(|| deep(data));
+            all_core_pool().install(|| deep(data));
         } else {
             deep(data);
         }
         #[allow(unreachable_code)]
-        {
-        }
+        {}
     }
 
     /// Scalar reference implementation. Used as the test oracle and on
@@ -935,7 +961,7 @@ impl AdditiveNttF128 {
                         let twiddle = self.twiddle(layer, block);
                         let block_start = block * block_size;
                         let chunk = &mut data[block_start..block_start + block_size];
-                        kernels::butterfly_neon_block(chunk, twiddle, block_size_half);
+                        butterfly_neon_block(chunk, twiddle, block_size_half);
                     }
                 } else {
                     // Deepest layer (half = 1): batch across 2 adjacent blocks
@@ -946,7 +972,7 @@ impl AdditiveNttF128 {
                     while block + 1 < num_blocks {
                         let t_a = self.twiddle(layer, block);
                         let t_b = self.twiddle(layer, block + 1);
-                        kernels::butterfly_neon_block_pair(data, block * 2, t_a, t_b);
+                        butterfly_neon_block_pair(data, block * 2, t_a, t_b);
                         block += 2;
                     }
                     // Scalar tail (num_blocks odd — only when num_blocks = 1).
@@ -968,7 +994,6 @@ impl AdditiveNttF128 {
     /// Rayon-parallel + NEON forward transform.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     pub fn forward_transform_parallel(&self, data: &mut [F128]) {
-        use rayon::prelude::*;
         let log_d = log2_pow2(data.len());
         assert!(log_d <= self.log_domain_size());
 
@@ -993,7 +1018,7 @@ impl AdditiveNttF128 {
                     .zip(twiddles.par_iter())
                     .for_each(|(chunk, &twiddle)| {
                         // SAFETY: aes target feature enabled.
-                        unsafe { kernels::butterfly_neon_block(chunk, twiddle, block_size_half) };
+                        unsafe { butterfly_neon_block(chunk, twiddle, block_size_half) };
                     });
             } else if block_size_half >= 2 {
                 // Few large blocks — process sequentially with NEON.
@@ -1002,7 +1027,7 @@ impl AdditiveNttF128 {
                     for block in 0..num_blocks {
                         let twiddle = self.twiddle(layer, block);
                         let block_start = block * block_size;
-                        kernels::butterfly_neon_block(
+                        butterfly_neon_block(
                             &mut data[block_start..block_start + block_size],
                             twiddle,
                             block_size_half,
@@ -1022,7 +1047,7 @@ impl AdditiveNttF128 {
                         |(chunk, twiddle_pair)| {
                             // SAFETY: aes target feature enabled.
                             unsafe {
-                                kernels::butterfly_neon_block_pair_chunk(
+                                butterfly_neon_block_pair_chunk(
                                     chunk,
                                     twiddle_pair[0],
                                     twiddle_pair[1],
@@ -1059,7 +1084,6 @@ impl AdditiveNttF128 {
     /// per-layer parallel path.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     pub fn forward_transform_batched(&self, data: &mut [F128]) {
-        use rayon::prelude::*;
         let log_d = log2_pow2(data.len());
         assert!(log_d <= self.log_domain_size());
 
@@ -1084,7 +1108,7 @@ impl AdditiveNttF128 {
                     .zip(twiddles.par_iter())
                     .for_each(|(chunk, &t)| {
                         // SAFETY: aes target feature enabled.
-                        unsafe { kernels::butterfly_neon_block(chunk, t, block_size_half) };
+                        unsafe { butterfly_neon_block(chunk, t, block_size_half) };
                     });
             } else {
                 // Few large blocks at very top layers: sequential NEON.
@@ -1092,7 +1116,7 @@ impl AdditiveNttF128 {
                     for block in 0..num_blocks {
                         let t = self.twiddle(layer, block);
                         let block_start = block * block_size;
-                        kernels::butterfly_neon_block(
+                        butterfly_neon_block(
                             &mut data[block_start..block_start + block_size],
                             t,
                             block_size_half,
@@ -1119,9 +1143,7 @@ impl AdditiveNttF128 {
                         let block = &mut sub_data[block_start..block_start + block_size];
                         if block_size_half >= 2 {
                             // SAFETY: aes target feature enabled.
-                            unsafe {
-                                kernels::butterfly_neon_block(block, twiddle, block_size_half)
-                            };
+                            unsafe { butterfly_neon_block(block, twiddle, block_size_half) };
                         } else {
                             // Deepest layer: 1 pair per block, scalar.
                             let v = block[1];
@@ -1171,7 +1193,6 @@ fn butterfly_interleaved_block_par_rows(
     num_ntts: usize,
     live: usize,
 ) {
-    use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 512;
     if block_size_half < PARALLEL_ROW_THRESHOLD {
         butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts, live);
@@ -1193,7 +1214,7 @@ fn butterfly_interleaved_block_par_rows(
     top.par_chunks_mut(num_ntts)
         .zip(bot.par_chunks_mut(num_ntts))
         .for_each(|(top_row, bot_row)| {
-            kernels::butterfly_row_pair(&mut top_row[..live], &mut bot_row[..live], twiddle);
+            butterfly_row_pair(&mut top_row[..live], &mut bot_row[..live], twiddle);
         });
 }
 
@@ -1212,7 +1233,6 @@ fn butterfly_interleaved_fused_3layer_par_rows(
     num_ntts: usize,
     live: usize,
 ) {
-    use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     let stride = eighth * num_ntts;
     debug_assert_eq!(block.len(), 8 * stride);
@@ -1230,7 +1250,7 @@ fn butterfly_interleaved_fused_3layer_par_rows(
     if eighth < PARALLEL_ROW_THRESHOLD {
         for r in 0..eighth {
             let o = r * num_ntts;
-            kernels::butterfly_fused_3layer(
+            butterfly_fused_3layer(
                 [
                     &mut q0[o..o + live],
                     &mut q1[o..o + live],
@@ -1256,7 +1276,7 @@ fn butterfly_interleaved_fused_3layer_par_rows(
             .zip(q6.par_chunks_mut(num_ntts))
             .zip(q7.par_chunks_mut(num_ntts))
             .for_each(|(((((((r0, r1), r2), r3), r4), r5), r6), r7)| {
-                kernels::butterfly_fused_3layer(
+                butterfly_fused_3layer(
                     [
                         &mut r0[..live],
                         &mut r1[..live],
@@ -1279,7 +1299,7 @@ fn butterfly_interleaved_fused_3layer_par_rows(
 /// short-circuit for outer block 0 (`t_outer = t_inner_a = 0` — only the
 /// (c,d) inner butterfly multiplies; the branch is per-row, not per-lane).
 /// The general case delegates to the arch-dispatched
-/// [`kernels::butterfly_fused_2layer`].
+/// [`butterfly_fused_2layer`].
 #[inline(always)]
 fn fused_2layer_row_op(
     row_a: &mut [F128],
@@ -1307,7 +1327,7 @@ fn fused_2layer_row_op(
         }
         return;
     }
-    kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
+    butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
 }
 
 /// Forced-serial fused 2-layer butterfly for use INSIDE the deep pass's
@@ -1369,7 +1389,6 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     num_ntts: usize,
     live: usize,
 ) {
-    use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     let stride = quarter * num_ntts;
     debug_assert_eq!(block.len(), 4 * stride);
@@ -1438,7 +1457,9 @@ fn butterfly_interleaved_fused_2layer_par_rows_from_src(
     quarter: usize,
     num_ntts: usize,
 ) {
-    use rayon::prelude::*;
+    use rayon::prelude::{
+        IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+    };
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     let stride = quarter * num_ntts;
     debug_assert_eq!(block.len(), 4 * stride);
@@ -1500,16 +1521,18 @@ fn butterfly_interleaved_fused_2layer_par_rows_from_src(
 /// first pass of [`AdditiveNttF128::forward_transform_interleaved_from_message`]
 /// cannot serve. Every slot of `data` is written (prior contents arbitrary).
 fn replicate_interleaved(data: &mut [F128], msg: &[F128]) {
-    use rayon::prelude::*;
+    use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
     let msg_len = msg.len();
     debug_assert_eq!(data.len() % msg_len, 0);
     const COPY_CHUNK: usize = 1 << 16;
     if msg_len >= COPY_CHUNK {
         // Both are powers of two, so chunks never straddle a replica boundary.
-        data.par_chunks_mut(COPY_CHUNK).enumerate().for_each(|(i, dst)| {
-            let src_off = (i * COPY_CHUNK) % msg_len;
-            dst.copy_from_slice(&msg[src_off..src_off + dst.len()]);
-        });
+        data.par_chunks_mut(COPY_CHUNK)
+            .enumerate()
+            .for_each(|(i, dst)| {
+                let src_off = (i * COPY_CHUNK) % msg_len;
+                dst.copy_from_slice(&msg[src_off..src_off + dst.len()]);
+            });
     } else {
         for rep in data.chunks_mut(msg_len) {
             rep.copy_from_slice(msg);
@@ -1538,7 +1561,6 @@ fn replicate_interleaved(data: &mut [F128], msg: &[F128]) {
 /// basis powers): 3/17 ≈ 18% of all NTT mults.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 fn mul_small_twiddle(v: F128, t_lo: u64) -> F128 {
-    use core::arch::aarch64::*;
     unsafe {
         let d0 = vreinterpretq_u64_p128(vmull_p64(v.lo, t_lo));
         let d1 = vreinterpretq_u64_p128(vmull_p64(v.hi, t_lo));
@@ -1595,7 +1617,7 @@ fn butterfly_interleaved_block(
     let (top, bot) = block.split_at_mut(off_bot);
     for r in 0..block_size_half {
         let o = r * num_ntts;
-        kernels::butterfly_row_pair(&mut top[o..o + live], &mut bot[o..o + live], twiddle);
+        butterfly_row_pair(&mut top[o..o + live], &mut bot[o..o + live], twiddle);
     }
 }
 
@@ -1609,7 +1631,6 @@ fn butterfly_interleaved_fused_4layer_par_rows(
     sixteenth: usize,
     num_ntts: usize,
 ) {
-    use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     // Carry the base as `usize` (Send+Sync) so rayon's per-`r` closure can hold
@@ -1619,16 +1640,12 @@ fn butterfly_interleaved_fused_4layer_par_rows(
     if sixteenth < PARALLEL_ROW_THRESHOLD {
         for r in 0..sixteenth {
             // SAFETY: row group r writes disjoint rows of this block.
-            unsafe {
-                kernels::butterfly_fused_4layer_row(base as *mut F128, sixteenth, num_ntts, r, t)
-            };
+            unsafe { butterfly_fused_4layer_row(base as *mut F128, sixteenth, num_ntts, r, t) };
         }
     } else {
         (0..sixteenth).into_par_iter().for_each(|r| {
             // SAFETY: distinct r → disjoint row groups → no aliasing.
-            unsafe {
-                kernels::butterfly_fused_4layer_row(base as *mut F128, sixteenth, num_ntts, r, t)
-            };
+            unsafe { butterfly_fused_4layer_row(base as *mut F128, sixteenth, num_ntts, r, t) };
         });
     }
 }
@@ -1654,9 +1671,10 @@ fn ceil_log2(n: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        ntt::additive_ntt_f128::{AdditiveNttF128, F128, log2_pow2, replicate_interleaved},
+        test_rng::Rng,
+    };
 
     fn rand_vec(rng: &mut Rng, n: usize) -> Vec<F128> {
         (0..n).map(|_| rng.f128()).collect()

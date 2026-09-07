@@ -10,11 +10,15 @@
 //! Informational — run with
 //! `cargo test -p flock-core --release --test assist_blocked -- --ignored --nocapture`.
 
-use flock_core::challenger::FsChallenger;
-use flock_core::field::F128;
-use flock_core::pcs::jagged::{
-    self, FrobeniusClaim, JaggedParams, prove_assist, prove_frobenius_assist, verify_assist,
-    verify_frobenius_assist,
+use std::{hint::black_box, time::Instant};
+
+use flock_core::{
+    challenger::FsChallenger,
+    field::F128,
+    pcs::jagged::{
+        FrobeniusClaim, JaggedParams, f_hat_t, prove_assist, prove_frobenius_assist, verify_assist,
+        verify_frobenius_assist,
+    },
 };
 
 /// xorshift — the probe only needs points that aren't structurally special.
@@ -52,7 +56,7 @@ fn registry_heights(regions: &[(usize, u64)], k: usize) -> Vec<u64> {
 fn min_ms(iters: usize, mut f: impl FnMut()) -> f64 {
     let mut best = f64::INFINITY;
     for _ in 0..iters {
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         f();
         best = best.min(t.elapsed().as_secs_f64() * 1e3);
     }
@@ -153,11 +157,11 @@ fn assist_shapes_probe() {
         let fproof = prove_frobenius_assist(&params, &claims, &[], &rho, &mut fp);
         let fprove = min_ms(iters, || {
             let mut ch = FsChallenger::new(b"assist-blocked-probe");
-            std::hint::black_box(prove_frobenius_assist(&params, &claims, &[], &rho, &mut ch));
+            black_box(prove_frobenius_assist(&params, &claims, &[], &rho, &mut ch));
         });
         let fverify = min_ms(iters, || {
             let mut ch = FsChallenger::new(b"assist-blocked-probe");
-            std::hint::black_box(verify_frobenius_assist(
+            black_box(verify_frobenius_assist(
                 &params,
                 &claims,
                 &[],
@@ -180,11 +184,11 @@ fn assist_shapes_probe() {
         let aproof = prove_assist(&params, &zr, &zc, &zi, &mut ap);
         let aprove = min_ms(iters, || {
             let mut ch = FsChallenger::new(b"assist-blocked-probe");
-            std::hint::black_box(prove_assist(&params, &zr, &zc, &zi, &mut ch));
+            black_box(prove_assist(&params, &zr, &zc, &zi, &mut ch));
         });
         let averify = min_ms(iters, || {
             let mut ch = FsChallenger::new(b"assist-blocked-probe");
-            std::hint::black_box(verify_assist(&params, &zr, &zc, &zi, &aproof, &mut ch));
+            black_box(verify_assist(&params, &zr, &zc, &zi, &aproof, &mut ch));
         });
         let mut vch = FsChallenger::new(b"assist-blocked-probe");
         assert_eq!(
@@ -193,7 +197,7 @@ fn assist_shapes_probe() {
             "assist must verify [{label}]"
         );
         // The value is shape-independent, so it also pins the collapse.
-        assert_eq!(aproof.beta, jagged::f_hat_t(&params, &zr, &zc, &zi));
+        assert_eq!(aproof.beta, f_hat_t(&params, &zr, &zc, &zi));
 
         println!(
             "{label:<46} m={m:<3} frobenius(256 stmt) prove {fprove:6.2} verify {fverify:5.2} |  \

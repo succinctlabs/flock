@@ -1,4 +1,45 @@
-use super::*;
+use std::iter::repeat_n;
+
+use flock_core::{
+    circuit::builder::{CircuitShape, SlotId},
+    lincheck::{LincheckCircuit, build_eq_table},
+    pcs::{Commitment, ligerito::eval_sk_at_vks},
+    r1cs::{BlockR1cs, SparseBinaryMatrix},
+};
+use flock_multilinear::{IndexOrder, eq_table};
+use flock_transcript::transcript_record::{Stream, StreamWord, TranscriptOp, TranscriptOp as Op};
+#[cfg(test)]
+use {
+    crate::r1cs_hashes::blake3::{build_block_r1cs, generate_witness_batch_major_partial},
+    crate::tower::{
+        Blake3Gate, DOMAIN, HashKind, PowMaskGate, PowMaskTable, gates_glue::PowMaskInput,
+        pcs_batch_for,
+    },
+    crate::{
+        challenger::FsChallenger,
+        prover::{UnionSlotProverInput, prove_fast_ligerito_union_circuit},
+        r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
+        union::UnionInstance,
+        verifier::verify_ligerito_union_circuit,
+    },
+    flock_core::{circuit::builder::CircuitWitness, pcs::ligerito::LigeritoProfile},
+    flock_hash::blake3_compress,
+    flock_transcript::challenger::pow_squeeze_counter,
+    std::array::from_fn,
+    std::panic::AssertUnwindSafe,
+    std::panic::catch_unwind,
+};
+
+use crate::{
+    r1cs_hashes::fs_chain::FsChainTrace,
+    tower::{
+        CHUNK_END, CHUNK_START, CollapsedSlots, F128, F256, Lvl, MacGate, MacGate256, MixedProof,
+        OpenLevel, PARENT, PcsParams, PrefixGate, PrefixGate256, ResidualAccGate256,
+        ResidualPrefix3Gate256, ResidualWeightsGate256, RoundRec, SLOT_WORDS, ShapeBuilder, Wire,
+        cw, emit_mac256, hash_to_digest, l0_ood_z_index, pack_params, slot_cached,
+        squeeze_word_wire,
+    },
+};
 
 /// Emit the whole QUERY PHASE — every level's Merkle openings against the
 /// absorbed caps, plus the leaf-eval accumulators — as circuit rows.
@@ -9,31 +50,27 @@ use super::*;
 /// columns), and folds the opened rows against the fold challenges into one
 /// accumulator per level.
 ///
-/// **ROUND 1 — the cap is hashed, not selected.** Per level, `2^c − 1`
+/// Per level, `2^c − 1`
 /// PARENT rows fold the ABSORBED cap wires (`cap_w`, from [`cap_wires`])
 /// to one root in fixed positional order — no swaps, the cap layer IS the
 /// tree's depth-`c` slice — and every opening runs FULL depth (path
 /// siblings from the proof, cap-internal siblings recomputed natively from
-/// the cap) and CONNECTS to that root. The absorbed cap is bound to the
-/// openings by copy constraint; the per-query boundary select — 3 publics
-/// per query and its checker tier — is gone. MVP-7, MVP-9 and MVP-10 all
-/// need exactly this, so it lives here once rather than three times.
+/// the cap) and CONNECTS to that root. A copy constraint binds the cap to
+/// each opening.
 ///
 /// Appends the sibling `hints` and the public `vals` in declaration order;
 /// returns the per-level alpha wires to publish AFTER every input is
-/// declared — publishing inside the loop would interleave with the next
-/// level's inputs and misindex the public segment (the recorded MVP-7
-/// gotcha) — and the accumulators.
+/// declared, and the accumulators.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_query_phase(
     sb: &mut ShapeBuilder,
     slots: CollapsedSlots,
     iv: [Wire; 2],
-    leafeval: &[flock_core::circuit::builder::SlotId],
+    leafeval: &[SlotId],
     levels: &[OpenLevel],
     geo: &[Lvl],
     lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
-    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &FsChainTrace,
     outs: &[Vec<Wire>],
     chals: &[F128],
     cap_w: &[Vec<[Wire; 2]>],
@@ -41,7 +78,6 @@ pub(super) fn emit_query_phase(
     consts: &mut Vec<(F128, Wire)>,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
 ) -> (Vec<Vec<Wire>>, Vec<[Wire; 2]>, Vec<Vec<Wire>>) {
-    use flock_core::lincheck::build_eq_table;
     let mut to_publish: Vec<Vec<Wire>> = Vec::new();
     let mut level_accs: Vec<[Wire; 2]> = Vec::new();
     let mut query_positions: Vec<Vec<Wire>> = Vec::new();
@@ -106,23 +142,11 @@ pub(super) fn emit_query_phase(
         // values of the fold challenges past the 8-lane gate's three.
         let le_vars = g.lanes.min(8).trailing_zeros() as usize;
         let le_groups = g.lanes >> le_vars;
-        let hw = {
-            let v_hi: Vec<F256> = lvl.fold_chs[le_vars..]
-                .iter()
-                .map(|&i| F256::new(chals[i], chals[i + 1]))
-                .collect();
-            let mut table = vec![F256::ONE];
-            for r in v_hi {
-                let old = table.len();
-                table.resize(2 * old, F256::ZERO);
-                for i in 0..old {
-                    let x = table[i];
-                    table[i + old] = x * r;
-                    table[i] = x * (F256::ONE + r);
-                }
-            }
-            table
-        };
+        let v_hi: Vec<F256> = lvl.fold_chs[le_vars..]
+            .iter()
+            .map(|&i| F256::new(chals[i], chals[i + 1]))
+            .collect();
+        let hw = eq_table(&v_hi, F256::ONE, IndexOrder::LowToHigh);
         let zero = cw(sb, vals, consts, F128::ZERO);
         let mut acc = [zero, zero];
         let mut level_positions = Vec::with_capacity(g.q);
@@ -219,23 +243,20 @@ pub(super) fn emit_query_phase(
 /// boundary-bound q_field, a prefix over the LATER levels' fold wires,
 /// suffix subset products over the `2^yr` residual positions); the
 /// close-out then assembles `eval_b` from gamma' and the W-round wires
-/// through ONE `pl_full`-wide prefix slot (shorter calls pad their (a, b)
-/// blocks with zero pairs — each padded factor is 1 + 0 + 0 = 1, so the wide
-/// gate is exact), folds in each OOD claim and each level's beta-weighted
-/// accumulators, and dots the absorbed `yr` words into the residual-side
-/// `inner`. MVP-7, MVP-9 and MVP-10 all need exactly this, so it lives here
-/// once rather than three times.
+/// through ONE `pl_full`-wide prefix slot. Shorter calls pad their `(a, b)`
+/// blocks with zero pairs. It folds each OOD claim and each level accumulator.
+/// It then dots the absorbed `yr` words into the residual-side `inner`.
 ///
 /// Appends public `vals` in declaration order; the caller publishes the
-/// returned accumulators and `inner` AFTER all inputs are declared (the
-/// recorded MVP-7 gotcha). Also returns the prefix slot AND ITS WIDTH
+/// returned accumulators and `inner` after all inputs are declared. It also
+/// returns the prefix slot and its width,
 /// `min(pl_full, 8)`, which the anchor-expect machinery reuses for its
 /// chunked products — longer factor lists seed-chain across rows. (The
 /// cap keeps the schema at 19 IO words instead of 2·pl_full + 3; every
 /// gate cell-slot is also a wiring gather claim, so schema words are the
 /// μ AND claim-count budget.)
 ///
-/// **CHUNKING.** The accumulator gate has eight positions (`chunk_log=3`)
+/// The accumulator gate has eight positions (`chunk_log=3`)
 /// at kappa 6 regardless of the proof's residual size. The real inner's
 /// yr = 32 would otherwise push its schema to kappa 7-8. A yr > 8 region
 /// runs as `2^(yr_log-3)` chunks of 8:
@@ -252,7 +273,7 @@ pub(super) fn emit_query_phase(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_residual_region(
     sb: &mut ShapeBuilder,
-    leaf_slot: &mut Vec<(usize, flock_core::circuit::builder::SlotId)>,
+    leaf_slot: &mut Vec<(usize, SlotId)>,
     levels: &[OpenLevel],
     geo: &[Lvl],
     alpha_wires: &[Vec<Wire>],
@@ -260,15 +281,11 @@ pub(super) fn emit_residual_region(
     w_rounds: &[RoundRec],
     inner_pd_fin: usize,
     yr_wires: &[[Wire; 2]],
-    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &FsChainTrace,
     outs: &[Vec<Wire>],
     zw: Wire,
     ow: Wire,
-) -> (
-    Vec<Vec<[Wire; 2]>>,
-    [Wire; 2],
-    (flock_core::circuit::builder::SlotId, usize),
-) {
+) -> (Vec<Vec<[Wire; 2]>>, [Wire; 2], (SlotId, usize)) {
     let yr_len = yr_wires.len();
     assert!(yr_len.is_power_of_two());
     let yr_log = yr_len.trailing_zeros() as usize;
@@ -391,7 +408,7 @@ pub(super) fn emit_residual_region(
         )
         .collect();
     // ROUND 3: the close-out's suffix/combine/dot arithmetic rides the
-    // shared 4-word MacGate (cache key 600, the mvp8 convention) plus the
+    // shared 4-word MacGate (cache key 600) plus the
     // prefix slot — the SuffixGate/PartialCombineGate/FinalDotGate types
     // are DISSOLVED: 51 schema words (each a cell slot AND a gather claim)
     // bought ~30 rows of work; as mac/prefix rows the same work is ~250
@@ -432,11 +449,11 @@ pub(super) fn emit_residual_region(
                 for (a, _) in chunk_f {
                     g_in.extend_from_slice(a);
                 }
-                g_in.extend(std::iter::repeat_n(zw, 2 * (pf_w - chunk_f.len())));
+                g_in.extend(repeat_n(zw, 2 * (pf_w - chunk_f.len())));
                 for (_, b) in chunk_f {
                     g_in.extend_from_slice(b);
                 }
-                g_in.extend(std::iter::repeat_n(zw, 2 * (pf_w - chunk_f.len())));
+                g_in.extend(repeat_n(zw, 2 * (pf_w - chunk_f.len())));
                 g_in.push(ow);
                 g_in.push(zw);
                 let out = sb.gate(pfslot, &g_in);
@@ -579,8 +596,7 @@ pub(super) fn emit_residual_region(
 }
 
 /// Check the residual region's published wires against a NATIVE replica:
-/// `induce_sumcheck_evaluate_at_residual` per level (sks replicated via
-/// `eval_sk_at_vks` — the mvp7 discipline), then the close-out's gamma-weighted
+/// `induce_sumcheck_evaluate_at_residual` per level, then the close-out's gamma-weighted
 /// char-2 eq products and the yr dot. Walks `public` from `at` (the first
 /// accumulator, `levels × 2^yr` entries, then the inner), asserting each.
 /// Returns the native inner — the residual-side t_r — so the caller asserts
@@ -596,7 +612,6 @@ pub(super) fn check_residual_publics(
     yr_vals: &[F256],
     chals: &[F128],
 ) -> F256 {
-    use flock_core::lincheck::build_eq_table;
     let yr_len = yr_vals.len();
     assert!(yr_len.is_power_of_two());
     let yr_log = yr_len.trailing_zeros() as usize;
@@ -605,7 +620,7 @@ pub(super) fn check_residual_publics(
     for (li, lvl) in levels.iter().enumerate() {
         let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len() - 1).sum();
         let lmc = pl + yr_log;
-        let sks = flock_core::pcs::ligerito::eval_sk_at_vks(lmc);
+        let sks = eval_sk_at_vks(lmc);
         let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
         let ris: Vec<F256> = levels[li + 1..]
             .iter()
@@ -775,8 +790,8 @@ pub(super) fn pow_leading_zero_mask(bits: u32) -> F128 {
 /// enforces the canonical nonce 0.
 pub(super) fn emit_pow_checks(
     sb: &mut ShapeBuilder,
-    _b3: flock_core::circuit::builder::SlotId,
-    pow: flock_core::circuit::builder::SlotId,
+    _b3: SlotId,
+    pow: SlotId,
     _iv: [Wire; 2],
     pows: &[([Wire; 2], u32)],
     vals: &mut Vec<F128>,
@@ -824,18 +839,17 @@ pub(super) fn emit_pow_checks(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_recorded_pow_checks(
     sb: &mut ShapeBuilder,
-    b3: flock_core::circuit::builder::SlotId,
-    spread: flock_core::circuit::builder::SlotId,
+    b3: SlotId,
+    spread: SlotId,
     iv: [Wire; 2],
-    ops: &[flock_core::transcript_record::TranscriptOp],
-    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
-    stream: &flock_core::transcript_record::Stream,
+    ops: &[TranscriptOp],
+    trace: &FsChainTrace,
+    stream: &Stream,
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
 ) {
-    use flock_core::transcript_record::TranscriptOp as Op;
     let (mut fin, mut pay) = (0usize, 0usize);
     let mut pows = Vec::new();
     for op in ops {
@@ -856,12 +870,9 @@ pub(super) fn emit_recorded_pow_checks(
             let wi = stream
                 .words
                 .iter()
-                .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pay))
+                .position(|w| matches!(w, StreamWord::Bytes { payload, .. } if *payload == pay))
                 .expect("pow nonce stream word");
-            (
-                [outs[sq[0]][1], ww[wi].expect("pow nonce wired")],
-                bits,
-            )
+            ([outs[sq[0]][1], ww[wi].expect("pow nonce wired")], bits)
         })
         .collect();
     emit_pow_checks(sb, b3, spread, iv, &checks, vals, consts);
@@ -869,7 +880,7 @@ pub(super) fn emit_recorded_pow_checks(
 
 #[test]
 pub(super) fn fused_pow_masks_match_raw_compression() {
-    let cv: [u32; 8] = std::array::from_fn(|i| 0x1020_3040u32.wrapping_mul(i as u32 + 1));
+    let cv: [u32; 8] = from_fn(|i| 0x1020_3040u32.wrapping_mul(i as u32 + 1));
     for pending_words in 0..4 {
         let pending_len = 16 * pending_words;
         for nonce in 0..64u64 {
@@ -879,15 +890,14 @@ pub(super) fn fused_pow_masks_match_raw_compression() {
                     *b = (17 * i + 9) as u8;
                 }
                 block[pending_len..pending_len + 8].copy_from_slice(&nonce.to_le_bytes());
-                let message: [u32; 16] = std::array::from_fn(|i| {
-                    u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap())
-                });
-                let out = blake3::blake3_compress(
+                let message: [u32; 16] =
+                    from_fn(|i| u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap()));
+                let out = blake3_compress(
                     &cv,
                     &message,
-                    flock_core::challenger::pow_squeeze_counter(bits, pending_len + 16),
+                    pow_squeeze_counter(bits, pending_len + 16),
                     64,
-                    crate::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
+                    CHAIN_SQUEEZE,
                 );
                 let mut predicate = [0u8; 16];
                 for (i, word) in out[4..8].iter().enumerate() {
@@ -938,21 +948,19 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
     for (i, b) in state_digest.iter_mut().enumerate() {
         *b = (29 * i + 3) as u8;
     }
-    let cv: [u32; 8] = std::array::from_fn(|i| {
-        u32::from_le_bytes(state_digest[4 * i..4 * i + 4].try_into().unwrap())
-    });
+    let cv: [u32; 8] =
+        from_fn(|i| u32::from_le_bytes(state_digest[4 * i..4 * i + 4].try_into().unwrap()));
     let fused = |nonce: u64| {
         let mut block = [0u8; 64];
         block[..8].copy_from_slice(&nonce.to_le_bytes());
-        let message: [u32; 16] = std::array::from_fn(|i| {
-            u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap())
-        });
-        blake3::blake3_compress(
+        let message: [u32; 16] =
+            from_fn(|i| u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap()));
+        blake3_compress(
             &cv,
             &message,
-            flock_core::challenger::pow_squeeze_counter(bits, 16),
+            pow_squeeze_counter(bits, 16),
             64,
-            crate::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
+            CHAIN_SQUEEZE,
         )
     };
     let accepts = |nonce: u64| {
@@ -997,11 +1005,7 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
             &mut sb,
             &mut vals,
             &mut consts,
-            pack_params(
-                flock_core::challenger::pow_squeeze_counter(circuit_bits, 16),
-                64,
-                crate::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
-            ),
+            pack_params(pow_squeeze_counter(circuit_bits, 16), 64, CHAIN_SQUEEZE),
         );
         let h = sb.gate(
             b3,
@@ -1046,10 +1050,7 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
         "the invalid nonce reaches a failing in-circuit prefix row"
     );
 
-    let prove = |shape: &flock_core::circuit::builder::CircuitShape,
-                 built: &flock_core::circuit::builder::CircuitWitness,
-                 b3_slot,
-                 spread_slot| {
+    let prove = |shape: &CircuitShape, built: &CircuitWitness, b3_slot, spread_slot| {
         let mut union = UnionInstance::new(&shape.registry, shape.counts.clone());
         union.set_dense_floor(22);
         let pcs = PcsParams {
@@ -1060,7 +1061,7 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
             num_lanes: union.commit_lanes(pcs_batch_for(&union, LigeritoProfile::Fast)),
             merkle_hash: HashKind::Blake3,
         };
-        let b3_r1cs = blake3::build_block_r1cs(nu);
+        let b3_r1cs = build_block_r1cs(nu);
         let b3_lc = b3_r1cs.csc_lincheck_circuit();
         let spread_ty = PowMaskTable;
         let spread_r1cs = spread_ty.build_block_r1cs(nu);
@@ -1069,10 +1070,7 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
             (
                 shape.registry_slot(b3_slot),
                 UnionSlotProverInput::new(
-                    blake3::generate_witness_batch_major_partial(
-                        built.rows::<Blake3Gate>(b3_slot),
-                        nu,
-                    ),
+                    generate_witness_batch_major_partial(built.rows::<Blake3Gate>(b3_slot), nu),
                     b3_lc,
                 ),
             ),
@@ -1087,7 +1085,7 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
         ];
         slots.sort_by_key(|(i, _)| *i);
         let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+        let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
             &union,
             &shape.circuit,
             &built.public,
@@ -1101,12 +1099,12 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
             (shape.registry_slot(spread_slot), spread_lc),
         ];
         lcs.sort_by_key(|(i, _)| *i);
-        let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = lcs
+        let lcs: Vec<&dyn LincheckCircuit> = lcs
             .into_iter()
-            .map(|(_, lc)| lc as &dyn flock_core::lincheck::LincheckCircuit)
+            .map(|(_, lc)| lc as &dyn LincheckCircuit)
             .collect();
         let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-        verifier::verify_ligerito_union_circuit(
+        verify_ligerito_union_circuit(
             &union,
             &shape.circuit,
             &built.public,
@@ -1120,7 +1118,7 @@ pub(super) fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
 
     prove(&good_shape, &good_built, good_b3, good_spread)
         .expect("a valid grinding witness proves and verifies");
-    let bad_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let bad_result = catch_unwind(AssertUnwindSafe(|| {
         prove(&bad_shape, &bad_built, bad_b3, bad_spread)
     }));
     assert!(
@@ -1257,16 +1255,16 @@ pub(super) fn emit_opening(
 /// the BLAKE3/BLAKE3 circuit proof, and the boolean tables whose lincheck
 /// circuits a verifier needs (in registry order via the `*_slot` indices).
 pub struct LeafOuter {
-    pub(super) shape: flock_core::circuit::builder::CircuitShape,
+    pub(super) shape: CircuitShape,
     pub(super) public: Vec<F128>,
     pub(super) proof: MixedProof,
-    pub(super) commitment: flock_core::pcs::Commitment,
+    pub(super) commitment: Commitment,
     pub(super) pcs: PcsParams,
-    pub(super) b3_r1cs: flock_core::r1cs::BlockR1cs,
-    pub(super) swap_r1cs: flock_core::r1cs::BlockR1cs,
-    pub(super) spread_r1cs: flock_core::r1cs::BlockR1cs,
-    pub(super) pow_r1cs: flock_core::r1cs::BlockR1cs,
-    pub(super) family_r1cs: flock_core::r1cs::BlockR1cs,
+    pub(super) b3_r1cs: BlockR1cs,
+    pub(super) swap_r1cs: BlockR1cs,
+    pub(super) spread_r1cs: BlockR1cs,
+    pub(super) pow_r1cs: BlockR1cs,
+    pub(super) family_r1cs: BlockR1cs,
     pub(super) b3_slots: Vec<usize>,
     pub(super) swap_slot: usize,
     pub(super) spread_slot: usize,
@@ -1274,8 +1272,8 @@ pub struct LeafOuter {
     pub(super) family_slot: usize,
 }
 
-pub(super) fn leaf_boolean_lcs(lo: &LeafOuter) -> Vec<&dyn flock_core::lincheck::LincheckCircuit> {
-    let mut ordered: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+pub(super) fn leaf_boolean_lcs(lo: &LeafOuter) -> Vec<&dyn LincheckCircuit> {
+    let mut ordered: Vec<(usize, &dyn LincheckCircuit)> = vec![
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
         (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
         (lo.pow_slot, lo.pow_r1cs.csc_lincheck_circuit()),
@@ -1284,19 +1282,14 @@ pub(super) fn leaf_boolean_lcs(lo: &LeafOuter) -> Vec<&dyn flock_core::lincheck:
     ordered.extend(lo.b3_slots.iter().map(|&slot| {
         (
             slot,
-            lo.b3_r1cs.csc_lincheck_circuit() as &dyn flock_core::lincheck::LincheckCircuit,
+            lo.b3_r1cs.csc_lincheck_circuit() as &dyn LincheckCircuit,
         )
     }));
     ordered.sort_by_key(|(slot, _)| *slot);
     ordered.into_iter().map(|(_, circuit)| circuit).collect()
 }
 
-pub(super) fn leaf_boolean_mats(
-    lo: &LeafOuter,
-) -> Vec<(
-    &flock_core::r1cs::SparseBinaryMatrix,
-    &flock_core::r1cs::SparseBinaryMatrix,
-)> {
+pub(super) fn leaf_boolean_mats(lo: &LeafOuter) -> Vec<(&SparseBinaryMatrix, &SparseBinaryMatrix)> {
     let mut ordered = vec![
         (lo.swap_slot, (&lo.swap_r1cs.a_0, &lo.swap_r1cs.b_0)),
         (lo.spread_slot, (&lo.spread_r1cs.a_0, &lo.spread_r1cs.b_0)),

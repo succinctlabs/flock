@@ -10,15 +10,25 @@
 //! Run:   `cargo bench --bench field`
 //! On M-series, requires `.cargo/config.toml` so the `aes` feature is on.
 
-use std::hint::black_box;
-use std::time::Instant;
+use std::{hint::black_box, time::Instant};
 
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-use flock_prover::field::gf2_128::aarch64;
-use flock_prover::field::gf2_128::software;
+use flock_prover::field::gf2_128::aarch64::{
+    ghash_mul_binius, ghash_mul_karatsuba, ghash_mul_karatsuba_barrett, ghash_mul_schoolbook,
+};
 #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
-use flock_prover::field::gf2_128::x86_64;
-use flock_prover::field::{F8, F128, F256Unreduced};
+use flock_prover::field::gf2_128::x86_64::{
+    ghash_mul_binius, ghash_mul_karatsuba, ghash_mul_karatsuba_barrett, ghash_mul_schoolbook,
+};
+use flock_prover::{
+    field::{F8, F128, F256Unreduced, gf2_128::software::ghash_mul, mul_by_x},
+    init_perf_thread_pool,
+};
+#[cfg(target_arch = "aarch64")]
+use {
+    core::arch::aarch64::{veorq_u8, vld1q_u8, vst1q_u8},
+    flock_prover::field::gf2_8::neon::gf8_mul_vec16,
+};
 
 const N: usize = 100_000_000;
 
@@ -97,9 +107,6 @@ fn bench_f8() {
 // against the scalar `F8 mul` numbers above.
 #[cfg(target_arch = "aarch64")]
 fn bench_f8_vec16() {
-    use core::arch::aarch64::*;
-    use flock_prover::field::gf2_8::neon::gf8_mul_vec16;
-
     header("F8 vec16 (GF(2^8), 16-wide NEON kernel)");
     unsafe {
         let b = vld1q_u8([0xADu8; 16].as_ptr());
@@ -263,28 +270,28 @@ fn bench_f128_mul() {
     {
         // SAFETY: aes target feature is enabled at compile time.
         bench_mul_latency!("schoolbook (latency)", |a, b| unsafe {
-            aarch64::ghash_mul_schoolbook(a, b)
+            ghash_mul_schoolbook(a, b)
         });
         bench_mul_throughput!("schoolbook (throughput)", |a, b| unsafe {
-            aarch64::ghash_mul_schoolbook(a, b)
+            ghash_mul_schoolbook(a, b)
         });
         bench_mul_latency!("karatsuba (latency)", |a, b| unsafe {
-            aarch64::ghash_mul_karatsuba(a, b)
+            ghash_mul_karatsuba(a, b)
         });
         bench_mul_throughput!("karatsuba (throughput)", |a, b| unsafe {
-            aarch64::ghash_mul_karatsuba(a, b)
+            ghash_mul_karatsuba(a, b)
         });
         bench_mul_latency!("karatsuba+barrett (latency)", |a, b| unsafe {
-            aarch64::ghash_mul_karatsuba_barrett(a, b)
+            ghash_mul_karatsuba_barrett(a, b)
         });
         bench_mul_throughput!("karatsuba+barrett (throughput)", |a, b| unsafe {
-            aarch64::ghash_mul_karatsuba_barrett(a, b)
+            ghash_mul_karatsuba_barrett(a, b)
         });
         bench_mul_latency!("binius (latency)  ← default Mul impl", |a, b| unsafe {
-            aarch64::ghash_mul_binius(a, b)
+            ghash_mul_binius(a, b)
         });
         bench_mul_throughput!("binius (throughput)", |a, b| unsafe {
-            aarch64::ghash_mul_binius(a, b)
+            ghash_mul_binius(a, b)
         });
     }
 
@@ -293,29 +300,29 @@ fn bench_f128_mul() {
         // SAFETY: pclmulqdq is enabled at compile time; every function also
         // declares the sse4.1 feature it requires.
         bench_mul_latency!("x86 schoolbook (latency)", |a, b| unsafe {
-            x86_64::ghash_mul_schoolbook(a, b)
+            ghash_mul_schoolbook(a, b)
         });
         bench_mul_throughput!("x86 schoolbook (throughput)", |a, b| unsafe {
-            x86_64::ghash_mul_schoolbook(a, b)
+            ghash_mul_schoolbook(a, b)
         });
         bench_mul_latency!("x86 karatsuba (latency)", |a, b| unsafe {
-            x86_64::ghash_mul_karatsuba(a, b)
+            ghash_mul_karatsuba(a, b)
         });
         bench_mul_throughput!("x86 karatsuba (throughput)", |a, b| unsafe {
-            x86_64::ghash_mul_karatsuba(a, b)
+            ghash_mul_karatsuba(a, b)
         });
         bench_mul_latency!(
             "x86 karatsuba+barrett (latency)  ← default Mul impl",
-            |a, b| unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) }
+            |a, b| unsafe { ghash_mul_karatsuba_barrett(a, b) }
         );
         bench_mul_throughput!("x86 karatsuba+barrett (throughput)", |a, b| unsafe {
-            x86_64::ghash_mul_karatsuba_barrett(a, b)
+            ghash_mul_karatsuba_barrett(a, b)
         });
         bench_mul_latency!("x86 binius (latency)", |a, b| unsafe {
-            x86_64::ghash_mul_binius(a, b)
+            ghash_mul_binius(a, b)
         });
         bench_mul_throughput!("x86 binius (throughput)", |a, b| unsafe {
-            x86_64::ghash_mul_binius(a, b)
+            ghash_mul_binius(a, b)
         });
     }
 
@@ -328,8 +335,8 @@ fn bench_f128_mul() {
     }
 
     // Software fallback (bit-loop) — for reference / cross-platform sanity.
-    bench_mul_latency!("software clmul64 (latency)", software::ghash_mul);
-    bench_mul_throughput!("software clmul64 (throughput)", software::ghash_mul);
+    bench_mul_latency!("software clmul64 (latency)", ghash_mul);
+    bench_mul_throughput!("software clmul64 (throughput)", ghash_mul);
 
     // The public Mul trait — should match `binius` exactly.
     bench_mul_latency!("F128::mul (latency)", |a: F128, b: F128| a * b);
@@ -338,7 +345,6 @@ fn bench_f128_mul() {
 
 fn bench_f128_mul_by_x() {
     header("F128 mul_by_x (shift + conditional fold)");
-    use flock_prover::field::mul_by_x;
 
     // Latency
     {
@@ -456,7 +462,7 @@ fn bench_f128_deferred() {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     // Quick build-config sanity print so the reader knows which path is hot.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — PMULL path active)");

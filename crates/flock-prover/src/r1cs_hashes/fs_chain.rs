@@ -19,11 +19,14 @@
 //! could otherwise produce a self-consistent circuit for a transcript nobody
 //! computes.
 
-use flock_core::challenger::pow_squeeze_counter;
-use flock_core::field::F128;
-use flock_core::transcript_record::{Stream, TranscriptOp};
+use flock_field::F128;
+use flock_hash::blake3_compress;
+use flock_transcript::{
+    challenger::pow_squeeze_counter,
+    transcript_record::{Stream, TranscriptOp},
+};
 
-use super::blake3::{Compression, blake3_compress};
+use crate::r1cs_hashes::blake3::Compression;
 
 /// One forked child chain: its own trace plus the four cross-chain links
 /// that connect it to its parent. The child is an INDEPENDENT chain (own
@@ -505,7 +508,7 @@ pub const CHAIN_ABSORB: u32 = 1 << 6;
 pub const CHAIN_SQUEEZE: u32 = 1 << 7;
 
 /// The SPONGE-CHAINED transcript trace builder (transcript-v3 DUPLEX):
-/// mirrors [`flock_core::challenger::FsChallenger::with_chained_blake3`]
+/// mirrors [`flock_transcript::challenger::FsChallenger::with_chained_blake3`]
 /// row for row — a sequential compression chain, no chunk tree, and
 /// squeezes that MUTATE the state. A squeeze's first row consumes the
 /// pending partial block as its message (`block_offsets = Some(..)` with a
@@ -752,7 +755,17 @@ impl FsChainSponge {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use blake3::Hasher;
+    use flock_field::F128;
+    use flock_transcript::{
+        challenger::{Challenger, FsChallenger},
+        transcript_record::{RecordingChallenger, StreamWord},
+    };
+
+    use crate::r1cs_hashes::fs_chain::{
+        CvSource, FsChain, FsChainSponge, FsChainTrace, blake3_compress, trace_duplex,
+        trace_duplex_forked,
+    };
 
     /// The SPONGE trace builder must equal the chained challenger byte for
     /// byte: same absorb schedule, same squeeze outputs. The challenger is
@@ -760,15 +773,12 @@ mod tests {
     /// hashes.
     #[test]
     fn sponge_finalize_matches_the_chained_challenger() {
-        use flock_core::challenger::{Challenger, FsChallenger};
-        use flock_core::field::F128;
         // Drive both through the SAME op schedule via the recording layer:
         // absorb framed values exactly as the challenger frames them.
         let mut ch = FsChallenger::with_chained_blake3(b"sponge-diff");
         let rec_bytes: Vec<u8> = Vec::new();
-        // Reproduce the challenger's framing byte-for-byte using the
-        // recording of a twin transcript.
-        use flock_core::transcript_record::RecordingChallenger;
+
+        // Reproduce framing through a recorded transcript.
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(b"sponge-diff"));
         let mut squeezed_ch: Vec<Vec<u8>> = Vec::new();
         for i in 0..40u64 {
@@ -845,7 +855,7 @@ mod tests {
                 let got = c.finalize(out_bytes);
 
                 let mut want = vec![0u8; out_bytes];
-                let mut h = ::blake3::Hasher::new();
+                let mut h = Hasher::new();
                 h.update(&data[..len]);
                 h.finalize_xof().fill(&mut want);
 
@@ -867,7 +877,7 @@ mod tests {
             at = s;
             let got = c.finalize(32);
             let mut want = [0u8; 32];
-            ::blake3::Hasher::new()
+            Hasher::new()
                 .update(&data[..s])
                 .finalize_xof()
                 .fill(&mut want);
@@ -908,9 +918,6 @@ mod tests {
     /// computes.
     #[test]
     fn forked_chains_reproduce_the_native_transcript() {
-        use flock_core::challenger::{Challenger, FsChallenger};
-        use flock_core::transcript_record::RecordingChallenger;
-
         // Parent absorbs, forks, both sides run, merge, parent continues —
         // the union prover's one-sided wiring branch in miniature.
         fn drive<C: Challenger + Sized>(ch: &mut C) -> Vec<F128> {
@@ -1014,9 +1021,6 @@ mod tests {
 
     #[test]
     fn fused_pow_squeeze_trace_matches_recorded_challenger() {
-        use flock_core::challenger::{Challenger, FsChallenger};
-        use flock_core::transcript_record::RecordingChallenger;
-
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(b"pow-trace"));
         rec.observe_f128_slice(&[
             F128::new(1, 2),
@@ -1078,7 +1082,7 @@ mod tests {
         let nonce_at = stream
             .words
             .iter()
-            .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if rec.payloads()[*payload] == nonce.to_le_bytes()))
+            .position(|w| matches!(w, StreamWord::Bytes { payload, .. } if rec.payloads()[*payload] == nonce.to_le_bytes()))
             .expect("nonce word");
         assert_eq!(
             F128::new(

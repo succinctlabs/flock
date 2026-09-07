@@ -10,11 +10,14 @@
 //! `x^-1` is one, so the quadratic is irreducible. Multiplication uses three
 //! base-field products; multiplication by `x^-1` is a linear shift-and-fold.
 
-use core::ops::{Add, AddAssign, Mul, MulAssign};
+use core::{
+    mem::{align_of, size_of},
+    ops::{Add, AddAssign, Mul, MulAssign},
+};
 
 use serde::{Deserialize, Serialize};
 
-use super::gf2_128::F128;
+use crate::gf2_128::F128;
 
 /// Multiply a base-field element by `x^-1` in the GHASH polynomial basis.
 ///
@@ -158,15 +161,16 @@ impl Mul<F256> for F128 {
     }
 }
 
-const _: [(); 32] = [(); core::mem::size_of::<F256>()];
-const _: [(); 16] = [(); core::mem::align_of::<F256>()];
+const _: [(); 32] = [(); size_of::<F256>()];
+const _: [(); 16] = [(); align_of::<F256>()];
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::field::mul_by_x;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        gf2_256::{F128, F256, QUADRATIC_NONRESIDUE, mul_by_x_inv},
+        mul_by_x,
+        test_rng::Rng,
+    };
 
     fn absolute_trace(mut a: F128) -> F128 {
         let mut out = F128::ZERO;

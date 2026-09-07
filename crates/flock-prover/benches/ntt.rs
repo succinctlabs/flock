@@ -15,10 +15,8 @@
 
 use std::time::Instant;
 
-use flock_prover::field::F128;
-use flock_prover::ntt::AdditiveNttF128;
-
 use flock_core::test_rng::Rng;
+use flock_prover::{field::F128, init_perf_thread_pool, ntt::AdditiveNttF128};
 
 fn fill_f128(n: usize, seed: u64) -> Vec<F128> {
     let mut rng = Rng::new(seed);
@@ -158,7 +156,7 @@ fn header(name: &str) {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes — PMULL path active)");
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]

@@ -16,38 +16,44 @@
 //! Run:  cargo run --release --bin dump_ligerito_f256_vectors -- \
 //!         cuda-ghash/ligerito_f256_vectors.bin [m=22]
 
-use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::field::F128;
-use flock_prover::ntt::AdditiveNttF128;
-use flock_prover::pcs::LOG_PACKING;
-use flock_prover::pcs::ligerito::{
-    LigeritoProfile, ligero_commit, prover_config_for, recursive_prover_with_basis,
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
 };
 
+use env::args;
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    field::F128,
+    ntt::AdditiveNttF128,
+    pcs::{
+        LOG_PACKING,
+        ligerito::{
+            LigeritoProfile, ligero_commit, prover_config_for, recursive_prover_with_basis,
+        },
+    },
+};
 
-fn wf(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn wf(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
 
-fn wu32(w: &mut impl Write, v: usize) -> std::io::Result<()> {
+fn wu32(w: &mut impl Write, v: usize) -> Result<()> {
     w.write_all(&(v as u32).to_le_bytes())
 }
 
-fn wu32s(w: &mut impl Write, v: &[usize]) -> std::io::Result<()> {
+fn wu32s(w: &mut impl Write, v: &[usize]) -> Result<()> {
     for &x in v {
         wu32(w, x)?;
     }
     Ok(())
 }
 
-fn main() -> std::io::Result<()> {
-    let a: Vec<String> = env::args().collect();
+fn main() -> Result<()> {
+    let a: Vec<String> = args().collect();
     let path = a
         .get(1)
         .cloned()
@@ -127,23 +133,21 @@ fn main() -> std::io::Result<()> {
             w.write_all(h)?;
         }
     }
-    let write_open = |w: &mut BufWriter<File>,
-                      rows: &[Vec<F128>],
-                      path_hashes: &[[u8; 32]]|
-     -> std::io::Result<()> {
-        wu32(w, rows.len())?;
-        wu32(w, rows.first().map_or(0, |r| r.len()))?;
-        for row in rows {
-            for &x in row {
-                wf(w, x)?;
+    let write_open =
+        |w: &mut BufWriter<File>, rows: &[Vec<F128>], path_hashes: &[[u8; 32]]| -> Result<()> {
+            wu32(w, rows.len())?;
+            wu32(w, rows.first().map_or(0, |r| r.len()))?;
+            for row in rows {
+                for &x in row {
+                    wf(w, x)?;
+                }
             }
-        }
-        wu32(w, path_hashes.len())?;
-        for h in path_hashes {
-            w.write_all(h)?;
-        }
-        Ok(())
-    };
+            wu32(w, path_hashes.len())?;
+            for h in path_hashes {
+                w.write_all(h)?;
+            }
+            Ok(())
+        };
     wu32(&mut w, 2 + proof.recursive_proofs.len())?;
     write_open(
         &mut w,
@@ -181,7 +185,7 @@ fn main() -> std::io::Result<()> {
         proof.fold_grinding_nonces.is_empty(),
         "F256 ladder never fold-grinds"
     );
-    let wnonces = |w: &mut BufWriter<File>, v: &[u64]| -> std::io::Result<()> {
+    let wnonces = |w: &mut BufWriter<File>, v: &[u64]| -> Result<()> {
         wu32(w, v.len())?;
         for &n in v {
             w.write_all(&n.to_le_bytes())?;

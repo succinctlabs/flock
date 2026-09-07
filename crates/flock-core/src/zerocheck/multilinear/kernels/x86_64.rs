@@ -1,5 +1,16 @@
-use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
-use crate::field::{F128, F256Unreduced};
+use core::{
+    arch::x86_64::{
+        __m128i, __m512i, _mm_load_si128, _mm_set_epi64x, _mm_setzero_si128, _mm_xor_si128,
+        _mm512_broadcast_i32x4, _mm512_loadu_si512, _mm512_permutex2var_epi64, _mm512_set_epi64,
+        _mm512_storeu_si512, _mm512_xor_si512,
+    },
+    mem::transmute,
+};
+
+use crate::field::{
+    F128, F256Unreduced,
+    gf2_128::x86_64::{WideGhashX4, f128x4_loadu, ghash_mul_x4},
+};
 
 /// Fold the four rows for one round-2 pair in parallel x86 SIMD registers.
 /// Returns `[a0, a1, b0, b1]`.
@@ -25,8 +36,6 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
     b0_bytes: *const u8,
     b1_bytes: *const u8,
 ) -> [F128; 4] {
-    use core::arch::x86_64::*;
-
     // SAFETY: the caller guarantees all table and row bounds. Every table
     // entry is 16-byte aligned because F128 has align(16).
     unsafe {
@@ -40,7 +49,7 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
             }
         }
         // F128 is exactly two u64 words and accepts every bit pattern.
-        acc.map(|value| core::mem::transmute::<__m128i, F128>(value))
+        acc.map(|value| transmute::<__m128i, F128>(value))
     }
 }
 
@@ -67,9 +76,6 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     r_fold: F128,
     eq_lo: &[F128],
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
-    use core::arch::x86_64::*;
-
     debug_assert_eq!(a_in.len(), 2 * a_out.len());
     debug_assert_eq!(b_in.len(), 2 * b_out.len());
     debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
@@ -82,9 +88,6 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
-        use core::arch::x86_64::*;
-
         // SAFETY: caller supplies eight readable F128 values at src.
         unsafe {
             let lo = _mm512_loadu_si512(src.cast::<__m512i>());

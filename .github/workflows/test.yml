@@ -98,3 +98,14 @@ jobs:
 
       - name: cargo test
         run: cargo test --release --workspace
+
+      # The two #[ignore] tape-region pin tests — the byte-format gate for
+      # the tower tape walkers (tower::chain / tower::node). Both arch legs
+      # run them: off aarch64 the leaf/outer zerocheck dispatch takes the RS
+      # arms (config::leaf_zc_ag / outer_zc_ag are compile-time false), so
+      # the tests compile and pass on x86_64 too. Names + --ignored select
+      # exactly these two (the rest of the ignored tower suite stays out);
+      # the release test binary is already built by the step above, so this
+      # adds only the two pins' runtime (~15 s).
+      - name: tower tape pins (ignored)
+        run: cargo test --release -p flock-prover --lib -- tower::chain::chain_tape_regions_pinned tower::node::real_tape_regions_pinned --ignored

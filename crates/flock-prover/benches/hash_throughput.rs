@@ -4,26 +4,32 @@
 //! `RAYON_NUM_THREADS`; `benchmarks/bench_hash_throughput.sh` runs the complete
 //! single- and multi-threaded matrix and renders it as Markdown.
 
-use std::hint::black_box;
-use std::time::{Duration, Instant};
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression};
-use flock_prover::r1cs_hashes::sha2::Sha256HybridSetup;
+use std::{
+    array::from_fn,
+    env::var,
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    init_perf_thread_pool,
+    r1cs_hashes::{
+        blake3::{Blake3Setup, Compression},
+        sha2::Sha256HybridSetup,
+    },
+};
+use rayon::current_num_threads;
 
 fn random_sha2_input(rng: &mut Rng) -> ([u32; 8], [u32; 16]) {
-    (
-        std::array::from_fn(|_| rng.next_u32()),
-        std::array::from_fn(|_| rng.next_u32()),
-    )
+    (from_fn(|_| rng.next_u32()), from_fn(|_| rng.next_u32()))
 }
 
 fn random_blake3_input(rng: &mut Rng) -> Compression {
     (
-        std::array::from_fn(|_| rng.next_u32()),
-        std::array::from_fn(|_| rng.next_u32()),
+        from_fn(|_| rng.next_u32()),
+        from_fn(|_| rng.next_u32()),
         rng.next_u64(),
         64,
         11,
@@ -56,7 +62,7 @@ fn report(hash: &str, batch: usize, best: Duration) {
     let throughput = batch as f64 / seconds;
     println!(
         "RESULT\t{hash}\t{batch}\t{}\t{seconds:.6}\t{throughput:.2}",
-        rayon::current_num_threads(),
+        current_num_threads(),
     );
 }
 
@@ -111,7 +117,7 @@ fn bench_blake3(batch: usize, runs: usize) {
 }
 
 fn parse_log2_batches() -> Vec<u32> {
-    let value = std::env::var("HASH_BENCH_LOG2S").unwrap_or_else(|_| "10 12 14 16 18".to_owned());
+    let value = var("HASH_BENCH_LOG2S").unwrap_or_else(|_| "10 12 14 16 18".to_owned());
     let batches: Vec<u32> = value
         .split([',', ' '])
         .filter(|part| !part.is_empty())
@@ -135,7 +141,7 @@ fn parse_log2_batches() -> Vec<u32> {
 }
 
 fn parse_runs() -> usize {
-    let runs = std::env::var("HASH_BENCH_RUNS")
+    let runs = var("HASH_BENCH_RUNS")
         .unwrap_or_else(|_| "3".to_owned())
         .parse::<usize>()
         .expect("HASH_BENCH_RUNS must be a positive integer");
@@ -160,12 +166,12 @@ fn enabled_x86_features() -> &'static str {
 }
 
 fn main() {
-    let _ = flock_prover::init_perf_thread_pool();
+    let _ = init_perf_thread_pool();
     let batches = parse_log2_batches();
     let runs = parse_runs();
     eprintln!(
         "Flock hash proving throughput: {} thread(s), {}, best of {runs} after one warm-up",
-        rayon::current_num_threads(),
+        current_num_threads(),
         enabled_x86_features(),
     );
 

@@ -19,16 +19,20 @@
 //! L0 folds blocks). Knobs: `MICRO_RUNS` (default 7 per arm), `MICRO_M` /
 //! `MICRO_K` / `MICRO_LANES` for the other shipped shapes — the envelope
 //! outer is `MICRO_M=29 MICRO_K=5 MICRO_LANES=24`.
-use flock_core::challenger::FsChallenger;
-use flock_core::field::F128;
-use flock_core::merkle::HashKind;
-use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::{
-    DirectEqInd, OpeningGrinding, PackedDirectClaim, PcsParams, VIRTUAL_B_OVERRIDE,
-    commit_lane_major, open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding,
+use std::{env::var, sync::atomic::Ordering, time::Instant};
+
+use bincode::serialize;
+use flock_core::{
+    challenger::FsChallenger,
+    field::F128,
+    merkle::HashKind,
+    pcs::{
+        DirectEqInd, OpeningGrinding, PackedDirectClaim, PcsParams, VIRTUAL_B_OVERRIDE,
+        commit_lane_major, ligerito::LigeritoProfile,
+        open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding,
+    },
+    zerocheck::PaddingSpec,
 };
-use flock_core::zerocheck::PaddingSpec;
-use std::sync::atomic::Ordering;
 
 const DOMAIN: &[u8] = b"flock-virtual-b-microbench";
 
@@ -45,16 +49,12 @@ impl Rng {
 #[test]
 #[ignore] // Benchmark + byte oracle — run explicitly with --nocapture.
 fn virtual_b_microbench() {
-    let runs: usize = std::env::var("MICRO_RUNS")
+    let runs: usize = var("MICRO_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7);
-    let env = |k: &str, d: usize| -> usize {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d)
-    };
+    let env =
+        |k: &str, d: usize| -> usize { var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) };
     let (m, k, lanes) = (
         env("MICRO_M", 32),
         env("MICRO_K", 6),
@@ -99,7 +99,7 @@ fn virtual_b_microbench() {
         VIRTUAL_B_OVERRIDE.store(arm, Ordering::Relaxed);
         let w = q.clone();
         let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let proof = open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
             w,
             &prover_data,
@@ -113,7 +113,7 @@ fn virtual_b_microbench() {
             &mut ch,
         );
         let ms = t.elapsed().as_secs_f64() * 1e3;
-        (ms, bincode::serialize(&proof).expect("serialize"))
+        (ms, serialize(&proof).expect("serialize"))
     };
 
     // Warm both arms (first-touch pages, scratch pools) before timing, and

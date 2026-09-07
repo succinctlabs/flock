@@ -33,12 +33,24 @@
 //! a *regenerated* circuit must be the SAME circuit, not merely an equivalent
 //! one.
 
-use std::any::{Any, TypeId};
+use core::ops::Range;
+use std::{
+    any::{Any, TypeId, type_name},
+    cmp::Reverse,
+    env::var,
+    mem::take,
+    sync::Arc,
+    time::Instant,
+};
 
-use crate::field::F128;
-use crate::schedule::{IoDirection, Registry, TableType};
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
-use super::{Cell, Circuit, CircuitError};
+use crate::{
+    alloc_zeroed_vec,
+    circuit::{Cell, Circuit, CircuitError},
+    field::F128,
+    schedule::{IoDirection, Registry, TableType},
+};
 
 /// A value in the circuit, and the cells that must hold it.
 ///
@@ -82,7 +94,7 @@ impl SlotWitness {
     /// over a `width << nu` buffer, rows in declaration order. Every
     /// element gate's `witness()` is this call.
     pub fn element_from_rows<R: AsRef<[F128]>>(width: usize, nu: usize, rows: &[R]) -> Self {
-        let mut z = crate::alloc_zeroed_vec::<F128>(width << nu);
+        let mut z = alloc_zeroed_vec::<F128>(width << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.as_ref().iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -216,7 +228,7 @@ where
         let hint = hint.downcast_ref::<G::Hint>().unwrap_or_else(|| {
             panic!(
                 "gate expects a hint of type {}; use gate_hinted and supply one",
-                std::any::type_name::<G::Hint>()
+                type_name::<G::Hint>()
             )
         });
         let row = self.gate.eval(inputs, hint, outputs);
@@ -255,7 +267,7 @@ where
             let hint = hint_any.downcast_ref::<G::Hint>().unwrap_or_else(|| {
                 panic!(
                     "gate expects a hint of type {}; use gate_hinted and supply one",
-                    std::any::type_name::<G::Hint>()
+                    type_name::<G::Hint>()
                 )
             });
             scratch_out.clear();
@@ -611,7 +623,7 @@ impl ShapeBuilder {
         if ra == rb {
             return;
         }
-        let cells = std::mem::take(&mut self.wires[rb]);
+        let cells = take(&mut self.wires[rb]);
         self.wires[ra].extend(cells);
         self.parent[rb] = ra;
     }
@@ -661,7 +673,7 @@ impl ShapeBuilder {
             })
             .collect();
         let mut order: Vec<usize> = (0..meta.len()).collect();
-        order.sort_by_key(|&i| (meta[i].0, std::cmp::Reverse(meta[i].1)));
+        order.sort_by_key(|&i| (meta[i].0, Reverse(meta[i].1)));
 
         let registry = Registry::new(
             order
@@ -753,7 +765,7 @@ impl ShapeBuilder {
             nu: self.nu,
             order,
             registry_slot,
-            slots: self.slots.into_iter().map(std::sync::Arc::from).collect(),
+            slots: self.slots.into_iter().map(Arc::from).collect(),
             slot_types: self.slot_types,
             steps,
             n_wires,
@@ -799,7 +811,7 @@ pub struct CircuitShape {
     /// before `finish` moved them here) — and shared slots are what makes
     /// the shape `Clone`, so a statement-independent shape can be built
     /// once and reused across proofs.
-    slots: Vec<std::sync::Arc<dyn SlotBuild>>,
+    slots: Vec<Arc<dyn SlotBuild>>,
     slot_types: Vec<TypeId>,
     steps: Vec<Step>,
     n_wires: usize,
@@ -864,12 +876,7 @@ impl CircuitShape {
         let mut rows: Vec<Box<dyn Any + Send>> = self.slots.iter().map(|s| s.new_rows()).collect();
 
         if self.islands.len() >= 2 {
-            // Declared-independent islands run in PARALLEL, each on a COPY of
-            // the value state (a few MB — the safe alternative to shared
-            // mutation: a violated independence contract fails as a
-            // deterministic "no value yet" assert inside its island, and
-            // conflicting writes are caught at the merge, never a race).
-            use rayon::prelude::*;
+            // Declared-independent islands run in parallel on copied value state.
             let hinted_before = |at: usize| self.steps[..at].iter().filter(|s| s.hinted).count();
             for w in self.islands.windows(2) {
                 assert_eq!(
@@ -1170,9 +1177,9 @@ impl CircuitShape {
         hints: &[&(dyn Any + Sync)],
     ) -> CircuitWitness {
         let mut w = self.run_filled_deferred(plan, inputs, hints);
-        let t_pack = std::time::Instant::now();
+        let t_pack = Instant::now();
         self.pack_witnesses(&mut w);
-        if std::env::var("FILL_TRACE").is_ok() {
+        if var("FILL_TRACE").is_ok() {
             eprintln!(
                 "  [run_filled] pack_witnesses {:.2} ms",
                 t_pack.elapsed().as_secs_f64() * 1e3
@@ -1218,7 +1225,7 @@ impl CircuitShape {
             hints.len()
         );
 
-        let t_run = std::time::Instant::now();
+        let t_run = Instant::now();
         let mut values = vec![F128::ZERO; self.n_wires];
         for &(r, ord) in &plan.input_fills {
             values[r as usize] = inputs[ord as usize];
@@ -1244,10 +1251,7 @@ impl CircuitShape {
                 &mut scratch_out,
             );
         } else {
-            // The islands run in parallel, each on its compact local tape:
-            // gather in, evaluate, scatter back — no value-state clones, no
-            // full-width merges; disjointness was proven at compile time.
-            use rayon::prelude::*;
+            // Each island evaluates its compact local tape in parallel.
             let pre = plan.islands[0].batches.0 as usize;
             let suf = plan.islands.last().expect("nonempty").batches.1 as usize;
             self.exec_batches(
@@ -1259,7 +1263,7 @@ impl CircuitShape {
                 &mut scratch_in,
                 &mut scratch_out,
             );
-            let t_isl = std::time::Instant::now();
+            let t_isl = Instant::now();
             let results: Vec<(Vec<F128>, Vec<Box<dyn Any + Send>>)> = plan
                 .islands
                 .par_iter()
@@ -1272,7 +1276,7 @@ impl CircuitShape {
                         self.slots.iter().map(|s| s.new_rows()).collect();
                     let mut si: Vec<F128> = Vec::with_capacity(16);
                     let mut so: Vec<F128> = Vec::with_capacity(16);
-                    if std::env::var("FILL_CENSUS").is_ok() {
+                    if var("FILL_CENSUS").is_ok() {
                         // Per-slot time attribution inside this island,
                         // batch-serial so the numbers are exact. DECLARED
                         // slot indices — map them with the harness's own
@@ -1280,7 +1284,7 @@ impl CircuitShape {
                         // residual gates' per-row constant inversions.
                         let mut per_slot = vec![(0f64, 0usize); self.slots.len()];
                         for bi in isl.batches.0 as usize..isl.batches.1 as usize {
-                            let t = std::time::Instant::now();
+                            let t = Instant::now();
                             self.exec_batches(
                                 plan,
                                 bi..bi + 1,
@@ -1319,7 +1323,7 @@ impl CircuitShape {
                     (local, irows)
                 })
                 .collect();
-            let t_merge = std::time::Instant::now();
+            let t_merge = Instant::now();
             for (isl, (local, irows)) in plan.islands.iter().zip(results) {
                 for &(l, g) in &isl.scatter {
                     values[g as usize] = local[l as usize];
@@ -1328,7 +1332,7 @@ impl CircuitShape {
                     self.slots[d].merge_rows(rows[d].as_mut(), src);
                 }
             }
-            let t_suf = std::time::Instant::now();
+            let t_suf = Instant::now();
             self.exec_batches(
                 plan,
                 suf..plan.batches.len(),
@@ -1338,7 +1342,7 @@ impl CircuitShape {
                 &mut scratch_in,
                 &mut scratch_out,
             );
-            if std::env::var("FILL_TRACE").is_ok() {
+            if var("FILL_TRACE").is_ok() {
                 eprintln!(
                     "  [run_filled] prefix {:.2} | islands {:.2} | merge {:.2} | suffix {:.2} ms",
                     t_isl.duration_since(t_run).as_secs_f64() * 1e3,
@@ -1350,7 +1354,7 @@ impl CircuitShape {
         }
 
         let public: Vec<F128> = self.publics.iter().map(|&r| values[r]).collect();
-        if std::env::var("FILL_TRACE").is_ok() {
+        if var("FILL_TRACE").is_ok() {
             eprintln!(
                 "  [run_filled] batches+islands+publics {:.2} ms",
                 t_run.elapsed().as_secs_f64() * 1e3,
@@ -1384,7 +1388,7 @@ impl CircuitShape {
     fn exec_batches(
         &self,
         plan: &FillPlan,
-        range: core::ops::Range<usize>,
+        range: Range<usize>,
         values: &mut [F128],
         rows: &mut [Box<dyn Any + Send>],
         hints: &[&(dyn Any + Sync)],
@@ -1416,7 +1420,7 @@ impl CircuitShape {
     /// range (hints are consumed in absolute instantiation order).
     fn exec_steps(
         &self,
-        range: core::ops::Range<usize>,
+        range: Range<usize>,
         values: &mut [F128],
         set: &mut [bool],
         rows: &mut [Box<dyn Any + Send>],
@@ -1512,7 +1516,7 @@ impl CircuitWitness {
     /// gate-typed accessor cannot serve it. A wrong `R` still fails loudly
     /// on the downcast.
     pub fn take_rows_of<R: Send + 'static>(&mut self, s: SlotId) -> Vec<R> {
-        std::mem::take(
+        take(
             self.rows[s.0]
                 .downcast_mut::<Vec<R>>()
                 .expect("slot rows are not of this row type"),
@@ -1638,10 +1642,16 @@ fn decode(c: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::element_r1cs::{ElementTableBuilder, ElementTableType};
-    use crate::schedule::IoWord;
     use std::sync::Arc;
+
+    use crate::{
+        circuit::builder::{
+            Any, Cell, Circuit, CircuitBuilder, F128, GateType, Registry, ShapeBuilder,
+            SlotWitness, TableType, Wire,
+        },
+        element_r1cs::{ElementTableBuilder, ElementTableType},
+        schedule::IoWord,
+    };
 
     #[test]
     fn fixed_public_values_are_digest_bound_and_checked() {

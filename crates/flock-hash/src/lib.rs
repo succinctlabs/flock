@@ -1,24 +1,15 @@
-//! Selection of the hash function backing a protocol component.
+//! Hash functions for commitments and Fiat-Shamir transcripts.
 //!
-//! Two components are independently configurable, and they are genuinely
-//! independent — a proof can use BLAKE3 Merkle commitments with a SHA-256
-//! Fiat-Shamir transcript, or any other combination:
-//!
-//! - the Merkle commitments, via [`crate::pcs::commit::PcsParams::merkle_hash`]
-//!   (see [`crate::merkle`]);
-//! - the Fiat-Shamir transcript and its proof-of-work grinding, via
-//!   [`crate::challenger::FsChallenger::with_hash`].
-//!
-//! Both default to BLAKE3 (the faster hash on this codebase's NEON multi-lane
-//! kernels); SHA-256 remains selectable per component.
+//! Each protocol component selects its hash independently. The default is BLAKE3 (the faster hash on this codebase's NEON
+//! multi-lane kernels); SHA-256 remains selectable per component.
+
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use serde::{Deserialize, Serialize};
 
-/// Which hash function backs a component.
-///
-/// `Blake3` is the default (Merkle tree and Fiat-Shamir transcript alike).
-/// Serialized params and configs that
-/// predate these options deserialize unchanged.
+pub type Digest = [u8; 32];
+
+/// A supported hash function.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HashKind {
@@ -52,21 +43,11 @@ impl HashKind {
     }
 }
 
-impl std::fmt::Display for HashKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for HashKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str(self.as_str())
     }
 }
-
-// ---------------------------------------------------------------------------
-// The raw BLAKE3 compression function.
-//
-// Moved here from `flock-prover`'s blake3 table module so the CHALLENGER can
-// build the sponge-chained Fiat–Shamir discipline on the same primitive the
-// circuit's BLAKE3 gate proves (transcript-v2; the prover delegates to this
-// copy — one implementation). Verbatim RFC-compliant compression; for
-// chaining, the new CV is `out[0..8]`.
-// ---------------------------------------------------------------------------
 
 /// BLAKE3's initial chaining value.
 pub const BLAKE3_IV: [u32; 8] = [
@@ -99,6 +80,7 @@ fn b3_round(state: &mut [u32; 16], block: &[u32; 16]) {
 
 /// BLAKE3 compression. Returns the full 16-word output state
 /// (post-finalization XOR); the chaining CV is `out[0..8]`.
+#[inline]
 pub fn blake3_compress(
     cv: &[u32; 8],
     block_words: &[u32; 16],
@@ -144,7 +126,9 @@ pub fn blake3_compress(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use serde_json::{from_str, to_string};
+
+    use crate::HashKind;
 
     /// Every variant, for tests that sweep both.
     pub(crate) const ALL: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
@@ -167,13 +151,9 @@ mod tests {
     #[test]
     fn serde_uses_config_spellings() {
         for kind in ALL {
-            let json = serde_json::to_string(&kind).unwrap();
+            let json = to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{}\"", kind.as_str()));
-            assert_eq!(
-                serde_json::from_str::<HashKind>(&json).unwrap(),
-                kind,
-                "{kind}"
-            );
+            assert_eq!(from_str::<HashKind>(&json).unwrap(), kind, "{kind}");
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::field::F128;
+use crate::field::{F128, gf2_128::aarch64::ghash_mul_vec2_neon};
 
 /// Process two butterflies at a time within a block sharing one twiddle.
 ///
@@ -6,8 +6,6 @@ use crate::field::F128;
 /// Requires the `aes` target feature.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: usize) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
-
     debug_assert!(half >= 2);
     debug_assert_eq!(chunk.len(), 2 * half);
     let mut idx0 = 0;
@@ -52,8 +50,6 @@ pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: us
 /// Requires the `aes` target feature.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn butterfly_block_pair(chunk: &mut [F128], t_a: F128, t_b: F128) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
-
     debug_assert_eq!(chunk.len(), 4);
     let u_a = chunk[0];
     let v_a = chunk[1];
@@ -197,7 +193,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     twiddles: &[F128; 7],
     zero_root: bool,
 ) {
-    use core::arch::aarch64::*;
+    use core::arch::aarch64::{uint64x2_t, vld1q_u64, vst1q_u64};
     unsafe {
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
@@ -241,7 +237,7 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
     t_zero: &[F128; 7],
     t_gen: &[F128; 7],
 ) {
-    use core::arch::aarch64::*;
+    use core::arch::aarch64::{uint64x2_t, vld1q_u64, vst1q_u64};
 
     #[inline(always)]
     unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {

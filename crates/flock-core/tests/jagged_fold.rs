@@ -8,10 +8,15 @@
 //! verifier's own statements (`frobenius_statements`) lands with the
 //! assertion-export step, mirroring how sigma route B was pinned.
 
-use flock_core::challenger::FsChallenger;
-use flock_core::field::F128;
-use flock_core::matrix_fold::{self, JaggedClaim, JaggedRowWeight, JaggedTable, MatrixClaim};
-use flock_core::pcs::jagged::JaggedParams;
+use flock_core::{
+    challenger::FsChallenger,
+    field::F128,
+    matrix_fold::{
+        FoldError, JaggedClaim, JaggedRowWeight, JaggedTable, MatrixClaim, discharge_jagged,
+        prove_fold_jagged, verify_fold_jagged,
+    },
+    pcs::jagged::JaggedParams,
+};
 
 struct Rng(u64);
 impl Rng {
@@ -175,13 +180,13 @@ fn jagged_fold_verifies_inherits_and_discharges_at_the_root() {
     claims.extend(proof_claims(&table, &mut rng));
 
     let mut chp = FsChallenger::new(b"jagged-fold-test");
-    let (fproof, folded_p) = matrix_fold::prove_fold_jagged(&table, &claims, &mut chp);
+    let (fproof, folded_p) = prove_fold_jagged(&table, &claims, &mut chp);
     let mut chv = FsChallenger::new(b"jagged-fold-test");
-    let folded_v = matrix_fold::verify_fold_jagged(table.k, &claims, &fproof, &mut chv)
-        .expect("the jagged fold verifies");
+    let folded_v =
+        verify_fold_jagged(table.k, &claims, &fproof, &mut chv).expect("the jagged fold verifies");
     assert_eq!(folded_p, folded_v, "prover and verifier agree on the fold");
     assert!(
-        matrix_fold::discharge_jagged(&folded_v, &table),
+        discharge_jagged(&folded_v, &table),
         "the folded claim discharges — the root evaluation"
     );
 
@@ -190,13 +195,13 @@ fn jagged_fold_verifies_inherits_and_discharges_at_the_root() {
     let mut next = vec![JaggedClaim::from_folded(&folded_v).expect("folded claims are plain eq")];
     next.extend(proof_claims(&table, &mut rng));
     let mut chp = FsChallenger::new(b"jagged-fold-lvl2");
-    let (fproof2, folded2) = matrix_fold::prove_fold_jagged(&table, &next, &mut chp);
+    let (fproof2, folded2) = prove_fold_jagged(&table, &next, &mut chp);
     let mut chv = FsChallenger::new(b"jagged-fold-lvl2");
-    let folded2_v = matrix_fold::verify_fold_jagged(table.k, &next, &fproof2, &mut chv)
+    let folded2_v = verify_fold_jagged(table.k, &next, &fproof2, &mut chv)
         .expect("the inherited fold verifies");
     assert_eq!(folded2, folded2_v);
     assert!(
-        matrix_fold::discharge_jagged(&folded2, &table),
+        discharge_jagged(&folded2, &table),
         "the inherited fold discharges"
     );
 
@@ -205,14 +210,14 @@ fn jagged_fold_verifies_inherits_and_discharges_at_the_root() {
     lying[0].value += F128::ONE;
     let mut chv = FsChallenger::new(b"jagged-fold-test");
     assert!(
-        matrix_fold::verify_fold_jagged(table.k, &lying, &fproof, &mut chv).is_err(),
+        verify_fold_jagged(table.k, &lying, &fproof, &mut chv).is_err(),
         "a tampered input claim fails the fold replay"
     );
 
     // A tampered folded value fails the discharge.
     let mut bad = folded_v.clone();
     bad.value += F128::ONE;
-    assert!(!matrix_fold::discharge_jagged(&bad, &table));
+    assert!(!discharge_jagged(&bad, &table));
 
     // The key discipline: the same folded claim must NOT discharge against
     // a different layout — claims are about ONE height vector.
@@ -221,7 +226,7 @@ fn jagged_fold_verifies_inherits_and_discharges_at_the_root() {
     other_heights[4] = 0;
     let other = JaggedTable::from_params(&params_from_heights(&other_heights, N, M));
     assert!(
-        !matrix_fold::discharge_jagged(&folded_v, &other),
+        !discharge_jagged(&folded_v, &other),
         "a claim about one height vector fails another's discharge"
     );
 
@@ -230,13 +235,13 @@ fn jagged_fold_verifies_inherits_and_discharges_at_the_root() {
     short.row_rounds.pop();
     let mut chv = FsChallenger::new(b"jagged-fold-test");
     assert_eq!(
-        matrix_fold::verify_fold_jagged(table.k, &claims, &short, &mut chv),
-        Err(matrix_fold::FoldError::Malformed)
+        verify_fold_jagged(table.k, &claims, &short, &mut chv),
+        Err(FoldError::Malformed)
     );
     let mut chv = FsChallenger::new(b"jagged-fold-test");
     assert_eq!(
-        matrix_fold::verify_fold_jagged(table.k, &[], &fproof, &mut chv),
-        Err(matrix_fold::FoldError::Malformed)
+        verify_fold_jagged(table.k, &[], &fproof, &mut chv),
+        Err(FoldError::Malformed)
     );
 }
 
@@ -274,16 +279,16 @@ fn distinct_heights_are_distinct_tables() {
     // the root discharge catches it.
     let claims = vec![ca];
     let mut chp = FsChallenger::new(b"jagged-cross");
-    let (fproof, folded) = matrix_fold::prove_fold_jagged(&tb, &claims, &mut chp);
+    let (fproof, folded) = prove_fold_jagged(&tb, &claims, &mut chp);
     let _: &MatrixClaim = &folded;
     assert!(
-        matrix_fold::discharge_jagged(&folded, &tb),
+        discharge_jagged(&folded, &tb),
         "the honest prover's output is an honest B-statement"
     );
     let mut chv = FsChallenger::new(b"jagged-cross");
     assert_eq!(
-        matrix_fold::verify_fold_jagged(tb.k, &claims, &fproof, &mut chv),
-        Err(matrix_fold::FoldError::ConsistencyFailed { which: "col" }),
+        verify_fold_jagged(tb.k, &claims, &fproof, &mut chv),
+        Err(FoldError::ConsistencyFailed { which: "col" }),
         "the foreign value diverges the replay — the accumulation gate"
     );
 }

@@ -78,16 +78,33 @@
 //! fixed Boolean pattern, which is why they open as **packed-direct** claims
 //! with a `Sparse` eq tensor and no ring-switching.
 
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use core::ops::Range;
 
-use super::lincheck::{column_sumcheck_prove, column_sumcheck_replay};
-use super::{ElementTableType, Grinding, zerocheck};
-use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::matrix_fold::MatrixClaim;
-use crate::union::{ElementSlotLayout, UnionInstance};
-use crate::zerocheck::univariate_skip::build_eq;
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice};
+use serde::{Deserialize, Serialize};
+use zerocheck::{
+    Claim, ElementZerocheckError, RowSupport, prove_with_support_with_grinding,
+    verify_with_label_and_grinding,
+};
+
+use crate::{
+    challenger::Challenger,
+    element_r1cs::{
+        ElementTableType, Grinding,
+        lincheck::{
+            ElementLincheckError, Proof as LincheckProof, column_sumcheck_prove,
+            column_sumcheck_replay,
+        },
+        zerocheck,
+        zerocheck::Proof as ZerocheckProof,
+    },
+    field::F128,
+    matrix_fold::{MatrixClaim, Weight, bilinear},
+    pcs::ring_switch::build_eq_parallel,
+    scratch::{give_zeroed_f128, take_zeroed_f128},
+    union::{ElementSlotLayout, UnionInstance},
+    zerocheck::univariate_skip::build_eq,
+};
 
 /// Domain labels of the region PIOP's two phases — distinct from the
 /// standalone single-table labels, so a region proof can never be replayed as
@@ -127,7 +144,7 @@ pub fn region_slots<'r>(union: &UnionInstance<'r>) -> Vec<RegionSlot<'r>> {
 /// the jagged heights use, so prover and verifier cannot disagree about which
 /// rows exist — and it changes no round message, so it is invisible to the
 /// verifier entirely.
-fn row_support(slots: &[RegionSlot<'_>], nu: usize, e_vars: usize) -> zerocheck::RowSupport {
+fn row_support(slots: &[RegionSlot<'_>], nu: usize, e_vars: usize) -> RowSupport {
     let n_cols = 1usize << (e_vars - nu);
     let mut live = vec![0usize; n_cols];
     let mut a_dead = vec![F128::ZERO; n_cols];
@@ -143,7 +160,7 @@ fn row_support(slots: &[RegionSlot<'_>], nu: usize, e_vars: usize) -> zerocheck:
             b_dead[off + y] = s.ty.b_const()[y];
         }
     }
-    zerocheck::RowSupport {
+    RowSupport {
         live,
         a_dead,
         b_dead,
@@ -153,8 +170,8 @@ fn row_support(slots: &[RegionSlot<'_>], nu: usize, e_vars: usize) -> zerocheck:
 /// The region PIOP's proof: the two phases' round messages and final values.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proof {
-    pub zerocheck: zerocheck::Proof,
-    pub lincheck: super::lincheck::Proof,
+    pub zerocheck: ZerocheckProof,
+    pub lincheck: LincheckProof,
 }
 
 /// The two witness evaluation claims a verified region PIOP leaves behind, in
@@ -174,8 +191,8 @@ pub struct Claims {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
-    Zerocheck(zerocheck::VerifyError),
+pub enum ElementUnionError {
+    Zerocheck(ElementZerocheckError),
     /// Wrong number of lincheck round messages (expected `E − nu`).
     LincheckRoundCount {
         expected: usize,
@@ -236,7 +253,7 @@ pub fn prove_with_grinding<C: Challenger>(
     // support so the row rounds cost `O(Σ n_t · used_cols)` instead of
     // `O(2^E)`. Bit-identical to the dense path — see `zerocheck::RowSupport`.
     let support = row_support(&slots, nu, e_vars);
-    let (zc_proof, zc) = zerocheck::prove_with_support_with_grinding(
+    let (zc_proof, zc) = prove_with_support_with_grinding(
         ZC_LABEL,
         pa,
         pb,
@@ -278,7 +295,7 @@ pub fn prove_with_grinding<C: Challenger>(
     // accumulates must name the static matrix alone.
     let r_col: Vec<F128> = bind_order.iter().rev().copied().collect();
     let matrix_evals = slot_matrix_evals(&slots, nu, &zc.r, &r_col);
-    let lc_proof = super::lincheck::Proof {
+    let lc_proof = LincheckProof {
         rounds: lc_rounds,
         z_eval: g[0],
         matrix_evals,
@@ -300,7 +317,7 @@ pub fn verify<C: Challenger>(
     union: &UnionInstance<'_>,
     proof: &Proof,
     ch: &mut C,
-) -> Result<Claims, VerifyError> {
+) -> Result<Claims, ElementUnionError> {
     verify_with_grinding(union, proof, Grinding::disabled(), ch)
 }
 
@@ -309,7 +326,7 @@ pub fn verify_with_grinding<C: Challenger>(
     proof: &Proof,
     grinding: Grinding,
     ch: &mut C,
-) -> Result<Claims, VerifyError> {
+) -> Result<Claims, ElementUnionError> {
     let (claims, assertion) = verify_deferred_with_grinding(union, proof, grinding, ch)?;
     assertion.check_reported(union)?;
     Ok(claims)
@@ -321,7 +338,7 @@ pub fn verify_deferred<C: Challenger>(
     union: &UnionInstance<'_>,
     proof: &Proof,
     ch: &mut C,
-) -> Result<(Claims, ElementAssertion), VerifyError> {
+) -> Result<(Claims, ElementAssertion), ElementUnionError> {
     verify_deferred_with_grinding(union, proof, Grinding::disabled(), ch)
 }
 
@@ -330,7 +347,7 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
     proof: &Proof,
     grinding: Grinding,
     ch: &mut C,
-) -> Result<(Claims, ElementAssertion), VerifyError> {
+) -> Result<(Claims, ElementAssertion), ElementUnionError> {
     let slots = region_slots(union);
     let (nu, e_vars) = (union.n_log(), union.m_elem() - 7);
     assert!(
@@ -339,21 +356,20 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
     );
     let lc_rounds = e_vars - nu;
     if proof.lincheck.rounds.len() != lc_rounds {
-        return Err(VerifyError::LincheckRoundCount {
+        return Err(ElementUnionError::LincheckRoundCount {
             expected: lc_rounds,
             got: proof.lincheck.rounds.len(),
         });
     }
 
-    let zc =
-        zerocheck::verify_with_label_and_grinding(ZC_LABEL, e_vars, &proof.zerocheck, grinding, ch)
-            .map_err(VerifyError::Zerocheck)?;
+    let zc = verify_with_label_and_grinding(ZC_LABEL, e_vars, &proof.zerocheck, grinding, ch)
+        .map_err(ElementUnionError::Zerocheck)?;
     let (va, vb, a_const_eval, b_const_eval) = strip_constants(&slots, nu, &zc);
 
     ch.observe_label(LC_LABEL);
     let expected_nonces = grinding.lincheck_nonce_count(lc_rounds);
     if proof.lincheck.grinding_nonces.len() != expected_nonces {
-        return Err(VerifyError::LincheckGrindingNonceCount {
+        return Err(ElementUnionError::LincheckGrindingNonceCount {
             expected: expected_nonces,
             got: proof.lincheck.grinding_nonces.len(),
         });
@@ -362,7 +378,7 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
     let alpha = if let Some(bits) = grinding.alpha_bits() {
         let alpha = ch
             .verify_pow_and_sample_f128(proof.lincheck.grinding_nonces[nonce_idx], bits)
-            .ok_or(VerifyError::LincheckGrindingInvalid { which: "alpha" })?;
+            .ok_or(ElementUnionError::LincheckGrindingInvalid { which: "alpha" })?;
         nonce_idx += 1;
         alpha
     } else {
@@ -377,10 +393,10 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
         ch,
     )
     .map_err(|err| match err {
-        super::lincheck::VerifyError::InvalidGrindingNonce { which } => {
-            VerifyError::LincheckGrindingInvalid { which }
+        ElementLincheckError::InvalidGrindingNonce { which } => {
+            ElementUnionError::LincheckGrindingInvalid { which }
         }
-        _ => VerifyError::LincheckFinalFailed,
+        _ => ElementUnionError::LincheckFinalFailed,
     })?;
     debug_assert_eq!(nonce_idx, proof.lincheck.grinding_nonces.len());
 
@@ -416,7 +432,7 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
 /// would be a transcript break.
 fn assemble_claims(
     union: &UnionInstance<'_>,
-    zc: &zerocheck::Claim,
+    zc: &Claim,
     bind_order: &[F128],
     lc_value: F128,
 ) -> Claims {
@@ -450,11 +466,7 @@ fn assemble_claims(
 /// sum away by partition of unity and the slot contributes
 /// `eq(r[ν+κ_t..], q_t) · Σ_c eq(r[ν..ν+κ_t], c)·a_const_t[c]`. Gaps
 /// contribute nothing (no slot owns them). `O(Σ_t 2^{κ_t})`.
-fn strip_constants(
-    slots: &[RegionSlot<'_>],
-    nu: usize,
-    zc: &zerocheck::Claim,
-) -> (F128, F128, F128, F128) {
+fn strip_constants(slots: &[RegionSlot<'_>], nu: usize, zc: &Claim) -> (F128, F128, F128, F128) {
     let mut a_sum = F128::ZERO;
     let mut b_sum = F128::ZERO;
     for s in slots {
@@ -547,11 +559,11 @@ fn slot_matrix_evals(
         .iter()
         .map(|s| {
             let kappa = s.layout.kappa;
-            let row = crate::matrix_fold::Weight::eq(r[nu..nu + kappa].to_vec());
-            let col = crate::matrix_fold::Weight::eq(r_col[..kappa].to_vec());
+            let row = Weight::eq(r[nu..nu + kappa].to_vec());
+            let col = Weight::eq(r_col[..kappa].to_vec());
             (
-                crate::matrix_fold::bilinear(&row, &col, s.ty.a_0()),
-                crate::matrix_fold::bilinear(&row, &col, s.ty.b_0()),
+                bilinear(&row, &col, s.ty.a_0()),
+                bilinear(&row, &col, s.ty.b_0()),
             )
         })
         .collect()
@@ -587,8 +599,8 @@ impl ElementAssertion {
             .zip(&self.evals)
             .map(|(s, &(va, vb))| {
                 let kappa = s.layout.kappa;
-                let row = crate::matrix_fold::Weight::eq(self.r_con[..kappa].to_vec());
-                let col = crate::matrix_fold::Weight::eq(self.r_col[..kappa].to_vec());
+                let row = Weight::eq(self.r_con[..kappa].to_vec());
+                let col = Weight::eq(self.r_col[..kappa].to_vec());
                 (
                     MatrixClaim {
                         row: row.clone(),
@@ -607,11 +619,11 @@ impl ElementAssertion {
 
     /// Check the reported values reproduce the target — scalars only, no
     /// matrix read.
-    pub fn check_reported(&self, union: &UnionInstance<'_>) -> Result<(), VerifyError> {
+    pub fn check_reported(&self, union: &UnionInstance<'_>) -> Result<(), ElementUnionError> {
         let nu = union.n_log();
         let slots = region_slots(union);
         if self.evals.len() != slots.len() {
-            return Err(VerifyError::LincheckFinalFailed);
+            return Err(ElementUnionError::LincheckFinalFailed);
         }
         let mut acc = F128::ZERO;
         for (s, &(va, vb)) in slots.iter().zip(&self.evals) {
@@ -621,55 +633,50 @@ impl ElementAssertion {
             acc += w_r * w_col * (va + self.alpha * vb);
         }
         if acc * self.z_eval != self.target {
-            return Err(VerifyError::LincheckFinalFailed);
+            return Err(ElementUnionError::LincheckFinalFailed);
         }
         Ok(())
     }
 }
 
-/// Closed-form `Ĉomb(r_col)` — what the verifier used to evaluate inline,
-/// now the differential oracle for the reported path
-/// (`reported_evals_match_the_inline_comb`). Reads the base matrices, which
-/// is exactly why the verifier no longer calls it.
 #[cfg(test)]
-fn region_comb_at_oracle(
-    slots: &[RegionSlot<'_>],
-    nu: usize,
-    alpha: F128,
-    r: &[F128],
-    r_col: &[F128],
-) -> F128 {
-    region_comb_at(slots, nu, alpha, r, r_col)
-}
+mod test_support {
+    use crate::element_r1cs::union::{F128, RegionSlot, build_eq, eq_prefix_weight, slot_comb};
 
-/// Closed-form `Ĉomb(r_col)` — the verifier's counterpart of
-/// [`region_comb`], without materializing anything region-sized: each slot
-/// contributes its own comb MLE at the bound point times the subcube prefix-eq
-/// factor "the bound point addresses slot `t`".
-#[cfg_attr(not(test), allow(dead_code))]
-fn region_comb_at(
-    slots: &[RegionSlot<'_>],
-    nu: usize,
-    alpha: F128,
-    r: &[F128],
-    r_col: &[F128],
-) -> F128 {
-    let mut acc = F128::ZERO;
-    for s in slots {
-        let kappa = s.layout.kappa;
-        let comb = slot_comb(s.ty, alpha, &build_eq(&r[nu..nu + kappa]));
-        let w_r = eq_prefix_weight(&r[nu + kappa..], s.layout.region_prefix(nu));
-        // The bound COLUMN point must address this slot's block: its low
-        // `kappa` coords index the comb, its high coords freeze to `q_t`.
-        let w_col = eq_prefix_weight(&r_col[kappa..], s.layout.region_prefix(nu));
-        let eq_col = build_eq(&r_col[..kappa]);
-        let inner = comb
-            .iter()
-            .zip(&eq_col)
-            .fold(F128::ZERO, |a, (c, e)| a + *c * *e);
-        acc += w_r * w_col * inner;
+    /// Evaluates the region combination without materializing the region.
+    pub(super) fn region_comb_at(
+        slots: &[RegionSlot<'_>],
+        nu: usize,
+        alpha: F128,
+        r: &[F128],
+        r_col: &[F128],
+    ) -> F128 {
+        let mut acc = F128::ZERO;
+        for s in slots {
+            let kappa = s.layout.kappa;
+            let comb = slot_comb(s.ty, alpha, &build_eq(&r[nu..nu + kappa]));
+            let w_r = eq_prefix_weight(&r[nu + kappa..], s.layout.region_prefix(nu));
+            let w_col = eq_prefix_weight(&r_col[kappa..], s.layout.region_prefix(nu));
+            let eq_col = build_eq(&r_col[..kappa]);
+            let inner = comb
+                .iter()
+                .zip(&eq_col)
+                .fold(F128::ZERO, |a, (c, e)| a + *c * *e);
+            acc += w_r * w_col * inner;
+        }
+        acc
     }
-    acc
+
+    /// Evaluates the matrix-based reference for reported values.
+    pub(super) fn region_comb_at_oracle(
+        slots: &[RegionSlot<'_>],
+        nu: usize,
+        alpha: F128,
+        r: &[F128],
+        r_col: &[F128],
+    ) -> F128 {
+        region_comb_at(slots, nu, alpha, r, r_col)
+    }
 }
 
 /// The row collapse: `G[u] = Σ_j eq(r_row, j)·z[(u << ν) + j] = ẑ_region(r_row, u)`,
@@ -679,7 +686,7 @@ fn region_comb_at(
 /// (where it is zero), which is what makes the output claim an evaluation of
 /// the committed polynomial.
 fn collapse_rows(z: &[F128], r_row: &[F128], live: Option<&[usize]>) -> Vec<F128> {
-    let eq_row = crate::pcs::ring_switch::build_eq_parallel(r_row);
+    let eq_row = build_eq_parallel(r_row);
     let rows = eq_row.len();
     debug_assert_eq!(z.len() % rows, 0);
     z.par_chunks(rows)
@@ -766,8 +773,8 @@ pub fn copy_live_region(
     // Zero-pool buffers: all-zero without a memset, and — since [`prove`]
     // never writes its inputs — returnable via [`give_back_live_region`]
     // with exactly the spans below declared dirty.
-    let mut pa = crate::scratch::take_zeroed_f128(words);
-    let mut pb = crate::scratch::take_zeroed_f128(words);
+    let mut pa = take_zeroed_f128(words);
+    let mut pb = take_zeroed_f128(words);
     for span in live_spans(union) {
         pa[span.clone()].copy_from_slice(&a_region[span.clone()]);
         pb[span.clone()].copy_from_slice(&b_region[span]);
@@ -778,7 +785,7 @@ pub fn copy_live_region(
 /// The element region's live word spans — per slot, per used column, rows
 /// `[0, n_t)`: exactly what [`copy_live_region`] writes, and therefore the
 /// dirty ranges its give-back must re-zero.
-fn live_spans(union: &UnionInstance<'_>) -> Vec<core::ops::Range<usize>> {
+fn live_spans(union: &UnionInstance<'_>) -> Vec<Range<usize>> {
     let nu = union.n_log();
     let mut spans = Vec::new();
     for s in region_slots(union) {
@@ -798,28 +805,40 @@ fn live_spans(union: &UnionInstance<'_>) -> Vec<core::ops::Range<usize>> {
 /// poison the pool's all-zero invariant (debug builds verify it outright).
 pub fn give_back_live_region(union: &UnionInstance<'_>, pa: Vec<F128>, pb: Vec<F128>) {
     let spans = live_spans(union);
-    crate::scratch::give_zeroed_f128(pa, &spans);
-    crate::scratch::give_zeroed_f128(pb, &spans);
+    give_zeroed_f128(pa, &spans);
+    give_zeroed_f128(pb, &spans);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::challenger::FsChallenger;
-    use crate::element_r1cs::tests::{mixed_gate, mixed_witness, mult_gate, mult_witness};
-    use crate::element_r1cs::{ElementTableBuilder, ElementTableType};
-    use crate::schedule::{Registry, TableType};
-    use crate::test_rng::Rng;
-    use crate::zerocheck::multilinear::{eq_eval, fold_in_place_single};
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
+
+    use flock_multilinear::{IndexOrder, evaluate};
+    use zerocheck::{LABEL, prove_with_support};
+
+    use crate::{
+        challenger::FsChallenger,
+        element_r1cs::{
+            ElementTableBuilder, ElementTableType, broadcast_add,
+            tests::{mixed_gate, mixed_witness, mult_gate, mult_witness},
+            union::{
+                ElementUnionError, ElementZerocheckError, F128, Grinding, Proof, UnionInstance,
+                collapse_rows, eq_prefix_weight, fill_slot, prove, prove_with_grinding,
+                region_comb, region_slots, row_support,
+                test_support::{region_comb_at, region_comb_at_oracle},
+                verify, verify_deferred, verify_with_grinding,
+            },
+            zerocheck,
+        },
+        r1cs::SparseBinaryMatrix,
+        schedule::{Registry, TableClass, TableType},
+        test_rng::Rng,
+        zerocheck::multilinear::eq_eval,
+    };
 
     /// Direct MLE evaluation at `point`, binding the low variable first.
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
-        let mut t = table.to_vec();
-        for &p in point {
-            fold_in_place_single(&mut t, p);
-        }
-        t[0]
+        evaluate(table, point, IndexOrder::LowToHigh)
     }
 
     fn bits(v: usize, n: usize) -> Vec<F128> {
@@ -840,23 +859,23 @@ mod tests {
         TableType {
             k_log,
             useful_bits,
-            a_0: crate::r1cs::SparseBinaryMatrix {
+            a_0: SparseBinaryMatrix {
                 num_rows: 0,
                 num_cols: 0,
                 rows: Vec::new(),
             },
-            b_0: crate::r1cs::SparseBinaryMatrix {
+            b_0: SparseBinaryMatrix {
                 num_rows: 0,
                 num_cols: 0,
                 rows: Vec::new(),
             },
-            c_0: crate::r1cs::SparseBinaryMatrix {
+            c_0: SparseBinaryMatrix {
                 num_rows: 0,
                 num_cols: 0,
                 rows: Vec::new(),
             },
             const_pin: None,
-            class: crate::schedule::TableClass::Boolean,
+            class: TableClass::Boolean,
             io_schema: Vec::new(),
         }
     }
@@ -1305,7 +1324,7 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"element-region-grinding");
         assert!(matches!(
             verify_with_grinding(&union, &bad, grinding, &mut ch_v),
-            Err(VerifyError::LincheckGrindingNonceCount { .. })
+            Err(ElementUnionError::LincheckGrindingNonceCount { .. })
         ));
 
         // The α nonce is checked before alpha is squeezed.  The scan finds a
@@ -1319,7 +1338,7 @@ mod tests {
             let mut ch_v = FsChallenger::new(b"element-region-grinding");
             if matches!(
                 verify_with_grinding(&union, &bad, grinding, &mut ch_v),
-                Err(VerifyError::LincheckGrindingInvalid { which: "alpha" })
+                Err(ElementUnionError::LincheckGrindingInvalid { which: "alpha" })
             ) {
                 rejected_bad_nonce = true;
                 break;
@@ -1362,8 +1381,8 @@ mod tests {
             let mut ch_v = FsChallenger::new(b"element-region-bad");
             assert_eq!(
                 verify(&union, &proof, &mut ch_v),
-                Err(VerifyError::Zerocheck(
-                    zerocheck::VerifyError::SumcheckFinalFailed
+                Err(ElementUnionError::Zerocheck(
+                    ElementZerocheckError::SumcheckFinalFailed
                 )),
                 "slot {bad_slot}"
             );
@@ -1583,9 +1602,6 @@ mod tests {
     /// nothing asserts on the clock.
     #[test]
     fn support_proportional_rounds_are_bit_identical() {
-        use crate::element_r1cs::zerocheck;
-        use std::time::Instant;
-
         let mut rng = Rng::new(0x5044_0A17);
         let nu = 14usize;
         let cases = vec![mult_case(3)]; // kappa 3: 8 columns, 3 real + padding
@@ -1607,30 +1623,14 @@ mod tests {
             for rep in 0..=reps {
                 let mut ch = FsChallenger::new(b"element-rows-ab");
                 let t = Instant::now();
-                let (dense, dclaim) = zerocheck::prove_with_support(
-                    zerocheck::LABEL,
-                    &pa,
-                    &pb,
-                    &z,
-                    e_vars,
-                    nu,
-                    None,
-                    &mut ch,
-                );
+                let (dense, dclaim) =
+                    prove_with_support(LABEL, &pa, &pb, &z, e_vars, nu, None, &mut ch);
                 let ms_d = t.elapsed().as_secs_f64() * 1e3;
 
                 let mut ch = FsChallenger::new(b"element-rows-ab");
                 let t = Instant::now();
-                let (sparse, sclaim) = zerocheck::prove_with_support(
-                    zerocheck::LABEL,
-                    &pa,
-                    &pb,
-                    &z,
-                    e_vars,
-                    nu,
-                    Some(&sup),
-                    &mut ch,
-                );
+                let (sparse, sclaim) =
+                    prove_with_support(LABEL, &pa, &pb, &z, e_vars, nu, Some(&sup), &mut ch);
                 let ms_s = t.elapsed().as_secs_f64() * 1e3;
 
                 assert_eq!(dense, sparse, "n={n}: round messages must be identical");
@@ -1673,8 +1673,8 @@ dense {:6.2} [{:5.2} – {:5.2}]  support {:6.2} [{:5.2} – {:5.2}]  {:4.1}x",
         let rows = mixed_witness(&ty, nu, n, &mut rng);
 
         let (mut apply_a, mut apply_b) = ty.apply(&rows, nu);
-        crate::element_r1cs::broadcast_add(&mut apply_a, ty.a_const(), nu);
-        crate::element_r1cs::broadcast_add(&mut apply_b, ty.b_const(), nu);
+        broadcast_add(&mut apply_a, ty.a_const(), nu);
+        broadcast_add(&mut apply_b, ty.b_const(), nu);
 
         let words = ty.width() << nu;
         let mut z = vec![F128::ZERO; words];

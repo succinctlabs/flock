@@ -1,3 +1,5 @@
+use core::arch::aarch64::{veorq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8};
+
 use crate::field::F128;
 
 /// NEON one-row fold: 8 aligned 16-byte loads + 8 XORs, hand-unrolled for
@@ -18,7 +20,7 @@ pub(crate) unsafe fn fold_one_row_neon_q_unchecked_8(
     table_data: *const u8,
     bytes_ptr: *const u8,
 ) -> core::arch::aarch64::uint8x16_t {
-    use core::arch::aarch64::*;
+    use core::arch::aarch64::{veorq_u8, vld1q_u8};
     unsafe {
         const STRIDE: usize = 256 * 16;
         // One u64 load + in-register extracts instead of eight byte loads:
@@ -30,9 +32,7 @@ pub(crate) unsafe fn fold_one_row_neon_q_unchecked_8(
         for j in 1..8usize {
             acc = veorq_u8(
                 acc,
-                vld1q_u8(
-                    table_data.add(j * STRIDE + ((w >> (8 * j)) & 0xff) as usize * 16),
-                ),
+                vld1q_u8(table_data.add(j * STRIDE + ((w >> (8 * j)) & 0xff) as usize * 16)),
             );
         }
         acc
@@ -48,7 +48,6 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     table_data: *const u8,
     bytes_ptr: *const u8,
 ) -> F128 {
-    use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
         let mut acc = vld1q_u8(table_data.add((*bytes_ptr) as usize * 16));

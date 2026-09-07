@@ -1,13 +1,11 @@
-use super::*;
-
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-
 pub(super) use crate::r1cs_hashes::merkle_glue::{
     BitSpreadInput, BitSpreadTable, FamilyTransposeTileInput, FamilyTransposeTileTable,
     PowMaskInput, PowMaskTable, SwapInput, SwapTable,
 };
+use crate::tower::{F128, GateType, SLOT_WORDS, SlotWitness, TableType, digest_words, unpack8};
 
 /// One Merkle level's conditional swap. The sibling is a [`GateType::Hint`] —
 /// it is not word-aligned-wireable in the composite and nothing else reads it

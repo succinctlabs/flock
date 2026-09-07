@@ -155,6 +155,12 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "flock-field",
+ "flock-hash",
+ "flock-merkle",
+ "flock-multilinear",
+ "flock-parallel",
+ "flock-transcript",
  "rand_core",
  "rayon",
  "serde",
@@ -172,14 +178,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "flock-field"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "flock-hash"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "flock-merkle"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "flock-hash",
+ "flock-parallel",
+ "rayon",
+ "sha2",
+]
+
+[[package]]
+name = "flock-multilinear"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
+name = "flock-parallel"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "flock-prover"
 version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
  "flock-core",
+ "flock-field",
+ "flock-hash",
+ "flock-merkle",
+ "flock-multilinear",
+ "flock-transcript",
  "rayon",
  "serde",
+ "sha2",
+]
+
+[[package]]
+name = "flock-transcript"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "flock-field",
+ "flock-hash",
+ "rayon",
  "sha2",
 ]
 

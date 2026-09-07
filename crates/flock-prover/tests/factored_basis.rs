@@ -18,8 +18,7 @@
 //!
 //! i.e. the SAME factored form with `eq_col` halved. If that holds, the L0
 //! rounds never need a 2^m basis array at all.
-use flock_core::field::F128;
-use flock_core::lincheck::build_eq_table;
+use flock_core::{field::F128, lincheck::build_eq_table};
 
 /// Materialized reference: W over the whole dense domain.
 fn materialize(len: usize, h: usize, eq_row: &[F128], eq_col: &[F128]) -> Vec<F128> {

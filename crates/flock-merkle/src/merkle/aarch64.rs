@@ -1,5 +1,10 @@
-use super::{Hash, SHA256_IV, SHA256_K};
-use core::arch::aarch64::*;
+use core::arch::aarch64::{
+    uint32x4_t, vaddq_u32, vdupq_n_u32, vld1q_u8, vld1q_u32, vreinterpretq_u8_u32,
+    vreinterpretq_u32_u8, vrev32q_u8, vsha256h2q_u32, vsha256hq_u32, vsha256su0q_u32,
+    vsha256su1q_u32, vst1q_u8,
+};
+
+use crate::hashing::{Hash, SHA256_IV, SHA256_K};
 
 /// One interleaved compression round over 4 independent states.
 /// `blocks[i]` must be ≥ 64 bytes; only the first 64 are consumed.

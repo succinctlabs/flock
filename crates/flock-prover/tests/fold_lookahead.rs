@@ -10,20 +10,24 @@
 //! `f256_round1_lookahead_is_byte_identical` in flock-core; the historical
 //! byte anchors are the union m6 fixtures + the mixed-class pins.)
 
-use std::sync::atomic::Ordering;
-
-use flock_prover::challenger::FsChallenger;
-use flock_prover::pcs::ligerito::FOLD_LOOKAHEAD_OVERRIDE;
-use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression};
+use std::{
+    array::from_fn,
+    sync::{Mutex, atomic::Ordering},
+};
 
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    challenger::FsChallenger,
+    pcs::ligerito::FOLD_LOOKAHEAD_OVERRIDE,
+    r1cs_hashes::blake3::{Blake3Setup, Compression},
+};
 
 fn blocks(n: usize, seed: u64) -> Vec<Compression> {
     let mut rng = Rng(seed);
     (0..n)
         .map(|_| {
-            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = from_fn(|_| rng.next_u32());
             (cv, m, rng.next_u32() as u64, 64u32, 11u32)
         })
         .collect()
@@ -35,7 +39,7 @@ fn assert_byte_identical(n_blocks: usize, seed: u64) {
     // this store and the prover's read, both proves take the same arm, and
     // the byte-equality assert passes vacuously (an A/A). One lock per
     // A/B, released only after the override is reset.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let setup = Blake3Setup::new(n_blocks);
     let inputs = blocks(n_blocks, seed);

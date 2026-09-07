@@ -16,12 +16,17 @@
 //!
 //! Run: cargo run --release --quiet --bin dump_blake3_lincheck_matrices -- <out.bin>
 
-use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
 
-use flock_prover::r1cs::SparseBinaryMatrix;
-use flock_prover::r1cs_hashes::blake3::{K, USEFUL_BITS, build_matrices};
+use env::args;
+use flock_prover::{
+    r1cs::SparseBinaryMatrix,
+    r1cs_hashes::blake3::{K, USEFUL_BITS, build_matrices},
+};
 
 fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     let mut col_ptr = vec![0u32; m.num_cols + 1];
@@ -44,19 +49,19 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     (col_ptr, rows_flat)
 }
 
-fn write_u32(w: &mut impl Write, v: u32) -> std::io::Result<()> {
+fn write_u32(w: &mut impl Write, v: u32) -> Result<()> {
     w.write_all(&v.to_le_bytes())
 }
 
-fn write_u32s(w: &mut impl Write, v: &[u32]) -> std::io::Result<()> {
+fn write_u32s(w: &mut impl Write, v: &[u32]) -> Result<()> {
     for &x in v {
         w.write_all(&x.to_le_bytes())?;
     }
     Ok(())
 }
 
-fn main() -> std::io::Result<()> {
-    let out = env::args()
+fn main() -> Result<()> {
+    let out = args()
         .nth(1)
         .unwrap_or_else(|| "blake3_lincheck_matrices.bin".to_string());
 

@@ -20,34 +20,34 @@
 //!
 //! Run: cargo run --release --bin dump_zerocheck_round2_vectors -- cuda-ghash/zerocheck_round2_vectors.bin 15
 
-use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-
-use flock_prover::field::F128;
-use flock_prover::zerocheck::PaddingSpec;
-use flock_prover::zerocheck::multilinear::{
-    UniSkipFoldTable, uni_skip_fold_and_round_pair_optimized_packed_padded,
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
 };
-use flock_prover::zerocheck::univariate_skip::pack_bits;
 
+use env::args;
+use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    zerocheck::{
+        PaddingSpec,
+        multilinear::{UniSkipFoldTable, uni_skip_fold_and_round_pair_optimized_packed_padded},
+        univariate_skip::pack_bits,
+    },
+};
 const K_SKIP: usize = 6;
 
-use flock_core::test_rng::Rng;
-
-fn wf(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn wf(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "zerocheck_round2_vectors.bin".to_string());
-    let m: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(15);
+    let m: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(15);
     assert!(m > K_SKIP);
     let n_total = 1usize << m;
     let n_out = 1usize << (m - K_SKIP);

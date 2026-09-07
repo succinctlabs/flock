@@ -16,8 +16,9 @@
 //!
 //! Used by the verifier's polylog `eval_rs_eq` (DP24 §1.3, Figure 3).
 
-use crate::field::{F128, F256};
 use core::ops::{Add, AddAssign};
+
+use crate::field::{F128, F256, QUADRATIC_NONRESIDUE};
 
 /// The degree of `F_{2^128}` over `F_2`.
 pub const DEGREE: usize = 128;
@@ -144,9 +145,7 @@ impl TensorAlgebra256 {
         let p1 = self.c1.scale_horizontal(scalar.c1);
         let p2 = sum.scale_horizontal(scalar.c0 + scalar.c1);
         let mut c0 = p0.clone();
-        c0 += &p1
-            .clone()
-            .scale_horizontal(crate::field::QUADRATIC_NONRESIDUE);
+        c0 += &p1.clone().scale_horizontal(QUADRATIC_NONRESIDUE);
         let mut c1 = p2;
         c1 += &p0;
         Self { c0, c1 }
@@ -203,9 +202,10 @@ fn square_transpose(elems: &mut [F128]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        pcs::tensor_algebra::{DEGREE, F128, TensorAlgebra},
+        test_rng::Rng,
+    };
 
     /// Site-specific draws kept verbatim from this file's former local `Rng`.
     trait RngExt {

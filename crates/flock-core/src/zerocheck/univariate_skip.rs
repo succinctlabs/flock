@@ -18,8 +18,13 @@
 //! [`super::univariate_skip_optimized`] drops a constant F₈ factor
 //! `C_s = φ₈(0x1C)` from the eq-on-S weights; this one keeps it.
 
-use crate::field::{F8, F128, mul_by_x, phi8};
-use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
+use flock_multilinear::{IndexOrder, eq_table};
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+
+use crate::{
+    field::{F8, F128, mul_by_x, phi8},
+    ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8},
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -29,21 +34,7 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
-    let n = r.len();
-    // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
-    // every slot in t[0..2^n] is written exactly once before any read.
-    let mut t = crate::alloc_uninit_f128_vec(1usize << n);
-    t[0] = F128::ONE;
-    for i in 0..n {
-        let r_i = r[i];
-        let one_minus_r = F128::ONE + r_i;
-        // Iterate downward so we read t[x] before overwriting it as t[x | (1<<i)].
-        for x in (0..(1usize << i)).rev() {
-            t[x | (1 << i)] = t[x] * r_i;
-            t[x] *= one_minus_r;
-        }
-    }
-    t
+    eq_table(r, F128::ONE, IndexOrder::LowToHigh)
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +131,6 @@ pub fn round1_naive(
 
 /// Pack a bit vector LSB-first into bytes.
 pub fn pack_bits(bits: &[bool]) -> Vec<u8> {
-    use rayon::prelude::*;
     let n_bytes = bits.len().div_ceil(8);
     let mut out = vec![0u8; n_bytes];
     // Each output byte depends on 8 contiguous input bits — disjoint, so
@@ -543,9 +533,15 @@ pub fn round1_evals_on_s(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::test_rng::Rng;
+    use crate::{
+        pcs::{pack::pack_witness, ring_switch::fold_1b_rows_naive},
+        test_rng::Rng,
+        zerocheck::univariate_skip::{
+            AdditiveNttGf8, F8, F128, InvNttTableByteSingleGf8, SplitEqGhash, build_eq, pack_bits,
+            round1_evals_on_s, round1_extract_c, round1_extract_c_packed,
+            round1_extract_c_packed_with_s_hat_v, round1_naive,
+        },
+    };
 
     #[test]
     fn build_eq_basic() {
@@ -749,8 +745,6 @@ mod tests {
     /// suffix `r[k_skip + 1 ..]` (everything past `prefix0 = r[k_skip]`).
     #[test]
     fn extract_c_with_s_hat_v_matches_fold_1b_rows() {
-        use crate::pcs::pack::pack_witness;
-        use crate::pcs::ring_switch::fold_1b_rows_naive;
         // K_SKIP = 6 is the production setup (LOG_PACKING = 7, so 2 · 2^K_SKIP
         // = 128 matches s_hat_v's length). The kernel needs m >= K_SKIP + 1 =
         // 7 for pack_witness, plus the SplitEqGhash's n_lo + n_hi machinery

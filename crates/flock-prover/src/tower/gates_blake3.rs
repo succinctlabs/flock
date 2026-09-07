@@ -1,4 +1,17 @@
-use super::*;
+use std::array::from_fn;
+
+use flock_hash::blake3_compress;
+#[cfg(test)]
+use {
+    crate::r1cs_hashes::merkle_r1cs::{ChunkPathInput, MerkleTreeLayout, blake3_spec},
+    flock_core::circuit::builder::{CircuitBuilder, Wire},
+    flock_merkle::{HashKind, merkle_tree},
+};
+
+use crate::{
+    r1cs_hashes::blake3::{Compression, build_block_r1cs, io_schema},
+    tower::{F128, GateType, SLOT_WORDS, SlotWitness, TableType},
+};
 
 pub(super) const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
 
@@ -73,7 +86,7 @@ pub(super) fn digest_words(d: &[u32; SLOT_WORDS]) -> [F128; 2] {
 }
 
 pub(super) fn hash_to_digest(h: &[u8; 32]) -> [u32; SLOT_WORDS] {
-    std::array::from_fn(|w| u32::from_le_bytes(h[4 * w..4 * w + 4].try_into().unwrap()))
+    from_fn(|w| u32::from_le_bytes(h[4 * w..4 * w + 4].try_into().unwrap()))
 }
 
 #[cfg(test)]
@@ -101,12 +114,11 @@ pub(super) struct Blake3Gate {
 }
 
 impl GateType for Blake3Gate {
-    type Row = blake3::Compression;
+    type Row = Compression;
     type Hint = ();
 
     fn table(&self) -> TableType {
-        TableType::from_block_r1cs(&blake3::build_block_r1cs(self.nu))
-            .with_io_schema(blake3::io_schema())
+        TableType::from_block_r1cs(&build_block_r1cs(self.nu)).with_io_schema(io_schema())
     }
 
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
@@ -119,7 +131,7 @@ impl GateType for Blake3Gate {
             m[4 * i..4 * i + 4].copy_from_slice(&unpack4(inputs[2 + i]));
         }
         let (counter, block_len, flags) = unpack_params(inputs[6]);
-        let out = blake3::blake3_compress(&cv, &m, counter, block_len, flags);
+        let out = blake3_compress(&cv, &m, counter, block_len, flags);
         let lo = pack8(&out[0..8].try_into().unwrap());
         let hi = pack8(&out[8..16].try_into().unwrap());
         outputs.extend_from_slice(&[lo[0], lo[1], hi[0], hi[1]]);
@@ -148,10 +160,10 @@ impl MerklePathGate {
     /// it here means a circuit cannot silently wire a challenge that the
     /// relation truncates differently than the sampler did.
     ///
-    /// Real-protocol paths are CAPPED since Merkle capping landed: they are
+    /// Protocol paths are capped. They are
     /// `d − c` deep and the index's high `c` bits select a node of the
     /// absorbed cap layer rather than folding to a root. The COLLAPSED path
-    /// models this (`emit_opening` + the boundary select in `mvp6`): the
+    /// models this with `emit_opening` and the boundary select. The
     /// select is done by the checker on published words, so no mux gadget
     /// exists in-circuit. This COMPOSITE gate stays full-depth against its
     /// synthetic trees, where the assert above IS the index-binding
@@ -234,7 +246,7 @@ impl Tree {
         let data: Vec<u8> = (0..n_leaves * leaf_bytes)
             .map(|_| rng.next_u32() as u8)
             .collect();
-        let flat = core_merkle::merkle_tree(&data, n_leaves, HashKind::Blake3);
+        let flat = merkle_tree(&data, n_leaves, HashKind::Blake3);
         let root = flat[flat.len() - 1];
         Self {
             data,

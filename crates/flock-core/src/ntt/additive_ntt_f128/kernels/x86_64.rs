@@ -1,10 +1,18 @@
-use crate::field::F128;
+use core::arch::x86_64::{
+    __m512i, _mm_set_epi64x, _mm512_broadcast_i32x4, _mm512_loadu_si512, _mm512_setzero_si512,
+    _mm512_storeu_si512, _mm512_xor_si512,
+};
+
+use crate::{
+    field::{F128, gf2_128::x86_64::ghash_mul_x4},
+    ntt::additive_ntt_f128::kernels::portable::{
+        butterfly_fused_2layer as butterfly_fused_2layer_portable, butterfly_fused_4layer,
+        butterfly_row_pair as butterfly_row_pair_portable,
+    },
+};
 
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
-    use core::arch::x86_64::*;
-
     // SAFETY: caller guarantees the target features and equal slice lengths.
     unsafe {
         let twiddle_lanes =
@@ -20,7 +28,7 @@ pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twid
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, new_bot);
             i += 4;
         }
-        super::portable::butterfly_row_pair(&mut top[i..], &mut bot[i..], twiddle);
+        butterfly_row_pair_portable(&mut top[i..], &mut bot[i..], twiddle);
     }
 }
 
@@ -35,9 +43,6 @@ pub(super) unsafe fn butterfly_fused_2layer(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
-    use core::arch::x86_64::*;
-
     // SAFETY: caller guarantees the target features and equal slice lengths.
     unsafe {
         let broadcast =
@@ -73,7 +78,7 @@ pub(super) unsafe fn butterfly_fused_2layer(
             _mm512_storeu_si512(d.as_mut_ptr().add(i) as *mut __m512i, vd);
             i += 4;
         }
-        super::portable::butterfly_fused_2layer(
+        butterfly_fused_2layer_portable(
             &mut a[i..],
             &mut b[i..],
             &mut c[i..],
@@ -95,9 +100,6 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     r: usize,
     twiddles: &[F128; 15],
 ) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
-    use core::arch::x86_64::*;
-
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
         let broadcast =
@@ -151,7 +153,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *row(i).add(lane);
             }
-            super::portable::butterfly_fused_4layer(&mut values, twiddles);
+            butterfly_fused_4layer(&mut values, twiddles);
             for (i, value) in values.iter().enumerate() {
                 *row(i).add(lane) = *value;
             }

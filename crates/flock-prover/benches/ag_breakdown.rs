@@ -105,7 +105,9 @@ mod aarch64_only {
         };
 
         let t_r1 = time(&mut || {
-            black_box(round1_slp_packed_banks_fused_padded(&a, &b, &c, &eq, &coverage));
+            black_box(round1_slp_packed_banks_fused_padded(
+                &a, &b, &c, &eq, &coverage,
+            ));
         });
         let t_fold = time(&mut || {
             black_box(fold_and_first_round_sparse(&a, &b, &w, &r_rest, &coverage));

@@ -1,5 +1,7 @@
-use super::messages::{BaseMessage, ExtendedMessage, ProductMessage};
-use super::tables::{TABLES, Tables};
+use crate::genus95_curve_code::{
+    messages::{BaseMessage, ExtendedMessage, ProductMessage},
+    tables::{TABLES, Tables},
+};
 
 /// Compute the 222-bit product-code message for the product of two 64-bit base
 /// messages.

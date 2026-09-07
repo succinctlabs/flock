@@ -21,28 +21,29 @@
 //!
 //! Run: cargo run --release --bin dump_zerocheck_tail_vectors -- cuda-ghash/zerocheck_tail_vectors.bin 16
 
-use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Result, Write},
+};
 
-use flock_prover::field::F128;
-use flock_prover::zerocheck::multilinear::{fold_in_place_pair, round_pair_naive};
-
+use env::args;
 use flock_core::test_rng::Rng;
+use flock_prover::{
+    field::F128,
+    zerocheck::multilinear::{fold_in_place_pair, round_pair_naive},
+};
 
-fn wf(w: &mut impl Write, x: F128) -> std::io::Result<()> {
+fn wf(w: &mut impl Write, x: F128) -> Result<()> {
     w.write_all(&x.lo.to_le_bytes())?;
     w.write_all(&x.hi.to_le_bytes())
 }
 
-fn main() -> std::io::Result<()> {
-    let path = env::args()
+fn main() -> Result<()> {
+    let path = args()
         .nth(1)
         .unwrap_or_else(|| "zerocheck_tail_vectors.bin".to_string());
-    let l: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
+    let l: usize = args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(16);
     let n = 1usize << l;
 
     let mut rng = Rng::new(0x2C7A11 ^ (l as u64));

@@ -1,5 +1,10 @@
-use super::{Hash, SHA256_IV, SHA256_K};
-use core::arch::x86_64::*;
+use core::arch::x86_64::{
+    __m128i, _mm_add_epi32, _mm_alignr_epi8, _mm_blend_epi16, _mm_loadu_si128, _mm_set_epi32,
+    _mm_set_epi64x, _mm_setzero_si128, _mm_sha256msg1_epu32, _mm_sha256msg2_epu32,
+    _mm_sha256rnds2_epu32, _mm_shuffle_epi8, _mm_shuffle_epi32, _mm_storeu_si128,
+};
+
+use crate::hashing::{Hash, SHA256_IV, SHA256_K};
 
 #[inline(always)]
 unsafe fn schedule(v0: __m128i, v1: __m128i, v2: __m128i, v3: __m128i) -> __m128i {

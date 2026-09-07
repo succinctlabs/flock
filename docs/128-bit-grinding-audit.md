@@ -190,7 +190,7 @@ D = 256, lambda = 9: 256 / 2^137    = 2^-129.
 ```
 
 Implementation: `grinding_bits_for_degree` in
-[`challenger.rs`](../crates/flock-core/src/challenger.rs).
+[`challenger.rs`](../crates/flock-transcript/src/challenger.rs).
 
 ## Exact PoW relation
 
@@ -658,7 +658,7 @@ Key reviewer entry points:
 
 - policy selection: [`pcs/commit.rs`](../crates/flock-core/src/pcs/commit.rs);
 - native PoW and degree helper:
-  [`challenger.rs`](../crates/flock-core/src/challenger.rs);
+  [`challenger.rs`](../crates/flock-transcript/src/challenger.rs);
 - Boolean PIOPs: [`zerocheck.rs`](../crates/flock-core/src/zerocheck.rs),
   [`lincheck.rs`](../crates/flock-core/src/lincheck.rs), and
   [`lincheck/union.rs`](../crates/flock-core/src/lincheck/union.rs);
@@ -673,13 +673,13 @@ Key reviewer entry points:
 - accumulation: [`matrix_fold.rs`](../crates/flock-core/src/matrix_fold.rs)
   and [`aggregate.rs`](../crates/flock-core/src/aggregate.rs);
 - F256 Ligerito: [`extension.rs`](../crates/flock-core/src/pcs/ligerito/extension.rs),
-  [`gf2_256.rs`](../crates/flock-core/src/field/gf2_256.rs), and
+  [`gf2_256.rs`](../crates/flock-field/src/gf2_256.rs), and
   [`tensor_algebra.rs`](../crates/flock-core/src/pcs/tensor_algebra.rs);
 - production plumbing: [`prover.rs`](../crates/flock-prover/src/prover.rs)
   and [`verifier.rs`](../crates/flock-core/src/verifier.rs); and
 - recursive recording and R1CS replay:
-  [`transcript_record.rs`](../crates/flock-core/src/transcript_record.rs) and
-  [`tower.rs`](../crates/flock-prover/src/tower.rs).
+  [`transcript_record.rs`](../crates/flock-transcript/src/transcript_record.rs) and
+  [`tower/mod.rs`](../crates/flock-prover/src/tower/mod.rs).
 
 The native chain and Merkle-path wrappers also carry grinding for their own
 packed-position and shift arguments. Their native implementations are recorded

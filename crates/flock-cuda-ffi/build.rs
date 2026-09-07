@@ -5,24 +5,24 @@
 //! for sm_120 (the inline-PTX clmad kernels are Blackwell-only) into a static
 //! archive the test binary links against.
 
-use std::env;
-use std::path::PathBuf;
-use std::process::Command;
+use std::{env, fs::read_dir, path::PathBuf, process::Command};
+
+use env::{var, var_os};
 
 fn main() {
-    if env::var_os("CARGO_FEATURE_GPU").is_none() {
+    if var_os("CARGO_FEATURE_GPU").is_none() {
         return;
     }
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let manifest = PathBuf::from(var("CARGO_MANIFEST_DIR").unwrap());
     let repo = manifest.parent().unwrap().parent().unwrap();
     let cuda_dir = repo.join("cuda-ghash");
     let src = cuda_dir.join("prove_ffi.cu");
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_dir = PathBuf::from(var("OUT_DIR").unwrap());
     let lib = out_dir.join("libflock_cuda_prover.a");
 
     // Rebuild when the FFI TU or any header it includes changes.
     println!("cargo:rerun-if-changed={}", src.display());
-    for entry in std::fs::read_dir(&cuda_dir).unwrap().flatten() {
+    for entry in read_dir(&cuda_dir).unwrap().flatten() {
         let p = entry.path();
         if p.extension()
             .is_some_and(|e| e == "cuh" || e == "hpp" || e == "h")
@@ -32,7 +32,7 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=NVCC");
 
-    let nvcc = env::var("NVCC").unwrap_or_else(|_| {
+    let nvcc = var("NVCC").unwrap_or_else(|_| {
         for cand in ["/usr/local/cuda/bin/nvcc", "nvcc"] {
             if Command::new(cand).arg("--version").output().is_ok() {
                 return cand.to_string();

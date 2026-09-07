@@ -117,16 +117,27 @@ fn run(m: usize, k: usize, lanes: usize, runs: usize) {
 #[test]
 fn stats_ladder_matches_incremental_small() {
     let env = |k: &str, d: usize| -> usize {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     };
-    run(env("SMALL_M", 26), env("MICRO_K", 6), env("MICRO_LANES", 56), 1);
+    run(
+        env("SMALL_M", 26),
+        env("MICRO_K", 6),
+        env("MICRO_LANES", 56),
+        1,
+    );
 }
 
 #[test]
 #[ignore] // Benchmark + byte oracle at the m32 leaf — run explicitly with --nocapture.
 fn stats_ladder_microbench() {
     let env = |k: &str, d: usize| -> usize {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     };
     run(
         env("MICRO_M", 32),
