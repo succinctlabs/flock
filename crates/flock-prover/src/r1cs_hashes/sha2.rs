@@ -707,11 +707,7 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         a_rows: &mut a_rows,
         b_rows: &mut b_rows,
     });
-    let to_mat = |rows| SparseBinaryMatrix {
-        num_rows: K,
-        num_cols: K,
-        rows,
-    };
+    let to_mat = |rows| SparseBinaryMatrix::new(K, K, rows);
     (to_mat(a_rows), to_mat(b_rows))
 }
 

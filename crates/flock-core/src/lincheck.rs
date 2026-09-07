@@ -390,7 +390,7 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     assert!(m.num_rows <= u32::MAX as usize);
     assert!(m.num_cols <= u32::MAX as usize);
     let mut col_ptr = vec![0u32; m.num_cols + 1];
-    for row in &m.rows {
+    for row in m.rows.iter() {
         for &c in row {
             col_ptr[c + 1] += 1;
         }
@@ -2393,11 +2393,7 @@ mod tests {
         for row in &mut rows {
             row.sort();
         }
-        SparseBinaryMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows,
-        }
+        SparseBinaryMatrix::new(k, k, rows)
     }
 
     // ---- Unit tests for the kernels ----

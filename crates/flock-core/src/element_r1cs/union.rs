@@ -859,21 +859,9 @@ mod tests {
         TableType {
             k_log,
             useful_bits,
-            a_0: SparseBinaryMatrix {
-                num_rows: 0,
-                num_cols: 0,
-                rows: Vec::new(),
-            },
-            b_0: SparseBinaryMatrix {
-                num_rows: 0,
-                num_cols: 0,
-                rows: Vec::new(),
-            },
-            c_0: SparseBinaryMatrix {
-                num_rows: 0,
-                num_cols: 0,
-                rows: Vec::new(),
-            },
+            a_0: SparseBinaryMatrix::new(0, 0, Vec::new()),
+            b_0: SparseBinaryMatrix::new(0, 0, Vec::new()),
+            c_0: SparseBinaryMatrix::new(0, 0, Vec::new()),
             const_pin: None,
             class: TableClass::Boolean,
             io_schema: Vec::new(),

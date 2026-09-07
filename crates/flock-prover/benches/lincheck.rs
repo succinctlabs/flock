@@ -38,11 +38,7 @@ fn random_sparse_matrix(k: usize, nnz: usize, rng: &mut Rng) -> SparseBinaryMatr
     for row in &mut rows {
         row.sort();
     }
-    SparseBinaryMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows,
-    }
+    SparseBinaryMatrix::new(k, k, rows)
 }
 
 fn main() {

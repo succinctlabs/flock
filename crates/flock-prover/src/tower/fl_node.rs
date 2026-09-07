@@ -110,11 +110,12 @@ pub(super) fn chain_jagged_params(cp: &ChainProof) -> JaggedParams {
     )
 }
 
-/// The chain BLAKE3 block R1CS per nu, cached process-wide: the ~21M-nnz
-/// base is identical for every chain proof and every FL's chain-side fold
-/// materials, and the tower bench used to build ten of them. Serves the
-/// borrow-only sites; callers that STORE an R1CS (LeafOuter) still build
-/// their own.
+/// The chain BLAKE3 block R1CS per nu, cached process-wide. The base
+/// matrices are already shared by every `build_block_r1cs` call (see
+/// `r1cs_hashes::blake3`); what this cache adds is the BLOCK, and with it
+/// the lazily built CSC lincheck circuit (~178 MiB) that lives in the
+/// block's `OnceLock` — every chain proof and every FL's chain-side fold
+/// materials then read one circuit instead of rebuilding it per leaf.
 pub(super) fn chain_blake_r1cs(nu: usize) -> Arc<BlockR1cs> {
     type Cache = Mutex<Vec<(usize, Arc<BlockR1cs>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();

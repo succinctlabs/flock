@@ -303,8 +303,10 @@ pub(super) struct ChainShape {
 
 /// The chain SHAPE per n_blocks, cached process-wide: the emission+finish
 /// (~1.4 s at m32) is statement-independent — that is the digest pin — so
-/// the tower's material proofs CLONE the cached shape (Registry + Circuit
-/// memcpy, ~an order of magnitude cheaper) instead of re-emitting it.
+/// the tower's material proofs CLONE the cached shape instead of
+/// re-emitting it. The clone is cheap: the BLAKE3 matrices behind the
+/// registry share their storage (`SparseBinaryMatrix` rows are `Arc`), so
+/// only the circuit and the slot bookkeeping are copied.
 /// `build_chain_proof`'s setup_ms honestly reflects whichever it paid.
 pub(super) fn chain_shape_cached(n_blocks: usize) -> Arc<ChainShape> {
     type Cache = Mutex<Vec<(usize, Arc<ChainShape>)>>;

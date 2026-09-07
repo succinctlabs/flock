@@ -158,9 +158,9 @@ pub trait GateType {
 /// can be run many times concurrently — the whole point of the split.
 trait SlotBuild: Any + Send + Sync {
     /// MOVE the table out. Called once, by `finish`, on its way into the
-    /// registry — which then owns it. Cloning here instead cost 2 deep copies
-    /// of every table's matrices; BLAKE3's are ~21M nonzeros, so that was
-    /// ~300 ms of pure memcpy per circuit.
+    /// registry — which then owns it. (A table's matrices share their row
+    /// storage, so a clone would be cheap today; the move keeps the
+    /// ownership story single-owner.)
     fn take_table(&mut self) -> TableType;
     fn n_in(&self) -> usize;
     fn n_out(&self) -> usize;

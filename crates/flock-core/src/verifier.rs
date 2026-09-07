@@ -1459,17 +1459,9 @@ mod tests {
     fn non_identity_c_is_rejected_by_both_single_table_entries() {
         let k_log = 6;
         let k = 1usize << k_log;
-        let identity = SparseBinaryMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows: (0..k).map(|i| vec![i]).collect(),
-        };
+        let identity = SparseBinaryMatrix::new(k, k, (0..k).map(|i| vec![i]).collect());
         // c_0 = a shift-by-one permutation: a valid matrix, not the identity.
-        let shifted = SparseBinaryMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows: (0..k).map(|i| vec![(i + 1) % k]).collect(),
-        };
+        let shifted = SparseBinaryMatrix::new(k, k, (0..k).map(|i| vec![(i + 1) % k]).collect());
         let r1cs = BlockR1cs {
             m: 12,
             k_log,

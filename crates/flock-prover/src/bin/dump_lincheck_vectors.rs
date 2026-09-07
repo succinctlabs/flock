@@ -84,18 +84,14 @@ fn random_matrix(k: usize, nnz_per_row: usize, rng: &mut Rng) -> SparseBinaryMat
             cols
         })
         .collect();
-    SparseBinaryMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows,
-    }
+    SparseBinaryMatrix::new(k, k, rows)
 }
 
 /// Flatten a sparse matrix to CSC arrays — verbatim mirror of
 /// `lincheck.rs::csc_from_rows`, so the CUDA kernel folds the same columns.
 fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     let mut col_ptr = vec![0u32; m.num_cols + 1];
-    for row in &m.rows {
+    for row in m.rows.iter() {
         for &c in row {
             col_ptr[c + 1] += 1;
         }

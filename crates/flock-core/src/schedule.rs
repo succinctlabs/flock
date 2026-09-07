@@ -179,11 +179,7 @@ impl TableType {
     /// docs). The boolean matrix fields are empty stubs — the real payload
     /// rides in [`TableClass::LargeField`].
     pub fn element(ty: Arc<ElementTableType>) -> Self {
-        let stub = || SparseBinaryMatrix {
-            num_rows: 0,
-            num_cols: 0,
-            rows: Vec::new(),
-        };
+        let stub = || SparseBinaryMatrix::new(0, 0, Vec::new());
         Self {
             k_log: ty.kappa() + 7,
             useful_bits: ty.k() * 128,
@@ -804,11 +800,7 @@ mod tests {
     /// Empty matrix stub — layout tests never apply the matrices, mirroring
     /// the walker-based encoders' stub practice.
     fn stub() -> SparseBinaryMatrix {
-        SparseBinaryMatrix {
-            num_rows: 0,
-            num_cols: 0,
-            rows: Vec::new(),
-        }
+        SparseBinaryMatrix::new(0, 0, Vec::new())
     }
 
     fn ty(k_log: usize, useful_bits: usize) -> TableType {
@@ -1041,11 +1033,7 @@ mod tests {
     /// as-is; the digest does not validate dimensions against `k_log`, same
     /// as the walker-encoder stub convention).
     fn matrix(rows: Vec<Vec<usize>>) -> SparseBinaryMatrix {
-        SparseBinaryMatrix {
-            num_rows: rows.len(),
-            num_cols: 512,
-            rows,
-        }
+        SparseBinaryMatrix::new(rows.len(), 512, rows)
     }
 
     /// Digest is stable across calls (cache), across identically constructed
