@@ -149,6 +149,10 @@ fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<Sha2Compression> {
 // VALUE-ONLY (claim points are transcript-derived and verifier-recomputed,
 // never prover messages; ~92 KB of self-absorbed points deleted from the
 // recursion replay). Label flock-merged-open-v0 -> v1.
+// Re-pinned 2026-09-07: proof-IO VERSION 22 -> 23 (the tower span
+// counter) — only the bundle HEADER byte moved; payloads are unchanged,
+// and the header-less anchor digests did not move, which is the
+// cross-check. Two deterministic print runs agreed.
 // Re-pinned 2026-08-05: BLAKE3 R1CS "Option E" lin-id drop — the b3 table
 // narrowed 121 -> 93 word-cols (b_new/d_new slots dissolved into the
 // cascade), so every blake3-committed fixture's bytes move. The pure
@@ -195,7 +199,7 @@ fn merged_bundle_digest(
 /// registry id, counts vector, commitment, and the merged proof — plus the
 /// claim values. The registry here (BLAKE3+SHA-256 at ν = 10) IS the
 /// `Blake3Sha2Nu10` tier, so this pins exactly what `proof_io` puts on disk
-/// for the current v21 mixed proof. It retains the removed jagged fixture's
+/// for the current mixed proof (the header carries `proof_io::VERSION`). It retains the removed jagged fixture's
 /// statements and witness streams; the Ligerito query ladder intentionally
 /// changed with v18.
 #[test]
@@ -206,22 +210,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "e50fcc617bc0e02cdb7592c8c702483864ae1f0acaf2b6239ae820ea6a054b04",
+            "493ce5531c9d8feb591f0e00bffb1aaf0bd0e1307ac4d5c1490fbaca6e54a5e3",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "2e9fa4c9d476cb3453b6e01f2d68d22b43871d8691635acb8837dd896bc654c0",
+            "31c2098ce646bb57b9c7c4bb98855aebb45bff5ee90d95816550dbc5a3d08ce8",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "388612533f9f425591168a6d560288a9c591879e37f7ace55c5636f6cd1c7251",
+            "09c23f3aa9794834b9b19cda27ede0e794dcf1ef59894415700e5b01ead18775",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "6ea3899c9c235e0012297323d24d5440b8a704e9fbe12c793e0070d1210dced5",
+            "0e2d3d81dd8057aeebff8d72ae4a1adcf3b76efaa84b922d30a3513e2eeeb656",
         ),
     ];
 

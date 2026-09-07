@@ -51,7 +51,7 @@ use crate::{
         TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire, ZskipTapeRec, ZskipWires,
         assert_chain_replays, balance_extra_rows, bytes_payload_mask, challenge_word_locs,
         check_ag_skip_publics, check_fold_publics, check_jagged_fold_publics,
-        check_real_child_region, emit_ag_point_binding, emit_fold_region, emit_fs_chain,
+        check_real_child_region, cw, emit_ag_point_binding, emit_fold_region, emit_fs_chain,
         emit_fs_chain_partitioned, emit_jagged_fold_region, emit_lagrange_lows,
         emit_real_child_region, emit_recorded_pow_checks, env_acc_chain_base, env_acc_main_base,
         env_app_base, env_pass_base, envelope_shape, expected_real_tail_schedule, flatten_ops,
@@ -1676,10 +1676,34 @@ pub fn build_node_outer_app(
                 }
             }
             let last = &regions[n_kids - 1];
-            (0..4)
+            let mut out: Vec<Wire> = (0..4)
                 .map(|j| regions[0].child_pub_w[off + j])
                 .chain((0..4).map(|j| last.child_pub_w[off + 4 + j]))
-                .collect()
+                .collect();
+            // THE SPAN COUNTER composes MULTIPLICATIVELY: the node's word
+            // is the product of its children's (g^{a+b} = g^a · g^b), one
+            // MAC row per extra child — depth never enters the shape.
+            let mut e = regions[0].child_pub_w[off + 8];
+            for rk in &regions[1..] {
+                e = sb.gate(cs.macs, &[zw, e, rk.child_pub_w[off + 8]])[0];
+            }
+            out.push(e);
+            // THE COUNTER BASE, chained: every child's word 9 is
+            // copy-constrained to this node's own baked C, so the fixed
+            // public grounds out at the ROOT's native check_public — the
+            // link that makes the counter adversarially proof-bound (a
+            // fixed public alone is never checked below the root).
+            let c_w = cw(
+                &mut sb,
+                &mut vals,
+                &mut consts,
+                los[0].public[env_app_base(&env) + 9],
+            );
+            for rk in &regions {
+                sb.connect(rk.child_pub_w[off + 9], c_w);
+            }
+            out.push(c_w);
+            out
         });
         // The publish of the combined span rides the envelope's fixed tail
         // block (below, with the padding), never inline.

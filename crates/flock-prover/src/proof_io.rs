@@ -68,8 +68,12 @@ const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 /// different query/rate/PoW schedule and cannot be interpreted safely; the
 /// mixed registry codes 3 and 4 (`merkle26+blake3@nu*`) were retired and
 /// are never reused. `fast100`/`slim100`/`secure` payloads are unchanged.
+/// v23 (2026-09-07): the SPAN COUNTER — the envelope app block grew to
+/// nine words (`g^{n_blocks}` composed child-to-parent), so every tower
+/// outer's transcript moved; a v22 tower-root bundle cannot verify under
+/// v23 shapes. R1cs/Mixed payloads are structurally unchanged.
 /// (The per-version history this file used to carry lives in git.)
-const VERSION: u8 = 22;
+const VERSION: u8 = 23;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see
@@ -222,8 +226,8 @@ impl MixedProofBundleLigerito {
 /// cross-checks — the right verification key. The statement rides the
 /// payload for transport; NOTHING decoded here is trusted, and a bare
 /// `from_bytes` proves nothing — `verify_root_bytes` is the ONE entry
-/// that returns a statement with its qualification (the span caveat of
-/// the verify module's `SpanBound` applies verbatim).
+/// that returns a verified statement — endpoints and count alike (the
+/// span counter in the app block pins `n_blocks` at every depth).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TowerRootBundle {
     pub config: TowerConfig,
