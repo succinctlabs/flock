@@ -5883,3 +5883,39 @@ numbers themselves: prove best **438.3 ms** (min over 8), witgen 33.6,
 commit 147.2, zerocheck + lincheck 146.6, open 101.3 — the campaign's
 lowest, and the reference for the next A/Bs (`blake3_proof_base7` is
 the cap-48 binary).
+
+### REFUTED: fusing the C-claim bit-bank fold into the lincheck's sweep (two-point stripe kernel) — 2026-09-06
+
+The idea: the union lincheck's fold and stage 1's C-claim bank read the
+same 512 MB stripe with different row weights, and the C row point is
+known before the lincheck runs; a two-point kernel (32-byte sum-table
+entries holding both points' subset sums, sixteen NEON accumulators, one
+index computation and two adjacent loads per stripe byte) would sweep
+once. Built (`partial_fold_packed_z_neon_oblock_dual_padded` + dual
+dispatchers + `union_bitbank_fold2` + `..._with_grinding_and_bank`,
+375 lines; bit-identical to two single folds by unit test, and all
+proof-byte pins unchanged).
+
+First the regime: the production kernel at m=32 (useful bits 92·128)
+runs 85.9 ms on one thread, 22.6 on four, 14.4 on eight — 6.0× at
+eight, 37 GB/s of stripe. Per byte it sustains ≈ 1.4 lookups per cycle
+on one core: core-throughput-bound (extract, address, 16-byte load,
+XOR), not DRAM-bound; the 40 GB/s figure was a coincidence.
+
+Then the A/B (fused vs `base7`, 8-prove steady state, min, alternating):
+
+| pair | fused sweep (both points) | two passes (lincheck + C fold) |
+|---|---|---|
+| 1 | 25.4 | 14.4 + 13.5 = 27.8 |
+| 2 | 28.3 | 15.5 + 13.4 = 28.8 |
+| 3 | 27.2 | 14.0 + 13.4 = 27.3 |
+| 4 | 31.0 (load spike to 19) | 15.2 + 14.4 = 29.6 |
+
+Mean −0.3 ms; totals a wash. The second point costs its own load and
+XOR per stripe byte; only the extraction and addressing are shared
+(≈ 5% of the work), and halving the stripe traffic buys nothing for a
+kernel that is not bandwidth-bound. Reverted; the diff is saved as
+`dual_fold.patch` (scratchpad). Verdict on the transport tax: the
+C-claim fold (12.6 ms) is at the lookup rate and has no cheaper form;
+with the q′ fold (5) and the ladder's seed sweep (4) at the multiply
+rate, the remaining ≈ 13 ms of stage 1's tax is protocol-shaped.
