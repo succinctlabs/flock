@@ -1,0 +1,21 @@
+[package]
+name = "flock-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "C-ABI shim over the Flock prover for iOS (aarch64-apple-ios / -sim)."
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "flock_mobile_probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+flock-prover = { path = "../flock-prover" }
+libc = "0.2"
+
+[lints]
+workspace = true

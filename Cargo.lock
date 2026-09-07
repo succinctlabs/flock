@@ -204,6 +204,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flock-mobile"
+version = "0.1.0"
+dependencies = [
+ "flock-prover",
+ "libc",
+]
+
+[[package]]
 name = "flock-multilinear"
 version = "0.1.0"
 dependencies = [

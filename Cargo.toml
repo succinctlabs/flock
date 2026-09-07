@@ -5,6 +5,7 @@ members = [
     "crates/flock-field",
     "crates/flock-hash",
     "crates/flock-merkle",
+    "crates/flock-mobile",
     "crates/flock-multilinear",
     "crates/flock-parallel",
     "crates/flock-prover",
