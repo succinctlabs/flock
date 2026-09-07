@@ -5858,3 +5858,28 @@ buffers between proves and witgen/commit re-faulted them. That is the
 machine, not the prover: on a box without memory pressure it does not
 happen, and the only in-process mitigation (wiring the pool's ~7 GB
 with `mlock`) is a dedicated-box knob, not something to land blind.
+
+### REFUTED: wiring the pool with `mlock` — no benefit on a quiet box; prove best 438.3 ms — 2026-09-06
+
+Benedikt closed the desktop's heavy processes (load 5 → 8–10 during the
+run, compressor 27 GB → 7 GB, 14 GB free, `ulimit -l` unlimited). Same
+binary, an opt-in probe pinning every pooled buffer of 2^22 words and up
+(since stripped), 4 alternating pairs × 8 proves:
+
+| pair | pinned min / med / max | unpinned min / med / max |
+|---|---|---|
+| 1 | 442.3 / 446.0 / 498.6 | 438.3 / 455.2 / 521.7 |
+| 2 | 456.7 / 459.4 / 495.5 | 447.1 / 449.3 / 464.8 |
+| 3 | 457.9 / 459.9 / 497.9 | 464.8 / 466.8 / 484.4 |
+| 4 | 473.4 / 477.8 / 509.5 | 475.7 / 484.3 / 515.0 |
+
+No effect on the minimum, median or maximum (mixed signs, within ±10);
+per-phase minima equal (witgen 33.5–34.4 both, commit, zc+lc, open);
+pinning ADDS ≈ 63k minor faults per prove (the `mlock` walks) and holds
+the wired set out of the compressor's reach permanently. With nothing
+to pin against, nothing to gain — the storms of the loaded box did not
+recur (max within 10% of min in every run). Not landed. The quiet-box
+numbers themselves: prove best **438.3 ms** (min over 8), witgen 33.6,
+commit 147.2, zerocheck + lincheck 146.6, open 101.3 — the campaign's
+lowest, and the reference for the next A/Bs (`blake3_proof_base7` is
+the cap-48 binary).
