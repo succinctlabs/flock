@@ -6024,3 +6024,75 @@ Mean −1.6 ms, mixed signs; every phase within ±4 ms with mixed signs
 within noise). The box was not quiet (load 9–12), which the pairing
 absorbs. The merge costs nothing; `blake3_proof_merged` is the new
 control.
+
+### MEASURED: the Yukon `flock-challenge` frontier added to the comparison — GPU-assisted 1.65× us, CPU-only ≈ 10% MT / equal ST — 2026-09-07
+
+Benedikt asked for Yukon in the three-way. The Yukon benchmark
+(`eigenlabs/flock-challenge`, mac track; local checkout
+`/Users/buenz/flock-snark-fast-mac`) is the old direct-open `prove_fast`
+pipeline with a different statement — F128, SHA-256 Merkle, 19-bit fold
+grinding, no zerocheck grinding, no union — and a **Metal GPU** commit,
+GPU zerocheck fold, GPU grind and GPU keep-warm (`gpu_commit.rs`, 15k
+lines; kill switches `FLOCK_NO_GPU_*`). Its leaderboard frontier is
+f81bb5d (commit c35c1c4, 2026-08-27, pepedesigner): 1,851,759 c/s on the
+CI runner (10 P-cores, M3 Max class, median 141 ms). The local
+checkout is three weeks behind that (c576e683) and carries a codex
+agent's uncommitted measurement knobs; its last local score was 630,803
+c/s on 2026-08-25 and its last edit 2026-08-27 — no agent process is
+running now.
+
+Two arms built in sandbox clones (the agent's tree untouched): the
+frontier c35c1c4 and the local snapshot (c576e683 + the agent's diff),
+each with two measurement-only grafts (the agent's `FLOCK_NO_GRIND`
+knob; the bench's duplicate global allocator stubbed, which the newer
+library makes necessary). Same harness as the three-way: this M1 Max
+(8P+2E, 32 GB), m=32, best of 3, breakdown min of 3, grind off unless
+noted, load 3–6. The Yukon tree's breakdown pass is instrumented and
+its phases sum ABOVE its wall time (MT: 379 vs 266; ST: 3.38 s vs
+2.86 s), so its phases are upper bounds — compare wall times.
+
+| | current (ours) | Yukon frontier, as the benchmark runs it (GPU) | Yukon frontier, GPU off | local snapshot (GPU / GPU off) |
+|---|---|---|---|---|
+| prove MT, best | **438.0** | **265.6** | **383.9** | 268.1 / 414.9 |
+| prove ST, best | 2.91 s | 2.63 s (GPU still engaged) | 2.86 s | 2.60 / 2.87 s |
+| prove MT, grind on | 445.3 | 275.1 | 793.2 (CPU grind) | 273.6 / 386.9 |
+| verify | 6.0 | 3.6 | 6.2 | 3.1 / 2.9 |
+| proof bytes | 462,052 | 437,551 | 437,551 | 437,551 |
+
+Per phase, MT (ms, min of 3):
+
+| phase | current | Yukon frontier (GPU) | Yukon frontier (GPU off) |
+|---|---|---|---|
+| witness generation | 34.9 | 29.2 | 28.8 |
+| commit | 150.2 | 147.1 | 231.6 |
+| zerocheck + lincheck | 145.9 + 12.3 (C bank) = 158.2 | 115.2 + 12.7 = 127.9 | 124.2 + 17.7 = 141.9 |
+| open | 105.9 | 74.4 | 81.5 |
+| wall, best | 438.0 | 265.6 | 383.9 |
+
+Per phase, ST (ms; Yukon GPU off):
+
+| phase | current | Yukon frontier |
+|---|---|---|
+| witness generation | 266.8 | 212.5 |
+| commit | 1,012 | 1,670 |
+| zerocheck + lincheck | 1,055 + 86 = 1,141 | 860 + 117 = 977 |
+| open | 562 | 524 |
+| wall, best | 2,910 | 2,860 |
+
+Reading. As the benchmark runs it, the Yukon frontier proves in 266 ms
+on this box against our 438 — 1.65× — and 141 ms on the runner. Switch
+its GPU off and the gap is 384–407 vs 438–451 ms multi-threaded (≈ 10%)
+and nothing single-threaded (2.86 vs 2.91 s). So the CPU work is equal;
+Yukon's CPU-only edge is parallel efficiency (MT/ST 7.4× vs our 6.6×:
+its E-core helper pool drains and keep-alive spinners), and its real
+edge is the GPU, which our campaign rules exclude. Phase by phase,
+CPU-only: our commit is far cheaper (150 vs 232 MT, 1,012 vs 1,670 ST —
+8-way NEON BLAKE3 against SHA-256); their zerocheck and open are
+cheaper (F128 statement, no union lincheck, no zerocheck grinding, one
+direct open against our two ring switches plus merged open); their
+witness generation is 15–20% cheaper. Their proof is 5% smaller and
+verifies in half the time. Note for any future ST comparison: under
+`RAYON_NUM_THREADS=1` the Yukon tree still uses the GPU (2.63 vs
+2.86 s) — kill it explicitly. Binaries: `blake3_proof_flock-yukon`,
+`blake3_proof_flock-yukon-wip` (scratchpad); clones `/Users/buenz/
+flock-yukon` (c35c1c4 + grafts) and `/Users/buenz/flock-yukon-wip`.
