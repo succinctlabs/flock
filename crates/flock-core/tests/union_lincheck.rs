@@ -43,11 +43,7 @@ use zerocheck::{prove_packed_padded, verify as verify_zerocheck};
 const DOMAIN: &[u8] = b"flock-union-lincheck-test-v0";
 
 fn identity(k: usize) -> SparseBinaryMatrix {
-    SparseBinaryMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows: (0..k).map(|i| vec![i]).collect(),
-    }
+    SparseBinaryMatrix::new(k, k, (0..k).map(|i| vec![i]).collect())
 }
 
 /// Random sparse `k × k` matrix supported on the useful square: rows
@@ -68,11 +64,7 @@ fn random_useful_matrix(
         }
         *row = cols.into_iter().collect();
     }
-    SparseBinaryMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows,
-    }
+    SparseBinaryMatrix::new(k, k, rows)
 }
 
 /// One synthetic slot: matrices, declared count, and the semantic

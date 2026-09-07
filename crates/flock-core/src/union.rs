@@ -1105,11 +1105,7 @@ mod tests {
     /// Empty matrix stub — nothing here applies the matrices (same practice
     /// as the schedule.rs layout tests).
     fn stub() -> SparseBinaryMatrix {
-        SparseBinaryMatrix {
-            num_rows: 0,
-            num_cols: 0,
-            rows: Vec::new(),
-        }
+        SparseBinaryMatrix::new(0, 0, Vec::new())
     }
 
     fn ty(k_log: usize, useful_bits: usize) -> TableType {

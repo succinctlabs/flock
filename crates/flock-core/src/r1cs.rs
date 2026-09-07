@@ -12,7 +12,7 @@
 use std::{
     array::from_fn,
     slice::{from_raw_parts, from_raw_parts_mut},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use blake3::Hasher;
@@ -29,11 +29,34 @@ use crate::{
 };
 
 /// Sparse boolean matrix. `rows[i]` lists the column indices where the entry is 1.
+///
+/// The row storage is frozen behind an `Arc` at construction: a matrix is
+/// built once and then read by the registry, by every clone of a circuit
+/// shape, and by the lincheck circuit, so `Clone` bumps a count instead of
+/// deep-copying tens of millions of indices (BLAKE3's base block alone holds
+/// 44M of them, 339 MiB per copy).
 #[derive(Clone, Debug)]
 pub struct SparseBinaryMatrix {
     pub num_rows: usize,
     pub num_cols: usize,
-    pub rows: Vec<Vec<usize>>,
+    pub rows: Arc<Vec<Vec<usize>>>,
+}
+
+impl SparseBinaryMatrix {
+    /// Freeze `rows` as the matrix's shared storage. Trailing capacity is
+    /// released first: the rows never grow again, so slack from push-built
+    /// rows would be dead weight in every holder.
+    pub fn new(num_rows: usize, num_cols: usize, mut rows: Vec<Vec<usize>>) -> Self {
+        for row in &mut rows {
+            row.shrink_to_fit();
+        }
+        rows.shrink_to_fit();
+        Self {
+            num_rows,
+            num_cols,
+            rows: Arc::new(rows),
+        }
+    }
 }
 
 /// Memory/variable layout of the committed witness (address bit `i` of the
@@ -426,7 +449,7 @@ impl BlockR1cs {
 pub(crate) fn absorb_matrix(h: &mut Hasher, m: &SparseBinaryMatrix) {
     h.update(&(m.num_rows as u64).to_le_bytes());
     h.update(&(m.num_cols as u64).to_le_bytes());
-    for row in &m.rows {
+    for row in m.rows.iter() {
         h.update(&(row.len() as u64).to_le_bytes());
         for &col in row {
             h.update(&(col as u64).to_le_bytes());
@@ -551,7 +574,7 @@ fn flatten_csr(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     let mut row_ptr = Vec::with_capacity(m.num_rows + 1);
     let mut cols = Vec::with_capacity(nnz);
     row_ptr.push(0u32);
-    for row in &m.rows {
+    for row in m.rows.iter() {
         for &c in row {
             cols.push(c as u32);
         }
@@ -785,11 +808,7 @@ mod tests {
     /// Identity base matrix: `A_0 = I_k`. Each row has exactly one nonzero at
     /// the diagonal.
     fn identity(k: usize) -> SparseBinaryMatrix {
-        SparseBinaryMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows: (0..k).map(|i| vec![i]).collect(),
-        }
+        SparseBinaryMatrix::new(k, k, (0..k).map(|i| vec![i]).collect())
     }
 
     /// Packed apply_a matches bool apply_a.
@@ -802,19 +821,16 @@ mod tests {
             // Build a random sparse matrix.
             let k = 1usize << k_log;
             let mut rng = TestRng::new(0xABCD + m as u64 + k_log as u64 * 37);
-            let mat = SparseBinaryMatrix {
-                num_rows: k,
-                num_cols: k,
-                // Each row picks a few random columns.
-                rows: (0..k)
-                    .map(|_| {
-                        let n_nonzero = 2 + (rng.next_u64() % 4) as usize;
-                        (0..n_nonzero)
-                            .map(|_| (rng.next_u64() as usize) % k)
-                            .collect::<Vec<_>>()
-                    })
-                    .collect(),
-            };
+            // Each row picks a few random columns.
+            let rows: Vec<Vec<usize>> = (0..k)
+                .map(|_| {
+                    let n_nonzero = 2 + (rng.next_u64() % 4) as usize;
+                    (0..n_nonzero)
+                        .map(|_| (rng.next_u64() as usize) % k)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let mat = SparseBinaryMatrix::new(k, k, rows);
 
             // Random witness.
             let z: Vec<bool> = (0..(1 << m)).map(|_| rng.next_u64() & 1 == 1).collect();
@@ -877,11 +893,7 @@ mod tests {
         // A_0 = B_0 = 0, C_0 = I ⇒ a·b = 0 ⇒ z = 0.
         let k_log = 3;
         let m = 6;
-        let zero = SparseBinaryMatrix {
-            num_rows: 1 << k_log,
-            num_cols: 1 << k_log,
-            rows: vec![Vec::new(); 1 << k_log],
-        };
+        let zero = SparseBinaryMatrix::new(1 << k_log, 1 << k_log, vec![Vec::new(); 1 << k_log]);
         let r1cs = BlockR1cs {
             m,
             k_log,

@@ -30,7 +30,7 @@ use flock_prover::{
 
 fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     let mut col_ptr = vec![0u32; m.num_cols + 1];
-    for row in &m.rows {
+    for row in m.rows.iter() {
         for &c in row {
             col_ptr[c + 1] += 1;
         }

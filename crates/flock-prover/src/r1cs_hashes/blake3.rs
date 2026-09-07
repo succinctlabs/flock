@@ -96,7 +96,7 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use std::{array::from_fn, mem::take, slice::from_raw_parts_mut};
+use std::{array::from_fn, mem::take, slice::from_raw_parts_mut, sync::OnceLock};
 
 use flock_core::{
     lincheck::LincheckCircuit,
@@ -776,18 +776,23 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     // Padding rows [USEFUL_BITS..K): A = B = []. Constraint 0·0 = z[i]
     // forces z[i] = 0 for all padding bits.
 
-    let to_mat = |rows| SparseBinaryMatrix {
-        num_rows: K,
-        num_cols: K,
-        rows,
-    };
+    let to_mat = |rows| SparseBinaryMatrix::new(K, K, rows);
     (to_mat(a_rows), to_mat(b_rows))
+}
+
+/// The base matrices, built once per process. They do not depend on the
+/// batch size — `build_block_r1cs` only threads `n_blocks_log` into `m` —
+/// and [`SparseBinaryMatrix`] shares its storage, so every block R1CS,
+/// gate table, and registry in the process reads this ONE 44M-nonzero set.
+fn shared_matrices() -> &'static (SparseBinaryMatrix, SparseBinaryMatrix) {
+    static MATRICES: OnceLock<(SparseBinaryMatrix, SparseBinaryMatrix)> = OnceLock::new();
+    MATRICES.get_or_init(build_matrices)
 }
 
 /// Build a [`BlockR1cs`] batching `2^n_blocks_log` independent BLAKE3
 /// compressions. `n_blocks_log ≥ 3` is required (lincheck needs `n_outer ≥ 8`).
 pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
-    let (a_0, b_0) = build_matrices();
+    let (a_0, b_0) = shared_matrices().clone();
     build_block_r1cs_with_matrices(
         n_blocks_log,
         K_LOG,
