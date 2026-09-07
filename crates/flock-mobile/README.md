@@ -35,28 +35,28 @@ targets with no source changes. The interleaved Merkle SHA-256 kernel uses
 `core::arch` NEON intrinsics, and the iOS target enables the `sha2` and `aes`
 CPU features at compile time, so the hash hot path carries over.
 
-Native, after PR #50 (shared BLAKE3 R1CS matrices; the "before" column is main
-before that PR):
+Native, after PR #50 (shared BLAKE3 R1CS matrices) and PR #51 (nodes share the
+cached block + CSC circuit); the "before" column is main before those PRs:
 
 | run | prove before | peak RSS before | prove after | peak RSS after |
 | --- | --- | --- | --- | --- |
-| tower 4 x 256 | 18.6 s | 12.5 GiB | 10.7 s | 3.85 GiB |
+| tower 4 x 256 | 18.6 s | 12.5 GiB | 10.7 s | 3.49 GiB |
 | leaf 256 | 1.80 s | 2.42 GiB | 1.20 s | 0.79 GiB |
 | leaf 65536 | 2.09 s | 4.06 GiB | 1.44 s | 2.44 GiB |
 
 Inside the iPhone 17 Pro simulator (iOS 26.5 runtime, same Mac, via `simctl spawn`),
-after PR #50:
+after PRs #50 and #51:
 
 | run | prove | peak RSS |
 | --- | --- | --- |
-| tower 4 x 256 | 13.0 s | 3.31 GiB |
+| tower 4 x 256 | 13.0 s | 2.96 GiB |
 | leaf 256 | 1.75 s | 0.78 GiB |
 
 The simulator runs on the host CPU, so it proves the iOS runtime works (threads,
 allocation, the C-built hash kernels) but says nothing about phone speed.
 
 The recursion node is a fixed m=29 dense circuit. Before PR #50 the tower could not
-fit any phone; at 3.85 GiB the smallest tower is now within reach of an 8 GB
+fit any phone; at 3.5 GiB the smallest tower is now within reach of an 8 GB
 iPhone's per-process limit, and a leaf at 256 compressions is well inside it.
 What is left in a leaf's floor is one shared copy of the 44M-nonzero BLAKE3 base
 matrices (339 MiB) plus the CSC lincheck circuit (~178 MiB); narrowing the column
