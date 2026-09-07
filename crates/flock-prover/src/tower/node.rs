@@ -39,7 +39,7 @@ use crate::prover::prove_fast_ligerito_union_circuit_ag;
 use crate::{
     prover::{UnionElementSlotInput, prove_fast_ligerito_union_circuit},
     r1cs_hashes::{
-        blake3::{build_block_r1cs, generate_witness_batch_major_partial_into},
+        blake3::generate_witness_batch_major_partial_into,
         fs_chain::{IV, trace_duplex},
     },
     schedule::Registry,
@@ -54,12 +54,12 @@ use crate::{
         check_real_child_region, cw, emit_ag_point_binding, emit_fold_region, emit_fs_chain,
         emit_fs_chain_partitioned, emit_jagged_fold_region, emit_lagrange_lows,
         emit_real_child_region, emit_recorded_pow_checks, env_acc_chain_base, env_acc_main_base,
-        env_app_base, env_pass_base, envelope_shape, expected_real_tail_schedule, flatten_ops,
-        fold_region_ops, jagged_fold_region_ops, labeled_bytes_payloads, leaf_boolean_lcs,
-        leaf_boolean_mats, live_element_input_from_rows, locate_and_pin_folds,
-        locate_and_pin_jagged_folds, merge_chain, outer_lanes, outer_union, outer_zc_ag, pack8,
-        pad_envelope_counts, payload_words, pcs_batch_for, read_acc_entry, replay_fold_endpoints,
-        replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+        env_app_base, env_pass_base, envelope_shape, expected_real_tail_schedule,
+        fl_node::chain_blake_r1cs, flatten_ops, fold_region_ops, jagged_fold_region_ops,
+        labeled_bytes_payloads, leaf_boolean_lcs, leaf_boolean_mats, live_element_input_from_rows,
+        locate_and_pin_folds, locate_and_pin_jagged_folds, merge_chain, outer_lanes, outer_union,
+        outer_zc_ag, pack8, pad_envelope_counts, payload_words, pcs_batch_for, read_acc_entry,
+        replay_fold_endpoints, replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
     },
 };
 
@@ -2129,7 +2129,7 @@ pub fn build_node_outer_app(
             merkle_hash: HashKind::Blake3,
         };
         let t_r1cs = Instant::now();
-        let b3_r1cs2 = build_block_r1cs(nu2);
+        let b3_r1cs2 = chain_blake_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
