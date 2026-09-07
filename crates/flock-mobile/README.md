@@ -35,33 +35,36 @@ targets with no source changes. The interleaved Merkle SHA-256 kernel uses
 `core::arch` NEON intrinsics, and the iOS target enables the `sha2` and `aes`
 CPU features at compile time, so the hash hot path carries over.
 
+Native, after PR #50 (shared BLAKE3 R1CS matrices; the "before" column is main
+before that PR):
+
+| run | prove before | peak RSS before | prove after | peak RSS after |
+| --- | --- | --- | --- | --- |
+| tower 4 x 256 | 18.6 s | 12.5 GiB | 10.7 s | 3.85 GiB |
+| leaf 256 | 1.80 s | 2.42 GiB | 1.20 s | 0.79 GiB |
+| leaf 65536 | 2.09 s | 4.06 GiB | 1.44 s | 2.44 GiB |
+
+Inside the iPhone 17 Pro simulator (iOS 26.5 runtime, same Mac, via `simctl spawn`),
+after PR #50:
+
 | run | prove | peak RSS |
 | --- | --- | --- |
-| tower 4 x 256 | 18.6 s | 12.5 GiB |
-| tower 8 x 256 | 49.7 s | 15.8 GiB |
-| leaf 256 | 1.80 s | 2.42 GiB |
-| leaf 4096 | 1.80 s | 2.48 GiB |
-| leaf 16384 | 1.88 s | 2.85 GiB |
-| leaf 65536 | 2.09 s | 4.06 GiB |
-
-Inside the iPhone 17 Pro simulator (iOS 26.5 runtime, same Mac, via `simctl spawn`):
-
-| run | prove | peak RSS |
-| --- | --- | --- |
-| tower 4 x 256 | 26.6 s | 10.2 GiB |
-| leaf 256 | 2.46 s | 2.46 GiB |
-| leaf 4096 | 2.72 s | 2.52 GiB |
+| tower 4 x 256 | 13.0 s | 3.31 GiB |
+| leaf 256 | 1.75 s | 0.78 GiB |
 
 The simulator runs on the host CPU, so it proves the iOS runtime works (threads,
 allocation, the C-built hash kernels) but says nothing about phone speed.
 
-The recursion node is a fixed m=29 dense circuit, so the tower cannot run on a
-phone as it stands. A single leaf has a ~2.4 GiB floor, which fits the per-process
-limit on 8 GB iPhones.
+The recursion node is a fixed m=29 dense circuit. Before PR #50 the tower could not
+fit any phone; at 3.85 GiB the smallest tower is now within reach of an 8 GB
+iPhone's per-process limit, and a leaf at 256 compressions is well inside it.
+What is left in a leaf's floor is one shared copy of the 44M-nonzero BLAKE3 base
+matrices (339 MiB) plus the CSC lincheck circuit (~178 MiB); narrowing the column
+index type is the next lever if the phone needs more headroom.
 
-### Where the leaf floor goes (leaf 256, m = 22, traced 2026-09-07)
+### Where the leaf floor went before PR #50 (leaf 256, m = 22, traced 2026-09-07)
 
-The proof itself adds 7 MiB. The floor is the BLAKE3 base-block R1CS,
+The proof itself adds 7 MiB. The floor was the BLAKE3 base-block R1CS,
 `build_block_r1cs`: A has 27.3M nonzeros and B 17.2M, 44.4M in all, stored as
 `Vec<Vec<usize>>` (8 bytes per nonzero, 16384 x 16384 block), so one copy is
 339 MiB (397 MiB with Vec slack). Peak RSS along the leaf build:
@@ -76,13 +79,10 @@ The proof itself adds 7 MiB. The floor is the BLAKE3 base-block R1CS,
 | `csc_lincheck_circuit` (u32 CSC, ~178 MiB) + walk | 2,399 MiB |
 | prove, deferred verify, matrix check | 2,407 MiB |
 
-Three full copies of the matrices are live at once (shape cache, shape clone,
-lincheck BlockR1cs) plus two transient ones during the build. Levers, in order
-of payoff: share one `Arc` copy across the cache, the clone, and the lincheck
-circuit (about -700 MiB); store column indices as `u16` (columns fit; -75% per
-copy); drop the BlockR1cs before cloning the TableType out of it. None of these
-touch the proof system.
+PR #50 froze `SparseBinaryMatrix` rows behind an `Arc` and memoized the BLAKE3
+base matrices once per process, which removed every duplicate above.
 
-Open items: thread-pool sizing on a 2P+4E phone (the pool is `available_parallelism`; the macOS
-perf-core sysctl and background-QoS hooks in `flock-core` are gated on
-`target_os = "macos"` and become no-ops on iOS), and a real device number.
+Open items: thread-pool sizing on a 2P+4E phone (the pool is
+`available_parallelism`; the macOS perf-core sysctl and background-QoS hooks in
+`flock-core` are gated on `target_os = "macos"` and become no-ops on iOS), and a
+real device number.
