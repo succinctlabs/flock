@@ -1,4 +1,4 @@
-use std::iter::repeat_n;
+use std::{iter::repeat_n, sync::Arc};
 
 use flock_core::{
     circuit::builder::{CircuitShape, SlotId},
@@ -1260,7 +1260,10 @@ pub struct LeafOuter {
     pub(super) proof: MixedProof,
     pub(super) commitment: Commitment,
     pub(super) pcs: PcsParams,
-    pub(super) b3_r1cs: BlockR1cs,
+    /// The BLAKE3 block, shared process-wide (`chain_blake_r1cs`): every
+    /// node at one envelope reads ONE block and ONE compressed lincheck
+    /// circuit instead of building and keeping its own ~170 MiB copy.
+    pub(super) b3_r1cs: Arc<BlockR1cs>,
     pub(super) swap_r1cs: BlockR1cs,
     pub(super) spread_r1cs: BlockR1cs,
     pub(super) pow_r1cs: BlockR1cs,

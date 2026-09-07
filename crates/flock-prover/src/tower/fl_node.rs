@@ -110,12 +110,13 @@ pub(super) fn chain_jagged_params(cp: &ChainProof) -> JaggedParams {
     )
 }
 
-/// The chain BLAKE3 block R1CS per nu, cached process-wide. The base
-/// matrices are already shared by every `build_block_r1cs` call (see
+/// The BLAKE3 block R1CS per nu, cached process-wide. The base matrices
+/// are already shared by every `build_block_r1cs` call (see
 /// `r1cs_hashes::blake3`); what this cache adds is the BLOCK, and with it
 /// the lazily built CSC lincheck circuit (~178 MiB) that lives in the
-/// block's `OnceLock` — every chain proof and every FL's chain-side fold
-/// materials then read one circuit instead of rebuilding it per leaf.
+/// block's `OnceLock`. Every chain leaf (its own nu), every FL and every
+/// recursion node (the envelope nu*) reads one circuit through here; each
+/// node's [`LeafOuter`] holds the `Arc` rather than a private copy.
 pub(super) fn chain_blake_r1cs(nu: usize) -> Arc<BlockR1cs> {
     type Cache = Mutex<Vec<(usize, Arc<BlockR1cs>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -978,7 +979,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
             num_lanes: outer_lanes(&union2, pcs_batch_for(&union2, pf)),
             merkle_hash: HashKind::Blake3,
         };
-        let b3_r1cs2 = build_block_r1cs(nu2);
+        let b3_r1cs2 = chain_blake_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
