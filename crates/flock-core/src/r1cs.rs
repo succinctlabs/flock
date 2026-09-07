@@ -9,11 +9,10 @@
 //! boolean (`k = 2^k_log`). `C_0 = I_k` is implicit (we still carry the
 //! materialized `c_0` matrix for utilities like `satisfies`).
 
-use std::sync::Arc;
 use std::{
     array::from_fn,
     slice::{from_raw_parts, from_raw_parts_mut},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use blake3::Hasher;

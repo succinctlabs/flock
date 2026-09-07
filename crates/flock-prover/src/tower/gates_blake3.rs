@@ -9,8 +9,8 @@ use {
 };
 
 use crate::{
-    r1cs_hashes::blake3::{Compression, io_schema},
-    tower::{F128, GateType, SLOT_WORDS, SlotWitness, TableType, fl_node::chain_blake_r1cs},
+    r1cs_hashes::blake3::{Compression, build_block_r1cs, io_schema},
+    tower::{F128, GateType, SLOT_WORDS, SlotWitness, TableType},
 };
 
 pub(super) const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
@@ -118,10 +118,7 @@ impl GateType for Blake3Gate {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        // The process-wide cached block: the gate table and the leaf's
-        // lincheck circuit (`chain_blake_r1cs` again, in `build_chain_proof`)
-        // then read ONE set of matrices, and `from_block_r1cs` shares it.
-        TableType::from_block_r1cs(&chain_blake_r1cs(self.nu)).with_io_schema(io_schema())
+        TableType::from_block_r1cs(&build_block_r1cs(self.nu)).with_io_schema(io_schema())
     }
 
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
