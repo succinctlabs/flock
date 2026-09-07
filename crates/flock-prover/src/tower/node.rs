@@ -39,7 +39,7 @@ use crate::prover::prove_fast_ligerito_union_circuit_ag;
 use crate::{
     prover::{UnionElementSlotInput, prove_fast_ligerito_union_circuit},
     r1cs_hashes::{
-        blake3::{build_block_r1cs, generate_witness_batch_major_partial_into},
+        blake3::generate_witness_batch_major_partial_into,
         fs_chain::{IV, trace_duplex},
     },
     schedule::Registry,
@@ -51,15 +51,15 @@ use crate::{
         TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire, ZskipTapeRec, ZskipWires,
         assert_chain_replays, balance_extra_rows, bytes_payload_mask, challenge_word_locs,
         check_ag_skip_publics, check_fold_publics, check_jagged_fold_publics,
-        check_real_child_region, emit_ag_point_binding, emit_fold_region, emit_fs_chain,
+        check_real_child_region, cw, emit_ag_point_binding, emit_fold_region, emit_fs_chain,
         emit_fs_chain_partitioned, emit_jagged_fold_region, emit_lagrange_lows,
         emit_real_child_region, emit_recorded_pow_checks, env_acc_chain_base, env_acc_main_base,
-        env_app_base, env_pass_base, envelope_shape, flatten_ops, fold_region_ops,
-        jagged_fold_region_ops, labeled_bytes_payloads, leaf_boolean_lcs, leaf_boolean_mats,
-        live_element_input_from_rows, locate_and_pin_folds, locate_and_pin_jagged_folds,
-        merge_chain, outer_lanes, outer_union, outer_zc_ag, pack8, pad_envelope_counts,
-        payload_words, pcs_batch_for, read_acc_entry, replay_fold_endpoints,
-        replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+        env_app_base, env_pass_base, envelope_shape, expected_real_tail_schedule,
+        fl_node::chain_blake_r1cs, flatten_ops, fold_region_ops, jagged_fold_region_ops,
+        labeled_bytes_payloads, leaf_boolean_lcs, leaf_boolean_mats, live_element_input_from_rows,
+        locate_and_pin_folds, locate_and_pin_jagged_folds, merge_chain, outer_lanes, outer_union,
+        outer_zc_ag, pack8, pad_envelope_counts, payload_words, pcs_batch_for, read_acc_entry,
+        replay_fold_endpoints, replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
     },
 };
 
@@ -871,6 +871,11 @@ pub fn build_node_outer_app(
                 );
                 sb.end_island(isl);
                 mac_marks.push(sb.rows_in_slot(cs.macs));
+                assert_eq!(
+                    r.tail_schedule,
+                    expected_real_tail_schedule(rt),
+                    "real child {i}'s tail publishes on its declared schedule"
+                );
                 r
             })
             .collect();
@@ -1671,10 +1676,34 @@ pub fn build_node_outer_app(
                 }
             }
             let last = &regions[n_kids - 1];
-            (0..4)
+            let mut out: Vec<Wire> = (0..4)
                 .map(|j| regions[0].child_pub_w[off + j])
                 .chain((0..4).map(|j| last.child_pub_w[off + 4 + j]))
-                .collect()
+                .collect();
+            // THE SPAN COUNTER composes MULTIPLICATIVELY: the node's word
+            // is the product of its children's (g^{a+b} = g^a · g^b), one
+            // MAC row per extra child — depth never enters the shape.
+            let mut e = regions[0].child_pub_w[off + 8];
+            for rk in &regions[1..] {
+                e = sb.gate(cs.macs, &[zw, e, rk.child_pub_w[off + 8]])[0];
+            }
+            out.push(e);
+            // THE COUNTER BASE, chained: every child's word 9 is
+            // copy-constrained to this node's own baked C, so the fixed
+            // public grounds out at the ROOT's native check_public — the
+            // link that makes the counter adversarially proof-bound (a
+            // fixed public alone is never checked below the root).
+            let c_w = cw(
+                &mut sb,
+                &mut vals,
+                &mut consts,
+                los[0].public[env_app_base(&env) + 9],
+            );
+            for rk in &regions {
+                sb.connect(rk.child_pub_w[off + 9], c_w);
+            }
+            out.push(c_w);
+            out
         });
         // The publish of the combined span rides the envelope's fixed tail
         // block (below, with the padding), never inline.
@@ -2100,7 +2129,7 @@ pub fn build_node_outer_app(
             merkle_hash: HashKind::Blake3,
         };
         let t_r1cs = Instant::now();
-        let b3_r1cs2 = build_block_r1cs(nu2);
+        let b3_r1cs2 = chain_blake_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();

@@ -56,9 +56,76 @@ pub(super) struct EnvShape {
     pub(super) lanes: usize,
 }
 
-/// The APPLICATION STATEMENT's width in the envelope's public segment: the
-/// hash-chain PoC's span `(h_start, h_end)`, eight 128-bit words.
-pub(super) const ENV_APP_WORDS: usize = 8;
+/// The APPLICATION STATEMENT's width in the envelope's public segment:
+/// the hash-chain span `(h_start, h_end)` — four packed words each —
+/// plus the SPAN COUNTER `g^{n_blocks}` (word 8; Ron's call, 2026-09-07:
+/// the number of hashes is part of the statement) and the COUNTER BASE
+/// `C = g^{blocks_per_leaf}` (word 9). Ten 128-bit words.
+///
+/// The base word is the counter's GROUNDING: a fixed public is only
+/// natively checked at the ROOT (`check_public` — below the root the
+/// walks treat child publics as witness wires), so every parent
+/// copy-constrains each child's word 9 to its own baked C, the chain
+/// ends at the root's native check, and every word 8 is then bound by
+/// PROVEN relations — `C^k` via mac rows at the FL, the children's
+/// product via a mac row at every node.
+pub(super) const ENV_APP_WORDS: usize = 10;
+
+/// The span counter's base: the polynomial `x` in F128, certified a
+/// GENERATOR of the multiplicative group by `span_generator_full_order`
+/// — so two spans collide only at a difference of `2^128 - 1`, which no
+/// tower reaches. The count composes MULTIPLICATIVELY child-to-parent
+/// (char-2 kills integer field addition): an FL raises the GROUNDED
+/// base word to its arity via mac rows, and every node multiplies its
+/// children's counter words with one MAC row — see [`ENV_APP_WORDS`] for
+/// the grounding chain.
+pub(super) const SPAN_G: F128 = F128 { lo: 2, hi: 0 };
+
+/// `SPAN_G^e` by square-and-multiply — the native side of the span
+/// counter: the statement leg holds the published word against
+/// `span_count_word(statement.n_blocks)`.
+pub(super) fn span_count_word(e: u128) -> F128 {
+    let mut acc = F128::ONE;
+    let mut base = SPAN_G;
+    let mut e = e;
+    while e > 0 {
+        if e & 1 == 1 {
+            acc *= base;
+        }
+        base = base * base;
+        e >>= 1;
+    }
+    acc
+}
+
+/// THE GENERATOR CERTIFICATE: `SPAN_G` has full order `2^128 - 1` — for
+/// every prime factor `p`, `g^{(2^128 - 1)/p} != 1`. The factorization is
+/// `(2^64 - 1)(2^64 + 1)` = 3 · 5 · 17 · 257 · 641 · 65537 · 6700417 ·
+/// 274177 · 67280421310721. Plus the homomorphism the composition rests
+/// on: `g^{a+b} = g^a · g^b`.
+#[test]
+fn span_generator_full_order() {
+    const GROUP_ORDER: u128 = u128::MAX; // 2^128 - 1
+    const PRIMES: [u128; 9] = [3, 5, 17, 257, 641, 65537, 6700417, 274177, 67280421310721];
+    assert_eq!(
+        PRIMES.iter().product::<u128>(),
+        GROUP_ORDER,
+        "factorization"
+    );
+    for p in PRIMES {
+        assert_ne!(
+            span_count_word(GROUP_ORDER / p),
+            F128::ONE,
+            "SPAN_G's order is divisible by {p}"
+        );
+    }
+    assert_eq!(span_count_word(GROUP_ORDER), F128::ONE, "Lagrange sanity");
+    assert_eq!(
+        span_count_word(1 << 20) * span_count_word((1 << 20) + 12345),
+        span_count_word((1 << 21) + 12345),
+        "the counter composes multiplicatively"
+    );
+}
 
 /// Steady-repetition override: how many EXTRA times a builder re-runs its
 /// ONLINE phases (tapes + walk + witgen + prove + verify) over the

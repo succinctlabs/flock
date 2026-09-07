@@ -47,14 +47,15 @@ use crate::{
         SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable, TowerConfig, UnionInstance,
         UnionSlotProverInput, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays,
         balance_extra_rows, bytes_payload_mask, challenge_word_locs, check_ag_skip_publics,
-        check_child_region, check_fold_publics, check_jagged_fold_publics, emit_ag_point_binding,
-        emit_child_region, emit_fold_region, emit_fs_chain_partitioned, emit_jagged_fold_region,
-        emit_lagrange_lows, emit_recorded_pow_checks, env_acc_chain_base, env_app_base,
-        envelope_shape, flatten_ops, fold_region_ops, jagged_fold_region_ops,
-        labeled_bytes_payloads, live_element_input_from_rows, locate_and_pin_folds,
-        locate_and_pin_jagged_folds, merge_chain, native_chain, outer_lanes, outer_union,
-        outer_zc_ag, pack4, pack8, pad_envelope_counts, pcs_batch_for, replay_fold_endpoints,
-        replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+        check_child_region, check_fold_publics, check_jagged_fold_publics, cw,
+        emit_ag_point_binding, emit_child_region, emit_fold_region, emit_fs_chain_partitioned,
+        emit_jagged_fold_region, emit_lagrange_lows, emit_recorded_pow_checks, env_acc_chain_base,
+        env_app_base, envelope_shape, expected_child_tail_schedule, flatten_ops, fold_region_ops,
+        jagged_fold_region_ops, labeled_bytes_payloads, live_element_input_from_rows,
+        locate_and_pin_folds, locate_and_pin_jagged_folds, merge_chain, native_chain, outer_lanes,
+        outer_union, outer_zc_ag, pack4, pack8, pad_envelope_counts, pcs_batch_for,
+        replay_fold_endpoints, replay_jagged_fold_endpoints, span_count_word, steady_reps,
+        tower_fold_grinding,
     },
     verifier::{verify_ligerito_union_circuit_ag_deferred, verify_ligerito_union_circuit_deferred},
 };
@@ -109,11 +110,13 @@ pub(super) fn chain_jagged_params(cp: &ChainProof) -> JaggedParams {
     )
 }
 
-/// The chain BLAKE3 block R1CS per nu, cached process-wide: the ~21M-nnz
-/// base is identical for every chain proof and every FL's chain-side fold
-/// materials, and the tower bench used to build ten of them. Serves the
-/// borrow-only sites; callers that STORE an R1CS (LeafOuter) still build
-/// their own.
+/// The BLAKE3 block R1CS per nu, cached process-wide. The base matrices
+/// are already shared by every `build_block_r1cs` call (see
+/// `r1cs_hashes::blake3`); what this cache adds is the BLOCK, and with it
+/// the lazily built CSC lincheck circuit (~178 MiB) that lives in the
+/// block's `OnceLock`. Every chain leaf (its own nu), every FL and every
+/// recursion node (the envelope nu*) reads one circuit through here; each
+/// node's [`LeafOuter`] holds the `Arc` rather than a private copy.
 pub(super) fn chain_blake_r1cs(nu: usize) -> Arc<BlockR1cs> {
     type Cache = Mutex<Vec<(usize, Arc<BlockR1cs>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -438,6 +441,11 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                     &mut consts,
                 );
                 sb.end_island(isl);
+                assert_eq!(
+                    r.tail_schedule,
+                    expected_child_tail_schedule(t),
+                    "child {i}'s tail publishes on its declared schedule"
+                );
                 r
             })
             .collect();
@@ -865,10 +873,32 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
         // declares the same count vector and segment length every other
         // envelope outer does, and both the app block and the accumulator
         // claims ride the envelope's fixed TAIL.
-        let app_w: Vec<Wire> = (0..4)
+        let mut app_w: Vec<Wire> = (0..4)
             .map(|j| regions[0].child_pub_w[3 + j])
             .chain((0..4).map(|j| regions[k_ary - 1].child_pub_w[11 - 4 + j]))
             .collect();
+        // THE SPAN COUNTER: the base C = g^{n_blocks} rides word 9 as a
+        // fixed public — GROUNDED by the parent chain (every parent
+        // copy-constrains it to its own, up to the root's native
+        // check_public) — and word 8 = C^k via mac rows, so the count is
+        // bound by proven relations, not by fixed-public metadata.
+        let per_leaf = cps[0].n_blocks;
+        assert!(
+            cps.iter().all(|cp| cp.n_blocks == per_leaf),
+            "one leaf size per FL"
+        );
+        let c_w = cw(
+            &mut sb,
+            &mut vals,
+            &mut consts,
+            span_count_word(per_leaf as u128),
+        );
+        let mut e_w = c_w;
+        for _ in 1..k_ary {
+            e_w = sb.gate(cs.macs, &[zw, e_w, c_w])[0];
+        }
+        app_w.push(e_w);
+        app_w.push(c_w);
         let stmt_base = {
             pad_envelope_counts(
                 &mut sb,
@@ -949,7 +979,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
             num_lanes: outer_lanes(&union2, pcs_batch_for(&union2, pf)),
             merkle_hash: HashKind::Blake3,
         };
-        let b3_r1cs2 = build_block_r1cs(nu2);
+        let b3_r1cs2 = chain_blake_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();

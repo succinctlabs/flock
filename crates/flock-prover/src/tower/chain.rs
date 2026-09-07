@@ -22,7 +22,7 @@ use {
         r1cs_hashes::blake3::{Compression, build_block_r1cs},
         tower::{
             ChildSlots, ChildTape, SLOT_WORDS, check_child_region, emit_child_region,
-            gates_blake3::Rng, test_config,
+            expected_child_tail_schedule, gates_blake3::Rng, test_config,
         },
     },
     flock_core::{
@@ -303,8 +303,10 @@ pub(super) struct ChainShape {
 
 /// The chain SHAPE per n_blocks, cached process-wide: the emission+finish
 /// (~1.4 s at m32) is statement-independent — that is the digest pin — so
-/// the tower's material proofs CLONE the cached shape (Registry + Circuit
-/// memcpy, ~an order of magnitude cheaper) instead of re-emitting it.
+/// the tower's material proofs CLONE the cached shape instead of
+/// re-emitting it. The clone is cheap: the BLAKE3 matrices behind the
+/// registry share their storage (`SparseBinaryMatrix` rows are `Arc`), so
+/// only the circuit and the slot bookkeeping are copied.
 /// `build_chain_proof`'s setup_ms honestly reflects whichever it paid.
 pub(super) fn chain_shape_cached(n_blocks: usize) -> Arc<ChainShape> {
     type Cache = Mutex<Vec<(usize, Arc<ChainShape>)>>;
@@ -378,6 +380,10 @@ pub struct ChainProof {
     pub(super) inner: MixedInner,
     pub(super) h_start: [u32; 16],
     pub(super) h_end: [u32; 16],
+    /// The segment's compression count — what the FL's baked span
+    /// counter (`g^{Σ n_blocks}`) sums over. Shape-bound: a different
+    /// count is a different chain (and FL) circuit digest.
+    pub(super) n_blocks: usize,
     /// What the leaf cost, split SETUP vs ONLINE — see [`Online`]. The
     /// LAST online iteration under steady repetition. Read by the in-file
     /// `#[test]` benches only.
@@ -543,6 +549,7 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
             work,
             sigma,
         },
+        n_blocks,
         h_start,
         h_end,
         t: *onlines.last().expect("one online iteration"),
@@ -897,5 +904,10 @@ pub(super) fn chain_child_region_emits_alone() {
         region.pub_base + consumed,
         built2.public.len(),
         "the region's publics are the whole tail"
+    );
+    assert_eq!(
+        region.tail_schedule,
+        expected_child_tail_schedule(&ct),
+        "the lone child region's tail publishes on its declared schedule"
     );
 }

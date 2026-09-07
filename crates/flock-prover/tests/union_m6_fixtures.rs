@@ -149,6 +149,10 @@ fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<Sha2Compression> {
 // VALUE-ONLY (claim points are transcript-derived and verifier-recomputed,
 // never prover messages; ~92 KB of self-absorbed points deleted from the
 // recursion replay). Label flock-merged-open-v0 -> v1.
+// Re-pinned 2026-09-07: proof-IO VERSION 22 -> 23 (the tower span
+// counter) — only the bundle HEADER byte moved; payloads are unchanged,
+// and the header-less anchor digests did not move, which is the
+// cross-check. Two deterministic print runs agreed.
 // Re-pinned 2026-08-05: BLAKE3 R1CS "Option E" lin-id drop — the b3 table
 // narrowed 121 -> 93 word-cols (b_new/d_new slots dissolved into the
 // cascade), so every blake3-committed fixture's bytes move. The pure
@@ -195,12 +199,15 @@ fn merged_bundle_digest(
 /// registry id, counts vector, commitment, and the merged proof — plus the
 /// claim values. The registry here (BLAKE3+SHA-256 at ν = 10) IS the
 /// `Blake3Sha2Nu10` tier, so this pins exactly what `proof_io` puts on disk
-/// for the current v21 mixed proof. It retains the removed jagged fixture's
+/// for the current mixed proof (the header carries `proof_io::VERSION`). It retains the removed jagged fixture's
 /// statements and witness streams; the Ligerito query ladder intentionally
 /// changed with v18.
 #[test]
 // Default-run (~2 s for both anchors): these pins are what makes the
 // "fixture anchors byte-stable" claim enforceable in CI.
+// Re-pinned 2026-09-07: main's proof-IO v23 (the tower span counter) merged
+// onto the BLAKE3 default — the four merged bundles moved with the header
+// byte, the header-less anchors did not. Two deterministic print runs agreed.
 // Re-pinned 2026-08-31: main's profile consolidation (proof-IO v22) merged
 // on top of the BLAKE3 default — both sides' pins were stale. Two
 // deterministic print runs agreed.
@@ -209,22 +216,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "c3d7b17119826833b218d05b2684f1b2a9c1a99c91507861a6bdf61834408ff9",
+            "19114ba0625a23655be4dd2d8514527c2a51df83c52376a868b5bc81c2c4625d",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "0f15486ead29dbb3c27222522fa68dc4c24d240a688e2391dc0f4477ee4e0e8a",
+            "e8e7a778e916fd39521d7f53fbd5ab1cc592799947c24bdf010cd7fd2dd21d5e",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "16773ba2aece640a77de8712a2c0004bd0f0acfee548a1ff6ec56c436047cb96",
+            "96ae2fad523f7dfb131c9e927c95d6b00163bed9c08c71a95bc58068bf84c221",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "e0e6e9cdfc8dc7834b81bd3ad758630cc1a6e622835f3ec7c25ac81e66e1cb74",
+            "30286680ab5ce851884552eefd71e6e0c6950a91ae35a6bc683bcdb8a073006a",
         ),
     ];
 

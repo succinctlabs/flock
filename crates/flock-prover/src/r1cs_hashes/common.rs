@@ -233,20 +233,12 @@ pub(crate) fn const_add_parts(k: u32, y: u32) -> (u32, u32, u32, u32) {
 /// K × K sparse matrix with no nonzero entries. Used as an `a_0`/`b_0` stub
 /// when the constraint definition lives in a `LincheckCircuit` walker.
 pub(crate) fn empty_matrix(k: usize) -> SparseBinaryMatrix {
-    SparseBinaryMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows: vec![Vec::new(); k],
-    }
+    SparseBinaryMatrix::new(k, k, vec![Vec::new(); k])
 }
 
 /// K × K identity sparse matrix.
 pub(crate) fn identity(k: usize) -> SparseBinaryMatrix {
-    SparseBinaryMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows: (0..k).map(|i| vec![i]).collect(),
-    }
+    SparseBinaryMatrix::new(k, k, (0..k).map(|i| vec![i]).collect())
 }
 
 /// Build a `BlockR1cs` with caller-supplied A_0, B_0 sparse matrices and

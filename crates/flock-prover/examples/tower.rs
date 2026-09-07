@@ -71,13 +71,12 @@ fn main() {
         let gen_s = t2.elapsed().as_secs_f64();
         let bytes = tower.root_bundle_bytes();
         let t3 = Instant::now();
-        let (stmt, bound) =
-            verify_root_bytes(&vk, &bytes).expect("the wire bundle verifies standalone");
+        let stmt = verify_root_bytes(&vk, &bytes).expect("the wire bundle verifies standalone");
         let verify_s = t3.elapsed().as_secs_f64();
         assert_eq!(&stmt, s, "the statement rode the wire");
         println!(
             "  VERIFIED STANDALONE (consumer path, over the wire): bundle {:.1} KiB \
-             | vk generate {gen_s:.1}s (one-time) | verify {verify_s:.3}s | span bound: {bound:?}",
+             | vk generate {gen_s:.1}s (one-time) | verify {verify_s:.3}s | statement certified",
             bytes.len() as f64 / 1024.0,
         );
     }

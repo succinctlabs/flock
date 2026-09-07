@@ -6096,3 +6096,20 @@ verifies in half the time. Note for any future ST comparison: under
 2.86 s) — kill it explicitly. Binaries: `blake3_proof_flock-yukon`,
 `blake3_proof_flock-yukon-wip` (scratchpad); clones `/Users/buenz/
 flock-yukon` (c35c1c4 + grafts) and `/Users/buenz/flock-yukon-wip`.
+
+### LANDED: origin/main 3877687 (PRs #48–#51) merged on top — one fixture re-pin, prover unchanged within noise — 2026-09-07
+
+Main took four more PRs this morning (tower op-schedule #48, the span
+counter #49 with proof-IO v22 → v23, R1CS base-matrix sharing #50,
+the node CSC cache #51): 36 files, ten overlapping ours, all
+auto-merged except the m=6 proof-byte fixtures, where both sides had
+re-pinned (ours for the BLAKE3 default, main for the v23 header byte).
+Re-pinned from the merged tree: the four merged bundles moved, the
+header-less anchors did not; two deterministic print runs agreed.
+Gates: fmt, CI clippy, x86 leg, workspace release tests 649/0/78,
+tower spine/lane e2e and both tape pins. A/B (merged vs the previous
+merge, m=32 grind-free, 8-prove min, 4 alternating pairs): 440.3 /
+446.5 / 448.8 / 460.0 vs 443.1 / 444.1 / 443.4 / 446.2 — mean +4.7 ms
+with mixed signs, the last pair under a load spike (8.9–15); per phase
+every bucket within ±3 ms with mixed signs. Nothing in these PRs
+touches the m=32 prove path; treated as unchanged.

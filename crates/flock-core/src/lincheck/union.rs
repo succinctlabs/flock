@@ -976,11 +976,7 @@ mod tests {
     };
 
     fn stub() -> SparseBinaryMatrix {
-        SparseBinaryMatrix {
-            num_rows: 0,
-            num_cols: 0,
-            rows: Vec::new(),
-        }
+        SparseBinaryMatrix::new(0, 0, Vec::new())
     }
 
     fn ty(k_log: usize, useful_bits: usize) -> TableType {
