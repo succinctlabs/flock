@@ -672,6 +672,22 @@ Measured in a paired, alternating A/B against the previous binary
 (three pairs, min of two runs each): the open drops from $137$~ms to
 $109$~ms and the whole proof by $\approx 15$~ms net of the C fold.
 
+The C fold is the transport's one cost at the lookup rate, and it has
+no cheaper form. Fusing it into the lincheck's own sweep of the same
+stripe --- a two-point kernel with $32$-byte sum-table entries holding
+both points' subset sums and sixteen accumulators, one address
+computation and two adjacent loads per stripe byte --- was built,
+bit-identical to the two single folds, and measured a wash ($-0.3$~ms
+over four alternating pairs). The reason is the kernel's regime: at
+$m = 25$ it sustains ${\approx}1.4$ table lookups per cycle per core
+($85.9$~ms on one thread, $14.4$ on eight, $37$~GB/s of stripe), so it
+is bound by the core's extract--address--load--XOR chain and not by
+memory, and a second point costs its own load and XOR per byte while
+sharing only the addressing (${\approx}5\%$ of the work). With the $q'$
+fold ($5$~ms) and the ladder's seed sweep ($4$~ms) already at the
+multiply rate, the ${\approx}13$~ms that stage~1 still pays over the
+open proper is the protocol's shape, not an implementation gap.
+
 \paragraph{What remains: the full fusion, built and parked.} The row
 rounds still fold $(q', W')$ at $2^{n+1}$ and the inner Ligerito
 opening of $\hat q(\rho)$ still runs on the committed data. The full
@@ -727,6 +743,24 @@ growth from the right-sized to the $4\times$ tier is $+14$\,ms versus
 $+41$\,ms, with right-sized totals at parity and the standard
 pipeline's multi-hundred-MB weight transient eliminated. Verifier
 overhead is below $1$\,ms at the deployed layout.
+
+\paragraph{Where the transport stands.} Against the retired direct
+pipeline at the same $m = 25$ shape, on the same machine, grind-free:
+the merged pipeline's open is $105$\,ms multi-threaded ($562$
+single-threaded) where the direct pipeline's was $30$ ($148$) --- two
+ring-switched claims and the merged transport in place of one direct
+open --- and its proof is $462$\,KB against $437$. The prove as a whole
+is nonetheless ahead on both thread counts ($438$ vs $459$\,ms;
+$2.91$ vs $3.28$\,s), because the commit is $42\%$ cheaper and the
+zerocheck faster; the open is the one phase that costs more, and what
+remains in it after the block-first rounds is the protocol (the
+recursive levels, the level OODs, the transport's $\approx 13$\,ms
+tax above). For an external reference, an independently optimized
+fork of the direct pipeline (the \emph{flock-challenge} frontier:
+$\F$ statement, SHA-256 Merkle, $19$-bit fold grinding, no union, a
+GPU commit) proves the same $2^{18}$ compressions here in $266$\,ms
+with its GPU, $384$--$407$ without, and $2.86$\,s single-threaded ---
+equal CPU work, a parallel-efficiency edge on the CPU, and the GPU.
 
 \begin{remark}
 The technique needs only an $\Ftwo$-linear per-word fold map, an
