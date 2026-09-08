@@ -2,7 +2,7 @@
 //! from the real `uni_skip_fold_and_round_pair_optimized_packed_padded` so the
 //! CUDA port (`cuda-ghash/test_zerocheck_round2.cu`) can be checked bit-for-bit.
 //!
-//! Round-2 folds the packed witness a/b at the URM challenge z (over the skip
+//! Round-2 folds the packed witness a/b at the univariate round message challenge z (over the skip
 //! domain) into a_mlv/b_mlv (F128, length 2^(m-6)), then computes the first
 //! multilinear sumcheck message:
 //!   a_mlv[row] = Σ_{j=0..8} foldtable[j*256 + a_packed[row*8 + j]]

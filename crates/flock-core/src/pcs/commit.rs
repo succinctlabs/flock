@@ -235,13 +235,13 @@ impl PcsParams {
     }
 
     /// Cap depth of the L0 commitment tree — the opener config's own rule
-    /// ([`ligerito::ProverConfig::l0_cap_depth`]): the stratified schedule's
+    /// ([`ligerito::ProverConfig::level_zero_cap_depth`]): the stratified schedule's
     /// cap when the config opts in, else the legacy `min(⌈log2 q₀⌉,
     /// k_code)`. The `udr_queries` fallback mirrors the opener's config
     /// fallback, so commit-time cap sizing always agrees with the opener.
-    pub fn l0_cap_depth(&self) -> usize {
+    pub fn level_zero_cap_depth(&self) -> usize {
         match self.ligerito_prover_config() {
-            Ok(cfg) => cfg.l0_cap_depth(),
+            Ok(cfg) => cfg.level_zero_cap_depth(),
             // The fallback mirrors `default_config`, which is stratified
             // since the flip: the schedule of the udr count.
             Err(_) => {
@@ -272,7 +272,7 @@ impl PcsParams {
 }
 
 /// Public commitment (Merkle CAP + params). The cap is the `2^c` tree nodes
-/// at depth `c = params.l0_cap_depth()` below the root — the commitment IS
+/// at depth `c = params.level_zero_cap_depth()` below the root — the commitment IS
 /// the cap; there is no root (a 32-byte id, if ever needed externally, is
 /// just a hash of the cap and lives outside the protocol). Openings
 /// authenticate leaf → cap node in `k_code − c` siblings.
@@ -585,7 +585,7 @@ fn commit_into_pipelined(
         params.merkle_hash,
         prehashed_levels,
     );
-    let cap = merkle::cap_layer(&merkle_tree, n_leaves, params.l0_cap_depth()).to_vec();
+    let cap = merkle::cap_layer(&merkle_tree, n_leaves, params.level_zero_cap_depth()).to_vec();
     if timing {
         eprintln!(
             "[commit-timing] merkle top: {:.2} ms",
@@ -856,7 +856,12 @@ pub fn commit_merkle(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, Pr
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
     // Ligerito's L0 commitment.
     let merkle_tree = merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
-    let cap = cap_layer(&merkle_tree, params.n_leaves(), params.l0_cap_depth()).to_vec();
+    let cap = cap_layer(
+        &merkle_tree,
+        params.n_leaves(),
+        params.level_zero_cap_depth(),
+    )
+    .to_vec();
     if timing {
         eprintln!(
             "[commit-timing] merkle: {:.2} ms",
@@ -1121,7 +1126,11 @@ mod tests {
             let oracle_bytes: &[u8] =
                 unsafe { from_raw_parts(oracle.as_ptr() as *const u8, oracle.len() * 16) };
             let oracle_tree = merkle_tree(oracle_bytes, params.n_leaves(), params.merkle_hash);
-            let oracle_cap = cap_layer(&oracle_tree, params.n_leaves(), params.l0_cap_depth());
+            let oracle_cap = cap_layer(
+                &oracle_tree,
+                params.n_leaves(),
+                params.level_zero_cap_depth(),
+            );
             assert_eq!(
                 commitment.cap, oracle_cap,
                 "cap mismatch at m={m} r={log_inv_rate}"
@@ -1285,7 +1294,7 @@ mod tests {
                     )
                 };
                 let tree = merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash);
-                let cap = cap_layer(&tree, t_params.n_leaves(), t_params.l0_cap_depth());
+                let cap = cap_layer(&tree, t_params.n_leaves(), t_params.level_zero_cap_depth());
                 assert_eq!(cap, _c_t.cap, "cap must be over t-wide leaves");
             }
         }
@@ -1370,7 +1379,7 @@ mod tests {
                 cap_layer(
                     &prover_data.merkle_tree,
                     params.n_leaves(),
-                    params.l0_cap_depth(),
+                    params.level_zero_cap_depth(),
                 ),
                 commitment.cap
             );

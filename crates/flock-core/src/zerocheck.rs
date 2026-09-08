@@ -142,14 +142,14 @@ impl ZerocheckGrinding {
     }
 
     /// Explicit PoW bits on the AG-skip zerocheck's FUSED `r₁` nonce
-    /// ([`ag_skip::sample_r1_prover_pow`]): ALL `bits_for(474) = 9` bits
+    /// ([`ag_skip::sample_round_one_prover_pow`]): ALL `bits_for(474) = 9` bits
     /// required ([`ag_skip::R1_ZERO_BOUND`]) are explicit — the recursion
     /// circuit binds the decode with RELAXED canonicity (any fiber point
     /// over the XOF-derived `x`), which returns the sampler's 5 flattening
     /// bits to the prover, so they are repaid in the PoW target. `None`
     /// under a disabled schedule (the direct route's plain single-attempt
     /// nonce, which makes no 128-bit claim).
-    pub const fn ag_r1_bits(self) -> Option<u32> {
+    pub const fn ag_round_one_bits(self) -> Option<u32> {
         if self.enabled {
             Some(R1_POW_BITS)
         } else {
@@ -220,12 +220,12 @@ impl PaddingRun {
     }
 }
 
-/// Witness padding descriptor for URM / fold work-skipping.
+/// Witness padding descriptor for univariate round message and fold work-skipping.
 ///
 /// The witness is described by an ordered **run-list**: the [`PaddingRun`]s
 /// are laid out back-to-back from address 0, and everything after the last
 /// run (up to the instance's `2^m` domain) is an implicit all-zero gap.
-/// URM/fold contributions from a chunk of all-zero bits are themselves zero,
+/// Univariate round message and fold contributions from an all-zero chunk are zero,
 /// so kernels may skip any chunk the spec marks as padding or gap and produce
 /// byte-identical output — provided those bits are honestly zero.
 ///
@@ -247,7 +247,7 @@ pub struct PaddingSpec {
 
 impl PaddingSpec {
     /// "No padding": every bit of the witness is treated as useful. Equivalent
-    /// to the legacy URM path with no skipping.
+    /// to the legacy univariate round message path with no skipping.
     pub fn dense(m: usize) -> Self {
         Self::uniform(m, 1usize << m, 1)
     }
@@ -328,7 +328,7 @@ impl PaddingSpec {
     /// merged: block `x` is listed iff bits `[x·2^log2_block,
     /// (x+1)·2^log2_block)` intersect a useful interval. This is the live set
     /// of a table whose entries each aggregate one block of witness bits
-    /// (e.g. the post-URM tables at `log2_block = k_skip`, or packed words at
+    /// (e.g. tables after the univariate round message at `log2_block = k_skip`, or packed words at
     /// `log2_block = 7`): outside it the honest table is identically zero.
     pub fn useful_block_intervals(&self, log2_block: usize) -> Vec<(usize, usize)> {
         let mut out: Vec<(usize, usize)> = Vec::new();
@@ -578,7 +578,7 @@ pub fn prove_packed_with_grinding<C: Challenger>(
 }
 
 /// Same as [`prove_packed`] but lets the caller declare a run-list padding
-/// pattern so URM can skip work for chunks that fall entirely in zero
+/// pattern so univariate round message can skip work for chunks that fall entirely in zero
 /// padding (or in the trailing gap after the last run). Output is
 /// byte-identical to the dense path when the padding bits are honestly zero.
 pub fn prove_packed_padded<C: Challenger>(
@@ -695,11 +695,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     //
     // r layout:
     //   r[0..k_skip]                — sampled (used by verifier for the
-    //                                  final check at S; not by the URM)
+    //                                  final check at S; not by the univariate round message)
     //   r[k_skip..k_skip+3]         — protocol small-eq constants φ_8(0xF7..)
     //   r[k_skip+3..k_skip+7]       — protocol medium-eq constants β_i
     //   r[k_skip+7..m]              — sampled (the "outer" eq weights for
-    //                                  the URM and multilinear rounds)
+    //                                  the univariate round message and multilinear rounds)
     let r_skip = if let Some(bits) = grinding.initial_bits(m) {
         let (nonce, r_skip) = challenger.grind_pow_and_sample_f128_vec(bits, k_skip);
         grinding_nonces.push(nonce);
@@ -718,9 +718,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     }
     r[k_skip + N_INNER..].copy_from_slice(&r_outer);
 
-    // ---- 3. Round 1: URM (extract_c, parallel) ----
+    // ---- 3. Round 1: univariate round message (extract_c, parallel) ----
     //
-    // The optimized URM drops a `C_s = φ_8(0x1C)` scalar from its accumulators
+    // The optimized univariate round message drops a `C_s = φ_8(0x1C)` scalar from its accumulators
     // (a prover-side optimization tied to the small-eq trick — see the
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
@@ -751,7 +751,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         );
     }
 
-    // ---- 4. Observe round-1 message, sample z (URM fold point) ----
+    // ---- 4. Observe round-1 message, sample z (univariate round message fold point) ----
     challenger.observe_f128_slice(&round1_ab);
     challenger.observe_f128_slice(&round1_c);
     let z = if let Some(bits) = grinding.skip_bits() {
@@ -781,7 +781,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
     // Support-proportional prover (M6): under a multi-run count-derived spec
-    // the post-URM tables are zero outside the declared support (the live
+    // the tables after the univariate round message are zero outside the declared support (the live
     // interval list). While that support is sparse (live·16 ≤ n), round 2 and
     // the tail rounds fold/evaluate over the live intervals only — every
     // skipped term carries an `a·b` factor of zero, so all messages and folded

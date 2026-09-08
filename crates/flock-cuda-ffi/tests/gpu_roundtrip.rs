@@ -135,7 +135,7 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
 }
 
 // Zerocheck round-1 kernel tables (same as dump_zerocheck_full_vectors).
-fn zc_tables() -> (Vec<u8>, Vec<u8>) {
+fn zerocheck_tables() -> (Vec<u8>, Vec<u8>) {
     let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
     let mut mcol = vec![0u8; 64 * 64];
@@ -243,7 +243,7 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
             b_rows,
         }
     });
-    let (mcol, f8mul) = zc_tables();
+    let (mcol, f8mul) = zerocheck_tables();
 
     let to_i32 = |v: &[usize]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
     let log_inv_rates = to_i32(&cfg.log_inv_rates);

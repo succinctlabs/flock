@@ -15,8 +15,8 @@ pub use crate::hashing::{
 };
 #[cfg(test)]
 use crate::hashing::{
-    blake3_hash_many_leaves, blake3_hash_many_parents, blake3_leaf_cv,
-    blake3_leaf_size_is_batchable, blake3_parent_cv,
+    blake3_hash_many_leaves, blake3_hash_many_parents, blake3_leaf_chaining_value,
+    blake3_leaf_size_is_batchable, blake3_parent_chaining_value,
 };
 mod hashing;
 
@@ -335,10 +335,10 @@ mod tests {
 
     use crate::{
         Blake3MerkleHash, Hash, HashKind, Sha256MerkleHash, blake3_hash_many_leaves,
-        blake3_hash_many_parents, blake3_leaf_cv, blake3_leaf_size_is_batchable, blake3_parent_cv,
-        cap_depth, cap_layer, hash_leaf, hash_pair, merkle_proof, merkle_proof_capped, merkle_root,
-        merkle_tree, merkle_tree_sequential, merkle_tree_with, verify_merkle_proof,
-        verify_merkle_proof_capped,
+        blake3_hash_many_parents, blake3_leaf_chaining_value, blake3_leaf_size_is_batchable,
+        blake3_parent_chaining_value, cap_depth, cap_layer, hash_leaf, hash_pair, merkle_proof,
+        merkle_proof_capped, merkle_root, merkle_tree, merkle_tree_sequential, merkle_tree_with,
+        verify_merkle_proof, verify_merkle_proof_capped,
     };
 
     /// Every structural test runs against both hashes: the tree and path
@@ -455,7 +455,11 @@ mod tests {
             for i in 0..n {
                 let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
                 let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
-                assert_eq!(batched[i], blake3_parent_cv(l, r), "parent {i} of {n}");
+                assert_eq!(
+                    batched[i],
+                    blake3_parent_chaining_value(l, r),
+                    "parent {i} of {n}"
+                );
             }
         }
 
@@ -475,7 +479,7 @@ mod tests {
                 for i in 0..n {
                     assert_eq!(
                         batched[i],
-                        blake3_leaf_cv(&data[i * leaf_size..(i + 1) * leaf_size]),
+                        blake3_leaf_chaining_value(&data[i * leaf_size..(i + 1) * leaf_size]),
                         "leaf {i} of {n} at size {leaf_size}"
                     );
                 }

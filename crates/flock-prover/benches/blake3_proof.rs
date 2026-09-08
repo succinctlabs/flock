@@ -115,7 +115,7 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     // Boolean zerocheck flavor. **AG is the default wherever its round-1
     // kernel exists** (aarch64 NEON); x86 falls back to RS until the AVX-512
     // AG round-1 kernel lands (docs/ag-recursion-plan.md Phase F.1). Same
-    // selector convention as the tower's `leaf_zc_ag()`/`outer_zc_ag()`,
+    // selector convention as the tower's `leaf_zerocheck_ag()`/`outer_zerocheck_ag()`,
     // which have defaulted to AG since Phase B/C.
     //
     // Measured at m=32, paired alternating, 2026-09-01: AG 862.7 best /

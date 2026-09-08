@@ -523,7 +523,7 @@ impl<'r> UnionInstance<'r> {
 
     // -----------------------------------------------------------------------
     // Layout-aware claim points — the union counterparts of the BlockR1cs
-    // BatchMajor bookkeeping (`x_ab_from_mlv` / `ab_claim_point` /
+    // BatchMajor bookkeeping (`x_ab_from_multilinear_values` / `ab_claim_point` /
     // `c_claim_point`). The union address order is `[6 skip | dim6 | nu batch
     // | col_log chunk]`, so the formulas are the BatchMajor ones with
     // `(m, n_log) = (M, nu)`; they depend on no per-slot data, which is what
@@ -542,9 +542,9 @@ impl<'r> UnionInstance<'r> {
     /// Lincheck's **semantic** quirky point from the boolean zerocheck claim:
     /// split the address-ordered `mlv` challenges (length `M_bool − 6`) into
     /// `x_inner_rest = [dim6, chunk…]` and `x_outer = batch`. Union analog of
-    /// [`BlockR1cs::x_ab_from_mlv`] (BatchMajor). Stays in BOOLEAN-REGION
+    /// [`BlockR1cs::x_ab_from_multilinear_values`] (BatchMajor). Stays in BOOLEAN-REGION
     /// coordinates — the boolean lincheck's column domain is `M_bool − nu`.
-    pub fn x_ab_from_mlv(&self, z_skip: SkipPoint, mlv: &[F128]) -> QuirkyPoint {
+    pub fn x_ab_from_multilinear_values(&self, z_skip: SkipPoint, mlv: &[F128]) -> QuirkyPoint {
         let nu = self.n_log();
         assert_eq!(mlv.len(), self.m_bool() - K_SKIP);
         let mut x_inner_rest = Vec::with_capacity(1 + self.boolean_col_log());
@@ -1196,9 +1196,12 @@ mod tests {
         for _ in 0..16 {
             let z_skip = rng.f128();
             let mlv = rng.f128_vec(m - K_SKIP);
-            let x_ab_union = union.x_ab_from_mlv(SkipPoint::Phi8(z_skip), &mlv);
-            let x_ab_r1cs = r1cs.x_ab_from_mlv(SkipPoint::Phi8(z_skip), &mlv);
-            assert_eq!(x_ab_union, x_ab_r1cs, "x_ab_from_mlv diverged");
+            let x_ab_union = union.x_ab_from_multilinear_values(SkipPoint::Phi8(z_skip), &mlv);
+            let x_ab_r1cs = r1cs.x_ab_from_multilinear_values(SkipPoint::Phi8(z_skip), &mlv);
+            assert_eq!(
+                x_ab_union, x_ab_r1cs,
+                "x_ab_from_multilinear_values diverged"
+            );
 
             let r_inner_skip = rng.f128();
             let r_inner_rest = rng.f128_vec(k_log - K_SKIP);
@@ -2003,7 +2006,7 @@ mod tests {
         let mut rng = Rng::new(0xE1E_C7);
 
         let mlv = rng.f128_vec(m_bool - K_SKIP);
-        let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(rng.f128()), &mlv);
+        let x_ab = union.x_ab_from_multilinear_values(SkipPoint::Phi8(rng.f128()), &mlv);
         assert_eq!(x_ab.x_outer.len(), union.n_log());
         assert_eq!(
             x_ab.x_inner_rest.len(),

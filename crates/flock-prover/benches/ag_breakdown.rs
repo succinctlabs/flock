@@ -25,7 +25,7 @@ mod aarch64_only {
 
     use flock_prover::challenger::FsChallenger;
     use flock_prover::field::F128;
-    use flock_prover::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded;
+    use flock_prover::genus95_curve_code::round1::round1_straight_line_program_packed_banks_fused_padded;
     use flock_prover::zerocheck::BlockCoverage;
     use flock_prover::zerocheck::ag_skip::{
         LOOKAHEAD_DISABLE, N_INNER, fold_and_first_round_sparse, friendly_challenges,
@@ -105,7 +105,7 @@ mod aarch64_only {
         };
 
         let t_r1 = time(&mut || {
-            black_box(round1_slp_packed_banks_fused_padded(
+            black_box(round1_straight_line_program_packed_banks_fused_padded(
                 &a, &b, &c, &eq, &coverage,
             ));
         });

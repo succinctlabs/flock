@@ -1,4 +1,4 @@
-//! Round-1 URM bench — full sweep through m=29 (the C++ headline workload).
+//! Round-1 univariate round message bench — full sweep through m=29 (the C++ headline workload).
 //!
 //! At m=29 the witness is 3 × 64 MB packed bytes. We generate `*_packed`
 //! directly to avoid 3 × 537 MB bool-vec allocations.

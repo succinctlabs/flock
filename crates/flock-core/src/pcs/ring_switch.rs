@@ -224,7 +224,7 @@ pub fn fold_1b_rows_multi_padded(
             // the fused kernel's register pressure ate the win on M-series).
             #[cfg(target_arch = "x86_64")]
             {
-                let (a0, a1) = fold_1b_rows_2way_mfr_16wide_padded(
+                let (a0, a1) = fold_1b_rows_2way_method_of_four_russians_16wide_padded(
                     packed_witness,
                     suffix_tensors[0],
                     suffix_tensors[1],
@@ -234,15 +234,21 @@ pub fn fold_1b_rows_multi_padded(
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
-                let a0 =
-                    fold_1b_rows_1way_mfr_16wide_padded(packed_witness, suffix_tensors[0], padding);
-                let a1 =
-                    fold_1b_rows_1way_mfr_16wide_padded(packed_witness, suffix_tensors[1], padding);
+                let a0 = fold_1b_rows_1way_method_of_four_russians_16wide_padded(
+                    packed_witness,
+                    suffix_tensors[0],
+                    padding,
+                );
+                let a1 = fold_1b_rows_1way_method_of_four_russians_16wide_padded(
+                    packed_witness,
+                    suffix_tensors[1],
+                    padding,
+                );
                 return vec![a0, a1];
             }
         }
         if packed_witness.len().is_multiple_of(8) {
-            let (a0, a1) = fold_1b_rows_2way_mfr_8wide_padded(
+            let (a0, a1) = fold_1b_rows_2way_method_of_four_russians_8wide_padded(
                 packed_witness,
                 suffix_tensors[0],
                 suffix_tensors[1],
@@ -251,7 +257,7 @@ pub fn fold_1b_rows_multi_padded(
             return vec![a0, a1];
         }
         if packed_witness.len().is_multiple_of(4) {
-            let (a0, a1) = fold_1b_rows_2way_mfr_padded(
+            let (a0, a1) = fold_1b_rows_2way_method_of_four_russians_padded(
                 packed_witness,
                 suffix_tensors[0],
                 suffix_tensors[1],
@@ -385,18 +391,18 @@ fn subset_sums_4(elems: [F128; 4]) -> [F128; 16] {
 /// group of 4 elements = 32 per element, vs ~64 set bits × 1 RMW per element
 /// in the scalar path), and the OoO engine can pipeline the constant-cost
 /// loop more aggressively than the bit-scan.
-pub fn fold_1b_rows_2way_mfr(
+pub fn fold_1b_rows_2way_method_of_four_russians(
     packed_witness: &[F128],
     t0: &[F128],
     t1: &[F128],
 ) -> (Vec<F128>, Vec<F128>) {
     let m = LOG_PACKING + (packed_witness.len().trailing_zeros() as usize);
-    fold_1b_rows_2way_mfr_padded(packed_witness, t0, t1, &PaddingSpec::dense(m))
+    fold_1b_rows_2way_method_of_four_russians_padded(packed_witness, t0, t1, &PaddingSpec::dense(m))
 }
 
-/// Padding-aware variant of [`fold_1b_rows_2way_mfr`]. Skips chunks of 4
+/// Padding-aware variant of [`fold_1b_rows_2way_method_of_four_russians`]. Skips chunks of 4
 /// F128s that fall entirely in the zero padding of every block.
-pub fn fold_1b_rows_2way_mfr_padded(
+pub fn fold_1b_rows_2way_method_of_four_russians_padded(
     packed_witness: &[F128],
     t0: &[F128],
     t1: &[F128],
@@ -407,7 +413,7 @@ pub fn fold_1b_rows_2way_mfr_padded(
     assert_eq!(t1.len(), packed_witness.len());
     assert!(
         packed_witness.len().is_multiple_of(4),
-        "fold_1b_rows_2way_mfr requires len divisible by 4 (got {})",
+        "fold_1b_rows_2way_method_of_four_russians requires len divisible by 4 (got {})",
         packed_witness.len()
     );
     let skip = ChunkPadding::new(padding, 4);
@@ -515,26 +521,31 @@ pub fn fold_1b_rows_2way_mfr_padded(
     (pair.0, pair.1)
 }
 
-/// **Experimental** 8-wide / two-k=4-table version of [`fold_1b_rows_2way_mfr`].
+/// **Experimental** 8-wide / two-k=4-table version of [`fold_1b_rows_2way_method_of_four_russians`].
 /// Packs 8 witness elements per transpose group (the 4-wide version wastes the
 /// upper 4 transpose rows). The single transpose is shared across both claims;
 /// each claim uses two small 16-entry tables (low nibble = elems 0-3, high =
 /// elems 4-7) XORed in-register before one acc RMW. Net vs the current 2-way:
 /// transposes halved, acc-RMWs halved per claim, same small tables.
-pub fn fold_1b_rows_2way_mfr_8wide(
+pub fn fold_1b_rows_2way_method_of_four_russians_8wide(
     packed_witness: &[F128],
     t0: &[F128],
     t1: &[F128],
 ) -> (Vec<F128>, Vec<F128>) {
     let m = LOG_PACKING + (packed_witness.len().trailing_zeros() as usize);
-    fold_1b_rows_2way_mfr_8wide_padded(packed_witness, t0, t1, &PaddingSpec::dense(m))
+    fold_1b_rows_2way_method_of_four_russians_8wide_padded(
+        packed_witness,
+        t0,
+        t1,
+        &PaddingSpec::dense(m),
+    )
 }
 
-/// Padding-aware variant of [`fold_1b_rows_2way_mfr_8wide`]. Skips chunks of
+/// Padding-aware variant of [`fold_1b_rows_2way_method_of_four_russians_8wide`]. Skips chunks of
 /// 8 F128s that fall entirely in the zero padding of every block — those
 /// chunks contribute nothing (witness bytes = 0 → subset-sum mask = 0 →
 /// `lookup[0] = 0`).
-pub fn fold_1b_rows_2way_mfr_8wide_padded(
+pub fn fold_1b_rows_2way_method_of_four_russians_8wide_padded(
     packed_witness: &[F128],
     t0: &[F128],
     t1: &[F128],
@@ -603,15 +614,15 @@ pub fn fold_1b_rows_2way_mfr_8wide_padded(
 }
 
 /// Single-tensor (k=1) version of the method-of-four-Russians fold, mirroring
-/// [`fold_1b_rows_2way_mfr`]. Same algorithm but maintains one subset-sum
+/// [`fold_1b_rows_2way_method_of_four_russians`]. Same algorithm but maintains one subset-sum
 /// table and one accumulator. Used by [`fold_1b_rows_naive`] for inputs
 /// divisible by 4 (the standard case at any reasonable `m`).
-pub fn fold_1b_rows_1way_mfr(packed_witness: &[F128], t: &[F128]) -> Vec<F128> {
+pub fn fold_1b_rows_1way_method_of_four_russians(packed_witness: &[F128], t: &[F128]) -> Vec<F128> {
     let n = 1 << LOG_PACKING; // 128
     assert_eq!(t.len(), packed_witness.len());
     assert!(
         packed_witness.len().is_multiple_of(4),
-        "fold_1b_rows_1way_mfr requires len divisible by 4 (got {})",
+        "fold_1b_rows_1way_method_of_four_russians requires len divisible by 4 (got {})",
         packed_witness.len()
     );
 
@@ -689,7 +700,10 @@ pub fn fold_1b_rows_1way_mfr(packed_witness: &[F128], t: &[F128]) -> Vec<F128> {
 /// lookups are XORed in-register before a single `acc` RMW — so vs the current
 /// kernel this halves the transpose count AND halves the acc-RMW count, while
 /// keeping the well-reused small tables.
-pub fn fold_1b_rows_1way_mfr_8wide_k4(packed_witness: &[F128], t: &[F128]) -> Vec<F128> {
+pub fn fold_1b_rows_1way_method_of_four_russians_8wide_k4(
+    packed_witness: &[F128],
+    t: &[F128],
+) -> Vec<F128> {
     let n = 1 << LOG_PACKING;
     assert_eq!(t.len(), packed_witness.len());
     assert!(packed_witness.len().is_multiple_of(8));
@@ -753,7 +767,7 @@ pub fn fold_1b_rows_1way_mfr_8wide_k4(packed_witness: &[F128], t: &[F128]) -> Ve
 /// accumulators + eight tables, which ate most of the 16-wide win there. The
 /// shared bit-transpose recomputed per call is nearly free (the fold is not
 /// memory-bandwidth bound).
-pub fn fold_1b_rows_1way_mfr_16wide_padded(
+pub fn fold_1b_rows_1way_method_of_four_russians_16wide_padded(
     packed_witness: &[F128],
     t: &[F128],
     padding: &PaddingSpec,
@@ -827,14 +841,21 @@ pub fn fold_1b_rows_1way_mfr_16wide_padded(
         )
 }
 
-/// Dense (no-skip) wrapper over [`fold_1b_rows_1way_mfr_16wide_padded`]. Used by
+/// Dense (no-skip) wrapper over [`fold_1b_rows_1way_method_of_four_russians_16wide_padded`]. Used by
 /// [`fold_1b_rows_naive`] for inputs divisible by 16.
-pub fn fold_1b_rows_1way_mfr_16wide_k4(packed_witness: &[F128], t: &[F128]) -> Vec<F128> {
+pub fn fold_1b_rows_1way_method_of_four_russians_16wide_k4(
+    packed_witness: &[F128],
+    t: &[F128],
+) -> Vec<F128> {
     let m = LOG_PACKING + (packed_witness.len().trailing_zeros() as usize);
-    fold_1b_rows_1way_mfr_16wide_padded(packed_witness, t, &PaddingSpec::dense(m))
+    fold_1b_rows_1way_method_of_four_russians_16wide_padded(
+        packed_witness,
+        t,
+        &PaddingSpec::dense(m),
+    )
 }
 
-pub fn fold_1b_rows_2way_mfr_16wide_padded(
+pub fn fold_1b_rows_2way_method_of_four_russians_16wide_padded(
     packed_witness: &[F128],
     t0: &[F128],
     t1: &[F128],
@@ -918,7 +939,7 @@ pub fn fold_1b_rows_2way_mfr_16wide_padded(
         )
 }
 
-/// Tensor-split sibling of [`fold_1b_rows_1way_mfr_16wide_padded`]. Instead of
+/// Tensor-split sibling of [`fold_1b_rows_1way_method_of_four_russians_16wide_padded`]. Instead of
 /// streaming a fully-materialized length-`2^n` suffix tensor `t`, it takes the
 /// two factors `(eq_lo, eq_hi)` from [`build_eq_split`] and reassociates the
 /// fold as inner-then-outer:
@@ -934,7 +955,7 @@ pub fn fold_1b_rows_2way_mfr_16wide_padded(
 /// `eq_hi[i_hi]` and XORs it into the global accumulator.
 ///
 /// Result is **byte-identical** to
-/// `fold_1b_rows_1way_mfr_16wide_padded(W, build_eq_parallel(r), padding)`:
+/// `fold_1b_rows_1way_method_of_four_russians_16wide_padded(W, build_eq_parallel(r), padding)`:
 /// GF(2^128) add is XOR (associative/commutative) and multiply is exact and
 /// distributes, so the reassociation reproduces the same multiset of XOR terms.
 /// Two wins over the materialized kernel:
@@ -1315,13 +1336,13 @@ pub fn fold_1b_rows_naive(packed_witness: &[F128], suffix_tensor: &[F128]) -> Ve
     // touched once per 16 elements (~1.25× over 8-wide); fall back to 8-wide,
     // then 4-wide, then scalar as divisibility drops.
     if packed_witness.len().is_multiple_of(16) {
-        return fold_1b_rows_1way_mfr_16wide_k4(packed_witness, suffix_tensor);
+        return fold_1b_rows_1way_method_of_four_russians_16wide_k4(packed_witness, suffix_tensor);
     }
     if packed_witness.len().is_multiple_of(8) {
-        return fold_1b_rows_1way_mfr_8wide_k4(packed_witness, suffix_tensor);
+        return fold_1b_rows_1way_method_of_four_russians_8wide_k4(packed_witness, suffix_tensor);
     }
     if packed_witness.len() >= 4 && packed_witness.len().is_multiple_of(4) {
-        return fold_1b_rows_1way_mfr(packed_witness, suffix_tensor);
+        return fold_1b_rows_1way_method_of_four_russians(packed_witness, suffix_tensor);
     }
 
     // Partition into chunks; each chunk computes its own partial.
@@ -2985,16 +3006,20 @@ mod tests {
                 F128, LOG_PACKING, PaddingSpec, RingSwitchError, RsEqInd, build_claim_weights,
                 build_eq_sparse, build_eq_split, build_fold_byte_table, claim_check, eval_rs_eq,
                 eval_rs_eq_finish_from_prefix, eval_rs_eq_finish_from_prefix_binary_q,
-                eval_rs_eq_prefix, eval_rs_eq_prefix_f256, fold_1b_rows_1way_mfr_8wide_k4,
-                fold_1b_rows_1way_mfr_16wide_padded, fold_1b_rows_2way_mfr,
-                fold_1b_rows_2way_mfr_8wide, fold_1b_rows_2way_mfr_8wide_padded,
-                fold_1b_rows_2way_mfr_16wide_padded, fold_1b_rows_2way_mfr_padded,
-                fold_1b_rows_naive, fold_1b_rows_sparse, fold_1b_rows_split,
-                fold_1b_rows_split_2way, fold_b128_elems, fold_b128_elems_naive,
-                fold_b128_elems_sparse, fold_b128_elems_split, fold_one_slot, inner_product,
-                linearized_coefficients, moore_inverse, prove, prove_batched,
-                prove_batched_padded_with_precomputed, prove_with_grinding, s_hat_v_from_z_vec,
-                split_n_lo, subset_sums_4, tensor_algebra_transpose, verify, verify_with_grinding,
+                eval_rs_eq_prefix, eval_rs_eq_prefix_f256,
+                fold_1b_rows_1way_method_of_four_russians_8wide_k4,
+                fold_1b_rows_1way_method_of_four_russians_16wide_padded,
+                fold_1b_rows_2way_method_of_four_russians,
+                fold_1b_rows_2way_method_of_four_russians_8wide,
+                fold_1b_rows_2way_method_of_four_russians_8wide_padded,
+                fold_1b_rows_2way_method_of_four_russians_16wide_padded,
+                fold_1b_rows_2way_method_of_four_russians_padded, fold_1b_rows_naive,
+                fold_1b_rows_sparse, fold_1b_rows_split, fold_1b_rows_split_2way, fold_b128_elems,
+                fold_b128_elems_naive, fold_b128_elems_sparse, fold_b128_elems_split,
+                fold_one_slot, inner_product, linearized_coefficients, moore_inverse, prove,
+                prove_batched, prove_batched_padded_with_precomputed, prove_with_grinding,
+                s_hat_v_from_z_vec, split_n_lo, subset_sums_4, tensor_algebra_transpose, verify,
+                verify_with_grinding,
             },
         },
         test_rng::Rng,
@@ -3375,7 +3400,7 @@ mod tests {
     /// The method-of-four-Russians fold must produce byte-identical output
     /// to the scalar bit-scan version, for both s_hat_v vectors at k=2.
     #[test]
-    fn mfr_fold_matches_scalar_bit_scan() {
+    fn method_of_four_russians_fold_matches_scalar_bit_scan() {
         let mut rng = Rng::new(0xBEEF_D00D);
         for &m in &[9usize, 11, 13, 14] {
             let l = m - 7;
@@ -3392,7 +3417,8 @@ mod tests {
             let s1_ref = fold_1b_rows_naive(&pw, &tensor1);
 
             // Under test: method-of-four-Russians.
-            let (s0_mfr, s1_mfr) = fold_1b_rows_2way_mfr(&pw, &tensor0, &tensor1);
+            let (s0_mfr, s1_mfr) =
+                fold_1b_rows_2way_method_of_four_russians(&pw, &tensor0, &tensor1);
 
             assert_eq!(s0_mfr, s0_ref, "s_hat_v0 mismatch at m={m}");
             assert_eq!(s1_mfr, s1_ref, "s_hat_v1 mismatch at m={m}");
@@ -3402,7 +3428,7 @@ mod tests {
     /// The 8-wide (two-k=4-table) folds — both the 1-way and 2-way variants —
     /// must match the naive bit-scan.
     #[test]
-    fn mfr_fold_8wide_matches_scalar() {
+    fn method_of_four_russians_fold_8wide_matches_scalar() {
         let mut rng = Rng::new(0x8888_1357);
         for &m in &[10usize, 12, 13, 16] {
             let l = m - 7;
@@ -3416,11 +3442,11 @@ mod tests {
             let s0_ref = fold_1b_rows_naive(&pw, &t0);
             let s1_ref = fold_1b_rows_naive(&pw, &t1);
             assert_eq!(
-                fold_1b_rows_1way_mfr_8wide_k4(&pw, &t0),
+                fold_1b_rows_1way_method_of_four_russians_8wide_k4(&pw, &t0),
                 s0_ref,
                 "1-way 8wide m={m}"
             );
-            let (s0, s1) = fold_1b_rows_2way_mfr_8wide(&pw, &t0, &t1);
+            let (s0, s1) = fold_1b_rows_2way_method_of_four_russians_8wide(&pw, &t0, &t1);
             assert_eq!(s0, s0_ref, "2-way 8wide s0 m={m}");
             assert_eq!(s1, s1_ref, "2-way 8wide s1 m={m}");
         }
@@ -3468,16 +3494,19 @@ mod tests {
             let padding = PaddingSpec::uniform(k_log, useful_bits, 1usize << (m - k_log));
 
             if packed.len().is_multiple_of(8) {
-                let dense = fold_1b_rows_2way_mfr_8wide(&packed, &t0, &t1);
-                let padded = fold_1b_rows_2way_mfr_8wide_padded(&packed, &t0, &t1, &padding);
+                let dense = fold_1b_rows_2way_method_of_four_russians_8wide(&packed, &t0, &t1);
+                let padded = fold_1b_rows_2way_method_of_four_russians_8wide_padded(
+                    &packed, &t0, &t1, &padding,
+                );
                 assert_eq!(
                     dense, padded,
                     "8-wide mismatch: m={m}, k_log={k_log}, useful={useful_bits}"
                 );
             }
             if packed.len().is_multiple_of(4) {
-                let dense = fold_1b_rows_2way_mfr(&packed, &t0, &t1);
-                let padded = fold_1b_rows_2way_mfr_padded(&packed, &t0, &t1, &padding);
+                let dense = fold_1b_rows_2way_method_of_four_russians(&packed, &t0, &t1);
+                let padded =
+                    fold_1b_rows_2way_method_of_four_russians_padded(&packed, &t0, &t1, &padding);
                 assert_eq!(
                     dense, padded,
                     "4-wide mismatch: m={m}, k_log={k_log}, useful={useful_bits}"
@@ -3548,7 +3577,8 @@ mod tests {
             let full_eq = build_eq(&r);
             let padding = PaddingSpec::uniform(k_log, useful_bits, 1usize << (m - k_log));
 
-            let reference = fold_1b_rows_1way_mfr_16wide_padded(&w, &full_eq, &padding);
+            let reference =
+                fold_1b_rows_1way_method_of_four_russians_16wide_padded(&w, &full_eq, &padding);
             // Sweep n_lo across, below, and equal to the padding block width so
             // the split-block vs padding-block alignment is exercised both ways.
             for n_lo in 4..=l {
@@ -3742,7 +3772,7 @@ mod tests {
 
     /// `subset_sums_4` matches the obvious specification.
     #[test]
-    fn mfr_fold_16wide_2way_matches_scalar() {
+    fn method_of_four_russians_fold_16wide_2way_matches_scalar() {
         let mut rng = Rng::new(0x161616);
         for &m in &[11usize, 12, 14, 16] {
             let l = m - 7;
@@ -3756,7 +3786,8 @@ mod tests {
             let s0_ref = fold_1b_rows_naive(&pw, &t0);
             let s1_ref = fold_1b_rows_naive(&pw, &t1);
             let dense = PaddingSpec::dense(m);
-            let (s0, s1) = fold_1b_rows_2way_mfr_16wide_padded(&pw, &t0, &t1, &dense);
+            let (s0, s1) =
+                fold_1b_rows_2way_method_of_four_russians_16wide_padded(&pw, &t0, &t1, &dense);
             assert_eq!(s0, s0_ref, "2-way 16wide s0 m={m}");
             assert_eq!(s1, s1_ref, "2-way 16wide s1 m={m}");
         }

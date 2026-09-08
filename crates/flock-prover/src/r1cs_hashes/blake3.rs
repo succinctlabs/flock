@@ -332,7 +332,7 @@ const OFF_RIP2G: usize = OFF_MAJ2G + CARRY_BITS_PER_ADD; // 123
 const OFF_C2G: usize = OFF_RIP2G + RIPPLE_BITS_PER_FADD; // 153
 
 #[inline]
-fn cv_bit(w: usize, b: usize) -> usize {
+fn chaining_value_bit(w: usize, b: usize) -> usize {
     debug_assert!(w < 8 && b < WORD_BITS);
     CV_BASE + WORD_BITS * w + b
 }
@@ -641,7 +641,7 @@ fn write_const_add_rows(
 fn initial_lane_words() -> [Word; 16] {
     let mut s: [Word; 16] = from_fn(|_| Word::zero());
     for w in 0..8 {
-        s[w] = Word::from_slot_base(cv_bit(w, 0));
+        s[w] = Word::from_slot_base(chaining_value_bit(w, 0));
     }
     for i in 0..4 {
         s[8 + i] = Word::from_const(BLAKE3_IV[i]);
@@ -763,7 +763,7 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             a_rows[s] = lo.bits[i].clone();
             b_rows[s] = vec![Z_CONST_POS];
         }
-        let cv_w = Word::from_slot_base(cv_bit(w, 0));
+        let cv_w = Word::from_slot_base(chaining_value_bit(w, 0));
         let hi = state[w + 8].xor(&cv_w).dedup();
         for i in 0..WORD_BITS {
             let s = out_hi_bit(w, i);
@@ -808,7 +808,7 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 // ---------------------------------------------------------------------------
 // Lincheck circuit walker — mirrors `build_matrices`. Same structure as
 // `blake3::Blake3LincheckCircuit` but uses this module's I/O-aligned slot
-// positions (cv_bit/m_bit/etc.).
+// positions (chaining_value_bit/m_bit/etc.).
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -1057,7 +1057,7 @@ impl LincheckCircuit for Blake3LincheckCircuit {
                 let s = out_lo_bit(w, i);
                 scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &lo.bits[i]);
             }
-            let cv_w = Word::from_slot_base(cv_bit(w, 0));
+            let cv_w = Word::from_slot_base(chaining_value_bit(w, 0));
             let hi = state[w + 8].xor(&cv_w).dedup();
             for i in 0..WORD_BITS {
                 let s = out_hi_bit(w, i);
@@ -1142,7 +1142,7 @@ pub fn build_block_witness(
     z[Z_CONST_POS] = true;
     // Inputs.
     for w in 0..8 {
-        write_word(&mut z, cv_bit(w, 0), cv[w]);
+        write_word(&mut z, chaining_value_bit(w, 0), cv[w]);
     }
     for i in 0..16 {
         write_word(&mut z, m_bit(i, 0), m[i]);
@@ -1327,7 +1327,7 @@ pub(crate) fn build_block_witness_ab_packed_into(
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
     for w in 0..8 {
-        write_lin_word_ab_packed(cv_bit(w, 0), cv[w], z, a, b);
+        write_lin_word_ab_packed(chaining_value_bit(w, 0), cv[w], z, a, b);
     }
     for i in 0..16 {
         write_lin_word_ab_packed(m_bit(i, 0), m[i], z, a, b);
@@ -1814,7 +1814,7 @@ impl Blake3Setup {
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
-fn bm_xor_rotr(x: &[u32; BM_V], y: &[u32; BM_V], r: u32) -> [u32; BM_V] {
+fn batch_major_xor_rotr(x: &[u32; BM_V], y: &[u32; BM_V], r: u32) -> [u32; BM_V] {
     from_fn(|j| (x[j] ^ y[j]).rotate_right(r))
 }
 
@@ -1825,14 +1825,14 @@ struct BmRows<'a> {
 }
 
 #[inline(always)]
-fn bm_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
+fn batch_major_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
     or_u32_row(rows.z, bit, vals);
     or_u32_row(rows.a, bit, vals);
     or_u32_row(rows.b, bit, &[0xFFFF_FFFF; BM_V]);
 }
 
 #[inline(always)]
-fn bm_add_inline(
+fn batch_major_add_inline(
     rows: &mut BmRows<'_>,
     x: &[u32; BM_V],
     y: &[u32; BM_V],
@@ -1846,7 +1846,7 @@ fn bm_add_inline(
 }
 
 #[inline(always)]
-fn bm_fused_add_inline(
+fn batch_major_fused_add_inline(
     rows: &mut BmRows<'_>,
     x: &[u32; BM_V],
     y: &[u32; BM_V],
@@ -1865,7 +1865,7 @@ fn bm_fused_add_inline(
 }
 
 #[inline(always)]
-fn bm_const_add_inline(
+fn batch_major_const_add_inline(
     rows: &mut BmRows<'_>,
     k: u32,
     y: &[u32; BM_V],
@@ -1921,15 +1921,15 @@ pub(crate) fn build_group_batch_major(
     or_bit_row(rows.b, Z_CONST_POS);
 
     for w in 0..8 {
-        bm_write_lin(&mut rows, cv_bit(w, 0), &cv[w]);
+        batch_major_write_lin(&mut rows, chaining_value_bit(w, 0), &cv[w]);
     }
     for i in 0..16 {
-        bm_write_lin(&mut rows, m_bit(i, 0), &m[i]);
+        batch_major_write_lin(&mut rows, m_bit(i, 0), &m[i]);
     }
-    bm_write_lin(&mut rows, T_LO_BASE, &counter_lo);
-    bm_write_lin(&mut rows, T_HI_BASE, &counter_hi);
-    bm_write_lin(&mut rows, BLEN_BASE, &block_len);
-    bm_write_lin(&mut rows, FLAGS_BASE, &flags);
+    batch_major_write_lin(&mut rows, T_LO_BASE, &counter_lo);
+    batch_major_write_lin(&mut rows, T_HI_BASE, &counter_hi);
+    batch_major_write_lin(&mut rows, BLEN_BASE, &block_len);
+    batch_major_write_lin(&mut rows, FLAGS_BASE, &flags);
 
     let mut state: [[u32; BM_V]; 16] = [
         cv[0],
@@ -1963,7 +1963,7 @@ pub(crate) fn build_group_batch_major(
             let c_val = state[lc];
             let d_val = state[ld];
 
-            let a_1 = bm_fused_add_inline(
+            let a_1 = batch_major_fused_add_inline(
                 &mut rows,
                 &a_val,
                 &b_val,
@@ -1971,9 +1971,9 @@ pub(crate) fn build_group_batch_major(
                 g_bit(g, OFF_MAJ1),
                 g_bit(g, OFF_RIP1),
             );
-            let d_1 = bm_xor_rotr(&d_val, &a_1, 16);
+            let d_1 = batch_major_xor_rotr(&d_val, &a_1, 16);
             let c_1 = if g < 4 {
-                bm_const_add_inline(
+                batch_major_const_add_inline(
                     &mut rows,
                     BLAKE3_IV[g],
                     &d_1,
@@ -1981,10 +1981,10 @@ pub(crate) fn build_group_batch_major(
                     g_c1_rows(g),
                 )
             } else {
-                bm_add_inline(&mut rows, &c_val, &d_1, g_bit(g, OFF_C1))
+                batch_major_add_inline(&mut rows, &c_val, &d_1, g_bit(g, OFF_C1))
             };
-            let b_1 = bm_xor_rotr(&b_val, &c_1, 12);
-            let a_2 = bm_fused_add_inline(
+            let b_1 = batch_major_xor_rotr(&b_val, &c_1, 12);
+            let a_2 = batch_major_fused_add_inline(
                 &mut rows,
                 &a_1,
                 &b_1,
@@ -1992,9 +1992,9 @@ pub(crate) fn build_group_batch_major(
                 g_bit(g, off_maj2(g)),
                 g_bit(g, off_rip2(g)),
             );
-            let d_2 = bm_xor_rotr(&d_1, &a_2, 8);
-            let c_2 = bm_add_inline(&mut rows, &c_1, &d_2, g_bit(g, off_c2(g)));
-            let b_new = bm_xor_rotr(&b_1, &c_2, 7);
+            let d_2 = batch_major_xor_rotr(&d_1, &a_2, 8);
+            let c_2 = batch_major_add_inline(&mut rows, &c_1, &d_2, g_bit(g, off_c2(g)));
+            let b_new = batch_major_xor_rotr(&b_1, &c_2, 7);
             let d_new = d_2;
 
             state[la] = a_2;
@@ -2007,8 +2007,8 @@ pub(crate) fn build_group_batch_major(
     for w in 0..8 {
         let lo: [u32; BM_V] = from_fn(|j| state[w][j] ^ state[w + 8][j]);
         let hi: [u32; BM_V] = from_fn(|j| state[w + 8][j] ^ cv[w][j]);
-        bm_write_lin(&mut rows, out_lo_bit(w, 0), &lo);
-        bm_write_lin(&mut rows, out_hi_bit(w, 0), &hi);
+        batch_major_write_lin(&mut rows, out_lo_bit(w, 0), &lo);
+        batch_major_write_lin(&mut rows, out_hi_bit(w, 0), &hi);
     }
 }
 

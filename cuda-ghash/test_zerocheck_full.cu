@@ -1,6 +1,6 @@
 // Full zerocheck prove_packed orchestration on GPU, replayed byte-for-byte
 // against the flock transcript (dump_zerocheck_full_vectors.rs, ZCFV). Drives
-// the host FsChallenger through: round-1 URM → c-interp → round-2 fold+msg →
+// the host FsChallenger through: round-1 univariate round message → c-interp → round-2 fold+msg →
 // sumcheck tail → final binding, wiring the validated kernels together.
 //
 // Build:  make test_zerocheck_full
@@ -113,7 +113,7 @@ int main(int argc, char** argv){
     for(int i=0;i<4;i++) r[9+i]=MUL(gm[i], f128_inv_host(ADD(ONE,gm[i])));
     for(int i=0;i<m-13;i++) r[13+i]=frch(ro[i]);
 
-    // ---- 2. round-1 URM ----
+    // ---- 2. round-1 univariate round message ----
     std::vector<F128> r_outer(r.begin()+13, r.end());
     std::vector<F128> eq_outer=build_eq(r_outer);
     CK(cudaMemcpy(d_eq,eq_outer.data(),eq_outer.size()*sizeof(F128),cudaMemcpyHostToDevice));

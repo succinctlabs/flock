@@ -75,14 +75,14 @@ pub(super) fn test_config() -> TowerConfig {
 /// kernel. Private on purpose — the endgame deletes the RS arm rather than
 /// growing `TowerConfig`. `TOWER_LEAF_ZC=rs` forces the RS leaf for A/B
 /// measurement on aarch64.
-pub(super) fn leaf_zc_ag() -> bool {
+pub(super) fn leaf_zerocheck_ag() -> bool {
     cfg!(target_arch = "aarch64") && !matches!(var("TOWER_LEAF_ZC").as_deref(), Ok("rs"))
 }
 
 /// Phase C flip-in-place: the envelope OUTERS (FL / internal / spine)
 /// prove under the AG skip on the same terms as the leaf.
 /// `TOWER_OUTER_ZC=rs` forces the RS outers for A/B measurement.
-pub(super) fn outer_zc_ag() -> bool {
+pub(super) fn outer_zerocheck_ag() -> bool {
     cfg!(target_arch = "aarch64") && !matches!(var("TOWER_OUTER_ZC").as_deref(), Ok("rs"))
 }
 

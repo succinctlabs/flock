@@ -319,12 +319,12 @@ pub fn open_batch_mixed_ligerito_seeded<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
     // Belt-and-braces on the cap-depth derivation: the commit-time cap
-    // (from `PcsParams::l0_cap_depth`) must be the layer the opener's
+    // (from `PcsParams::level_zero_cap_depth`) must be the layer the opener's
     // config implies — a config-source disagreement fails loudly here at
     // prove time instead of as a verifier reject.
     assert_eq!(
         commitment.cap.len(),
-        1usize << lig_config.l0_cap_depth(),
+        1usize << lig_config.level_zero_cap_depth(),
         "commitment cap size disagrees with the opener config's L0 query count"
     );
     debug_assert_eq!(
@@ -332,7 +332,7 @@ pub fn open_batch_mixed_ligerito_seeded<Ch: Challenger>(
         cap_layer(
             &prover_data.merkle_tree,
             commitment.params.n_leaves(),
-            lig_config.l0_cap_depth(),
+            lig_config.level_zero_cap_depth(),
         ),
         "commitment cap is not the prover tree's cap layer"
     );
@@ -1974,12 +1974,12 @@ pub fn open_batch_merged<Ch: Challenger>(
     let trace = var("PCS_TRACE").is_ok();
     let t_total = Instant::now();
     // Belt-and-braces on the cap-depth derivation: the commit-time cap
-    // (from `PcsParams::l0_cap_depth`) must be the layer the opener's
+    // (from `PcsParams::level_zero_cap_depth`) must be the layer the opener's
     // config implies — a config-source disagreement fails loudly here at
     // prove time instead of as a verifier reject.
     assert_eq!(
         commitment.cap.len(),
-        1usize << lig_config.l0_cap_depth(),
+        1usize << lig_config.level_zero_cap_depth(),
         "commitment cap size disagrees with the opener config's L0 query count"
     );
     debug_assert_eq!(
@@ -1987,7 +1987,7 @@ pub fn open_batch_merged<Ch: Challenger>(
         cap_layer(
             &prover_data.merkle_tree,
             commitment.params.n_leaves(),
-            lig_config.l0_cap_depth(),
+            lig_config.level_zero_cap_depth(),
         ),
         "commitment cap is not the prover tree's cap layer"
     );
@@ -2967,7 +2967,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_transport_grinds_over_the_johnson_l0_list() {
+    fn strict_transport_grinds_over_the_johnson_level_zero_list() {
         let policy = OpeningGrinding::per_challenge_128();
         assert_eq!(policy.claim_batch_bits_for(1), 0);
         assert_eq!(policy.claim_batch_bits_for(2), 6);

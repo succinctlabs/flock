@@ -1220,7 +1220,7 @@ impl SkipPoint {
     /// `z_partial`) so the point is post-commitment for Schwartz-Zippel. The AG
     /// arm seeds a hash-matched DRBG (`FsRng`, following the transcript hash)
     /// from two F128 squeezes and replays the rejection sampler on both sides (unlike the zerocheck's `r₁`, which now uses the
-    /// prover-side nonce grind — see `ag_skip::sample_r1_prover`).
+    /// prover-side nonce grind — see `ag_skip::sample_round_one_prover`).
     pub fn sample_fresh<Ch: Challenger>(&self, ch: &mut Ch) -> SkipPoint {
         match self {
             SkipPoint::Phi8(_) => SkipPoint::Phi8(ch.sample_f128()),

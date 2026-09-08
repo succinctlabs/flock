@@ -883,7 +883,7 @@ fn verify_union_piops<Ch: Challenger>(
                             )
                         }
                     };
-                let x_ab = union.x_ab_from_mlv(z_skip, &mlv_challenges);
+                let x_ab = union.x_ab_from_multilinear_values(z_skip, &mlv_challenges);
                 // The union-column lincheck (one circuit per BOOLEAN slot, in
                 // slot order); the declared counts additionally bind through
                 // the per-type const-pin target terms.
@@ -1165,7 +1165,8 @@ fn verify_core_ag_inner<Ch: Challenger>(
     let ag_claim = verify_ag(r1cs.m, ag_proof, challenger).map_err(FlockVerifyError::Ag)?;
 
     // ---- Lincheck on the AG quirky point (layout-aware constructors).
-    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Ag(ag_claim.r1), &ag_claim.mlv_challenges);
+    let x_ab =
+        r1cs.x_ab_from_multilinear_values(SkipPoint::Ag(ag_claim.r1), &ag_claim.mlv_challenges);
     let lc_claim = verify_lincheck(
         r1cs.m,
         r1cs.k_log,
@@ -1352,7 +1353,8 @@ fn verify_core_inner<Ch: Challenger>(
 
     // ---- Build lincheck's shared quirky point from the zerocheck output
     // (layout-aware: the mlv challenges are address-ordered).
-    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
+    let x_ab =
+        r1cs.x_ab_from_multilinear_values(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 
     // ---- Lincheck. v_a, v_b come from the zerocheck's final â, b̂ evals.
     let t = Instant::now();

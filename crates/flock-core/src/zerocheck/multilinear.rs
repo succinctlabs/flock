@@ -1,6 +1,6 @@
 //! Multilinear sumcheck — rounds 2..(m − k_skip + 1) of the zerocheck protocol.
 //!
-//! After the round-1 URM and the verifier's univariate-skip fold-point `z`, the
+//! After the round-1 univariate round message and the verifier's univariate-skip fold-point `z`, the
 //! protocol enters a standard multilinear sumcheck over `n = m − k_skip` variables.
 //! For the **extract_c** variant, only AB participate (C was pinned down at round
 //! 1 as `res_C_lifted`), so the polynomial we sumcheck is
@@ -81,7 +81,7 @@ mod kernels;
 
 /// Returns `(pair_in_block_mask, useful_pairs_inclusive)` for the round-2
 /// fused-fold kernel, from a **single-run** padding spec (the multi-run case
-/// takes [`uni_skip_fold_and_round_pair_runs`] instead). A pair (post-URM
+/// takes [`uni_skip_fold_and_round_pair_runs`] instead). A pair (after the univariate round message,
 /// chunks `2k`, `2k+1`) is fully inside padding iff
 /// `(k & pair_in_block_mask) >= useful_pairs_inclusive` — those pairs
 /// contribute zero to both the message and the folded output (which is
@@ -222,7 +222,7 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
 /// embedded via `φ_8` (offset by `2^k_skip` from the S-domain nodes).
 ///
 /// Used to interpolate the extract_c round-1 output `round1_c` (which carries
-/// the polynomial `P^C` as its 2^k_skip evaluations on Λ) at the URM challenge `z`.
+/// the polynomial `P^C` as its 2^k_skip evaluations on Λ) at the univariate round message challenge `z`.
 pub fn lagrange_weights_lambda_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(2 * ell <= 256, "Λ ∪ S must fit in F_8 (need k_skip ≤ 7)");
@@ -475,7 +475,7 @@ impl UniSkipFoldTable {
     }
 }
 
-/// Optimized fused fold (at the URM challenge `z`, baked into `table`) plus
+/// Optimized fused fold (at the univariate round message challenge `z`, baked into `table`) plus
 /// round-2 prover message. **Packed input** (LSB-first bit packing). **Parallel
 /// by default** via rayon — the outer x_hi loop is distributed across workers,
 /// each writing to a disjoint chunk of `a_folded`/`b_folded` via `par_chunks_mut`
@@ -516,7 +516,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed(
 }
 
 /// Padding-aware variant of [`uni_skip_fold_and_round_pair_optimized_packed`].
-/// Skips pairs whose post-URM chunk indices both fall in the per-block zero
+/// Skips pairs whose chunk indices after the univariate round message both fall in the per-block zero
 /// padding: the fold output is already zero-initialized and the message
 /// contribution would be zero, so we can `continue` past those pairs.
 pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
@@ -622,7 +622,7 @@ fn kill_pair(a: &mut [F128], b: &mut [F128], x0l: usize, x1l: usize, write_dead:
 /// `x_hi` block, so one hoisted `eq_hi` factor covers the run — and return the
 /// run's UNREDUCED message accumulators.
 ///
-/// Pair `p` reads post-URM rows `2p`, `2p+1` of the packed witness and writes
+/// Pair `p` reads rows `2p`, `2p+1` after the univariate round message and writes
 /// its two folded values to `a_out[2·(p − out_base)]` and the slot after it;
 /// `out_base` is the pair index the caller's output slice starts at. Dead
 /// pairs (`is_dead`) fold to zero and are skipped, zero-filled only when
@@ -896,7 +896,7 @@ where
 
 /// The round-2 fused fold + message kernel, shared by BOTH padding regimes.
 ///
-/// `is_dead(pair)` decides, for a GLOBAL post-URM pair index, whether that
+/// `is_dead(pair)` decides whether a GLOBAL pair index after the univariate round message
 /// pair's window is entirely padding — the only thing the single-run and
 /// run-list paths ever disagreed about. Everything else (the per-row fold, the
 /// eq weighting, the parallel-over-`x_hi` structure, the accumulator
@@ -1099,7 +1099,7 @@ where
 /// parallel-over-x_hi structure and output convention as
 /// the optimized kernel, but with the portable scalar per-row fold and a
 /// precomputed per-pair skip table instead of the periodic mask/threshold
-/// predicate. A pair (post-URM chunks `2k`, `2k+1`) covers witness bits
+/// predicate. A pair (chunks `2k`, `2k+1` after the univariate round message) covers witness bits
 /// `[k·2^(k_skip+1), (k+1)·2^(k_skip+1))`; pairs whose window contains no
 /// useful bits fold to zero and are skipped. Output is byte-identical to the
 /// dense path when the padding/gap bits are honestly zero.
@@ -1180,7 +1180,7 @@ pub fn uni_skip_fold_and_round_pair_runs_sparse(
     );
     // The canonical live-pair interval list IS the skip predicate — the kernel
     // visits live pairs only, so no per-pair table is built and `is_dead` is
-    // never consulted. A pair (post-URM chunks `2k`, `2k+1`) covers witness
+    // never consulted. A pair (chunks `2k`, `2k+1` after the univariate round message) covers witness
     // bits `[k·2^(k_skip+1), (k+1)·2^(k_skip+1))`, which is exactly
     // `useful_block_intervals` at block size `2^(k_skip+1)` (merged, so
     // intervals that share a boundary pair are never processed twice).

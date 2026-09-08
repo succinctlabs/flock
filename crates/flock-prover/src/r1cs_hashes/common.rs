@@ -246,7 +246,7 @@ pub(crate) fn identity(k: usize) -> SparseBinaryMatrix {
 /// their `build_matrices`).
 ///
 /// `useful_bits ≤ 2^k_log` declares how many rows of each block carry real
-/// data; the remainder is zero padding (URM can skip work over those).
+/// data; the remainder is zero padding (univariate round message can skip work over those).
 ///
 /// `const_pin` is the column of the constant-one wire to pin to 1 across all
 /// blocks (closing the all-zero soundness gap — see `docs/const-wire-pin.md`),
