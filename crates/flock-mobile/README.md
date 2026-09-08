@@ -18,6 +18,29 @@ cargo build --release -p flock-mobile --target aarch64-apple-ios-sim   # + flock
 The header is `include/flock_mobile.h`. Link the `.a` plus `-lc++`-free system
 libs only; the crate has no C++ dependency.
 
+## On a phone
+
+`ios/FlockProbe` is an xcodegen-generated SwiftUI app around this crate, and
+`ios/run.sh` builds the Rust library and the app, installs, launches, and
+streams the result lines:
+
+```sh
+ios/run.sh sim                                   # iPhone 17 Pro simulator
+ios/run.sh sim -- -leaf 256,4096 -tower 4,256    # choose the plan
+ios/run.sh phone <udid> -- -global 2 -all_core 6 # a connected iPhone
+```
+
+Phone runs need: Developer Mode on the phone (Settings > Privacy & Security),
+the phone trusted over cable (`xcrun devicectl list devices` shows its udid),
+and a signing team — sign in once in Xcode > Settings > Accounts and select the
+team under the project's Signing & Capabilities, or `export TEAM=<team id>`. A
+free Apple ID works for development builds (seven-day profiles). The app reads
+`os_proc_available_memory` before and after each prove, so the jetsam budget on
+the device comes back with the numbers; pool sizes are process-wide, so a sweep
+over `-global` / `-all_core` is several launches. The entitlement
+`com.apple.developer.kernel.increased-memory-limit` is declared for phones that
+honour it.
+
 ## Probe
 
 ```sh

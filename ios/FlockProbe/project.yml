@@ -1,0 +1,37 @@
+# xcodegen spec for the on-device probe. Regenerate with `xcodegen generate`
+# from this directory (ios/run.sh does it). The Rust static library is built by
+# cargo for the matching target and linked from the workspace's target/ dir.
+name: FlockProbe
+options:
+  bundleIdPrefix: xyz.succinct.flock
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    SWIFT_OBJC_BRIDGING_HEADER: Sources/FlockProbe-Bridging-Header.h
+    HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../../crates/flock-mobile/include
+    OTHER_LDFLAGS: -lflock_mobile
+    "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": $(PROJECT_DIR)/../../target/aarch64-apple-ios/release
+    "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": $(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/release
+    ENABLE_BITCODE: NO
+    # Signing: pick your team once in Xcode (Signing & Capabilities) or pass
+    # DEVELOPMENT_TEAM=XXXXXXXXXX to xcodebuild; ios/run.sh forwards $TEAM.
+    CODE_SIGN_STYLE: Automatic
+targets:
+  FlockProbe:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    info:
+      path: Sources/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        # Raise the jetsam cap on devices that support it (8 GB phones).
+    entitlements:
+      path: Sources/FlockProbe.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
