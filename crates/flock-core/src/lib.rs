@@ -28,8 +28,6 @@ pub use flock_parallel::all_core_pool;
 use rayon::{ThreadPoolBuilder, current_num_threads};
 #[cfg(target_os = "linux")]
 use {std::collections::HashSet, std::fs::read_dir, std::fs::read_to_string};
-#[cfg(target_os = "macos")]
-use {std::process::Command, std::str::from_utf8};
 
 use crate::field::F128;
 pub mod aggregate;
@@ -262,6 +260,26 @@ pub fn alloc_zeroed_vec<T: Zeroable>(n: usize) -> Vec<T> {
 /// Cached [`perf_core_count`]. The uncached version may spawn `sysctl`; this
 /// memoizes it so hot paths can cheaply ask "is the current rayon pool the
 /// homogeneous P-core pool?" (i.e. `current_num_threads() <= this`).
+#[cfg(all(test, target_vendor = "apple", target_arch = "aarch64"))]
+mod apple_core_detect_tests {
+    use super::{efficiency_core_count, perf_core_count};
+    use std::thread::available_parallelism;
+
+    /// On Apple silicon the P- and E-clusters partition the logical CPUs,
+    /// and the counts are read in-process (no `sysctl` tool spawned).
+    #[test]
+    fn perf_plus_efficiency_cores_is_the_logical_count() {
+        let p = perf_core_count();
+        let e = efficiency_core_count();
+        assert!(p > 0, "at least one performance core");
+        assert_eq!(
+            p + e,
+            available_parallelism().map(|n| n.get()).unwrap_or(0),
+            "P {p} + E {e} partition the logical CPUs"
+        );
+    }
+}
+
 pub(crate) fn perf_core_count_cached() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(perf_core_count)
@@ -272,19 +290,16 @@ pub(crate) fn perf_core_count_cached() -> usize {
 /// memory-bandwidth-bound; SMT siblings share the core's execution ports and
 /// add no DRAM bandwidth, so running 2 threads per physical core only adds
 /// contention (on a 32C/64T Threadripper the prove is ~16% faster at 32 threads
-/// than 64). On macOS, queries `hw.perflevel0.physicalcpu` (= P-core count on
-/// Apple silicon, = physical CPU count on Intel). On Linux, `available_
-/// parallelism()` counts SMT siblings, so derive physical cores from `/sys`
-/// topology and clamp that host-wide count to the process's affinity/cgroup
-/// availability. Elsewhere, falls back to `available_parallelism()`.
+/// than 64). On Apple platforms, reads `hw.perflevel0.physicalcpu` (= P-core
+/// count on Apple silicon, = physical CPU count on Intel). On Linux,
+/// `available_parallelism()` counts SMT siblings, so derive physical cores
+/// from `/sys` topology and clamp that host-wide count to the process's
+/// affinity/cgroup availability. Elsewhere, falls back to
+/// `available_parallelism()`.
 fn perf_core_count() -> usize {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
-        if let Ok(out) = Command::new("sysctl")
-            .args(["-n", "hw.perflevel0.physicalcpu"])
-            .output()
-            && let Ok(s) = from_utf8(&out.stdout)
-            && let Ok(n) = s.trim().parse::<usize>()
+        if let Some(n) = apple_sysctl_usize(c"hw.perflevel0.physicalcpu")
             && n > 0
         {
             return n;
@@ -330,7 +345,7 @@ fn linux_physical_cores() -> Option<usize> {
     (!cores.is_empty()).then_some(cores.len())
 }
 
-/// Best-effort count of efficiency cores. On macOS, queries
+/// Best-effort count of efficiency cores. On Apple platforms, reads
 /// `hw.perflevel1.physicalcpu` (= E-core count on Apple silicon; the key is
 /// absent on Intel, yielding 0). Elsewhere, returns 0: heterogeneous-core
 /// detection is only wired up for Apple silicon, and on homogeneous machines
@@ -338,18 +353,55 @@ fn linux_physical_cores() -> Option<usize> {
 /// which were never validated to help (the global pool is deliberately
 /// sized to physical cores — see [`init_perf_thread_pool`]).
 fn efficiency_core_count() -> usize {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
-        if let Ok(out) = Command::new("sysctl")
-            .args(["-n", "hw.perflevel1.physicalcpu"])
-            .output()
-            && let Ok(s) = from_utf8(&out.stdout)
-            && let Ok(n) = s.trim().parse::<usize>()
-        {
+        if let Some(n) = apple_sysctl_usize(c"hw.perflevel1.physicalcpu") {
             return n;
         }
     }
     0
+}
+
+/// One integer `sysctl` key, read in-process. macOS AND iOS: the `sysctl`
+/// command-line tool this used to shell out to does not exist inside an iOS
+/// app sandbox (no process spawning), while the library call is available
+/// on every Apple platform. Declared inline to avoid a libc dependency.
+/// `None` when the key is absent (Intel Macs have no `hw.perflevel*`) or
+/// not a plain integer.
+#[cfg(target_vendor = "apple")]
+fn apple_sysctl_usize(key: &std::ffi::CStr) -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *mut std::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: `value` is a writable 8-byte buffer and `len` tells the kernel
+    // its size; the call writes at most `len` bytes and updates `len`.
+    let rc = unsafe {
+        sysctlbyname(
+            key.as_ptr(),
+            (&mut value as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // The kernel reports these as 32-bit ints; a 4-byte write lands in the
+    // low half of `value` on this little-endian target.
+    match len {
+        4 => Some((value & 0xffff_ffff) as usize),
+        8 => Some(value as usize),
+        _ => None,
+    }
 }
 
 /// True when the E-cluster is large enough relative to the P-cluster for the
