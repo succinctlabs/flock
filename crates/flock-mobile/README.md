@@ -55,6 +55,36 @@ after PRs #50 and #51:
 The simulator runs on the host CPU, so it proves the iOS runtime works (threads,
 allocation, the C-built hash kernels) but says nothing about phone speed.
 
+### Cold vs warm, and thread pools (2026-09-08, after PR #52)
+
+`flock_mobile_init_threads(global, all_core)` sizes rayon's global pool (the
+NTT-shaped prover phases; 0 = the performance-core count read in-process via
+`sysctlbyname`) and the all-core P+E pool (the flat parallel-for passes; 0 =
+every logical CPU). The leaf demo now proves twice: cold pays the per-shape
+setup (circuit emission, BLAKE3 matrices, CSC lincheck circuit), warm is the
+per-statement cost over the cached shape.
+
+| leaf | pools | cold | warm | peak RSS |
+| --- | --- | --- | --- | --- |
+| 256 | 10 / 14 (M4 Max default) | 1.24 s | 12.6 ms | 811 MiB |
+| 4096 | 10 / 14 | 1.22 s | 30.6 ms | 882 MiB |
+| 65536 | 10 / 14 | 1.48 s | 214 ms | 2.42 GiB |
+| 256 | 2 / 6 (a 2P+4E phone's shape) | 1.22 s | 33.2 ms | 777 MiB |
+| 4096 | 2 / 6 | 1.27 s | 78.8 ms | 899 MiB |
+| 65536 | 2 / 6 | 1.87 s | 566 ms | 2.55 GiB |
+
+The setup is single-threaded and dominates a phone-sized leaf: the pool size
+barely moves the cold number and scales the warm one. A production prover
+pays setup once per process. Tower 4 x 256 with the global pool at 2 / 4 / 6
+threads (all-core 6) proves in 11.5 / 10.9 / 10.7 s against 10.4 s at the
+default 10 / 14, again mostly setup. In the simulator (host CPU) leaf 256 is
+2.1 s cold / 44 ms warm at the defaults and 1.7 s / 39 ms at 2 / 6.
+
+What a real device changes: Apple schedules threads onto core types by QoS
+class rather than by count, so a 2-thread pool is not guaranteed to land on the
+P-cores and 6 threads may beat the desktop heuristic. Measure 2 / 4 / 6 on the
+phone through `flock_mobile_init_threads` before choosing.
+
 The recursion node is a fixed m=29 dense circuit. Before PR #50 the tower could not
 fit any phone; at 3.5 GiB the smallest tower is now within reach of an 8 GB
 iPhone's per-process limit, and a leaf at 256 compressions is well inside it.
@@ -82,7 +112,7 @@ The proof itself adds 7 MiB. The floor was the BLAKE3 base-block R1CS,
 PR #50 froze `SparseBinaryMatrix` rows behind an `Arc` and memoized the BLAKE3
 base matrices once per process, which removed every duplicate above.
 
-Open items: thread-pool sizing on a 2P+4E phone (the pool is
-`available_parallelism`; the macOS perf-core sysctl and background-QoS hooks in
-`flock-core` are gated on `target_os = "macos"` and become no-ops on iOS), and a
-real device number.
+Open items: a real device number (an Xcode app target with signing), and the
+thread-pool choice on the device (see above). The background-QoS hook for the
+codeword pre-fault in `flock-core` is still gated on `target_os = "macos"` and
+is a no-op on iOS; the same pthread call exists there.

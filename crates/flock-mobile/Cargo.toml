@@ -15,6 +15,8 @@ path = "src/bin/probe.rs"
 
 [dependencies]
 flock-prover = { path = "../flock-prover" }
+flock-parallel = { workspace = true }
+rayon = { workspace = true }
 libc = "0.2"
 
 [lints]

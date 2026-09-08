@@ -207,8 +207,10 @@ dependencies = [
 name = "flock-mobile"
 version = "0.1.0"
 dependencies = [
+ "flock-parallel",
  "flock-prover",
  "libc",
+ "rayon",
 ]
 
 [[package]]
