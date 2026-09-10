@@ -269,6 +269,12 @@ image, under the invertible Moore matrix, of $128$ independent
 bilinear contractions of the $\rho$-side data --- the batch width is
 information-inherent, and only the surrounding structure (points,
 coefficients, boundary combinatorics, verifier chains) can be shared.
+The significance of the move is deferred to \S\ref{sec:multipoint}: a
+twist sitting on $z$ twists the \emph{jagged} weight, which has no
+closed form; moved onto $\rho$ it twists only the \emph{eq} factor,
+which collapses (Lemma~\ref{lem:twisted-eq}) --- one closed form for
+the verifier, one $\Ftwo$-linear pass for the prover, and a single
+untwisted assist as the only jagged-shaped obligation left.
 \end{remark}
 
 \section{The batched assist}\label{sec:protocol}
