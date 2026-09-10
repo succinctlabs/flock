@@ -11,8 +11,8 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 22)
-//!   bytes 6..7    flavor: 2 = R1cs, 4 = Mixed, 5 = TowerRoot
+//!   byte  5       VERSION                  (currently 23)
+//!   bytes 6..7    flavor: 2 = R1cs, 4 = Mixed, 5 = TowerRoot, 6 = R1csAg
 //!                 (0/1 reserved: legacy BaseFold; 3 was the retired chain)
 //!   bytes 7..     bincode-serialized payload
 //! ```
@@ -93,7 +93,9 @@ const FLAVOR_R1CS_LIGERITO_AG: u8 = 6;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BundleFlavor {
     R1cs,
-    /// The AG-skip boolean zerocheck flavor — the default on aarch64.
+    /// The AG-skip boolean zerocheck flavor (aarch64 only). The library's
+    /// `prove_fast` still emits the RS flavor; the BLAKE3 benchmark is what
+    /// defaults to AG on aarch64.
     R1csAg,
     Mixed,
     /// A recursion-tower ROOT: statement + root outer proof/publics/
@@ -199,9 +201,11 @@ impl R1csProofBundleLigerito {
     }
 }
 
-/// [`R1csProofBundleLigerito`] with the **AG-skip** boolean zerocheck — the
-/// default flavor on aarch64 (the AG round-1 kernel is NEON; x86 stays on the
-/// RS bundle until the AVX-512 port, docs/ag-recursion-plan.md Phase F.1).
+/// [`R1csProofBundleLigerito`] with the **AG-skip** boolean zerocheck. The
+/// AG round-1 kernel is NEON, so this flavor exists on aarch64 only; the
+/// BLAKE3 benchmark defaults to it there, while the library's `prove_fast`
+/// stays on the RS bundle everywhere (x86 until the AVX-512 port,
+/// docs/ag-recursion-plan.md Phase F.1).
 /// Same commitment and merged opening; only the boolean zerocheck differs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct R1csProofBundleLigeritoAg {
