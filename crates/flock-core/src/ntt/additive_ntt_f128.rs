@@ -649,7 +649,31 @@ impl AdditiveNttF128 {
         start_layer: usize,
         on_sub: Option<&(dyn Fn(usize, &[F128]) + Sync)>,
     ) {
-        self.interleaved_parallel_live_from_layer(data, num_ntts, num_ntts, start_layer, on_sub);
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        {
+            self.interleaved_parallel_live_from_layer(
+                data,
+                num_ntts,
+                num_ntts,
+                start_layer,
+                on_sub,
+            );
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        {
+            // Portable targets have no deep split: transform in place and
+            // hand the hook the whole finished buffer once.
+            self.interleaved_scalar_live_from_layer(data, num_ntts, num_ntts, start_layer);
+            if let Some(cb) = on_sub {
+                cb(0, data);
+            }
+        }
     }
 
     /// Parallel interleaved forward NTT over the first `live` lanes (dead
