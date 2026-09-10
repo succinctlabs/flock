@@ -431,6 +431,7 @@ fn commit_into_pipelined(
 ) -> (Commitment, ProverData) {
     use crate::merkle;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{TrySendError, sync_channel};
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
 
@@ -440,10 +441,14 @@ fn commit_into_pipelined(
     debug_assert_eq!(leaf_size, num_ntts * core::mem::size_of::<F128>());
     // ~1 MiB of leaves per job at the production 1 KB leaf: big enough to
     // amortize dispatch, small enough that only a few MB of finished
-    // codeword ever awaits hashing.
+    // codeword ever awaits hashing. A job never spans two NTT sub-groups,
+    // and the deep pass's sub-groups shrink with the pool size (down to
+    // `MIN_SUB_LOG` rows), so a job can be SMALLER than this cap: each job
+    // hashes exactly `log2(len)` local parent levels, and the tree is
+    // finished from the shallowest level any job reached.
     let job_leaves = (1usize << 10).min(n_leaves);
-    let local_parent_levels = job_leaves.trailing_zeros() as usize;
     let mut tree: Vec<Hash> = crate::alloc_uninit_vec(2 * n_leaves - 1);
+    let min_local_levels = AtomicUsize::new(usize::MAX);
 
     let t_ntt = std::time::Instant::now();
     {
@@ -465,6 +470,15 @@ fn commit_into_pipelined(
             let outs =
                 core::slice::from_raw_parts_mut((tree_ptr as *mut Hash).add(leaf_start), leaf_len);
             merkle::hash_leaves_serial(bytes, leaf_size, outs, kind);
+            // Aligned power-of-two jobs are what make each local subtree
+            // self-contained; any other shape would leave parent slots of
+            // the uninitialized tree buffer unwritten.
+            assert!(
+                leaf_len.is_power_of_two() && leaf_start % leaf_len == 0,
+                "leaf job ({leaf_start}, {leaf_len}) is not an aligned power of two"
+            );
+            let local_parent_levels = leaf_len.trailing_zeros() as usize;
+            min_local_levels.fetch_min(local_parent_levels, Ordering::Relaxed);
             let mut read_level_start = 0usize;
             let mut read_level_len = n_leaves;
             let mut local_start = leaf_start;
@@ -557,11 +571,19 @@ fn commit_into_pipelined(
         );
     }
     let t_parents = std::time::Instant::now();
+    // Every leaf belongs to exactly one job and a job with `len` leaves
+    // completes parent levels `1..=log2(len)` over its aligned range, so
+    // the shallowest level any job reached is complete across the tree.
+    let prehashed_levels = min_local_levels.load(Ordering::Relaxed);
+    assert!(
+        prehashed_levels <= job_leaves.trailing_zeros() as usize,
+        "no leaf job ran"
+    );
     let merkle_tree = merkle::merkle_tree_from_prehashed_level(
         tree,
         n_leaves,
         params.merkle_hash,
-        local_parent_levels,
+        prehashed_levels,
     );
     let cap = merkle::cap_layer(&merkle_tree, n_leaves, params.l0_cap_depth()).to_vec();
     if timing {
@@ -1030,25 +1052,42 @@ mod tests {
     /// interleaving widths.
     /// Leaf-fused commit == staged commit, bit for bit (root, tree,
     /// codeword) — m=22 exercises the scalar-fallback hook (one whole-buffer
-    /// callback), m=25 the deep-pass per-sub-group hooks.
+    /// callback), m=25 the deep-pass per-sub-group hooks. The pool size
+    /// sets the deep pass's sub-group size (256 rows at 128 threads for
+    /// m=25), so every job shape the publisher can emit — the 1024-leaf cap
+    /// and sub-group-sized jobs below it — is covered.
     #[test]
     fn pipelined_commit_matches_staged() {
-        for m in [22usize, 25] {
-            let mut params = default_params(m);
-            params.merkle_hash = HashKind::Blake3;
-            params.log_batch_size = 5;
-            let mut rng = Rng::new(0xF05E ^ m as u64);
-            let bits = rng.bits(1 << m);
-            let z_packed = crate::pcs::pack::pack_witness(&bits, m);
-            let (c_a, d_a) = {
-                let cw = commit_encode(&z_packed, &params);
-                commit_merkle(cw, &params)
-            };
-            let buf = crate::scratch::take_f128(params.codeword_len_f128());
-            let (c_b, d_b) = commit_into_pipelined(&z_packed, &params, buf);
-            assert_eq!(c_a.cap, c_b.cap, "m={m}: cap mismatch");
-            assert_eq!(d_a.merkle_tree, d_b.merkle_tree, "m={m}: tree mismatch");
-            assert_eq!(d_a.codeword, d_b.codeword, "m={m}: codeword mismatch");
+        for threads in [2usize, 8, 32, 128] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for m in [22usize, 25] {
+                    let mut params = default_params(m);
+                    params.merkle_hash = HashKind::Blake3;
+                    params.log_batch_size = 5;
+                    let mut rng = Rng::new(0xF05E ^ m as u64);
+                    let bits = rng.bits(1 << m);
+                    let z_packed = crate::pcs::pack::pack_witness(&bits, m);
+                    let (c_a, d_a) = {
+                        let cw = commit_encode(&z_packed, &params);
+                        commit_merkle(cw, &params)
+                    };
+                    let buf = crate::scratch::take_f128(params.codeword_len_f128());
+                    let (c_b, d_b) = commit_into_pipelined(&z_packed, &params, buf);
+                    assert_eq!(c_a.cap, c_b.cap, "m={m} threads={threads}: cap mismatch");
+                    assert_eq!(
+                        d_a.merkle_tree, d_b.merkle_tree,
+                        "m={m} threads={threads}: tree mismatch"
+                    );
+                    assert_eq!(
+                        d_a.codeword, d_b.codeword,
+                        "m={m} threads={threads}: codeword mismatch"
+                    );
+                }
+            });
         }
     }
 
