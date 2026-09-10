@@ -2395,7 +2395,6 @@ mod tests {
     /// identity compaction `q` aliases it), so it must stay honestly zero.
     #[cfg(target_arch = "aarch64")]
     #[test]
-    #[ignore] // Heavy — run with `cargo test dead_padding_regions -- --ignored`
     fn dead_padding_regions_are_never_read() {
         use flock_core::challenger::FsChallenger;
         use flock_core::field::F128;
