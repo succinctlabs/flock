@@ -162,27 +162,38 @@ unsafe fn process_block_neon_single(
     let mut a6 = vld1q_u8(o.add(96));
     let mut a7 = vld1q_u8(o.add(112));
 
-    for t in 0..TILE_T {
-        let stripe_ptr = tile_bytes_ptr.add(t * k + bs);
-        let ta = tables_ptr.add(t * 256 * 16);
+    // Two stripes per iteration, each stripe's 8 bytes grabbed with ONE u64
+    // load and shift-extracted in GPRs (vs. 8 scalar byte loads), and the two
+    // table entries folded into the accumulator as an XOR pair that LLVM
+    // fuses to EOR3 under the SHA3 feature. The loop is load-port bound, so
+    // dropping from 16 loads per stripe (8 table + 8 byte) to ~9 (8 table +
+    // 1 word) is the win; the XOR multiset is unchanged — bit-identical.
+    const _: () = assert!(NEON_TILE_T.is_multiple_of(2));
+    for t in (0..TILE_T).step_by(2) {
+        let w0 = (tile_bytes_ptr.add(t * k + bs) as *const u64).read_unaligned();
+        let w1 = (tile_bytes_ptr.add((t + 1) * k + bs) as *const u64).read_unaligned();
+        let ta0 = tables_ptr.add(t * 256 * 16);
+        let ta1 = tables_ptr.add((t + 1) * 256 * 16);
 
-        let i0 = *stripe_ptr as usize;
-        let i1 = *stripe_ptr.add(1) as usize;
-        let i2 = *stripe_ptr.add(2) as usize;
-        let i3 = *stripe_ptr.add(3) as usize;
-        let i4 = *stripe_ptr.add(4) as usize;
-        let i5 = *stripe_ptr.add(5) as usize;
-        let i6 = *stripe_ptr.add(6) as usize;
-        let i7 = *stripe_ptr.add(7) as usize;
-
-        a0 = veorq_u8(a0, vld1q_u8(ta.add(i0 * 16)));
-        a1 = veorq_u8(a1, vld1q_u8(ta.add(i1 * 16)));
-        a2 = veorq_u8(a2, vld1q_u8(ta.add(i2 * 16)));
-        a3 = veorq_u8(a3, vld1q_u8(ta.add(i3 * 16)));
-        a4 = veorq_u8(a4, vld1q_u8(ta.add(i4 * 16)));
-        a5 = veorq_u8(a5, vld1q_u8(ta.add(i5 * 16)));
-        a6 = veorq_u8(a6, vld1q_u8(ta.add(i6 * 16)));
-        a7 = veorq_u8(a7, vld1q_u8(ta.add(i7 * 16)));
+        macro_rules! fold2 {
+            ($acc:ident, $sh:expr) => {
+                $acc = veorq_u8(
+                    $acc,
+                    veorq_u8(
+                        vld1q_u8(ta0.add((((w0 >> $sh) & 0xff) as usize) * 16)),
+                        vld1q_u8(ta1.add((((w1 >> $sh) & 0xff) as usize) * 16)),
+                    ),
+                );
+            };
+        }
+        fold2!(a0, 0);
+        fold2!(a1, 8);
+        fold2!(a2, 16);
+        fold2!(a3, 24);
+        fold2!(a4, 32);
+        fold2!(a5, 40);
+        fold2!(a6, 48);
+        fold2!(a7, 56);
     }
 
     vst1q_u8(o, a0);

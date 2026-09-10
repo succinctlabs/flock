@@ -42,6 +42,12 @@ pub struct InvNttTableByteSingleGf8 {
     /// Start of the logical table inside `data`, chosen so every 64-byte row
     /// in the production `ell = 64` table starts on a cache-line boundary.
     data_offset: usize,
+    /// The same table with every byte multiplied by x^4 in GF(2^8). Lets the
+    /// URM fast accumulate obtain the x^4 component of its x^K row weight from
+    /// the gather itself (same row index, different table) instead of from
+    /// arithmetic. Same size and alignment discipline as `data`.
+    data_x4: Vec<F8>,
+    data_x4_offset: usize,
 }
 
 impl InvNttTableByteSingleGf8 {
@@ -102,12 +108,25 @@ impl InvNttTableByteSingleGf8 {
             }
         }
 
+        // x^4-scaled image: scaling every byte scales each gathered XOR-sum
+        // by x^4 (the table is F_2-linear in its entries).
+        const X4: F8 = F8(0x10);
+        let mut data_x4 = vec![F8::ZERO; table_len + TABLE_ALIGNMENT - 1];
+        let data_x4_offset = (TABLE_ALIGNMENT
+            - (data_x4.as_ptr() as usize & (TABLE_ALIGNMENT - 1)))
+            & (TABLE_ALIGNMENT - 1);
+        for i in 0..table_len {
+            data_x4[data_x4_offset + i] = data[data_offset + i] * X4;
+        }
+
         Self {
             k,
             ell,
             n_chunks,
             data,
             data_offset,
+            data_x4,
+            data_x4_offset,
         }
     }
 
@@ -119,6 +138,14 @@ impl InvNttTableByteSingleGf8 {
         // SAFETY: `data_offset` selects a position within the over-allocated
         // buffer and the allocation cannot move while borrowed through self.
         unsafe { self.data.as_ptr().add(self.data_offset) as *const u8 }
+    }
+
+    /// Raw pointer to the x^4-scaled table image (same layout as
+    /// [`Self::data_ptr`]).
+    #[inline]
+    pub fn data_x4_ptr(&self) -> *const u8 {
+        // SAFETY: same discipline as `data_ptr`.
+        unsafe { self.data_x4.as_ptr().add(self.data_x4_offset) as *const u8 }
     }
 
     #[inline]

@@ -132,7 +132,8 @@ fn main() -> Result<()> {
     );
     let l0_block_len = wtns_0.block_len;
 
-    let mut ch = FsChallenger::new(domain);
+    // cuda-ghash hashes with SHA-256 only: pin it, never the repo default.
+    let mut ch = FsChallenger::with_hash(domain, HashKind::Sha256);
     ch.observe_label(PROVER_LABEL);
     ch.observe_f128(target);
     ch.observe_bytes(&wtns_root(&wtns_0));

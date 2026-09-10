@@ -6,7 +6,6 @@
 use std::ptr::copy_nonoverlapping;
 use std::{
     array::from_fn,
-    ptr::write_bytes,
     slice::{from_raw_parts, from_raw_parts_mut},
     sync::OnceLock,
 };
@@ -323,6 +322,29 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
+    drive_witness_packed_and_lincheck_impl(
+        initial_states,
+        padding,
+        n_blocks_log,
+        k_log,
+        false,
+        per_block,
+    )
+}
+
+fn drive_witness_packed_and_lincheck_impl<S: Sync, F>(
+    initial_states: &[S],
+    padding: Option<&S>,
+    n_blocks_log: usize,
+    k_log: usize,
+    full_write: bool,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+    debug_assert!(!full_write || padding.is_some());
     let k = 1usize << k_log;
     let f128_per_block = k / 128;
     let u64_per_block = k / 64;
@@ -344,10 +366,10 @@ where
     // parallel build. The per-block builders OR 1-bits into pre-zeroed words,
     // so each group must be zeroed before its `per_block` calls. `z_lincheck`
     // stays `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
-    let mut z = take_f128(total_f128);
-    let mut a = take_f128(total_f128);
-    let mut b = take_f128(total_f128);
-    let mut z_lincheck = vec![0u8; (n_total / 8) * k];
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
@@ -359,12 +381,16 @@ where
             // were uninit-allocated). The per-block builder ORs 1-bits into
             // pre-zeroed words; any slot left unbuilt (no padding block) stays
             // zero, which the lincheck transpose below reads correctly.
+            // Full-write builders initialize every word themselves, so the
+            // memset (and the RMW it forces on every subsequent OR) is skipped.
             // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
             // the valid `F128::ZERO`, so a byte memset is a correct init.
-            unsafe {
-                write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+            if !full_write {
+                unsafe {
+                    std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+                    std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+                    std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+                }
             }
             for k_in in 0..8 {
                 let global_idx = 8 * g + k_in;
@@ -551,6 +577,42 @@ pub(crate) unsafe fn flush_rows_nt(
     }
 }
 
+/// [`flush_rows_nt`] for `n_sets` consecutive groups staged back to back
+/// (`rows_per_set` words each): for every chunk-column the sets' 8-row
+/// records are stored one after another, so column `c` receives ONE
+/// contiguous `128·n_sets`-byte burst at `dest[(c << n_log) + o0]` instead of
+/// `n_sets` scattered 128-byte stores.
+///
+/// # Safety
+/// As [`flush_rows_nt`], for rows `[o0, o0 + 8·n_sets)`.
+#[inline]
+pub(crate) unsafe fn flush_rows_nt_burst(
+    rows_all: &[BmRow],
+    n_sets: usize,
+    rows_per_set: usize,
+    dest: *mut u64,
+    o0: usize,
+    n_log: usize,
+    useful_chunks: usize,
+) {
+    debug_assert!(rows_all.len() >= n_sets * rows_per_set);
+    for c in 0..useful_chunks {
+        for i in 0..n_sets {
+            let rows = &rows_all[i * rows_per_set..(i + 1) * rows_per_set];
+            let even = &rows[2 * c];
+            let odd = &rows[2 * c + 1];
+            let mut buf = [0u64; 2 * BM_V];
+            for j in 0..BM_V {
+                buf[2 * j] = even[j];
+                buf[2 * j + 1] = odd[j];
+            }
+            unsafe {
+                nt_store_row(buf.as_ptr(), dest.add(((c << n_log) + o0 + i * BM_V) * 2));
+            }
+        }
+    }
+}
+
 /// Transpose the z rows into the lincheck byte-stripe for one V = 8 group.
 /// Only `useful_words` rows are written (the stripe tail stays zero).
 #[inline]
@@ -653,6 +715,7 @@ where
             a: &mut a,
             b: &mut b,
             elide_padding_writes: false,
+            dead_padding_unread: false,
         },
         per_group,
     );
@@ -692,6 +755,7 @@ where
         a,
         b,
         elide_padding_writes: _,
+        dead_padding_unread: _,
     } = dst;
     for buf in [&*z, &*a, &*b] {
         assert_eq!(buf.len(), total_f128, "witness destination length");
@@ -794,6 +858,7 @@ where
             a: &mut a,
             b: &mut b,
             elide_padding_writes: false,
+            dead_padding_unread: false,
         },
         per_group,
     );
@@ -828,6 +893,7 @@ where
         a,
         b,
         elide_padding_writes,
+        dead_padding_unread,
     } = dst;
     for buf in [&*z, &*a, &*b] {
         assert_eq!(buf.len(), total_f128, "witness destination length");
@@ -846,16 +912,51 @@ where
     } else {
         n_total / BM_V
     };
-    stripe
-        .par_chunks_mut(u64_per_block * 64)
-        .take(tail_groups)
-        .for_each(|g| g[useful_words * 64..].fill(0));
+    // The stripe tail (rows >= useful_words of each visited group) is only
+    // ever read by `partial_fold_packed_z_rows_best`, which is `useful_bits`
+    // aware and skips whole blocks past the useful region — so when the
+    // caller certifies `dead_padding_unread` it can stay dirty, saving
+    // 153 MB at m=32. Uncertified callers keep the strict contract: the
+    // stripe then matches canonical `pack_z_lincheck` byte for byte, which
+    // `batch_major_partial_zeroes_dummy_rows` pins.
+    if !dead_padding_unread {
+        stripe
+            .par_chunks_mut(u64_per_block * 64)
+            .take(tail_groups)
+            .for_each(|g| g[useful_words * 64..].fill(0));
+    }
     if !elide_padding_writes {
         // Zero the padding suffix (contiguous chunk-columns >=
         // useful_chunks); the group loop fully writes the useful prefix —
         // declared rows from the builders, dummy rows as zero flushes.
+        // Zero the padding suffix (contiguous chunk-columns >=
+        // useful_chunks) of **`z` ONLY**. `z` is the committed buffer: under
+        // identity compaction q IS this buffer, so its padding words go into
+        // the committed stack and must be honest zeros or the prover's own
+        // opening disagrees with its claims.
+        //
+        // `a` and `b` are NEVER committed — their only consumers are the
+        // run-list-gated zerocheck (Dead blocks skipped, Partial blocks
+        // cleansed into zeroed scratch; see the padding contract on
+        // `flock_core::proof::BooleanPiopProofAg`) and the count-proportional
+        // lincheck, none of which reads a declared-dead bit. So their suffix
+        // is left as-is, saving 2/3 of this memset — 288 MB of the 432 MB at
+        // m=32. Verified by `ab_padding_suffix_is_never_read`, which poisons
+        // exactly this region and pins the proof byte-identical; if a future
+        // consumer starts reading a/b padding, that test fails.
+        // Zero the padding suffix (contiguous chunk-columns >=
+        // useful_chunks). `z` ALWAYS: it is the committed buffer, and under
+        // identity compaction q IS this buffer, so its padding words land in
+        // the committed stack and must be honest zeros or the prover's own
+        // opening disagrees with its claims. `a`/`b` only when the caller has
+        // NOT certified `ab_padding_unread` — they are never committed, and
+        // the run-list-gated zerocheck plus count-proportional lincheck read
+        // no declared-dead bit. Skipping them saves 288 MB of the 432 MB here.
         let tail = useful_chunks << n_blocks_log;
-        for buf in [&mut *z, &mut *a, &mut *b] {
+        for (i, buf) in [&mut *z, &mut *a, &mut *b].into_iter().enumerate() {
+            if i > 0 && dead_padding_unread {
+                continue;
+            }
             buf[tail..]
                 .par_chunks_mut(1 << 16)
                 .for_each(|c| c.fill(F128::ZERO));
@@ -878,15 +979,37 @@ where
     } else {
         n_total / BM_V
     };
-    (0..n_groups).into_par_iter().for_each_init(
-        || {
-            (
-                vec![[0u64; BM_V]; u64_per_block],
-                vec![[0u64; BM_V]; u64_per_block],
-                vec![[0u64; BM_V]; u64_per_block],
-            )
-        },
-        move |(rz, ra, rb), g| {
+    // BURST-LENGTH FLUSH. The witness is column-major (chunk-column c's 2^nu
+    // rows are contiguous, 4 MB apart per column), but the builder emits 8
+    // ROWS per group across all columns, so the natural flush is 92 separate
+    // 128-byte NT stores per group, each to a different page — measured at
+    // ~58 GB/s while the commit's contiguous lane fill runs the same bus at
+    // ~140 GB/s. Each task therefore stages WG consecutive groups (8·WG
+    // rows) and flushes them per column as ONE contiguous 128·WG-byte burst.
+    // Same words to the same addresses; the stripe stays per group (it is
+    // already group-major and contiguous). WG = 8 (1 KB bursts, 384 KB of
+    // staging per worker): measured at m=32 against the one-group flush,
+    // witgen −12 ms ST (339 vs 352) and −3 to −5 ms MT in-prove; WG = 16
+    // (768 KB staging) spills L2 and gives the ST gain back (+4).
+    const WG: usize = 8;
+    let wg = WG;
+    let n_super = n_groups.div_ceil(wg);
+    let init = || {
+        (
+            vec![[0u64; BM_V]; wg * u64_per_block],
+            vec![[0u64; BM_V]; wg * u64_per_block],
+            vec![[0u64; BM_V]; wg * u64_per_block],
+        )
+    };
+    type Staging = (Vec<BmRow>, Vec<BmRow>, Vec<BmRow>);
+    let body = move |(rz_all, ra_all, rb_all): &mut Staging, sg: usize| {
+        let g0 = sg * wg;
+        let n_in = wg.min(n_groups - g0);
+        for i in 0..n_in {
+            let g = g0 + i;
+            let rz = &mut rz_all[i * u64_per_block..(i + 1) * u64_per_block];
+            let ra = &mut ra_all[i * u64_per_block..(i + 1) * u64_per_block];
+            let rb = &mut rb_all[i * u64_per_block..(i + 1) * u64_per_block];
             rz[..useful_words].fill([0u64; BM_V]);
             ra[..useful_words].fill([0u64; BM_V]);
             rb[..useful_words].fill([0u64; BM_V]);
@@ -913,13 +1036,45 @@ where
             // the dummy region must be written, not skipped — see above.
             // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
             unsafe {
-                flush_rows_nt(rz, zp.get(), o0, n_blocks_log, useful_chunks);
-                flush_rows_nt(ra, ap.get(), o0, n_blocks_log, useful_chunks);
-                flush_rows_nt(rb, bp.get(), o0, n_blocks_log, useful_chunks);
                 stripe_from_rows(rz, sp.get() as *mut u8, o0, u64_per_block, useful_words);
             }
-        },
-    );
+        }
+        // SAFETY: the staged groups own rows [g0·8, (g0+n_in)·8) of every
+        // chunk-column; super-groups are disjoint.
+        unsafe {
+            flush_rows_nt_burst(
+                rz_all,
+                n_in,
+                u64_per_block,
+                zp.get(),
+                g0 * BM_V,
+                n_blocks_log,
+                useful_chunks,
+            );
+            flush_rows_nt_burst(
+                ra_all,
+                n_in,
+                u64_per_block,
+                ap.get(),
+                g0 * BM_V,
+                n_blocks_log,
+                useful_chunks,
+            );
+            flush_rows_nt_burst(
+                rb_all,
+                n_in,
+                u64_per_block,
+                bp.get(),
+                g0 * BM_V,
+                n_blocks_log,
+                useful_chunks,
+            );
+        }
+    };
+    // Super-groups drain on the shared P+E queue with per-worker staging:
+    // the BLAKE3 builder is compute-bound, and the two E-cores measured
+    // witgen −2.6 / −1.3 / −2.1 ms MT (3/3, twice) at m=32.
+    let _ = flock_core::run_hetero_chunks_stateful(n_super, init, |s, sg| body(s, sg));
 
     stripe
 }

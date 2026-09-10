@@ -203,6 +203,52 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
 
 /// [`prove_union_capture_z_vec`] with an explicit Fiat--Shamir grinding
 /// policy.
+/// The union's column bit-bank at the row point `x_outer`: entry `k·128 + b`
+/// is `Σ_r eq(x_outer, r)·bit_b(z[k·2^ν + r])` for chunk column `k` of the
+/// boolean region (dead bits and rows past a slot's count contribute zero).
+/// The union lincheck's `z_vec` is this fold at the lincheck's own row point;
+/// the merged open's block-first transport (`pcs::open_batch_merged`) also
+/// wants it at the C claim's row point, which is why it is a public entry.
+pub fn union_bitbank_fold(
+    union: &UnionInstance,
+    slots: &[UnionLincheckSlot<'_>],
+    x_outer: &[F128],
+) -> Vec<F128> {
+    let registry = union.registry();
+    let nu = union.n_log();
+    let col_vars = union.m_bool() - nu;
+    let single = registry.num_boolean() == 1 && registry.slots()[0].m_slot == registry.m_bool();
+    let eq_x_outer = build_eq_table(x_outer);
+    let mut z_vec: Vec<F128> = if single {
+        Vec::new()
+    } else {
+        vec![F128::ZERO; 1usize << col_vars]
+    };
+    for (((ty, slot), slot_in), &n_t) in registry
+        .boolean_types()
+        .iter()
+        .zip(registry.slots())
+        .zip(slots)
+        .zip(union.counts())
+    {
+        let y_t = partial_fold_packed_z_rows_best(
+            slot_in.z_lincheck,
+            nu + ty.k_log,
+            ty.k_log,
+            ty.useful_bits,
+            &eq_x_outer,
+            n_t,
+        );
+        if single {
+            z_vec = y_t;
+        } else {
+            let off = slot.prefix << ty.k_log;
+            z_vec[off..off + y_t.len()].copy_from_slice(&y_t);
+        }
+    }
+    z_vec
+}
+
 pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     union: &UnionInstance<'_>,
     slots: &[UnionLincheckSlot<'_>],
@@ -346,35 +392,12 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     //    single partial fold. Dummy rows are honest zeros, so folding only
     //    the DECLARED rows equals the full-capacity fold byte for byte —
     //    the row-aware dispatch makes the fold count-proportional (M6).
-    let t_fold = if trace { Some(Instant::now()) } else { None };
-    let eq_x_outer = build_eq_table(&x_ab.x_outer);
-    let mut z_vec: Vec<F128> = if single {
-        Vec::new()
+    let t_fold = if trace {
+        Some(std::time::Instant::now())
     } else {
-        vec![F128::ZERO; 1usize << col_vars]
+        None
     };
-    for (((ty, slot), slot_in), &n_t) in registry
-        .boolean_types()
-        .iter()
-        .zip(registry.slots())
-        .zip(slots)
-        .zip(union.counts())
-    {
-        let y_t = partial_fold_packed_z_rows_best(
-            slot_in.z_lincheck,
-            nu + ty.k_log,
-            ty.k_log,
-            ty.useful_bits,
-            &eq_x_outer,
-            n_t,
-        );
-        if single {
-            z_vec = y_t;
-        } else {
-            let off = slot.prefix << ty.k_log;
-            z_vec[off..off + y_t.len()].copy_from_slice(&y_t);
-        }
-    }
+    let z_vec = union_bitbank_fold(union, slots, &x_ab.x_outer);
 
     if let Some(t) = t_fold {
         eprintln!(

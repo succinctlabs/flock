@@ -19,22 +19,19 @@
 //! See [DP24](https://eprint.iacr.org/2024/504) (ring-switching) and the
 //! ligerito module docs for the recursion.
 
-use std::{
-    env::{var, var_os},
-    mem::swap,
-    sync::atomic::{AtomicU8, Ordering},
-    time::Instant,
-};
+use std::{env::var, sync::atomic::AtomicU8, time::Instant};
 
 pub use commit::{
-    Commitment, PcsParams, ProverData, commit, commit_into, commit_lane_major, dense_lanes,
+    Commitment, PcsParams, ProverData, commit, commit_encode, commit_encode_into, commit_into,
+    commit_lane_major, commit_leaf_pipeline_shape, commit_merkle, dense_lanes,
     prefault_codeword_during,
 };
+pub use jagged::rectangular_prefix_columns;
 use jagged::{
     FrobeniusClaim, JaggedParams, MergedWeightClaim, MultipointDefer, MultipointGrinding,
-    MultipointTwistedProof, ScalarGroupClaim, build_merged_weight_and_prime,
-    fold_and_round_oop_par, fold_oop_par, fold_round_claim, prove_multipoint_twisted_with_grinding,
-    verify_multipoint_twisted_deferred_with_grinding, verify_multipoint_twisted_with_grinding,
+    MultipointTwistedProof, ScalarGroupClaim, fold_round_claim,
+    prove_multipoint_twisted_with_grinding, verify_multipoint_twisted_deferred_with_grinding,
+    verify_multipoint_twisted_with_grinding,
 };
 use ligerito::{
     BasisWindowFn, FoldLookahead, LigeritoProof, ProverConfig, VerifierConfig, VirtualEqBasis,
@@ -180,6 +177,28 @@ pub struct PackedDirectClaim {
 /// arms on this box carry ±4-8 ms of interference per sample.
 pub static VIRTUAL_B_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
+/// In-process A/B override for the STATISTICS LADDER (see
+/// `ligerito::extension::init_phase_statistics`): `0` follows the
+/// `FLOCK_NO_STATS_LADDER` env knob, `1` forces it on, `2` forces the
+/// incremental L0 fold ladder. Both arms produce byte-identical proofs.
+pub static STATS_LADDER_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn virtual_b_enabled() -> bool {
+    match VIRTUAL_B_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => std::env::var_os("FLOCK_NO_VIRTUAL_B").is_none(),
+    }
+}
+
+pub(crate) fn stats_ladder_enabled() -> bool {
+    match STATS_LADDER_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => std::env::var_os("FLOCK_NO_STATS_LADDER").is_none(),
+    }
+}
+
 /// Fiat--Shamir grinding policy for the PCS transport that sits before the
 /// Ligerito opening.  Each nonzero field is applied immediately after its
 /// prover message(s) are bound and immediately before the challenge it
@@ -262,6 +281,41 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Chall
     padding: &PaddingSpec,
     lig_config: &ProverConfig,
     grinding: OpeningGrinding,
+    challenger: &mut Ch,
+) -> BatchOpeningProofLigerito {
+    open_batch_mixed_ligerito_seeded(
+        packed_witness,
+        prover_data,
+        commitment,
+        x_outers,
+        precomputed_s_hat_v,
+        packed_direct,
+        padding,
+        lig_config,
+        grinding,
+        None,
+        challenger,
+    )
+}
+
+/// [`open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding`] with
+/// the inner open's SEEDED BLOCK STATISTICS supplied by the caller: the
+/// merged transport's inner claim sits at the merged sumcheck's own point,
+/// so that sumcheck's folded witness after `log_n − initial_k` rounds IS
+/// `Σ_h f[e,h]·eq(ρ_{low}, h)` per lane block — the statistics ladder's
+/// seeded term, which it would otherwise sweep the witness to recompute.
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_mixed_ligerito_seeded<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    grinding: OpeningGrinding,
+    seeded_stats: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
     // Belt-and-braces on the cap-depth derivation: the commit-time cap
@@ -350,13 +404,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Chall
     // Lane-major only: the virtual basis rides the BLOCKED L0 fold, which is
     // what every shipped merged-transport open runs (a pow2-lane inner keeps
     // the tuned element-pairing kernel and its round-0 JIT).
-    let virtual_b = eq_basis.is_some()
-        && lane_major
-        && match VIRTUAL_B_OVERRIDE.load(Ordering::Relaxed) {
-            1 => true,
-            2 => false,
-            _ => var_os("FLOCK_NO_VIRTUAL_B").is_none(),
-        };
+    let virtual_b = eq_basis.is_some() && lane_major && virtual_b_enabled();
     let vbasis = if virtual_b {
         // The point IS the claim's, and γ is its single transcript scalar —
         // the same (γ, ρ) the split tables above were seeded with.
@@ -398,6 +446,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Chall
         round1_lookahead,
         jit,
         vbasis,
+        seeded_stats,
         challenger,
     );
     if trace {
@@ -606,6 +655,27 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let mask = (1usize << n_lo) - 1;
         let bs = |u: usize| lo[u & mask] * hi[u >> n_lo];
         let blk = eqpoint_round0_block;
+        // STATISTICS LADDER: the lane-major inner open derives its round-0
+        // message and every later L0 round from block statistics inside the
+        // recursive prover (one sweep there covers this term AND the L0 OOD
+        // term), so the O(L) prime + lookahead sweep below is skipped. Same
+        // gate as the prover's: `virtual_b` = eq basis + lane-major, which
+        // is exactly this branch with `blk > 1`.
+        if blk > 1 && virtual_b_enabled() && stats_ladder_enabled() {
+            if trace {
+                eprintln!("  [open_batch] combine (seeded EqPoint, statistics ladder): no sweep");
+            }
+            return CombinedClaim {
+                ring_switches: Vec::new(),
+                batching_nonces,
+                b_combined: Vec::new(),
+                eq_basis: Some((lo, hi, n_lo)),
+                eq_gamma: Some(gammas_pd[0]),
+                target_combined,
+                round0_prime: (F128::ZERO, F128::ZERO),
+                round1_lookahead: None,
+            };
+        }
         if blk == 1 {
             // The ladder statically rejects a lookahead on this shape:
             // `fold_block == 1` comes with the factored (JIT) basis, so
@@ -1451,6 +1521,432 @@ fn scalar_claim_groups<'a>(
     groups
 }
 
+/// One ring-switch claim's inputs to the block-first phase.
+struct BlockFirstClaim<'a> {
+    z_row: &'a [F128],
+    z_col: &'a [F128],
+    /// `linearized_coefficients` of its γ-scaled fold table.
+    coeffs: &'a [F128],
+    /// Column bit-bank at `z_row`:
+    /// `bank[c·128 + b] = Σ_r eq(z_row, r)·bit_b(q[c·2^n + r])`.
+    bank: &'a [F128],
+}
+
+/// `x^(2^j)`.
+#[inline]
+fn frob(mut x: F128, j: usize) -> F128 {
+    for _ in 0..j {
+        x = x.square();
+    }
+    x
+}
+
+/// Round message of the product sumcheck from rank-1 terms `Σ_t A_t(e)·S_t(e)`
+/// (LSB-first pairs): `(Σ_odd A·S, Σ (A0+A1)(S0+S1))`.
+fn round_message_terms(terms: &[(Vec<F128>, Vec<F128>)]) -> (F128, F128) {
+    let mut g_one = F128::ZERO;
+    let mut g_inf = F128::ZERO;
+    for (a, s) in terms {
+        for i in 0..a.len() / 2 {
+            let (a0, a1, s0, s1) = (a[2 * i], a[2 * i + 1], s[2 * i], s[2 * i + 1]);
+            g_one += a1 * s1;
+            g_inf += (a0 + a1) * (s0 + s1);
+        }
+    }
+    (g_one, g_inf)
+}
+
+/// `v[i] ← v[2i] + r·(v[2i] + v[2i+1])`, halving `v`.
+fn fold_pairs_in_place(v: &mut Vec<F128>, r: F128) {
+    let half = v.len() / 2;
+    for i in 0..half {
+        let (x0, x1) = (v[2 * i], v[2 * i + 1]);
+        v[i] = x0 + r * (x0 + x1);
+    }
+    v.truncate(half);
+}
+
+/// Round message of the product sumcheck over a dense pair (see
+/// `round_message_terms`).
+fn round_message_pairs(a: &[F128], b: &[F128]) -> (F128, F128) {
+    use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice};
+    a.par_chunks(4096)
+        .zip(b.par_chunks(4096))
+        .map(|(ac, bc)| {
+            let mut g_one = F128::ZERO;
+            let mut g_inf = F128::ZERO;
+            for i in 0..ac.len() / 2 {
+                let (a0, a1, b0, b1) = (ac[2 * i], ac[2 * i + 1], bc[2 * i], bc[2 * i + 1]);
+                g_one += a1 * b1;
+                g_inf += (a0 + a1) * (b0 + b1);
+            }
+            (g_one, g_inf)
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |x, y| (x.0 + y.0, x.1 + y.1))
+}
+
+/// Reference column bit-bank of the dense stack at `z_row` (the union prover
+/// supplies these from its stripe kernels; this is the slow oracle).
+fn column_bitbank_reference(q: &[F128], z_row: &[F128], n_log: usize, k_cols: usize) -> Vec<F128> {
+    use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+    let eq_row = crate::lincheck::build_eq_table(z_row);
+    let n_rows = 1usize << n_log;
+    (0..1usize << k_cols)
+        .into_par_iter()
+        .flat_map_iter(|c| {
+            let mut acc = vec![F128::ZERO; 1 << LOG_PACKING];
+            for (r, w) in q[c * n_rows..(c + 1) * n_rows].iter().enumerate() {
+                let e = eq_row[r];
+                let mut lo = w.lo;
+                while lo != 0 {
+                    acc[lo.trailing_zeros() as usize] += e;
+                    lo &= lo - 1;
+                }
+                let mut hi = w.hi;
+                while hi != 0 {
+                    acc[64 + hi.trailing_zeros() as usize] += e;
+                    hi &= hi - 1;
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
+/// The block-first phase of the merged sumcheck (docs, "direct transport").
+///
+/// The dense index is `d = e·2^(n+1) + c0·2^n + r` (block `e` of two lane
+/// columns, column bit `c0`, row `r`). Every weight term is rank-1 across the
+/// `(e | c0, r)` split once the fold map is linearized:
+/// `W_i[e, (c0, r)] = Σ_j c_ij·u_i(e)^(2^j)·(eq(z_col[0], c0)·eq(z_row, r))^(2^j)`
+/// with `u_i(e) = eq(z_col[1..], e)`, masked to the live column prefix. The
+/// `k−1` block rounds therefore need only, per term, the block statistics
+/// `S_ij[e] = (eq(z_col[0], c0)·Σ_b β_b^(2^-j)·bank[(2e+c0)·128 + b])^(2^j)`
+/// — a Frobenius transform of the column bit-bank — against
+/// `A_ij[e] = c_ij·eq(z_col[1..]^(2^j), e)`. After them, `q` is folded over
+/// the bound block coordinates and the row-side weight `W'` is written in
+/// closed form (the block factor folds into the linearized coefficients, the
+/// `c0` bit into the byte tables), ready for the ordinary row rounds.
+#[allow(clippy::too_many_arguments)]
+fn block_first_phase<Ch: Challenger>(
+    q: &[F128],
+    n_log: usize,
+    k_cols: usize,
+    live_cols: usize,
+    rs: &[BlockFirstClaim<'_>],
+    pd_groups: &[(&[F128], Vec<F128>)],
+    grinding: OpeningGrinding,
+    challenger: &mut Ch,
+    merged_rounds: &mut Vec<(F128, F128)>,
+    merged_round_nonces: &mut Vec<u64>,
+    r_blk: &mut Vec<F128>,
+    trace: bool,
+) -> (Vec<F128>, Vec<F128>) {
+    use rayon::prelude::{
+        IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+    };
+    const NB: usize = 1 << LOG_PACKING;
+    let t = std::time::Instant::now();
+    let kb = k_cols - 1;
+    let n_e = 1usize << kb;
+    let blk = 1usize << (n_log + 1);
+    let n_rows = 1usize << n_log;
+    // Live blocks per column bit: column `2e + c0` is live iff `2e + c0 < p`.
+    let live_e = |c0: usize| (live_cols + 1 - c0) / 2;
+    // Frobenius powers of the bit basis: `pw[b][k] = β_b^(2^k)`.
+    let pw: Vec<Vec<F128>> = (0..NB)
+        .map(|b| {
+            let mut row = vec![F128::ZERO; NB];
+            row[0] = ring_switch::bit_basis(b);
+            for k in 1..NB {
+                row[k] = row[k - 1].square();
+            }
+            row
+        })
+        .collect();
+
+    // Rank-1 terms on the block cube.
+    let mut terms: Vec<(Vec<F128>, Vec<F128>)> = Vec::new();
+    for cl in rs {
+        let z0 = cl.z_col[0];
+        let z_hi = &cl.z_col[1..];
+        let per_j: Vec<(Vec<F128>, Vec<F128>)> = (0..NB)
+            .into_par_iter()
+            .filter(|&j| cl.coeffs[j] != F128::ZERO)
+            .flat_map_iter(|j| {
+                let pw = &pw;
+                let zj: Vec<F128> = z_hi.iter().map(|&z| frob(z, j)).collect();
+                let eq_hi = crate::lincheck::build_eq_table(&zj);
+                let kinv = (NB - j) % NB;
+                (0..2).map(move |c0| {
+                    let kappa = if c0 == 0 { F128::ONE + z0 } else { z0 };
+                    let live = live_e(c0);
+                    let a: Vec<F128> = (0..n_e)
+                        .map(|e| {
+                            if e < live {
+                                cl.coeffs[j] * eq_hi[e]
+                            } else {
+                                F128::ZERO
+                            }
+                        })
+                        .collect();
+                    let s: Vec<F128> = (0..n_e)
+                        .map(|e| {
+                            let bank = &cl.bank[(2 * e + c0) * NB..(2 * e + c0 + 1) * NB];
+                            let mut acc = F128::ZERO;
+                            for b in 0..NB {
+                                acc += pw[b][kinv] * bank[b];
+                            }
+                            frob(kappa * acc, j)
+                        })
+                        .collect();
+                    (a, s)
+                })
+            })
+            .collect();
+        terms.extend(per_j);
+    }
+    for (z_row, cols) in pd_groups {
+        let eq_row = crate::lincheck::build_eq_table(z_row);
+        let f: Vec<F128> = (0..1usize << k_cols)
+            .into_par_iter()
+            .map(|c| {
+                if c < live_cols {
+                    q[c * n_rows..(c + 1) * n_rows]
+                        .iter()
+                        .zip(&eq_row)
+                        .fold(F128::ZERO, |acc, (&x, &y)| acc + x * y)
+                } else {
+                    F128::ZERO
+                }
+            })
+            .collect();
+        for c0 in 0..2 {
+            let live = live_e(c0);
+            let a: Vec<F128> = (0..n_e)
+                .map(|e| {
+                    if e < live {
+                        cols[2 * e + c0]
+                    } else {
+                        F128::ZERO
+                    }
+                })
+                .collect();
+            let s: Vec<F128> = (0..n_e).map(|e| f[2 * e + c0]).collect();
+            terms.push((a, s));
+        }
+    }
+    if trace {
+        eprintln!(
+            "  [open_merged] block statistics ({} terms × {n_e}): {:6.2} ms",
+            terms.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // The block rounds.
+    let t = std::time::Instant::now();
+    let (mut g_one, mut g_inf) = round_message_terms(&terms);
+    for round in 0..kb {
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = if grinding.merged_round_bits != 0 {
+            let (nonce, r) = challenger.grind_pow_and_sample_f128(grinding.merged_round_bits);
+            merged_round_nonces.push(nonce);
+            r
+        } else {
+            challenger.sample_f128()
+        };
+        merged_rounds.push((g_one, g_inf));
+        r_blk.push(r);
+        for (a, s) in terms.iter_mut() {
+            fold_pairs_in_place(a, r);
+            fold_pairs_in_place(s, r);
+        }
+        if round + 1 < kb {
+            (g_one, g_inf) = round_message_terms(&terms);
+        }
+    }
+
+    // q' = q folded over the bound block coordinates.
+    let eq_blk = crate::lincheck::build_eq_table(r_blk);
+    let n_live_e = live_cols.div_ceil(2);
+    let mut qp = vec![F128::ZERO; blk];
+    qp.par_chunks_mut(2048).enumerate().for_each(|(ci, chunk)| {
+        let off = ci * 2048;
+        for e in 0..n_live_e {
+            let w = eq_blk[e];
+            let src = &q[e * blk + off..e * blk + off + chunk.len()];
+            for (d, &x) in chunk.iter_mut().zip(src) {
+                *d += w * x;
+            }
+        }
+    });
+
+    // W'[(c0, r)] = Σ_{e live for c0} eq(r_blk, e)·W[e, (c0, r)], in closed
+    // form: the block factor folds into the linearized coefficients,
+    // c'_{j,c0} = c_j·Σ_e eq(r_blk, e)·eq(z_col[1..]^(2^j), e), and the
+    // column bit bakes eq(z_col[0], c0) into the per-c0 byte tables.
+    let eq_rows: Vec<Vec<F128>> = rs
+        .iter()
+        .map(|cl| crate::lincheck::build_eq_table(cl.z_row))
+        .collect();
+    let tabs: Vec<[Vec<F128>; 2]> = rs
+        .iter()
+        .map(|cl| {
+            let z0 = cl.z_col[0];
+            let z_hi = &cl.z_col[1..];
+            let eq_hi_j: Vec<Vec<F128>> = (0..NB)
+                .map(|j| {
+                    let zj: Vec<F128> = z_hi.iter().map(|&z| frob(z, j)).collect();
+                    crate::lincheck::build_eq_table(&zj)
+                })
+                .collect();
+            [0usize, 1].map(|c0| {
+                let kappa = if c0 == 0 { F128::ONE + z0 } else { z0 };
+                let live = live_e(c0);
+                let cp: Vec<F128> = (0..NB)
+                    .map(|j| {
+                        let s =
+                            (0..live).fold(F128::ZERO, |acc, e| acc + eq_blk[e] * eq_hi_j[j][e]);
+                        cl.coeffs[j] * s * frob(kappa, j)
+                    })
+                    .collect();
+                let w: Vec<F128> = (0..NB)
+                    .map(|b| (0..NB).fold(F128::ZERO, |acc, j| acc + cp[j] * pw[b][j]))
+                    .collect();
+                ring_switch::build_fold_byte_table(&w)
+            })
+        })
+        .collect();
+    let pd: Vec<(Vec<F128>, [F128; 2])> = pd_groups
+        .iter()
+        .map(|(z_row, cols)| {
+            let eq_row = crate::lincheck::build_eq_table(z_row);
+            let s = [0usize, 1].map(|c0| {
+                (0..live_e(c0)).fold(F128::ZERO, |acc, e| acc + eq_blk[e] * cols[2 * e + c0])
+            });
+            (eq_row, s)
+        })
+        .collect();
+    let mut wp = vec![F128::ZERO; blk];
+    wp.par_chunks_mut(2048).enumerate().for_each(|(ci, chunk)| {
+        let off = ci * 2048;
+        for (i, slot) in chunk.iter_mut().enumerate() {
+            let h = off + i;
+            let c0 = h >> n_log;
+            let r = h & (n_rows - 1);
+            let mut acc = F128::ZERO;
+            for (eq_row, tab) in eq_rows.iter().zip(&tabs) {
+                acc += ring_switch::fold_one_slot(eq_row[r], &tab[c0]);
+            }
+            for (eq_row, s) in &pd {
+                acc += s[c0] * eq_row[r];
+            }
+            *slot = acc;
+        }
+    });
+    if trace {
+        eprintln!(
+            "  [open_merged] block rounds ({kb}) + q'/W' (2^{}): {:6.2} ms",
+            n_log + 1,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    (qp, wp)
+}
+
+/// The remaining rounds of the merged product sumcheck over `(a0, b0)`
+/// (LSB-first pairs), starting from the caller's round message. `live` bounds
+/// the non-zero prefix of `a0` (fold ranges shrink with it; `b0` must be zero
+/// on `[area, live)`). Appends messages, grinding nonces and challenges;
+/// returns the fully folded pair and the statistics seed captured at
+/// `seed_len` (see `open_batch_mixed_ligerito_seeded`).
+#[allow(clippy::too_many_arguments)]
+fn merged_sumcheck_rounds<Ch: Challenger>(
+    a0: &[F128],
+    b0: &[F128],
+    live: usize,
+    mut g_one: F128,
+    mut g_inf: F128,
+    seed_len: usize,
+    grinding: OpeningGrinding,
+    challenger: &mut Ch,
+    merged_rounds: &mut Vec<(F128, F128)>,
+    merged_round_nonces: &mut Vec<u64>,
+    rho: &mut Vec<F128>,
+) -> (F128, F128, Option<Vec<F128>>) {
+    let l = a0.len();
+    debug_assert_eq!(b0.len(), l);
+    let n_rounds = l.trailing_zeros() as usize;
+    debug_assert_eq!(1usize << n_rounds, l);
+    if n_rounds == 0 {
+        return (a0[0], b0[0], None);
+    }
+    let mut live = live.min(l);
+    let mut sa = crate::scratch::take_f128(l / 2);
+    let mut sb = crate::scratch::take_f128(l / 2);
+    let mut a = crate::scratch::take_f128(l / 4);
+    let mut bb = crate::scratch::take_f128(l / 4);
+    let mut cur = l;
+    let mut seeded_stats: Option<Vec<F128>> = None;
+    for round in 0..n_rounds {
+        let half = cur / 2;
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = if grinding.merged_round_bits != 0 {
+            let (nonce, r) = challenger.grind_pow_and_sample_f128(grinding.merged_round_bits);
+            merged_round_nonces.push(nonce);
+            r
+        } else {
+            challenger.sample_f128()
+        };
+        merged_rounds.push((g_one, g_inf));
+        rho.push(r);
+        let (a_src, b_src): (&[F128], &[F128]) = if round == 0 { (a0, b0) } else { (&a, &bb) };
+        if cur == seed_len && seed_len < l {
+            let lv = live.min(cur);
+            let mut g = a_src[..lv].to_vec();
+            g.resize(cur, F128::ZERO);
+            seeded_stats = Some(g);
+        }
+        if cur > 2 {
+            let lv = live.min(cur);
+            let lhalf = lv / 2;
+            (g_one, g_inf) = jagged::fold_and_round_oop_par(
+                &a_src[..lv],
+                &b_src[..lv],
+                r,
+                &mut sa[..lhalf],
+                &mut sb[..lhalf],
+            );
+            let next = lhalf.next_multiple_of(4).min(half).max(lhalf);
+            for i in lhalf..next {
+                sa[i] = F128::ZERO;
+                sb[i] = F128::ZERO;
+            }
+            live = next;
+        } else {
+            jagged::fold_oop_par(
+                &a_src[..cur],
+                &b_src[..cur],
+                r,
+                &mut sa[..half],
+                &mut sb[..half],
+            );
+        }
+        std::mem::swap(&mut a, &mut sa);
+        std::mem::swap(&mut bb, &mut sb);
+        cur = half;
+    }
+    let out = (a[0], bb[0], seeded_stats);
+    crate::scratch::give_f128(sa);
+    crate::scratch::give_f128(sb);
+    crate::scratch::give_f128(a);
+    crate::scratch::give_f128(bb);
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_merged<Ch: Challenger>(
     q: Vec<F128>,
@@ -1462,6 +1958,11 @@ pub fn open_batch_merged<Ch: Challenger>(
     commitment: &Commitment,
     x_outers: &[&[F128]],
     precomputed_s_hat_v: &[Option<&[F128]>],
+    // Per ring-switch claim, the column bit-bank at its row point (see
+    // `lincheck::union_bitbank_fold`); consumed by the block-first transport
+    // when the stack is a full-height column prefix. Missing entries are
+    // rebuilt from `q` (slow reference fold — tests, not the union prover).
+    column_bitbanks: &[Option<&[F128]>],
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
     heights: &[u64],
@@ -1602,109 +2103,8 @@ pub fn open_batch_merged<Ch: Challenger>(
             .map(|(z_row, cols)| MergedWeightClaim::Scalar { z_row, cols }),
     );
 
-    // The twisted weight over the dense cube (count-proportional Φ-pass;
-    // zero tail past the jagged area).
-    let t = Instant::now();
-    let (mut w, (u0, u2)) = build_merged_weight_and_prime(&params, &weight_claims, &q);
-    if trace {
-        eprintln!(
-            "  [open_merged] W build + round-0 prime (2^{} words): {:6.2} ms",
-            dense_log,
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
-    // ---- Merged sumcheck: Σ_d q[d]·W[d] = target, dense_log rounds, same
-    // message/fold conventions as the virtual-opening sumcheck.
-    //
-    // LIVE-PREFIX folds: both q (the committed stack, honestly zero-padded)
-    // and W (zero past the jagged area by construction) vanish past the
-    // area, every skipped message term carries one of them as a factor, and
-    // folding maps a zero tail to a zero tail — so each round folds only
-    // the live prefix, rounded to the fused kernel's 4-wide chunking with
-    // explicitly zeroed guard slots (the scratch halves are pool-dirty).
-    let t = Instant::now();
-    let (mut g_one, mut g_inf) = (target + u0, u2);
-    let mut merged_rounds = Vec::with_capacity(dense_log);
-    let mut merged_round_nonces =
-        Vec::with_capacity((grinding.merged_round_bits != 0) as usize * dense_log);
-    let mut rho = Vec::with_capacity(dense_log);
-    let l = q.len();
-    let area = (params.area() as usize).min(l);
-    let mut live = area.next_multiple_of(4).clamp(4, l);
-    // W's guard slots may sit past its (in-chunk-zeroed) straddle tail in a
-    // wholly-dirty scratch chunk; q's are honest zeros already.
-    for slot in &mut w[area..live] {
-        *slot = F128::ZERO;
-    }
-    let mut sa = take_f128(l / 2);
-    let mut sb = take_f128(l / 2);
-    let mut a = take_f128(l / 4);
-    let mut bb = take_f128(l / 4);
-    let mut cur = l;
-    for round in 0..dense_log {
-        let half = cur / 2;
-        challenger.observe_f128(g_one);
-        challenger.observe_f128(g_inf);
-        let r = if grinding.merged_round_bits != 0 {
-            let (nonce, r) = challenger.grind_pow_and_sample_f128(grinding.merged_round_bits);
-            merged_round_nonces.push(nonce);
-            r
-        } else {
-            challenger.sample_f128()
-        };
-        merged_rounds.push((g_one, g_inf));
-        rho.push(r);
-        let (a_src, b_src): (&[F128], &[F128]) = if round == 0 {
-            (q.as_slice(), w.as_slice())
-        } else {
-            (&a, &bb)
-        };
-        if cur > 2 {
-            let lv = live.min(cur);
-            let lhalf = lv / 2;
-            (g_one, g_inf) = fold_and_round_oop_par(
-                &a_src[..lv],
-                &b_src[..lv],
-                r,
-                &mut sa[..lhalf],
-                &mut sb[..lhalf],
-            );
-            let next = lhalf.next_multiple_of(4).min(half).max(lhalf);
-            for i in lhalf..next {
-                sa[i] = F128::ZERO;
-                sb[i] = F128::ZERO;
-            }
-            live = next;
-        } else {
-            fold_oop_par(
-                &a_src[..cur],
-                &b_src[..cur],
-                r,
-                &mut sa[..half],
-                &mut sb[..half],
-            );
-        }
-        swap(&mut a, &mut sa);
-        swap(&mut bb, &mut sb);
-        cur = half;
-    }
-    let q_eval = if dense_log == 0 { q[0] } else { a[0] };
-    let w_eval = if dense_log == 0 { w[0] } else { bb[0] };
-    if trace {
-        eprintln!(
-            "  [open_merged] merged sumcheck ({dense_log} rounds): {:6.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-    give_f128(w);
-    give_f128(sa);
-    give_f128(sb);
-    give_f128(a);
-    give_f128(bb);
-
-    // ---- Frobenius assist: proves V = Ŵ(ρ).
-    let t = Instant::now();
+    // Linearized coefficients of the (γ-scaled) fold tables: the block-first
+    // transport needs them now; the Frobenius assist below reuses them.
     let coeffs: Vec<Vec<F128>> = rs_results
         .iter()
         .map(|(_, o)| match &o.rs_eq_ind {
@@ -1712,7 +2112,130 @@ pub fn open_batch_merged<Ch: Challenger>(
             _ => unreachable!("checked above"),
         })
         .collect();
-    let fclaims: Vec<FrobeniusClaim<'_>> = x_outers
+
+    let t = std::time::Instant::now();
+    let mut merged_rounds = Vec::with_capacity(dense_log);
+    let mut merged_round_nonces =
+        Vec::with_capacity((grinding.merged_round_bits != 0) as usize * dense_log);
+    let mut rho = Vec::with_capacity(dense_log);
+    let seed_len = 1usize << lig_config.initial_k;
+    let (q_eval, w_eval, seeded_stats) = if let Some(live_cols) =
+        jagged::rectangular_prefix_columns(heights, n_log)
+    {
+        // Block-first transport (docs, "direct transport"): a full-height
+        // column prefix lets the lane-block coordinates be bound first
+        // from O(2^k) block statistics — no 2^m weight vector — and the
+        // row rounds then run on the block-folded pair. The verifier
+        // rotates ρ back into coordinate order under the same predicate.
+        let banks: Vec<std::borrow::Cow<'_, [F128]>> = x_outers
+            .iter()
+            .enumerate()
+            .map(|(i, x)| match column_bitbanks.get(i).copied().flatten() {
+                Some(b) if b.len() == 1usize << (k_cols + LOG_PACKING) => {
+                    std::borrow::Cow::Borrowed(b)
+                }
+                _ => {
+                    if trace {
+                        eprintln!(
+                            "  [open_merged] claim {i}: no column bit-bank supplied, \
+                                 reference fold"
+                        );
+                    }
+                    std::borrow::Cow::Owned(column_bitbank_reference(
+                        &q,
+                        &x[1..1 + n_log],
+                        n_log,
+                        k_cols,
+                    ))
+                }
+            })
+            .collect();
+        let rs: Vec<BlockFirstClaim<'_>> = x_outers
+            .iter()
+            .zip(&coeffs)
+            .zip(&banks)
+            .map(|((x, c), b)| BlockFirstClaim {
+                z_row: &x[1..1 + n_log],
+                z_col: &x[1 + n_log..],
+                coeffs: c,
+                bank: b,
+            })
+            .collect();
+        let (qp, wp) = block_first_phase(
+            &q,
+            n_log,
+            k_cols,
+            live_cols,
+            &rs,
+            &pd_groups,
+            grinding,
+            challenger,
+            &mut merged_rounds,
+            &mut merged_round_nonces,
+            &mut rho,
+            trace,
+        );
+        let (g_one, g_inf) = round_message_pairs(&qp, &wp);
+        let (q_eval, w_eval, _) = merged_sumcheck_rounds(
+            &qp,
+            &wp,
+            qp.len(),
+            g_one,
+            g_inf,
+            usize::MAX,
+            grinding,
+            challenger,
+            &mut merged_rounds,
+            &mut merged_round_nonces,
+            &mut rho,
+        );
+        // Round order → coordinate order: the first k−1 rounds bound the
+        // block coordinates n+1.. of the dense index.
+        rho.rotate_left(k_cols - 1);
+        (q_eval, w_eval, None)
+    } else {
+        // The twisted weight over the dense cube (count-proportional
+        // Φ-pass; zero tail past the jagged area).
+        let (mut w, (u0, u2)) = jagged::build_merged_weight_and_prime(&params, &weight_claims, &q);
+        if trace {
+            eprintln!(
+                "  [open_merged] W build + round-0 prime (2^{} words): {:6.2} ms",
+                dense_log,
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let l = q.len();
+        let area = (params.area() as usize).min(l);
+        let live = area.next_multiple_of(4).clamp(4, l);
+        for slot in &mut w[area..live] {
+            *slot = F128::ZERO;
+        }
+        let out = merged_sumcheck_rounds(
+            &q,
+            &w,
+            live,
+            target + u0,
+            u2,
+            seed_len,
+            grinding,
+            challenger,
+            &mut merged_rounds,
+            &mut merged_round_nonces,
+            &mut rho,
+        );
+        crate::scratch::give_f128(w);
+        out
+    };
+    if trace {
+        eprintln!(
+            "  [open_merged] merged sumcheck ({dense_log} rounds): {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // ---- Frobenius assist: proves V = Ŵ(ρ).
+    let t = std::time::Instant::now();
+    let fclaims: Vec<jagged::FrobeniusClaim<'_>> = x_outers
         .iter()
         .zip(&coeffs)
         .map(|(x, c)| FrobeniusClaim {
@@ -1774,7 +2297,7 @@ pub fn open_batch_merged<Ch: Challenger>(
             )
         },
         || {
-            open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
+            open_batch_mixed_ligerito_seeded(
                 q,
                 prover_data,
                 commitment,
@@ -1784,6 +2307,7 @@ pub fn open_batch_merged<Ch: Challenger>(
                 &PaddingSpec::dense(commitment.params.m),
                 lig_config,
                 grinding,
+                seeded_stats,
                 challenger,
             )
         },
@@ -2173,6 +2697,11 @@ fn verify_batch_merged_core<Ch: Challenger>(
     let t = Instant::now();
     let params = JaggedParams::from_heights(heights, n_log, dense_log);
     let k_cols = params.k;
+    if jagged::rectangular_prefix_columns(heights, n_log).is_some() {
+        // Block-first transport: the prover bound the k−1 block coordinates
+        // first; put ρ back into coordinate order.
+        rho.rotate_left(k_cols - 1);
+    }
     if trace {
         eprintln!(
             "        [vbm] JaggedParams::from_heights (n_log={n_log}, dense_log={dense_log}, k_cols={k_cols}): {}",

@@ -145,6 +145,58 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     }
 }
 
+/// In-place radix-8 (fused-3-layer) rows of one block; `zero_root` selects
+/// the block-0 XOR-only spine. NEON-only entry (the ranked top pass).
+///
+/// # Safety
+/// Row geometry valid; concurrent calls own disjoint row ranges.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_rows(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    row_start: usize,
+    row_end: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+) {
+    // SAFETY: cfg gate guarantees PMULL; caller contract forwarded.
+    unsafe {
+        aarch64::butterfly_fused_3layer_rows(
+            ptr, eighth, num_ntts, row_start, row_end, twiddles, zero_root,
+        )
+    }
+}
+
+/// Rate-1/2 dual-destination from-source radix-8 row (see the aarch64
+/// module comment: staged L1 tiles + non-temporal row bursts). NEON-only.
+///
+/// # Safety
+/// Geometry valid for all three pointers; disjoint row groups; `num_ntts`
+/// even and ≤ 64; `t_zero[0]==t_zero[1]==t_zero[3]==0`.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
+    src: *const F128,
+    dst0: *mut F128,
+    dst1: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    t_zero: &[F128; 7],
+    t_gen: &[F128; 7],
+) {
+    // SAFETY: cfg gate guarantees PMULL; caller contract forwarded.
+    unsafe {
+        aarch64::butterfly_fused_3layer_dual_from_src_row(
+            src, dst0, dst1, eighth, num_ntts, r, t_zero, t_gen,
+        )
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {

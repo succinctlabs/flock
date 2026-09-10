@@ -58,7 +58,14 @@ use {
     target_feature = "vpclmulqdq"
 )))]
 use crate::field::f128_slice::fold_pairs;
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use crate::zerocheck::multilinear::kernels::aarch64::fold_one_row_neon_q_unchecked_8;
+/// The 8-gather row fold, re-exported for the AG skip fold: its `w` tables
+/// have the identical layout (8 x [F128; 256], STRIDE = 256*16), so the same
+/// kernel serves both.
 #[cfg(target_arch = "aarch64")]
+pub(crate) use crate::zerocheck::multilinear::kernels::aarch64::fold_one_row_neon_q_unchecked_8 as fold_row_q_neon;
+#[cfg(all(target_arch = "aarch64", any(test, not(target_feature = "aes"))))]
 use crate::zerocheck::multilinear::kernels::aarch64::fold_one_row_neon_unchecked_8;
 use crate::{
     alloc_uninit_f128_vec,
@@ -649,12 +656,88 @@ where
     let mut p1_acc = F256Unreduced::ZERO;
     let mut pinf_acc = F256Unreduced::ZERO;
 
-    #[cfg(target_arch = "aarch64")]
+    // aarch64 + PMULL: the whole round-2 message chain stays resident in q
+    // registers. The fold returns its accumulator unextracted, the products
+    // use the q-resident multiply, and the eq products feed the wide
+    // accumulator directly — so none of the three per-pair vector/GPR
+    // crossings the extracted form paid (fold extract, scalar field multiply
+    // in/out, re-entry to accumulate) remain. Per pair the only traffic left
+    // is the four required folded-value stores and one eq load.
+    //
+    // Bit-identical to the extracted form: `F128` is `repr(C, align(16))`
+    // `{lo, hi}` and the extraction convention is lane0 -> lo, lane1 -> hi,
+    // so `vst1q_u64` writes exactly the same bytes; reduction is XOR-linear
+    // and the XOR multiset is unchanged.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    unsafe {
+        use crate::field::gf2_128::aarch64::{WideNeon, mul_q, wide_mul_unreduced_q};
+        use core::arch::aarch64::{veorq_u64, vld1q_u64, vreinterpretq_u64_u8, vst1q_u64};
+        let table_ptr = table.data.as_ptr() as *const u8;
+        let a_pkt_ptr = a_packed.as_ptr();
+        let b_pkt_ptr = b_packed.as_ptr();
+        let mut p1_w = WideNeon::zero();
+        let mut pinf_w = WideNeon::zero();
+
+        for pair in ps..pe {
+            let x0l = 2 * (pair - out_base);
+            let x1l = x0l + 1;
+            if is_dead(pair) {
+                kill_pair(a_out, b_out, x0l, x1l, write_dead);
+                continue;
+            }
+            let x0g = 2 * pair;
+            let x1g = x0g + 1;
+
+            let a0 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                table_ptr,
+                a_pkt_ptr.add(x0g * 8),
+            ));
+            let b0 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                table_ptr,
+                b_pkt_ptr.add(x0g * 8),
+            ));
+            let a1 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                table_ptr,
+                a_pkt_ptr.add(x1g * 8),
+            ));
+            let b1 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                table_ptr,
+                b_pkt_ptr.add(x1g * 8),
+            ));
+
+            vst1q_u64(a_out.as_mut_ptr().add(x0l) as *mut u64, a0);
+            vst1q_u64(a_out.as_mut_ptr().add(x1l) as *mut u64, a1);
+            vst1q_u64(b_out.as_mut_ptr().add(x0l) as *mut u64, b0);
+            vst1q_u64(b_out.as_mut_ptr().add(x1l) as *mut u64, b1);
+
+            let eq_q = vld1q_u64(eq_lo.as_ptr().add(pair & lo_mask) as *const u64);
+            p1_w.xor_assign(wide_mul_unreduced_q(eq_q, mul_q(a1, b1)));
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            pinf_w.xor_assign(wide_mul_unreduced_q(eq_q, g_inf));
+        }
+
+        p1_acc ^= p1_w.to_unreduced();
+        pinf_acc ^= pinf_w.to_unreduced();
+    }
+
+    // aarch64 without PMULL: the extracted fold + portable field multiply.
+    // (`gf2_128::aarch64`, which holds the q-resident primitives, is itself
+    // gated on the `aes` feature.)
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
     unsafe {
         let table_ptr = table.data.as_ptr() as *const u8;
         let a_pkt_ptr = a_packed.as_ptr();
         let b_pkt_ptr = b_packed.as_ptr();
 
+        // Deferred reduction IN THE VECTOR FILE. `F256Unreduced` is a
+        // four-word GPR struct: each `mul_unreduced` pays six
+        // `vgetq_lane_u64` extracts to leave the vector registers and each
+        // `^=` is four GPR XORs. `WideNeon` holds the same 256-bit
+        // accumulator as two vector registers — accumulate is two NEON XORs
+        // with no extracts, and the extracts are paid ONCE on the way out.
+        // Bit-identical: reduction is XOR-linear and the XOR multiset is
+        // unchanged. (The x86 arm below already accumulates wide via
+        // `WideGhashX4`; aarch64 had been left on the scalar struct.)
         for pair in ps..pe {
             let x0l = 2 * (pair - out_base);
             let x1l = x0l + 1;
@@ -678,10 +761,8 @@ where
             b_out[x1l] = b1;
 
             let eq_l = eq_lo[pair & lo_mask];
-            let g1 = a1 * b1;
-            p1_acc ^= eq_l.mul_unreduced(g1);
-            let g_inf = (a0 + a1) * (b0 + b1);
-            pinf_acc ^= eq_l.mul_unreduced(g_inf);
+            p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+            pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
         }
     }
     #[cfg(all(
@@ -1150,7 +1231,14 @@ pub fn fold_in_place_single(a: &mut Vec<F128>, challenge: F128) {
 pub fn fold_in_place_pair(a: &mut Vec<F128>, b: &mut Vec<F128>, challenge: F128) {
     let n = a.len();
     assert_eq!(b.len(), n);
-    assert!(n.is_power_of_two() && n >= 2);
+    // Any EVEN length folds exactly — the sparse tail resolves a deferred
+    // lookahead challenge on its compact live PREFIX, which is a multiple of
+    // the chunk-column width but not a power of two. Power-of-two callers are
+    // unchanged.
+    assert!(
+        n.is_multiple_of(2) && n >= 2,
+        "fold_in_place_pair needs an even length ≥ 2"
+    );
     let half = n / 2;
     for x in 0..half {
         let a0 = a[2 * x];
@@ -1834,12 +1922,25 @@ pub fn lookahead_msg_second(q: &LookaheadSums, rho: F128) -> (F128, F128) {
     )
 }
 
-/// The 8 per-position Q products from the 4 folded values per witness
-/// (index = x + 2y): [s10, sinf0, c0, t11, c2, d0, dt, d2] — see the module
-/// comment for which sum each feeds.
+/// Per-position Q contribution — the 8 products from the 4 folded values per
+/// witness (index = x + 2y): [s10, sinf0, c0, t11, c2, d0, dt, d2], see the
+/// module comment for which sum each feeds — eq-weighted into the 8 unreduced
+/// accumulators.
+///
+/// ONE SCALING PER ROW: the four `a` values are pre-scaled by `eq` with four
+/// REDUCED multiplies, and each of the eight products is then a single
+/// UNREDUCED multiply that already carries the weight — 12 multiplies per
+/// position against the 16 of "8 reduced products, then 8 unreduced eq
+/// weightings". Exact: every product is bilinear, so `(eq·a)·b = eq·(a·b)` in
+/// the field, and the unreduced accumulators reduce to the same sums.
 #[inline(always)]
-pub(crate) fn lookahead_products(ga: &[F128; 4], gb: &[F128; 4]) -> [F128; 8] {
-    let (ga00, ga10, ga01, ga11) = (ga[0], ga[1], ga[2], ga[3]);
+pub(crate) fn lookahead_accum(
+    ga: &[F128; 4],
+    gb: &[F128; 4],
+    eq: F128,
+    acc: &mut [F256Unreduced; 8],
+) {
+    let (ga00, ga10, ga01, ga11) = (eq * ga[0], eq * ga[1], eq * ga[2], eq * ga[3]);
     let (gb00, gb10, gb01, gb11) = (gb[0], gb[1], gb[2], gb[3]);
     let sxa0 = ga00 + ga10;
     let sxb0 = gb00 + gb10;
@@ -1849,25 +1950,14 @@ pub(crate) fn lookahead_products(ga: &[F128; 4], gb: &[F128; 4]) -> [F128; 8] {
     let dcb = gb00 + gb01;
     let dsa = sxa0 + sxa1;
     let dsb = sxb0 + sxb1;
-    [
-        ga10 * gb10,               // s10
-        sxa0 * sxb0,               // sinf0
-        ga01 * gb01,               // col1 c0
-        ga11 * gb11,               // col1 @ X=1
-        sxa1 * sxb1,               // col1 c2
-        dca * dcb,                 // col∞ c0
-        (dca + dsa) * (dcb + dsb), // col∞ @ X=1
-        dsa * dsb,                 // col∞ c2
-    ]
-}
-
-/// Per-position Q contribution, eq-weighted into the 8 unreduced accumulators.
-#[inline(always)]
-fn lookahead_accum(ga: &[F128; 4], gb: &[F128; 4], eq: F128, acc: &mut [F256Unreduced; 8]) {
-    let p = lookahead_products(ga, gb);
-    for k in 0..8 {
-        acc[k] ^= eq.mul_unreduced(p[k]);
-    }
+    acc[0] ^= ga10.mul_unreduced(gb10); // s10
+    acc[1] ^= sxa0.mul_unreduced(sxb0); // sinf0
+    acc[2] ^= ga01.mul_unreduced(gb01); // col1 c0
+    acc[3] ^= ga11.mul_unreduced(gb11); // col1 @ X=1
+    acc[4] ^= sxa1.mul_unreduced(sxb1); // col1 c2
+    acc[5] ^= dca.mul_unreduced(dcb); // col∞ c0
+    acc[6] ^= (dca + dsa).mul_unreduced(dcb + dsb); // col∞ @ X=1
+    acc[7] ^= dsa.mul_unreduced(dsb); // col∞ c2
 }
 
 pub(crate) fn lookahead_finish(s: [F128; 8]) -> LookaheadSums {
@@ -1886,7 +1976,16 @@ macro_rules! lookahead_pass {
         /// Writes the folded arrays into `a_out`/`b_out` and returns the 8
         /// lookahead sums over the next two variables. `r_y` is the eq coord of
         /// the SECOND lookahead variable; `rest` the coords after it
-        /// (`rest.len() == log2(out_len/4)`). Parallel over the eq-hi chunks.
+        /// (`rest.len() == log2(DOMAIN/4)` where DOMAIN is the full logical
+        /// output domain). Parallel over the eq-hi chunks.
+        ///
+        /// `a` may be a PREFIX of the full domain (`a.len() <= PER_U <<
+        /// rest.len()`, a multiple of `PER_U`): the eq tables are sized from
+        /// `rest`, every position is weighted by its own global index, and
+        /// only the present positions are visited — so on a live-prefix layout
+        /// (the sparse tail's single interval) the sums are exactly the full
+        /// domain's with the dead suffix at zero, and the outputs are the dense
+        /// outputs' prefix. Full-domain callers are unchanged.
         pub fn $name(
             a: &[F128],
             b: &[F128],
@@ -1901,10 +2000,9 @@ macro_rules! lookahead_pass {
             assert_eq!(a.len() % PER_U, 0);
             assert_eq!(a_out.len(), 4 * n_u);
             assert_eq!(b_out.len(), 4 * n_u);
-            assert_eq!(
-                1usize << rest.len(),
-                n_u,
-                "rest coords must cover log2(len/{PER_U})"
+            assert!(
+                n_u <= 1usize << rest.len(),
+                "rest coords must cover log2(domain/{PER_U}); got a prefix longer than the domain"
             );
             let n_lo = rest.len() / 2;
             let eq_lo = build_eq(&rest[..n_lo]);
@@ -1918,7 +2016,8 @@ macro_rules! lookahead_pass {
                 .map(|(u_hi, (ao, bo))| {
                     let mut acc = [F256Unreduced::ZERO; 8];
                     let base_u = u_hi * lo_size;
-                    for u_lo in 0..lo_size {
+                    // A prefix's last chunk may be partial.
+                    for u_lo in 0..ao.len() / 4 {
                         let u = base_u + u_lo;
                         let mut ga = [F128::ZERO; 4];
                         let mut gb = [F128::ZERO; 4];
@@ -1998,6 +2097,1032 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Round-2 fused fold with integrated LOOKAHEAD: like
+/// [`uni_skip_fold_and_round_pair_optimized_packed_padded`], but instead of
+/// the round-2 message pair it returns the eight lookahead sums over the two
+/// upcoming variables. The caller derives BOTH round 2's message
+/// (`lookahead_msg_first(q, mlv_challenges[1])` — algebraically identical to
+/// the classic return) and round 3's (`lookahead_msg_second(q, ρ₁)`) with
+/// zero further data passes, so every tail pass can fold TWO variables
+/// (4→1, [`fold2_lookahead_into`]) and no intermediate tail state ever
+/// touches DRAM. The transcript is unchanged.
+///
+/// Costs the extra lookahead products here (8 per four outputs, replacing
+/// the classic message's 4) to delete the tail's `fold1` entry pass — the
+/// largest tail pass, which saves no traffic and pays the same product bill.
+///
+/// aarch64-NEON + scalar arms only (no AVX-512 arm) — gate callers on
+/// aarch64, where the classic kernel's shape is matched. Requires
+/// `lo_size ≥ 2` even (caller gates on instance size).
+pub fn uni_skip_fold_and_round_pair_lookahead_packed_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, LookaheadSums) {
+    use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+
+    assert_eq!(k_skip, 6, "lookahead round-2 variant is k_skip=6 only");
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+
+    let mut a_folded: Vec<F128> = crate::scratch::take_f128(n_out);
+    let mut b_folded: Vec<F128> = crate::scratch::take_f128(n_out);
+
+    let eq = SplitEqGhash::new(&mlv_challenges[1..]);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n_out);
+    assert!(
+        eq.n_lo >= 1 && lo_size >= 2,
+        "lookahead round-2 needs an even pair count per chunk"
+    );
+
+    // Lookahead group = two consecutive pairs (four outputs). Group index =
+    // pair index >> 1, so the group-lo coords drop the lowest pair coord
+    // (`mlv_challenges[1]`, which becomes the Y column weight applied by
+    // `lookahead_msg_first`) and the group-hi coords are exactly `eq.hi`.
+    let eq_la_lo = crate::zerocheck::univariate_skip::build_eq(&mlv_challenges[2..1 + eq.n_lo]);
+    debug_assert_eq!(eq_la_lo.len(), lo_size / 2);
+
+    let chunk_size = 2 * lo_size;
+    let eq_hi = &eq.hi;
+    let run = padding
+        .as_single_run()
+        .expect("integrated-lookahead / compact round 2 serve single-run padding only");
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(&run, k_skip);
+
+    // Per-x_hi body: fold one chunk (writing every slot) and return this
+    // chunk's eight raw lookahead sums, eq_hi-weighted. Exact XOR merge.
+    let chunk_body = |x_hi: usize, a_chunk: &mut [F128], b_chunk: &mut [F128]| -> [F128; 8] {
+        let pair_idx_base = x_hi * lo_size;
+
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        // SAFETY: `aes` by the cfg; row offsets bounded by the length asserts
+        // above (same access pattern as the classic kernel).
+        let sums8 = unsafe {
+            use crate::field::gf2_128::aarch64::{WideNeon, mul_q, wide_mul_unreduced_q};
+            use core::arch::aarch64::{vdupq_n_u64, veorq_u64, vld1q_u64, vst1q_u8};
+
+            let table_ptr = table.data.as_ptr() as *const u8;
+            let a_pkt_ptr = a_packed.as_ptr();
+            let b_pkt_ptr = b_packed.as_ptr();
+            let base = x_hi * chunk_size;
+            let zero_q = vdupq_n_u64(0);
+
+            let mut acc = [
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+            ];
+
+            // SWEEP 1 — fold + store only, the classic kernel's register
+            // budget (gather state, no live accumulators). Padded pairs
+            // write zeros, so sweep 2 can run unconditionally (0·x = 0
+            // keeps every sum exact).
+            let _ = zero_q;
+            for x_lo in 0..lo_size {
+                let x0l = 2 * x_lo;
+                let x1l = x0l + 1;
+                if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                    a_chunk[x0l] = F128::ZERO;
+                    a_chunk[x1l] = F128::ZERO;
+                    b_chunk[x0l] = F128::ZERO;
+                    b_chunk[x1l] = F128::ZERO;
+                    continue;
+                }
+                let x0g = base + x0l;
+                let x1g = x0g + 1;
+                let a0 = fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
+                let b0 = fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
+                let a1 = fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
+                let b1 = fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
+                vst1q_u8(a_chunk.as_mut_ptr().add(x0l) as *mut u8, a0);
+                vst1q_u8(a_chunk.as_mut_ptr().add(x1l) as *mut u8, a1);
+                vst1q_u8(b_chunk.as_mut_ptr().add(x0l) as *mut u8, b0);
+                vst1q_u8(b_chunk.as_mut_ptr().add(x1l) as *mut u8, b1);
+            }
+
+            // SWEEP 2 — the eight lookahead products over the just-written
+            // chunk (L2-resident: ~256 KB per worker), with the full vector
+            // register file available. Fusing this into sweep 1 was measured
+            // +16 ms at m=32: 8 wide accumulators + 8 group values + the
+            // gather state spill hard.
+            let acp = a_chunk.as_ptr() as *const u64;
+            let bcp = b_chunk.as_ptr() as *const u64;
+            for g in 0..lo_size / 2 {
+                let o = 4 * g;
+                let ga0 = vld1q_u64(acp.add(2 * o));
+                let ga1 = vld1q_u64(acp.add(2 * o + 2));
+                let ga2 = vld1q_u64(acp.add(2 * o + 4));
+                let ga3 = vld1q_u64(acp.add(2 * o + 6));
+                let gb0 = vld1q_u64(bcp.add(2 * o));
+                let gb1 = vld1q_u64(bcp.add(2 * o + 2));
+                let gb2 = vld1q_u64(bcp.add(2 * o + 4));
+                let gb3 = vld1q_u64(bcp.add(2 * o + 6));
+                // One weight per group (idea from the challenge tree's
+                // compact-r2 kernel): all eight products share this group's
+                // weight, so pre-scale the four a-rows once (4 reduced muls)
+                // and every product becomes a SINGLE unreduced multiply —
+                // 52 PMULL/group vs 72 for weight-per-product. Exact: each
+                // accumulated term reduces to the same field value
+                // (w·(x·y) = (w·x)·y), pinned by the transcript-identity
+                // test. Product indices match `lookahead_products`.
+                let eq_arr = [eq_la_lo[g].lo, eq_la_lo[g].hi];
+                let w = vld1q_u64(eq_arr.as_ptr());
+                let wa0 = mul_q(w, ga0);
+                let wa1 = mul_q(w, ga1);
+                let wa2 = mul_q(w, ga2);
+                let wa3 = mul_q(w, ga3);
+                let wsxa0 = veorq_u64(wa0, wa1);
+                let wsxa1 = veorq_u64(wa2, wa3);
+                let wdca = veorq_u64(wa0, wa2);
+                let wdsa = veorq_u64(wsxa0, wsxa1);
+                let sxb0 = veorq_u64(gb0, gb1);
+                let sxb1 = veorq_u64(gb2, gb3);
+                let dcb = veorq_u64(gb0, gb2);
+                let dsb = veorq_u64(sxb0, sxb1);
+                acc[0].xor_assign(wide_mul_unreduced_q(wa1, gb1));
+                acc[1].xor_assign(wide_mul_unreduced_q(wsxa0, sxb0));
+                acc[2].xor_assign(wide_mul_unreduced_q(wa2, gb2));
+                acc[3].xor_assign(wide_mul_unreduced_q(wa3, gb3));
+                acc[4].xor_assign(wide_mul_unreduced_q(wsxa1, sxb1));
+                acc[5].xor_assign(wide_mul_unreduced_q(wdca, dcb));
+                acc[6].xor_assign(wide_mul_unreduced_q(
+                    veorq_u64(wdca, wdsa),
+                    veorq_u64(dcb, dsb),
+                ));
+                acc[7].xor_assign(wide_mul_unreduced_q(wdsa, dsb));
+            }
+            [
+                acc[0].reduce(),
+                acc[1].reduce(),
+                acc[2].reduce(),
+                acc[3].reduce(),
+                acc[4].reduce(),
+                acc[5].reduce(),
+                acc[6].reduce(),
+                acc[7].reduce(),
+            ]
+        };
+
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        let sums8 = {
+            let base = x_hi * chunk_size;
+            let mut acc = [F256Unreduced::ZERO; 8];
+            for g in 0..lo_size / 2 {
+                let mut ga = [F128::ZERO; 4];
+                let mut gb = [F128::ZERO; 4];
+                let mut any = false;
+                for p in 0..2usize {
+                    let x_lo = 2 * g + p;
+                    let x0l = 2 * x_lo;
+                    let x1l = x0l + 1;
+                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                        a_chunk[x0l] = F128::ZERO;
+                        a_chunk[x1l] = F128::ZERO;
+                        b_chunk[x0l] = F128::ZERO;
+                        b_chunk[x1l] = F128::ZERO;
+                        continue;
+                    }
+                    any = true;
+                    let x0g = base + x0l;
+                    let x1g = x0g + 1;
+                    ga[2 * p] = table.fold_one_row(&a_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+                    ga[2 * p + 1] =
+                        table.fold_one_row(&a_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+                    gb[2 * p] = table.fold_one_row(&b_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+                    gb[2 * p + 1] =
+                        table.fold_one_row(&b_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+                    a_chunk[x0l] = ga[2 * p];
+                    a_chunk[x1l] = ga[2 * p + 1];
+                    b_chunk[x0l] = gb[2 * p];
+                    b_chunk[x1l] = gb[2 * p + 1];
+                }
+                if !any {
+                    continue;
+                }
+                lookahead_accum(&ga, &gb, eq_la_lo[g], &mut acc);
+            }
+            let mut out = [F128::ZERO; 8];
+            for k in 0..8 {
+                out[k] = acc[k].reduce();
+            }
+            out
+        };
+
+        let eh = eq_hi[x_hi];
+        let mut out = [F128::ZERO; 8];
+        for k in 0..8 {
+            out[k] = eh * sums8[k];
+        }
+        out
+    };
+
+    let sums = a_folded
+        .par_chunks_mut(chunk_size)
+        .zip(b_folded.par_chunks_mut(chunk_size))
+        .enumerate()
+        .map(|(x_hi, (a_chunk, b_chunk))| chunk_body(x_hi, a_chunk, b_chunk))
+        .reduce(
+            || [F128::ZERO; 8],
+            |mut p, q| {
+                for k in 0..8 {
+                    p[k] += q[k];
+                }
+                p
+            },
+        );
+
+    (a_folded, b_folded, lookahead_finish(sums))
+}
+
+// ---------------------------------------------------------------------------
+// Compact round-2 state (variant K, idea from the challenge tree): the
+// round-2 sweep stores, per adjacent post-URM row pair, the folded even-row
+// ANCHOR plus the raw packed-byte XOR of the pair (the delta stays in the
+// bit domain). Fold linearity over F2 gives
+//
+//   fold(row0) + rho·(fold(row0)+fold(row1)) = anchor + fold_rho(delta),
+//
+// with `fold_rho` the ordinary 32 KiB byte table scaled by rho once — so the
+// consumer binds challenges through table lookups instead of per-output
+// multiplies, and the intermediate state is 48 bytes per A/B pair instead of
+// 64. The same sweep accumulates round 3's message as six deferred
+// coefficients (a quadratic in the not-yet-sampled rho1): the products are
+// parity-split over pair index, and `eq2(2y+1) = r1·eq3(y)` makes the odd
+// halves exactly the round-3 aggregates after one r1 division.
+// ---------------------------------------------------------------------------
+
+/// Compact round-2 output: interleaved `[a_anchor, b_anchor]` per pair plus
+/// interleaved `[delta_a; 8], [delta_b; 8]` packed bytes per pair.
+pub struct UniSkipCompactFold {
+    pub anchors: Vec<F128>,
+    pub deltas: Vec<u8>,
+}
+
+impl UniSkipCompactFold {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.anchors.len() / 2
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.anchors.is_empty()
+    }
+    /// Return both buffers to the scratch pools.
+    pub fn recycle(self) {
+        crate::scratch::give_f128(self.anchors);
+        crate::scratch::give_u8(self.deltas);
+    }
+}
+
+/// Six deferred quadratic coefficients: a round message
+/// `(c0 + c1·rho + c2·rho², c3 + c4·rho + c5·rho²)` in a challenge sampled
+/// AFTER the pass that accumulated them. Round-agnostic (rounds 3 and 5 use
+/// the same shape).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeferredRoundMsg {
+    pub c: [F128; 6],
+}
+
+/// Evaluate a deferred message at the sampled challenge.
+#[inline]
+pub fn eval_deferred_round_msg(la: &DeferredRoundMsg, rho: F128) -> (F128, F128) {
+    let rho_sq = rho * rho;
+    (
+        la.c[0] + la.c[1] * rho + la.c[2] * rho_sq,
+        la.c[3] + la.c[4] * rho + la.c[5] * rho_sq,
+    )
+}
+
+/// Assemble the six deferred coefficients from the parity aggregates:
+/// `[w0, w1, w2]` are the odd-pair `a·b`, sibling `a·b`, and cross sums for
+/// the `G(1)` line, `[w3, w4, w5]` the even/odd/cross sums for the `G(inf)`
+/// line. `A(rho)B(rho)` expands to `[w0, w0+w1+w2, w2]` in char 2.
+#[inline]
+fn deferred_msg_from_w(w: [F128; 6]) -> DeferredRoundMsg {
+    DeferredRoundMsg {
+        c: [
+            w[0],
+            w[0] + w[1] + w[2],
+            w[2],
+            w[3],
+            w[3] + w[4] + w[5],
+            w[5],
+        ],
+    }
+}
+
+impl UniSkipFoldTable {
+    /// The fold table with every entry scaled by `rho`: `fold_rho(bytes) =
+    /// rho · fold(bytes)` by F2-linearity of the table decomposition.
+    pub fn scaled_linear(&self, rho: F128) -> Vec<F128> {
+        self.data.iter().map(|&v| rho * v).collect()
+    }
+}
+
+/// One compact round-2 chunk, architecture-dispatched. NEON arm: q-resident
+/// folds (no GPR round trips), deltas as two u64 XORs per pair straight from
+/// the packed rows, products in eight wide unreduced accumulators — ONE
+/// sweep where the incumbent lookahead round-2 needs a fold sweep plus an
+/// L2 re-read products sweep. Values are bit-identical to the scalar
+/// reference (exact field ops, order-free sums, linear reduction).
+#[allow(clippy::too_many_arguments)]
+fn round2_compact_chunk(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    anchors: &mut [F128],
+    deltas: &mut [u8],
+    eq_lo: &[F128],
+    lo_size: usize,
+    row_base: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> [F128; 8] {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: `aes` by the cfg; offsets bounded by the caller's length
+    // asserts (same access pattern as the incumbent round-2 kernel).
+    unsafe {
+        use crate::field::gf2_128::aarch64::{WideNeon, mul_q, wide_mul_unreduced_q};
+        use core::arch::aarch64::{
+            uint64x2_t, vdupq_n_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vreinterpretq_u64_u8,
+            vst1q_u64,
+        };
+
+        let table_ptr = table.data.as_ptr() as *const u8;
+        let a_pkt = a_packed.as_ptr();
+        let b_pkt = b_packed.as_ptr();
+        let anchors_ptr = anchors.as_mut_ptr();
+        let deltas_ptr = deltas.as_mut_ptr();
+        let zero = vdupq_n_u64(0);
+        // Degenerate-b fast path (idea from the challenge tree): an all-ones
+        // packed b row folds to fold(0xFF..) for ANY table, so a pair with
+        // both b rows all-ones skips its 16 b-table lookups, stores b_ones as
+        // the anchor and 0 as the b delta, and its G(∞) term is provably
+        // zero (b0+b1 = 0). When fold(0xFF..) == 1 (the common case — the
+        // Lagrange weights sum to one), a fully degenerate group also drops
+        // the three e/o aggregates (e_b = o_b = 0). Value-preserving, not an
+        // approximation.
+        let ones_row = [0xFFu8; 8];
+        let b_ones = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+            table_ptr,
+            ones_row.as_ptr(),
+        ));
+        let one_val = F128::ONE;
+        let one_q = vld1q_u64((&raw const one_val).cast::<u64>());
+        let ones_is_one = {
+            let d = veorq_u64(b_ones, one_q);
+            (vgetq_lane_u64::<0>(d) | vgetq_lane_u64::<1>(d)) == 0
+        };
+
+        let mut acc = [
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+        ];
+
+        for u in 0..lo_size / 2 {
+            let pe = 2 * u;
+            let po = pe + 1;
+            let even_ok = ((pair_idx_base + pe) & pair_in_block_mask) < useful_pairs_inclusive;
+            let odd_ok = ((pair_idx_base + po) & pair_in_block_mask) < useful_pairs_inclusive;
+
+            // Per pair: fold rows, store anchor + one 16 B delta vector.
+            // Returns (a0, a1, b0, b1, deg): deg pairs skip their b folds
+            // (b0 = b1 = b_ones, delta_b = 0).
+            let do_pair = |p: usize,
+                           ok: bool|
+             -> (uint64x2_t, uint64x2_t, uint64x2_t, uint64x2_t, bool) {
+                if !ok {
+                    vst1q_u64(anchors_ptr.add(2 * p).cast::<u64>(), zero);
+                    vst1q_u64(anchors_ptr.add(2 * p + 1).cast::<u64>(), zero);
+                    vst1q_u64(deltas_ptr.add(16 * p).cast::<u64>(), zero);
+                    return (zero, zero, zero, zero, false);
+                }
+                let x0g = row_base + 2 * p;
+                let x1g = x0g + 1;
+                let a0_code = (a_pkt.add(x0g * 8) as *const u64).read_unaligned();
+                let a1_code = (a_pkt.add(x1g * 8) as *const u64).read_unaligned();
+                let b0_code = (b_pkt.add(x0g * 8) as *const u64).read_unaligned();
+                let b1_code = (b_pkt.add(x1g * 8) as *const u64).read_unaligned();
+                let a0 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                    table_ptr,
+                    a_pkt.add(x0g * 8),
+                ));
+                let a1 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                    table_ptr,
+                    a_pkt.add(x1g * 8),
+                ));
+                if (b0_code & b1_code) == u64::MAX {
+                    vst1q_u64(anchors_ptr.add(2 * p).cast::<u64>(), a0);
+                    vst1q_u64(anchors_ptr.add(2 * p + 1).cast::<u64>(), b_ones);
+                    let dv = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
+                    vst1q_u64(deltas_ptr.add(16 * p).cast::<u64>(), dv);
+                    return (a0, a1, b_ones, b_ones, true);
+                }
+                let b0 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                    table_ptr,
+                    b_pkt.add(x0g * 8),
+                ));
+                let b1 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(
+                    table_ptr,
+                    b_pkt.add(x1g * 8),
+                ));
+                vst1q_u64(anchors_ptr.add(2 * p).cast::<u64>(), a0);
+                vst1q_u64(anchors_ptr.add(2 * p + 1).cast::<u64>(), b0);
+                let dv = core::mem::transmute::<[u64; 2], uint64x2_t>([
+                    a0_code ^ a1_code,
+                    b0_code ^ b1_code,
+                ]);
+                vst1q_u64(deltas_ptr.add(16 * p).cast::<u64>(), dv);
+                (a0, a1, b0, b1, false)
+            };
+
+            let (a0, a1, b0, b1, deg0) = do_pair(pe, even_ok);
+            let (a2, a3, b2, b3, deg1) = do_pair(po, odd_ok);
+            if !even_ok && !odd_ok {
+                continue;
+            }
+
+            let wt = vld1q_u64((&raw const eq_lo[po]).cast::<u64>());
+            if deg0 && deg1 && ones_is_one {
+                // b ≡ 1 across the group: every surviving product is wt·a_i;
+                // the G(∞) chains and the three e/o aggregates are exactly
+                // zero (b0+b1 = b2+b3 = e_b = o_b = 0).
+                acc[0].xor_assign(wide_mul_unreduced_q(wt, a1));
+                acc[2].xor_assign(wide_mul_unreduced_q(wt, a3));
+                acc[4].xor_assign(wide_mul_unreduced_q(wt, a2));
+                continue;
+            }
+            let a0w = mul_q(a0, wt);
+            let a1w = mul_q(a1, wt);
+            let a2w = mul_q(a2, wt);
+            let a3w = mul_q(a3, wt);
+            // Padded halves contribute exact zeros (0·x = 0); degenerate
+            // pairs' G(∞) terms carry a provably-zero (b0+b1) factor.
+            acc[0].xor_assign(wide_mul_unreduced_q(a1w, b1));
+            if !deg0 {
+                acc[1].xor_assign(wide_mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)));
+            }
+            acc[2].xor_assign(wide_mul_unreduced_q(a3w, b3));
+            if !deg1 {
+                acc[3].xor_assign(wide_mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)));
+            }
+            acc[4].xor_assign(wide_mul_unreduced_q(a2w, b2));
+            let e_aw = veorq_u64(a0w, a2w);
+            let e_b = veorq_u64(b0, b2);
+            let o_aw = veorq_u64(a1w, a3w);
+            let o_b = veorq_u64(b1, b3);
+            acc[5].xor_assign(wide_mul_unreduced_q(e_aw, e_b));
+            acc[6].xor_assign(wide_mul_unreduced_q(o_aw, o_b));
+            acc[7].xor_assign(wide_mul_unreduced_q(
+                veorq_u64(e_aw, o_aw),
+                veorq_u64(e_b, o_b),
+            ));
+        }
+
+        [
+            acc[0].reduce(),
+            acc[1].reduce(),
+            acc[2].reduce(),
+            acc[3].reduce(),
+            acc[4].reduce(),
+            acc[5].reduce(),
+            acc[6].reduce(),
+            acc[7].reduce(),
+        ]
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    round2_compact_chunk_scalar(
+        a_packed,
+        b_packed,
+        table,
+        anchors,
+        deltas,
+        eq_lo,
+        lo_size,
+        row_base,
+        pair_idx_base,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+    )
+}
+
+/// One compact round-2 chunk: fold + compact stores + the ten parity-split
+/// products per group of two pairs. Slot order in the return:
+/// `[p1_even, pinf_even, p1_odd, pinf_odd, W_a2b2, W_e, W_o, W_eo]` — the
+/// last six (from p1_odd on) are the round-3 aggregates on the odd lane's
+/// weight. Portable reference; the NEON arm must match it bit for bit.
+#[cfg_attr(all(target_arch = "aarch64", target_feature = "aes"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn round2_compact_chunk_scalar(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    anchors: &mut [F128],
+    deltas: &mut [u8],
+    eq_lo: &[F128],
+    lo_size: usize,
+    row_base: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> [F128; 8] {
+    let n_chunks = table.n_chunks;
+    let mut p1_even = F256Unreduced::ZERO;
+    let mut pinf_even = F256Unreduced::ZERO;
+    let mut p1_odd = F256Unreduced::ZERO;
+    let mut pinf_odd = F256Unreduced::ZERO;
+    let mut w = [F256Unreduced::ZERO; 4];
+
+    let fold_pair = |x_lo: usize,
+                     anchors: &mut [F128],
+                     deltas: &mut [u8]|
+     -> Option<(F128, F128, F128, F128)> {
+        if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+            anchors[2 * x_lo] = F128::ZERO;
+            anchors[2 * x_lo + 1] = F128::ZERO;
+            deltas[2 * x_lo * n_chunks..2 * (x_lo + 1) * n_chunks].fill(0);
+            return None;
+        }
+        let x0g = row_base + 2 * x_lo;
+        let x1g = x0g + 1;
+        let a0_bytes = &a_packed[x0g * n_chunks..(x0g + 1) * n_chunks];
+        let a1_bytes = &a_packed[x1g * n_chunks..(x1g + 1) * n_chunks];
+        let b0_bytes = &b_packed[x0g * n_chunks..(x0g + 1) * n_chunks];
+        let b1_bytes = &b_packed[x1g * n_chunks..(x1g + 1) * n_chunks];
+        let a0 = table.fold_one_row(a0_bytes);
+        let a1 = table.fold_one_row(a1_bytes);
+        let b0 = table.fold_one_row(b0_bytes);
+        let b1 = table.fold_one_row(b1_bytes);
+        anchors[2 * x_lo] = a0;
+        anchors[2 * x_lo + 1] = b0;
+        for j in 0..n_chunks {
+            deltas[2 * x_lo * n_chunks + j] = a0_bytes[j] ^ a1_bytes[j];
+            deltas[(2 * x_lo + 1) * n_chunks + j] = b0_bytes[j] ^ b1_bytes[j];
+        }
+        Some((a0, a1, b0, b1))
+    };
+
+    for u in 0..lo_size / 2 {
+        let even = fold_pair(2 * u, anchors, deltas);
+        let odd = fold_pair(2 * u + 1, anchors, deltas);
+        if even.is_none() && odd.is_none() {
+            continue;
+        }
+        let (a0, a1, b0, b1) = even.unwrap_or((F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO));
+        let (a2, a3, b2, b3) = odd.unwrap_or((F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO));
+        // One weight per group: the odd lane (`eq2(2u+1) = r1·eq3(u)`).
+        let wt = eq_lo[2 * u + 1];
+        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+        if even.is_some() {
+            p1_even ^= a1w.mul_unreduced(b1);
+            pinf_even ^= (a0w + a1w).mul_unreduced(b0 + b1);
+        }
+        if odd.is_some() {
+            p1_odd ^= a3w.mul_unreduced(b3);
+            pinf_odd ^= (a2w + a3w).mul_unreduced(b2 + b3);
+            w[0] ^= a2w.mul_unreduced(b2);
+        }
+        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+        w[1] ^= e_aw.mul_unreduced(e_b);
+        w[2] ^= o_aw.mul_unreduced(o_b);
+        w[3] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+    }
+
+    [
+        p1_even.reduce(),
+        pinf_even.reduce(),
+        p1_odd.reduce(),
+        pinf_odd.reduce(),
+        w[0].reduce(),
+        w[1].reduce(),
+        w[2].reduce(),
+        w[3].reduce(),
+    ]
+}
+
+/// Compact round-2 producer: one sweep over the packed rows yields the
+/// compact state, round 2's wire message, AND round 3's message as a
+/// deferred quadratic in rho1 — no second products sweep (the parity split
+/// replaces the eight-sum lookahead re-read) and 48 instead of 64 stored
+/// bytes per pair. Wire values are identical to the incumbent route (exact
+/// F128, pure reassociation). Requires `mlv_challenges[1] != 0` (the parity
+/// unscaling divides by it); the caller gates and falls back.
+#[allow(clippy::too_many_arguments)]
+pub fn uni_skip_fold_round23_compact_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (UniSkipCompactFold, F128, F128, DeferredRoundMsg) {
+    use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+    assert_eq!(k_skip, 6, "compact round-2 variant is k_skip=6 only");
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    let n_pairs = n_out / 2;
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+    let r1 = mlv_challenges[1];
+    assert_ne!(
+        r1,
+        F128::ZERO,
+        "compact round-2 requires nonzero r[k_skip+1]"
+    );
+
+    let mut anchors = crate::scratch::take_f128(2 * n_pairs);
+    let mut deltas = crate::scratch::take_u8(2 * n_pairs * n_chunks);
+
+    // Clamp so the lo half keeps at least one variable: the sweep consumes
+    // pairs two at a time (one deferred-round group) inside a chunk.
+    let n_vars = mlv_challenges.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(
+        &mlv_challenges[1..],
+        SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(1)),
+    );
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size, n_pairs);
+    assert!(lo_size >= 2, "compact sweep pairs two x_lo per group");
+    // `eq2(2y) = (1+r1)·eq3(y)` and `eq2(2y+1) = r1·eq3(y)`: the sweep uses
+    // the odd lane as the group weight; κ restores the even lane's scale.
+    let kappa = (F128::ONE + r1) * r1.inv();
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let anchor_chunk = 2 * lo_size;
+    let delta_chunk = 2 * lo_size * n_chunks;
+    let run = padding
+        .as_single_run()
+        .expect("integrated-lookahead / compact round 2 serve single-run padding only");
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(&run, k_skip);
+
+    let (sum1, sum_inf, agg) = anchors
+        .par_chunks_mut(anchor_chunk)
+        .zip(deltas.par_chunks_mut(delta_chunk))
+        .enumerate()
+        .map(|(x_hi, (anchors_c, deltas_c))| {
+            let pair_idx_base = x_hi * lo_size;
+            let out = round2_compact_chunk(
+                a_packed,
+                b_packed,
+                table,
+                anchors_c,
+                deltas_c,
+                eq_lo,
+                lo_size,
+                pair_idx_base * 2,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+            );
+            let eq_h = eq_hi[x_hi];
+            (
+                eq_h * (kappa * out[0] + out[2]),
+                eq_h * (kappa * out[1] + out[3]),
+                [
+                    eq_h * out[2],
+                    eq_h * out[3],
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ],
+            )
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+            |(s1, si, mut wa), (c1, ci, wb)| {
+                for (a, v) in wa.iter_mut().zip(wb.iter()) {
+                    *a += *v;
+                }
+                (s1 + c1, si + ci, wa)
+            },
+        );
+
+    // Every aggregate rode the odd lane's weight `r1·eq3`; one division puts
+    // all six back on `eq3`. Slot order: [p1_odd, pinf_odd, W_a2b2, W_e,
+    // W_o, W_eo] -> deferred [w0..w5] = [a2b2, p1_odd, pinf_odd, W_e, W_o,
+    // W_eo] per the expansion in `deferred_msg_from_w`.
+    let r1_inv = r1.inv();
+    let la = deferred_msg_from_w([
+        r1_inv * agg[2],
+        r1_inv * agg[0],
+        r1_inv * agg[1],
+        r1_inv * agg[3],
+        r1_inv * agg[4],
+        r1_inv * agg[5],
+    ]);
+
+    (
+        UniSkipCompactFold { anchors, deltas },
+        mlv_challenges[0] * sum1,
+        sum_inf,
+        la,
+    )
+}
+
+/// Bind rho1 AND rho2 in one pass over the compact round-2 state: emits
+/// round 4's wire message, materializes the quarter-size `(a_out, b_out)`
+/// level (exactly what the incumbent tail holds entering iteration i = 3),
+/// and accumulates round 5's message as a deferred quadratic in the
+/// not-yet-sampled rho3 — so the cascade tail resumes its ordinary
+/// two-rounds-per-pass cadence from here with zero extra passes.
+///
+/// Reconstruction per output group `g` (pairs `2g, 2g+1` of the compact
+/// state): in char 2, `λ0+λ1 = 1+rho2` and `λ2+λ3 = rho2`, so the anchors
+/// take one ordinary rho2 fold and only the two deltas carry rho1:
+///
+///   out = anc_e + rho2·(anc_e + anc_o) + fold_{rho1(1+rho2)}(δ_e)
+///                                       + fold_{rho1·rho2}(δ_o).
+///
+/// `r_next4[0] = ONE` (Convention A), `r_next4[1..] = r[k_skip+3..]`;
+/// requires `r_next4[1] != 0` (the round-5 parity unscaling divides by it).
+#[allow(clippy::too_many_arguments)]
+pub fn fold2_compact_round45_into(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+) -> (F128, F128, DeferredRoundMsg) {
+    use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+    let n_pairs = compact.len();
+    let n_groups = n_pairs / 2;
+    assert!(n_groups >= 4 && n_groups.is_power_of_two());
+    assert_eq!(compact.anchors.len(), 2 * n_pairs);
+    assert_eq!(compact.deltas.len(), 2 * n_pairs * table.n_chunks);
+    assert_eq!(table.n_chunks, 8);
+    assert_eq!(a_out.len(), n_groups);
+    assert_eq!(b_out.len(), n_groups);
+    assert_eq!(r_next4.len(), n_groups.trailing_zeros() as usize);
+    let r_par = r_next4[1];
+    assert_ne!(
+        r_par,
+        F128::ZERO,
+        "compact double-fold requires r_next4[1] != 0"
+    );
+
+    let lambda1 = rho1 * (F128::ONE + rho2);
+    let lambda3 = rho1 * rho2;
+    let table_l1 = table.scaled_linear(lambda1);
+    let table_l3 = table.scaled_linear(lambda3);
+
+    // Same lo-keeps-a-variable clamp as the producer (groups of two pairs).
+    let n_vars4 = r_next4.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(
+        &r_next4[1..],
+        SplitEqGhash::MAX_N_HI.min(n_vars4.saturating_sub(1)),
+    );
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n_groups);
+    assert!(
+        lo_size >= 2,
+        "compact double-fold pairs two round-4 pairs per group"
+    );
+    let kappa = (F128::ONE + r_par) * r_par.inv();
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let out_chunk = 2 * lo_size;
+    let nc = table.n_chunks;
+
+    let (sum1, sum_inf, agg) = a_out
+        .par_chunks_mut(out_chunk)
+        .zip(b_out.par_chunks_mut(out_chunk))
+        .enumerate()
+        .map(|(x_hi, (a_c, b_c))| {
+            let out = fold45_compact_chunk(
+                compact, &table_l1, &table_l3, rho2, a_c, b_c, eq_lo, lo_size, x_hi, out_chunk, nc,
+            );
+            let eq_h = eq_hi[x_hi];
+            (
+                eq_h * (kappa * out[0] + out[2]),
+                eq_h * (kappa * out[1] + out[3]),
+                [
+                    eq_h * out[2],
+                    eq_h * out[3],
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ],
+            )
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+            |(s1, si, mut wa), (c1, ci, wb)| {
+                for (a, v) in wa.iter_mut().zip(wb.iter()) {
+                    *a += *v;
+                }
+                (s1 + c1, si + ci, wa)
+            },
+        );
+
+    let r_inv = r_par.inv();
+    let la5 = deferred_msg_from_w([
+        r_inv * agg[2],
+        r_inv * agg[0],
+        r_inv * agg[1],
+        r_inv * agg[3],
+        r_inv * agg[4],
+        r_inv * agg[5],
+    ]);
+
+    (r_next4[0] * sum1, sum_inf, la5)
+}
+
+/// One compact double-fold chunk: reconstruct the outputs from anchors +
+/// λ-scaled delta tables, then the parity-split round-4 products and round-5
+/// aggregates. Slot order matches [`round2_compact_chunk_scalar`].
+#[allow(clippy::too_many_arguments)]
+fn fold45_compact_chunk(
+    compact: &UniSkipCompactFold,
+    table_l1: &[F128],
+    table_l3: &[F128],
+    rho2: F128,
+    a_c: &mut [F128],
+    b_c: &mut [F128],
+    eq_lo: &[F128],
+    lo_size: usize,
+    x_hi: usize,
+    out_chunk: usize,
+    nc: usize,
+) -> [F128; 8] {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: `aes` by the cfg; indices bounded by the caller's asserts.
+    unsafe {
+        use crate::field::gf2_128::aarch64::{WideNeon, mul_q, wide_mul_unreduced_q};
+        use core::arch::aarch64::{veorq_u64, vld1q_u64, vreinterpretq_u64_u8, vst1q_u64};
+
+        let l1_ptr = table_l1.as_ptr() as *const u8;
+        let l3_ptr = table_l3.as_ptr() as *const u8;
+        let anchors_ptr = compact.anchors.as_ptr();
+        let deltas_ptr = compact.deltas.as_ptr();
+        let rho2_q = vld1q_u64((&raw const rho2).cast::<u64>());
+
+        // Reconstruct: out = anc_e + rho2·(anc_e + anc_o)
+        //                  + fold_λ1(δ_e) + fold_λ3(δ_o), per operand.
+        for g_local in 0..out_chunk {
+            let g = x_hi * out_chunk + g_local;
+            let anc = anchors_ptr.add(4 * g);
+            let a_e = vld1q_u64(anc.cast::<u64>());
+            let b_e = vld1q_u64(anc.add(1).cast::<u64>());
+            let a_o = vld1q_u64(anc.add(2).cast::<u64>());
+            let b_o = vld1q_u64(anc.add(3).cast::<u64>());
+            let d = deltas_ptr.add(4 * g * nc);
+            let fa1 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(l1_ptr, d));
+            let fb1 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(l1_ptr, d.add(nc)));
+            let fa3 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(l3_ptr, d.add(2 * nc)));
+            let fb3 = vreinterpretq_u64_u8(fold_one_row_neon_q_unchecked_8(l3_ptr, d.add(3 * nc)));
+            let a = veorq_u64(
+                veorq_u64(a_e, mul_q(veorq_u64(a_e, a_o), rho2_q)),
+                veorq_u64(fa1, fa3),
+            );
+            let b = veorq_u64(
+                veorq_u64(b_e, mul_q(veorq_u64(b_e, b_o), rho2_q)),
+                veorq_u64(fb1, fb3),
+            );
+            vst1q_u64(a_c.as_mut_ptr().add(g_local).cast::<u64>(), a);
+            vst1q_u64(b_c.as_mut_ptr().add(g_local).cast::<u64>(), b);
+        }
+
+        let mut acc = [
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+        ];
+        let acp = a_c.as_ptr();
+        let bcp = b_c.as_ptr();
+        for u in 0..lo_size / 2 {
+            let o = 4 * u;
+            let a0 = vld1q_u64(acp.add(o).cast::<u64>());
+            let a1 = vld1q_u64(acp.add(o + 1).cast::<u64>());
+            let a2 = vld1q_u64(acp.add(o + 2).cast::<u64>());
+            let a3 = vld1q_u64(acp.add(o + 3).cast::<u64>());
+            let b0 = vld1q_u64(bcp.add(o).cast::<u64>());
+            let b1 = vld1q_u64(bcp.add(o + 1).cast::<u64>());
+            let b2 = vld1q_u64(bcp.add(o + 2).cast::<u64>());
+            let b3 = vld1q_u64(bcp.add(o + 3).cast::<u64>());
+            let wt = vld1q_u64((&raw const eq_lo[2 * u + 1]).cast::<u64>());
+            let a0w = mul_q(a0, wt);
+            let a1w = mul_q(a1, wt);
+            let a2w = mul_q(a2, wt);
+            let a3w = mul_q(a3, wt);
+            acc[0].xor_assign(wide_mul_unreduced_q(a1w, b1));
+            acc[1].xor_assign(wide_mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)));
+            acc[2].xor_assign(wide_mul_unreduced_q(a3w, b3));
+            acc[3].xor_assign(wide_mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)));
+            acc[4].xor_assign(wide_mul_unreduced_q(a2w, b2));
+            let e_aw = veorq_u64(a0w, a2w);
+            let e_b = veorq_u64(b0, b2);
+            let o_aw = veorq_u64(a1w, a3w);
+            let o_b = veorq_u64(b1, b3);
+            acc[5].xor_assign(wide_mul_unreduced_q(e_aw, e_b));
+            acc[6].xor_assign(wide_mul_unreduced_q(o_aw, o_b));
+            acc[7].xor_assign(wide_mul_unreduced_q(
+                veorq_u64(e_aw, o_aw),
+                veorq_u64(e_b, o_b),
+            ));
+        }
+        [
+            acc[0].reduce(),
+            acc[1].reduce(),
+            acc[2].reduce(),
+            acc[3].reduce(),
+            acc[4].reduce(),
+            acc[5].reduce(),
+            acc[6].reduce(),
+            acc[7].reduce(),
+        ]
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        // Portable reference (bit-identical: exact ops, order-free sums).
+        for (g_local, (a_slot, b_slot)) in a_c.iter_mut().zip(b_c.iter_mut()).enumerate() {
+            let g = x_hi * out_chunk + g_local;
+            let anc = &compact.anchors[4 * g..4 * g + 4];
+            let d = &compact.deltas[4 * g * nc..4 * (g + 1) * nc];
+            let mut a = anc[0] + rho2 * (anc[0] + anc[2]);
+            let mut b = anc[1] + rho2 * (anc[1] + anc[3]);
+            for j in 0..nc {
+                a += table_l1[j * 256 + d[j] as usize];
+                b += table_l1[j * 256 + d[nc + j] as usize];
+                a += table_l3[j * 256 + d[2 * nc + j] as usize];
+                b += table_l3[j * 256 + d[3 * nc + j] as usize];
+            }
+            *a_slot = a;
+            *b_slot = b;
+        }
+        let mut p1_even = F256Unreduced::ZERO;
+        let mut pinf_even = F256Unreduced::ZERO;
+        let mut p1_odd = F256Unreduced::ZERO;
+        let mut pinf_odd = F256Unreduced::ZERO;
+        let mut w = [F256Unreduced::ZERO; 4];
+        for u in 0..lo_size / 2 {
+            let o = 4 * u;
+            let (a0, a1, a2, a3) = (a_c[o], a_c[o + 1], a_c[o + 2], a_c[o + 3]);
+            let (b0, b1, b2, b3) = (b_c[o], b_c[o + 1], b_c[o + 2], b_c[o + 3]);
+            let wt = eq_lo[2 * u + 1];
+            let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+            p1_even ^= a1w.mul_unreduced(b1);
+            pinf_even ^= (a0w + a1w).mul_unreduced(b0 + b1);
+            p1_odd ^= a3w.mul_unreduced(b3);
+            pinf_odd ^= (a2w + a3w).mul_unreduced(b2 + b3);
+            w[0] ^= a2w.mul_unreduced(b2);
+            let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+            let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+            w[1] ^= e_aw.mul_unreduced(e_b);
+            w[2] ^= o_aw.mul_unreduced(o_b);
+            w[3] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+        }
+        [
+            p1_even.reduce(),
+            pinf_even.reduce(),
+            p1_odd.reduce(),
+            pinf_odd.reduce(),
+            w[0].reduce(),
+            w[1].reduce(),
+            w[2].reduce(),
+            w[3].reduce(),
+        ]
+    }
+}
 
 #[cfg(test)]
 mod tests {

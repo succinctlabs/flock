@@ -1288,45 +1288,51 @@ fn bundle_digest_merged(
 // the grinding). Two deterministic print runs agreed.
 // Runs by default since 2026-08-27: CI never passes `--ignored`, which is
 // how the 700cace sweep missed this pin. Same policy as `union_m6_fixtures`.
+// Re-pinned 2026-08-28: repo default hash flipped to BLAKE3 (HashKind
+// default + config generator + embedded TOMLs) — every default-constructed
+// transcript moves by design. Two deterministic print runs agreed.
+// Re-pinned 2026-08-31: merged main's profile consolidation (proof-IO v22,
+// Fast = former Fast128 schedule) on top of the BLAKE3 default — both
+// sides' pins were stale. Two deterministic print runs agreed.
 #[test]
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "43e3c8b0de3a1fbd682ee1a07d78c4bdfce0de49a25fa237648eaef113f90532",
+            "29c86f0b9211babda7a64cb57456b3b7c76341ce470c773d0ed08ed211a37205",
         ),
         (
             "elem-merged-nu12-2731",
             2731,
-            "fc293680f649aecf034122cb391b1ff35e49240b494d261dde3f4ed35d1bd685",
+            "ad0497a7863b73cda94d3ca7463d0b91359262fc962ce8c9f12f19e69ed753d9",
         ),
         (
             "elem-merged-nu12-0",
             0,
-            "ebb1dd96ef1a5a381f2b9f47f3d194d0505b39370f581c648a064ced08065a1b",
+            "92e265b26dd16b274c0f4d985449efaad0020a9deb1d283cdf1cda2d2c29f813",
         ),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "1d0f6680e46c7254447cf2b2e37a6b7f06213d6a1fea17fcce9cd8f857a24ee7",
+            "a7df4157d729a14cebd2953784a87bb299244bb7204988eb6710d2a21e9447f6",
         ),
         (
             "mix-merged-nu7-100-90",
             [100, 90],
-            "84456fa03bd629fd217a21fda86b8d3527ea5819a6971988a6aa68bd119efca8",
+            "ecbfcfd4d98318e537b0b5090b3b9306ea142a2d88a5bb48f89498fdf3bbfff6",
         ),
         (
             "mix-merged-nu7-0-90",
             [0, 90],
-            "1e5a3c409edf63ded8fb863d74c090598725267e048a84646ebc2fa69cb99398",
+            "4fbd01dfdb65e0be475acef7dc8a728ba68af08f22a48c1ecc8599f12704dd57",
         ),
         (
             "mix-merged-nu7-100-0",
             [100, 0],
-            "bee4a92a2b0fec998aeae218a29608c1a0512d2e9dc7e161aff44950ed564b65",
+            "bd1ed5ee049132b7950b8dedb667475d19d5f6fc977eab8b65b7774875c7719d",
         ),
     ];
 

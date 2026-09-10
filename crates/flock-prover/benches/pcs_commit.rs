@@ -180,6 +180,15 @@ fn main() {
 
     println!("\nLOG_PACKING = {}", LOG_PACKING);
 
+    // FLOCK_COMMIT_M=<m>: run only the packed breakdown at one size.
+    if let Ok(ms) = std::env::var("FLOCK_COMMIT_M") {
+        for tok in ms.split([',', ' ']).filter(|t| !t.is_empty()) {
+            let m: usize = tok.parse().expect("FLOCK_COMMIT_M: integer m");
+            bench_commit_packed_breakdown(m);
+        }
+        return;
+    }
+
     header("PCS commit at typical R1CS witness sizes (rate-1/2)");
     for &m in &[13usize, 15, 20, 24, 26, 28] {
         bench_commit_breakdown(m);

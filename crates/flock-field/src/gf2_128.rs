@@ -401,7 +401,7 @@ mod tests {
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     use crate::gf2_128::aarch64::{
-        ghash_mul_binius as ghash_mul_binius_aarch64,
+        self, ghash_mul_binius as ghash_mul_binius_aarch64,
         ghash_mul_karatsuba as ghash_mul_karatsuba_aarch64,
         ghash_mul_karatsuba_barrett as ghash_mul_karatsuba_barrett_aarch64,
         ghash_mul_schoolbook as ghash_mul_schoolbook_aarch64, ghash_mul_vec2_neon,
@@ -607,6 +607,75 @@ mod tests {
             assert_eq!(result[0], expected[0], "lane 0");
             assert_eq!(result[1], expected[1], "lane 1");
         }
+    }
+
+    /// The register-resident wide accumulator must agree with the
+    /// F256Unreduced path product-for-product AND after accumulation, since
+    /// the hot loops sum many products before a single reduce.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn neon_wide_accumulator_matches_f256unreduced() {
+        let mut rng = Rng::new(4242);
+        // Single products.
+        for _ in 0..256 {
+            let a = rng.f128();
+            let b = rng.f128();
+            let wide = unsafe { aarch64::wide_mul_unreduced_neon(a, b).reduce() };
+            let scalar = unsafe { aarch64::ghash_mul_unreduced_neon(a, b) }.reduce();
+            assert_eq!(wide, scalar, "single product");
+            assert_eq!(wide, a * b, "vs reduced mul");
+        }
+        // Accumulated sums: reduction is F2-linear, so sum-then-reduce must
+        // match reduce-then-sum.
+        for len in [1usize, 2, 3, 8, 17] {
+            let mut acc_wide = unsafe { aarch64::WideNeon::zero() };
+            let mut acc_scalar = F256Unreduced::ZERO;
+            let mut acc_direct = F128::ZERO;
+            for _ in 0..len {
+                let a = rng.f128();
+                let b = rng.f128();
+                unsafe { acc_wide.xor_assign(aarch64::wide_mul_unreduced_neon(a, b)) };
+                acc_scalar ^= unsafe { aarch64::ghash_mul_unreduced_neon(a, b) };
+                acc_direct += a * b;
+            }
+            let got = unsafe { acc_wide.reduce() };
+            assert_eq!(got, acc_scalar.reduce(), "accumulated len={len}");
+            assert_eq!(got, acc_direct, "accumulated vs direct len={len}");
+        }
+    }
+
+    /// The q-register multiplies must agree with the scalar path, both the
+    /// reduced form and the unreduced-accumulate form.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn neon_q_multiplies_match_scalar() {
+        use core::arch::aarch64::*;
+        let to_q = |v: F128| -> uint64x2_t {
+            unsafe { core::mem::transmute::<[u64; 2], uint64x2_t>([v.lo, v.hi]) }
+        };
+        let from_q = |v: uint64x2_t| -> F128 {
+            let a: [u64; 2] = unsafe { core::mem::transmute(v) };
+            F128 { lo: a[0], hi: a[1] }
+        };
+        let mut rng = Rng::new(0x9_C0DE);
+        for _ in 0..256 {
+            let a = rng.f128();
+            let b = rng.f128();
+            let got = from_q(unsafe { aarch64::mul_q(to_q(a), to_q(b)) });
+            assert_eq!(got, a * b, "mul_q");
+            let wide = unsafe { aarch64::wide_mul_unreduced_q(to_q(a), to_q(b)).reduce() };
+            assert_eq!(wide, a * b, "wide_mul_unreduced_q");
+        }
+        // Accumulated: sum-then-reduce must match reduce-then-sum.
+        let mut acc = unsafe { aarch64::WideNeon::zero() };
+        let mut direct = F128::ZERO;
+        for _ in 0..33 {
+            let a = rng.f128();
+            let b = rng.f128();
+            unsafe { acc.xor_assign(aarch64::wide_mul_unreduced_q(to_q(a), to_q(b))) };
+            direct += a * b;
+        }
+        assert_eq!(unsafe { acc.reduce() }, direct, "accumulated");
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]

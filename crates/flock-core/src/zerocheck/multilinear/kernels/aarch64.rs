@@ -11,8 +11,39 @@ use crate::field::F128;
 /// # Safety
 /// Caller must guarantee `table_data` points to ≥ 8 × 256 × 16 valid bytes
 /// (an `n_chunks ≥ 8` table) and `bytes_ptr` to ≥ 8 valid bytes.
+/// [`fold_one_row_neon_unchecked_8`] without the final lane extraction: the
+/// XOR-accumulated row stays in a q register for callers that keep computing
+/// on it (the round-2 message chain). Same safety contract.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+pub(crate) unsafe fn fold_one_row_neon_q_unchecked_8(
+    table_data: *const u8,
+    bytes_ptr: *const u8,
+) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::{veorq_u8, vld1q_u8};
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        // One u64 load + in-register extracts instead of eight byte loads:
+        // the bytes only feed gather addresses, so the extraction rides the
+        // integer side and the freed load slots go to the table gathers.
+        // Same mechanism as the round-1 prep word-extract (-5.1% there).
+        let w = u64::from_le((bytes_ptr as *const u64).read_unaligned());
+        let mut acc = vld1q_u8(table_data.add((w & 0xff) as usize * 16));
+        for j in 1..8usize {
+            acc = veorq_u8(
+                acc,
+                vld1q_u8(table_data.add(j * STRIDE + ((w >> (8 * j)) & 0xff) as usize * 16)),
+            );
+        }
+        acc
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+// Production callers moved to the q-returning variant; this remains as the
+// extraction-included form the NEON-vs-scalar test exercises.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     table_data: *const u8,
     bytes_ptr: *const u8,

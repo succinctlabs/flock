@@ -34,6 +34,8 @@ use {
     crate::pcs::LOG_PACKING, crate::zerocheck::PaddingSpec, std::env::var_os, std::time::Instant,
 };
 
+#[cfg(target_arch = "aarch64")]
+use crate::zerocheck::sparse_tail_gate;
 use crate::{
     challenger::Challenger,
     field::{F128, F256Unreduced, mul_by_x},
@@ -51,7 +53,6 @@ use crate::{
             fold_and_round_pair_sparse_into, fold_in_place_pair, fold1_lookahead_into,
             fold2_lookahead_into, lookahead_msg_first, lookahead_msg_second, round_pair_naive,
         },
-        sparse_tail_gate,
         univariate_skip::{SplitEqGhash, build_eq},
     },
 };
@@ -201,6 +202,24 @@ pub(super) fn build_w_tables(w: &[F128]) -> Vec<[F128; 256]> {
 /// the XOR chain from depth 7 to 3. Output bit-identical.
 #[inline]
 pub(super) fn byte_dot(packed: &[u8], r: usize, table: &[[F128; 256]]) -> F128 {
+    // NEON: eight 16-byte table gathers XORed in vector registers, against the
+    // scalar form's sixteen u64 loads and fourteen GPR XORs. The `w` tables are
+    // `8 x [F128; 256]` contiguous — exactly the layout the RS row-fold kernel
+    // indexes (`STRIDE = 256*16`) — so the same kernel serves both trees.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::{vgetq_lane_u64, vreinterpretq_u64_u8};
+        let acc = crate::zerocheck::multilinear::fold_row_q_neon(
+            table.as_ptr() as *const u8,
+            packed.as_ptr().add(r * 8),
+        );
+        let q = vreinterpretq_u64_u8(acc);
+        F128 {
+            lo: vgetq_lane_u64::<0>(q),
+            hi: vgetq_lane_u64::<1>(q),
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     unsafe {
         let v = (packed.as_ptr().add(r * 8) as *const u64).read_unaligned();
         byte_dot_u64(v, table)
@@ -208,7 +227,10 @@ pub(super) fn byte_dot(packed: &[u8], r: usize, table: &[[F128; 256]]) -> F128 {
 }
 
 /// [`byte_dot`] on a pre-loaded (possibly pre-combined) 64-bit message. Lets
-/// the tensor fold dot `m₀⊕m₁` without a memory round-trip.
+/// the tensor fold dot `m₀⊕m₁` without a memory round-trip. Non-aarch64 only:
+/// on aarch64 `byte_dot` goes through the NEON row-fold kernel and nothing
+/// reaches the scalar form, so it would trip `-D warnings` as dead code.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub(super) fn byte_dot_u64(v: u64, table: &[[F128; 256]]) -> F128 {
     unsafe {
@@ -364,6 +386,165 @@ fn fold_block_at(
     (s1, s_inf)
 }
 
+/// Scalar form of the fold + lookahead sums: the same byte-dot fold, but instead of
+/// the round-0 Horner message it forms the EIGHT lookahead sums over the
+/// block's 32 quads (inner dims 0 and 1 = the pair variable and the next),
+/// each quad weighted by the true eq over inner dims 2..6 (`eq_inner2`, 32
+/// entries). Rounds 0 AND 1's messages then fall out of the block-reduced
+/// sums via `lookahead_msg_first` / `lookahead_msg_second`, so the tail can
+/// enter at a fold2 pass. Quad `q` = outputs `4q..4q+4`, value index
+/// `v = dim0 + 2·dim1`, matching `lookahead_pass!`.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+#[inline]
+fn fold_block_at_la(
+    a_src: &[u8],
+    b_src: &[u8],
+    msg_base: usize,
+    table: &[[F128; 256]],
+    am: &mut [F128],
+    bm: &mut [F128],
+    eq_inner2: &[F128],
+) -> [F256Unreduced; 8] {
+    let mut acc = [F256Unreduced::ZERO; 8];
+    for q in 0..32 {
+        let base = 4 * q;
+        let mut ga = [F128::ZERO; 4];
+        let mut gb = [F128::ZERO; 4];
+        for v in 0..4 {
+            ga[v] = byte_dot(a_src, msg_base + base + v, table);
+            gb[v] = byte_dot(b_src, msg_base + base + v, table);
+            am[base + v] = ga[v];
+            bm[base + v] = gb[v];
+        }
+        super::multilinear::lookahead_accum(&ga, &gb, eq_inner2[q], &mut acc);
+    }
+    acc
+}
+
+/// NEON-resident [`fold_block_at_la`]: the byte-dots come out of
+/// `fold_row_q_neon` in q-registers, the four `a` values are pre-scaled by
+/// the quad's eq weight with `mul_q`, and the eight lookahead products are
+/// `wide_mul_unreduced_q` into eight `WideNeon` accumulators — no scalar
+/// F128 round-trip per value. Same sums as the scalar form.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn fold_block_at_la_neon(
+    a_src: &[u8],
+    b_src: &[u8],
+    msg_base: usize,
+    table: &[[F128; 256]],
+    am: &mut [F128],
+    bm: &mut [F128],
+    eq_inner2: &[F128],
+) -> [F256Unreduced; 8] {
+    use crate::field::gf2_128::aarch64::{WideNeon, mul_q, wide_mul_unreduced_q};
+    use core::arch::aarch64::{veorq_u64, vld1q_u64, vreinterpretq_u64_u8, vst1q_u64};
+    unsafe {
+        let tp = table.as_ptr() as *const u8;
+        let ap = a_src.as_ptr().add(msg_base * 8);
+        let bp = b_src.as_ptr().add(msg_base * 8);
+        let mut acc = [
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+            WideNeon::zero(),
+        ];
+        for q in 0..32usize {
+            let base = 4 * q;
+            let w = vld1q_u64(eq_inner2.as_ptr().add(q) as *const u64);
+            let a00 =
+                vreinterpretq_u64_u8(super::multilinear::fold_row_q_neon(tp, ap.add(base * 8)));
+            let a10 = vreinterpretq_u64_u8(super::multilinear::fold_row_q_neon(
+                tp,
+                ap.add((base + 1) * 8),
+            ));
+            let a01 = vreinterpretq_u64_u8(super::multilinear::fold_row_q_neon(
+                tp,
+                ap.add((base + 2) * 8),
+            ));
+            let a11 = vreinterpretq_u64_u8(super::multilinear::fold_row_q_neon(
+                tp,
+                ap.add((base + 3) * 8),
+            ));
+            let b00 =
+                vreinterpretq_u64_u8(super::multilinear::fold_row_q_neon(tp, bp.add(base * 8)));
+            let b10 = vreinterpretq_u64_u8(super::multilinear::fold_row_q_neon(
+                tp,
+                bp.add((base + 1) * 8),
+            ));
+            let b01 = vreinterpretq_u64_u8(super::multilinear::fold_row_q_neon(
+                tp,
+                bp.add((base + 2) * 8),
+            ));
+            let b11 = vreinterpretq_u64_u8(super::multilinear::fold_row_q_neon(
+                tp,
+                bp.add((base + 3) * 8),
+            ));
+            let o = am.as_mut_ptr().add(base) as *mut u64;
+            vst1q_u64(o, a00);
+            vst1q_u64(o.add(2), a10);
+            vst1q_u64(o.add(4), a01);
+            vst1q_u64(o.add(6), a11);
+            let ob = bm.as_mut_ptr().add(base) as *mut u64;
+            vst1q_u64(ob, b00);
+            vst1q_u64(ob.add(2), b10);
+            vst1q_u64(ob.add(4), b01);
+            vst1q_u64(ob.add(6), b11);
+            let (e00, e10, e01, e11) = (mul_q(w, a00), mul_q(w, a10), mul_q(w, a01), mul_q(w, a11));
+            let sxa0 = veorq_u64(e00, e10);
+            let sxb0 = veorq_u64(b00, b10);
+            let sxa1 = veorq_u64(e01, e11);
+            let sxb1 = veorq_u64(b01, b11);
+            let dca = veorq_u64(e00, e01);
+            let dcb = veorq_u64(b00, b01);
+            let dsa = veorq_u64(sxa0, sxa1);
+            let dsb = veorq_u64(sxb0, sxb1);
+            acc[0].xor_assign(wide_mul_unreduced_q(e10, b10));
+            acc[1].xor_assign(wide_mul_unreduced_q(sxa0, sxb0));
+            acc[2].xor_assign(wide_mul_unreduced_q(e01, b01));
+            acc[3].xor_assign(wide_mul_unreduced_q(e11, b11));
+            acc[4].xor_assign(wide_mul_unreduced_q(sxa1, sxb1));
+            acc[5].xor_assign(wide_mul_unreduced_q(dca, dcb));
+            acc[6].xor_assign(wide_mul_unreduced_q(
+                veorq_u64(dca, dsa),
+                veorq_u64(dcb, dsb),
+            ));
+            acc[7].xor_assign(wide_mul_unreduced_q(dsa, dsb));
+        }
+        let mut out = [F256Unreduced::ZERO; 8];
+        for k in 0..8 {
+            out[k] = acc[k].to_unreduced();
+        }
+        out
+    }
+}
+
+/// Per-block fold + lookahead sums: the NEON-resident form where the byte-dot
+/// kernel exists, the scalar form elsewhere. Same sums.
+#[inline]
+fn fold_block_la(
+    a_src: &[u8],
+    b_src: &[u8],
+    msg_base: usize,
+    table: &[[F128; 256]],
+    am: &mut [F128],
+    bm: &mut [F128],
+    eq_inner2: &[F128],
+) -> [F256Unreduced; 8] {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        fold_block_at_la_neon(a_src, b_src, msg_base, table, am, bm, eq_inner2)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        fold_block_at_la(a_src, b_src, msg_base, table, am, bm, eq_inner2)
+    }
+}
+
 /// [`fold_and_first_round`] under a witness run-list ([`BlockCoverage`] at
 /// the 8192-bit code-block grid, one entry per outer block): DEAD blocks
 /// write zero folds and contribute nothing (their honest bits are all
@@ -446,8 +627,18 @@ pub fn fold_and_first_round_sparse(
     b_packed: &[u8],
     w: &[F128],
     r_rest: &[F128],
-    coverage: &[BlockCoverage],
-) -> (Vec<F128>, Vec<F128>, F128, F128, LiveLayout) {
+    coverage: &[super::BlockCoverage],
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    F128,
+    F128,
+    LiveLayout,
+    Option<super::multilinear::LookaheadSums>,
+) {
+    use rayon::prelude::{
+        IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
+    };
     assert_eq!(a_packed.len(), b_packed.len());
     debug_assert_eq!(
         &r_rest[1..N_INNER],
@@ -463,11 +654,6 @@ pub fn fold_and_first_round_sparse(
         n_outer,
         "one coverage entry per outer block"
     );
-    let mut d1 = F128::ONE;
-    for j in 1..N_INNER {
-        d1 *= F128::ONE + gamma_pow(1usize << j);
-    }
-    let d1_inv = d1.inv();
 
     // The live block list + its 128-aligned mlv-slot intervals.
     let live: Vec<usize> = (0..n_outer)
@@ -483,33 +669,57 @@ pub fn fold_and_first_round_sparse(
     }
     let store = LiveLayout::new(intervals);
     let n_live = 128 * live.len();
-    let mut a_mlv = take_f128(n_live);
-    let mut b_mlv = take_f128(n_live);
-    let (g1, g_inf) = a_mlv
+    let mut a_mlv = crate::scratch::take_f128(n_live);
+    let mut b_mlv = crate::scratch::take_f128(n_live);
+    // FOLD-LEVEL LOOKAHEAD: the sweep that folds each block ALSO forms the
+    // eight lookahead sums over inner dims 0 and 1 (each quad weighted by the
+    // true eq over inner dims 2..6, `eq_inner2`; the block by `eq_outer`), so
+    // rounds 0 AND 1's messages come out of one pass and the sparse tail
+    // enters at a fold2 pass — no fold1 entry pass. Measured at m=32:
+    // fold +5 ms (NEON) for tail −17 → fold+tail −10 ms MT, −12 ST,
+    // transcript-identical (round 0's message is derived from the same sums
+    // via `lookahead_msg_first`; a wrong derivation fails verify).
+    let eq_inner2 = super::univariate_skip::build_eq(&r_rest[2..N_INNER]);
+    let la_sum = a_mlv
         .par_chunks_mut(128)
         .zip(b_mlv.par_chunks_mut(128))
         .zip(live.par_iter())
         .map(|((am, bm), &outer)| {
-            let (s1, s_inf) = match &coverage[outer] {
-                BlockCoverage::Dead => unreachable!("the live list has no dead entry"),
-                BlockCoverage::Full => {
-                    fold_block_at(a_packed, b_packed, outer * 128, &table, am, bm)
+            let acc = match &coverage[outer] {
+                super::BlockCoverage::Dead => unreachable!("the live list has no dead entry"),
+                super::BlockCoverage::Full => {
+                    fold_block_la(a_packed, b_packed, outer * 128, &table, am, bm, &eq_inner2)
                 }
                 BlockCoverage::Partial(ranges) => {
                     let mut a_buf = [0u8; 1024];
                     let mut b_buf = [0u8; 1024];
-                    cleanse_block(a_packed, outer * 1024, ranges, &mut a_buf);
-                    cleanse_block(b_packed, outer * 1024, ranges, &mut b_buf);
-                    fold_block_at(&a_buf, &b_buf, 0, &table, am, bm)
+                    super::cleanse_block(a_packed, outer * 1024, ranges, &mut a_buf);
+                    super::cleanse_block(b_packed, outer * 1024, ranges, &mut b_buf);
+                    fold_block_la(&a_buf, &b_buf, 0, &table, am, bm, &eq_inner2)
                 }
             };
-            let e = eq_outer[outer] * d1_inv;
-            (e * s1.reduce(), e * s_inf.reduce())
+            let eo = eq_outer[outer];
+            let mut la = [F128::ZERO; 8];
+            for k in 0..8 {
+                la[k] = eo * acc[k].reduce();
+            }
+            la
         })
-        .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (r, s)| (p + r, q + s));
+        .reduce(
+            || [F128::ZERO; 8],
+            |mut l1, l2| {
+                for k in 0..8 {
+                    l1[k] += l2[k];
+                }
+                l1
+            },
+        );
+    let sums = super::multilinear::lookahead_finish(la_sum);
+    let (g1, g_inf) = super::multilinear::lookahead_msg_first(&sums, r_rest[1]);
+    let la_out = Some(sums);
     a_mlv.truncate(n_live);
     b_mlv.truncate(n_live);
-    (a_mlv, b_mlv, g1, g_inf, store)
+    (a_mlv, b_mlv, g1, g_inf, store, la_out)
 }
 
 /// One wide-Horner step with a compile-time shift `S` (the friendly base
@@ -1321,17 +1531,33 @@ fn prove_from_round1<C: Challenger>(
         let n_out = cov.len() * 128;
         live_blocks < cov.len() && n_out >= 8 && live_blocks * 128 * sparse_tail_gate() <= n_out
     });
-    let (a_mlv, b_mlv, g1_0, ginf_0, store) = if sparse {
+    // Phase split for FLOCK_ZC_TIMING: the standalone `ag_breakdown` kernel
+    // timings overstate the fold badly (cold pool + 2 GB alloc: 115 ms
+    // standalone vs ~42 ms in-prove), so the attribution has to come from
+    // inside the prove.
+    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    let t_fold = std::time::Instant::now();
+    let (a_mlv, b_mlv, g1_0, ginf_0, store, la_sums) = if sparse {
         let cov = coverage.expect("sparse implies coverage");
-        let (a, b, g1, gi, st) = fold_and_first_round_sparse(a_packed, b_packed, &w, &r_rest, cov);
-        (a, b, g1, gi, Some(st))
+        let (a, b, g1, gi, st, la) =
+            fold_and_first_round_sparse(a_packed, b_packed, &w, &r_rest, cov);
+        (a, b, g1, gi, Some(st), la)
     } else {
         let (a, b, g1, gi) = match coverage {
             Some(cov) => fold_and_first_round_padded(a_packed, b_packed, &w, &r_rest, cov),
             None => fold_and_first_round(a_packed, b_packed, &w, &r_rest),
         };
-        (a, b, g1, gi, None)
+        (a, b, g1, gi, None, None)
     };
+    if zc_timing {
+        eprintln!(
+            "[ag-zc-timing] skip->mlv fold{}: {:.2} ms (out n={})",
+            if sparse { " (sparse)" } else { "" },
+            t_fold.elapsed().as_secs_f64() * 1e3,
+            a_mlv.len()
+        );
+    }
+    let t_mlv = std::time::Instant::now();
     let (rounds, rhos, a_eval, b_eval) = match grinding.multilinear_round_bits() {
         Some(bits) => {
             let mut gch = RoundGrindProver {
@@ -1339,10 +1565,20 @@ fn prove_from_round1<C: Challenger>(
                 bits,
                 nonces: &mut grinding_nonces,
             };
-            mlv_tail_dispatch(a_mlv, b_mlv, g1_0, ginf_0, store, &r_rest, &mut gch)
+            mlv_tail_dispatch(
+                a_mlv, b_mlv, g1_0, ginf_0, la_sums, store, &r_rest, &mut gch,
+            )
         }
-        None => mlv_tail_dispatch(a_mlv, b_mlv, g1_0, ginf_0, store, &r_rest, challenger),
+        None => mlv_tail_dispatch(
+            a_mlv, b_mlv, g1_0, ginf_0, la_sums, store, &r_rest, challenger,
+        ),
     };
+    if zc_timing {
+        eprintln!(
+            "[ag-zc-timing] mlv tail: {:.2} ms",
+            t_mlv.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     let proof = AgProof {
         round1_ab: msg.ab_fresh,
@@ -1399,12 +1635,13 @@ fn mlv_tail_dispatch<C: Challenger>(
     b_mlv: Vec<F128>,
     g1_0: F128,
     ginf_0: F128,
+    la: Option<super::multilinear::LookaheadSums>,
     store: Option<LiveLayout>,
     r_rest: &[F128],
     challenger: &mut C,
 ) -> (Vec<(F128, F128)>, Vec<F128>, F128, F128) {
     match store {
-        Some(st) => mlv_tail_fs_sparse(a_mlv, b_mlv, g1_0, ginf_0, st, r_rest, challenger),
+        Some(st) => mlv_tail_fs_sparse(a_mlv, b_mlv, g1_0, ginf_0, la, st, r_rest, challenger),
         None => mlv_tail_fs(a_mlv, b_mlv, g1_0, ginf_0, r_rest, challenger),
     }
 }
@@ -1421,6 +1658,7 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
     mut b_mlv: Vec<F128>,
     g1_0: F128,
     ginf_0: F128,
+    la: Option<super::multilinear::LookaheadSums>,
     mut store: LiveLayout,
     r_rest: &[F128],
     challenger: &mut C,
@@ -1433,6 +1671,22 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
     challenger.observe_f128(ginf_0);
     let mut rho_prev = challenger.sample_f128();
     rhos.push(rho_prev);
+    // FOLD-LEVEL ENTRY: when the fold formed the round-0/1 lookahead sums in
+    // its own sweep, round 1's message is a zero-pass derivation from them
+    // at ρ₀, its fold is deferred (`pending2`), and the ladder below starts
+    // at round 2 with a fold2 pass — no fold1 entry pass. Same transcript.
+    let mut entry_pending: Option<F128> = None;
+    let mut entry_i = 1usize;
+    if let Some(sums) = la {
+        let (m1, mi) = super::multilinear::lookahead_msg_second(&sums, rho_prev);
+        rounds.push((m1, mi));
+        challenger.observe_f128(m1);
+        challenger.observe_f128(mi);
+        let rho1 = challenger.sample_f128();
+        rhos.push(rho1);
+        entry_pending = Some(rho1);
+        entry_i = 2;
+    }
 
     // The sparse rounds — the RS tail's loop shape: the logical `domain`
     // halves every round regardless of the compacted buffer length, and
@@ -1441,10 +1695,33 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
     let mut domain = 1usize << n_mlv;
     let (mut a_nxt, mut b_nxt) = (Vec::new(), Vec::new());
     let mut i = 1usize;
-    while i < n_mlv && domain >= 1024 && store.len() * sparse_tail_gate() <= domain {
-        let log_before = domain.trailing_zeros() as usize;
-        let mut r_next = vec![F128::ONE; log_before - 1];
-        r_next[1..].copy_from_slice(&r_rest[i + 1..]);
+    // LOOKAHEAD on the sparse path. When the live layout is a single PREFIX
+    // interval — the shipped shape: the useful chunk-columns are a prefix, so
+    // the compact buffer IS the dense prefix — the dense lookahead ladder
+    // runs on it directly: `fold1/fold2_lookahead_into` size their eq tables
+    // from the challenge suffix and weight every position by its global
+    // index, so a prefix's sums are the full domain's with the dead suffix
+    // at zero, and its outputs are the dense outputs' prefix. Two rounds per
+    // pass with the message in the same sweep; measured on the dense route
+    // at m=32: the steady fold2 passes cost 19–36% less than the two classic
+    // rounds each replaces (the fold1 ENTRY pass is the one that does not
+    // pay, +16% ST). Same `pending2` invariant as `mlv_tail_fs_resume`: the
+    // arrays are folded through every sampled challenge except `rho_prev`
+    // (and `pending2` if set); while a challenge is deferred, `domain` is
+    // one halving ahead of the round index. Transcript-identical to the
+    // classic rounds (the lookahead messages are exact).
+    let mut pending2 = entry_pending;
+    if entry_pending.is_some() {
+        i = entry_i;
+    }
+    let la_enabled = !LOOKAHEAD_DISABLE.load(Ordering::Relaxed);
+    while i < n_mlv && domain >= 1024 && store.len() * super::sparse_tail_gate() <= domain {
+        let live = store.len();
+        let is_prefix =
+            store.intervals().len() == 1 && store.intervals()[0].0 == 0 && a_mlv.len() == live;
+        let per_u = if pending2.is_some() { 16 } else { 8 };
+        let lookahead =
+            la_enabled && is_prefix && i + 1 < n_mlv && live >= 1024 && live.is_multiple_of(per_u);
         // Output storage is bounded by the input's: shrinking pairs can
         // only round outward by one slot per interval end.
         let cap = store.len() + 2 * store.intervals().len() + 2;
@@ -1454,6 +1731,77 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
             a_nxt = take_f128(cap);
             b_nxt = take_f128(cap);
         }
+        if lookahead {
+            let out_len = if pending2.is_some() {
+                live / 4
+            } else {
+                live / 2
+            };
+            let (ao, bo) = (&mut a_nxt[..out_len], &mut b_nxt[..out_len]);
+            let q = if let Some(r2) = pending2 {
+                fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r_rest[i + 2..])
+            } else {
+                fold1_lookahead_into(
+                    &a_mlv,
+                    &b_mlv,
+                    ao,
+                    bo,
+                    (rho_prev, F128::ZERO),
+                    &r_rest[i + 2..],
+                )
+            };
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(out_len);
+            b_mlv.truncate(out_len);
+            store = LiveLayout::new(vec![(0, out_len)]);
+            domain = if pending2.is_some() {
+                domain / 4
+            } else {
+                domain / 2
+            };
+            let (m1a, mia) = lookahead_msg_first(&q, r_rest[i + 1]);
+            rounds.push((m1a, mia));
+            challenger.observe_f128(m1a);
+            challenger.observe_f128(mia);
+            let rho_a = challenger.sample_f128();
+            rhos.push(rho_a);
+            let (m1b, mib) = lookahead_msg_second(&q, rho_a);
+            rounds.push((m1b, mib));
+            challenger.observe_f128(m1b);
+            challenger.observe_f128(mib);
+            let rho_b = challenger.sample_f128();
+            rhos.push(rho_b);
+            rho_prev = rho_a;
+            pending2 = Some(rho_b);
+            i += 2;
+            continue;
+        }
+        // Leaving lookahead mode inside the sparse loop: resolve the deferred
+        // fold on the compact prefix (still one interval), then continue with
+        // the classic rounds.
+        if let Some(r2) = pending2.take() {
+            // The pairwise in-place fold never straddles an interval (intervals
+            // are 128-aligned), so every interval simply halves — this holds
+            // for ANY layout, which matters because the fold-level entry
+            // starts the loop with a deferred challenge before a prefix was
+            // ever established.
+            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+            store = LiveLayout::new(
+                store
+                    .intervals()
+                    .iter()
+                    .map(|&(s, e)| (s / 2, e / 2))
+                    .collect(),
+            );
+            debug_assert_eq!(store.len(), a_mlv.len());
+            domain /= 2;
+            rho_prev = r2;
+            continue;
+        }
+        let log_before = domain.trailing_zeros() as usize;
+        let mut r_next = vec![F128::ONE; log_before - 1];
+        r_next[1..].copy_from_slice(&r_rest[i + 1..]);
         let (m1, mi, store_out) = fold_and_round_pair_sparse_into(
             &a_mlv,
             &b_mlv,
@@ -1489,7 +1837,7 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
     give_f128(a_nxt);
     give_f128(b_nxt);
     let (tail_rounds, tail_rhos, a_eval, b_eval) =
-        mlv_tail_fs_resume(a_full, b_full, i, rho_prev, None, r_rest, challenger);
+        mlv_tail_fs_resume(a_full, b_full, i, rho_prev, pending2, r_rest, challenger);
     rounds.extend(tail_rounds);
     rhos.extend(tail_rhos);
     (rounds, rhos, a_eval, b_eval)

@@ -88,6 +88,7 @@ pub(super) struct ChildTape<'p> {
     pub(super) start_v: usize,
     gammas_o: Vec<PdRec>,
     pub(super) w_rounds: Vec<RoundRec>,
+    pub(super) w_coords: Vec<RoundRec>,
     pub(super) w_resid: Vec<RoundRec>,
     mp_o: MpRec,
     inner_pd2: InnerPd,
@@ -376,6 +377,19 @@ impl<'p> ChildTape<'p> {
         );
         assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
         let n_log_i = union.n_log();
+        // Block-first transport (`pcs::open_batch_merged`): under a
+        // full-height column prefix the prover bound the k−1 block
+        // coordinates first. `w_rounds` stays in round order for the
+        // running-claim chain; `w_coords` is ρ in coordinate order.
+        let w_coords: Vec<RoundRec> = {
+            let mut v = w_rounds.clone();
+            if flock_core::pcs::rectangular_prefix_columns(&union.jagged_heights(), n_log_i)
+                .is_some()
+            {
+                v.rotate_left(m_mp2 - n_log_i - 1);
+            }
+            v
+        };
         // Recompute the recombination and f == g from located words.
         let n_pub_slots_c = pin_recombination(
             inner.built.shape.circuit.cells(),
@@ -742,7 +756,7 @@ impl<'p> ChildTape<'p> {
             for j in 1..257 + n_p {
                 gpow_n.push(gpow_n[j - 1] * gamma_n);
             }
-            let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
+            let rho_mrg_n: Vec<F128> = w_coords.iter().map(|rr| chals[rr.ch]).collect();
             let point_n: Vec<F128> = mp_o.rounds.iter().map(|rr| chals[rr.ch]).collect();
             let sig_n: Vec<F128> = mp_o.anchor_rounds.iter().map(|rr| chals[rr.ch]).collect();
             let bit = |b: bool| if b { F128::ONE } else { F128::ZERO };
@@ -906,7 +920,7 @@ impl<'p> ChildTape<'p> {
         }
 
         let (yr_len, w_resid) =
-            walker_common::parse_residual_rotation(proof, &geo, &levels, &w_rounds);
+            walker_common::parse_residual_rotation(proof, &geo, &levels, &w_coords);
 
         let z_ix = el_assert.as_ref().map(|assertion| {
             gammas_o
@@ -932,6 +946,7 @@ impl<'p> ChildTape<'p> {
             start_v,
             gammas_o,
             w_rounds,
+            w_coords,
             w_resid,
             mp_o,
             inner_pd2,
@@ -2630,7 +2645,7 @@ fn emit_anchor_expect(
     let macs = cs.macs;
     let spine = cs.spine;
     let chals = &ct.chals[..];
-    let w_rounds = &ct.w_rounds[..];
+    let w_coords = &ct.w_coords[..];
     let el_rec = ct.el.as_ref();
     let m_mp2 = ct.m_mp2;
     let n_log_i = ct.n_log_i;
@@ -2682,8 +2697,8 @@ fn emit_anchor_expect(
 
     // ĝ(ρ″): advice square-root chains for ρ^(2^-j), bound by forward
     // squaring deltas y·y + prev = 0.
-    let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
-    let rho_mrg_w: Vec<Wire> = w_rounds
+    let rho_mrg_n: Vec<F128> = w_coords.iter().map(|rr| chals[rr.ch]).collect();
+    let rho_mrg_w: Vec<Wire> = w_coords
         .iter()
         .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
         .collect();

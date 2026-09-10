@@ -24,7 +24,9 @@ use std::{
     thread::available_parallelism,
 };
 
-pub use flock_parallel::all_core_pool;
+pub use flock_parallel::{
+    all_core_pool, run_hetero_chunks, run_hetero_chunks_stateful, set_utility_qos,
+};
 use rayon::{ThreadPoolBuilder, current_num_threads};
 #[cfg(target_os = "linux")]
 use {std::collections::HashSet, std::fs::read_dir, std::fs::read_to_string};

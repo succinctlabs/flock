@@ -1,6 +1,7 @@
 //! Hash functions for commitments and Fiat-Shamir transcripts.
 //!
-//! Each protocol component selects its hash independently. The default is SHA-256.
+//! Each protocol component selects its hash independently. The default is BLAKE3 (the faster hash on this codebase's NEON
+//! multi-lane kernels); SHA-256 remains selectable per component.
 
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
@@ -12,8 +13,8 @@ pub type Digest = [u8; 32];
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HashKind {
-    #[default]
     Sha256,
+    #[default]
     Blake3,
 }
 
@@ -141,7 +142,7 @@ mod tests {
         assert_eq!(HashKind::parse("BLAKE3").unwrap(), HashKind::Blake3);
         assert_eq!(HashKind::parse("sha-256").unwrap(), HashKind::Sha256);
         assert_eq!(HashKind::parse("  blake3 ").unwrap(), HashKind::Blake3);
-        assert_eq!(HashKind::default(), HashKind::Sha256);
+        assert_eq!(HashKind::default(), HashKind::Blake3);
         // An unrecognized hash must be an error, never a silent SHA-256.
         assert!(HashKind::parse("keccak").is_err());
         assert!(HashKind::parse("").is_err());

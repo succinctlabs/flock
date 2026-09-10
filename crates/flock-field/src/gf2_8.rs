@@ -143,8 +143,9 @@ pub const fn gf8_reduce(p: u16) -> u8 {
 pub mod neon {
     use core::{
         arch::aarch64::{
-            poly8x8_t, uint8x8_t, uint8x16_t, veorq_u8, vget_high_u8, vget_low_u8, vmull_p8,
-            vreinterpretq_u8_u16, vreinterpretq_u16_p16, vshlq_n_u16, vuzp1q_u8, vuzp2q_u8,
+            poly8x8_t, uint8x8_t, uint8x16_t, vandq_u8, vdupq_n_u8, veorq_u8, vget_high_u8,
+            vget_low_u8, vmull_p8, vreinterpretq_s8_u8, vreinterpretq_u8_s8, vreinterpretq_u8_u16,
+            vreinterpretq_u16_p16, vshlq_n_u8, vshlq_n_u16, vshrq_n_s8, vuzp1q_u8, vuzp2q_u8,
         },
         mem::transmute,
     };
@@ -197,6 +198,23 @@ pub mod neon {
         }
     }
 
+    /// Multiply 16 GF(2^8) values by x^2 (two rounds of shift-and-conditionally
+    /// XOR the reduction byte 0x1b). Used by the URM fast accumulate for the
+    /// x^2 component of its x^K row weight.
+    ///
+    /// # Safety
+    /// Uses `core::arch::aarch64` NEON intrinsics; only call on `aarch64`.
+    #[inline]
+    pub unsafe fn gf8_mul_x2_vec16(v: uint8x16_t) -> uint8x16_t {
+        unsafe {
+            let red = vdupq_n_u8(0x1b);
+            let m1 = vreinterpretq_u8_s8(vshrq_n_s8::<7>(vreinterpretq_s8_u8(v)));
+            let v1 = veorq_u8(vshlq_n_u8::<1>(v), vandq_u8(m1, red));
+            let m2 = vreinterpretq_u8_s8(vshrq_n_s8::<7>(vreinterpretq_s8_u8(v1)));
+            veorq_u8(vshlq_n_u8::<1>(v1), vandq_u8(m2, red))
+        }
+    }
+
     /// Element-wise multiply 16 pairs of GF(2^8) values (binius64 13-op NEON kernel).
     ///
     /// # Safety
@@ -220,12 +238,60 @@ pub mod neon {
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "aarch64")]
-    use {crate::gf2_8::neon::gf8_mul_vec16, core::mem::transmute, std::arch::aarch64::vld1q_u8};
+    use {
+        crate::gf2_8::neon::{self, gf8_mul_vec16},
+        core::mem::transmute,
+        std::arch::aarch64::vld1q_u8,
+    };
 
     use crate::{
-        gf2_8::{F8, clmul8, software::clmul8 as clmul8_software},
+        gf2_8::{F8, clmul8, gf8_reduce, software::clmul8 as clmul8_software},
         test_rng::Rng,
     };
+
+    /// Both reducers document "degree <= 14", but the fast URM accumulate
+    /// shifts unreduced products left by 1, producing degree-15 lanes.
+    /// Check the full 16-bit domain against a from-scratch bitwise mod.
+    #[test]
+    fn scalar_reduce_full_u16_domain() {
+        fn slow_mod(mut p: u32) -> u8 {
+            // x^8 + x^4 + x^3 + x + 1 = 0x11b
+            for bit in (8..=15).rev() {
+                if p & (1 << bit) != 0 {
+                    p ^= 0x11b << (bit - 8);
+                }
+            }
+            p as u8
+        }
+        for v in 0..=u16::MAX {
+            assert_eq!(gf8_reduce(v), slow_mod(v as u32), "at {v:#06x}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_reduce_full_u16_domain() {
+        use core::arch::aarch64::*;
+        // Sweep all 65536 values, 16 lanes at a time, including bit-15-set
+        // inputs (degree 15), and compare with the scalar reducer.
+        for base in (0..=u16::MAX as u32).step_by(16) {
+            let vals: [u16; 16] = core::array::from_fn(|i| (base as u16).wrapping_add(i as u16));
+            // Pack lanes 0-7 into c0, 8-15 into c1 (raw u16x8 as u8x16).
+            let c0 = unsafe { vld1q_u8(vals.as_ptr() as *const u8) };
+            let c1 = unsafe { vld1q_u8((vals.as_ptr() as *const u8).add(16)) };
+            let got = unsafe { neon::gf8_reduce_vec16(c0, c1) };
+            let mut out = [0u8; 16];
+            unsafe { vst1q_u8(out.as_mut_ptr(), got) };
+            for i in 0..16 {
+                assert_eq!(
+                    out[i],
+                    gf8_reduce(vals[i]),
+                    "lane {i} value {:#06x}",
+                    vals[i]
+                );
+            }
+        }
+    }
 
     #[test]
     fn add_is_xor() {

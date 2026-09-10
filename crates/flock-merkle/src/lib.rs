@@ -10,7 +10,8 @@ use rayon::current_num_threads;
 #[cfg(feature = "hash-count")]
 pub use crate::hashing::hash_count;
 pub use crate::hashing::{
-    Blake3MerkleHash, Hash, HashKind, MerkleHash, Sha256MerkleHash, hash_leaf, hash_pair,
+    Blake3MerkleHash, Hash, HashKind, MerkleHash, Sha256MerkleHash, hash_leaf, hash_leaves_serial,
+    hash_pair, hash_parents_serial, merkle_tree_from_prehashed_level,
 };
 #[cfg(test)]
 use crate::hashing::{
@@ -458,8 +459,12 @@ mod tests {
             }
         }
 
-        // Leaves, at every size the batched path claims to handle.
-        for leaf_size in [64usize, 128, 256, 512, 1024] {
+        // Leaves, at every size the batched path claims to handle —
+        // including the integer-lane commit's `lanes × 16` (736 at m=32)
+        // and short/odd last blocks.
+        for leaf_size in [
+            1usize, 16, 32, 48, 63, 64, 100, 128, 256, 512, 736, 1000, 1024,
+        ] {
             for n in counts {
                 let data: Vec<u8> = (0..=255u8).cycle().take(n * leaf_size).collect();
                 let mut batched = vec![[0u8; 32]; n];

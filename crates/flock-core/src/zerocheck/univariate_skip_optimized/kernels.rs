@@ -225,6 +225,32 @@ pub(super) fn accumulate_convert(
     );
 }
 
+/// AB-only drain (C banks come from the lincheck-stripe fold).
+#[inline]
+pub(super) fn accumulate_convert_ab_only(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    partial_ab: &mut [super::F128; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
+    // all table-selected loads.
+    unsafe {
+        aarch64::accumulate_convert_ab_only(
+            chunk_ab_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    portable::accumulate_convert_ab_only(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn accumulate_convert_with_s_hat_v(
