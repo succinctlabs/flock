@@ -242,27 +242,20 @@ circuit} --- constant-lane folds at a wired transcript point.
 The twists can be moved off the claim points and onto $\rho$. Writing
 $a_d := \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c}, \colof(d))$,
 the $j$-th statement of Theorem~\ref{thm:main} is
-$\sum_d \eq(\rho, d)\, a_d^{2^j}$; since squaring is additive in
-characteristic $2$ and $\eq(\sigma, d)^2 = \eq(\sigma^2, d)$ at
-Boolean $d$ (Lemma~\ref{lem:transport} in the $\rho$-slot),
-\[
-  \textstyle\sum_d \eq(\rho, d)\, a_d^{2}
-  \;=\;
-  \bigl(\sum_d \eq(\rho^{2^{-1}}, d)\, a_d\bigr)^{2},
-\]
-and iterating,
+$\sum_d \eq(\rho, d)\, a_d^{2^j}$; pulling the $2^j$-th root through
+the sum (Frobenius is additive, and
+$\eq(\sigma, d)^{2^{-j}} = \eq(\sigma^{2^{-j}}, d)$ at Boolean $d$ ---
+Lemma~\ref{lem:transport} in the $\rho$-slot),
 \[
   \fjag\bigl(z_{\mathrm r}^{2^j}, z_{\mathrm c}^{2^j}, \rho\bigr)
   \;=\;
   \fjag\bigl(z_{\mathrm r}, z_{\mathrm c}, \rho^{2^{-j}}\bigr)^{2^j},
 \]
-where $\rho^{2^{-j}}$ is the coordinate-wise $j$-fold Frobenius
-inverse (iterated square roots --- cheap linear maps). In this form
-all $128$ statements evaluate the \emph{single untwisted} jagged
-multilinear at $128$ derived points: the batched assist is a
-multipoint-evaluation argument for $\fjag(z_{\mathrm r}, z_{\mathrm c},
-\cdot)$, and every $z$-side quantity in the assist (column weights,
-the $z$-half of each transition weight) becomes statement-independent.
+with $\rho^{2^{-j}}$ the coordinate-wise Frobenius inverse (iterated
+square roots --- cheap linear maps). In this form all $128$ statements
+evaluate the \emph{single untwisted} jagged multilinear at $128$
+derived points: a multipoint-evaluation problem for
+$\fjag(z_{\mathrm r}, z_{\mathrm c}, \cdot)$.
 No formulation collapses the family further: expanding the twisted
 factors over an $\Ftwo$-basis writes the $128$ statement values as the
 image, under the invertible Moore matrix, of $128$ independent
@@ -493,9 +486,9 @@ The deployed claim set is mixed: alongside the $K$ ring-switched
 claims, element and circuit proofs leave \emph{packed-direct} claims,
 whose fold map is the $\F$-scalar $\Phi(x) = \gamma x$ ---
 $\Ftwo$-linear, so they enter the merged reduction of
-\S\ref{sec:merged} through the same weight builder (one sweep against
-a pre-combined $\gamma$-summed column table serves a whole group), and
-the builder cannot tell them apart. In this protocol their batch width
+\S\ref{sec:merged} through the same weight builder (one sweep per
+group against its pre-combined column table), which cannot tell them
+apart. In this protocol their batch width
 collapses: $c_j = 0$ past index $0$, so a packed-direct claim costs a
 single \emph{untwisted} value, and claims sharing a row point merge by
 $\F$-homogeneity into one \emph{scalar group} costing one value in
@@ -542,8 +535,7 @@ $k \gtrsim h/\log h$.
 A prototype confirms all of it ($m = 23$, $K = 2$, Apple silicon;
 exact-value tests against the brute-force twisted weight, including
 non-power-of-two strided shapes): prove totals $17 / 24 / 31$\,ms
-across $368 / 4096 / 32768$ columns --- and $29$\,ms at $27962$
-columns of height $300$, the non-power-of-two stride --- of which the
+across $368 / 4096 / 32768$ columns, of which the
 dense passes and sumcheck hold flat at ${\approx}15$\,ms, the values
 are $2 / 7.5 / 8.9$\,ms, and the single anchor assist is
 $0.4 / 1.7 / 7$\,ms (column-parallelized past ${\sim}2^{14}$ columns,
@@ -670,60 +662,51 @@ work are unchanged.
 M1~Max, all cores).} The weight build ($25$~ms) is gone; the merged
 sumcheck falls from $46$~ms to $14$~ms ($3.6$ statistics $+\ 9.5$ block
 rounds, $q'$ and $W'$ $+\ 1$ row rounds). Two costs move against it: the
-C claim's bit-bank fold ($13.6$~ms, outside the open) and the loss of
-the statistics-ladder seed (the ladder's seeded term was the merged
-sumcheck's fold at $2^{\mathrm{initial}\_k}$ in \emph{its} coordinate
-order, which the block-first order no longer produces: $+4$~ms sweep).
+C claim's bit-bank fold ($13.6$~ms, outside the open) and the
+statistics-ladder seed the old round order produced for free
+($+4$~ms sweep).
 Measured in a paired, alternating A/B against the previous binary
 (three pairs, min of two runs each): the open drops from $137$~ms to
 $109$~ms and the whole proof by $\approx 15$~ms net of the C fold.
 
 The C fold is the transport's one cost at the lookup rate, and it has
 no cheaper form. Fusing it into the lincheck's own sweep of the same
-stripe --- a two-point kernel with $32$-byte sum-table entries holding
-both points' subset sums and sixteen accumulators, one address
-computation and two adjacent loads per stripe byte --- was built,
-bit-identical to the two single folds, and measured a wash ($-0.3$~ms
-over four alternating pairs). The reason is the kernel's regime: at
-$m = 25$ it sustains ${\approx}1.4$ table lookups per cycle per core
-($85.9$~ms on one thread, $14.4$ on eight, $37$~GB/s of stripe), so it
-is bound by the core's extract--address--load--XOR chain and not by
-memory, and a second point costs its own load and XOR per byte while
-sharing only the addressing (${\approx}5\%$ of the work). With the $q'$
-fold ($5$~ms) and the ladder's seed sweep ($4$~ms) already at the
-multiply rate, the ${\approx}13$~ms that stage~1 still pays over the
-open proper is the protocol's shape, not an implementation gap.
+stripe (a two-point kernel sharing the per-byte addressing) was
+built, bit-identical, and measured a wash ($-0.3$~ms over four
+alternating pairs): at $m = 25$ the kernel sustains ${\approx}1.4$
+table lookups per cycle per core --- bound by the
+extract--address--load--XOR chain, not by memory ($37$~GB/s of
+stripe) --- so a second point costs its own load and XOR per byte and
+shares only the addressing (${\approx}5\%$ of the work). With the
+$q'$ fold and the ladder seed already at the multiply rate, the
+${\approx}13$~ms that stage~1 still pays over the open proper is the
+protocol's shape, not an implementation gap.
 
 \paragraph{What remains: the full fusion, built and parked.} The row
 rounds still fold $(q', W')$ at $2^{n+1}$ and the inner Ligerito
 opening of $\hat q(\rho)$ still runs on the committed data. The full
 fusion drops the merged sumcheck altogether and makes $W$ the
 opening's level-0 basis: its rank-one terms are exactly the statistics
-above, the opening's own six block rounds (extension-field challenges)
-bind the block coordinates, its fold yields the level-1 witness, and
-$W'$ is written in closed form with extension-field coefficients. The
-prover may then use the \emph{full-cube} weight (it defines the basis,
+above, the opening's own block rounds bind the block coordinates, and
+the \emph{full-cube} weight becomes admissible (it defines the basis,
 and $q$ vanishes on dead columns), so the verifier's evaluation of
 $\widehat W$ at the opening's point is a plain product of twisted eq
 factors, count-independent, and the assist leaves the transcript. We
 built this (prover and native verifier): the open gains $5$--$8$~ms at
-$m = 25$ (the $513$-term extension-field ladder rounds and the
-extension-field $W'$ cost $\approx 5$~ms), the proof shrinks by $8$~KB,
-the native verifier is at parity. The recursive verifier is where it
-stops: at the opening's extension-field point every form of $\widehat W$
-is extension-field work with no prover-assisted batching of the $128$
-twists, and the residual pairing does not twist for free either --- the
-residual witness's multilinear extension has base-field
-\emph{coefficients}, and Frobenius is only $\F_2$-linear, so it must be
-evaluated at all $128$ twisted points (in monomial form, $2^{r}$ squaring
-chains and $128 \cdot 2^{r}$ multiply-accumulates per column bit for $r$
-residual rows). That is about $+8.5$k rows per chain child, twelve
-percent of the region, against the $14.5$k the assist and merged rounds
-free; it fits the row-type ceilings only by packing three extension
-types near full. For a one-percent leaf gain the trade was declined and
-the work is parked as a patch. The partial-utilization case would need
-the rank-one split under the jagged twist, which the twist does not
-admit column by column; there the materialized weight stays.
+$m = 25$, the proof shrinks by $8$~KB, the native verifier is at
+parity. The recursive verifier is where it stops: at the opening's
+extension-field point there is no prover-assisted batching of the
+$128$ twists, and the residual pairing does not twist for free either
+--- the residual witness's multilinear extension has base-field
+\emph{coefficients}, and Frobenius is only $\F_2$-linear, so it must
+be evaluated at all $128$ twisted points. That is about $+8.5$k rows
+per chain child, twelve percent of the region, against the $14.5$k
+the assist and merged rounds free; it fits the row-type ceilings only
+by packing three extension types near full. For a one-percent leaf
+gain the trade was declined and the work is parked as a patch. The
+partial-utilization case would need the rank-one split under the
+jagged twist, which the twist does not admit column by column; there
+the materialized weight stays.
 
 \section{Implementation}\label{sec:eval}
 
