@@ -21,9 +21,9 @@
 
 \title{Capacity-Free Ring Switching for Jagged\\ Polynomial Commitments}
 \author{DRAFT --- author list and references to be settled}
-\date{July 27, 2026 --- revised September 3, 2026\\
-{\small (the shipped claim grouping, the coefficient closed form,
-pipeline status)}}
+\date{July 27, 2026 --- revised September 10, 2026\\
+{\small (protocol only; engineering measurements live in
+\texttt{docs/yukon-optimizations.tex})}}
 
 \begin{document}
 \maketitle
@@ -354,21 +354,9 @@ on the same tree, its per-layer quadrant product
 $\eq(c,\sigma_{\mathrm c})\eq(d,\sigma_{\mathrm d})$ being likewise
 run-constant: one multiply per node against $2(m{+}1)$ per column.
 Everything here is distributivity and associativity over $\F$, so the
-transcript is bit-identical to the per-column form.
-
-Measured ($256$ statements, Apple silicon) against the per-column
-form: prove $5.3 \to 4.3$\,ms and verify $1.78 \to 0.54$\,ms at the
-worst case ($m = 23$, $368$ full-height columns, $\log n_t$ within a
-factor $1.6$ of $m$), with proportionate gains at smaller shapes. At
-$4096$ columns the collapse is sharper, the verifier especially
-(prove $68.5 \to 41.9$\,ms, verify $17.8 \to 3.5$\,ms, suffix state
-$1.7$\,GB $\to 940$\,MB) --- merely expensive rather than infeasible,
-and the crossover stands: the multipoint protocol proves the same
-statement in $24$\,ms in total. The single-statement assist ---
-\S\ref{sec:multipoint}'s anchor --- runs the same tree: $0.15 \to
-0.06$\,ms at $m = 21$, flat at thousands of columns where its
-per-layer column pass already fills the pool, its verifier still
-gaining $2.8\times$.
+transcript is bit-identical to the per-column form; the
+single-statement assist --- \S\ref{sec:multipoint}'s anchor --- runs
+the same tree.
 
 \begin{theorem}[soundness, sketch]\label{thm:soundness}
 Against the committed $q$: if the ring-switching statement is false
@@ -532,32 +520,15 @@ the whole run --- times a high suffix that changes rarely. That is
 $O(1)$ per column after an $O(h)$ table, a win whenever
 $k \gtrsim h/\log h$.
 
-A prototype confirms all of it ($m = 23$, $K = 2$, Apple silicon;
-exact-value tests against the brute-force twisted weight, including
-non-power-of-two strided shapes): prove totals $17 / 24 / 31$\,ms
-across $368 / 4096 / 32768$ columns, of which the
-dense passes and sumcheck hold flat at ${\approx}15$\,ms, the values
-are $2 / 7.5 / 8.9$\,ms, and the single anchor assist is
-$0.4 / 1.7 / 7$\,ms (column-parallelized past ${\sim}2^{14}$ columns,
-and now also run-collapsed by the tree of \S\ref{par:runtree}; the
-largest remaining column-linear term). Verification measures
-$0.3 / 0.6 / 1.7$\,ms. The batched assist measures $5.5$\,ms at $368$
-columns and is memory-infeasible past a few thousand. Fused into the
-surrounding merged opening (shared dense context, byte-identical
-proofs), the marginal cost is $12 / 18 / 26$\,ms --- a net
-${\approx}5$--$8$\,ms saving over composing the standalone parts.
-
 \section{The prover's transport: block-first rounds from column
 statistics}\label{sec:blockfirst}
 
 Sections~\ref{sec:merged}--\ref{sec:protocol} price the
 \emph{verifier's} side of the merged reduction. On the prover's side
 the reduction as first implemented materializes $W$ over the dense cube
-and runs the $m$ product-sumcheck rounds on the pair $(q, W)$: at
-$m = 25$ (the BLAKE3 union of $2^{18}$ compressions) that is a
-$2^{25}$-word weight build ($\approx 25$~ms, one fold-table
-application per word and claim) plus $2^{25}$-length rounds
-($\approx 21$~ms). Both are avoidable. The weight is a sum of
+and runs the $m$ product-sumcheck rounds on the pair $(q, W)$ --- a
+full-domain weight build (one fold-table application per word and
+claim) plus full-length rounds. Both are avoidable. The weight is a sum of
 \emph{rank-one} terms across a block/row split of the dense index, and
 the sumcheck may bind the block coordinates first: those rounds then
 need only $O(2^{k})$ \emph{block statistics} per term --- a Frobenius
@@ -628,9 +599,9 @@ exactly the lincheck's own partial fold (the vector from which the
 ring switch's $\hat s_v$ is read), so the AB statistics cost nothing
 beyond a $128 \times 128$ transform per block; the C claim's row point
 is the zerocheck's, and its bank is one more stripe fold with the
-lincheck's kernel ($\approx 13$~ms at $m = 25$, outside the open). Given
+lincheck's kernel, outside the open. Given
 $T$, the $256$ statistics vectors of a claim cost $2^{k-1}\cdot 128^2$
-multiplications plus Frobenius powers --- $3.6$~ms for two claims.
+multiplications plus Frobenius powers.
 
 \paragraph{Rounds.} Rounds $0..k{-}2$ bind the block coordinates
 (LSB-first within $e$): each message is $\sum_{\text{terms}} \sum_{e}
@@ -658,98 +629,51 @@ is order-free; it applies the same rotation under the same predicate,
 as does the recursive verifier's replay. Proof size and the verifier's
 work are unchanged.
 
-\paragraph{Cost at $m = 25$ (BLAKE3, $2^{18}$ compressions,
-M1~Max, all cores).} The weight build ($25$~ms) is gone; the merged
-sumcheck falls from $46$~ms to $14$~ms ($3.6$ statistics $+\ 9.5$ block
-rounds, $q'$ and $W'$ $+\ 1$ row rounds). Two costs move against it: the
-C claim's bit-bank fold ($13.6$~ms, outside the open) and the
-statistics-ladder seed the old round order produced for free
-($+4$~ms sweep).
-Measured in a paired, alternating A/B against the previous binary
-(three pairs, min of two runs each): the open drops from $137$~ms to
-$109$~ms and the whole proof by $\approx 15$~ms net of the C fold.
-
-The C fold is the transport's one cost at the lookup rate, and it has
-no cheaper form. Fusing it into the lincheck's own sweep of the same
-stripe (a two-point kernel sharing the per-byte addressing) was
-built, bit-identical, and measured a wash ($-0.3$~ms over four
-alternating pairs): at $m = 25$ the kernel sustains ${\approx}1.4$
-table lookups per cycle per core --- bound by the
-extract--address--load--XOR chain, not by memory ($37$~GB/s of
-stripe) --- so a second point costs its own load and XOR per byte and
-shares only the addressing (${\approx}5\%$ of the work). With the
-$q'$ fold and the ladder seed already at the multiply rate, the
-${\approx}13$~ms that stage~1 still pays over the open proper is the
-protocol's shape, not an implementation gap.
-
-\paragraph{What remains: the full fusion, built and parked.} The row
-rounds still fold $(q', W')$ at $2^{n+1}$ and the inner Ligerito
-opening of $\hat q(\rho)$ still runs on the committed data. The full
-fusion drops the merged sumcheck altogether and makes $W$ the
-opening's level-0 basis: its rank-one terms are exactly the statistics
-above, the opening's own block rounds bind the block coordinates, and
-the \emph{full-cube} weight becomes admissible (it defines the basis,
-and $q$ vanishes on dead columns), so the verifier's evaluation of
+\paragraph{The full fusion, and why it stops.} The row rounds still
+fold $(q', W')$ at $2^{n+1}$ and the inner Ligerito opening of
+$\hat q(\rho)$ still runs on the committed data. The full fusion
+drops the merged sumcheck altogether and makes $W$ the opening's
+level-0 basis: its rank-one terms are exactly the statistics above,
+the opening's own block rounds bind the block coordinates, and the
+\emph{full-cube} weight becomes admissible (it defines the basis, and
+$q$ vanishes on dead columns), so the verifier's evaluation of
 $\widehat W$ at the opening's point is a plain product of twisted eq
-factors, count-independent, and the assist leaves the transcript. We
-built this (prover and native verifier): the open gains $5$--$8$~ms at
-$m = 25$, the proof shrinks by $8$~KB, the native verifier is at
-parity. The recursive verifier is where it stops: at the opening's
+factors, count-independent, and the assist leaves the transcript.
+The obstruction is the recursive verifier: at the opening's
 extension-field point there is no prover-assisted batching of the
 $128$ twists, and the residual pairing does not twist for free either
 --- the residual witness's multilinear extension has base-field
 \emph{coefficients}, and Frobenius is only $\F_2$-linear, so it must
-be evaluated at all $128$ twisted points. That is about $+8.5$k rows
-per chain child, twelve percent of the region, against the $14.5$k
-the assist and merged rounds free; it fits the row-type ceilings only
-by packing three extension types near full. For a one-percent leaf
-gain the trade was declined and the work is parked as a patch. The
-partial-utilization case would need the rank-one split under the
-jagged twist, which the twist does not admit column by column; there
-the materialized weight stays.
+be evaluated at all $128$ twisted points. The native build was
+declined on that row budget and parked. The partial-utilization case
+would need the rank-one split under the jagged twist, which the twist
+does not admit column by column; there the materialized weight stays.
+
+The transport's measured costs, and the experiments around it (the
+C-fold fusion, the parked full fusion), are recorded in the
+optimizations note (\texttt{docs/yukon-optimizations.tex},
+\S\emph{Block-first merged sumcheck from column statistics}).
 
 \section{Implementation}\label{sec:eval}
 
 The construction is implemented in the Flock proof system (batch-hash
 proving over $\F_{2^{128}}$, jagged integer-lane Ligerito commitment
 \cite{ligero,ligerito}) --- originally side by side with the standard
-pipeline, which supplied the comparison below and has since been
-retired: the merged reduction, opened through the two-product
-multipoint transport of Remark~\ref{rem:grouping}, is now the only
-path in-tree.
-Theorem~\ref{thm:main}, the coefficient extraction, and the batched
-assist are each pinned by exact tests against brute-force oracles
-(random non-power-of-two heights, zero-height columns, powers through
-$j = 40$); the full pipeline round-trips with a tamper matrix on real
-mixed instances. At a production-scale workload ($2^{30}$-bit virtual
-domain at the right-sized capacity tier), the standard pipeline's
-ring-switching stage measured $12.3 / 23.0 / 44.7$\,ms at
-$100\%/50\%/25\%$ utilization --- linear in the virtual domain ---
-while the merged pipeline's corresponding stages
-($\Phi$-pass ${\approx}4$\,ms, merged sumcheck ${\approx}4$\,ms,
-batched assist ${\approx}7$\,ms at $K = 2$) are tier-independent: prove-time
-growth from the right-sized to the $4\times$ tier is $+14$\,ms versus
-$+41$\,ms, with right-sized totals at parity and the standard
-pipeline's multi-hundred-MB weight transient eliminated. Verifier
-overhead is below $1$\,ms at the deployed layout.
-
-\paragraph{Where the transport stands.} Against the retired direct
-pipeline at the same $m = 25$ shape, on the same machine, grind-free:
-the merged pipeline's open is $105$\,ms multi-threaded ($562$
-single-threaded) where the direct pipeline's was $30$ ($148$) --- two
-ring-switched claims and the merged transport in place of one direct
-open --- and its proof is $462$\,KB against $437$. The prove as a whole
-is nonetheless ahead on both thread counts ($438$ vs $459$\,ms;
-$2.91$ vs $3.28$\,s), because the commit is $42\%$ cheaper and the
-zerocheck faster; the open is the one phase that costs more, and what
-remains in it after the block-first rounds is the protocol (the
-recursive levels, the level OODs, the transport's $\approx 13$\,ms
-tax above). For an external reference, an independently optimized
-fork of the direct pipeline (the \emph{flock-challenge} frontier:
-$\F$ statement, SHA-256 Merkle, $19$-bit fold grinding, no union, a
-GPU commit) proves the same $2^{18}$ compressions here in $266$\,ms
-with its GPU, $384$--$407$ without, and $2.86$\,s single-threaded ---
-equal CPU work, a parallel-efficiency edge on the CPU, and the GPU.
+pipeline, since retired: the merged reduction, opened through the
+two-product multipoint transport of Remark~\ref{rem:grouping}, is the
+only path in-tree. Theorem~\ref{thm:main}, the coefficient
+extraction, and the batched assist are each pinned by exact tests
+against brute-force oracles; the full pipeline round-trips with a
+tamper matrix on real mixed instances. The construction's defining
+measurement: at a $2^{30}$-bit virtual domain, the standard
+pipeline's ring-switching stage was linear in the virtual domain
+($12.3 / 23.0 / 44.7$\,ms at $100\%/50\%/25\%$ utilization) while the
+merged stages are tier-independent ($+14$\,ms versus $+41$\,ms of
+prove-time growth from the right-sized to the $4\times$ tier), with
+the standard pipeline's multi-hundred-MB weight transient eliminated
+and verifier overhead below $1$\,ms. All other measurements ---
+transport costs, pipeline standings, the experiments around both ---
+live in the optimizations note.
 
 \begin{remark}
 The technique needs only an $\Ftwo$-linear per-word fold map, an
