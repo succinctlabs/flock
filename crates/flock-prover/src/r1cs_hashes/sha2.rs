@@ -1456,7 +1456,7 @@ struct BmRows<'a> {
 
 /// z = a = v, b = all-ones (free-witness tautology rows).
 #[inline(always)]
-fn bm_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
+fn batch_major_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
     or_u32_row(rows.z, bit, vals);
     or_u32_row(rows.a, bit, vals);
     or_u32_row(rows.b, bit, &[0xFFFF_FFFF; BM_V]);
@@ -1464,7 +1464,7 @@ fn bm_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
 
 /// Inline add: carry rows only.
 #[inline(always)]
-fn bm_add_inline(
+fn batch_major_add_inline(
     rows: &mut BmRows<'_>,
     x: &[u32; BM_V],
     y: &[u32; BM_V],
@@ -1481,7 +1481,13 @@ fn bm_add_inline(
 /// [`build_block_ab_packed_into`] field-for-field (the lockstep test below
 /// pins byte-equality against the row-major driver).
 #[inline(always)]
-fn bm_triple(rows: &mut BmRows<'_>, bit: usize, l: &[u32; BM_V], r: &[u32; BM_V], p: &[u32; BM_V]) {
+fn batch_major_triple(
+    rows: &mut BmRows<'_>,
+    bit: usize,
+    l: &[u32; BM_V],
+    r: &[u32; BM_V],
+    p: &[u32; BM_V],
+) {
     or_u32_row(rows.z, bit, p);
     or_u32_row(rows.a, bit, l);
     or_u32_row(rows.b, bit, r);
@@ -1490,7 +1496,7 @@ fn bm_triple(rows: &mut BmRows<'_>, bit: usize, l: &[u32; BM_V], r: &[u32; BM_V]
 /// V-wide fused 4-operand add: maj1/maj2/ripple triples at the given bits.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn bm_fused_add4(
+fn batch_major_fused_add4(
     rows: &mut BmRows<'_>,
     x: &[u32; BM_V],
     y: &[u32; BM_V],
@@ -1513,15 +1519,15 @@ fn bm_fused_add4(
             rp[t][j] = a3[t];
         }
     }
-    bm_triple(rows, maj1_bit, &m1[0], &m1[1], &m1[2]);
-    bm_triple(rows, maj2_bit, &m2[0], &m2[1], &m2[2]);
-    bm_triple(rows, rip_bit, &rp[0], &rp[1], &rp[2]);
+    batch_major_triple(rows, maj1_bit, &m1[0], &m1[1], &m1[2]);
+    batch_major_triple(rows, maj2_bit, &m2[0], &m2[1], &m2[2]);
+    batch_major_triple(rows, rip_bit, &rp[0], &rp[1], &rp[2]);
     sum
 }
 
 /// V-wide fused 3-operand add.
 #[inline(always)]
-fn bm_fused_add3(
+fn batch_major_fused_add3(
     rows: &mut BmRows<'_>,
     x: &[u32; BM_V],
     y: &[u32; BM_V],
@@ -1540,14 +1546,19 @@ fn bm_fused_add3(
             rp[t][j] = a2[t];
         }
     }
-    bm_triple(rows, maj_bit, &mj[0], &mj[1], &mj[2]);
-    bm_triple(rows, rip_bit, &rp[0], &rp[1], &rp[2]);
+    batch_major_triple(rows, maj_bit, &mj[0], &mj[1], &mj[2]);
+    batch_major_triple(rows, rip_bit, &rp[0], &rp[1], &rp[2]);
     sum
 }
 
 /// V-wide constant add `k + y`.
 #[inline(always)]
-fn bm_const_add(rows: &mut BmRows<'_>, k: u32, y: &[u32; BM_V], bit: usize) -> [u32; BM_V] {
+fn batch_major_const_add(
+    rows: &mut BmRows<'_>,
+    k: u32,
+    y: &[u32; BM_V],
+    bit: usize,
+) -> [u32; BM_V] {
     let mut sum = [0u32; BM_V];
     let mut tr = [[0u32; BM_V]; 3];
     for j in 0..BM_V {
@@ -1557,7 +1568,7 @@ fn bm_const_add(rows: &mut BmRows<'_>, k: u32, y: &[u32; BM_V], bit: usize) -> [
         tr[1][j] = r;
         tr[2][j] = p;
     }
-    bm_triple(rows, bit, &tr[0], &tr[1], &tr[2]);
+    batch_major_triple(rows, bit, &tr[0], &tr[1], &tr[2]);
     sum
 }
 
@@ -1580,17 +1591,17 @@ fn build_group_batch_major(
     or_bit_row(rows.b, Z_CONST_POS);
 
     for w in 0..H_WORDS {
-        bm_write_lin(&mut rows, h_bit(w, 0), &h_in[w]);
+        batch_major_write_lin(&mut rows, h_bit(w, 0), &h_in[w]);
     }
     for i in 0..M_WORDS {
-        bm_write_lin(&mut rows, m_bit(i, 0), &m[i]);
+        batch_major_write_lin(&mut rows, m_bit(i, 0), &m[i]);
     }
 
     // Message schedule.
     let mut w_sched: Vec<[u32; BM_V]> = Vec::with_capacity(64);
     w_sched.extend_from_slice(&m);
     for t in 16..64 {
-        let w_t = bm_fused_add4(
+        let w_t = batch_major_fused_add4(
             &mut rows,
             &map_v(&w_sched[t - 2], small_sigma1),
             &map_v(&w_sched[t - 15], small_sigma0),
@@ -1628,8 +1639,8 @@ fn build_group_batch_major(
         or_u32_row(rows.b, maj_and_bit(r, 0), &c_xor_a);
         let maj_out = xor_v(&maj_and_v, &aa);
 
-        let hk = bm_const_add(&mut rows, SHA256_K[r], &hh, round_bit(r, RC_ADDK));
-        let t1 = bm_fused_add4(
+        let hk = batch_major_const_add(&mut rows, SHA256_K[r], &hh, round_bit(r, RC_ADDK));
+        let t1 = batch_major_fused_add4(
             &mut rows,
             &hk,
             &map_v(&ee, big_sigma1),
@@ -1639,7 +1650,7 @@ fn build_group_batch_major(
             round_bit(r, RC_MAJ2),
             round_bit(r, RC_RIP),
         );
-        let a_new = bm_fused_add3(
+        let a_new = batch_major_fused_add3(
             &mut rows,
             &t1,
             &map_v(&aa, big_sigma0),
@@ -1647,10 +1658,10 @@ fn build_group_batch_major(
             round_bit(r, RC_AMAJ),
             round_bit(r, RC_ARIP),
         );
-        let e_new = bm_add_inline(&mut rows, &dd, &t1, round_bit(r, RC_ENEW));
+        let e_new = batch_major_add_inline(&mut rows, &dd, &t1, round_bit(r, RC_ENEW));
         if r % EA_PERIOD == EA_PERIOD - 1 {
-            bm_write_lin(&mut rows, a_new_bit(r, 0), &a_new);
-            bm_write_lin(&mut rows, e_new_bit(r, 0), &e_new);
+            batch_major_write_lin(&mut rows, a_new_bit(r, 0), &a_new);
+            batch_major_write_lin(&mut rows, e_new_bit(r, 0), &e_new);
         }
 
         hh = gg;
@@ -1666,8 +1677,8 @@ fn build_group_batch_major(
     // Output feed-forward.
     let final_state = [aa, bb, cc, dd, ee, ff, gg, hh];
     for w in 0..N_OUT_WORDS {
-        let sum = bm_add_inline(&mut rows, &final_state[w], &h_in[w], out_carry_bit(w, 0));
-        bm_write_lin(&mut rows, h_out_bit(w, 0), &sum);
+        let sum = batch_major_add_inline(&mut rows, &final_state[w], &h_in[w], out_carry_bit(w, 0));
+        batch_major_write_lin(&mut rows, h_out_bit(w, 0), &sum);
     }
 }
 
@@ -2182,7 +2193,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn cv_to_phys_bits_roundtrips() {
+    fn chaining_value_to_phys_bits_roundtrips() {
         // Round-trip a fixed CV through bool-pack and assert the per-word bits
         // are recovered (sanity check on the within-slot layout convention).
         let cv: [u32; 8] = [

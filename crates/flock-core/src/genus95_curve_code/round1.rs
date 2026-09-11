@@ -1,4 +1,4 @@
-//! Production round-1 AG-code URM kernel — eq-folded encode·product·fold, fused
+//! Production round-1 AG-code univariate round message kernel — eq-folded encode·product·fold, fused
 //! AB+C in a single pass over the witness.
 //!
 //! Lifted verbatim from `benches/urm_bitslice.rs` (auto-generated genus-95
@@ -34,7 +34,7 @@ use crate::{
     field::{F128, F256Unreduced},
     genus95_curve_code::{
         messages::BaseMessage, product::extended_base_product_message,
-        slp_derived::encode_slp_derived,
+        slp_derived::encode_straight_line_program_derived,
     },
     zerocheck::BlockCoverage,
 };
@@ -451,7 +451,7 @@ pub fn round1_raw_packed(
 ) -> ([F128; 160], [F128; 64]) {
     crate::suboptimal_path!(
         "reference round-1 (raw, non-bitsliced)",
-        "round1_slp_packed_banks_fused"
+        "round1_straight_line_program_packed_banks_fused"
     );
     let ap = blocks_from_packed(a_packed);
     let bp = blocks_from_packed(b_packed);
@@ -472,13 +472,16 @@ pub fn round1_raw_packed(
 /// a/b/c, run the SLP on planes, product, fold. No *output* transpose (the SLP
 /// works on planes directly; it pays an *input* transpose instead). Output
 /// matches [`round1_raw_packed`] on the 158 fresh coords + `wbar`.
-pub fn round1_slp_packed(
+pub fn round1_straight_line_program_packed(
     a_packed: &[u8],
     b_packed: &[u8],
     c_packed: &[u8],
     eq: &[F128],
 ) -> ([F128; 160], [F128; 64]) {
-    crate::suboptimal_path!("unfused SLP round-1", "round1_slp_packed_banks_fused");
+    crate::suboptimal_path!(
+        "unfused SLP round-1",
+        "round1_straight_line_program_packed_banks_fused"
+    );
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
     let nthreads = current_num_threads().max(1);
@@ -593,8 +596,8 @@ unsafe fn process_block(
     let ap: &[uint8x16_t; 64] = (&pab[0..64]).try_into().unwrap();
     let bp: &[uint8x16_t; 64] = (&pab[64..128]).try_into().unwrap();
     unsafe {
-        encode_slp_derived(ap, af);
-        encode_slp_derived(bp, bf);
+        encode_straight_line_program_derived(ap, af);
+        encode_straight_line_program_derived(bp, bf);
         product_bs(af, bf, ap, bp, prod);
         fold_bs(prod, eq_o, res);
         fold_c(cp, eq_o, wbar);
@@ -619,8 +622,8 @@ unsafe fn process_block_fused(
     let ap: &[uint8x16_t; 64] = (&pab[0..64]).try_into().unwrap();
     let bp: &[uint8x16_t; 64] = (&pab[64..128]).try_into().unwrap();
     unsafe {
-        encode_slp_derived(ap, af);
-        encode_slp_derived(bp, bf);
+        encode_straight_line_program_derived(ap, af);
+        encode_straight_line_program_derived(bp, bf);
         product_fold_bs(af, bf, ap, bp, eq_o, res);
     }
 }
@@ -679,26 +682,29 @@ unsafe fn process_block_banks(
     let ap: &[uint8x16_t; 64] = (&pab[0..64]).try_into().unwrap();
     let bp: &[uint8x16_t; 64] = (&pab[64..128]).try_into().unwrap();
     unsafe {
-        encode_slp_derived(ap, af);
-        encode_slp_derived(bp, bf);
+        encode_straight_line_program_derived(ap, af);
+        encode_straight_line_program_derived(bp, bf);
         product_bs(af, bf, ap, bp, prod);
         fold_bs(prod, eq_o, res);
         fold_c_banks(cp, eq_o, bank0, bank1);
     }
 }
 
-/// [`round1_slp_packed`] that ALSO returns the two c-fold banks for `s_hat_v_c`
+/// [`round1_straight_line_program_packed`] that ALSO returns the two c-fold banks for `s_hat_v_c`
 /// capture (split by the 7th packing bit). `res` and `bank0 + bank1` are
-/// bit-identical to `round1_slp_packed`'s `(res, wbar)`. Kept separate from the
-/// hot `round1_slp_packed` so the standalone round-1 microbench path is
+/// bit-identical to `round1_straight_line_program_packed`'s `(res, wbar)`. Kept separate from the
+/// hot `round1_straight_line_program_packed` so the standalone round-1 microbench path is
 /// untouched; production AG prove (which needs `s_hat_v_c`) calls this.
-pub fn round1_slp_packed_banks(
+pub fn round1_straight_line_program_packed_banks(
     a_packed: &[u8],
     b_packed: &[u8],
     c_packed: &[u8],
     eq: &[F128],
 ) -> ([F128; 160], [F128; 64], [F128; 64]) {
-    crate::suboptimal_path!("unfused banks round-1", "round1_slp_packed_banks_fused");
+    crate::suboptimal_path!(
+        "unfused banks round-1",
+        "round1_straight_line_program_packed_banks_fused"
+    );
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
     let nthreads = current_num_threads().max(1);
@@ -849,11 +855,11 @@ fn transpose_fold_c_banks_2src(
     }
 }
 
-/// PROTOTYPE fused [`round1_slp_packed_banks`]: fused product+fold (no `prod`
+/// PROTOTYPE fused [`round1_straight_line_program_packed_banks`]: fused product+fold (no `prod`
 /// buffer), banked c-fold straight out of the c-transpose registers (no `pc`
 /// buffer), NEON-resident lazy reduction (reduce once per chunk). Bit-identical
-/// to [`round1_slp_packed_banks`] on `(res, bank0, bank1)`.
-pub fn round1_slp_packed_banks_fused(
+/// to [`round1_straight_line_program_packed_banks`] on `(res, bank0, bank1)`.
+pub fn round1_straight_line_program_packed_banks_fused(
     a_packed: &[u8],
     b_packed: &[u8],
     c_packed: &[u8],
@@ -958,7 +964,7 @@ pub fn round1_slp_packed_banks_fused(
         )
 }
 
-/// [`round1_slp_packed_banks_fused`] over a witness run-list: ONE parallel
+/// [`round1_straight_line_program_packed_banks_fused`] over a witness run-list: ONE parallel
 /// pass over the LIVE blocks only — Dead blocks are skipped (their honest
 /// contribution is zero), Partial blocks are cleansed into zeroed scratch
 /// inline ([`crate::zerocheck::cleanse_block`], so no declared-dead bit is
@@ -968,7 +974,7 @@ pub fn round1_slp_packed_banks_fused(
 /// cost matches the dense kernel — no per-segment call barriers (the
 /// segment-wrapper prototype paid ~450 rayon bridges at the envelope's
 /// per-column run structure and LOST to the dense scan).
-pub fn round1_slp_packed_banks_fused_padded(
+pub fn round1_straight_line_program_packed_banks_fused_padded(
     a_packed: &[u8],
     b_packed: &[u8],
     c_packed: &[u8],
@@ -1168,8 +1174,9 @@ mod tests {
             product::extended_base_product_message,
             product_code_message,
             round1::{
-                F128, derived_m, round1_raw_packed, round1_slp_packed, round1_slp_packed_banks,
-                round1_slp_packed_banks_fused,
+                F128, derived_m, round1_raw_packed, round1_straight_line_program_packed,
+                round1_straight_line_program_packed_banks,
+                round1_straight_line_program_packed_banks_fused,
             },
         },
         test_rng::Rng,
@@ -1229,9 +1236,9 @@ mod tests {
     }
 
     /// The Paar SLP path equals the trusted `encode_direct` path — validates the
-    /// generated `slp_derived::encode_slp_derived` against the derived `M`.
+    /// generated `slp_derived::encode_straight_line_program_derived` against the derived `M`.
     #[test]
-    fn round1_slp_matches_raw() {
+    fn round1_straight_line_program_matches_raw() {
         let mut rng = Rng(0x9ABC_DEF0);
         // Cover even n (all block-pairs) and odd n (exercises the trailing
         // single-block path via odd-length chunks).
@@ -1253,7 +1260,7 @@ mod tests {
                 })
                 .collect();
 
-            let (slp_ab, slp_w) = round1_slp_packed(&a, &b, &c, &eq);
+            let (slp_ab, slp_w) = round1_straight_line_program_packed(&a, &b, &c, &eq);
             let (raw_ab, raw_w) = round1_raw_packed(&a, &b, &c, &eq);
             assert!(
                 (0..158).all(|s| slp_ab[s] == raw_ab[s]),
@@ -1266,10 +1273,10 @@ mod tests {
         }
     }
 
-    /// PROTOTYPE: the fused banks path ([`round1_slp_packed_banks_fused`]) is
-    /// bit-identical to [`round1_slp_packed_banks`] on res + both banks.
+    /// PROTOTYPE: the fused banks path ([`round1_straight_line_program_packed_banks_fused`]) is
+    /// bit-identical to [`round1_straight_line_program_packed_banks`] on res + both banks.
     #[test]
-    fn round1_slp_banks_fused_matches_banks() {
+    fn round1_straight_line_program_banks_fused_matches_banks() {
         let mut rng = Rng(0xBA2C_F05E);
         for n in [4usize, 3, 5, 1, 16] {
             let mk = |rng: &mut Rng| -> Vec<u8> {
@@ -1289,8 +1296,8 @@ mod tests {
                 })
                 .collect();
 
-            let (ab, b0, b1) = round1_slp_packed_banks(&a, &b, &c, &eq);
-            let (fab, f0, f1) = round1_slp_packed_banks_fused(&a, &b, &c, &eq);
+            let (ab, b0, b1) = round1_straight_line_program_packed_banks(&a, &b, &c, &eq);
+            let (fab, f0, f1) = round1_straight_line_program_packed_banks_fused(&a, &b, &c, &eq);
             assert!(
                 (0..160).all(|s| ab[s] == fab[s]),
                 "fused banks res != res (n={n})"
@@ -1302,12 +1309,12 @@ mod tests {
         }
     }
 
-    /// The two-bank c-fold ([`round1_slp_packed_banks`]) reconstitutes the same
-    /// AB message and the same `wbar` as [`round1_slp_packed`]: `res` identical
+    /// The two-bank c-fold ([`round1_straight_line_program_packed_banks`]) reconstitutes the same
+    /// AB message and the same `wbar` as [`round1_straight_line_program_packed`]: `res` identical
     /// and `bank0[k] + bank1[k] == wbar[k]` (the even/odd bit split is a partition
     /// of `pf`, so the field-mult distributes back to the original fold).
     #[test]
-    fn round1_slp_banks_sum_matches_wbar() {
+    fn round1_straight_line_program_banks_sum_matches_wbar() {
         let mut rng = Rng(0x5A17_BA17);
         for n in [4usize, 3, 5, 1] {
             let mk = |rng: &mut Rng| -> Vec<u8> {
@@ -1327,8 +1334,8 @@ mod tests {
                 })
                 .collect();
 
-            let (ab, w) = round1_slp_packed(&a, &b, &c, &eq);
-            let (ab2, bank0, bank1) = round1_slp_packed_banks(&a, &b, &c, &eq);
+            let (ab, w) = round1_straight_line_program_packed(&a, &b, &c, &eq);
+            let (ab2, bank0, bank1) = round1_straight_line_program_packed_banks(&a, &b, &c, &eq);
             assert!((0..158).all(|s| ab[s] == ab2[s]), "banks AB != AB (n={n})");
             assert!(
                 (0..64).all(|k| bank0[k] + bank1[k] == w[k]),
@@ -1339,10 +1346,10 @@ mod tests {
 
     /// CODEGEN: Paar greedy SLP for the derived `M`, emitted to
     /// `src/genus95_curve_code/slp_derived.rs`. Run:
-    /// `cargo test --release --lib _generate_slp_derived -- --ignored --nocapture`.
+    /// `cargo test --release --lib _generate_straight_line_program_derived -- --ignored --nocapture`.
     #[ignore]
     #[test]
-    fn _generate_slp_derived() {
+    fn _generate_straight_line_program_derived() {
         let m = derived_m();
         // Rows over signals; signals 0..64 are the inputs. Paar repeatedly pulls
         // out the most-common co-occurring pair into a new signal (one XOR gate).
@@ -1404,14 +1411,14 @@ mod tests {
         };
         let mut src = String::new();
         src.push_str(
-            "//! AUTO-GENERATED by `round1::tests::_generate_slp_derived` — Paar greedy\n",
+            "//! AUTO-GENERATED by `round1::tests::_generate_straight_line_program_derived` — Paar greedy\n",
         );
         src.push_str(
             "//! straight-line program for the evaluator-derived `M` (160x64). Do not edit.\n",
         );
         src.push_str("use std::arch::aarch64::*;\n\n");
         src.push_str("#[inline(never)]\n");
-        src.push_str("pub(crate) unsafe fn encode_slp_derived(inp: &[uint8x16_t; 64], out: &mut [uint8x16_t; 160]) {\n    unsafe {\n");
+        src.push_str("pub(crate) unsafe fn encode_straight_line_program_derived(inp: &[uint8x16_t; 64], out: &mut [uint8x16_t; 160]) {\n    unsafe {\n");
         for (g, &(a, b)) in gates.iter().enumerate() {
             src.push_str(&format!(
                 "        let s{} = veorq_u8({}, {});\n",

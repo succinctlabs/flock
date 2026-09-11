@@ -1278,7 +1278,7 @@ mod tests {
     /// is preserved — sampling after PoW gives identical challenges on both
     /// sides.
     #[test]
-    fn fs_challenger_pow_roundtrip() {
+    fn fiat_shamir_challenger_pow_roundtrip() {
         for kind in KINDS {
             for bits in [0u32, 5, 10, 14] {
                 let mut prover = FsChallenger::with_hash(b"pow-test", kind);
@@ -1304,7 +1304,7 @@ mod tests {
 
     /// `verify_pow` rejects a wrong nonce when grinding bits > 0.
     #[test]
-    fn fs_challenger_pow_rejects_wrong_nonce() {
+    fn fiat_shamir_challenger_pow_rejects_wrong_nonce() {
         for kind in KINDS {
             let mut prover = FsChallenger::with_hash(b"pow-test", kind);
             prover.observe_bytes(b"root");
@@ -1324,7 +1324,7 @@ mod tests {
     /// (what `grind_pow(0)` emits) but rejects any non-zero nonce, so a proof
     /// can't be made malleable by swapping in an arbitrary nonce.
     #[test]
-    fn fs_challenger_pow_zero_bits_requires_canonical_nonce() {
+    fn fiat_shamir_challenger_pow_zero_bits_requires_canonical_nonce() {
         for kind in KINDS {
             let mk = || {
                 let mut ch = FsChallenger::with_hash(b"pow-test", kind);
@@ -1347,7 +1347,7 @@ mod tests {
     /// default flip a deliberate, test-visible event rather than a silent
     /// transcript change.
     #[test]
-    fn fs_challenger_new_defaults_to_blake3() {
+    fn fiat_shamir_challenger_new_defaults_to_blake3() {
         assert_eq!(FsChallenger::new(b"d").hash_kind(), HashKind::Blake3);
         for kind in KINDS {
             assert_eq!(FsChallenger::with_hash(b"d", kind).hash_kind(), kind);
@@ -1362,7 +1362,7 @@ mod tests {
     /// The two transcript hashes must produce different challenges from the
     /// same script — otherwise the option would be doing nothing.
     #[test]
-    fn fs_challenger_hashes_diverge() {
+    fn fiat_shamir_challenger_hashes_diverge() {
         let script = |ch: &mut FsChallenger| {
             ch.observe_label(b"phase");
             ch.observe_bytes(b"root");
@@ -1377,7 +1377,7 @@ mod tests {
     /// A verifier on the wrong transcript hash must reject: the PoW check is
     /// against a different digest, and the challenges diverge from there.
     #[test]
-    fn fs_challenger_pow_rejects_the_other_hash() {
+    fn fiat_shamir_challenger_pow_rejects_the_other_hash() {
         for kind in KINDS {
             let other = match kind {
                 HashKind::Sha256 => HashKind::Blake3,
@@ -1401,7 +1401,7 @@ mod tests {
     /// i.e. `sample_f128_vec(n)` is one XOF read of `16n` bytes, not `n`
     /// independent reads. Pins the stream layout for both hashes.
     #[test]
-    fn fs_challenger_long_squeeze_is_prefix_stable() {
+    fn fiat_shamir_challenger_long_squeeze_is_prefix_stable() {
         for kind in KINDS {
             // Two challengers on identical scripts, one squeezing 8 values and
             // one squeezing 8 values in a single call, must agree — this is
@@ -1456,7 +1456,7 @@ mod tests {
     /// Proof determinism depends on it: a different nonce is a different
     /// transcript and therefore a different proof.
     #[test]
-    fn fs_challenger_grind_returns_smallest_nonce() {
+    fn fiat_shamir_challenger_grind_returns_smallest_nonce() {
         for kind in KINDS {
             // 4 bits stays sequential; 14 crosses PARALLEL_GRIND_MIN_HASHES.
             for bits in [4u32, 14] {
@@ -1556,7 +1556,7 @@ mod tests {
     // ---- FsChallenger ------------------------------------------------------
 
     #[test]
-    fn fs_challenger_identical_scripts_produce_identical_output() {
+    fn fiat_shamir_challenger_identical_scripts_produce_identical_output() {
         for kind in KINDS {
             let mut c1 = FsChallenger::with_hash(b"flock-test", kind);
             let mut c2 = FsChallenger::with_hash(b"flock-test", kind);
@@ -1573,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_different_domains_diverge() {
+    fn fiat_shamir_challenger_different_domains_diverge() {
         for kind in KINDS {
             let mut c1 = FsChallenger::with_hash(b"flock-a", kind);
             let mut c2 = FsChallenger::with_hash(b"flock-b", kind);
@@ -1582,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_different_observations_diverge() {
+    fn fiat_shamir_challenger_different_observations_diverge() {
         for kind in KINDS {
             let mut c1 = FsChallenger::with_hash(b"flock", kind);
             let mut c2 = FsChallenger::with_hash(b"flock", kind);
@@ -1593,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_label_changes_output() {
+    fn fiat_shamir_challenger_label_changes_output() {
         for kind in KINDS {
             let mut c1 = FsChallenger::with_hash(b"flock", kind);
             let mut c2 = FsChallenger::with_hash(b"flock", kind);
@@ -1604,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_scalar_vs_slice_dont_collide() {
+    fn fiat_shamir_challenger_scalar_vs_slice_dont_collide() {
         for kind in KINDS {
             // observe_f128_slice(&[v]) must NOT produce the same state as
             // observe_f128(v) — the length prefix and kind tag must defeat this.
@@ -1618,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_two_scalars_dont_collide_with_one_slice_of_two() {
+    fn fiat_shamir_challenger_two_scalars_dont_collide_with_one_slice_of_two() {
         for kind in KINDS {
             let a = F128 { lo: 1, hi: 2 };
             let b = F128 { lo: 3, hi: 4 };
@@ -1632,7 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_sample_one_vs_sample_vec_one_differ() {
+    fn fiat_shamir_challenger_sample_one_vs_sample_vec_one_differ() {
         for kind in KINDS {
             // Squeeze tag differs (KIND_SCALAR vs KIND_SLICE+len), so a single
             // sample_f128 must not equal sample_f128_vec(1)[0].
@@ -1643,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_sample_advances_state() {
+    fn fiat_shamir_challenger_sample_advances_state() {
         for kind in KINDS {
             // After a sample, the next observation should not collapse to the
             // pre-sample state (the squeezed bytes are re-absorbed).

@@ -44,11 +44,11 @@ use crate::{
         OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ag_seed_bytes,
         assertion_mac, bytes_payload_mask, cap_payloads, cap_wires, check_residual_publics,
         circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
-        emit_boolean_reported_check, emit_element_reported_check, emit_fs_chain, emit_publics_hash,
-        emit_query_phase, emit_recombination, emit_residual_region, flatten_ops, level_geometry,
-        level_sources, observed_f256, pack8, parse_open_levels, payload_words, pin_recombination,
-        query_phase_b3_rows, replay_ligerito_spine256, squeeze_word_wire, strat_scheds,
-        walker_common,
+        emit_boolean_reported_check, emit_element_reported_check, emit_fiat_shamir_chain,
+        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region, flatten_ops,
+        level_geometry, level_sources, observed_f256, pack8, parse_open_levels, payload_words,
+        pin_recombination, query_phase_blake3_rows, replay_ligerito_spine256, squeeze_word_wire,
+        strat_scheds, walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -617,7 +617,7 @@ impl<'p> ChildTape<'p> {
                     let pt = decode_ag_point(
                         &ag_seed_bytes(chals[*seed_ch], chals[*seed_ch + 1]),
                         nonce,
-                        inner.pcs.zerocheck_grinding().ag_r1_bits(),
+                        inner.pcs.zerocheck_grinding().ag_round_one_bits(),
                     );
                     assert_eq!(
                         bool_assert.z_skip,
@@ -1506,7 +1506,7 @@ impl<'p> ChildTape<'p> {
             HashKind::Blake3,
             &strat_scheds(&inner.pcs),
         );
-        let b3_rows = trace.rows.len() + h_rows + query_phase_b3_rows(&geo);
+        let b3_rows = trace.rows.len() + h_rows + query_phase_blake3_rows(&geo);
         if var("B3_CENSUS").is_ok() {
             let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
             let blocks = trace.rows.len() - parents;
@@ -1727,11 +1727,11 @@ pub(super) struct ChildSlots {
 impl ChildSlots {
     #[cfg(test)]
     pub(super) fn new(sb: &mut ShapeBuilder, nu2: usize, spread_w: usize) -> Self {
-        Self::new_with_b3_split(sb, nu2, spread_w, false)
+        Self::new_with_blake3_split(sb, nu2, spread_w, false)
     }
 
     #[cfg(test)]
-    fn new_with_b3_split(
+    fn new_with_blake3_split(
         sb: &mut ShapeBuilder,
         nu2: usize,
         spread_w: usize,
@@ -1987,7 +1987,7 @@ pub(super) fn emit_child_region(
         sb.fixed_public_input(iv_w[0]),
         sb.fixed_public_input(iv_w[1]),
     ];
-    let (outs, ww) = emit_fs_chain(
+    let (outs, ww) = emit_fiat_shamir_chain(
         sb,
         b3_slot,
         iv2,

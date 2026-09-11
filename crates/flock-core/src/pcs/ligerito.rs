@@ -228,10 +228,10 @@ impl ProverConfig {
     }
 
     /// The L0 cap depth this config implies — the ONE rule commit-time
-    /// sizing (`PcsParams::l0_cap_depth`), the open entries'
+    /// sizing (`PcsParams::level_zero_cap_depth`), the open entries'
     /// belt-and-braces asserts, and the prover's own absorb must share:
     /// the L0 schedule's cap (top set bit).
-    pub fn l0_cap_depth(&self) -> usize {
+    pub fn level_zero_cap_depth(&self) -> usize {
         self.stratified[0].cap_depth()
     }
 }
@@ -293,8 +293,8 @@ impl VerifierConfig {
     }
 
     /// The L0 cap depth this config implies; see
-    /// [`ProverConfig::l0_cap_depth`].
-    pub fn l0_cap_depth(&self) -> usize {
+    /// [`ProverConfig::level_zero_cap_depth`].
+    pub fn level_zero_cap_depth(&self) -> usize {
         self.stratified[0].cap_depth()
     }
 }
@@ -4653,7 +4653,7 @@ pub fn recursive_prover<Ch: Challenger>(
 /// would produce at the same `(log_msg_cols_0 = log_n - initial_k, initial_k,
 /// log_inv_rates[0])`. In practice this means using `PcsParams` with
 /// `log_batch_size = config.initial_k` and `log_inv_rate = config.log_inv_rates[0]`.
-pub fn recursive_prover_with_l0<Ch: Challenger>(
+pub fn recursive_prover_with_level_zero<Ch: Challenger>(
     config: &ProverConfig,
     poly: &[F128],
     l0_codeword: Vec<F128>,
@@ -5490,7 +5490,7 @@ mod tests {
                 induce_sumcheck_poly_via_ntt, ligero_commit, merkle_paths_for, paper_ood_bits,
                 paper_per_query_bits, partial_eval_lsb, partial_eval_lsb_one, prover_config_for,
                 recursive_prover, recursive_prover_with_basis,
-                recursive_prover_with_basis_precomputed_round0, recursive_prover_with_l0,
+                recursive_prover_with_basis_precomputed_round0, recursive_prover_with_level_zero,
                 recursive_verifier, round_msg_and_eval_blocked,
                 round_msg_and_eval_eq_point_blocked, round_msg_eval_and_lookahead, round1,
                 sample_queries, transpose_forward_ntt, transpose_forward_ntt_sparse, udr_queries,
@@ -5544,7 +5544,7 @@ mod tests {
     }
 
     #[test]
-    fn l0_ood_accounting_includes_the_ring_switch_degree() {
+    fn level_zero_ood_accounting_includes_the_ring_switch_degree() {
         let cfg = LigeritoSecurityConfig::from_toml_str(include_str!(
             "../../configs/ligerito/m22_fast.toml"
         ))
@@ -6217,7 +6217,7 @@ mod tests {
             HashKind::Sha256,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"pow-test");
         let proof = recursive_prover_with_basis(
@@ -6931,7 +6931,7 @@ mod tests {
     /// End-to-end roundtrip: prover proves `poly(z) = v`, verifier accepts.
     /// R = 1 (one recursive step).
     #[test]
-    fn ligerito_r1_roundtrip_accepts() {
+    fn ligerito_round_one_roundtrip_accepts() {
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
@@ -7494,7 +7494,7 @@ mod tests {
 
         // And the proof is a real one.
         let v_cfg = verifier_config_for(log_n, 6, LigeritoProfile::Fast).unwrap();
-        let cap = wtns.cap(v_cfg.l0_cap_depth()).to_vec();
+        let cap = wtns.cap(v_cfg.level_zero_cap_depth()).to_vec();
         let mut v_ch = FsChallenger::new(b"la-test");
         assert!(recursive_verifier_with_basis_succinct(
             &v_cfg,
@@ -7569,7 +7569,7 @@ mod tests {
             HashKind::Sha256,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"basis-test");
         let proof = recursive_prover_with_basis(
@@ -8012,7 +8012,7 @@ mod tests {
             HashKind::Sha256,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"succ-cmp");
         let proof = recursive_prover_with_basis(
@@ -8158,7 +8158,7 @@ mod tests {
             HashKind::Sha256,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"ood-test");
         let proof = recursive_prover_with_basis(
@@ -8298,7 +8298,7 @@ mod tests {
             p_cfg.merkle_hash,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"m22-fast");
         let proof = recursive_prover_with_basis(
@@ -8389,7 +8389,7 @@ mod tests {
             p_cfg.merkle_hash,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"m22-blake3");
         let proof = recursive_prover_with_basis(
@@ -8469,8 +8469,9 @@ mod tests {
                 let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + 1);
                 let wtns_0 =
                     ligero_commit(&poly, log_msg_cols_0, initial_k, 1, &ntt_0, merkle_hash);
-                let initial_cap =
-                    |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+                let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
+                    wtns_0.cap(cfg.level_zero_cap_depth()).to_vec()
+                };
 
                 let mut p_ch = FsChallenger::with_hash(b"m22-matrix", fs_hash);
                 let proof = recursive_prover_with_basis(
@@ -8588,7 +8589,7 @@ mod tests {
             HashKind::Sha256,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"batched");
         let proof = recursive_prover_with_basis(
@@ -8633,11 +8634,11 @@ mod tests {
         assert!(ok, "batched-basis verifier rejected valid proof");
     }
 
-    /// `recursive_prover_with_l0` (external L0 path, for integration with
+    /// `recursive_prover_with_level_zero` (external L0 path, for integration with
     /// Flock's `pcs::commit`) produces a byte-identical proof to
     /// `recursive_prover` when given a matching pre-built L0.
     #[test]
-    fn recursive_prover_with_l0_matches_full() {
+    fn recursive_prover_with_level_zero_matches_full() {
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
@@ -8689,7 +8690,7 @@ mod tests {
             HashKind::Sha256,
         );
         let mut p_ch_b = FsChallenger::new(b"l0-test");
-        let proof_b = recursive_prover_with_l0(
+        let proof_b = recursive_prover_with_level_zero(
             &cfg,
             &poly,
             take(&mut wtns_0_external.mat),
@@ -8740,7 +8741,7 @@ mod tests {
 
     /// Mutation rejection: change one element of yr → verify should fail.
     #[test]
-    fn ligerito_r1_rejects_mutated_yr() {
+    fn ligerito_round_one_rejects_mutated_yr() {
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;

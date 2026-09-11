@@ -9,7 +9,7 @@
 //!
 //! - [`build_chain_proof`] — the LEAF: a Ligerito proof of one chain
 //!   segment (the workload).
-//! - [`build_fl_node_k`] — the FIRST-LEVEL node: adjacent chain leaves
+//! - [`build_first_level_node_k`] — the FIRST-LEVEL node: adjacent chain leaves
 //!   verified in-circuit (tape replay), their claims folded and proven as
 //!   one envelope outer.
 //! - [`build_node_outer_app`] — INTERNAL and SPINE nodes: 2->1 recursion
@@ -44,7 +44,7 @@ pub use crate::tower::{
     chain::{ChainProof, build_chain_proof},
     config::TowerConfig,
     driver::{ChainStatement, RootDischargeFailure, Tower},
-    fl_node::{FlNode, build_fl_node, build_fl_node_k},
+    fl_node::{FlNode, build_first_level_node, build_first_level_node_k},
     node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app},
     query::LeafOuter,
     verify::{
@@ -64,7 +64,9 @@ use crate::{
             ChildSlots, ChildTape, ZskipTapeRec, ZskipWires, check_child_region, emit_child_region,
             expected_child_tail_schedule,
         },
-        config::{leaf_zc_ag, outer_union, outer_zc_ag, pcs_batch_for, tower_fold_grinding},
+        config::{
+            leaf_zerocheck_ag, outer_union, outer_zerocheck_ag, pcs_batch_for, tower_fold_grinding,
+        },
         envelope::{
             ENV_ACC_MAIN_WORDS, EnvShape, EnvTail, declare_envelope_slots, env_acc_chain_base,
             env_acc_main_base, env_app_base, env_pass_base, envelope_shape, outer_lanes,
@@ -80,8 +82,8 @@ use crate::{
         },
         fs_chain::{
             MergedChain, ag_seed_bytes, assert_chain_replays, bytes_payload_mask, cw,
-            decode_ag_point, duplex_row_count_model, emit_fs_chain, emit_fs_chain_partitioned,
-            flatten_ops, merge_chain,
+            decode_ag_point, duplex_row_count_model, emit_fiat_shamir_chain,
+            emit_fiat_shamir_chain_partitioned, flatten_ops, merge_chain,
         },
         gates_blake3::{
             Blake3Gate, CHUNK_END, CHUNK_START, DOMAIN, IV, PARENT, ROOT, digest_words,
@@ -99,8 +101,8 @@ use crate::{
         },
         geometry::{
             CollapsedSlots, Lvl, balance_extra_rows, cap_payloads, cap_wires, emit_publics_hash,
-            l0_ood_z_index, level_geometry, level_query_phase_b3_rows, level_sources,
-            observed_f256, payload_words, query_phase_b3_rows, replay_ligerito_spine256,
+            level_geometry, level_query_phase_blake3_rows, level_sources, level_zero_ood_z_index,
+            observed_f256, payload_words, query_phase_blake3_rows, replay_ligerito_spine256,
             strat_scheds,
         },
         gkr::{

@@ -197,13 +197,13 @@ pub mod hash_count {
 
 /// Non-root chaining value of one BLAKE3 leaf, of any length.
 #[inline]
-pub(crate) fn blake3_leaf_cv(data: &[u8]) -> Hash {
+pub(crate) fn blake3_leaf_chaining_value(data: &[u8]) -> Hash {
     Hasher::new().update(data).finalize_non_root()
 }
 
 /// BLAKE3 parent-node chaining value of two children.
 #[inline]
-pub(crate) fn blake3_parent_cv(left: &Hash, right: &Hash) -> Hash {
+pub(crate) fn blake3_parent_chaining_value(left: &Hash, right: &Hash) -> Hash {
     merge_subtrees_non_root(left, right, Mode::Hash)
 }
 
@@ -217,7 +217,7 @@ pub fn hash_leaf(data: &[u8], kind: HashKind) -> Hash {
     }
     match kind {
         HashKind::Sha256 => Sha256::digest(data).into(),
-        HashKind::Blake3 => blake3_leaf_cv(data),
+        HashKind::Blake3 => blake3_leaf_chaining_value(data),
     }
 }
 
@@ -233,7 +233,7 @@ pub fn hash_pair(left: &Hash, right: &Hash, kind: HashKind) -> Hash {
             h.update(right);
             h.finalize().into()
         }
-        HashKind::Blake3 => blake3_parent_cv(left, right),
+        HashKind::Blake3 => blake3_parent_chaining_value(left, right),
     }
 }
 
@@ -383,7 +383,7 @@ fn blake3_hash_many<const N: usize>(
 }
 
 /// Batched BLAKE3 leaves: `out.len()` messages of `leaf_size` bytes, laid out
-/// contiguously in `data`. Equivalent to [`blake3_leaf_cv`] per leaf, for
+/// contiguously in `data`. Equivalent to [`blake3_leaf_chaining_value`] per leaf, for
 /// ANY single-chunk leaf size (`1..=1024`): eight leaves per NEON call, the
 /// last block carrying its true length. The integer-lane commit's leaves
 /// are `lanes × 16` bytes — 736 at the BLAKE3 union's m=32 (46 lanes) — and
@@ -419,7 +419,7 @@ pub(crate) fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [
         (&data[full * leaf_size..], &mut out[full..])
     };
     for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
-        *o = blake3_leaf_cv(leaf);
+        *o = blake3_leaf_chaining_value(leaf);
     }
     true
 }
@@ -432,7 +432,7 @@ pub(crate) fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
 }
 
 /// Batched BLAKE3 parent nodes: `data` is `out.len()` contiguous 64-byte
-/// (left ‖ right) child pairs. Equivalent to [`blake3_parent_cv`] per node.
+/// (left ‖ right) child pairs. Equivalent to [`blake3_parent_chaining_value`] per node.
 #[inline]
 pub(crate) fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
     blake3_hash_many::<64>(data, out, BLAKE3_PARENT, 0, 0);
@@ -469,7 +469,7 @@ pub fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash], kind:
         }
         HashKind::Blake3 => {
             for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
-                *o = blake3_leaf_cv(leaf);
+                *o = blake3_leaf_chaining_value(leaf);
             }
         }
         HashKind::Sha256 => {
@@ -547,7 +547,7 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
         HashKind::Blake3 => out
             .par_iter_mut()
             .zip(data.par_chunks(leaf_size))
-            .for_each(|(o, leaf)| *o = blake3_leaf_cv(leaf)),
+            .for_each(|(o, leaf)| *o = blake3_leaf_chaining_value(leaf)),
         HashKind::Sha256 => {
             out.par_chunks_mut(4)
                 .zip(data.par_chunks(4 * leaf_size))

@@ -298,7 +298,7 @@ fn blake3_chunk_chain_through_the_builder() {
 /// content of Fiat–Shamir.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
-fn fs_chain_circuit_derives_the_challenges() {
+fn fiat_shamir_chain_circuit_derives_the_challenges() {
     const D: &[u8] = b"flock-fs-chain-mvp";
     let nu = 8usize; // BLAKE3 kappa = 14 ⇒ M = 22; 256 rows of capacity
 
@@ -531,7 +531,7 @@ fn fs_chain_circuit_derives_the_challenges() {
 /// stack has real depth.
 #[test]
 #[ignore] // Heavy — run with `-- --ignored`.
-fn mvp_fs_chain_of_a_real_proof() {
+fn mvp_fiat_shamir_chain_of_a_real_proof() {
     const INNER: &[u8] = b"flock-union-element-v0";
     let (inner_nu, kappa, count) = (12usize, 3usize, 1usize << 12);
 

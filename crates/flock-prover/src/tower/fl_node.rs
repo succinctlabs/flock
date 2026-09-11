@@ -48,19 +48,19 @@ use crate::{
         UnionSlotProverInput, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays,
         balance_extra_rows, bytes_payload_mask, challenge_word_locs, check_ag_skip_publics,
         check_child_region, check_fold_publics, check_jagged_fold_publics, cw,
-        emit_ag_point_binding, emit_child_region, emit_fold_region, emit_fs_chain_partitioned,
-        emit_jagged_fold_region, emit_lagrange_lows, emit_recorded_pow_checks, env_acc_chain_base,
-        env_app_base, envelope_shape, expected_child_tail_schedule, flatten_ops, fold_region_ops,
-        jagged_fold_region_ops, labeled_bytes_payloads, live_element_input_from_rows,
-        locate_and_pin_folds, locate_and_pin_jagged_folds, merge_chain, native_chain, outer_lanes,
-        outer_union, outer_zc_ag, pack4, pack8, pad_envelope_counts, pcs_batch_for,
-        replay_fold_endpoints, replay_jagged_fold_endpoints, span_count_word, steady_reps,
-        tower_fold_grinding,
+        emit_ag_point_binding, emit_child_region, emit_fiat_shamir_chain_partitioned,
+        emit_fold_region, emit_jagged_fold_region, emit_lagrange_lows, emit_recorded_pow_checks,
+        env_acc_chain_base, env_app_base, envelope_shape, expected_child_tail_schedule,
+        flatten_ops, fold_region_ops, jagged_fold_region_ops, labeled_bytes_payloads,
+        live_element_input_from_rows, locate_and_pin_folds, locate_and_pin_jagged_folds,
+        merge_chain, native_chain, outer_lanes, outer_union, outer_zerocheck_ag, pack4, pack8,
+        pad_envelope_counts, pcs_batch_for, replay_fold_endpoints, replay_jagged_fold_endpoints,
+        span_count_word, steady_reps, tower_fold_grinding,
     },
     verifier::{verify_ligerito_union_circuit_ag_deferred, verify_ligerito_union_circuit_deferred},
 };
 
-/// The first-level node as a BUILDER: [`build_fl_node`]'s output. `lo` is
+/// The first-level node as a BUILDER: [`build_first_level_node`]'s output. `lo` is
 /// a real, RECURSABLE [`LeafOuter`] (BLAKE3 for both the FS chain and the
 /// Merkle trees), so the internal-node machinery ([`RealTape`],
 /// [`build_node_outer_app`]) consumes it exactly like a leaf outer; `acc` is
@@ -167,8 +167,8 @@ pub(super) fn record_chain_child_verify(cp: &ChainProof, blake_lc: &dyn Lincheck
     .expect("the chain child verifies (recorded)");
 }
 
-pub fn build_fl_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
-    build_fl_node_k(cfg, &[cp0, cp1])
+pub fn build_first_level_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
+    build_first_level_node_k(cfg, &[cp0, cp1])
 }
 
 /// The 2-ary first-level node: two adjacent chain proofs verified deferred
@@ -177,7 +177,7 @@ pub fn build_fl_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> Fl
 /// the arity LEVER, but today it is pinned to exactly two children — the
 /// split-BLAKE slot assignment (`ChildSlots::new_env` sets `b3_alt` for
 /// child 1 only) has no slots for a third child.
-pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
+pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
 
     let k_ary = cps.len();
@@ -468,7 +468,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
         ];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
         let pub_payloads = bytes_payload_mask(&ops);
-        let (chain_outs, ww) = emit_fs_chain_partitioned(
+        let (chain_outs, ww) = emit_fiat_shamir_chain_partitioned(
             &mut sb,
             b3s,
             fold_b3_primary_rows.map(|n| {
@@ -744,7 +744,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                         [tk.chals[*seed_ch], tk.chals[*seed_ch + 1]],
                         nonce,
                         &pt,
-                        cps[k].inner.pcs.zerocheck_grinding().ag_r1_bits(),
+                        cps[k].inner.pcs.zerocheck_grinding().ag_round_one_bits(),
                         &mut vals,
                         &mut consts,
                         zw,
@@ -1070,7 +1070,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                     check_ag_skip_publics(
                         &built2.public,
                         *base,
-                        cp.inner.pcs.zerocheck_grinding().ag_r1_bits(),
+                        cp.inner.pcs.zerocheck_grinding().ag_round_one_bits(),
                     );
                 }
             }
@@ -1201,7 +1201,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
             let asm_ms = t_asm.elapsed().as_secs_f64() * 1e3;
             let t_prove = Instant::now();
             let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
-            let (oproof, ocommit) = if outer_zc_ag() {
+            let (oproof, ocommit) = if outer_zerocheck_ag() {
                 #[cfg(target_arch = "aarch64")]
                 {
                     let (p, c, _) = prove_fast_ligerito_union_circuit_ag(
@@ -1216,7 +1216,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                     (MixedProof::Ag(p), c)
                 }
                 #[cfg(not(target_arch = "aarch64"))]
-                unreachable!("outer_zc_ag() is false off aarch64")
+                unreachable!("outer_zerocheck_ag() is false off aarch64")
             } else {
                 let (p, c, _) = prove_fast_ligerito_union_circuit(
                     &union2,
@@ -1296,7 +1296,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
 }
 
 /// **The first-level node's pin, through the builder** (converted-first:
-/// the test IS [`build_fl_node`]'s original body; every assert lives inside
+/// the test IS [`build_first_level_node`]'s original body; every assert lives inside
 /// the builder now, the wrapper re-checks the statement surface).
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
@@ -1307,7 +1307,7 @@ pub(super) fn first_level_node_two_chains_fold_and_adjacency() {
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
     let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
-    let fl = build_fl_node(cfg, &cp0, &cp1);
+    let fl = build_first_level_node(cfg, &cp0, &cp1);
     assert_eq!(fl.h_start, cp0.h_start);
     assert_eq!(fl.h_end, cp1.h_end);
     for j in 0..4 {
@@ -1359,8 +1359,8 @@ pub(super) fn envelope_content_probe() {
         h = cp.h_end;
         cps.push(cp);
     }
-    let fl0 = build_fl_node(cfg, &cps[0], &cps[1]);
-    let fl1 = build_fl_node(cfg, &cps[2], &cps[3]);
+    let fl0 = build_first_level_node(cfg, &cps[0], &cps[1]);
+    let fl1 = build_first_level_node(cfg, &cps[2], &cps[3]);
     let chain_registry = &cps[0].inner.built.shape.registry;
     let blake_r1cs = build_block_r1cs(cps[0].inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();

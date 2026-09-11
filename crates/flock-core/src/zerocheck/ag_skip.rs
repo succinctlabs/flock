@@ -11,7 +11,7 @@
 //!     the PROVER rejection-samples by scanning nonces (each seeding a
 //!     one-attempt SHA-256 DRBG from the transcript squeeze) and ships the
 //!     first working nonce in the proof; the VERIFIER re-derives the point with
-//!     a single attempt ([`sample_r1_prover`] / [`replay_r1_verifier`]). The
+//!     a single attempt ([`sample_round_one_prover`] / [`replay_round_one_verifier`]). The
 //!     DRBG reuses the transcript's own hash (the
 //!     [`crate::challenger::FsChallenger`] is SHA-256), so no second
 //!     cryptographic primitive enters the soundness argument.
@@ -28,9 +28,9 @@ use rayon::prelude::{
 use serde::{Deserialize, Serialize};
 #[cfg(target_arch = "aarch64")]
 use {
-    crate::genus95_curve_code::round1::round1_slp_packed,
-    crate::genus95_curve_code::round1::round1_slp_packed_banks_fused,
-    crate::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded,
+    crate::genus95_curve_code::round1::round1_straight_line_program_packed,
+    crate::genus95_curve_code::round1::round1_straight_line_program_packed_banks_fused,
+    crate::genus95_curve_code::round1::round1_straight_line_program_packed_banks_fused_padded,
     crate::pcs::LOG_PACKING, crate::zerocheck::PaddingSpec, std::env::var_os, std::time::Instant,
 };
 
@@ -137,7 +137,7 @@ pub fn prove_round1(
     c_packed: &[u8],
     eq: &[F128],
 ) -> Round1Message {
-    let (res_ab, wbar) = round1_slp_packed(a_packed, b_packed, c_packed, eq);
+    let (res_ab, wbar) = round1_straight_line_program_packed(a_packed, b_packed, c_packed, eq);
     let di = d_inv();
     Round1Message {
         ab_fresh: (0..158).map(|s| di * res_ab[s]).collect(),
@@ -262,7 +262,7 @@ pub(super) fn byte_dot_u64(v: u64, table: &[[F128; 256]]) -> F128 {
 /// rest position — the AG analog of the RS `UniSkipFoldTable(z)` fold. Witness
 /// order is skip = low 6 bits, rest = high, so rest position `r`'s 64-bit message
 /// is the 8 bytes at offset `r*8`. Parallel byte-dot.
-pub fn fold_witness_at_r1(packed: &[u8], w: &[F128]) -> Vec<F128> {
+pub fn fold_witness_at_round_one(packed: &[u8], w: &[F128]) -> Vec<F128> {
     assert_eq!(
         packed.len() % 8,
         0,
@@ -1028,7 +1028,7 @@ pub(crate) fn fallback_point() -> EvaluationPoint {
 
 /// Squeeze the 32-byte SHA-256 seed for `r₁` from the transcript (two `F128`
 /// samples). Shared by the prover's nonce grind and the verifier's replay.
-fn r1_seed<C: Challenger>(challenger: &mut C) -> [u8; 32] {
+fn round_one_seed<C: Challenger>(challenger: &mut C) -> [u8; 32] {
     challenger.observe_label(b"flock-ag-skip-r1-point");
     let s0 = challenger.sample_f128();
     let s1 = challenger.sample_f128();
@@ -1042,7 +1042,7 @@ fn r1_seed<C: Challenger>(challenger: &mut C) -> [u8; 32] {
 
 /// Bind the chosen `r₁` nonce into the transcript. Must happen before any
 /// later challenge is sampled — ξ̂ and the tail ρ's depend on `r₁` through it.
-fn observe_r1_nonce<C: Challenger>(challenger: &mut C, nonce: u32) {
+fn observe_round_one_nonce<C: Challenger>(challenger: &mut C, nonce: u32) {
     challenger.observe_label(b"flock-ag-skip-r1-nonce");
     challenger.observe_bytes(&nonce.to_le_bytes());
 }
@@ -1065,20 +1065,20 @@ fn observe_r1_nonce<C: Challenger>(challenger: &mut C, nonce: u32) {
 /// UNGRINDED path only (the direct route / disabled schedules, which make no
 /// 128-bit claim): the verifier's single attempt lets a cheating prover pick
 /// among the ~630 expected valid nonces in the budget — ≤ log₂(20 000) ≈ 14.3
-/// bits of freedom. Strict schedules use [`sample_r1_prover_pow`] instead.
-pub(super) fn sample_r1_prover<C: Challenger>(challenger: &mut C) -> (EvaluationPoint, u32) {
-    let seed = r1_seed(challenger);
+/// bits of freedom. Strict schedules use [`sample_round_one_prover_pow`] instead.
+pub(super) fn sample_round_one_prover<C: Challenger>(challenger: &mut C) -> (EvaluationPoint, u32) {
+    let seed = round_one_seed(challenger);
     let kind = challenger.hash_kind();
     for nonce in 0..SAMPLE_ATTEMPT_BUDGET {
         if let Some(point) = evaluation_point_from_nonce(&seed, nonce, kind) {
-            observe_r1_nonce(challenger, nonce);
+            observe_round_one_nonce(challenger, nonce);
             return (point, nonce);
         }
     }
     unreachable!("r1 nonce grind exhausted its budget (probability ~2^-921)")
 }
 
-/// [`sample_r1_prover`] under a strict grinding schedule: the FUSED nonce —
+/// [`sample_round_one_prover`] under a strict grinding schedule: the FUSED nonce —
 /// `H(seed ‖ nonce)` must clear `pow_bits` of PoW AND decode to a valid
 /// cover point, both criteria on the same hash. Every candidate the prover
 /// (or an attacker) evaluates re-enters the PoW, so there is no free choice
@@ -1090,15 +1090,15 @@ pub(super) fn sample_r1_prover<C: Challenger>(challenger: &mut C) -> (Evaluation
 /// which returns the fiber's 5 bits to the prover. Expected prover cost is
 /// `2^pow_bits · 32` hash calls plus `2^pow_bits` point attempts (~1 ms at
 /// 9 bits); the verifier stays ONE-SHOT.
-pub(super) fn sample_r1_prover_pow<C: Challenger>(
+pub(super) fn sample_round_one_prover_pow<C: Challenger>(
     challenger: &mut C,
     pow_bits: u32,
 ) -> (EvaluationPoint, u32) {
-    let seed = r1_seed(challenger);
+    let seed = round_one_seed(challenger);
     let kind = challenger.hash_kind();
     for nonce in 0..R1_FUSED_ATTEMPT_BUDGET {
         if let Some(point) = evaluation_point_from_nonce_pow(&seed, nonce, kind, pow_bits) {
-            observe_r1_nonce(challenger, nonce);
+            observe_round_one_nonce(challenger, nonce);
             return (point, nonce);
         }
     }
@@ -1110,34 +1110,34 @@ pub(super) fn sample_r1_prover_pow<C: Challenger>(
 /// NOT check the nonce is the prover's minimal one, so a cheating prover may
 /// pick any of the ~630 expected valid nonces in the budget: ≤ log₂(20 000) ≈
 /// 14.3 bits of freedom over `r₁`. UNGRINDED path only — strict schedules
-/// verify the fused nonce via [`replay_r1_verifier_pow`], which has no such
+/// verify the fused nonce via [`replay_round_one_verifier_pow`], which has no such
 /// freedom (every candidate carries its own PoW).
-pub(super) fn replay_r1_verifier<C: Challenger>(
+pub(super) fn replay_round_one_verifier<C: Challenger>(
     challenger: &mut C,
     nonce: u32,
 ) -> Result<EvaluationPoint, AgVerifyError> {
-    let seed = r1_seed(challenger);
+    let seed = round_one_seed(challenger);
     if nonce >= SAMPLE_ATTEMPT_BUDGET {
         return Err(AgVerifyError::BadR1Nonce { nonce });
     }
-    observe_r1_nonce(challenger, nonce);
+    observe_round_one_nonce(challenger, nonce);
     evaluation_point_from_nonce(&seed, nonce, challenger.hash_kind())
         .ok_or(AgVerifyError::BadR1Nonce { nonce })
 }
 
-/// Verifier mirror of [`sample_r1_prover_pow`]: ONE hash + ONE point attempt,
+/// Verifier mirror of [`sample_round_one_prover_pow`]: ONE hash + ONE point attempt,
 /// rejecting unless the fused nonce clears the PoW target AND lands a valid
 /// point. Constant-shape — no rejection replay, no data-dependent loop.
-pub(super) fn replay_r1_verifier_pow<C: Challenger>(
+pub(super) fn replay_round_one_verifier_pow<C: Challenger>(
     challenger: &mut C,
     nonce: u32,
     pow_bits: u32,
 ) -> Result<EvaluationPoint, AgVerifyError> {
-    let seed = r1_seed(challenger);
+    let seed = round_one_seed(challenger);
     if nonce >= R1_FUSED_ATTEMPT_BUDGET {
         return Err(AgVerifyError::BadR1Nonce { nonce });
     }
-    observe_r1_nonce(challenger, nonce);
+    observe_round_one_nonce(challenger, nonce);
     evaluation_point_from_nonce_pow(&seed, nonce, challenger.hash_kind(), pow_bits)
         .ok_or(AgVerifyError::BadR1Nonce { nonce })
 }
@@ -1150,7 +1150,7 @@ pub struct AgProof {
     /// Round 1: the folded c message `w̄` (64).
     pub round1_c: Vec<F128>,
     /// Grinding nonce for `r₁`: the verifier re-derives the point from
-    /// `SHA256(seed ‖ nonce)` in one attempt (see [`replay_r1_verifier`]).
+    /// `SHA256(seed ‖ nonce)` in one attempt (see [`replay_round_one_verifier`]).
     pub r1_nonce: u32,
     /// Multilinear rounds: `(G(1), G(∞))` each; length `m − K_SKIP`.
     pub multilinear_rounds: Vec<(F128, F128)>,
@@ -1303,7 +1303,7 @@ pub fn prove<C: Challenger>(
 /// [`prove`] that ALSO returns the c-claim's `s_hat_v_c` — the length-128
 /// ring-switch fold the PCS open would otherwise recompute via `fold_1b_rows`
 /// on `z_packed` at the c-claim's suffix. Captured as a near-free byproduct of
-/// round 1's c-scan (the two-bank [`round1::round1_slp_packed_banks`]), so the
+/// round 1's c-scan (the two-bank [`round1::round1_straight_line_program_packed_banks`]), so the
 /// open skips the c witness scan — the AG analog of the RS path's
 /// `prove_packed_padded_capture_s_hat_v_c`. The returned `AgProof`/`AgClaim` are
 /// byte-identical to [`prove`]'s (`bank0 + bank1 == wbar`).
@@ -1348,7 +1348,7 @@ pub fn prove_capture_s_hat_v_c<C: Challenger>(
 /// UNION route's strict-profile entry. Grinds the initial outer-eq point
 /// (`initial_bits(m)`) and every multilinear round
 /// (`multilinear_round_bits`), mirroring the RS zerocheck's schedule; `r₁`
-/// switches to the FUSED nonce ([`sample_r1_prover_pow`]):
+/// switches to the FUSED nonce ([`sample_round_one_prover_pow`]):
 /// [`R1_POW_BITS`] = 9 explicit PoW bits = `bits_for(474)` for the
 /// product+base code bad set ([`R1_ZERO_BOUND`]) — all explicit, so the
 /// budget survives the recursion circuit's relaxed-canonicity decode —
@@ -1439,13 +1439,13 @@ fn prove_round1_banks(
     c_packed: &[u8],
     eq: &[F128],
 ) -> (Round1Message, Vec<F128>) {
-    banks_to_message(round1_slp_packed_banks_fused(
+    banks_to_message(round1_straight_line_program_packed_banks_fused(
         a_packed, b_packed, c_packed, eq,
     ))
 }
 
 /// [`prove_round1_banks`] under a witness run-list:
-/// [`round1_slp_packed_banks_fused_padded`] — ONE parallel pass over
+/// [`round1_straight_line_program_packed_banks_fused_padded`] — ONE parallel pass over
 /// the live-block list, Partial blocks cleansed inline, per-element parity
 /// with the dense kernel. (A per-run-segment driver over the unfused kernel
 /// was MEASURED 2-3x SLOWER than the full dense scan at the envelope's ~450
@@ -1459,7 +1459,7 @@ fn prove_round1_banks_padded(
     eq: &[F128],
     coverage: &[BlockCoverage],
 ) -> (Round1Message, Vec<F128>) {
-    banks_to_message(round1_slp_packed_banks_fused_padded(
+    banks_to_message(round1_straight_line_program_packed_banks_fused_padded(
         a_packed, b_packed, c_packed, eq, coverage,
     ))
 }
@@ -1506,9 +1506,9 @@ fn prove_from_round1<C: Challenger>(
     challenger.observe_f128_slice(&msg.ab_fresh);
     challenger.observe_f128_slice(&msg.c_msg);
 
-    let (r1, r1_nonce) = match grinding.ag_r1_bits() {
-        Some(bits) => sample_r1_prover_pow(challenger, bits),
-        None => sample_r1_prover(challenger),
+    let (r1, r1_nonce) = match grinding.ag_round_one_bits() {
+        Some(bits) => sample_round_one_prover_pow(challenger, bits),
+        None => sample_round_one_prover(challenger),
     };
     let c_eval = eval_c_at(&msg, &r1);
 
@@ -1565,11 +1565,11 @@ fn prove_from_round1<C: Challenger>(
                 bits,
                 nonces: &mut grinding_nonces,
             };
-            mlv_tail_dispatch(
+            multilinear_values_tail_dispatch(
                 a_mlv, b_mlv, g1_0, ginf_0, la_sums, store, &r_rest, &mut gch,
             )
         }
-        None => mlv_tail_dispatch(
+        None => multilinear_values_tail_dispatch(
             a_mlv, b_mlv, g1_0, ginf_0, la_sums, store, &r_rest, challenger,
         ),
     };
@@ -1606,7 +1606,7 @@ fn prove_from_round1<C: Challenger>(
 /// lookahead/friendly/classic rounds to the final binding. `r_rest` must be
 /// `friendly ‖ outer`; the wire output is bit-identical across the internal
 /// path choices (lookahead on/off, friendly on/off).
-pub(super) fn mlv_tail_fs<C: Challenger>(
+pub(super) fn multilinear_values_tail_fiat_shamir<C: Challenger>(
     a_mlv: Vec<F128>,
     b_mlv: Vec<F128>,
     g1_0: F128,
@@ -1622,7 +1622,7 @@ pub(super) fn mlv_tail_fs<C: Challenger>(
     let rho0 = challenger.sample_f128();
     rhos.push(rho0);
     let (tail_rounds, tail_rhos, a_eval, b_eval) =
-        mlv_tail_fs_resume(a_mlv, b_mlv, 1, rho0, None, r_rest, challenger);
+        multilinear_values_tail_fiat_shamir_resume(a_mlv, b_mlv, 1, rho0, None, r_rest, challenger);
     rounds.extend(tail_rounds);
     rhos.extend(tail_rhos);
     (rounds, rhos, a_eval, b_eval)
@@ -1630,7 +1630,7 @@ pub(super) fn mlv_tail_fs<C: Challenger>(
 
 /// One tail, two storages: dispatch on whether the fold handed over
 /// live-span buffers (+ their [`LiveLayout`]) or a full dense pair.
-fn mlv_tail_dispatch<C: Challenger>(
+fn multilinear_values_tail_dispatch<C: Challenger>(
     a_mlv: Vec<F128>,
     b_mlv: Vec<F128>,
     g1_0: F128,
@@ -1641,19 +1641,21 @@ fn mlv_tail_dispatch<C: Challenger>(
     challenger: &mut C,
 ) -> (Vec<(F128, F128)>, Vec<F128>, F128, F128) {
     match store {
-        Some(st) => mlv_tail_fs_sparse(a_mlv, b_mlv, g1_0, ginf_0, la, st, r_rest, challenger),
-        None => mlv_tail_fs(a_mlv, b_mlv, g1_0, ginf_0, r_rest, challenger),
+        Some(st) => multilinear_values_tail_fiat_shamir_sparse(
+            a_mlv, b_mlv, g1_0, ginf_0, la, st, r_rest, challenger,
+        ),
+        None => multilinear_values_tail_fiat_shamir(a_mlv, b_mlv, g1_0, ginf_0, r_rest, challenger),
     }
 }
 
-/// [`mlv_tail_fs`] over LIVE-SPAN buffers (the sparse fold's output): the
+/// [`multilinear_values_tail_fiat_shamir`] over LIVE-SPAN buffers (the sparse fold's output): the
 /// tail runs the support-proportional rounds — RS's
 /// [`fold_and_round_pair_sparse_into`], with the friendly constants riding
 /// as ordinary `r_next` weights — while the live set clears the gate and
 /// the domain keeps the fused threshold, then expands to dense ONCE and
 /// resumes the lookahead tail mid-stream. Wire output is bit-identical to
 /// the dense tail: every skipped term carries an `a·b` factor of zero.
-pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
+pub(super) fn multilinear_values_tail_fiat_shamir_sparse<C: Challenger>(
     mut a_mlv: Vec<F128>,
     mut b_mlv: Vec<F128>,
     g1_0: F128,
@@ -1705,7 +1707,7 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
     // pass with the message in the same sweep; measured on the dense route
     // at m=32: the steady fold2 passes cost 19–36% less than the two classic
     // rounds each replaces (the fold1 ENTRY pass is the one that does not
-    // pay, +16% ST). Same `pending2` invariant as `mlv_tail_fs_resume`: the
+    // pay, +16% ST). Same `pending2` invariant as `multilinear_values_tail_fiat_shamir_resume`: the
     // arrays are folded through every sampled challenge except `rho_prev`
     // (and `pending2` if set); while a challenge is deferred, `domain` is
     // one halving ahead of the round index. Transcript-identical to the
@@ -1836,8 +1838,9 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
     give_f128(b_mlv);
     give_f128(a_nxt);
     give_f128(b_nxt);
-    let (tail_rounds, tail_rhos, a_eval, b_eval) =
-        mlv_tail_fs_resume(a_full, b_full, i, rho_prev, pending2, r_rest, challenger);
+    let (tail_rounds, tail_rhos, a_eval, b_eval) = multilinear_values_tail_fiat_shamir_resume(
+        a_full, b_full, i, rho_prev, pending2, r_rest, challenger,
+    );
     rounds.extend(tail_rounds);
     rhos.extend(tail_rhos);
     (rounds, rhos, a_eval, b_eval)
@@ -1848,7 +1851,7 @@ pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
 /// lookahead deferred-fold invariant). Lets a caller that derived the early
 /// round messages elsewhere (e.g. the swoop's fold-level lookahead, which
 /// covers rounds 0–1 during the witness fold) hand off without extra passes.
-pub(super) fn mlv_tail_fs_resume<C: Challenger>(
+pub(super) fn multilinear_values_tail_fiat_shamir_resume<C: Challenger>(
     mut a_mlv: Vec<F128>,
     mut b_mlv: Vec<F128>,
     i0: usize,
@@ -2088,9 +2091,9 @@ pub fn verify_with_grinding<C: Challenger>(
     challenger.observe_f128_slice(&proof.round1_ab);
     challenger.observe_f128_slice(&proof.round1_c);
 
-    let r1 = match grinding.ag_r1_bits() {
-        Some(bits) => replay_r1_verifier_pow(challenger, proof.r1_nonce, bits)?,
-        None => replay_r1_verifier(challenger, proof.r1_nonce)?,
+    let r1 = match grinding.ag_round_one_bits() {
+        Some(bits) => replay_round_one_verifier_pow(challenger, proof.r1_nonce, bits)?,
+        None => replay_round_one_verifier(challenger, proof.r1_nonce)?,
     };
     let msg = Round1Message {
         ab_fresh: proof.round1_ab.clone(),
@@ -2161,8 +2164,8 @@ mod tests {
             ag_skip::{
                 AgVerifyError, K_SKIP, LOOKAHEAD_DISABLE, Ordering, eval_ab_at, eval_c_at,
                 fold_and_compute_round_pair_into, fold_and_first_round,
-                fold_and_first_round_padded, fold_and_friendly_round_pair_into, fold_witness_at_r1,
-                friendly_norm, prove, prove_capture_s_hat_v_c,
+                fold_and_first_round_padded, fold_and_friendly_round_pair_into,
+                fold_witness_at_round_one, friendly_norm, prove, prove_capture_s_hat_v_c,
                 prove_capture_s_hat_v_c_with_grinding, prove_multilinear, prove_round1,
                 prove_round1_banks, prove_round1_banks_padded, round_pair_naive, verify,
                 verify_multilinear, verify_with_grinding,
@@ -2289,7 +2292,7 @@ mod tests {
     /// exact value round 1 produced.
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn fold_at_r1_consistent_with_round1_claim() {
+    fn fold_at_round_one_consistent_with_round1_claim() {
         let mut rng = Sha256Rng::new([99u8; 32]);
         let n = 2usize;
         let mut am = vec![[0u64; 128]; n];
@@ -2325,8 +2328,8 @@ mod tests {
         let bf = base_evaluation_functional(&r1).expect("base functional");
         let w: Vec<F128> = bf.iter().copied().collect();
 
-        let a_mlv = fold_witness_at_r1(&a_packed, &w);
-        let b_mlv = fold_witness_at_r1(&b_packed, &w);
+        let a_mlv = fold_witness_at_round_one(&a_packed, &w);
+        let b_mlv = fold_witness_at_round_one(&b_packed, &w);
 
         // (1) folded row == per-column base evaluation.
         for o in 0..n {
@@ -2382,8 +2385,8 @@ mod tests {
         let w: Vec<F128> = bf.iter().copied().collect();
 
         let (a_mlv_f, b_mlv_f, g1, ginf) = fold_and_first_round(&a, &b, &w, &r_rest);
-        let a_mlv = fold_witness_at_r1(&a, &w);
-        let b_mlv = fold_witness_at_r1(&b, &w);
+        let a_mlv = fold_witness_at_round_one(&a, &w);
+        let b_mlv = fold_witness_at_round_one(&b, &w);
         assert_eq!(a_mlv_f, a_mlv, "fused a_mlv != separate fold");
         assert_eq!(b_mlv_f, b_mlv, "fused b_mlv != separate fold");
 
@@ -2524,8 +2527,8 @@ mod tests {
 
         let bf = base_evaluation_functional(&r1).expect("base functional");
         let w: Vec<F128> = bf.iter().copied().collect();
-        let a_mlv = fold_witness_at_r1(&a_packed, &w);
-        let b_mlv = fold_witness_at_r1(&b_packed, &w);
+        let a_mlv = fold_witness_at_round_one(&a_packed, &w);
+        let b_mlv = fold_witness_at_round_one(&b_packed, &w);
 
         let mut r_rest = friendly_challenges().to_vec();
         r_rest.extend_from_slice(&r_outer);
@@ -2579,7 +2582,7 @@ mod tests {
     /// transcript (the two proofs genuinely diverge, so both arms are live).
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn prove_verify_roundtrip_blake3_fs() {
+    fn prove_verify_roundtrip_blake3_fiat_shamir() {
         let m = 14usize;
         let (a, b, c) = random_witness(m, 91);
         let mk = |kind| FsChallenger::with_hash(b"flock-ag-skip-b3", kind);
@@ -2636,7 +2639,7 @@ mod tests {
     /// / sumcheck consistency breaks downstream.
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn verify_rejects_tampered_r1_nonce() {
+    fn verify_rejects_tampered_round_one_nonce() {
         let m = 14usize;
         let (a, b, c) = random_witness(m, 67);
         let (proof, _) = prove(&a, &b, &c, m, &mut FsChallenger::new(b"flock-ag-skip-test"));
@@ -2831,8 +2834,8 @@ mod tests {
         );
         // The schedule methods expose exactly these constants.
         let g = ZerocheckGrinding::per_challenge_128();
-        assert_eq!(g.ag_r1_bits(), Some(R1_POW_BITS));
-        assert_eq!(ZerocheckGrinding::disabled().ag_r1_bits(), None);
+        assert_eq!(g.ag_round_one_bits(), Some(R1_POW_BITS));
+        assert_eq!(ZerocheckGrinding::disabled().ag_round_one_bits(), None);
     }
 
     /// The fused predicate really gates on BOTH criteria: a nonce whose

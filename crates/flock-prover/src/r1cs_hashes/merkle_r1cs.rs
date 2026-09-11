@@ -203,7 +203,7 @@ pub fn blake3_spec() -> HashSpec {
         out_cv_base: OUT_LO_BASE,
         msg_base: M_BASE,
         flags: BLAKE3_FLAG_PARENT,
-        compress: blake3_compress_cv,
+        compress: blake3_compress_chaining_value,
         fixed_bits: blake3_fixed_bits,
     }
 }
@@ -218,7 +218,7 @@ fn node_msg(left: &[u32; SLOT_WORDS], right: &[u32; SLOT_WORDS]) -> [u32; 16] {
 
 /// The output chaining value of one BLAKE3 compression — the first 8 words of
 /// the 16-word output, which is what every non-XOF use takes.
-fn blake3_compress_cv(
+fn blake3_compress_chaining_value(
     cv: &[u32; SLOT_WORDS],
     m: &[u32; 16],
     counter: u64,
@@ -546,7 +546,7 @@ impl MerkleTreeLayout {
     /// from the same IV the node compressions use. Decoded from
     /// [`HashSpec::fixed_bits`] so the witness and the pin rows cannot
     /// disagree.
-    fn pinned_in_cv(&self) -> [u32; SLOT_WORDS] {
+    fn pinned_in_chaining_value(&self) -> [u32; SLOT_WORDS] {
         let base = self.spec.in_cv_base;
         let mut cv = [0u32; SLOT_WORDS];
         for &(c, v) in &(self.spec.fixed_bits)() {
@@ -572,7 +572,7 @@ impl MerkleTreeLayout {
     pub fn root_chunk(&self, input: &ChunkPathInput) -> [u32; SLOT_WORDS] {
         self.assert_chunk_input(input);
         let compress = self.spec.compress;
-        let mut prev = self.pinned_in_cv();
+        let mut prev = self.pinned_in_chaining_value();
         for i in 0..self.leaf_blocks {
             let m = leaf_msg_words(&input.leaf_data, i);
             prev = compress(&prev, &m, NODE_COUNTER, NODE_BLOCK_LEN, self.chunk_flags(i));
@@ -581,7 +581,7 @@ impl MerkleTreeLayout {
             let bit = (input.index >> l) & 1 == 1;
             let (left, right) = if bit { (*sib, prev) } else { (prev, *sib) };
             prev = compress(
-                &self.pinned_in_cv(),
+                &self.pinned_in_chaining_value(),
                 &node_msg(&left, &right),
                 NODE_COUNTER,
                 NODE_BLOCK_LEN,

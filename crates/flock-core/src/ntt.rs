@@ -5,7 +5,7 @@
 //! exhausts all 256 elements of F_{2^8}.
 //!
 //! Scalar/portable implementation — correctness first. NEON "triple" variants
-//! that batch a/b/c with shared twiddles can be added later if the round-1 URM
+//! that batch a/b/c with shared twiddles can be added later if the round-1 univariate round message
 //! hot path needs them.
 
 pub use additive_ntt_f128::AdditiveNttF128;

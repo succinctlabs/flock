@@ -26,7 +26,7 @@ use flock_prover::r1cs_hashes::{
     },
 };
 /// One compression's output chaining value.
-fn cv(h: &[u32; 8], m: &[u32; 16], flags: u32) -> [u32; SLOT_WORDS] {
+fn chaining_value(h: &[u32; 8], m: &[u32; 16], flags: u32) -> [u32; SLOT_WORDS] {
     let out = blake3_compress(h, m, NODE_COUNTER, NODE_BLOCK_LEN, flags);
     out[..SLOT_WORDS].try_into().unwrap()
 }
@@ -159,7 +159,7 @@ fn swap_matches_the_composite_fold() {
                 if i + 1 == blocks {
                     f |= BLAKE3_FLAG_CHUNK_END;
                 }
-                prev = cv(&prev, &m, f);
+                prev = chaining_value(&prev, &m, f);
             }
             for (l, &sib) in input.siblings.iter().enumerate() {
                 let (left, right) = SwapTable::outputs(&SwapInput {
@@ -170,7 +170,7 @@ fn swap_matches_the_composite_fold() {
                 let mut m = [0u32; 16];
                 m[..SLOT_WORDS].copy_from_slice(&left);
                 m[SLOT_WORDS..].copy_from_slice(&right);
-                prev = cv(&BLAKE3_IV, &m, BLAKE3_FLAG_PARENT);
+                prev = chaining_value(&BLAKE3_IV, &m, BLAKE3_FLAG_PARENT);
             }
             assert_eq!(
                 prev,

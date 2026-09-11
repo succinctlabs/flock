@@ -65,7 +65,7 @@ pub(super) struct Lvl {
 /// Map actual sumcheck-fold order back to the transcript point's natural
 /// coordinate order. Partial L0 lane grids bind the high lane coordinates
 /// first; full grids and every later level use ordinary low-to-high order.
-pub(super) fn l0_ood_z_index(
+pub(super) fn level_zero_ood_z_index(
     z_len: usize,
     initial_k: usize,
     committed_row_words: usize,
@@ -137,7 +137,7 @@ impl Lvl {
 /// stratum. A query hashes its committed row, climbs to that stratum, and
 /// top-stratum queries take one additional edge so the opening binds to a
 /// derived cap-layer node without creating a transcript cycle.
-pub(super) fn level_query_phase_b3_rows(g: &Lvl) -> (usize, usize, usize) {
+pub(super) fn level_query_phase_blake3_rows(g: &Lvl) -> (usize, usize, usize) {
     let c_min = g.sched.summand_depths.last().copied().unwrap_or(g.c);
     let n_layers = (g.c - c_min).max(1);
     let cap_rows = (1..=n_layers).map(|j| 1usize << (g.c - j)).sum();
@@ -151,10 +151,10 @@ pub(super) fn level_query_phase_b3_rows(g: &Lvl) -> (usize, usize, usize) {
     (leaf_rows, path_rows, cap_rows)
 }
 
-pub(super) fn query_phase_b3_rows(geo: &[Lvl]) -> usize {
+pub(super) fn query_phase_blake3_rows(geo: &[Lvl]) -> usize {
     geo.iter()
         .map(|g| {
-            let (leaf, path, cap) = level_query_phase_b3_rows(g);
+            let (leaf, path, cap) = level_query_phase_blake3_rows(g);
             leaf + path + cap
         })
         .sum()

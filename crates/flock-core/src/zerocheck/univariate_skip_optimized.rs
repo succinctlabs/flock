@@ -92,7 +92,7 @@ const N_MEDIUM: usize = 4;
 /// four medium constants returned by [`medium_challenges_ghash`] — must be
 /// **F₂-linearly independent** in F₁₂₈. Zerocheck soundness relies on this
 /// (a witness aligned with the friendly subspace would otherwise let the
-/// prover cancel the URM message), and so does Ligerito's L0 list-collapse
+/// prover cancel the univariate round message), and so does Ligerito's L0 list-collapse
 /// argument (the SZ bound `(m−7)/|F|` for MLE collisions at `r` requires
 /// the seven friendly coords to span a 7-dim F₂-subspace). Asserted by
 /// `tests::friendly_challenges_f2_independent`.
@@ -1443,7 +1443,7 @@ mod tests {
     /// (`γ^{2^i}/(1+γ^{2^i})`, i ∈ 0..4) — being **F₂-linearly independent**
     /// in F₁₂₈.
     ///
-    /// Zerocheck needs this so that the prover's URM message can't be
+    /// Zerocheck needs this so that the prover's univariate round message can't be
     /// trivially canceled by a malicious witness aligned with the friendly
     /// subspace. Ligerito's L0 list-collapse argument (which leans on the
     /// zerocheck `(r, v)` claim as an OOD-equivalent) also depends on it
@@ -1497,7 +1497,7 @@ mod tests {
 
     /// Build the full `r` vector with the protocol-fixed constants in the
     /// small/medium slots. Only `r[k_skip + N_INNER..]` is the actual
-    /// randomness fed to the optimized URM.
+    /// randomness fed to the optimized univariate round message.
     fn build_protocol_r(m: usize, outer: &[F128]) -> Vec<F128> {
         assert_eq!(outer.len(), m - K_SKIP - N_INNER);
         let mut r = vec![F128::ZERO; m];
@@ -1867,8 +1867,8 @@ mod tests {
 
     /// **Padding skip is byte-identical to the dense path.** On a witness
     /// where bits `[useful_bits, 2^k_log)` of every block are honestly zero,
-    /// the padded URM must produce the exact same `(round1_ab, round1_c)`
-    /// vectors as the dense URM — every chunk we skip would have contributed
+    /// the padded univariate round message path must produce the same `(round1_ab, round1_c)`
+    /// vectors as the dense path — every skipped chunk would have contributed
     /// a literal zero to the dense sum (the convert table maps φ_8(0) = 0).
     ///
     /// Covers the three hash padding shapes:

@@ -182,7 +182,7 @@ pub fn union_comb_partial(
 /// `g` (the per-slot `y_t` vectors at their aligned column offsets, length
 /// `2^{M−ν}`) for downstream reuse — the union counterpart of
 /// [`super::prove_padded_capture_z_vec`]. `x_ab` is the union semantic
-/// quirky point from `UnionInstance::x_ab_from_mlv`; `k_skip` is the
+/// quirky point from `UnionInstance::x_ab_from_multilinear_values`; `k_skip` is the
 /// BatchMajor-fixed [`K_SKIP`]. On a single-type registry this computes
 /// exactly the single-table lincheck — same vectors, same rounds, same
 /// bytes.

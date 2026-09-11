@@ -41,7 +41,7 @@ use crate::{
     tower::{
         Blake3Gate, CHUNK_END, CHUNK_START, DOMAIN, F128, FsChallenger, HashKind, IV, Online,
         PcsParams, ROOT, ShapeBuilder, TowerConfig, UnionInstance, UnionSlotProverInput, Wire,
-        chain_blake_r1cs, leaf_zc_ag, pack_params, pack4, pack8, pcs_batch_for, steady_reps,
+        chain_blake_r1cs, leaf_zerocheck_ag, pack_params, pack4, pack8, pcs_batch_for, steady_reps,
     },
     verifier::{
         verify_ligerito_union_circuit, verify_ligerito_union_circuit_ag,
@@ -437,7 +437,7 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
         let witgen_ms = t1.elapsed().as_secs_f64() * 1e3;
         let t2 = Instant::now();
         let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-        let (proof, commitment) = if leaf_zc_ag() {
+        let (proof, commitment) = if leaf_zerocheck_ag() {
             #[cfg(target_arch = "aarch64")]
             {
                 let (p, c, _) = prove_fast_ligerito_union_circuit_ag(
@@ -452,7 +452,7 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
                 (MixedProof::Ag(p), c)
             }
             #[cfg(not(target_arch = "aarch64"))]
-            unreachable!("leaf_zc_ag() is false off aarch64")
+            unreachable!("leaf_zerocheck_ag() is false off aarch64")
         } else {
             let (p, c, _) = prove_fast_ligerito_union_circuit(
                 &union,

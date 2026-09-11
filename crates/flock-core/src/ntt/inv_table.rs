@@ -1,6 +1,6 @@
 //! §2.1 single-table collapse of the LDE matrix `M = fwd_NTT_Λ ∘ inv_NTT_S`.
 //!
-//! Background: the URM round-1 needs to map each `ell`-bit row of the boolean
+//! Background: the round-1 univariate round message needs to map each `ell`-bit row of the boolean
 //! witness (packed as `n_chunks = ell/8` bytes) to `ell` evaluations on the
 //! NTT domain `Λ`. The naive way computes inv_NTT on S then fwd_NTT on Λ for
 //! every row — too slow.
@@ -18,7 +18,7 @@
 //! Lookups per row: n_chunks (= ell/8), each load is `ell` contiguous bytes.
 //!
 //! Scalar/correctness-first implementation; NEON `apply_triple` and the
-//! unrolled `ntt_and_accum` can be added if the URM hot path needs them.
+//! unrolled `ntt_and_accum` can be added if the univariate round message hot path needs them.
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{veorq_u8, vextq_u8, vld1q_u8, vst1q_u8};
@@ -131,7 +131,7 @@ impl InvNttTableByteSingleGf8 {
     }
 
     /// Raw pointer to the table data (`256 × ell` bytes, row-major). Used by
-    /// the URM fused inner kernel, which can't go through the safe slice API
+    /// the univariate round message fused inner kernel, which can't go through the safe slice API
     /// without losing the register-fused layout.
     #[inline]
     pub fn data_ptr(&self) -> *const u8 {

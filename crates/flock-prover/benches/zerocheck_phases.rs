@@ -7,7 +7,7 @@
 //! thermal state.
 //!
 //! Phases:
-//!   1. Round-1 URM (univariate skip)            — `round1_shift_reduce_extract_c_packed`
+//!   1. Round-1 univariate round message (univariate skip)            — `round1_shift_reduce_extract_c_packed`
 //!   2. C-claim interpolation                    — `interpolate_at_z_on_lambda`
 //!   3. Round-2 (fused fold + 1st mlv message)  — `uni_skip_fold_and_round_pair_optimized_packed`
 //!   4. Rounds 3..(n_mlv+1) — the multilinear sumcheck tail (one sumcheck,
@@ -77,7 +77,7 @@ fn prove_with_phase_timing(
     let mut total = 0.0f64;
     let mut phases: Vec<f64> = Vec::new();
 
-    // ---- Phase 1: Round-1 URM ----
+    // ---- Phase 1: Round-1 univariate round message ----
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
     let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
