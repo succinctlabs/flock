@@ -16,9 +16,8 @@
 //! shape-corrupted ones.
 
 use std::{
-    env::{var, var_os},
+    env::var_os,
     mem::{replace, swap},
-    sync::OnceLock,
     time::Instant,
 };
 
@@ -186,20 +185,12 @@ impl ZerocheckGrinding {
 /// full-utilization zerocheck), so the gate engages at half utilization.
 /// Full utilization itself stays dense (live · 2 > n): it is the anchor
 /// configuration and the dense kernels are the calibrated choice there.
+///
+/// Deliberately a constant, not an env knob: a gate above 1 can push a
+/// multi-run (union) spec off the sparse route onto the cascade kernels,
+/// which take a single-run spec and read the a/b column padding that the
+/// witness generator no longer clears — an invalid proof, not a slower one.
 pub const SPARSE_TAIL_GATE: usize = 1;
-
-/// [`SPARSE_TAIL_GATE`] with an env override (`FLOCK_SPARSE_GATE`) — a
-/// tuning knob for A/B experiments; the constant above is the default.
-/// Value-identical either way (the sparse kernels drop only zero terms).
-fn sparse_tail_gate() -> usize {
-    static GATE: OnceLock<usize> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        var("FLOCK_SPARSE_GATE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(SPARSE_TAIL_GATE)
-    })
-}
 
 /// One run of identically-shaped blocks inside a [`PaddingSpec`] run-list.
 ///
@@ -805,7 +796,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         let list = padding.useful_block_intervals(k_skip);
         let live_elems: usize = list.iter().map(|&(s, e)| e - s).sum();
         let n_out = 1usize << n_mlv;
-        n_out >= 8 && live_elems * sparse_tail_gate() <= n_out
+        n_out >= 8 && live_elems * SPARSE_TAIL_GATE <= n_out
     };
     // Cascade-family gates (dense single-run only — the kernels serve
     // single-run padding, and the sparse path never defers challenges).
@@ -1117,7 +1108,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         // the naive kernels index globally, so compaction must be undone.
         let use_sparse = store
             .as_ref()
-            .is_some_and(|st| domain >= 1024 && st.len() * sparse_tail_gate() <= domain);
+            .is_some_and(|st| domain >= 1024 && st.len() * SPARSE_TAIL_GATE <= domain);
         if !use_sparse
             && let Some(st) = store.take()
             && sparse_dirty

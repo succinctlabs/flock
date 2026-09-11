@@ -35,7 +35,7 @@ use {
 };
 
 #[cfg(target_arch = "aarch64")]
-use crate::zerocheck::sparse_tail_gate;
+use crate::zerocheck::SPARSE_TAIL_GATE;
 use crate::{
     challenger::Challenger,
     field::{F128, F256Unreduced, mul_by_x},
@@ -1529,7 +1529,7 @@ fn prove_from_round1<C: Challenger>(
             .filter(|c| !matches!(c, BlockCoverage::Dead))
             .count();
         let n_out = cov.len() * 128;
-        live_blocks < cov.len() && n_out >= 8 && live_blocks * 128 * sparse_tail_gate() <= n_out
+        live_blocks < cov.len() && n_out >= 8 && live_blocks * 128 * SPARSE_TAIL_GATE <= n_out
     });
     // Phase split for FLOCK_ZC_TIMING: the standalone `ag_breakdown` kernel
     // timings overstate the fold badly (cold pool + 2 GB alloc: 115 ms
@@ -1717,7 +1717,7 @@ pub(super) fn multilinear_values_tail_fiat_shamir_sparse<C: Challenger>(
         i = entry_i;
     }
     let la_enabled = !LOOKAHEAD_DISABLE.load(Ordering::Relaxed);
-    while i < n_mlv && domain >= 1024 && store.len() * super::sparse_tail_gate() <= domain {
+    while i < n_mlv && domain >= 1024 && store.len() * SPARSE_TAIL_GATE <= domain {
         let live = store.len();
         let is_prefix =
             store.intervals().len() == 1 && store.intervals()[0].0 == 0 && a_mlv.len() == live;
