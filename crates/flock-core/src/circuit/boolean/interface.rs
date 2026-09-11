@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use super::{Bit, LinearExpr, ValueId};
+use super::{Bit, LinearExpr, ValueId, Var};
 
 /// Who supplies or derives the values in a named port.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +91,20 @@ pub struct InteractionField {
 }
 
 impl InteractionField {
+    /// An uninterpreted bit message over reserved schema columns.
+    pub fn column_bits(name: impl Into<String>, columns: impl IntoIterator<Item = Var>) -> Self {
+        Self::bits(name, columns.into_iter().map(|var| var.0))
+    }
+
+    /// A little-endian message over reserved schema columns.
+    pub fn columns(
+        name: impl Into<String>,
+        element_bits: usize,
+        columns: impl IntoIterator<Item = Var>,
+    ) -> Self {
+        Self::little_endian(name, element_bits, columns.into_iter().map(|var| var.0))
+    }
+
     pub fn bits(name: impl Into<String>, bits: impl IntoIterator<Item = Bit>) -> Self {
         Self::new(name, InteractionEncoding::Bits, bits)
     }

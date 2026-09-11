@@ -1,9 +1,13 @@
 //! Circuit inspection, evaluation, digests, and sparse R1CS lowering.
 
 use std::fmt;
-use std::sync::OnceLock;
 
-use crate::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
+pub(super) mod relation;
+
+mod two_variable;
+pub use two_variable::{AssertionAux, LoweredCircuit, LoweringMode, RowPlacement};
+
+use crate::r1cs::BlockR1cs;
 
 use super::{
     BooleanCircuit, Component, ExpressionNode, Interaction, LayoutBuilder, LayoutError,
@@ -29,10 +33,7 @@ impl BooleanCircuit {
     /// Total number of materialized-value references retained across all
     /// canonical normalized supports.
     pub fn normalized_support_terms(&self) -> usize {
-        self.expressions
-            .iter()
-            .map(|expression| expression.support.len())
-            .sum()
+        self.relation().normalized_support_terms()
     }
 
     /// Payload bytes occupied by all compact normalized-support entries.
@@ -233,44 +234,7 @@ impl BooleanCircuit {
     /// The returned vector is indexed by [`ValueId`]. It is not padded to an
     /// R1CS power of two; use [`Self::evaluate_r1cs`] for that representation.
     pub fn evaluate(&self, inputs: &[bool]) -> Result<Vec<bool>, EvaluationError> {
-        if inputs.len() != self.input_values.len() {
-            return Err(EvaluationError::InputCount {
-                expected: self.input_values.len(),
-                actual: inputs.len(),
-            });
-        }
-
-        let mut values = vec![false; self.value_count()];
-        values[self.one.index] = true;
-        for (&value, &input) in self.input_values.iter().zip(inputs) {
-            values[value.index] = input;
-        }
-
-        for row in &self.rows {
-            match row.kind {
-                RowKind::One | RowKind::Input => {}
-                RowKind::And => {
-                    let output = row.defined_value.expect("AND row must define a value");
-                    values[output.index] = self.eval_expression(row.lhs, &values)
-                        & self.eval_expression(row.rhs, &values);
-                }
-                RowKind::Materialize => {
-                    let output = row
-                        .defined_value
-                        .expect("materialization row must define a value");
-                    values[output.index] = self.eval_expression(row.lhs, &values);
-                }
-                RowKind::Constraint => {
-                    let lhs = self.eval_expression(row.lhs, &values);
-                    let rhs = self.eval_expression(row.rhs, &values);
-                    let result = self.eval_expression(row.result, &values);
-                    if (lhs & rhs) != result {
-                        return Err(EvaluationError::UnsatisfiedRow(row.id));
-                    }
-                }
-            }
-        }
-        Ok(values)
+        self.relation().evaluate(inputs)
     }
 
     /// Evaluate and pad one block to `2^k_log` bits in source-order layout.
@@ -335,91 +299,11 @@ impl BooleanCircuit {
         n_log: usize,
         layout: &PhysicalLayout,
     ) -> Result<BlockR1cs, R1csBuildError> {
-        layout
-            .validate_for(self)
-            .map_err(R1csBuildError::InvalidLayout)?;
-        let k = checked_capacity(k_log).map_err(R1csBuildError::InvalidKLog)?;
-        if k_skip > k_log {
-            return Err(R1csBuildError::InvalidKSkip { k_log, k_skip });
-        }
-        let required = layout.useful_bits;
-        if k < required {
-            return Err(R1csBuildError::Capacity {
-                required,
-                actual: k,
-            });
-        }
-        let m = k_log
-            .checked_add(n_log)
-            .ok_or(R1csBuildError::DimensionOverflow)?;
-        checked_capacity(m).map_err(|_| R1csBuildError::DimensionOverflow)?;
-
-        let mut a_rows = vec![Vec::new(); k];
-        let mut b_rows = vec![Vec::new(); k];
-        let mut c_rows = vec![Vec::new(); k];
-        let mut occupied_rows = vec![false; required];
-        let mut occupied_columns = vec![false; required];
-        for &position in &layout.value_positions {
-            occupied_columns[position] = true;
-        }
-        for row in &self.rows {
-            let physical_row = layout.row_positions[row.id.index];
-            occupied_rows[physical_row] = true;
-            a_rows[physical_row] = self.support_with_layout(row.lhs, layout);
-            b_rows[physical_row] = self.support_with_layout(row.rhs, layout);
-            c_rows[physical_row] = self.support_with_layout(row.result, layout);
-        }
-        // The explicit layout keeps every real row and value in the useful
-        // prefix. Its suffix is therefore available for canonical zero-padding
-        // rows regardless of holes or permutations inside the prefix.
-        for i in 0..k {
-            if i >= required || (!occupied_rows[i] && !occupied_columns[i]) {
-                c_rows[i] = vec![i];
-            }
-        }
-
-        Ok(BlockR1cs {
-            m,
-            k_log,
-            k_skip,
-            useful_bits: required,
-            a_0: SparseBinaryMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows: a_rows,
-            },
-            b_0: SparseBinaryMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows: b_rows,
-            },
-            c_0: SparseBinaryMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows: c_rows,
-            },
-            layout: WitnessLayout::RowMajor,
-            const_pin: Some(layout.value_positions[self.one.index]),
-            digest_cache: OnceLock::new(),
-            csc_cache: OnceLock::new(),
-        })
-    }
-
-    fn support_with_layout(&self, id: LinearExprId, layout: &PhysicalLayout) -> Vec<usize> {
-        let mut support: Vec<usize> = self.expressions[id.index]
-            .support
-            .iter()
-            .map(|value| layout.value_positions[value.index()])
-            .collect();
-        support.sort_unstable();
-        support
+        self.relation().to_block_r1cs(k_log, k_skip, n_log, layout)
     }
 
     pub(super) fn eval_expression(&self, id: LinearExprId, values: &[bool]) -> bool {
-        self.expressions[id.index]
-            .support
-            .iter()
-            .fold(false, |sum, value| sum ^ values[value.index()])
+        self.relation().eval_expression(id, values)
     }
 }
 

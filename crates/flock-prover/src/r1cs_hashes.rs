@@ -44,6 +44,7 @@ pub mod blake3_dsl;
 /// Shared low-level bit-packing / R1CS-row utilities (carry-save adders,
 /// fused adders, lin-id slot helpers) used by the per-hash encoders.
 pub mod common;
+pub mod dsl;
 /// The Fiat–Shamir chain: BLAKE3 over a transcript with a finalize forked at
 /// every squeeze — the FS chain's witness generator, over [`blake3`]'s rows.
 pub mod fs_chain;

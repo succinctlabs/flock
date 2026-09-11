@@ -4,12 +4,13 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt;
 
+use super::lowering::relation::RelationRef;
 use crate::field::F128;
 use crate::lincheck::LincheckCircuit;
 
 use super::{
     BooleanCircuit, CircuitId, ExpressionNode, LayoutError, LinearExprId, PhysicalLayout, RowId,
-    RowKind,
+    RowKind, ValueId,
 };
 
 mod forward;
@@ -27,6 +28,7 @@ pub struct WalkPlan {
     circuit: CircuitId,
     actions: Vec<Action>,
     input_positions: Vec<usize>,
+    initialized_zero_positions: Vec<usize>,
     one_position: usize,
     useful_bits: usize,
     c_is_identity: bool,
@@ -195,18 +197,30 @@ enum RawAction {
 impl BooleanCircuit {
     /// Compile a source-order structural walk.
     pub fn walk_plan(&self) -> Result<WalkPlan, LayoutError> {
-        WalkPlan::compile(self, &PhysicalLayout::source_order(self))
+        WalkPlan::compile(&self.relation(), &PhysicalLayout::source_order(self), [])
     }
 
     /// Compile a structural walk for an explicit physical layout.
     pub fn walk_plan_with_layout(&self, layout: &PhysicalLayout) -> Result<WalkPlan, LayoutError> {
-        WalkPlan::compile(self, layout)
+        WalkPlan::compile(&self.relation(), layout, [])
     }
 }
 
 impl WalkPlan {
-    fn compile(circuit: &BooleanCircuit, layout: &PhysicalLayout) -> Result<Self, LayoutError> {
-        layout.validate_for(circuit)?;
+    pub(super) fn compile(
+        circuit: &RelationRef<'_>,
+        layout: &PhysicalLayout,
+        initialized_zero_values: impl IntoIterator<Item = ValueId>,
+    ) -> Result<Self, LayoutError> {
+        layout.validate_relation(circuit)?;
+        let initialized_zero_positions = initialized_zero_values
+            .into_iter()
+            .map(|value| {
+                layout
+                    .value_position(value)
+                    .ok_or(LayoutError::WrongCircuit)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut raw_actions = Vec::new();
         let mut scheduled = vec![false; circuit.expressions.len()];
@@ -318,11 +332,7 @@ impl WalkPlan {
         occupied_positions.extend_from_slice(&value_positions);
         occupied_positions.sort_unstable();
         occupied_positions.dedup();
-        let c_is_identity = circuit.rows.iter().all(|row| {
-            let position = layout.row_positions[row.id.index];
-            let support = &circuit.expressions[row.result.index].support;
-            support.len() == 1 && layout.value_positions[support[0].index()] == position
-        }) && row_positions == value_positions;
+        let c_is_identity = circuit.c_is_identity(layout);
         let xor_term_bytes = xor_edges * std::mem::size_of::<Source>();
         let action_bytes = actions.len() * std::mem::size_of::<Action>() + xor_term_bytes;
 
@@ -334,6 +344,7 @@ impl WalkPlan {
                 .iter()
                 .map(|value| layout.value_positions[value.index])
                 .collect(),
+            initialized_zero_positions,
             one_position: layout.value_positions[circuit.one.index],
             useful_bits: layout.useful_bits,
             c_is_identity,
@@ -543,7 +554,7 @@ impl LincheckCircuit for WalkLincheckCircuit<'_> {
 }
 
 fn schedule_expression(
-    circuit: &BooleanCircuit,
+    circuit: &RelationRef<'_>,
     root: LinearExprId,
     scheduled: &mut [bool],
     actions: &mut Vec<RawAction>,
@@ -573,7 +584,7 @@ fn schedule_expression(
 }
 
 fn source(
-    circuit: &BooleanCircuit,
+    circuit: &RelationRef<'_>,
     layout: &PhysicalLayout,
     expression_slots: &[Option<usize>],
     id: LinearExprId,

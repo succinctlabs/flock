@@ -35,3 +35,20 @@ fn validation_rejects_read_before_definition() {
     early_row.lhs = late.expression;
     builder.finish();
 }
+
+#[test]
+#[should_panic(expected = "row reads a value before it is defined")]
+fn validation_checks_cancelled_structural_dependencies() {
+    let mut builder = CircuitBuilder::new();
+    let a = builder.input();
+    let early = builder.materialize(a);
+    let late = builder.materialize(a);
+    let cancelled = builder.xor3(late, a, late);
+    let row = builder
+        .rows
+        .iter_mut()
+        .find(|row| row.defined_value == Some(early.value))
+        .unwrap();
+    row.lhs = cancelled.id;
+    builder.finish();
+}

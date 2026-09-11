@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 
+use super::lowering::relation::RelationRef;
 use super::{BooleanCircuit, CircuitId, PortEncoding, RowId, ValueId};
 
 /// Deterministic mapping from logical circuit identifiers to physical R1CS
@@ -78,15 +79,19 @@ impl PhysicalLayout {
     }
 
     pub(super) fn validate_for(&self, circuit: &BooleanCircuit) -> Result<(), LayoutError> {
+        self.validate_relation(&circuit.relation())
+    }
+
+    pub(super) fn validate_relation(&self, circuit: &RelationRef<'_>) -> Result<(), LayoutError> {
         if self.circuit != circuit.id
-            || self.value_positions.len() != circuit.value_count()
-            || self.row_positions.len() != circuit.row_count()
+            || self.value_positions.len() != circuit.value_count
+            || self.row_positions.len() != circuit.rows.len()
         {
             return Err(LayoutError::WrongCircuit);
         }
         validate_unique_positions(&self.value_positions, PositionKind::Column)?;
         validate_unique_positions(&self.row_positions, PositionKind::Row)?;
-        for port in &circuit.ports {
+        for port in circuit.ports {
             if let PortEncoding::LittleEndianWord { alignment_bits } = port.encoding {
                 let start = self.value_positions[port.values[0].index];
                 if !start.is_multiple_of(alignment_bits) {
@@ -379,6 +384,7 @@ impl fmt::Display for PositionKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutError {
     WrongCircuit,
+    IdentityCRequired,
     UnknownPort(String),
     MisalignedPort {
         name: String,
@@ -418,6 +424,9 @@ impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongCircuit => f.write_str("layout belongs to another circuit shape"),
+            Self::IdentityCRequired => {
+                f.write_str("identity C cannot be satisfied with the required row placement")
+            }
             Self::UnknownPort(name) => write!(f, "unknown port `{name}`"),
             Self::MisalignedPort {
                 name,

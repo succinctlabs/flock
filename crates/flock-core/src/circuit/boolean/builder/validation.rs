@@ -127,17 +127,28 @@ impl CircuitBuilder {
             "input list disagrees with rows"
         );
 
+        // Structural dependencies do not cancel when their normalized supports do.
+        let mut latest_definition: Vec<Option<usize>> = Vec::with_capacity(self.expressions.len());
+        for expression in &self.expressions {
+            let latest = match &expression.node {
+                ExpressionNode::Zero => None,
+                ExpressionNode::Value(value) => Some(definition_rows[value.index].index),
+                ExpressionNode::Xor(terms) => terms
+                    .iter()
+                    .filter_map(|term| latest_definition[term.index])
+                    .max(),
+            };
+            latest_definition.push(latest);
+        }
         for row in &self.rows {
             for (expression, is_result) in [(row.lhs, false), (row.rhs, false), (row.result, true)]
             {
-                for value in &self.expressions[expression.index].support {
-                    let definition = definition_rows[value.index()];
-                    let self_reference = row
-                        .defined_value
-                        .is_some_and(|defined| defined.index == value.index())
+                if let Some(definition) = latest_definition[expression.index] {
+                    let self_reference = matches!(self.expressions[expression.index].node,
+                        ExpressionNode::Value(value) if row.defined_value == Some(value))
                         && (matches!(row.kind, RowKind::One | RowKind::Input) || is_result);
                     assert!(
-                        definition.index < row.id.index || self_reference,
+                        definition < row.id.index || self_reference,
                         "row reads a value before it is defined"
                     );
                 }

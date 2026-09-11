@@ -1,4 +1,4 @@
-//! Selector, advice, component, and interaction authoring.
+//! Selector, component, and interaction authoring.
 
 use super::*;
 use crate::circuit::boolean::{
@@ -11,46 +11,6 @@ impl CircuitBuilder {
     pub fn selector(&self, bit: Bit) -> Selector {
         self.assert_circuit(bit.value.circuit);
         Selector { bit }
-    }
-
-    /// Allocate a named selector input.
-    pub fn input_selector(&mut self, name: impl Into<String>) -> Selector {
-        let [bit] = self.input_port(name, PortEncoding::Bits, PortOrigin::Witness);
-        Selector { bit }
-    }
-
-    /// Allocate a named advice bit-array. Advice is untrusted input whose type
-    /// identifies its honest generator; constraints must establish validity.
-    pub fn advice_bits<const N: usize>(
-        &mut self,
-        name: impl Into<String>,
-        advice_type: impl Into<String>,
-    ) -> [Bit; N] {
-        self.advice_port(name, advice_type, PortEncoding::Bits)
-    }
-
-    /// Allocate a named little-endian advice word.
-    pub fn advice_word<const N: usize>(
-        &mut self,
-        name: impl Into<String>,
-        advice_type: impl Into<String>,
-    ) -> [Bit; N] {
-        self.advice_port(
-            name,
-            advice_type,
-            PortEncoding::LittleEndianWord { alignment_bits: 1 },
-        )
-    }
-
-    fn advice_port<const N: usize>(
-        &mut self,
-        name: impl Into<String>,
-        advice_type: impl Into<String>,
-        encoding: PortEncoding,
-    ) -> [Bit; N] {
-        let advice_type = advice_type.into();
-        assert!(!advice_type.is_empty(), "advice type must not be empty");
-        self.input_port(name, encoding, PortOrigin::Advice { advice_type })
     }
 
     /// Build one named component and record the ranges it emitted. The closure

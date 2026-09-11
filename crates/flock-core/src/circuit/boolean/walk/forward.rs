@@ -204,6 +204,10 @@ impl WalkPlan {
         for (&position, &input) in self.input_positions.iter().zip(inputs) {
             z[position] = input;
         }
+        // Honest initialization, not constant folding: transpose still sees these boundaries.
+        for &position in &self.initialized_zero_positions {
+            z[position] = false;
+        }
 
         for action in &self.actions {
             match action {
@@ -252,3 +256,6 @@ impl ForwardTrace {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

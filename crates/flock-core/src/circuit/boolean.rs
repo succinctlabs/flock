@@ -1,36 +1,48 @@
 //! Typed Boolean circuit definitions with explicit materialization.
 //!
-//! The language distinguishes virtual linear expressions from materialized
-//! witness bits:
+//! Declare inputs, advice, witnesses, and outputs through a [`ColumnSchema`].
+//! [`CircuitBuilder::compile`] reserves those columns, runs the circuit's eval
+//! function, and returns resolved column bindings alongside the circuit.
+//! Eval can compose reusable [operations](CircuitBuilder::operation).
 //!
-//! - [`CircuitBuilder::xor`] records a structural expression, but allocates no
-//!   witness value or R1CS row;
-//! - [`CircuitBuilder::and`] allocates one value and its defining row; and
-//! - [`CircuitBuilder::materialize`] explicitly allocates a linear-copy row.
+//! [`CircuitBuilder::xor`] records a virtual expression without a witness row.
+//! [`CircuitBuilder::define_and`] and [`CircuitBuilder::define_linear`] explicitly
+//! define reserved columns. Additional backend variables, when needed, belong to
+//! [lowering](BooleanCircuit::lower), not the authored column schema.
+//!
+//! Allocating construction is also supported: start with [`CircuitBuilder::new`],
+//! allocate inputs with [`CircuitBuilder::input`], then use [`CircuitBuilder::and`]
+//! or [`CircuitBuilder::materialize`] to allocate outputs and their defining rows.
+//! Schema and allocating construction cannot be mixed in one builder.
 //!
 //! The IR keeps both the structural XOR DAG and normalized linear supports.
 //! The DAG drives circuit walking; the supports drive sparse R1CS emission.
-//! General `A z * B z = C z` constraints are retained;
-//! `C = I` is an optional lowering/prover optimization, not a language rule.
+//! General `A z * B z = C z` constraints are retained; identity C is optional.
 //! Logical identifiers are separate from physical matrix positions. Source
 //! order is the default; compatibility layouts may permute it.
-//!
-//! The public types live here; authoring, layout, and lowering are separate
-//! implementation modules.
 
+mod acceptance_checker;
 mod builder;
 mod interface;
 mod layout;
 mod lowering;
+mod schema;
 mod walk;
 
+pub use acceptance_checker::{IdentityChecker, LoweringAux, LoweringPurpose};
 pub use builder::CircuitBuilder;
 pub use interface::{
     Component, Interaction, InteractionDirection, InteractionEncoding, InteractionField,
     InteractionScope, PortOrigin, Selector,
 };
 pub use layout::{LayoutBuilder, LayoutError, PhysicalLayout, PositionKind};
-pub use lowering::{EvaluationError, R1csBuildError};
+pub use lowering::{
+    AssertionAux, EvaluationError, LoweredCircuit, LoweringMode, R1csBuildError, RowPlacement,
+};
+pub use schema::{
+    ColumnRole, ColumnSchema, ColumnVisitor, CompiledColumns, OperationWord, SchemaColumn,
+    SchemaOperation, Var,
+};
 pub use walk::{ForwardTrace, WalkError, WalkLincheckCircuit, WalkPlan, WalkStats};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

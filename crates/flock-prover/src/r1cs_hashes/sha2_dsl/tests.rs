@@ -2,11 +2,13 @@ use super::*;
 
 use std::hint::black_box;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+use super::super::dsl::tests::{assert_relation_equal, median_time};
 
 use crate::prover::prove_ligerito;
 use flock_core::challenger::FsChallenger;
-use flock_core::circuit::boolean::{PortDirection, PortEncoding};
+use flock_core::circuit::boolean::{LoweringMode, PortDirection, PortEncoding, RowPlacement};
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::{self, PcsParams};
@@ -23,22 +25,12 @@ const SHA256_ABC: [u32; 8] = [
     0xf200_15ad,
 ];
 
-fn median_time(iterations: usize, mut operation: impl FnMut()) -> Duration {
-    let mut samples = Vec::with_capacity(iterations);
-    for _ in 0..iterations {
-        let start = Instant::now();
-        operation();
-        samples.push(start.elapsed());
+fn block_inputs(h_in: &[u32; 8], message: &[u32; 16]) -> Vec<bool> {
+    let mut inputs = Vec::with_capacity((sha2::H_WORDS + sha2::M_WORDS) * sha2::WORD_BITS);
+    for &word in h_in.iter().chain(message) {
+        inputs.extend((0..sha2::WORD_BITS).map(|bit| word >> bit & 1 == 1));
     }
-    samples.sort_unstable();
-    samples[iterations / 2]
-}
-
-fn assert_matrix_rows_equal(side: &str, actual: &[Vec<usize>], expected: &[Vec<usize>]) {
-    assert_eq!(actual.len(), expected.len());
-    for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-        assert_eq!(actual, expected, "{side} differs at row {row}");
-    }
+    inputs
 }
 
 #[test]
@@ -49,20 +41,25 @@ fn dsl_matches_legacy_relation_and_witness() {
     assert!(Arc::ptr_eq(&actual_r1cs, &sha256_relation_projection(3)));
     let expected_r1cs = sha2::build_block_r1cs(3);
 
-    assert_eq!(actual_r1cs.m, expected_r1cs.m);
-    assert_eq!(actual_r1cs.k_log, expected_r1cs.k_log);
-    assert_eq!(actual_r1cs.k_skip, expected_r1cs.k_skip);
-    assert_eq!(actual_r1cs.useful_bits, expected_r1cs.useful_bits);
-    assert_eq!(actual_r1cs.layout, expected_r1cs.layout);
-    assert_eq!(actual_r1cs.const_pin, expected_r1cs.const_pin);
-    assert_matrix_rows_equal("A", &actual_r1cs.a_0.rows, &expected_r1cs.a_0.rows);
-    assert_matrix_rows_equal("B", &actual_r1cs.b_0.rows, &expected_r1cs.b_0.rows);
-    assert_matrix_rows_equal("C", &actual_r1cs.c_0.rows, &expected_r1cs.c_0.rows);
-    assert_eq!(
-        actual_r1cs.statement_digest(),
-        expected_r1cs.statement_digest()
-    );
+    assert_relation_equal("legacy", &actual_r1cs, &expected_r1cs);
     drop(expected_r1cs);
+
+    let identity = dsl
+        .circuit()
+        .lower(
+            LoweringMode::RequireIdentityC,
+            dsl.layout(),
+            RowPlacement::Preserve,
+        )
+        .unwrap();
+    assert!(identity.c_is_identity());
+    assert!(identity.auxiliaries().is_empty());
+    assert_eq!(identity.layout(), dsl.layout());
+    let identity_r1cs = identity
+        .to_block_r1cs(sha2::K_LOG, sha2::K_SKIP, 3)
+        .unwrap();
+    assert_relation_equal("required identity C", &identity_r1cs, &actual_r1cs);
+    drop(identity_r1cs);
 
     for (name, direction, len, position) in [
         (
@@ -103,6 +100,8 @@ fn dsl_matches_legacy_relation_and_witness() {
     );
 
     let plan = sha256_walk_projection();
+    let identity_plan = identity.walk_plan().unwrap();
+    assert_eq!(identity_plan.stats(), plan.stats());
     assert!(std::ptr::eq(plan, sha256_walk_projection()));
     assert!(plan.c_is_identity());
     assert_eq!(dsl.circuit().expression_count(), 116_982);
@@ -152,6 +151,20 @@ fn dsl_matches_legacy_relation_and_witness() {
     for (case, &(h_in, message)) in cases.iter().enumerate() {
         let actual_witness = dsl.evaluate_block(&h_in, &message);
         let expected_witness = sha2::build_block_witness(&h_in, &message);
+        let identity_logical = identity.evaluate(&block_inputs(&h_in, &message)).unwrap();
+        assert_eq!(
+            super::super::dsl::physical_witness(
+                &identity_logical,
+                identity.layout(),
+                1 << sha2::K_LOG
+            ),
+            expected_witness,
+        );
+        let (cols, _) = dsl.generate_trace(&h_in, &message);
+        assert_eq!(
+            cols.h_out.into_iter().flatten().collect::<Vec<_>>(),
+            expected_witness[sha2::H_OUT_BASE..sha2::H_OUT_BASE + 256]
+        );
         assert_eq!(actual_witness, expected_witness);
         assert_eq!(
             pcs::pack_witness(&actual_witness, sha2::K_LOG),
@@ -161,6 +174,12 @@ fn dsl_matches_legacy_relation_and_witness() {
             .forward(&block_inputs(&h_in, &message), sha2::K_LOG)
             .expect("the structural walk must evaluate SHA-256");
         assert_eq!(walked.z, actual_witness);
+        assert_eq!(
+            identity_plan
+                .forward(&block_inputs(&h_in, &message), sha2::K_LOG)
+                .unwrap(),
+            walked
+        );
         let batched_witness: Vec<bool> = actual_witness.repeat(1 << 3);
         assert!(actual_r1cs.satisfies(&batched_witness));
         let h_out = sha2::read_h_out(&actual_witness);
