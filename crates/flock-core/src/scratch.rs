@@ -27,14 +27,9 @@ use crate::{
     field::{F128, F256},
 };
 
-/// Pool entries carry a provenance tag (0 = none): a producer that returns a
-/// buffer whose byte contents it can vouch for attaches a layout-specific
-/// tag; a later taker asking for the SAME tag and exact length receives the
-/// buffer with contents intact (a "hit") and may skip rewriting the layout's
-/// constant regions. Any other custody event — an untagged take, a
-/// different-tag take — clears the tag, so a hit can only ever alias bytes
-/// with a buffer that genuinely holds a previous run of the same layout.
-static POOL: Mutex<Vec<(Vec<F128>, u64)>> = Mutex::new(Vec::new());
+/// Retained buffers. Contents are stale and never trusted: every take
+/// hands out uninitialized scratch (see the module docs).
+static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
@@ -87,23 +82,22 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
     // oversized-but-resident fallback over a fresh allocation.
     let mut best: Option<usize> = None;
     let mut best_windowed: Option<usize> = None;
-    for (i, (v, _)) in pool.iter().enumerate() {
+    for (i, v) in pool.iter().enumerate() {
         if v.capacity() < n {
             continue;
         }
-        if best.is_none_or(|b: usize| v.capacity() < pool[b].0.capacity()) {
+        if best.is_none_or(|b: usize| v.capacity() < pool[b].capacity()) {
             best = Some(i);
         }
         if v.capacity() < 4 * n.max(1)
-            && best_windowed.is_none_or(|b: usize| v.capacity() < pool[b].0.capacity())
+            && best_windowed.is_none_or(|b: usize| v.capacity() < pool[b].capacity())
         {
             best_windowed = Some(i);
         }
     }
     let best = best_windowed.or(best);
     if let Some(i) = best {
-        // Untagged custody: the tag (if any) dies here.
-        let (mut v, _) = pool.swap_remove(i);
+        let mut v = pool.swap_remove(i);
         drop(pool);
         if var_os("FLOCK_POOL_TRACE").is_some() {
             eprintln!(
@@ -146,33 +140,11 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
 /// The residual is the capacity-scaled buffers EXISTING, which no eviction
 /// policy can address — see the live-span note on zerocheck's fold output.
 pub fn give_f128(v: Vec<F128>) {
-    give_f128_tagged(v, 0)
-}
-
-/// [`take_f128`] with provenance: returns `(buffer, hit)`. `hit` is true only
-/// when the pool held a buffer given back via [`give_f128_tagged`] with this
-/// exact `tag` and length `n` — its contents are then EXACTLY the previous
-/// producer's output, so layout-constant regions need not be rewritten.
-/// On a miss the buffer is ordinary uninitialized scratch. `tag` 0 never hits.
-pub fn take_f128_tagged(n: usize, tag: u64) -> (Vec<F128>, bool) {
-    if tag != 0 {
-        let mut pool = POOL.lock().unwrap();
-        if let Some(i) = pool.iter().position(|(v, t)| *t == tag && v.len() == n) {
-            let (v, _) = pool.swap_remove(i);
-            return (v, true);
-        }
-    }
-    (take_f128(n), false)
-}
-
-/// [`give_f128`]-with-provenance: the caller vouches that `v`'s bytes are a
-/// complete output of the layout named by `tag` (see [`take_f128_tagged`]).
-pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
     if v.capacity() == 0 {
         return;
     }
     let mut pool = POOL.lock().unwrap();
-    pool.push((v, tag));
+    pool.push(v);
     if pool.len() > MAX_POOLED {
         // Evict from the most-populated log2 size class (tie: the smallest
         // buffer in it). Always-evict-smallest let a prewarmed set of large
@@ -180,7 +152,7 @@ pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
         // every give of the hot size evicted the buffer just given.
         let class_of = |c: usize| usize::BITS - c.leading_zeros();
         let mut counts = [0u32; 65];
-        for (b, _) in pool.iter() {
+        for b in pool.iter() {
             counts[class_of(b.capacity()) as usize] += 1;
         }
         let crowded = (0..counts.len())
@@ -189,8 +161,8 @@ pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
         let victim = pool
             .iter()
             .enumerate()
-            .filter(|(_, (b, _))| class_of(b.capacity()) as usize == crowded)
-            .min_by_key(|(_, (b, _))| b.capacity())
+            .filter(|(_, b)| class_of(b.capacity()) as usize == crowded)
+            .min_by_key(|(_, b)| b.capacity())
             .map(|(i, _)| i)
             .expect("crowded class non-empty");
         pool.swap_remove(victim);
