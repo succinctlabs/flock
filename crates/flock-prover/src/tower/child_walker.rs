@@ -44,11 +44,11 @@ use crate::{
         OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ag_seed_bytes,
         assertion_mac, bytes_payload_mask, cap_payloads, cap_wires, check_residual_publics,
         circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
-        emit_boolean_reported_check, emit_element_reported_check, emit_fs_chain, emit_publics_hash,
-        emit_query_phase, emit_recombination, emit_residual_region, flatten_ops, level_geometry,
-        level_sources, observed_f256, pack8, parse_open_levels, payload_words, pin_recombination,
-        query_phase_b3_rows, replay_ligerito_spine256, squeeze_word_wire, strat_scheds,
-        walker_common,
+        emit_boolean_reported_check, emit_element_reported_check, emit_fiat_shamir_chain,
+        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region, flatten_ops,
+        level_geometry, level_sources, observed_f256, pack8, parse_open_levels, payload_words,
+        pin_recombination, query_phase_blake3_rows, replay_ligerito_spine256, squeeze_word_wire,
+        strat_scheds, walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -88,6 +88,7 @@ pub(super) struct ChildTape<'p> {
     pub(super) start_v: usize,
     gammas_o: Vec<PdRec>,
     pub(super) w_rounds: Vec<RoundRec>,
+    pub(super) w_coords: Vec<RoundRec>,
     pub(super) w_resid: Vec<RoundRec>,
     mp_o: MpRec,
     inner_pd2: InnerPd,
@@ -376,6 +377,19 @@ impl<'p> ChildTape<'p> {
         );
         assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
         let n_log_i = union.n_log();
+        // Block-first transport (`pcs::open_batch_merged`): under a
+        // full-height column prefix the prover bound the k−1 block
+        // coordinates first. `w_rounds` stays in round order for the
+        // running-claim chain; `w_coords` is ρ in coordinate order.
+        let w_coords: Vec<RoundRec> = {
+            let mut v = w_rounds.clone();
+            if flock_core::pcs::rectangular_prefix_columns(&union.jagged_heights(), n_log_i)
+                .is_some()
+            {
+                v.rotate_left(m_mp2 - n_log_i - 1);
+            }
+            v
+        };
         // Recompute the recombination and f == g from located words.
         let n_pub_slots_c = pin_recombination(
             inner.built.shape.circuit.cells(),
@@ -603,7 +617,7 @@ impl<'p> ChildTape<'p> {
                     let pt = decode_ag_point(
                         &ag_seed_bytes(chals[*seed_ch], chals[*seed_ch + 1]),
                         nonce,
-                        inner.pcs.zerocheck_grinding().ag_r1_bits(),
+                        inner.pcs.zerocheck_grinding().ag_round_one_bits(),
                     );
                     assert_eq!(
                         bool_assert.z_skip,
@@ -742,7 +756,7 @@ impl<'p> ChildTape<'p> {
             for j in 1..257 + n_p {
                 gpow_n.push(gpow_n[j - 1] * gamma_n);
             }
-            let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
+            let rho_mrg_n: Vec<F128> = w_coords.iter().map(|rr| chals[rr.ch]).collect();
             let point_n: Vec<F128> = mp_o.rounds.iter().map(|rr| chals[rr.ch]).collect();
             let sig_n: Vec<F128> = mp_o.anchor_rounds.iter().map(|rr| chals[rr.ch]).collect();
             let bit = |b: bool| if b { F128::ONE } else { F128::ZERO };
@@ -906,7 +920,7 @@ impl<'p> ChildTape<'p> {
         }
 
         let (yr_len, w_resid) =
-            walker_common::parse_residual_rotation(proof, &geo, &levels, &w_rounds);
+            walker_common::parse_residual_rotation(proof, &geo, &levels, &w_coords);
 
         let z_ix = el_assert.as_ref().map(|assertion| {
             gammas_o
@@ -932,6 +946,7 @@ impl<'p> ChildTape<'p> {
             start_v,
             gammas_o,
             w_rounds,
+            w_coords,
             w_resid,
             mp_o,
             inner_pd2,
@@ -1491,7 +1506,7 @@ impl<'p> ChildTape<'p> {
             HashKind::Blake3,
             &strat_scheds(&inner.pcs),
         );
-        let b3_rows = trace.rows.len() + h_rows + query_phase_b3_rows(&geo);
+        let b3_rows = trace.rows.len() + h_rows + query_phase_blake3_rows(&geo);
         if var("B3_CENSUS").is_ok() {
             let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
             let blocks = trace.rows.len() - parents;
@@ -1712,11 +1727,11 @@ pub(super) struct ChildSlots {
 impl ChildSlots {
     #[cfg(test)]
     pub(super) fn new(sb: &mut ShapeBuilder, nu2: usize, spread_w: usize) -> Self {
-        Self::new_with_b3_split(sb, nu2, spread_w, false)
+        Self::new_with_blake3_split(sb, nu2, spread_w, false)
     }
 
     #[cfg(test)]
-    fn new_with_b3_split(
+    fn new_with_blake3_split(
         sb: &mut ShapeBuilder,
         nu2: usize,
         spread_w: usize,
@@ -1972,7 +1987,7 @@ pub(super) fn emit_child_region(
         sb.fixed_public_input(iv_w[0]),
         sb.fixed_public_input(iv_w[1]),
     ];
-    let (outs, ww) = emit_fs_chain(
+    let (outs, ww) = emit_fiat_shamir_chain(
         sb,
         b3_slot,
         iv2,
@@ -2630,7 +2645,7 @@ fn emit_anchor_expect(
     let macs = cs.macs;
     let spine = cs.spine;
     let chals = &ct.chals[..];
-    let w_rounds = &ct.w_rounds[..];
+    let w_coords = &ct.w_coords[..];
     let el_rec = ct.el.as_ref();
     let m_mp2 = ct.m_mp2;
     let n_log_i = ct.n_log_i;
@@ -2682,8 +2697,8 @@ fn emit_anchor_expect(
 
     // ĝ(ρ″): advice square-root chains for ρ^(2^-j), bound by forward
     // squaring deltas y·y + prev = 0.
-    let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
-    let rho_mrg_w: Vec<Wire> = w_rounds
+    let rho_mrg_n: Vec<F128> = w_coords.iter().map(|rr| chals[rr.ch]).collect();
+    let rho_mrg_w: Vec<Wire> = w_coords
         .iter()
         .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
         .collect();

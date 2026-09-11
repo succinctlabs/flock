@@ -1,0 +1,6115 @@
+# RS-path port log
+
+Record of porting engineering optimizations from the Yukon challenge repo
+(`Layr-Labs/flock-challenge` @ `c576e68`) into this tree's RS zerocheck path.
+Goal: close the gap while keeping added code minimal, and keep every change
+attributable to a measured per-phase delta.
+
+Every number here is `benchmarks/breakdown_phases.sh` at 2^18 BLAKE3 on an
+**Apple M1 Max (8 P-cores, 32 GB)**, back-to-back A/B in the same session.
+Reproduce a row with:
+
+```sh
+LABEL=<tag> OUT=phases.tsv ./benchmarks/breakdown_phases.sh
+```
+
+## Baseline (`9793190`) and the target
+
+| phase | ours ST | ours 8T | challenge ST | challenge 8T |
+|---|---:|---:|---:|---:|
+| witness | 351.4 | 81.1 | *not reported* | *not reported* |
+| commit | 1277.4 | 196.2 | 1796.7 | 255.9 |
+| zc round 1 | 1441.4 | 196.7 | 314.1 | 43.7 |
+| zc round 2 | 433.1 | 58.8 | *(combined)* | *(combined)* |
+| zc rounds 3+ | 452.4 | 66.4 | 538.2 (r2+r3+) | 78.0 |
+| lincheck | 183.4 | 30.6 | 31.9 | 13.4 |
+| open | 636.9 | 100.2 | 565.2 | 89.5 |
+| **total** | **4781.0** | **723.9** | — | — |
+
+Two caveats on the challenge-repo column, both established with the session
+that produced it:
+
+1. Those numbers come from `prove_fast_timed`, which in that repo is a
+   structurally separate path from `prove_fast` and measured **~15% slower**
+   (405.7-420.7 ms vs 473-484 ms for the same work). Ours agrees with its own
+   headline `prove_fast` to within 1.4%, so the two columns are not on equal
+   footing. Where the 15% sits is unknown; if it is concentrated in `commit`
+   (the dominant phase there, and the one touching its pinned allocation) then
+   its commit figure is overstated by a lot.
+2. That repo moves work **across phase boundaries** —
+   `round1_c_fold4_from_lincheck_stripe` and `stage_c_prelude_for_tail_fill`
+   shift C-side work between lincheck and the zerocheck. Its very low lincheck
+   number is therefore partly re-attribution, not necessarily a real win.
+
+Treat the column as directional, not as a scoreboard.
+
+## Attempts
+
+| # | change | phase | ST | 8T | verdict |
+|---|---|---|---|---|---|
+| 1 | batch reduced msg muls via `ghash_mul_vec2_neon` | rounds 3+ | 455.2 → 500.8 (**+10.0%**) | 69.2 → 78.3 (+13.2%) | **reverted** |
+| 2 | `WideNeon` register-resident accumulator | round 2 | 433.1 → 375.2 (**−13.4%**) | 58.8 → 55.0 (−6.4%) | **kept** |
+| 3 | same, rounds 3+ | rounds 3+ | 452.5 → 455.7 (+0.7%) | 68.6 → 69.2 (+0.9%) | dropped |
+| 4 | defer round-1 partial-sum reduction to once per x_hi | round 1 | 1441.4 → 1447.1 (+0.4%) | 196.7 → 203.2 (+3.3%) | **reverted** |
+| 5 | port the multilinear lookahead to the RS tail | rounds 3+ | −7.5% *(pre-measured)* | — | not attempted |
+| 6 | fetch inv-NTT rows with one `LD1 x4` | round 1 | 1455.8 → 1634.6 (**+12.3%**) | 192.1 → 218.4 (+13.7%) | **reverted** |
+| 7 | fold XOR accumulation into `EOR3` pairs | round 1 | 1444.3 → 1469.9 (+1.8%) | *(8T arm discarded, drift)* | **reverted** |
+| 8 | hoist the challenge-independent AB transform out of the zerocheck, `rayon::join`ed with the commit (+ `stnp` non-temporal stores) | round 1 | 1474.6 → 601.1 (**−59%**) but **total unchanged** | 219.8 → 81.4 (−63%), total unchanged | **reverted** |
+| 9 | nibble-split convert tables (64 KiB → 8 KiB hot table, gathers 48 → 96/lane) | round-1 drain | headline 53508 → 51582 comp/s (**−3.6%**, base 8/8) | — | **reverted** |
+| 10 | lincheck-stripe dedup for round 1's C input | round-1 drain | *impossible* — byte groupings run on disjoint axes (stride 64 vs 2^14) | — | **closed on algebra** |
+| 11 | geometric eq-build in lincheck | lincheck | whole eq build is 0.13 ms; geometric variant *slower* at 5/6 sizes | — | **closed for free** |
+| 12 | **skip structurally-zero b K-rows** | round 1 | **1475.4 → 1433.0 ms (−42.4, −2.9%), head 8/8** | — | **KEPT** |
+| 13 | constant-fold all-ones b K-rows | round 1 | 1420.0 → 1413.9 (−6.1, −0.43%), 7/8 | — | reverted (~90 lines for 6 ms) |
+| 14 | **two lanes per iteration in the drain** | round-1 drain | **1483.1 → 1420.0 ms (−63.1, −4.3%), head 8/8** | — | **KEPT** |
+| 15 | **unreduced pmull accumulate + x^K weight split (x⁴ table image · x² byte-mul · u16 shift)** | round-1 prep | **1401.4 → 1273.4 ms (−128.0, −9.1%), head 8/8, every pair −8.7..−10.1%** | — | **KEPT** |
+| 16 | **stripe-fold C side: round-1 C banks from one multilinear fold of the lincheck stripe; drain runs AB-only, C transpose deleted** | round 1 | **1277.5 → 1204.7 ms (−72.7, −5.7%), head 8/8** | — | **KEPT** |
+| 17 | **q-resident round 2: fold outputs stay in q registers, in-register karatsuba `mul_q` (5 PMULLs), `WideNeon` fed directly** | round 2 | **358.1 → 311.6 ms (−13.0%), 8/8, every pair −12.6..−13.3%** | — | **KEPT** |
+| 18 | **fused q-resident rounds-3+ tail: fold+message in one pass, second read pass over multi-MB chunks deleted** | rounds 3+ | **449.5 → 306.6 ms (−31.8%), 8/8, every pair −31.1..−32.6% — largest single win of the effort** | — | **KEPT** |
+| 19 | **stripe fold through lincheck's tiled dispatcher** (was calling the portable fallback; its 256 KiB accumulator thrashes L2 at k_log=14) | round-1 C fold | **1191.0 → 1023.7 ms (−167.3, −14.0%), 8/8, every pair −13.6..−14.4%** | — | **KEPT** |
+| 21 | b === all-ones round-2 pair degeneration | round 2 | 312.0 → 312.4 ms, sign 4-4 — **null** (third partial-skip-vs-ILP confirmation) | — | reverted |
+| 22 | non-temporal (STNP) round-2 output stores | round 2 | 313.1 → 350.3 ms (**+12%**), base 8/8 — STNP *inverts* on M1 (M4-specific idiom, their ablation +1.2%) | — | **reverted** |
+| 23 | **four lanes per iteration in the AB-only drain** | round-1 drain | 960.5 → 954.4 ms (−6.0, −0.6%), 7/8 | — | **KEPT** (10 lines) |
+| 25 | word-extract in the round-2 fold | round 2 | 313.1 → 305.3 ms (−7.9, −2.5%), 6/8 | — | **KEPT** |
+| 26 | two round-2 pairs per iteration | round 2 | 306.5 → 317.9 (+3.7%), base 8/8; **re-verified under challenge**: 307.1 vs 325.4, unroll worse 8/8 disjoint, regression larger under load (register spills amplify with memory contention) | — | reverted, double-sourced |
+| 24 | static-b partial loads — bounded by probe, not implemented | round-1 prep | deleting ALL b gathers: 954 → 750.6 ms, so ceiling = 33.7% × 204 ≈ **69 ms**; realistic ≈ 15–20 at measured partial-skip capture rates, vs 200–800 lines | — | **closed on the bound** |
+| 20 | **word-extract addressing in the prep** (16 byte-loads per K-row → 2 word loads + shifts) | round-1 prep | **1027.6 → 974.8 ms (−52.7, −5.1%), 6/6** | — | **KEPT** |
+
+Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
+added lines.
+
+## What the negative results tell us
+
+- **Round 1 is not multiply-bound** (attempt 4: reductions cut by a factor of
+  `big_lo_size`, products from 6 PMULLs to 3, no movement). An earlier version
+  of this log inferred from that "round 1 is gather-bound on the convert
+  table". **That inference was wrong.** Measuring the split directly
+  (temporary `FLOCK_R1_SPLIT` scaffold, since removed) gives, at 2^18 ST:
+
+  | round-1 component | ST ms | of round 1 | of whole prove |
+  |---|---:|---:|---:|
+  | `shift_reduce_inner_ab` | ~810 | 56% | 17% |
+  | `bit_transpose_64bytes` | ~136 | 9% | 3% |
+  | `accumulate_convert` | ~521 | 36% | 11% |
+
+  So the convert-table accumulate is only a third of round 1; the prep pass
+  dominates. Reproduce by re-adding two `Instant` counters around the b_med
+  prep loop and the `accumulate_convert_with_s_hat_v` call in
+  `process_one_x_hi_with_s_hat_v` (per-x_outer_lo granularity; per-b_med timers
+  add ~470 ms of their own overhead and only the ratio survives).
+- **`shift_reduce_inner_ab` is limited by neither load-issue nor XOR-issue
+  count.** Attempts 6 and 7 cut load instructions 4x (8 per byte-pair to 2) and
+  XOR ops ~1.75x (56 to 32) respectively; the first cost 12.3% and the second
+  1.8%. On Apple cores the four-register structured `LD1` is microcoded and
+  loses to four independent 128-bit loads, and `EOR3` bought nothing. What is
+  left as the plausible limiter is load *latency* / L1 port pressure against
+  the 16 KB inv-NTT table — whose gathers are data-dependent and cannot be
+  batched — plus the `gf8_mul_vec16` work. Neither yields to a local rewrite,
+  which is consistent with the challenge repo needing specialized and generated
+  kernels here rather than a tidier loop.
+- **Interface shape can outweigh instruction counts.** Attempt 1 reduced PMULLs
+  (4/mul vs binius's 6) and still lost 10%, because `ghash_mul_vec2_neon` takes
+  and returns `[F128; 2]` and forces operands through memory. It earns its
+  place in the NTT and `f128_slice` call sites only because one operand there
+  is a loop-invariant broadcast.
+- **Lookahead loses on this hardware.** `cargo bench --bench ag_lookahead_ab`
+  (paired, same-process, proofs asserted bit-identical) gives classic 285.9 ms
+  vs lookahead 307.2 ms ST at m=30 — lookahead faster 0/4 runs. The code's own
+  comments target an M4; do not port it to the RS tail on an M1 without
+  re-measuring.
+- **Our `commit` is already ~1.4x faster than theirs** (1277 vs 1797 ms ST),
+  plausibly from #29/#30 which `c576e68` predates. Cross-pollination runs both
+  ways; commit is not a target for us.
+
+## Where the branch ended up
+
+Three changes kept, everything else reverted with its measurement in the commit
+message. Against `9793190` (the harness-only commit, before any optimization),
+2^18 BLAKE3 ST, paired n=8 with alternating arm order:
+
+| level | base | head | delta |
+|---|---:|---:|---|
+| round 1 (`round1 URM`) | 1477.30 ms | 1023.72 ms | **-30.7%**, each step 8/8 |
+| round 2 (`round2 fused fold`) | ~433 ms | 311.56 ms | **-28%** (WideNeon + q-resident) |
+| rounds 3+ (`rounds 3+ tail`) | ~455 ms | 306.56 ms | **-33%** (fused one-pass q-resident) |
+| end-to-end headline | ~52,400 comp/s | ~58,100 comp/s | **~+11%**, 8/8 (clean-band read; per-pair delta stable +9.6..+12.4% even through throttled pairs) |
+
+(Supersedes the interim +5.1% figure from the four-win state. The final run was
+taken with an active browser session; pairs 4-8 form tight bands on both arms
+and cross-check against the predicted sum of the individual wins, ~+7.9%.)
+
+Caveat on the end-to-end figure: the base arm spread that run was wide
+(46894-51655, ~10%) while head was tight (51231-53209), so the point estimate is
+soft even though the sign test is not. The round-1 number is the better
+measured of the two.
+
+The seven kept changes:
+
+1. **Round-2 NEON register accumulator** (~179 lines) -- `WideNeon`, a 256-bit
+   product held as two uint64x2_t instead of the GPR-resident F256Unreduced.
+   -13% on `zc_round2`.
+2. **Structurally-zero b K-row skip** (~10 lines) -- see above. Part of the
+   -5.0%.
+3. **Two lanes per drain iteration** (~50 lines) -- see above.
+4. **Unreduced pmull accumulate + x^K weight split** (~80 lines) -- the
+   challenge repo's top-attributed AB-prep mechanism, ported as an idea.
+   -128 ms on round 1 by itself (1401.4 -> 1273.4, 8/8, predicted 100-130 from
+   their attribution).
+5. **Stripe-fold C side** (~150 lines) -- round-1 C banks from one multilinear
+   fold of the lincheck stripe; drain AB-only, C transpose deleted. -72.7 ms.
+6. **q-resident round 2** (~120 lines) -- fold outputs stay in q registers,
+   in-register karatsuba mul_q, WideNeon fed directly. -46.6 ms (-13.0%).
+7. **Fused q-resident rounds-3+ tail** (~90 lines) -- fold and message in one
+   pass; the second read over multi-MB chunks deleted. -142.9 ms (-31.8%),
+   the largest single win. Two earlier failures on this exact loop (pair-mul
+   kernel +10%, WideNeon-alone 0%) had located the cost in the pass structure
+   and struct crossings, not the arithmetic.
+
+## What bounds each round-1 kernel (measured, not inferred)
+
+Five local rewrites of round 1 have now failed. Taken together they say
+something fairly precise about the two kernels, which is more useful than any
+of the individual results:
+
+- **The drain is bound by gather COUNT.** Doubling gathers (48 → 96 per lane)
+  while shrinking the hot table 8x (64 KiB → 8 KiB) cost 3.6%. M1 has 128 KiB
+  of L1D per performance core, so the 256-row convert table already fit and
+  there was no footprint problem to fix. Calibrating from that regression, the
+  drain's 48 gathers/lane are worth roughly 170 ms of its ~521 ms.
+- **The prep kernel is bound by neither load-issue nor XOR-issue count.**
+  Cutting load instructions 4x (LD1 x4) cost 12.3%; cutting XOR ops 1.75x
+  (EOR3 pairing) gave +1.8%. Deferring its reduction entirely moved nothing.
+- **And it is not bound by anything the witness's structure could unlock.**
+  Byte statistics of the packed BLAKE3 witness at 2^12 blocks:
+
+  | buffer | zeros | dominant byte | all-0xff rows | uniform 8-byte rows |
+  |---|---:|---|---:|---:|
+  | a | 6.6% | — | 0.0% | 5.9% |
+  | b | 6.1% | **0xff at 28.9%** | 9.4% | 15.3% |
+  | z | 12.6% | — | 0.0% | 5.9% |
+
+  `b` is strikingly non-random, which is presumably why the challenge repo has
+  a `static_b` / `mixed_const_b` / `single_k0_static_b` kernel family. But the
+  0xff bytes are scattered inside mixed rows rather than clustered: only 9.4%
+  of b's aligned 8-byte rows are uniformly 0xff, and the 5.9% all-zero rows
+  (identical in all three buffers) are padding that `b_med_counts` already
+  skips. Row-level constant specialization is therefore worth ~4% of prep
+  loads here -- order 10 ms -- not the 262 ms of the AB-prep gap.
+
+The uncomfortable implication: their AB prep is 548 ms against our ~810 ms
+while doing strictly MORE memory work (it streams 512 MiB out through
+non-temporal stores; ours writes a 1 KiB L1 scratch). So their kernel is
+genuinely ~1.5x better code at the same computation, and none of the
+structural explanations we can test account for it. That points at
+`fused_apply_one_k_fast` / `fast_shift_reduce_with_policy` / the 839-line
+generated `aarch64_bstatic_gen.rs` -- i.e. the specialized-and-generated
+kernel zoo, which is exactly the bloat this effort set out to avoid.
+
+## Anatomy of the remaining zerocheck gap (from the challenge-repo session)
+
+The session holding the c576e68 checkout read its own kernels and explained the
+mechanisms behind each sub-phase advantage. Recorded here because the *shape*
+of each answer matters for what upstream should do next.
+
+**AB prep (548 vs ~770 ms): one real arithmetic-kernel win.** Their
+`fused_apply_one_k_fast` replaces the incumbent's per-lane REDUCED GF(2^8)
+multiply (`gf8_mul_vec16`) with an UNREDUCED carry-less multiply (raw
+PMULL/PMULL2) and defers all reduction into an incremental Horner fold
+(`acc = acc*x XOR lo XOR hi`, one fused BCAX per step, precomputed carry
+constant x^16 mod p = 0x5e). Same gathers, same passes; cheaper arithmetic.
+~50-60% of the prep gap, per their attribution. The rest is traffic: zero-copy
+views into the precompute buffer instead of a per-row scratch memcpy
+(DIRECT_AB_ROWS) and skipping the zero-fill of dead tail rows
+(AB_COMPACT_STORE). This is the one honest kernel-quality gap, and it is
+portable as a technique.
+
+**Round-1 drain (314 vs ~590 ms): structural — they do not run this
+computation.** Their active path never reads c_packed, never bit-transposes,
+never touches the convert table. Because C = I (C aliases z), the round-1
+C-claim derives from the LINCHECK STRIPE via an eq-fold
+(`partial_fold_packed_z_best`) plus ring-switch's own fold8
+(`s_hat_v_fold8_from_z_vec`), a small quad fold, and one collapse to the
+two-half s_hat_v_c layout. This refines the "stripe dedup does not exist"
+section below: the index algebra there is correct — the stripe cannot feed
+*this tree's drain shape* — but they compute the same OUTPUT by a different
+algorithm, so the dedup exists at the algorithm level, not the buffer level.
+Their per-lane gather cost model simply does not apply. (Unresolved caveat:
+part of their 314 ms may be a Metal GPU prefix they could not isolate.)
+
+Decomposition of OUR 590 ms drain, all measured: ~136 ms C bit-transpose,
+~75 ms per-lane eq multiplies (timing probe: removing the muls took round 1
+from ~1403 to ~1330 ms), ~380 ms gathers+XORs.
+
+**Rounds 2+ (538 vs ~800 ms): NOT lookahead — lookahead is a shared regression.**
+At our request they kill-switched their sumcheck lookahead on their own machine:
+591 -> 514 ms with it OFF (13-15% loss when on, all 6 paired samples),
+matching this tree's M1 measurement (285.9 vs 307.2 in the AG tail). It is
+default-ON in their tree and loses on both chips. Cascade2/cascade3 (composed
+double-folds via a 32 KiB rho byte table) was the initial candidate for their
+remaining rounds-2+ edge, but a follow-up kill-switch run on their machine says
+otherwise: with cascade OFF and lookahead ON, rounds 2+ measured ~736 ms avg
+(noisy, 612-964, low confidence), while their fastest configuration remains
+lookahead fully OFF (~514 ms) -- where cascade structurally never fires, since
+it requires lookahead. So their rounds-2+ advantage over this tree's ~800 ms
+lives in the BASE per-round kernels: the register-resident wide-arithmetic
+family in their multilinear kernels (2779 lines against this tree's 56; the
+same family our round-2 WideNeon win was one piece of), not the fusion
+machinery. Cascade's own contribution could not be cleanly isolated.
+
+Direct consequence for THIS tree: the ligerito OPEN runs the same lookahead
+family by default (landed in #30, presumably tuned on the M4 Max reference
+machine) with the kill-switch `LIG_LOOKAHEAD_DISABLE=1`. Measured separately —
+see below if a result was recorded.
+
+**Connective tissue:** a size-classed scratch allocator (take_f128/give_f128)
+recycling large buffers across prove calls; the same recycle-don't-allocate
+pattern as their largest historical non-GPU win.
+
+Net revision to the earlier "no big idea" conclusion: the gap is NOT dozens of
+micro-tunings. It is one structural algorithm change (drain), one arithmetic
+kernel (prep), one fusion family (rounds 2+), plus a shared lookahead
+regression that is an upstream opportunity rather than a deficit.
+
+## The lincheck-stripe dedup does not exist (checked, closed)
+
+The most promising remaining idea was that `z` gets transposed twice -- once
+into the lincheck stripe, once again by round 1's `bit_transpose_64bytes` --
+and that round 1 could read its C input out of the stripe instead, deleting
+~136 ms of transpose plus the ~113 ms of C gathers it feeds. The challenge
+repo's active path is even named `round1_c_fold8_from_lincheck_stripe`.
+
+It does not work: the two byte-groupings run along different axes. Traced by
+setting one logical witness bit at a time (m=18, k_log=14):
+
+| byte | logical bits feeding it | stride |
+|---|---|---:|
+| round-1 C `[b_med=0][lane=0]` | 0, 64, 128, ..., 448 | 64 |
+| stripe `[byte_idx=0][i_inner=0]` | 0, 16384, ..., 114688 | 16384 |
+
+With `logical = i_inner + i_outer·K` and `K = 2^14`, round 1's byte runs along
+logical bits 6-8 (three of the within-block inner dims) while the stripe's runs
+along `i_outer`'s low three bits, logical bits 14-16. Disjoint. Converting one
+grouping into the other is precisely the transpose we wanted to skip.
+
+Two corollaries:
+
+- The challenge repo does not avoid this transpose either. Its C drain still
+  calls `bit_transpose_64bytes` into a local scratch (confirmed by the session
+  that has that checkout), so `..._from_lincheck_stripe` names the buffer it
+  reads, not an avoided pass.
+- The z transpose is already better handled here than "in parallel" would be:
+  `generate_witness_with_ab_packed_and_lincheck` fuses it into witness
+  generation, bit-transposing z u64s into the stripe while they are still hot
+  in L1, and replaces the standalone `pack_z_lincheck_from_packed` on the fast
+  path. Splitting it out to overlap it would add a 512 MiB DRAM round trip to
+  buy concurrency on an already-saturated pool -- the same trap as the AB
+  hoist. The remaining `pack_z_lincheck_from_packed` call sites are the generic
+  `prove_ligerito` path only.
+
+## The lincheck gap is re-attribution, and its fold has no reachable headroom
+
+Their lincheck is 32 ms against our 183 ms -- the largest ratio in the table
+(5.7x) and the row we explored last. It is not a real gap.
+
+**Physics.** `partial_fold_packed_z_neon_*` is byte-table driven: per input byte
+it loads the byte, loads a 16-byte `build_sum_table` entry, and XORs into an
+accumulator pinned in a Q register. At the 2^18 BLAKE3 shape z_packed is 512
+MiB, so 2^30 loads. M1 sustains ~3 loads/cycle, giving a floor of ~112 ms
+(~84 ms allowing for the `useful_bits` padding skip). Their 32 ms works out to
+**0.19 cycles per input byte**, roughly 3.5x below that floor, and even a
+16-bit-table variant (two bytes per lookup) only floors at ~0.34. So their
+lincheck cannot be performing this fold -- the C-side fold is presumably
+computed in round 1 from the stripe and reused, consistent with the active path
+being named `round1_c_fold8_from_lincheck_stripe`.
+
+Correcting for this, the real comparable gap is ~970 ms, not ~1120 ms.
+
+**And the genuine headroom is not reachable.** Our fold does sit 1.6-2.2x above
+its own floor, but:
+
+- It is insensitive to blocking. `FOLD_AB=1` A/Bs the size-aware dispatch
+  against forced `iblock` interleaved per m: 0.988x at m=26, 0.972x at m=28,
+  0.994x at m=29. Both strategies land within 3%.
+- The only load-reducing transform is arithmetically dominated. `build_sum_table`
+  builds 256 entries with 255 XORs by doubling; a 16-bit table needs 65535 XORs
+  to enable only `k = 2^14 = 16384` lookups per stripe, so the build costs 4x
+  more than it saves. (And the two stripe bytes for one `i_inner` are `k` bytes
+  apart, so forming a u16 index needs two loads regardless -- loads would go
+  4 -> 3, not 4 -> 2.) It could only pay at much larger `k_log`.
+
+**Stale comment worth fixing.** `benches/lincheck.rs` documents oblock beating
+iblock by "≈1.4-1.7x by m=28-29 at this k_log". That does not reproduce here --
+see the ratios above. Whoever tuned `OBLOCK_MIN_N_LOG = 16` did it on different
+hardware or the win has since regressed; do not trust that comment on M1.
+
+**Also closed for free:** the geometric eq-build (`build_eq_table_optimized` in
+their tree, prototyped here in `benches/eq_build_probe.rs`). Running that probe
+shows the entire `SplitEqGhash::new` at the round-2 shape costs 0.13 ms, and the
+geometric variant is *slower* than the standard build at 5 of 6 sizes. Worth
+approximately zero.
+
+## The measured round-1 decomposition (post-stripe-C), and what it closed
+
+A second FLOCK_R1_SPLIT probe (since removed) replaced the estimated
+decomposition with a measured one and immediately found a defect:
+
+| component | estimated | measured | note |
+|---|---:|---:|---|
+| AB prep | ~640 | ~715 | 90% gathers: a gathers-only probe put the whole multiply tail at ~67 ms, killing the h4-Horner port idea (ceiling ~15 ms for ~100 lines) |
+| stripe fold | ~180 | **340 -> 166** | was calling the PORTABLE fold; `partial_fold_packed_z_best` (lincheck's tiled NEON dispatcher) halves it -- the portable kernel's length-k accumulator is 256 KiB at k_log=14, twice M1's L1D |
+| AB drain | ~340 | ~167 | near its gather floor all along; the estimate that made it look like a target was wrong |
+
+With the dispatcher fix, drain+fold is ~333 ms against their ~314 --
+effectively at parity (and theirs may include an unquantified Metal prefix).
+The entire remaining round-1 gap (~150 ms after word-extract, if it lands)
+is AB-prep gather machinery, where the remaining lever is the static-b
+partial-load import previously ruled out as bloat.
+
+Zerocheck like-for-like standing: ~1643 vs ~1376 = **1.19x** (was 1.74x
+fairly accounted, "2.7x" as first misread). Rounds 3+ (1.03x) and drain+fold
+(1.06x) are closed; round 2 (1.45x, ~97 ms, their compact-fold mechanism) is
+the largest remaining relative gap.
+
+## Machine-specific tunings: three inversions/nulls on M1
+
+Mechanisms measured good on the challenge tree's M4 that fail on M1:
+oblock fold gating (comment claims 1.4-1.7x, measures 0.97-0.99x here),
+zerocheck-tail lookahead (default-ON there, loses 7-15% on BOTH machines),
+and STNP output stores (+1.2% there, **+12% regression** here -- the
+non-temporal hint costs store throughput on M1 instead of saving RFO
+traffic). Port memory-system hints only with a local paired measurement.
+
+## Final ST+MT comparison vs the session baseline (lightweight, 2026-08-25)
+
+Single instrumented invocation per cell; untouched phases (witness, commit,
+lincheck, open) matched across arms to <1% at both thread counts, validating
+the run. All 13 kept optimizations, vs `9793190`:
+
+| phase | ST base | ST head | delta | 8T base | 8T head | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| zerocheck | 2357 | 1638 | **-30.5%** | 322 | 221 | **-31.4%** |
+| -- round 1 | 1465 | 961 | -34% | 191 | 129 | -33% |
+| -- round 2 | 437 | 304 | -30% | 59 | 41 | -31% |
+| -- rounds 3+ | 454 | 310 | -32% | 65 | 48 | -26% |
+| **headline** | 52.5k | **62.5k c/s** | **+18.9%** | 349k | **406k c/s** | **+16.1%** |
+
+The MT columns are the first multithreaded measurement since any optimization
+landed: every win transferred to 8T at essentially its ST magnitude, and the
+end-to-end gain in the threaded (production/scored) configuration is +16%.
+
+Known anomaly, comparison-safe: the open phase measured ~850 ms ST on BOTH
+arms today vs ~636 in earlier sessions -- a day-scale bimodality also seen
+once before (the 857 ms lookahead-test reading). Same on both arms, so no
+delta is affected; flag for the commit/open campaign.
+
+## Cross-tree comparisons: GPU-status-uncertain (major caveat, 2026-08-25)
+
+The challenge-tree session re-ran its own round-2 measurement (identical
+config, same machine, days apart) and got **342 ms where it had reported
+215** -- a 127 ms swing it flagged rather than explained away. Its raw dump
+shows round-1 samples of 92-95 ms jumping to 309 ms MID-RUN with no code
+change. 92 ms is implausibly fast for its CPU drain+fold; it is exactly what
+its Metal GPU round-1 prefix produces, and that prefix "fires if the shape
+matches and Metal's available" with no warmup latch. The Metal-assist hypothesis was TESTED AND REFUTED as a complete explanation:
+with both GPU arms force-disabled (FLOCK_NO_GPU_ZEROCHECK=1 and the separately
+gated FLOCK_NO_GPU_ZC_R2=1), their first samples remained chaotic (a 1182 ms
+round-2 with no GPU involved). The broader driver: this shared machine ran
+builds and benches from three concurrent Claude sessions that day, plus
+ambient load. Widen the caveat from GPU-status to: fine-grained (sub-100 ms)
+cross-tree bucket deltas from this date are unresolvable, period.
+
+Consequences for this log:
+- Every "theirs" column in the cross-tree tables is soft until their GPU
+  test reports. Their bracket accounting itself was verified clean (buffer
+  takes, tables, and padding all inside their round-2 timer; their tail
+  honestly carries the compact-format reconstruction).
+- What the stable window of their full-GPU-off run DOES support (samples 3-7,
+  tight): their pure-CPU round 2 is 274-285 ms against our same-conditions
+  305, i.e. a residual of ~27 ms -- the size of their compact format's
+  modeled store saving (~25 ms), the one mechanism deliberately not ported.
+  The original "90 ms gap" therefore decomposes as ~25 ms format + ~65 ms
+  measurement conditions. Their tail (300-307) matches ours (307) exactly.
+  Coarse conclusion that survives all of this: the trees are within ~10% on
+  the zerocheck CPU-vs-CPU, and bucket deltas below ~50 ms cannot be
+  adjudicated on this machine this week.
+- Every KEPT win in this log is unaffected: all were internally paired A/B
+  on this tree alone and never depended on their numbers.
+
+## The SHA-256 cross-circuit control
+
+Question: is the challenge repo's remaining advantage BLAKE3 specialization
+(its static-b census, degen flags) or generic kernel quality? Control: SHA-256
+at 2^16 (m=31), ST, identical command on both trees, where neither side's
+structure guards fire at their tuned density.
+
+| tree | best prove_fast | throughput |
+|---|---:|---:|
+| this branch | 2.05 s | 32,027 h/s |
+| challenge (c576e68 frontier) | 1.72 s | 38,170 h/s |
+
+Their advantage on SHA-256: **1.19x** -- statistically the same as the ~1.16x
+comparable whole-proof gap on BLAKE3. Conclusion: their edge is uniform,
+circuit-agnostic kernel quality (commit path, round-2 compact/NT stores, prep
+tail, allocator recycling), and the BLAKE3-specific structure machinery is
+performance noise at end-to-end scale on both sides -- consistent with their
+own per-switch ablations (1-3% each) and with our ports of that family
+(zero-skip -42 ms; b===1 degen null).
+
+Also measured by the control: this branch's campaign improved SHA-256 by
+**+18% for free** (27.1k -> 32.0k h/s vs the session-baseline matrix) --
+no SHA-specific work was ever done, confirming the kept wins are
+circuit-agnostic. The b===1 degeneration port (row 21, reverted) was the
+last BLAKE3-structural candidate; with this control there is no reason to
+pursue that family further.
+
+## What finally worked, and why
+
+Two round-1 wins landed after eleven failures, and they share a property none
+of the failures had: they change **how much work exists** or **how much of it
+can be in flight**, rather than how the same work is encoded.
+
+**1. Skip structurally-zero b K-rows (−42.4 ms, 8/8).** A census of the packed
+BLAKE3 witness -- 256 word positions per block, 256 blocks, 3 independent
+witnesses -- found the circuit pins 38 of 256 8-byte b K-rows regardless of the
+inputs, taking only three distinct values:
+
+| value | positions | |
+|---|---:|---|
+| `0xffffffffffffffff` | 22 (8.6%) | const-one wires |
+| `0x0000000000000000` | 15 (5.9%) | structural zeros |
+| `0x0001ffffffffffff` | 1 | |
+
+33.7% of all b bytes are fixed, cross-checking the byte histogram (28.9% 0xff,
+6.1% zero) from the other direction. The zero case is the strongest: the
+inv-NTT transform is F_2-linear, so row(0) = 0, so db = 0, so
+y = gf8_mul(da, 0) = 0 and the K-row contributes nothing at all --
+`fused_apply_one_k` returns immediately, skipping all 64 table loads and the
+four F_8 multiplies. One u64 compare, no census data shipped, no position
+tracking, and a disagreeing witness falls through to the generic path.
+
+This is strictly better than the challenge repo's `static_b` fast path, which
+still loads a precomputed partial for these rows.
+
+**3. Unreduced pmull accumulate in the prep kernel (−128.0 ms, 8/8) — the
+largest single win of the effort, and the challenge repo's own top-attributed
+mechanism, ported as an idea (~80 lines).** `gf8_mul_vec16` spent 6 PMULLs per
+K-row per block — 2 for the raw product, 4 for a reduction that was redundant,
+since the accumulator gets one final reduce anyway. Now the raw product
+accumulates unreduced, with the x^K row weight decomposed as x^4 (a pre-scaled
+second table image to gather from — F_2-linearity makes scaled entries scale
+the XOR-sum) times x^2 (a 6-op byte-mul) times x^(K&1) (a u16 shift). Terms
+reach degree 15; both reducers were verified exact over the full 16-bit domain
+first (exhaustive tests now permanent in gf2_8). Predicted 100-130 ms from the
+challenge session's attribution; measured 128.
+
+**2. Two lanes per drain iteration (−63.1 ms, 8/8).** The drain carries three
+XOR chains per lane, each of depth `n_b_med` = 16. The gathers feeding them are
+independent but the accumulations are serial, so one lane exposes only three
+chains. Interleaving a second doubles that to six with no change in work.
+
+**The all-ones case is the instructive failure.** Predicted ~27 ms from the
+zero case's calibration; delivered 6.1. Halving a row's loads halves its
+memory-level parallelism at the same time, and the remaining dependency chain
+goes latency-bound -- the same mechanism that sank the LD1 x4 attempt. Whole-row
+elimination avoids it because no chain survives. That result is what motivated
+the lane unroll, which then outperformed the win that inspired it.
+
+**Two censuses that closed leads without any code:**
+
+- `a`-side pinned zeros are *exactly* the same 15 positions as `b`'s (union 15,
+  a-only 0) -- the padding rows where both operands vanish. An a-side check
+  would add nothing.
+- The zero words cluster into the block tail (parity 1, b_med 14-15), giving
+  only one fully-zero `(parity, b_med)` group of 32, worth ~1% of drain
+  gathers. Whole-`b_med` elimination is not there.
+
+**Combined effect, measured directly.** The two wins together, against the
+pre-zero-skip commit in a single session, paired n=8 with alternating arm
+order:
+
+  round1 URM  base median 1477.30 ms -> head median 1403.07 ms
+              -74.2 ms (-5.0%), head 8/8, ranges disjoint
+              (base min 1469.55 > head max 1433.81)
+
+That is less than the 42.4 + 63.1 = 105 ms the individual measurements suggest,
+and the combined figure is the one to trust: it is the only one where both arms
+ran under the same conditions. The individual runs were taken in different
+sessions, and cross-run drift on this machine is large enough to swamp the
+difference -- identical code measured 1420 ms in one run and 1483 ms in another.
+
+**Methodology that made these findable.** Earlier attempts were measured on the
+end-to-end headline, where a 40 ms effect is ~1% and sits under the noise. These
+were measured on `round1 URM` directly via `FLOCK_ZC_TIMING`, taking the min
+across the ~5 zerocheck calls in a run, 8 alternating-order pairs per verdict --
+about 3x faster per sample and aimed at the phase actually being changed. Note
+cross-run drift remains large: the same code measured 1420 ms in one run and
+1483 ms in another, so only within-run paired deltas are trustworthy.
+
+## Not attempted, and why
+
+- Anything GPU-gated (`partial_fold_packed_z_best_gpu_split`,
+  `ranked_lincheck_fold_gpu_shape`) — out of scope by request.
+- The `Round1AbInner` staged pipeline, `c_fold4` mask tables, static-B
+  specialization and its 839-line generated kernel. This is where the round-1
+  win actually lives, but it is ~6000 production lines across
+  `univariate_skip_optimized.rs`, its NEON kernels, and `zerocheck.rs`.
+- `build_eq_table_optimized` in lincheck. The geometric-medium trick is
+  prototyped in `benches/eq_build_probe.rs` but never landed; lincheck is only
+  3.9% of ST here and its cross-repo gap is partly re-attribution (see above),
+  so it was not the best next move.
+
+## The cross-repo round-1 comparison was never like-for-like
+
+This is the most important correction in this log. The challenge repo's
+round-1 figure **excludes its AB precompute**. `commit_with_round1_ab_precompute`
+in its `prover.rs` runs
+
+    rayon::join(commit_arm, precompute_ab_arm)
+
+so `precompute_round1_ab_inner_packed_padded` — the same
+`shift_reduce_inner_ab` work that is 56% of our round 1 — lands in its *commit*
+bucket, and its `t.commit_s` wraps the whole join. Comparing their 314 ms
+round 1 against our 1444 ms was comparing a drain against a prep-plus-drain.
+Combined:
+
+| phase | ours ST | theirs ST |
+|---|---:|---:|
+| commit | 1277.4 | 1796.7 |
+| zc round 1 | 1444.3 | 314.1 |
+| **commit + round 1** | **2721.7** | **2110.7** |
+
+The honest gap is ~611 ms, not ~1130 ms. An earlier claim in this log that
+"our commit is already ~1.4x faster than theirs" was wrong for the same
+reason — they do strictly more work in that phase.
+
+We implemented the same architecture to check whether it is a speedup or an
+accounting choice, and it is the latter. The transform really is
+challenge-independent (the challenge reaches round 1 only via `eq_lo_scaled`
+and the convert table, both owned by the drain), a
+`[x_outer][b_med][64]` buffer lets the drain consume it by borrowing with no
+copy, and the result is bit-identical. But:
+
+- **ST is a wash.** `rayon::join` is sequential on one thread, so the locality
+  won by no longer interleaving AB with the C transpose and the 64 KB
+  convert-table drain is spent again on a 512 MiB write plus 512 MiB read the
+  interleaved version never did. Non-temporal `stnp` stores, which skip the
+  read-for-ownership on that write-once surface, did not change it.
+- **8T is a wash.** Both join arms compete for the same saturated pool, so
+  there is no idle capacity for the overlap to fill.
+
+Measured three ways (ST paired n=8 order-alternating with NT stores: base
+53288 vs 53037, base 5/8; 8T paired n=6: 325007 vs 320655, base 4/6; ST
+paired n=10 without NT stores: indistinguishable once warm). Reverted.
+
+**Methodology note worth keeping: check the power source before measuring.**
+Two grand-total runs were invalidated in one evening by power state. On low
+battery, macOS caps frequencies (one base arm carried a sample ~20% low); while
+fast-charging a nearly-empty battery, it is even worse -- the charger's power
+budget is shared with the SoC and a paired run swung -13% to +57% per pair
+with a 51% base-arm spread. Run `pmset -g batt` first: measure only on AC with
+the battery above ~60%, where the charge rate has tapered. The alternating
+paired design protects the sign test through slow drift (arms sit within ~80 s
+of each other), and min-of-5 within a run rejects transient dips -- which is
+how the round-1 results cross-validated and survived -- but end-to-end
+magnitudes from a throttled window are unusable.
+
+**Methodology note worth keeping.** An earlier version of the paired script
+always ran the base arm first. Throughput declines monotonically across a run
+as the machine heats (342707 → 315100 over six 8T pairs), so a fixed order
+biases the comparison by roughly the size of the effect being measured. Always
+alternate which arm runs first, and discard a warm-up of each arm — an
+apparent +3.3% win for the hoist evaporated once both were done.
+
+## The idea behind their `accumulate_convert` win
+
+Worth recording even though it did not transplant, because the algebra is the
+interesting part. Their C-side drain does **no table gathers at all**.
+
+`convert[b][v] = γ^b · φ_8(v)`, and **γ = X** — the comments confirm it, the
+rows are built by `mul_by_x` doubling. So `Σ_b γ^b · (bit_b)` is *literally* a
+16-bit mask in the field's coefficient representation: `F128 { lo: mask }`.
+Since `φ_8` is F2-linear, the per-lane C contribution decomposes over the 8 bit
+positions of the byte into 8 such masks — the "eight-bank C drain" — each
+accumulated with pure bit operations. The only field work left is one multiply
+by `eq`, and `F128 { lo: m } * eq` is itself F2-linear in the mask's 16 bits,
+so even that becomes `T_lo[m & 0xff] + T_hi[m >> 8]` from tables built **once
+per prove** and shared read-only (8 MiB at their shape; building per call would
+cost ~4 GiB of L1 stores).
+
+Why it does not transplant on its own: profitability depends on data layout,
+not just the algebra. Building the masks needs one lane's bytes gathered
+*across* `b_med`, but `chunk_c_bytes` is `[b_med][lane]`, so extracting them
+costs exactly the 16 strided loads the trick was meant to remove. Their
+pipeline gets the transposed layout for free from the `Round1AbInner`
+precompute pass. The AB side is handled separately by the tensor split
+`eq.lo[(w << s) | u] · D^-1 == eq_top_scaled[w] · eq_bot[u]`, pre-scaling the
+convert tables by `eq_top` so the inner loop is pure XOR with no per-lane
+multiply, keeping `2^s` bank accumulators and applying `eq_bot` once at the
+end.
+
+Any future round-1 attempt should start from the layout, not the algebra.
+
+## Note on the geometric trick
+
+The three layered optimizations in `univariate_skip_optimized.rs` — geometric
+small-eq + shift_reduce, geometric medium-eq + 64 KB convert-table lookups, and
+D^-1 absorbed into eq_lo — are **already in this tree**; the doc headers are
+byte-identical to the challenge repo's. They are inherited upstream code, not a
+Yukon addition, and nothing there needs porting.
+
+## Commit phase, ST: decomposition and the refuted butterfly rewrite (2026-08-25)
+
+Commit-phase breakdown at m=32, single-threaded (`FLOCK_COMMIT_M=32
+FLOCK_NTT_SPLIT=1 RAYON_NUM_THREADS=1`, bench `pcs_commit`):
+alloc/pad ~90 ms (prefault-hidden in the real prover), **NTT 858 ms** (top 9
+fused-2 layers 329 ms, deep 11 blocked layers 529 ms), **merkle 417 ms** —
+merkle is at the SHA-256 silicon floor (~2.6 GB/s) and closed.
+
+**Refuted experiment — "q-resident 3-PMULL karatsuba butterflies"** (reverted,
+this commit). The premise was a misdiagnosis: `butterfly_row_pair` /
+`butterfly_fused_2layer` have no aarch64 dispatch arm, so I read the portable
+fallback as "scalar, 6 PMULLs through the struct/GPR interface". Wrong — the
+portable butterfly is generic over `F128` ops, and `F128::mul` on aarch64
+inlines `ghash_mul_binius` (gf2_128.rs:104-115, where the comment records that
+M-series picked binius over karatsuba). The baseline was already running the
+M1-tuned mul, register-resident after inlining.
+
+Measured, same session, same machine state, m=32 ST:
+
+| arm | top 9 | deep 11 | NTT total |
+|---|---|---|---|
+| baseline (binius via generic path) | 328.6 ms | 529.5 ms | 858 ms |
+| karatsuba + q-resident kernels, GPR half-sums | 540 ms | 873 ms | 1410 ms |
+| same, half-sums moved to NEON (veor+vext) | 525 ms | 835 ms | 1360 ms |
+
++58% regression, reproduced across two runs pre-fix and confirmed post-fix;
+the GPR-vs-NEON sum was worth only ~4 points of the 58. Fewer PMULLs lost to
+binius's shape: karatsuba's mid-term chain plus a per-butterfly vzip/reduce/
+vunzip repack costs more than the three PMULLs it saves. This is the sixth
+confirmation that re-encoding fixed work never pays on this machine (0/6), and
+it extends the rule to PMULL count itself: **binius's 6-PMULL mul beats
+3-PMULL karatsuba in situ on M1, not just in the latency microbench**.
+
+Kept from the episode: the `FLOCK_COMMIT_M` bench knob and the temporary
+`FLOCK_NTT_SPLIT` probe (strip the probe when the commit campaign closes).
+Remaining commit-ST headroom candidates, unmeasured: aarch64 fused-4 for the
+top layers (`fused4_ok` is currently x86-only; top layers are full-buffer
+sweeps, so deeper fusion removes memory passes — the win category with the
+best track record), and nothing else obvious; cross-tree, our commit was
+already at parity or ahead.
+
+## Cross-tree commit is measured parity, not inferred (2026-08-25)
+
+The earlier claims ("our commit is 1.4x faster", later corrected, then
+"parity or ahead") all came from in-prover bucket timers, which are
+confounded: their `commit_s` wraps a `rayon::join` that includes their
+round-1 AB precompute. Today: direct primitive-level A/B, m=31 packed
+breakdown, ST, alternating arms, 3 pairs, same minute, both trees' own
+`pcs_commit` bench (byte-identical bench code; theirs got the same
+FLOCK_COMMIT_M knob temporarily and was restored after; both merkle
+defaults are SHA-256; FLOCK_NO_GPU_COMMIT=1 on their arm):
+
+| arm | NTT (3 runs) | merkle | total |
+|---|---|---|---|
+| ours | 418 / 421 / 419 ms | 212.8 / 212.6 / 212.4 | 692 / 692 / 690 |
+| theirs (c576e68) | 422 / 437 / 420 ms | 212.2 / 213.8 / 212.2 | 690 / 706 / 684 |
+
+Identical to within ~1% on every bucket. Their NTT source files DO differ
+from ours (5 files), so this is a measured null, not shared code: whatever
+they changed there is performance-neutral at this shape, and there is no
+commit-phase port pool. Caveats: run on battery power with an active Zoom
+call (a real >15% gap could not hide in data this tight, but treat the
+third decimal as weather); and their tree has a Metal `gpu_commit.rs` path
+we did not exercise — CPU-vs-CPU is parity, GPU-on is untested and out of
+scope for this campaign.
+
+## Open campaign, ST (2026-08-25): the combine port, and a full two-tree reconciliation
+
+Protocol parity first: both trees produce byte-identical proofs at n=65536
+BLAKE3 (395,919 bytes) with identical verify times, so open comparisons are
+clean. ST decomposition (PCS_TRACE + LIG_PROVE_TRACE / their
+FLOCK_OPEN_TIMING, same day, same machine):
+
+| sub-phase | ours (pre) | theirs | ours (post-port) |
+|---|---:|---:|---:|
+| combine (b_combined fold+prime) | 94.4 | 64.4 | **78.5–79.4** |
+| initial sumcheck | ~36 | 44.6 | ~36 |
+| recursive commits (NTT+merkle) | 19.0 | 14.9 | 19.0 |
+| induce_sumcheck_poly | 7.5 | 5.6 | 7.5 |
+| ring_switch / folds / glue / OOD | ~3.7 | ~3.7 | ~3.7 |
+| **open TOTAL** | **~160** | **132.7** | **~145** |
+
+**The port (commit 6baccea): composed-table fold.** `fold_one_slot(·, T)` is
+F₂-linear, so `lo ↦ fold_one_slot(lo·e_hi, T)` collapses into one composed
+byte table per claim per block (x-ladder monomial walk + subset-sum
+doubling), deleting the per-slot field multiply — 2·L muls — from the sweep.
+Needs the coarse deferred split (eq_lo 2^15, not the balanced 2^11) so the
+~4.3k-op build amortizes. Bit-identical (equivalence test + verify). Their
+tree had both pieces; they never A/B'd it as a unit — it predates their
+session. Prediction was −30 ms; measured −15 ms, and the sub-timer probe
+explains the rest (below). MT: combine 10.9 ms at 8T (near-linear transfer).
+
+**Corrected accounting (in-fold sub-timers + open_combine_probe micro).**
+Sweeps alone: ours compose 1.2 + sweep0 22.7 + sweep1 24.5 = 48.4 ms —
+EXACTLY their sweep cost (64.4 bucket − ~16 prime). The remaining bucket
+difference is the tail pass: our fused prime+round-1-lookahead costs 24.5 ms
+vs their plain prime ~16 ms, and the lookahead buys ~12 ms back in initial
+sumcheck (36 vs 44.6). Tail+initial: ours 60.5, theirs 60.6 — **the
+lookahead placement is a wash**, another instance of "moving fixed work
+between buckets is not a speedup." It stays only because it is inherited
+code (zero new lines to keep). Earlier probes that "showed lookahead free"
+were wrong: LIG_LOOKAHEAD_DISABLE only gates the ligerito consumer, never
+the combine's producer pass.
+
+**Nulls, measured.** (1) EOR3 depth-3 fold tree: flat (79.5 vs 79.1) — LLVM
+already fuses XOR pairs into EOR3 under target-cpu=native, and the sweep is
+load-port bound (32 loads/slot). Not kept. (2) Fusing both claims into one
+sweep (two live 64 KiB composed tables, single store, no RMW read-back):
+55.6 vs 48.4 ms in the micro — the doubled gather footprint thrashes L1.
+Validates the claim-sequential design note in the challenge tree.
+
+**Residual vs theirs, and why it is closed for now**: ~6 ms structural
+(recursive commits 19 vs 15, induce 7.5 vs 5.6) comes from their
+sparse/windowed transpose-NTT + truncated-final-NTT machinery — thousands
+of lines whose four kill-switches all measured null at this shape in their
+own tree (peer-session test; several gate on their ranked 2^18 shape and
+cannot fire here). Fails the bloat bar decisively at ~6 ms. The remaining
+~7 ms is unattributed noise; Fiat-Shamir grinding lives inside "initial
+sumcheck" and swings 1.8–8.4 ms per sample (their measurement, same bucket
+convention in both trees).
+
+Instrumentation kept (strip at campaign close): `open_combine_probe` bench +
+`pcs::combine_probe` module, and the `b=` field in the combine trace line.
+Conditions caveat: battery power + active Zoom all afternoon; every kept
+number is an internal same-run comparison or reproduced across ≥3 samples.
+
+**Addendum (peer measurement, same day): their truncated-final-NTT is a real
+null even at its designed shape.** At the ranked 2^18 config (the exact shape
+`is_ranked_induce_truncated_final_ntt_shape` pins: log_msg_cols=19,
+n_queries=218), 7 paired ST samples with the production switch
+`FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT`: lig-prove 132.39 ms ON vs 132.79 OFF,
+induce 12.23 vs 11.80 — flat. So the truncation contributes nothing anywhere;
+whatever induce/commit edge their tree holds (~6 ms at our shape) rides on
+the always-on sparse transpose-NTT, not this. The not-ported decision stands
+with their own numbers behind it. Their run also showed the familiar
+environmental spike (two trailing samples at ~2× on BOTH arms identically) —
+same all-week pattern, comparison-safe, logged for the record.
+
+## Witness gen, ST: streamed full-write builder (2026-08-25, kept)
+
+Focused bench (`genwitness_phase`, n=65536, m=30): ours 95.9 ms best /
+123 avg; their default 61.4/62.4; their scalar path (FLOCK_NO_WITGEN_SIMD=1)
+73.8/76.1. So their edge decomposed as: streamed full-write + unrolled Gs
+(−22 ms) then SIMD quad lockstep (−12 ms more).
+
+Ported the first, natively: three `PackedWordWriter`s publish complete u64s
+sequentially (rows are contiguous through USEFUL_BITS), killing BOTH the
+driver's per-group memset and the OR path's read-modify-write on every
+store; the 56-G sequence unrolls with literal state/message indices. The
+one out-of-order region (out_lo, 256-bit aligned) is reserved and
+overwritten at the end. Bit-identical through the whole driver (new test:
+real + padding slots, both values of the prefix carry bit).
+
+Paired alternating A/B, best-of-12 per invocation: **ST 87.1–90.0 →
+64.8–68.9 ms (−24%, 3/3 disjoint ranges); 8T 18.0–18.3 → 14.4–15.8 ms
+(−20%, 2/2)**. Avg variance also fell (113 → 88 ms ST). In-prove witness
+bucket: 89.5 → 67.3 ms. Our streamed scalar now BEATS their scalar (73.8);
+their remaining SIMD-quad edge is ~3–7 ms ST for ~400+ lines of NEON
+lockstep + NT-drain + scratch-provenance machinery — fails the bloat bar.
+
+## Re-baseline: full ST cross-tree table after the open + witness ports
+
+Same day, same machine, GPU off on their arm (their Aug 22 binary),
+n=65536: ours witness 67.3 / commit 300.8 / zerocheck 396.9 / lincheck
+56.4 / open 146.7 / **total 967.4 ms (67.7k comp/s)**; theirs 30.4 /
+424.8 / 217.3 / 42.2 / 132.7 / **total 847.1 ms (77.4k comp/s)**. Headline
+gap **1.46× (start of day) → 1.14×**. Two buckets remain confounded, both
+in their favor's appearance only: their commit carries their round-1 AB
+prep (known since the zerocheck campaign) — commit+zerocheck combined is
+697.7 vs 642.1 (1.09×, matching the ~10% kernel-quality verdict) — and
+their in-prove witness bucket (30.4) is HALF their own focused bench
+(61.4), so something (seed-pipe speculation or the rate2-codeword fusion)
+moves witness work out of that bucket; under investigation. Honest
+remaining real gaps: lincheck 1.34×, their witness accounting, ~9% kernel
+quality in zerocheck+commit.
+
+## Lincheck: two-stripe word-load fold reaches the load floor (2026-08-25, kept)
+
+The prior "no reachable headroom" verdict on the lincheck fold examined
+blocking strategies and table geometry; the challenge tree's newer asm
+kernel wins differently: the inner loop is load-port bound, and their
+kernel grabs each stripe's 8 index bytes as ONE paired load (UBFX
+extracts) while folding two stripes per iteration with EOR3. Ported the
+idea as intrinsics (u64 load + shift extraction, two stripes per
+iteration, XOR pairs LLVM fuses to EOR3): 16 loads/stripe -> ~9,
+bit-identical XOR multiset. Paired A/B: **partial_fold_z ST 40.7-40.8 ->
+27.8-28.0 ms (-32%, 3/3 disjoint, at the ~28 ms computed floor); 8T
+6.0-6.1 -> 4.3-4.4 ms (-28%)**. Lincheck bucket 56.4 -> 42.6 ST — parity
+with theirs (42.2). One measurement-hygiene note for the record: two
+paired runs were invalidated before the real one — a stale-binary
+overwrite refusal (aliased interactive cp) and a stash left behind by a
+failed && chain built both arms from the same source; both caught by the
+disjoint-range check and a binary cmp before trusting any numbers.
+
+## End-of-day cumulative (n=65536, m=30): 1.46x -> ~1.10x
+
+ST: witness 71.6 / commit 300.7 / zerocheck 379.7 / lincheck 42.6 /
+open 144.6 — **936 ms, 70.0k comp/s**. 8T: 152.9 ms, **428.7k comp/s**.
+Vs their same-day CPU-only 847 ms ST: 1.10x, with their commit+zerocheck
+bucket confounds unwound this is within the ~9% uniform-kernel-quality
+band established by the SHA-256 control. Today's three kept ports:
+composed-table open fold (-15 ms), streamed witness builder (-22 ms),
+two-stripe lincheck fold (-13 ms) — ~50 ms ST total, all bit-identical,
+all paired-decisive, all transferring to 8T.
+
+## Round 1, final pass: the "bigish gap" was mostly an estimation error (2026-08-25)
+
+Skip-arm probes (FLOCK_R1_SKIP_PREP / _DRAIN, since stripped; the stripe-fold
+timer under FLOCK_ZC_TIMING was kept) split our round 1 at m=30 ST:
+**AB prep 160 + AB drain 39 + stripe fold 28 ≈ 230 ms** — the stripe fold
+already carries today's two-stripe lincheck kernel (was ~41).
+
+The peer session then measured their prep arm directly (their
+FLOCK_PHASE_TIMING probe inside the commit rayon::join, 7 ST samples,
+GPU off): **~140 ms**, not the ~105–125 my commit-bucket subtraction
+estimated. Corrected comparison:
+
+| piece | ours | theirs |
+|---|---:|---:|
+| AB prep | 160 | ~140 (measured) |
+| drain + fold | 67 | 72.5 |
+| **round 1 total** | **~230** | **~213** |
+
+So round 1 is ~7% apart, we are AHEAD on drain+fold, and the prep delta is
+12.5%, not 40%. Their prep mechanism (their read): `fused_apply_one_k_fast`
+— identical gather structure, but unreduced PMULL/Horner accumulation with
+one fused BCAX reduction per step instead of a full reduced GF(2^8)
+multiply per K-row. Arithmetic-only; our multiply tail is ~17 ms of the
+160 (gathers ~90%), so the port ceiling is ~8–15 ms for ~100 lines of
+kernel restructure — below the bloat bar. Their other two prep levers
+(DIRECT_AB_ROWS zero-copy views, AB_COMPACT_STORE) address the
+materialize-then-read-back architecture ours doesn't have: our prep is
+fused into the drain and never writes the 128 MB buffer at all.
+
+**Round-1 verdict, this time with both sides measured: closed.** The
+remaining zerocheck delta decomposes as r1 arithmetic ~8–15 (priced, not
+taken), r2 compact format ~7–10 (priced, not taken), tail parity.
+
+## Official end-state grid: clean-conditions, no-timer, both trees (2026-08-25 night)
+
+Machine quieted to just the two Claude sessions, AC power, 100% charged.
+15 runs: 3 per config, interleaved between trees, bare `blake3_proof`
+n=65536 (no instrumentation env), best-of-3 proves per run. Ours at HEAD;
+theirs the Aug 22 binary at c576e68.
+
+| config | ours (best, spread) | theirs (best, spread) | gap |
+|---|---|---|---|
+| ST CPU | 930.4 ms / 70.4k c/s (0.3%) | 843.7 ms / 77.7k c/s (0.9%) | 1.10x |
+| 8T CPU | 156.1 ms / 419.8k c/s (0.4%) | 131.3 ms / 499.3k c/s (2.0%) | 1.19x |
+| 8T GPU-on | — (no GPU path) | 131.0 ms / 500.3k c/s (2.3%) | 1.19x |
+
+Findings: (1) no-timer headlines match the instrumented runs within noise —
+instrumentation overhead confirmed ~zero, all bucket analyses stand;
+(2) run spread at 0.3–0.9 % ST confirms every prior "day-mode"/spike
+anomaly was ambient load, not code; (3) their GPU is worth nothing at 8T
+(131.0 vs 131.3) — their CPU path caught up to their own Metal offload;
+(4) the MT gap is 1.19x under clean conditions (1.23x on battery), and it
+is scheduling (helper threads / epool P+E / allocator recycling), not
+kernels — ST stands at 1.10x with every bucket at parity or priced.
+
+## Their GPU, resolved: an ST-only, ranked-shape-only effect (2026-08-25 night)
+
+The clean grid showed GPU-on worth ~nothing at n=65536, contradicting the
+campaign-era "+10.7% ST" table. Both were right — different cells. Full
+GPU value map (their Aug 22 binary, clean machine, AC, paired same-minute):
+
+| shape / threads | GPU-on | GPU-off | GPU worth |
+|---|---:|---:|---:|
+| m=30 ST | 832 ms | 847 ms | +1.7% |
+| m=30 8T | 131.0 ms | 131.3 ms | 0 |
+| m=32 ST | 2.63 s | 2.87 s | **+9.2%** |
+| m=32 8T | 413.5 ms | 406.1 ms | −1.8% |
+
+Mechanism: their heavy offloads are shape-pinned to the ranked m=32
+geometry (dormant at m=30 — Metal initializes but the cpu= telemetry shows
+all threads busy doing the work), and the GPU only adds value when the CPU
+is starved (ST). At 8T the CPU saturates the same memory system, the GPU
+graph "finishes with 0.00 ms host wait" (their comment), and sync overhead
+turns it slightly negative. In the threaded production configuration the
+GPU is worth nothing on either shape; the +10.7% campaign figure was the
+m=32 ST cell (reproduced tonight at +9.2%), not a general advantage.
+
+## CORRECTION + the ranked-config picture: the GPU verdict was a config artifact (2026-08-25 late)
+
+**Retraction.** The "their GPU is worth nothing threaded" section above was
+measured with the SHA-256 merkle default — which silently fails their
+ranked GPU gates (`merkle_hash == Blake3` is a hard condition on the big
+offload paths). The user's suspicion that "a flag needed to be turned on"
+was correct: with FLOCK_MERKLE_HASH=blake3 at m=32, their GPU is worth
+**+35%** at 8T on this M1 Max. The +9.2% ST figure earlier is also
+understated for the same reason.
+
+Ranked-config grid (m=32, this machine, clean, same half-hour):
+
+| m=32 8T | ours | theirs |
+|---|---:|---:|
+| SHA merkle, CPU | 433.6k c/s | 645.6k c/s |
+| Blake3 merkle, CPU | 410.3k (no fast blake3-merkle kernel here) | 663.4k |
+| Blake3 merkle, GPU 8T | — | 897.9k |
+| Blake3 merkle, GPU 10T | — | **942.7k** |
+
+Consequences:
+1. The MT gap is SHAPE-DEPENDENT: 1.19x at m=30 but **1.49x at m=32
+   CPU-vs-CPU** — their scheduling stack (seed-pipe, epool, allocator
+   recycling, AB-prep overlap) is gated on the ranked m=32 geometry and
+   never fired in the m=30 comparisons. Their throughput scales +29%
+   from m=30 to m=32; ours +3%.
+2. Full scored-config gap on this machine: 433.6k vs 942.7k = **2.17x**
+   (their reported 600k/900k reproduced here as 663k CPU / 898-943k GPU).
+3. The ST kernel campaign remains validly closed (1.10x, same-hash,
+   same-shape); what it never measured is the ranked-config stack:
+   MT scheduling at m=32, GPU offload behind the Blake3 gate, 10-thread
+   epool, and a fast BLAKE3 merkle kernel. Those are the remaining
+   campaign, in descending order of measured value.
+
+**10-thread addendum (2026-08-25 late).** All-core (8P+2E) CPU-only runs:
+ours m=30 414.3k (−1.3% vs 8T) / m=32 443.1k (+2.2%); theirs m=30 502.1k
+(+0.6%) / m=32 595.3k (−7.8% vs their 8T). E-cores are ~worthless for
+CPU-only proving on both trees — their 10T mode only pays with the GPU
+overlap (943k). Best-CPU-vs-best-CPU at the ranked shape: 443.1k vs
+645.6k = **1.46×**, all scheduling, not thread count. Ours reproduced to
+5 digits across runs (414,339 vs 414,337 c/s).
+
+## BLAKE3 merkle: the neon8 idea in 290 intrinsics lines (2026-08-25, kept)
+
+Their blake3 merkle edge is a 2.6k-line generated-asm 8-wide kernel; the
+mechanism is just ILP (the crate's 4-wide NEON state is latency-bound on
+the G chain). Re-derived as intrinsics: two transposed 4-wide states
+interleaved G-for-G, dispatched from blake3_hash_many for groups of 8,
+crate path for tails, bit-identical by equivalence test.
+
+merkle_tree ST: blake3 1.63→2.30 GB/s at 512 B leaves (+41%, now 1.08×
+faster than SHA-256), 1.71→2.42 GB/s at the ranked 1 KB leaves (+42%,
+parity with SHA silicon; their asm ≈2.58, i.e. within 6% for 9× fewer
+lines). E2E ranked config m=32 8T blake3-merkle: 410.3k → 431.5k c/s —
+the −5% blake3 penalty is erased and the ranked hash choice is now free
+for this tree. LLVM handled the 32-register pressure without measurable
+spill cost; the asm fallback (their .S) was not needed.
+
+## MT campaign, night 1 (2026-08-26): one keeper, seven nulls, a map of what's left
+
+Target (user directive): CPU-only MT within 10% of the challenge tree,
+no GPU. Start: 1.19× at m=30 8T.
+
+**Kept — AB hoist v2 (commit d963445):** prep under the commit via
+rayon::join, with the two defects that nulled v1 fixed: the ab_pre buffer
+comes from the scratch pool uninitialized (fresh vec![0u8] zero+fault cost
+was eating the entire gain) and the join window runs on the all-core (P+E)
+pool while the rest of the prove stays on P-cores. The E-cores are the
+active ingredient: prep is gather/PMULL compute they can add without
+stealing the DRAM bandwidth the NTT saturates. Paired 3/3 at m=30
+(149.6–151.3 vs 152.5–156.3), 2/2 at m=32 (best clean pair −57 ms).
+Best production number: 149.6 ms / 438.1k c/s.
+
+**Nulls/inversions, all paired, all on this M1 Max:** P-pool-only join
+(wash, third confirmation); NT stores in witness writers (~0 — M1 ignores
+the stnp hint, third confirmation of the model); lincheck-stripe transpose
+on E during commit (NEGATIVE: bandwidth task in a bandwidth-bound window,
+commit +7 ms); FLOCK_ALLCORE combine (0); NTT fused-4 on aarch64 (+19–26%,
+16 live F128s spill — the old code comment was right); two-block scalar
+witgen interleave (+40% ST, GPR blowout); quad-lite SIMD witgen (state
+math 4-wide, scalar packing — null even after removing 4.5k lane
+extractions: the packing is the cost, not the G math).
+
+**Decisive ablations on their tree (same day):** their witgen SIMD is
+worth 2× IN-PROVE (24.9→12.1 at 8T) but their SIMD-without-elision
+(16.7) ≈ our streamed scalar (16.2) — i.e. the entire remaining witness
+gap is their scratch-provenance CONSTANT-REGION ELISION (−4.6 ms their
+tree; ceiling probe on ours: −4.8 ms paired, degraded-machine caveat).
+The focused genwitness bench measures only their scalar path (the SIMD
+gate lives in their prove method), which earlier mislead this log.
+
+Standing at checkpoint: ~1.15× at m=30 (149.6–152.4 vs 130.5–130.9
+same-minute). Queued with measured ceilings: witgen constant-region
+elision via pool provenance tags (−3..5 ms, ~120 lines), zerocheck
+round-2 compact format (−2 ms, ~150 lines, previously priced). Those two
+land ≈1.10–1.12×; anything past that is their 2.6k-line lane-wise
+vectorized packing. Measurements paused: machine degraded after ~6 h of
+continuous benching (witness bench 14.3→37.9 ms both arms) — resume
+after cooldown per the discipline.
+
+## MT campaign, morning session (2026-08-26): elision kept; the last 4–6 ms priced
+
+Post-cooldown conditions verified (witness bench back to 14.2 ms from the
+degraded 37.9). **Kept — witness constant-region elision (4dc8742):**
+scratch-pool provenance tags, derived independently at give (from BlockR1cs)
+and take (from the encoder constants), gate skipping b's MAX prefix /
+reserved words and all three zero tails on a hit; any other custody clears
+the tag. Paired kill-switch A/B, production config: 4/5, mean −2.5 ms,
+best 146.98 ms / 445.9k c/s. Byte-identity test drives a tagged give/take
+cycle vs a fresh run. (The −4.8 ms ceiling probe from last night was
+degraded-machine-inflated; −2.5 is the clean value, in line with their
+−4.6 on the larger constant share their layout elides.)
+
+**Final standing, same-minute paired:** m=30 production 149.3–150.6 vs
+their 130.2–130.9 = **1.146×** (campaign start 1.19×; best single run
+146.98). m=32: ours 572.6 (457.8k, +5.6% on the shape since yesterday) vs
+theirs 394.9 = 1.45× — the ranked-shape residual is their m=32-gated
+machinery.
+
+**The remaining ~4–6 ms at m=30, priced:** (1) compact round-2
+anchor+delta (−1.8 ms @MT measured from their r2 8.9 vs ours 10.7) — ~800
+lines in their tree, resurfaces through our three tuned r2/r3 kernels,
+worst lines-per-ms of the campaign; their newer symbolic lookahead+cascade
+(rounds 3+4 and 5+6 collapsed into earlier passes) sits on top of it,
+m=32-gated there, several hundred more lines. (2) Their generated
+lane-wise vectorized packing network (−2–3 ms; our quad-lite probe
+confirmed the packing, not the hash math, is the cost — vectorizing it is
+their 2.6k-line codegen). Both exceed the standing bloat bar; parked for
+an explicit call rather than taken unilaterally.
+
+## The m=32 shape, decomposed and probed (2026-08-26)
+
+First m=32 bucket decomposition, both trees (8T-class, same minute):
+ours witness 71.2 / commit 260.3 / zc 131.2 / lincheck 27.9 / open 93.6
+(sum 584, best total 572.6); theirs 19.2 / 271.6 / 142.4 / 15.9 / 84.9
+(sum 534, best total **394.9** — 139 ms of phase OVERLAP that exists only
+at m=32, where their ranked stack's gates open). Notably our commit AND
+zerocheck buckets are BETTER than theirs at m=32 — the kernel campaign
+transferred; the 1.45× lives in witness (−52: their m==32-gated deferred
+stripe + witgen hetero drains), lincheck (−12: their round-1 stripe-fold
+reuse), open (−9), and the wholesale pipeline overlap.
+
+**Probed and rejected:** deferring our lincheck stripe into the commit's
+all-core join window as a third arm, gated to n_blocks_log ≥ 17 —
+NEGATIVE 3/3 at m=32 (628.9–641.6 on vs 616.4–633.8 off). Their own
+m==32 gate on the same idea works only inside their epool/GPU-window
+architecture; re-streaming 512 MB from DRAM into our already-saturated
+join window loses to the L1-fused eager transpose both at m=30 (measured
+earlier) and m=32. Reverted.
+
+m=32 conclusion: closing it means porting the pipeline architecture
+(phase-overlap scheduling), not any single mechanism — same class of
+decision as the r2 complex and the packing network. Parked with the rest.
+
+**Correction to the m=32 entry above (blake arms).** The 1.45× figure
+compared SHA-merkle arms — which silently disables the blake-gated half of
+their ranked stack (the deferred stripe requires HashKind::Blake3, and the
+witness attribution above is accordingly wrong: that gate was closed in the
+SHA runs). With blake arms (their true ranked config, CPU verified via
+util telemetry): theirs 920–950k c/s vs our best (SHA) 457.8k —
+**~2.1× at the ranked shape**. What the blake gates open, bucket-level:
+their lincheck 15.9→7.6 ms, open 84.9→21.9 ms, plus the deferred-stripe
+witness path. Their dev-bench blake-CPU (950k) also exceeds their
+worker-scored GPU-off number (630.8k), so ranked scoring overhead is
+large; cross-methodology caution applies. Conclusion unchanged in kind
+but bigger in degree: the m=32 gap is the integrated blake+m32-gated
+pipeline architecture, a deliberate port-project, not a mechanism list.
+
+**RETRACTION of the blake-arms correction above.** The 920–1036k "CPU-only"
+figures were GPU-contaminated: the challenge tree's GPU merkle paths
+(recursive merkle, L1 overlap) are BLAKE3-only — GPU shaders hash blake,
+not SHA — and sat outside the kill-switch list used here; and the GPU-
+utilization "verification" sampled only the bench's 3-minute setup window,
+killing the process before any timed prove ran (worthless both arms). The
+tree's owner reproduced with an airtight fresh-build kill: **their true
+CPU-only ceiling at m=32+blake(+blake FS, the worker's hardcoded config)
+is 638.9k c/s — consistent with their worker-scored GPU-off 630.8k**,
+which is the cross-check that settles it. Their GPU at the ranked config
+is worth +57% dev-warm / +43% scored.
+
+Corrected m=32 standing: ours 457.8k (SHA; blake costs us ~4%) vs theirs
+639k CPU-only = **1.40×** — in line with the original SHA-arms 1.45×, so
+the earlier pipeline-architecture analysis stands as written; the "2.1×"
+interlude is void. Also noted from the owner: the ranked worker hardcodes
+Blake3 for BOTH merkle and Fiat–Shamir (no env); dev-bench defaults are
+SHA — worth +3.7% on their tree; our FS hash config at the ranked point
+is an open item. Lesson for the log: a kill-switch list is only as
+airtight as the tree's owner says it is, and GPU telemetry must bracket
+the timed region, not the process.
+
+## Repo default switched to Blake3 (merkle + Fiat–Shamir), 2026-08-26
+
+Matches the ranked worker's hardcoded config (surfaced by the peer session:
+BENCHMARK_HASH = Blake3 for both, no env). HashKind::default(),
+FsChallenger::new, and all embedded ligerito TOMLs flipped; SHA-256 remains
+selectable per component and the cross-hash tests now exercise it as the
+non-default arm. Same-binary A/B: blake-vs-sha −1% at m=30, +2.3% at m=32
+— neutral-to-positive thanks to the neon8 merkle kernel. All future
+default-config numbers are now at the scored hash point; historical log
+entries above used SHA defaults unless marked otherwise.
+
+## m=32 blake, CPU-vs-CPU, finally clean (2026-08-26) — and the real root cause
+
+**The contamination mechanism was a shell bug, not a switch-coverage hole:**
+`GPUOFF="A=1 B=1 ..."` as a STRING does not word-split in zsh, so
+`env $GPUOFF cmd` set one garbage variable and none of the kill switches —
+verified by a 1 s GPU trace showing 94–98% utilization through an "all-off"
+run. The array form (used by the original official grid) and inline env
+lists were always valid; every blake "GPU-off" cell used the string form.
+The earlier "blake-gated GPU-merkle paths escaped the kill list" hypothesis
+is withdrawn — the switches were simply never delivered. (Same zsh footgun
+as the `for arm in $order` loop earlier in this campaign; now twice bitten.)
+
+**Clean paired comparison, m=32, Blake3 merkle+FS (the ranked hash point),
+CPU-only both arms, inline envs:**
+
+| pair | ours (default config, prod) | theirs (8T, all kills) | ratio |
+|---|---:|---:|---:|
+| 1 | 592.3 ms / 442.6k c/s | 392.1 ms / 668.6k c/s | 1.51× |
+| 2 | 629.0 ms / 416.8k c/s | 413.4 ms / 634.1k c/s | 1.52× |
+
+Their arm agrees with the owner's airtight fresh-build (638.9k) and their
+worker-scored GPU-off (630.8k) — three independent methodologies within
+5%. **Verified standing at the ranked shape and hash: 1.51× CPU-only.**
+(Slightly above the SHA-arms 1.40–1.45× because the blake hash point
+benefits their tree ~4% and ours ~2%.) The composition of that gap is the
+previously-logged one: their m=32-gated pipeline (phase overlap, deferred
+stripe, round-collapsing r2 complex) plus their blake-tuned kernels.
+
+## The "pipeline architecture" was an accounting mirage (2026-08-26)
+
+Stage 1 of the pipeline port (Merkle leaf hashing fused into the NTT deep
+pass's sub-group tasks, ~200 lines, bit-identical, kill-switched) measured
+3/5 pairs, mean −0.6% at m=32 — a null (the deep pass is PMULL-compute-
+bound, so hash compute doesn't ride stalls; only the codeword re-read
+saving survives). REVERTED.
+
+The null prompted re-examining the "139 ms of phase overlap" that motivated
+the pipeline theory — and it dissolves: their multi-run breakdown
+(BLAKE3_BREAKDOWN_RUNS) shows per-run buckets summing to ~471 ms against
+~400 ms headline runs, which is exactly their prove_fast_TIMED wrapper
+being ~15% slower than the untimed path (documented in week one and
+forgotten). Their buckets are self-consistent within the timed path; the
+"overlap" was timed-buckets-vs-untimed-best. WITHDRAWN.
+
+**The real m=32 (blake, CPU-only) gap, timed-vs-timed, finally solid:**
+
+| phase | ours | theirs | delta | mechanism |
+|---|---:|---:|---:|---|
+| witness | 71.2 | 29.5 | −41.7 | their witgen SIMD packing (2× in-prove) + scaling |
+| commit(+prep) | 260.3 | 231.0 | −29.3 | window packing/alloc details, NTT+merkle parity |
+| zerocheck | 131.2 | 113.6 | −17.6 | their r2 lookahead+cascade (m==32-gated) |
+| lincheck | 27.9 | 16.2 | −11.7 | their round-1 stripe-fold reuse |
+| open | 93.6 | 79.8 | −13.8 | ranked open machinery |
+
+No scheduling magic — five kernel/structure ports, all previously priced,
+with m=32 values now attached. The big mover is the witgen SIMD packing
+network: worth only ~2–3 ms at m=30 (why it was declined) but ~40 ms at
+m=32. Revised menu, m=32 value per effort: witgen packing (−40, 2.6k-line
+class), r2 complex (−18, ~800 lines), lincheck stripe-reuse (−12,
+unscoped), open ranked pieces (−14, partially GPU-adjacent), commit misc
+(−29, undecomposed). Ceiling if all land: ~600 → ~490 vs their ~400
+untimed — the last ~90 is their untimed-path leanness itself.
+
+## The SIMD packing port that became an allocation fix (2026-08-26)
+
+The witgen SIMD packing network — the full lane-wise design: u32-granular
+writers whose pending word lives in a vector register, every push one
+vsli with compile-time constants, an L1 stage per stream, vld4-deinterleave
+contiguous dump — was implemented via a build.rs generator (committed
+artifact = the ~200-line generator, not the 2.6k-line unrolled output) and
+was bit-identical on the first full test run. It then measured a NULL
+in-prove at both shapes, because the real in-prove witness cost was never
+the builder: **the lincheck stripe buffer was a fresh zeroed 128–512 MB
+allocation every prove**, faulted during the transpose. Pooling that one
+buffer (c8d36b6): witness m=30 18.5→8.0 ms, m=32 74→33 ms, both 2/2
+decisive — more than the SIMD port's entire predicted value. The quad
+kernel was reverted unmerged per the bloat rule; its full design and the
+generator live in the commit history via c8d36b6's message.
+
+Their in-prove witness advantage is now INVERTED at m=30 (ours 7.9 vs
+their 12.1) and mostly closed at m=32 (ours ~33 vs their timed 29.5).
+Third lesson of this genre in the campaign: measure the allocation story
+before porting a kernel (elision, ab_pre pooling, and now this).
+
+## Certification grid: MT target met at m=30 (2026-08-26)
+
+Final verification grid, both trees end-to-end untimed-best, blake3
+merkle+FS both arms, CPU-only both arms (their five GPU kill switches as a
+zsh array, verified by comp/s sanity), 8T, interleaved same-minute pairs
+with alternating order. Ours = HEAD (feb41428 build: pool fix c8d36b6,
+blake defaults fc78188); theirs = their fresh Aug-26 build (5d405d46).
+
+| pair | ours m=30 | theirs m=30 | ratio |
+|---|---:|---:|---:|
+| 1 | 141.85 | 133.89 | 1.059× |
+| 2 | 144.69 | 137.35 | 1.053× |
+| 3 | 143.28 | 132.08 | 1.085× |
+
+Best-vs-best **141.85 vs 132.08 = 1.074×**, every pair ≤1.09×: the
+"MT within 10% of yukon" target is CERTIFIED at the prod shape
+(462.0k vs 496.2k comp/s). Our best buckets: witness 7.6 / commit 64.7 /
+zc 33.7 / lincheck 8.1 / open 27.9.
+
+m=32 pairs: 542.22/397.56 = 1.364× and 541.32/405.82 = 1.334×
+(483.5k vs 659.4k comp/s best) — matches the priced-menu projection;
+the residual is the five parked ports (r2 complex, lincheck stripe-reuse,
+open ranked, commit misc, witgen tail).
+
+Conditions: AC power, ambient GUI load (WindowServer ~55%, Texifier ~30%)
+— absolute numbers mildly inflated vs quiet-window bests (their m=32 read
+384-386 in a quieter window an hour earlier; ratios are interleaved and
+robust). Two grid attempts discarded first: one ran a stale pre-pool
+binary left newest by the A/B stash build (witness bucket 18/68 ms gave
+it away), one was launched under bash where `$ARRAY` expands to its first
+element — kill switches silently dropped, their GPU came alive (1.02M
+comp/s tell). Both hazards now in the protocol notes.
+
+## Commit-bucket decomposition: the gap was absorption economics (2026-08-26)
+
+FLOCK_COMMIT_TIMING splits our m=32 commit bucket (270ms): replicate-fill
+13ms solo, NTT-from-layer-2 124ms, merkle (neon8) 54ms = **191ms of commit
+work** — plus the hoisted AB prep (85ms solo) absorbed at nearly full
+cost. The join window is thread-THROUGHPUT-bound: both arms scale threads
+near-perfectly, so wall = (191+85 work)/(pool) = 276 predicted, 270-278
+measured. Sequencing the fill before the join just moved the contention
+onto the NTT (124→230 beside prep; fill 90→13): thread-work is conserved,
+order can't matter. Paired A/B 3/3 old-schedule (best 558.4 vs 584.8,
+noisy window); reverted with numbers in the commit message.
+
+Peer anatomy (clean window, verified): their commit is ONE fused pipelined
+pass — replicate+NTT+merkle-LEAVES prints as a single 223-298ms number
+(min 223, cluster 223-242) + merkle-parents 0.1ms. Their AB-prep arm
+(116.9ms) rides the join FREE because the fused pass is bandwidth-bound
+and leaves idle thread-time. Their zc bucket (120.4) contains no prep
+(r1 41.3 + r2 49.4 + r3+ 29.7 sums exactly). So: commit work ours 191 vs
+theirs 223 — WE are ahead on work; bucket ours 270 vs theirs ~231 —
+they win on absorption. The earlier "-29 commit misc" menu item is
+re-attributed: it is join-contention, not kernel deficit.
+
+Consequence: the m=32 commit lever is DELETING THREAD-WORK from the join
+window, not scheduling. Two candidates: (1) fuse the replicate-fill into
+the first computed NTT layer-block (read z directly per replica; deletes
+the 2GB fill write + its re-read, ~25-30ms thread-work); (2) retry
+NTT→merkle-leaf fusion — measured null SOLO earlier (deep pass
+compute-bound) but under a thread-bound join, thread-work cuts pay even
+when solo wall doesn't. Together ≈ bucket parity with their 223-231.
+
+Our zc r1/r2/r3+ split at m=32: attempted, contaminated (user interactive
+on the machine; mins r1 38.7 / r2 70.1 / r3+ 64.7 exceed the known-clean
+134ms zc total — upper bounds only). Redo in a quiet window; their
+r2 49.4 vs our clean r2 (TBD) prices the r2-complex port properly.
+
+## Fill→NTT fusion: NULL, reverted (2026-08-26)
+
+Implemented `forward_transform_interleaved_from_message`: the first fused-2
+top pass copies its four input rows straight from z into the codeword rows
+and butterflies them in place L1-hot, deleting the standalone 2GB
+replicate pass (bit-identical: garbage-start equivalence test over 5
+shapes, NTT oracle, prove/verify roundtrips ×3 circuits; kill switch
+FLOCK_NO_FILL_FUSE=1). Paired same-binary A/B, 8 pairs at m=32 (ambient
+noisy, user interactive): commit-bucket sign test 6-2 AGAINST fusion,
+totals 4-4, min-vs-min commit 308.3 fuse vs 297.9 nofuse. Reverted;
+diff preserved at scratchpad/fillfuse.patch (566 lines) and in this entry.
+
+MODEL REFINEMENT (the valuable part): the fill's 90ms under the join was
+QUEUEING, not work — a memcpy pass contributes few thread-ms, so deleting
+its DRAM traffic doesn't shorten a thread-bound critical path, and the
+per-row copies added overhead inside the butterfly tasks. The commit
+bucket is compute-limited: NTT ~124 + merkle ~54 + prep ~85 ≈ 263 of
+thread-work ≈ the measured 270-278 wall. Corollary: the planned
+NTT→merkle-leaf fusion retry is ALSO downgraded — it deletes a 2GB READ
+(bandwidth, not thread-work) and keeps all the hashing compute; the
+earlier solo null likely stands under the join too.
+
+Surviving m=32 commit levers, by the compute model: make PREP cheaper
+(unreduced-PMULL Horner arithmetic, priced ~100 lines at m=30 and
+declined at ~8-15ms; prep is 85ms at m=32 so the same idea re-prices to
+an est. −20-30 bucket) — everything else in the window is already at its
+measured floor (fused-4 top NEON: tried, register spill, +19-26%).
+
+## RETRACTION: the "prep Horner" menu item was already banked (2026-08-26)
+
+Before implementing the recommended unreduced-PMULL Horner port, archaeology
+killed it: the headline win behind that name is ALREADY MERGED as e1398be
+(Aug 24, "accumulate round-1 prep products unreduced (pmull + weight
+split)") — the −128 ms / 8-of-8 ST result, §pmull of the writeup, one of
+the seven kept changes. What the menu item actually referred to was the
+RESIDUAL after that merge, priced at round-1 closure (74802fc): ~8-15 ms
+ceiling at m=30 ST for ~100 lines through the hottest kernel — declined
+then, and the decline stands.
+
+Decisive at today's target shape: at m=32 8T under the join, OUR prep arm
+measures 85-101 ms vs THEIR prep arm's 116.9 (their own clean sample).
+Our prep is already faster than theirs in the current architecture; there
+is nothing left in their tree's prep worth porting. My "−20-30 ms"
+estimate from earlier today was an error — I re-priced the menu label
+without checking that the mechanism behind it was already in.
+
+Corrected m=32 menu (nothing cheap left in commit): zc r2 anchor+delta
+complex (−15..30, ~800 lines), open ranked pieces (−10..20), lincheck
+stripe-fold reuse (−5, unscoped). The commit bucket's remaining −40 vs
+theirs is absorption economics (their bandwidth-bound fused pass hides
+prep free); by the compute-limited model it has no sub-800-line lever.
+
+### Amendment (same day, prompted by Benedikt)
+
+"Our prep is already faster than theirs" overstated an ARM-WALL comparison
+into a kernel claim. Scope is symmetric (both arms = the full
+challenge-independent AB transform; the challenge-dependent drain is
+outside both, pinned by Fiat-Shamir), but the contexts aren't: their 116.9
+runs beside a bandwidth-bound pass (near-solo), our 85-101 beside
+compute-saturating passes (contended). Scaling the clean ST closure
+numbers (160 vs 140 at m=30, post-e1398be) to m=32 8T: theirs ~80 solo vs
+ours ~91 — their prep kernel is likely still ~12% cheaper in isolation.
+The port stays dead for the corrected reason: the reachable ~10-11 ms has
+no named mechanism left (unreduced accumulation, zero-copy rows, and
+dead-row-fill skip are all banked here; their BCAX fold vs our
+shift+x2-byte absorb is a few vector ops in a gather-dominated kernel) —
+it's the campaign's unattributed uniform-kernel-quality band.
+
+## 8-P-core pool pinning retested at m=32: still correct (2026-08-26)
+
+Benedikt asked whether the deliberate 8-thread (P-core) global pool is now
+a slowdown at the ranked shape. Paired A/B, default-8 vs
+RAYON_NUM_THREADS=10, 3 pairs m=32 (noisy window): sign 2-1 for t8,
+cleanest pair dead even (574.2 vs 576.1). Per-phase on the clean samples:
+zc +14 ms and lincheck +6 ms on 10T (E-core stragglers at barriers),
+witness/open unchanged. The early-campaign "8 beats 10 on NTT-shaped
+phases" verdict holds with today's kernels. E-cores remain harvested
+selectively (join window, NTT deep pass, open combine — the phases where
+they add compute to bandwidth-bound windows) and nowhere else. Pool
+pinning is NOT part of the m=32 residual.
+
+### Epool priced by the peer's own kill-switch A/B: below bar (2026-08-26)
+
+The peer added FLOCK_NO_EPOOL to their tree (it didn't exist; I'd assumed
+it from naming) and ran 3 alternating pairs at ranked CPU config: epool
+is worth ~6.6% / ~26.5ms total THERE, 3/3 clean — but decomposed:
+commit −10.7 (their AB-prep-hetero, the analog of the all-core join we
+ALREADY have), zc −6.7, lincheck −0.6, open +3.1 (reversed, ~noise).
+Portable NEW value for us = zc+lincheck ≈ −7ms for a queue primitive +
+call-site conversions (~200 lines): below the bloat bar and priced-and-
+parked (zc-only variant listed on the menu at −6..7). The "uniform
+kernel-quality band" is NOT hidden E-core scheduling; the m=32 menu
+stands: r2 complex (−15..30, ~800 lines), open ranked (−10..20),
+lincheck stripe-reuse (−5), epool-zc (−6..7, ~200 lines).
+
+### epool: NULL-TO-NEGATIVE on our kernels, reverted (2026-08-26)
+
+Paired kill-switch A/B, 3 pairs m=32: tail 3/3 WORSE with helpers
+(49.7-51.4 off vs 53.6-56.2 on), zc bucket 3/3 worse (131-149 off vs
+142-171 on), r2 2/3 worse (42.2-47.4 off vs 45.3-46.7 on). Reverted (the
+implementation survives in history, commit "zerocheck: bounded-tail
+E-core chunk queue"). Mechanism: our r2/tail are bandwidth-heavy
+streaming passes; background-QoS E-cores add DRAM pressure the P-cores
+need — 4th confirmation of the bandwidth-on-bandwidth rule. Their epool
+pays on THEIR kernels plausibly because anchor+delta/compact formats
+made those passes compute-relative. RETEST epool after the anchor+delta
+port lands.
+
+Also learned from the off arm: our incumbent r2 is 42-47ms at m=32 —
+already FASTER than their timed 49.4 (≈ parity with their scored ~43).
+The r2-side of the anchor+delta port is ≈0; the port's value is
+concentrated in the TAIL (ours ~50 vs their timed 29.7): the r3
+table-combine, lookahead, and cascades. Task #3 rescoped accordingly.
+
+## Cascade tail: built, verified, staged opt-in — coupled to anchor+delta (2026-08-26)
+
+Three A/B rounds at m=32 told the full story:
+1. Scalar lookahead passes (as the AG tail ships them): tail 57-59 vs
+   classic 52-54 — the historical "lookahead = 13-15% regression" verdict
+   reproduced, and diagnosed as KERNEL QUALITY (generic scalar F128 muls
+   vs the classic path's q-resident NEON kernel), not scheduling.
+2. NEON lookahead kernel + fold1 entry: tail 50.4-51.7 vs 50.5-51.4 —
+   WASH, explained by pass accounting: the fold1 entry (the largest pass)
+   saves no traffic and pays the full product bill.
+3. Integrated r2 lookahead (r2 emits the 8 sums; all tail passes 4→1):
+   tail 35.0-37.4 vs 49.6-53.1, 3/3 DISJOINT (−15) — but r2 67-80 vs
+   42.6-47.8 (+24). The surcharge is the mul-count floor (8 mul_q + 8
+   wide per group vs classic's 4+4 = 36 extra PMULL/group × 2^24); a
+   two-sweep de-spill restructure changed nothing. Net zc ≈ +9. 
+
+CONCLUSION: cascade and anchor+delta are COUPLED — their tree affords the
+surcharge only because their compact r2 pays it from a lower base
+(deferred odd-element folds + cheaper unreduced product accumulation).
+Staged opt-in (FLOCK_ZC_LOOKAHEAD=1, transcript byte-identical by test);
+anchor+delta port is the remaining piece, anatomy question out to the
+peer: where do the odd folded values for THEIR Q products come from —
+paid delta-gathers in r2, or a product formulation in anchor/delta space?
+
+## Cascade CERTIFIED default-on via one-weight-per-group products (2026-08-26)
+
+The peer read their actual r2 kernel and surfaced the missing formulation:
+all eight lookahead products share the group's eq weight → pre-scale the
+four a-rows once, every product becomes a single unreduced multiply
+(52 vs 72 PMULL/group). Also confirmed from their kernel: anchor+delta is
+a STORE-side cut only (their r2 pays the same gathers) — decoupled from
+the cascade after all, re-priced as a separate −5..8 item (compact stores
++ r3 byte-table combine).
+
+With w-scaling in both kernels: m=32 tail 33-37 vs classic 53-66 (4/4
+disjoint; better than their timed 29.7 after wrapper deflation), r2
+surcharge +12 (= its PMULL floor), zc net −8..13 (sign 3/4; −7.7 on the
+clean pair). m=30: net −1.0, 2/2, best-of-run sample was a cascade arm
+(142.5) — no regression at the certified shape. DEFAULT ON,
+FLOCK_NO_ZC_LOOKAHEAD=1 kill switch, transcript byte-identical by test.
+
+Projected m=32 standing: zc 134 → ~121-126 vs their timed 120 — the
+zerocheck kernel gap is essentially closed. Remaining m=32 items:
+anchor+delta compact stores (−5..8), open ranked (−10..20, parked for
+M3/M4 per Benedikt), commit absorption economics (−40, structural).
+
+## m=32 ST gap measured: 1.30x — the MT hypothesis refuted (2026-08-26)
+
+Benedikt asked whether the m=32 gap is multithreading. Both trees ST
+(RAYON_NUM_THREADS=1, blake3, CPU-only, same-minute): ours 3.76s vs
+theirs 2.89s = 1.30x, vs 1.36x MT (ours 542.1 / theirs 398.3 same
+evening, cascade engaged — after fixing ANOTHER stale-bench-binary
+incident: the default-on flip was committed without rebuilding the
+bench, so the first "quick pull" measured the old default; hazard rule
+extended: rebuild the BENCH after every lib change, verify engagement
+by a phase signature before comparing). Parallel scaling ours 6.9x vs
+theirs 7.3x — MT contributes only ~0.05x. The m=32 deficit is
+kernel/path-level, present on one core.
+
+Why m=32 ST is 1.30x when m=30 ST closed at ~1.10-1.15x: their m==32
+allowlist — machinery that fires only at this shape (deeper
+cascade+anchor+delta forms, ranked-open pieces, SIMD witness packing
+whose value concentrates at m=32; our ST witness bucket is 227ms with
+no pool overlap to hide the scalar builder). Our ST buckets (cascade
+on): witness 227 / commit 1277 / zc 1559 (pre-cascade ~1820) /
+lincheck 126 / open 600.
+
+### m=32 ST attribution completed — half the gap is their scored-only path (2026-08-26)
+
+Peer's ST breakdown + our sub-phase split, prep-aligned (their AB prep
+sits in their commit at ST — sequential join, a straight +551 tax; ours
+sits inline in our zc/r1, ~620): like-instrumented per-phase gaps are
+MODEST — witness +22, ntt+merkle +159, r1-sans-prep parity (270 vs ~260,
+theirs on their slow r1 path), r2 404 vs ~350, tail 226 vs ~250 (OURS
+AHEAD — the cascade), lincheck parity, open +66; our commit-with-prep is
+AHEAD of theirs at ST. Sum ≈ +400 of the measured 870ms ST gap. The
+other ~470ms: their own bucket sum (3.39s) vs their scored run (2.88s) —
+their scored prove_fast is ~18% leaner than their instrumented
+prove_fast_timed ("bypasses several ranked-specific warm-path
+optimizations", r1 stripe path confirmed as one instance). Ours: ~2%.
+THE BIGGEST m=32 ITEM IS NOW ENUMERABLE BY CODE-READ: the diff list
+between their prove_fast and prove_fast_timed paths — requested from the
+peer. Everything else we have compared is within ~15% per phase.
+
+### Their scored-path enumeration: one real mechanism (= our adjudicated
+### fill-fusion), 470ms still unattributed (2026-08-26, late)
+
+Peer's wrapper-diff enumeration: the one substantial scored-only
+mechanism is their "from-message commit" (synthesize both codeword
+replicas from z during the NTT first layer, deleting a ~1GiB replica
+store) — MT-gated (threads>1), and ARCHITECTURALLY IDENTICAL to our
+fill-fusion (fillfuse.patch), which measured null-to-negative here:
+it pays on their bandwidth-bound commit window, not on our
+compute-saturated one. Items 2-6 minor/inapplicable. Their honest
+bottom line: the wrapper list does NOT account for the ~470ms
+scored-vs-instrumented delta; they are now diffing the timed-vs-untimed
+INNER prover fns. Our hypothesis handed over: their timed figure is a
+single sample vs scored best-of-3 with warm pools — if the timed inner
+fn defeats warm-path buffer reuse, the 18% is allocation economics
+(the genre of our two biggest wins). Same 3-untimed+1-timed harness
+shape here shows only ~2% skew, so the asymmetry is in their prover fns.
+
+### The 470ms resolved: their instrumentation artifact, nothing to port (2026-08-26, close)
+
+Peer located both mechanisms in their timed path, with line numbers.
+(1) A commit-tail-fill hook: their scored path stages round-1's C-fold
+prefix in the commit join's idle tail (their commit arm finishes first —
+their from-message commit shortened it; the hook fills the window while
+their prep arm runs). Their timed core hardcodes the hook to None.
+DOESN'T MAP HERE: our join has no idle window — our commit arm is the
+long pole and rayon keeps every thread busy (the same thread-bound
+economics as the absorption story); at ST it's work-reordering, not
+work-deletion. (2) Their scored path's ranked_lincheck_c_reuse (stripe-
+based C-derivation, gated to EXACTLY the ranked blake3 shape) — which
+our tree runs in ALL paths already (StripeC). Bottom line, their words:
+"not something you'd port — it only affects the fairness of MY
+diagnostic function against MY real path."
+
+FINAL m=32 ST accounting: the 870ms gap = ~400ms of modest per-phase
+deltas (witness +22..53, ntt+merkle +100..160 vs old parity — worth one
+re-check, open +66..146, tail OURS ahead) + ~470ms that was their
+timed-path artifact inflating every per-phase comparison we made against
+their instrumented numbers, of which the real scored-path content is
+C-reuse (we have it) and the tail-fill staging (doesn't map). The
+cross-tree kernel gap at m=32 is materially smaller than today's bucket
+tables suggested; the honest scored-vs-scored per-phase decomposition
+would require them instrumenting their scored path, which they may do
+for their own tooling honesty.
+
+## FIRST HONEST CROSS-TREE PER-PHASE TABLE (2026-08-26 night)
+
+Their timed prover fixed (tail-fill hook + ranked C-reuse threaded
+through; honesty check 0.4% vs scored). Both sides m=32, blake3
+merkle+FS, CPU-only. Ours from tonight's clean window (their fresh
+3-run averages; our matched re-run was ambient-contaminated — Chrome/
+ModelCatalogAgent — so our clean-window singles stand, ±3ms):
+
+| phase    | ours MT | theirs MT | Δ    | ours ST | theirs ST | Δ (prep-aligned) |
+|----------|--------:|----------:|-----:|--------:|----------:|-----:|
+| witness  |    30.2 |      29.3 |   +1 |     227 |     205.8 |  +21 |
+| commit   |   ~274  |     223.6 |  +50 |    1277 |  1673 (incl prep 551) | +155 sans-prep |
+| zerocheck|  ~120-128 |    99.9 |  +25 |    1559 (incl prep ~620) | 770.5 | +169 sans-prep |
+| lincheck |    19.6 |      16.2 |   +4 |     126 |     117.6 |   +8 |
+| open     |    96.5 |      24.9 | +72  |     600 |     122.6 | +477 |
+| total    |   ~542  |     393.8 | +148 |    3760 |    2889.8 | +870 |
+
+THE HEADLINE: OPEN is half the gap at both thread counts, and was
+mis-priced all campaign by their broken instrumentation (their old timed
+open read 79.8-86.6 MT / 534 ST — 3-4x inflated). Their open is FLAT
+across m=30→m=32 (~132→~123 ST) while ours scales linearly (145→600):
+an algorithmic difference behind their ranked/m==32 gate, not tuning.
+Open anatomy requested — loop 1 of the joint phase. After open, the
+residuals are commit-sans-prep +155 ST (ntt+merkle — vs the old m=31
+parity result, recheck), zc-sans-prep +169 ST, witness +21 ST,
+lincheck +8. Their flagged caveat: their MT witness/commit may still be
+slightly pessimistic (an MT-only from-message fast path not threaded
+through their timed fn).
+
+### Open anatomy received: sufficient-statistic combine (loop 1 target)
+
+Their m==32 open eliminates the O(L) combine sweep outright: b_combined
+(size 2^(m-7) — the quantity that 4x's m=30→32) is never allocated at the
+ranked shape; ring-switch round-0/1 messages derive from per-claim
+FIXED-SIZE sufficient statistics — DirectFold8Factors (64-bank pair),
+DirectFold4Factors (16x16 product matrix H[e,d]=Σ_h f[16h+e]·B_k[16h+d]),
+DirectFold2Factors (16 products) — none scaling with L. Statistics are
+computed where data is already resident (AB from lincheck's z_vec_pre —
+cost lands in lincheck; C from zc r1's URM extraction — lands in zc);
+we ALREADY have that relocation (our s_hat_v captures skip fold_1b_rows).
+What we lack is the elimination itself. CPU-only confirmed (no gpu_commit
+refs in their ring_switch). Their isolation switches exist
+(FLOCK_NO_OPEN_DIRECT_{FOLD8,FOLD4,AB}) for a confirming measurement.
+Port = re-derive the sufficient-statistic construction onto our combine
+(our composed-table fold path still does the O(L) sweep). This is the
+campaign's largest remaining item: open +72 MT / +477 ST at m=32.
+
+### Loop-1 port plan: sufficient-statistic open (scoped, ready to build)
+
+Inventory: OUR combine (pcs.rs compute_combined_basis_and_target — same
+fn lineage as theirs) always materializes b_combined (O(L), composed-
+table fold) feeding ligerito::recursive_prover_with_basis, and already
+precomputes round0_prime + round1_lookahead in the combine. We have the
+128-slice s_hat_v captures (AB from lincheck z_vec_pre, C from zc r1)
+but NO banked (retained-coordinate) variant and no factor structs.
+
+Port, three stages, each behind FLOCK_NO_OPEN_DIRECT (default off until
+certified), transcript-identical by proof-bytes test at every stage:
+1. PRODUCERS: fold8-banked s_hat_v variants of our two captures — keep
+   the low 6 suffix coordinates unfolded (64 banks; their bank index =
+   little-endian 6-bit retained coordinate matching build_eq(suffix[..6])).
+   Their producer refs: ring_switch.rs:3205-3320 (factor assembly from
+   w.s_hat_v_fold8), 2545-2558 (struct semantics: A[b,e] = transpose of
+   banks, bit-major so pair-fold kernels bind coords in place; W[b,d] =
+   Φ(low_eq[d]·x^b); round0 cached at construction).
+2. FACTORS + COMBINE BYPASS: when both claims carry factors at the gate
+   shape (L == 2^25, two RS claims, no packed-direct), skip b_combined
+   entirely (their pcs.rs:1286-1307) and hand the factor pair to the
+   recursive prover. γ baked into banks at construction (their
+   RingSwitchBatchOutput comment).
+3. BANKED SUMCHECK INTAKE: a recursive_prover entry whose rounds 0..6
+   run on the A/W factor states (fold banks in place per bind; after six
+   binds W collapses to the byte-map generator vector) then rejoin the
+   incumbent path. Their consumer ref: ring_switch.rs:4399 (
+   "sixty-four-bank intake"), fold4 fallback = 16x16 H[e,d] product
+   matrix (H[e,d] = Σ_h f[16h+e]·B_k[16h+d]).
+Value: open 96.5→~25 MT (−72), 600→~123 ST (−477) at m=32 if the full
+mechanism transfers. Gates: shape-exact like theirs initially, widen
+after certification. Estimated size: 400-700 lines, the campaign's
+largest port; algebra to re-derive, not copy.
+
+### The algebra (for the port; doc gets it on certification)
+
+Claim k: ⟨f, B_k⟩ = t_k with B_k[i] = γ_k·Π_j eq(u_j, i_j) — RANK-1.
+Split i = (e,h) ∈ {0,1}^c × {0,1}^(ℓ−c): B_k = γ_k·lo_k(e)·hi_k(h).
+Statistic: G_k[e] = Σ_h f[(e,h)]·hi_k(h) ∈ F^{2^c} — computed free where
+f already streams (lincheck z-fold for AB, zc r1 extraction for C; our
+s_hat_v captures are the c=0 case). Target t_k = γ_k Σ_e lo_k(e)G_k[e].
+Rounds r<c fold G bank-wise (G'[e'] = G[0e'] + ρ(G[1e']+G[0e'])) and
+update lo_k's eq factor; messages are the usual quadratics over 2^(c−r)
+terms instead of L/2^(r+1). After c binds the surviving bank collapses
+into the byte-map generator (their W[b,d] = Φ(low_eq[d]·x^b)); rejoin
+incumbent. Deleted: the basis' O(L) life ≈ 4L element-ops + traffic
+(alloc + γ-sweep + c rounds of length-L folds). f's own folds remain
+(needed downstream). Same field elements throughout ⇒ transcript
+bit-identical ⇒ proof-bytes equality is the port's correctness test.
+Their fold4 H[e,d] = Σ_h f[16h+e]B_k[16h+d] = the same object with the
+basis low factor pre-multiplied. Conceptually: the table-vs-fold rule's
+endpoint — one resident rank-1 object ⇒ contract once, never
+materialize the map.
+
+### Direct-open derivation, verified against our conventions (implementation basis)
+
+Our ring switch: suffix S = rank-1 eq tensor over word coords (x_outer[1..]);
+basis B[i] = φ(S[i]) with φ(u) = Σ_b bit_b(u)·E[b], E = build_eq(r''):
+φ is F2-LINEAR (fold_b128_elems). Identities the port rests on:
+1. ⟨f,B⟩ = Σ_β x^β·φ(s_hat_v[β])  (F2-linearity pulls φ out of the
+   bit_β(f)-weighted sum) — consistent with sumcheck_claim =
+   ⟨transpose(s_hat_v), E⟩.
+2. BANKED: M_e[β] = Σ_h bit_β(f[(e,h)])·hi(h) (banked s_hat_v, low c word
+   coords retained; Σ_e lo(e)·M_e = s_hat_v — the reconstruction test).
+   W[b,d] = φ(lo(d)·x^b) (basis-side state; r''-dependent, built at open).
+3. Round r<c message at eval point x₀: both states fold at the SAME
+   challenges (A on the f-side lag, W on the basis-side lag — same ρ);
+   g_r(x₀) = Σ_{e'} Σ_β x^β · Σ_b bit_b(A-partial(x₀,e')[β])·W-partial(x₀,e')[b]
+   — O(128·128·2^(c-r)) XOR-dominated, sub-ms; NO O(L) touch.
+4. Exit: after all c binds, W's sole bank = the byte-map generator vector
+   G[b] = Σ_e lag(ρ)(e)·W[b,e]; b¹[h] = ψ_G(hi(h)) materialized at
+   2^(ℓ-c) via the existing composed-byte-table machinery. f folds through
+   the same rounds with existing kernels (f-only variant of the lane fold).
+Producers are SMALL: AB banks from lincheck's z_vec (2^k_log elements —
+banked s_hat_v_from_z_vec, trivial); C banks from the zc capture
+analogously. Deleted O(L) work per claim: fold_b128_elems (rs_eq_ind),
+the b_combined build, and its c rounds of folds (~4L total).
+Implementation order: (1) ring_switch banked structs + reference
+producers + W + reconstruction/claim identity tests; (2) round-message +
+state-fold fns, oracle-tested vs the dense SumcheckProver at m=13-16;
+(3) ligerito lane-fold intake (f-only folds + direct messages + b¹ exit);
+(4) pcs gate + banked captures from z_vec/zc; kill switch
+FLOCK_NO_OPEN_DIRECT; proof-bytes identity test at every stage.
+
+### Direct open: wired end-to-end, proof-bytes identical (loop-1 units 1-3)
+
+The basis-free opening is complete behind FLOCK_OPEN_DIRECT=1:
+prove_batched emits banked claim bundles (RsEqInd::Direct; flat s_hat_v
+reconstructed from banks for the transcript), the combine skips
+rs_eq_ind + b_combined entirely, and recursive_prover_direct runs the L0
+lane folds with f-only array folds + banked round messages, materializes
+the residual basis from the exit generators at the level-1 boundary, and
+rejoins the incumbent flow. One wiring bug shaken out (banked messages
+reached the challenger but not the proof's sumcheck transcript;
+prefixed). Also found pre-existing rot in the ignored hand-rolled-config
+pcs roundtrip test (fails on HEAD; unrelated).
+
+Verified: proof-bytes identity through the full pcs stack at m=22
+(production config shape) + verify; production-glue bundle test; oracle
+tests at 4 shapes incl. (15,6); full prove/verify roundtrips on all
+three circuits with the direct path ON; 347 core tests green.
+
+REMAINING before the m=32 A/B (unit 4, producers): the v1 gate builds
+banks with the serial reference scan — unusable at m=32. Plumb
+banked_s_hat_v_from_z_vec (exists, tested) for the AB claim from
+prover.rs's z_vec_pre, and generalize the zc r1 s_hat_v_c capture to its
+banked form for the C claim. Target: open 96.5→~25 MT / 600→~123 ST.
+
+### Direct open: producers landed, port complete; certification pending
+### a clean window (2026-08-26, late night)
+
+Unit 4 (producers) landed: AB banks from lincheck's z_vec_pre
+(banked_s_hat_v_from_z_vec, carried through ProveCore), C banks captured
+free inside the zc stripe fold (round1_c_banks_from_stripe_with_banked —
+same outer partial fold, middle fold stopped c dims early, flat banks
+bit-identical by test), plumbed via open_batch_..._banked with per-claim
+fallback to the reference scan. Full validation green (proof-bytes
+identity, banked-C equivalence, roundtrips with FLOCK_OPEN_DIRECT=1,
+348 core tests).
+
+First m=32 A/B attempts hit a heavily contaminated window (bests
+836ms-1.3s vs clean 541; Chrome bursts): magnitudes unusable. Signal
+that survives: sign 3/3 for direct on usable pairs, and one direct open
+sample at 80.8ms — BELOW the clean dense floor (96.5), proving
+engagement with real producers and sub-incumbent cost. Certification
+A/B (target: open 96.5→~25 MT, 600→~123 ST) deferred to a quiet window;
+the gate stays opt-in (FLOCK_OPEN_DIRECT=1) until then.
+
+## DIRECT OPEN CERTIFIED, DEFAULT ON — campaign record (2026-08-26 23:09)
+
+Quiet window (the self-arming gate fired as the machine went idle).
+3 MT pairs + 1 ST pair, alternating, kill-switched same binary:
+
+| | direct | dense | verdict |
+|---|---|---|---|
+| MT open | 59.5-72.1 | 94.3-100.2 | 3/3 disjoint, −33 avg |
+| MT zc | 121.6-126.7 | 127.0-133.0 | no regression (3/3 better) |
+| MT best | 484.3-518.4 | 527.4-543.1 | 3/3, avg −32.5 |
+| ST open | 210.0 | 614.2 | −404 |
+| ST best | 3.37s | 3.74s | −370 |
+
+**Best prove 484.25 ms / 541,336 c/s — the campaign's best m=32 reading.**
+Headline vs their scored ~397: ≈1.22×, from 1.36× this morning (the
+cascade + direct open together). DEFAULT ON (FLOCK_NO_OPEN_DIRECT=1
+kills). The residual open gap (+39 MT / +87 ST vs their honest 24.9/123)
+= the unported ranked-open extras (their exact-shape-gated truncated
+final NTT + lazy OOD eq) — parked per Benedikt for the M3/M4 revisit,
+now cleanly the next item if unparked. Loop-1 of the joint phase is
+CLOSED: mechanism identified from their honest numbers, algebra
+re-derived, ported in four verified units, certified same-day.
+
+## Open residual, loop 2 opened: our own floor first (2026-08-26, midnight)
+
+Peer's honest ST decomposition of their open (113-126 total): ring-switch
+tail 0.5 / combine 0 / initial sumcheck 38-51 / recursive commits ~58 /
+induce 11.2 / OOD 0.8. Verdict: their commits are NOT near-zero (parity
+with ours per-thread); their edge concentrates in the small stages —
+which on OUR side were self-inflicted. Three local fixes, all
+transcript-identical (identity test green each step):
+1. W-state via fold byte table (was a 128-bit scan/element): tail 8.7→6.6
+2. COMPOSED f-fold — unique to the direct path: messages never touch f,
+   so all initial_k challenges bind in one 2^k→1 pass (~2L→~1.03L
+   traffic): initial sumcheck 26.4→19.6
+3. Parallelized bank transposes + reconstruction: tail 6.6→1.4 (their
+   floor: 0.5)
+OPEN: 64.1 (certified) → 47.6 ms at m=32 8T. Remaining deltas vs their
+MT-scaled ~25: initial ~−10 (drill the 19.6), induce −4.5 (their
+truncated-final-NTT — exact, requires log_inv_rate==1, fused round-msg
+variant), OOD −2.8 (lazy split-eq + glue fused into the next fold),
+commits ≈ parity. Their two extras' full anatomy is on file (their
+message, ligerito.rs refs).
+
+### Micro-fixes PAIRED-CERTIFIED (correcting the single-sample claim above)
+
+Benedikt asked whether 64.1→47.6 was measured or estimated — it was
+single-sample traces across different windows. Proper two-binary paired
+A/B (3 pairs, alternating, head rebuilt after): open 45.5-50.4 vs
+59.7-61.3 — 3/3 DISJOINT, −12.1 avg (−20%); totals 492.5-511.1 vs
+516.0-538.2, 3/3. The honest certified delta for the three micro-fixes
+is −12 (not −16.5: the pre-fix arm reads 60.4 in this window, not the
+earlier quiet-window 64.1). Best this window: 492.53 ms / 532.2k c/s.
+
+### Initial-sumcheck drill: half is PoW grinding at its floor (2026-08-27)
+
+Fine timers on the direct L0: fold grinds 9.3-11.8ms (block-parallel
+lowest-nonce already — protocol security work, high-variance, NOT a
+kernel target; explains both trees' initial-sumcheck noise), composed
+f-fold 4.5-4.7, b1 5.7-6.4, boundary 0.2-0.6. b1 split-fold variant
+tried: SLOWER (9.2-9.4; per-slot mul > saved tensor build at 2^20),
+reverted. Grind-adjusted kernel content of our open ≈ 36ms vs their
+grind-adjusted ~15-20: remaining targets = induce truncated-final-NTT
+(−4.5) and lazy OOD (−2.8), then commits/misc at parity.
+
+### FLOCK_NO_GRIND: grinding removed from the measurement protocol (2026-08-27)
+
+Benedikt: grind time is nonce-search luck (9.3-11.8ms MT of the open at
+m=32 L0 alone) and adds variance paired A/B can't cancel. Both trees now
+carry the same knob: `FLOCK_NO_GRIND=1` coerces grinding bits to 0 in
+`grind_pow` (nonce 0, zero hashing; ~5 lines, LazyLock env check).
+Default unchanged (grind ON). Deliberately NOT mirrored in the verifier
+— grind-free proofs FAIL verification (the bench's final verify panics
+after timings print; scripts tolerate the exit). Yukon confirmed with
+Benedikt and added the identical knob. ALL grind-free numbers are a new
+baseline family — not comparable to anything certified earlier.
+
+### Port wave 3: truncated-final-NTT induce + lazy OOD (2026-08-27)
+
+Both peer-anatomy items, both transcript-identical (dense-equality unit
+tests + full lib suite + m=22 proof-identity green):
+
+1. **Fused low-half final-3 NTT tail** (their `..._fused_final_3layer_
+   low_half`): `induce_sumcheck_poly_via_ntt` computed the full 2^21
+   transpose then `truncate(n)` — at rate 1/2 the retained half never
+   needs the last three layers' full sweeps. Fused strided kernel
+   (8-gather, 3 butterfly levels in registers, 4 low writes, in place
+   via split_at_mut): last layer's kept output is a plain XOR, ~6n
+   traffic → 1.5n. Gated `log_inv_rate == 1` inside the sparse
+   transpose. Trace attribution: induce 6.8-7.6 → 6.0-7.2ms MT (~−0.8,
+   consistent with the traffic math; peer's −4.5 bundled other diffs).
+2. **Lazy OOD** (their `introduce_new_ood_factorized`/`glue_factorized_
+   ood` analog): `introduce_ood` splits eq(z,·) = eq_lo ⊗ eq_hi
+   (build_eq_table is LSB-first) — round msg + eval read only f, the
+   2^n table is never built; glue defers (α·eq_hi, eq_lo) and the next
+   basis glue drains all samples fused in its one read-modify-write
+   pass (fold paths carry a flush no-op as insurance). Trace: OOD
+   samples (5) 2.6-3.0 → 0.4-1.0ms MT; basis glue +0.1-0.6 (the
+   drain). Net ≈ −2.
+
+**Wave 3 CERTIFIED** (paired grind-free A/B, quiet-window checked): open
+bucket 40.8-41.3 → 36.8-37.8 ms m=32 8T, **−9%, 3/3 disjoint**; totals
+2/3 (a ~4ms effect inside ±10ms window noise — bucket is the signal).
+Committed d87cb4b. Window hazard logged: three consecutive windows read
+528-556 both arms with no foreign process >50% CPU — thermal inflation
+from hours of sustained benching; grind-free family best remains the
+first quiet run (469.39 ms / 558.5k c/s). Remaining open residual ~37
+vs their grind-adjusted ~15-20; unattributed ~20 (recursive
+commits/opens inside the bucket) is the next drill.
+
+### Open drill wave 4: boundary join + blocked transpose (2026-08-27 overnight)
+
+Peer's grind-free MT decomposition (their bench, 4 samples): open 21.46
+total = initial 5.19 / recursive commits 9.88 / induce 3.17 / rest ~2 —
+so the "15-20" carry was right, and our residual concentrates in three
+buckets. Two fixes, certified together (paired A/B: open bucket sign
+3/3, −2.8/−3.2/−8.0, avg −4.7ms; totals 2/3 — ~4ms effect in window
+noise; pair 3's window degraded mid-run, pairing absorbed it):
+1. **Boundary join**: the composed f-fold (DRAM-bound, full-witness
+   read) and the residual-b1 build (L1-gather-bound byte-table folds)
+   ran back-to-back; they're data-independent at the boundary →
+   rayon::join (compute-under-bandwidth, the AB-hoist pattern).
+   Initial sumcheck 11.3 → 8.5-9.8 (their 5.19 — asked how).
+2. **Blocked dense transpose** in the sparse induce: the dense remainder
+   ran one full 32MB sweep per layer (10 layers); layers whose blocks
+   fit 2MB now run together over L2-resident chunks (blocks nest, so a
+   chunk at the run's lowest layer contains whole blocks of every
+   higher layer): ~640MB traffic → ~130MB. Induce 6.6-8.5 → 5.4-6.7
+   (their 3.17). Equality test extended with a rate-1/4 blocked shape.
+NULL: twiddle-width census (hypothesis: fused-2 loses the 3-PMULL
+half-width path on mid layers) — only the 2 deepest layers are
+half-width at dim 18/24; the static gate is already right. No change.
+Recursive commits 14.3-15.5 vs their 9.88: our L1 NTT deep is at the
+PMULL floor and merkle at the blake3 floor per component math —
+anatomy question sent to peer (different decomposition / overlap /
+config?). Open now ~30-33 vs their 21.5.
+
+### Recursive fill fusion CERTIFIED (2026-08-27 overnight)
+
+Peer per-level anatomy: their recursive commits skip the replicate fill
+— first NTT pass writes the codeword straight from the compact message
+(fill 0.00, their L1 ntt 3.1-3.4). Our tree already HAD the mechanism:
+forward_transform_interleaved_from_message, built for the main commit,
+adjudicated NULL there (compute-limited join window, 6-2 against), and
+reverted into scratchpad/fillfuse.patch. Resurrected the NTT-side
+machinery verbatim and switched ONLY ligero_commit (recursive path) to
+it — the main commit stays on replicate (null verdict stands; the
+recursive commits are standalone + bandwidth-bound, which is why it
+pays here). L1 fill 0.5→0.00, all-in NTT 5.2-6.9→5.0-5.2; recursive
+commits 14.3-15.5→12.9-13.3 (their 9.88; residual = their radix-8
+kernel shape, parked). PAIRED A/B: open sign 3/3 (−2.35/−1.60/−0.56,
+avg −1.5), totals 3/3. FLOCK_NO_FILL_FUSE=1 kills (same-binary A/B).
+
+### Boundary FUSION (join → single sweep) — phase-certified (2026-08-27)
+
+Read their materialize_direct_fold8 directly (Benedikt owns both trees):
+one witness sweep produces f1 AND b1 AND the round-0 message — the b1
+gathers + factored eq products run in the witness stream's stall slots,
+fold accumulates unreduced (fold_banked_slot). Ported the idea as
+fold_boundary_fused_par: replaces the rayon::join; suffix eq kept
+factored (eq_lo⊗eq_hi, never built); lag fold via mul_unreduced + one
+reduce. The standalone split-fold null INVERTS under fusion (logged
+where the null was recorded). Boundary pair 7.3-8.4 → 5.5-5.7; initial
+sumcheck 8.5-9.8 → 5.9-6.0 (their 5.19). CERTIFICATION: bucket-level
+A/B inconclusive (−0.2/+10.1 outlier/0.0 in a noisy window — a ~2ms
+effect under ±5ms noise); per-phase paired A/B (same binaries, same
+window, init_min per run) 3/3 DISJOINT: 5.85/6.04/6.59 vs
+7.52/8.40/8.13, avg −1.9. Proof-identity + full suite green.
+
+NULL: pooled densify buffer in the induce (scratch take + parallel zero
++ right-sized copy-out vs fresh vec![ZERO; 2^21]) — induce 6.1-7.1 vs
+5.4-6.7 baseline windows, the 16MB copy-out eats the fault savings at
+32MB scale. The allocation rule pays at witness scale (128-512MB), not
+here. Reverted.
+
+### JOINT GRIND-FREE CROSS-TREE TABLE (2026-08-27 ~05:00, m=32 blake CPU-only 8T)
+
+First fully-honest table of the campaign: both trees grind-free
+(FLOCK_NO_GRIND=1), GPU off, strict slot alternation in one window
+(theirs #N then ours #N), both sides' timed paths previously fixed.
+
+  pair1: theirs 392.44 ms / 667,992 c/s   ours 477.93 / 548,497   1.218x
+  pair2: theirs 388.75 ms / 674,319 c/s   ours 469.02 / 558,920   1.207x
+  pair3: theirs 391.35 ms / 669,849 c/s   ours 475.33 / 551,497   1.215x
+  best-vs-best: 469.02 vs 388.75 = 1.206x
+
+Per-phase mins across slots — open: theirs 20.6-21.7 vs ours 29.7-31.1
+(initial ~parity 5.05-5.19 vs 5.73-5.87; recursive commits 9.5-9.9 vs
+11.8-12.5 = their radix-8 kernel shape; induce 2.5-2.6 vs 5.05-5.24 =
+their fused densify/arena/intro-msg mechanisms, each sub-ms, below our
+bloat bar — anatomy on file). Their other buckets: witness 29.1-29.9 /
+commit 223.7-235.8 / zc 101.0-103.5 / lincheck 16.1-17.4. Campaign
+arc: 1.36x (yesterday morning, with-grind) → 1.206x honest grind-free;
+whole campaign vs origin baseline ≈ 723.9 → 469.0 ms 8T (1.54x) /
+4781 → ~3370 ms ST.
+
+### Full grind-free breakdown snapshot @ af90ba1 (2026-08-27 morning, m=32 blake 2^18)
+
+1T: 3312.30 total (78,269 c/s) = witness 244.1 / commit 1267.8 / zc-r1
+895.9 / zc-r2 408.0 / zc-r3+ 226.9 / lincheck 124.6 / open 145.0.
+8T: 472.76 total (553,362 c/s) = witness 30.1 / commit 273.4 / zc-r1
+35.1 / zc-r2 54.3 / zc-r3+ 31.9 / lincheck 18.8 / open 29.2.
+Open sub-phases 8T: boundary fused pair 5.5-5.6, initial SC 6.1-6.2,
+recursive commits 13.2-14.0 (L1 = ntt 5.2 + merkle 3.1-3.3, L2 ~2.3,
+tail ~1.2), induce 5.9-7.4, intro+glue 0.7, OOD(5) 0.4, opens 0.2.
+Open ST: 145 = commits 68.1 / initial 41.9 (pair 40.2) / induce 24.4 /
+misc ~5. Campaign totals vs origin baseline: ST 4781→3312 (1.44x), 8T
+723.9→472.8 (1.53x). vs peer grind-free same morning: witness parity,
+commit +38..50, zc +18..20, open +7.5..8.6, lincheck +1.4..2.7.
+
+### Commit attack, experiment 1 NULL: prep ∥ merkle staging (2026-08-27)
+
+Hypothesis: pair the PMULL prep with the Merkle stage (BLAKE3 =
+integer-SIMD) instead of the PMULL NTT — disjoint execution ports.
+REFUTED decisively: staged join wall 306-327 vs 273 baseline; the
+merkle arm inflates 55 → 150-157 beside prep (~fully additive). On M1
+BLAKE3 and PMULL both issue on the NEON pipes — there is no disjoint
+port pool, the compute-additive window model holds. Scheduling reshuffle
+reverted (prover.rs); the commit.rs encode/merkle stage split kept
+(used by experiment 2). Also measured: NTT truly solo = 158 vs 128-145
+in-join windows — arm-wall readings continue to be context-dependent.
+
+### Commit attack, experiment 2 NULL: leaf hashing fused into the NTT deep pass
+
+Built the peer-shape fusion (per-sub-group hook in the parallel
+interleaved NTT; each 2MB sub-group's leaves hashed cache-hot in the
+task that finished its butterflies; merkle's 1GB codeword re-read
+deleted; bit-identical root/tree/codeword by test at two shapes).
+MEASURED NULL in a cooled window (kill-switch pairs, min-of-run): join
+wall fused 269.5-281.5 vs staged 266.1-276.3 (sign 1/3), commit bucket
+2/3, totals 1/3 — all inside ±6ms noise. The old "deletes a read, not
+compute" pricing is now a measured verdict; no prep absorption
+materialized either (the M1 compute-additive window model holds — their
+absorption comes with a pass that is SLOWER alone by ~13ms, and
+adopting slower-alone shapes only pays if absorption exceeds the
+slowdown, which our kernels' shape does not exhibit). Reverted; patch
+preserved in scratchpad/leaffuse.patch. COMMIT VERDICT so far: our
+kernels win solo (fill 22.9 + NTT 844.7 + merkle 413 ≈ 1280 ST — NTT
+repeatable to 0.13ms), the ~40ms MT bucket gap is their prep riding a
+stall-rich fused pass; closing it means adopting their whole commit
+architecture with uncertain net on our faster kernels. ST cross-tree
+comparison pending (peer running grind-free ST decomposition).
+
+### Commit attack, experiments 3+4 NULL: NEON fused-4 and radix-8 fused-3 top
+
+The "aarch64 fused-4 top layers" menu item is now measured and DEAD,
+with the model corrected in the process:
+- NEON fused-4 (16-point rows, paired-PMULL vec2 muls): top layers
+  316-323 → 794-860 ST (2.5× WORSE) — sixteen ~32MB-strided streams per
+  row group break the M1 prefetcher.
+- Radix-8 fused-3 (8 streams, the challenge tree's choice): 586-601 ST
+  — still 1.9× worse than fused-2.
+- MODEL CORRECTION: the ST top was never at the bandwidth floor. Per
+  fused-2 pass: ~6.7e7 muls ≈ 67-98ms compute vs 79ms measured — the
+  top layers sit AT the compute≈bandwidth balance point single-threaded,
+  so wider fusion trades traffic nobody is waiting on for access
+  patterns that stall. (At 8T the top IS bandwidth-bound, but the MT
+  ceiling is ~10-15ms and both wider kernels regress compute.)
+Both reverted. COMMIT ATTACK VERDICT: kernels are near-parity ST (our
+encode+merkle 1280 vs their 1207, −6%; merkle ±6; prep ~parity); the
+~40ms MT bucket gap is their single-pass commit architecture absorbing
+prep in its stalls, and four replication attempts (prep∥merkle staging,
+leaf fusion, fused-4, fused-3) all measured null-to-negative. Remaining
+option = porting their full streaming radix-8 replicate+NTT+leaf pass:
+large rewrite of the tuned NTT, uncertain net (their pass is faster ST
+by ~73 but slower MT-solo by ~13 than our staged pipeline) — priced for
+Benedikt's call.
+
+### Streaming commit port (their full architecture) — MEASURED UNSUCCESSFUL, reverted
+
+Benedikt-directed full port (no kill switch; his correct note: my
+"slower MT-solo" claim was bad accounting — their 235 was prep-contended
+too). Built faithfully from their source (commit.rs:489-830): deep-pass
+NTT publishes ~1MiB leaf jobs (leaf hashing + aligned local parent
+subtrees, hashed hot) into a bounded channel drained by utility-QoS
+helper threads (E-cores); queue-full → inline; tail drained on the main
+pool; shared top after (merkle top 0.03ms — locals worked). Join moved
+to the P-pool when the pipeline engages (E-cores reserved for helpers).
+Bit-identical (root/tree/codeword equality test at 2 shapes; suite
+350 green). MEASURED, same window as a staged baseline re-run
+(287-294): shallow queue (cap 4) 294-307 — inline fallback
+re-serializes leaves onto P mid-transform; deep queue (no inline)
+350-354 — codeword cold by drain time, staged merkle's DRAM read comes
+back plus overhead. Intra-window structure: ntt+leaves 194-239 vs
+staged ntt+merkle 183 — the pipeline never beats staged even inside
+its own window. WHY THEIRS WINS AND OURS CAN'T (this hardware): the
+architecture monetizes E-core silicon for leaf hashing; their host has
+4 E-cores, ours 2 — and our all-core join ALREADY monetizes those 2
+E-cores for prep compute (certified AB-hoist v2). Switching the same 2
+E-cores from prep-absorption to leaf-absorption is conserved-compute
+zero-sum, minus channel/QoS overhead. Patch preserved:
+scratchpad/streaming_commit.patch (542 lines incl. equality test).
+COMMIT PHASE FINAL VERDICT: closed-structural on M1 Max — kernels ST
+near-parity, all five architecture/scheduling experiments
+null-to-negative; the ~40ms MT bucket gap is E-core-count-bound, not
+code-bound.
+
+### STREAMING COMMIT CERTIFIED — the earlier verdict was wrong (2026-08-27)
+
+Benedikt challenged the "E-core-count-bound" conclusion: their 1.2x was
+measured on THIS machine. He was right — the "4-E-core host" was a
+comment in their code about the ranked contest hardware, misread as the
+measurement box. The real missing piece was visible in our own trace:
+our pipelined ntt+leaves (194-205) was FASTER than theirs (235), but
+our prep had already burned its overlap window beside a 100ms
+standalone replicate-fill that their architecture doesn't have — their
+from-message top eliminates the fill, so prep rides the ENTIRE window.
+The main-commit fill-fusion null (staged shape: "deletes a read, not
+compute") does NOT transfer to the pipeline shape, where the fill
+fusion is load-bearing: it buys the prep its hiding window.
+
+v2 = pipeline + from-message fill fusion (hook threaded through
+forward_transform_interleaved_from_message_with): join wall becomes ONE
+line (ntt+leaves, prep inside, merkle top 0.03ms). PAIRED A/B
+(two-binary, 8-min cooldown, 3 pairs): join wall 252.5/254.7/252.8 vs
+262.6/260.5/261.1 — 3/3 DISJOINT, avg −7.4; totals 482.5/463.1/456.9
+vs 502.8/479.8/489.6 — 3/3 DISJOINT, avg −23. Bit-identical
+(root/tree/codeword equality at 2 shapes; proof-identity; suite 350).
+NEW CAMPAIGN RECORD: 456.95 ms / 573,681 c/s ≈ 1.175x vs their 388.75.
+"Commit closed-structural" is RETRACTED; the architecture works on 2
+E-cores once the fill is fused. Lesson for the log: a null verdict is
+scoped to the architecture it was measured in.
+
+### Ranked radix-8 top with E-core hetero tiles CERTIFIED (2026-08-27)
+
+Second half of the streaming-commit architecture (their split-ranked
+top, read from their ntt source): layers 1..9 in THREE radix-8 passes
+replacing four fused-2 sweeps — layer 1 fused with the fill via the
+dual-destination from-message kernel (one 512MB witness read → BOTH
+replica blocks; block 0 on the XOR-only zero-root chain; outputs staged
+in 8KB L1 tiles, emitted as sequential stnp bursts — the staging is
+what my earlier fused-3 lacked: per-lane scatter stores defeat the
+streaming-store detector and pay RFO on the fresh 1GB destination,
+their note records −4% for that exact mistake); layers 4/7 in-place
+radix-8 with q-resident butterflies (field lib's mul_q, no GPR
+crossings; block 0 zero-root). All three passes distribute 128-row
+tiles over the rayon pool AND two utility-QoS E-threads
+(run_hetero_chunks, one atomic counter) — the E-cores assist the top,
+then switch to leaf hashing when the deep pass publishes. Gated to the
+rate-1/2 shape with n_top≤10 guard (huge shapes keep fused-2; skipping
+layers 10..n_top would corrupt). Bit-identical: from_message equality
+(shape (16,32,2) runs the ranked path), pipelined-commit
+root/tree/codeword test, full suite. PAIRED A/B (cooled, 3 pairs):
+commit join wall 256.6/259.4/266.7 vs 273.1/273.2/275.5 — 3/3
+DISJOINT, avg −13.1; commit bucket 3/3; totals 2/3 (pair-1 new-arm
+total was a Chrome-window outlier, its commit wall still won).
+Commit window now ~256-267 warm ≈ ~240s cool-window basis vs their
+224-236. Fused-3 verdict CORRECTED: the kernel shape (q-resident +
+staged NT stores), not the radix, was what failed before.
+
+### JOINT TABLE 2 (2026-08-27 afternoon): ratio ~1.2, UNCHANGED within noise
+
+  pair1: theirs 389.83 (672,460)   ours 467.88 (560,278)   1.200x
+  pair2: theirs 378.15 (693,226)   ours 465.22 (563,485)   1.230x
+  pair3: theirs 402.44 (651,389)   ours 485.22 (540,253)   1.206x
+  best-vs-best: 465.22 vs 378.15 = 1.230x  (morning: 1.206x)
+
+Their spread alone is 6% (378-402, commit 219-241) with NO code changes
+on their side (verified: their last commit Aug 18, same 7-file diff) —
+the per-pair ratio noise floor is ±3%. HONEST RECONCILIATION of today's
+afternoon commit work: bucket-level cross-window truth = commit 273.4
+(morning calm) → ~263 (best current samples) ≈ −11, NOT the −36 the
+stacked within-window certs implied. The streaming-commit A/B's totals
+line (−23, 3/3) overstated its bucket line (−7, 2/3) — the bucket was
+the truthful number, and part of the totals margin was window texture
+that survived alternation. Ranked top's −13 wall partially overlaps in
+the bucket view. Rule reinforced: certify on the phase/bucket the
+mechanism lives in; totals inherit too much window. Current calm-basis
+gap decomposition: commit +35-40 (ours ~263 vs theirs 219-241 — their
+remaining edge = deep pair fusion + whole-prove epool depth), zc +20
+(r2 anchor+delta priced −5..8/800 lines), open +7, lincheck +3,
+witness +1. Ours slot-3 zc bucket read 174.2 in its traced run —
+polluted sample, excluded from analysis.
+
+### Whole-prove epool pass: 1 keep, 2 reverts (2026-08-27 evening)
+
+Three compute-bound sites hetero-tiled (rayon pool + 2 utility-QoS
+E-threads via run_hetero_chunks[_stateful]; streaming zc r2/tail and
+lincheck excluded per the standing bandwidth-on-bandwidth null). Cooled
+paired A/B, per-site buckets:
+- KEEP zc r1 gather drain: r1 line 34.38-34.67 vs 34.98-35.14, 3/3
+  disjoint, −0.53ms. The fold/reduce became run_hetero_chunks_stateful;
+  values order-free.
+- REVERT open boundary pass + recursive-commit merkle leaves: open
+  bucket 1/3 with negative lean (+3.0/−1.1/+0.5) — per-call helper
+  spawn/QoS churn exceeds what 2 E-cores add on 3-6ms passes. The
+  epool pattern needs passes ≥ ~30ms to amortize on this host.
+Cool-window state: HEAD (old arm) 461.1-461.8; new arm best 458.64 ms
+/ 571,574 c/s — NEW RECORD. run_hetero_chunks gained the ST guard
+(inline at 1 thread, parity preserved) and a stateful variant.
+### zc COMPACT VARIANT K ported (r2..r5 in two passes) — CERTIFIED, DEFAULT ON
+
+Full port of their compact round-2 architecture (read from source;
+~700 lines): (1) PRODUCER uni_skip_fold_round23_compact_padded — one
+sweep over the packed rows yields the 48B/pair compact state (anchor =
+fold(row0); delta = packed-byte XOR, still in the bit domain), round
+2's wire message, AND round 3's as six deferred quadratic coefficients:
+products parity-split over pair index (eq2(2y+1) = r1·eq3(y)), one
+odd-lane weight per group, κ=(1+r1)/r1 rebalance, single r1^-1 unscale.
+Replaces our two-sweep lookahead r2 (fold+store then L2 re-read) with
+ONE sweep and 25% smaller stores. (2) DEGENERATE-B fast path (theirs):
+all-ones packed b rows skip their 16 table lookups (fold(0xFF..) is a
+per-table constant), delta_b = 0, and the G(∞)/e/o products carry
+provably-zero factors — value-preserving, targeted-tested with b ≡ 1
+half-domains. (3) CONSUMER fold2_compact_round45_into — binds ρ1 AND
+ρ2 through two λ-scaled byte tables (λ1 = ρ1(1+ρ2), λ3 = ρ1ρ2; the
+anchors need only an ordinary ρ2 fold), emits round 4's message,
+materializes the quarter level, and defers round 5's message in ρ3 by
+the same parity trick — after which OUR cascade tail resumes its
+ordinary cadence (entry i=3, ρ3/ρ4 deferred; the loop invariant holds
+unchanged). NEON arms throughout (q-resident folds, 8 wide unreduced
+accumulators, u64-pair delta stores); scalar references kept as the
+non-aarch64 arm and oracle. Transcript-identical by two tests (random
++ degen-b targeted) at m=16/18; full suite green. Gates: n_mlv ≥ 7,
+n_out ≥ 1024, r[k_skip+1] ≠ 0, r[k_skip+3] ≠ 0 (parity unscalings;
+each fails w.p. 2^-128) — fallback = incumbent cascade route.
+
+CERTIFICATION (same-binary env arms, 8-min cooldown, 3 pairs): producer
+(r2 line) 47.96/50.50/50.97 vs classic 54.29/55.27/55.88 — 3/3
+disjoint; K double fold 23.7-24.6; tail 8.2-8.9 vs 31.6-32.0.
+MECHANISM SUM (r2 + K + tail): 79.9/83.2/84.5 vs 85.9/87.2/87.9 —
+3/3 DISJOINT, avg −4.9ms (on the −5..8 pricing). zc bucket 2/3 with
+one polluted K sample (141.5 vs its own min-sum ~118); totals 2/3 —
+bucket rule applied. DEFAULT ON; FLOCK_NO_ZC_COMPACT_K=1 kills
+(cascade precedent). zc sub-line sums now ≈117 vs their ≈116 —
+ZEROCHECK AT PARITY on like instrumentation. Their remaining r2
+number includes GPU-arm machinery we correctly skip (CPU-only rule).
+
+### FULL CROSS-CERTIFICATION, ST + MT (2026-08-27 evening, grind-free,
+GPU off, strict alternation; cooldown skipped per Benedikt — warm
+absolutes, paired-valid ratios)
+
+MT (m=32 blake 8T):
+  pair1: ours 457.58 (572,895)  theirs 385.17 (680,587)  1.188x
+  pair2: ours 460.04 (569,832)  theirs 384.91 (681,058)  1.195x
+  pair3: ours 463.93 (565,045)  theirs 380.21 (689,479)  1.220x
+  best-vs-best: 457.58 vs 380.21 = 1.203x
+  our buckets: witness 30.0-30.4 / commit 262.9-263.8 / zc 115.4-121.1
+  / lincheck 18.6-22.7 / open 29.0-30.6; theirs: 29.0-29.2 /
+  221.9-251.5 / 100.4-102.2 / 16.1-16.2 / 20.6-21.2.
+
+ST (1T):
+  pair1: ours 3.25s (80,728)  theirs 2.82s (93,005)  1.152x
+  pair2: ours 3.25s (80,621)  theirs 2.81s (93,248)  1.157x
+  our buckets (repeatable to 0.2%): witness 230-231 / commit
+  1266.5-1266.9 / zc 1486-1487 / lincheck 124.8-125.3 / open 143.6-146;
+  theirs: 204-214 / 1630-1650 (their prep inside) / 757-759 / 115.5 /
+  101.5-101.8. Bucket-boundary caveat: at 1T their r1 prep lives in
+  commit, ours in zc — only totals and like-for-like compare.
+
+READING: ST 1.15-1.16x vs MT 1.19-1.22x — the kernels are within ~15%
+single-threaded (their generated-asm/16-bit-Horner margins, adjudicated
+below bar), and the extra MT spread is the commit-window scheduling
+residual (five experiments adjudicated null; their absorption exceeds
+ours by ~30-40ms at 8T). Compact-K visible in both axes: zc MT 115-121
+(was 121-134), zc ST 1487 (was 1531). CAMPAIGN TOTALS at certification:
+MT 723.9 → 457.6 ms = 1.58x; ST 4781 → 3250 = 1.47x; cross-tree gap
+1.49x (ranked discovery) → 1.36x (yesterday) → 1.19-1.22x MT /
+1.15-1.16x ST certified.
+
+### r1 prep structured-b shortcuts CERTIFIED (2026-08-27, no-cooldown protocol)
+
+What "the 16-bit thing" turned out to be: the shift_reduce 16-bit
+geometric-eq machinery is ALREADY OURS (identical mechanism, ported at
+r1 parity long ago) — the stale "16-bit Horner as remaining margin"
+attribution in earlier entries is hereby CORRECTED. The real adjacent
+gap was their prep kernel's structured-b runtime shortcuts, now ported
+(generic dispatch only; their ranked-census constants stay adjudicated
+as noise): (1) all-ones 8-K b-block → a-only kernel (extension of the
+constant-one row is constant one ⇒ y_K = ntt_a: no b gathers, no
+product muls; our x4-table/x2-mul weight decomposition preserved);
+(2) single-live-K0 block → one dual transform + one lane multiply
+(zero rows contribute nothing). Two integer compares per block; exact.
+Naive-oracle test with CRAFTED b (all-ones + single-K0 quarters —
+random data never hits these paths) + suite 353 + proof-identity.
+CERTIFIED under the new no-cooldown protocol (6 pairs, add-pairs-not-
+minutes): join wall 5/6 for new, avg −5.7 (new 252.5-259.7 tight vs
+old 257.5-271.4); r1-drain and zc lines flat (correct controls — the
+kernel runs in the hoisted prep). NEW RECORD pair-5: 454.70 ms /
+576,521 c/s. SECOND CORRECTION: the earlier "zc sub-line parity ~117
+vs ~116" compared our cool numbers to their warm sub-line medians —
+their zc BUCKET is 100-102, so zerocheck retains +14-19 MT post
+compact-K; the parity claim is withdrawn.
+
+### FINAL CAMPAIGN TABLE (2026-08-27 evening, grind-free, strict
+alternation, no cooldowns — both sides ~1% warm, ratios paired-valid)
+
+MT (m=32 blake 8T, GPU off):
+  ours   469.66 / 464.50 / 467.86 ms   (best 564,362 c/s)
+  theirs 381.77 / 382.60 / 383.30 ms   (best 686,648 c/s)
+  pairs 1.230 / 1.214 / 1.221 — best-vs-best 464.50/381.77 = 1.217x
+  buckets ours:   witness 30.3-30.7 / commit 261.7-266.0 / zc
+  119.5-124.7 / lincheck 19.2-19.3 / open 28.3-30.1
+  buckets theirs: 28.9-29.1 / 220.9-224.0 / 99.5-100.2 / 16.2-16.5 /
+  21.1-22.2
+
+ST (1T):
+  ours 3.24 / 3.23 s (buckets repeatable ≤0.3%: witness 230.6-231.0 /
+  commit 1265.9-1269.8 / zc 1465.2-1468.3 / lincheck 124.0-124.5 /
+  open 147.1-147.6)
+  theirs 2.82 / 2.84 s (204.0-204.6 / 1660-1690 incl. their prep /
+  761.5-765.3 / 115.7-116.4 / 100.7-100.8)
+  pairs 1.149 / 1.137 — best-vs-best 3.23/2.82 = 1.145x (campaign-best
+  ST; zc 1465 = compact-K + structured-b at 1T, was 1531 this morning)
+
+MT+GPU (theirs only; we are CPU-only by campaign rule):
+  theirs 261.44 / 246.74 ms (1,002,687 / 1,062,409 c/s) — GPU absorbs
+  commit (220-224 → 124-152) and assists zc r2 (100 → 86-88); vs our
+  CPU MT best: 464.50/246.74 = 1.883x.
+
+CAMPAIGN CLOSE: baseline → final: MT 723.9 → 454.70 record / 464.50
+this table (1.56-1.59x); ST 4781 → 3230 (1.48x). Cross-tree CPU gap:
+1.49x (ranked discovery) → 1.36x → 1.217x MT / 1.145x ST certified.
+Kept optimizations: 20+ certified with paired sign tests; nulls: 20+
+measured and reverted with written verdicts; every remaining delta
+attributed (commit MT scheduling ~35-40, zc +14-19 bucket, open +7,
+kernel-generation ST margins) and adjudicated below the bloat bar.
+
+### Repo cleanup: production flags & TEMP probes stripped (2026-08-27)
+
+Removed per Benedikt (features are certified default-on; production
+never toggles them): env kill switches FLOCK_NO_ZC_LOOKAHEAD,
+FLOCK_NO_ZC_COMPACT_K, FLOCK_NO_OPEN_DIRECT, FLOCK_NO_FILL_FUSE,
+FLOCK_NO_AB_HOIST, FLOCK_NO_WITNESS_ELIDE, FLOCK_NO_PREFAULT,
+NTT_DEEP_NOFUSE(+static), NTT_DEEP_PCORES_ONLY(+static),
+MERKLE_PCORES_ONLY(+static), PCS_COMBINE_PCORES_ONLY,
+LINCHECK_PCORES_ONLY, LIG_LOOKAHEAD_DISABLE; TEMP probes: combine_probe
+module + open_combine_probe bench + Cargo entry, FLOCK_NTT_SPLIT
+top/deep timers, LIG_COMMIT_TRACE per-level commit probe. KEPT: test
+oracles as atomics only (OPEN_DIRECT_DISABLE, RS_TAIL_LOOKAHEAD_DISABLE,
+ZC_COMPACT_K_DISABLE — the compact-K transcript tests had gone VACUOUS
+at the default-on flip [both arms ran compact]; converted FORCE→DISABLE
+so the oracle arm is real again); instrumentation used by committed
+tooling (FLOCK_PHASE_TSV, FLOCK_ZC_TIMING, FLOCK_COMMIT_TIMING,
+*_TRACE family); FLOCK_NO_GRIND (the measurement protocol itself);
+FLOCK_ALLCORE (hardware-topology escape hatch, not a feature toggle).
+Consequence for future work: same-binary feature A/B is gone for these
+— use two-binary git-arm A/Bs. Post-cleanup sanity run: 472.75 ms warm
+with all certified defaults engaged; suite 353 + proof-identity +
+compact-K oracles green.
+
+### Streamed witness→prep NULL — the strongest bandwidth-on-bandwidth
+confirmation of the campaign (2026-08-27 evening)
+
+Built the streamed round-1 prep (Benedikt-directed try): witness groups
+publish completion on a channel; two utility-QoS E-threads run the
+matching prep chunks (contiguous a/b regions — prefix-friendly, unlike
+the commit's strided first pass, whose literal streaming caps at ~4ms
+and was ruled out on inspection); the commit-window prep arm finishes
+the remainder. IT WORKED MECHANICALLY: prep arm 97→18 (80% streamed),
+commit join wall 261→182-194, witness bucket flat, roundtrip+verify
+green. BUT totals 465→690-710 (+240!). Discrimination: zero consumers
+→ normal; no-op consumers (threads+channel, no work) → normal;
+prefaulter QoS raised → no change. VERDICT: the prep's memory work on
+2 E-cores during the WRITE-SATURATED witness window collapses the
+P-pool's streaming throughput — ~60 thread-ms of E work costs ~240
+wall-ms (reads of freshly-written a/b lines add coherence traffic on
+top of 512MB of competing stores). 5th bandwidth-on-bandwidth
+confirmation, and the sharpest: the same E-cores+prep pairing that WINS
+inside the commit window (AB-hoist, certified) is catastrophic inside
+the witness window. E-core value is entirely window-boundedness-
+dependent. Reverted; patch (631 lines incl. chunked prep API) in
+scratchpad/streamed_prep.patch.
+
+---
+
+## MAIN-MERGE PHASE (2026-08-28 →)
+
+Directive: adopt main's protocol (676 commits: recursion_circuit, f256
+two-point OOD, ag-union, lagrange-const-denom, legacy-hardening, bloat
+phase 1, tower-split), merging mainline PRs one at a time, keeping our
+kernel/substrate performance work wherever it still has a live call
+path, and re-porting the rest as measured follow-ups.
+
+### Merge step 1: PR #26 recursion_circuit (600a901) — 2026-08-28
+
+**Scope surprise:** the upstream feature branches cross-merged, so
+#26's tip already carries the f256 configs, the two-point-OOD f256
+split opening, the union (lane-major, integer-lane) commit transport,
+per-challenge grinding, and the sparse (M6) zerocheck tail. The
+protocol jump lands HERE; later steps should be much smaller.
+
+**53 conflicts.** Resolution policy: main wins protocol semantics
+(configs, grinding schedule, opening structure, drivers); ours wins
+kernels/substrate. Per-file outcomes:
+
+- 42 config TOMLs: theirs (f256, queries 279, fold_grinding 0,
+  claim/consistency batch grinding, ood_samples). Our blake3 hash
+  default REVERTED to main's sha256 (generator + derivation test are
+  main's; flipping the default is a one-commit DECISION ITEM for
+  later — benches select blake3 via FLOCK_MERKLE_HASH/FLOCK_FS_HASH,
+  which survived). hash.rs default likewise back to Sha256; our two
+  default-hash tests updated.
+- scratch.rs: hand-merged. Theirs' pool upgrades kept (4x capacity
+  window, class-aware eviction, POOL_TRACE, f256 view pool, zero pool,
+  prewarm budget/union) + our provenance-tag API re-applied on top
+  (tagged tuples, take/give_f128_tagged). Their U8_POOL replaces our
+  duplicate POOL_U8.
+- additive_ntt_f128.rs: hand-merged. Theirs' integer-lane + live-lane
+  (dead-lane skip) machinery + parallelism floor kept; our on_sub
+  per-sub-group hook, from_message fusion, ranked radix-8 top and
+  interleaved_n_top helper kept (helper updated to ceil_log2 for
+  integer lanes). Both sides' tests kept.
+- pcs/commit.rs: hand-merged. Theirs' lane-major commit
+  (commit_lane_major, dense_lanes, finalize_commit, cap-based
+  Commitment) + our streaming pipelined commit + stage split kept;
+  pipelined path now emits the cap; pipeline gated to pow2 lanes
+  (integer-lane goes lane-major/staged); pow2 msg-len asserts
+  loosened to msg_len_f128().
+- pcs.rs, ligerito.rs, ring_switch.rs: THEIRS WHOLESALE (f256-split
+  opening is a rewrite; our f128 direct-open, boundary fusion,
+  composed-table sweep, lazy-OOD glue have no call path in it).
+  RE-PORT CANDIDATES, assessed against the new opening.
+- zerocheck.rs: THEIRS WHOLESALE (grinding + sparse-M6 driver).
+  multilinear.rs hand-merged: theirs' generic kernel restructure +
+  runs/sparse machinery kept, our integrated-lookahead round 2 and
+  compact-K section re-appended (adapted to single-run
+  round2_pair_skip). Driver wiring for cascade/compact-K NOT yet
+  re-grafted — RE-GRAFT ITEM (transcript-identical, so it layers
+  cleanly).
+- prover.rs, r1cs_hashes/blake3.rs: THEIRS WHOLESALE (union driver;
+  auto-merge garbled ours in). Lost for now: stripe-C zerocheck entry,
+  AB-hoist (gate returns false with note — its consumer is the
+  stripe-C entry), tagged witness give-backs, streamed full-write
+  witness builder + provenance elision. All RE-GRAFT ITEMS. prove_fast
+  now runs the UNION prover; prove_fast_timed decomposes the legacy
+  direct path (bench labeled accordingly; union breakdown via
+  PCS_TRACE=1).
+
+**Tests:** flock-core 563 green, flock-prover 114 green, ignored
+roundtrips green (batch-major prove_fast, prove_fast_ag, ligerito
+roundtrip, const-pin). Two auto-merge stitch bugs caught at compile
+(fused_2layer_row_op arity, build_b_med_counts arity); one caught by
+tests (pipelined commit cap). Lesson re-confirmed: auto-merged regions
+of co-evolved files are STITCH HAZARDS — the failures were loud, but
+only because main's test additions (derivation test, l0-matches-full)
+covered them.
+
+**Step-1 bench snapshot** (m=32, grind-free, blake3 via env, warm,
+single session — indicative, not certified):
+- Union headline prove_fast: best 879.5 ms (runs 1.13 s / 879.5 ms /
+  1.11 s) vs 465 ms pre-merge = 1.89x. Peak memory 8.93 GB. Proof
+  567.31 KiB (was 427.30).
+- Union phases (PCS_TRACE, warm run): commit 259 ms (staged lane-major
+  — no streaming pipeline on this path yet), boolean zerocheck +
+  lincheck 284–458 ms (noisy; no compact-K/cascade), open 266–297 ms
+  (f256 split: W build ~40, merged sumcheck ~18–37, inner ligerito
+  ~193–222), witgen ~free (batch-major partial + zero pool).
+- Legacy direct path (prove_fast_timed, one cool run): witness 51 ms,
+  commit 193 ms, zerocheck 1.56 s (!!), lincheck 84 ms, open 393 ms.
+  The 1.56 s zc is an OPEN ITEM — smells like the generic run-list
+  (scalar) round-2 kernel or a mis-gated fast path on the direct
+  spec; investigate during the zc re-graft.
+
+**Re-port/re-graft queue** (each as its own measured commit, after the
+remaining merge steps land): (1) zc cascade + compact-K driver wiring
+onto the grinding driver; (2) streaming/pipelined commit for the
+lane-major union L0; (3) stripe-C + AB-hoist onto the union/direct
+drivers; (4) streamed witness builder + provenance elision for the
+batch-major generator; (5) direct-open/boundary-fusion ideas vs the
+f256-split opening (assess — the opening changed shape); (6) direct
+path zc 1.56 s anomaly; (7) DECISION: flip default hash to blake3
+repo-wide (generator + TOMLs + tests) or keep sha256 default with env
+selection for benches.
+
+### Merge step 2: PR #32 f256-lookahead (372d323) — 2026-08-28
+
+Clean merge, ZERO conflicts (step 1 absorbed the cross-merged bulk).
++1459/-120 over 11 files, dominated by ligerito/extension.rs (f256
+tower extension fold machinery + fold-lookahead tests). Suites green
+(core 564, prover 117). m=32 grind-free blake3, 3 cold-start runs:
+1.90 / 1.17 / 1.15 s (step 1 same protocol: 1.85 / 1.34 / 1.19) —
+PARITY within session noise; proof size unchanged (567.31 KiB), peak
+8.52 GB.
+
+### Merge step 3: PR #33 ag-union (6ee974f) — 2026-08-28
+
+Clean merge, zero conflicts. +4727/-555 over 20 files: AG-skip union
+integration (genus95 round 1, ag_skip driver, tower.rs expansion,
+union verifier work, 128-bit grinding audit doc). Suites green (core
+572, prover 118). m=32 grind-free blake3 cold-start: 1.66 / 1.12 /
+1.79 s, best 1.12 — parity (run-3 spike looks environmental); proof
+size unchanged.
+
+### Merge step 4: PR #10 lagrange-const-denom (via abe3df1 fmt tip) — 2026-08-28
+
+3ff5d29 was already in ancestry (absorbed by the cross-merged
+branches); this merge added only the fmt commit's merkle_path.rs delta
+(+52/-19). Suites green (core 572, prover 120). Bench cold-start:
+2.27 / 2.15 / 0.948 s — best 948 ms, parity; first-two-run spikes look
+like memory-pressure churn from back-to-back 8.5 GB bench sessions
+(the certified comparison comes after the re-grafts, with proper
+alternation).
+
+### Merge step 5: PR #34 legacy-hardening (2bb04a9) — 2026-08-28
+
+Clean merge, zero conflicts (+186/-1: verifier/r1cs hardening checks,
+small blake3/sha2 additions). Suites green (core 574, prover 122).
+First bench session read 2.26/2.32/2.28 s across the board — rerun
+gave 1.85/1.07/0.970 s: the slow session was machine state (788K
+pageouts; back-to-back 8.5 GB bench sessions), not the PR. PARITY,
+best 970 ms.
+
+### Merge step 6: PR #37 bloat-phase1 (86d5fd5+61cff5f) — 2026-08-28
+
+Two trivial merkle.rs hunks (kept main's MERKLE_PCORES_ONLY knob).
+Main's own purge: -13,121 lines over 66 files, INCLUDING the legacy
+direct-path prover (prove_fast_timed / prove_fast_ligerito_timed) —
+the bench's timed breakdown block is gone with it; per-phase
+attribution is now PCS_TRACE=1 only, matching main's bench. This also
+retires the "direct path zc 1.56 s" open item (the path no longer
+exists) and re-scopes re-graft targets to the UNION driver only.
+Suites green (core 545 — count reflects deleted legacy tests, prover
+124). Bench: 1.92 / 1.72 / 0.919 s, best 919 ms — parity.
+
+### Merge step 7: PR #38 tower-split (b310f35) — 2026-08-28
+
+Clean merge, zero conflicts (tower.rs split into
+query/real_walker/tape modules; ~20K moved lines). Suites green (core
+545, prover 124). Bench 1.58 / 1.18 / 1.73 s, best 1.18 — parity
+(session noise; the machine has been paging all afternoon).
+
+**MERGE COMPLETE: merge-base(HEAD, origin/main) == origin/main tip
+(b310f35).** All 7 mainline PRs are in. Union prove_fast at m=32
+grind-free blake3 sits at ~0.92–1.18 s best-of-3 cold-start across
+steps (vs 465 ms pre-merge) — the gap is the re-graft/re-port queue
+from step 1, now re-scoped to the union driver: zc cascade+compact-K,
+streaming lane-major commit, stripe-C/AB-hoist, streamed witness
+builder, direct-open ideas vs the f256 opening.
+
+### Default hash → BLAKE3, repo-wide (Benedikt-directed) — 2026-08-28
+
+Restores our pre-merge default on top of the merged tree, this time
+through main's own machinery: HashKind::default() → Blake3, the
+security-config generator emits hash = "blake3", all 98 embedded
+config TOMLs flipped (derivation test keeps generator and TOMLs
+locked), FsChallenger::new() → Blake3 transcripts. Tests updated to
+be default-agnostic where they pin consistency (23 test cfg literals
+pinned to explicit Sha256) and flipped where they pin the default
+(challenger default pin, params-inherit test, m29 TOML load, m22
+roundtrip now exercises the sha256 arm + blake3-mismatch reject).
+Proof-byte fixtures re-pinned by design (union_element 7,
+union_m6_fixtures 6; two deterministic print runs agreed each).
+Suites green (core 545, prover 124) + ignored roundtrips green with
+grinding on. Bench sanity: defaults print blake3/blake3 with no env;
+times in the machine's current paging-degraded band, hash config
+identical to prior runs.
+
+### Merge step 8: bloat-phase2/3 (8a36c91) + first branch-vs-main A/B — 2026-08-31
+
+Main moved 10 commits past b310f35; merged cleanly on top of the
+blake3 flip. Resolutions: the 28 retired `*_fast128`/`*_slim128`
+TOMLs deleted (main's rename — Fast/Slim now CARRY the 128 schedules,
+proof-IO v22; our `hash = "blake3"` line auto-merged into the
+surviving files), gf2_128 wide-NEON tests moved to the shared
+`test_rng::Rng` (`next_f128` → `f128`), 13 proof-byte pins
+regenerated (both sides stale: v22 × blake3 default; two agreeing
+deterministic print runs each). Suites green (core 557, prover
+green). merge-base == origin/main tip again.
+
+**Branch-vs-main paired A/B (m=32, grind-free, blake3/blake3 pinned
+via env on BOTH arms; mainline worktree carries two measurement-only
+patches: the FLOCK_NO_GRIND knob in grind_pow and the bench
+verify-skip).** Totals run (8 pairs, alternating): 5/8 branch, but
+the run split early-late (pairs 1–5 all branch −20..−140 ms, pairs
+6–8 all main +40..+83) with mediaanalysisd at 64% CPU and the battery
+fast-charging at 25–29% while DRAINING under load — both named
+hazards; unadjudicable. Phase-paired run (6 pairs, PCS_TRACE
+min-per-phase): commit 2/4 med +10 ms, zc+lincheck 4/2 med −7 ms
+(pair swings ±150 ms — foreign load), open 3/3 med 0, total 4/2 med
+−2 ms. **Verdict: no bucket certifies a difference; branch ≈ main
+end-to-end within today's noise.** Consistent with the liveness
+audit: the live survivors (blake3 hash8 leaf kernel, lincheck NEON
+rewrite, round1 E-core drain) are tens-of-ms items under a
+±50–150 ms floor; every big-ticket optimization (compact-K/cascade
+zc, streaming pipelined commit, stripe-C/AB-hoist, streamed witness
+builder) is present but DORMANT — no driver calls. Re-certify on a
+quiet, charged machine; the real move is the re-graft queue.
+Trace note: `bind statement` is ~815 ms on the first prove only
+(cached after) — cold totals ~2.4 s are not a regression signal.
+
+### ST/MT phase table, branch vs main — 2026-08-31
+
+m=32 grind-free blake3 both arms, one invocation per cell (min per
+phase over 5 proves; ST = RAYON_NUM_THREADS=1). ms:
+
+| phase   | br MT | mn MT | ratio | br ST  | mn ST  | ratio |
+|---------|-------|-------|-------|--------|--------|-------|
+| commit  | 232.0 | 227.6 | 1.019 | 1690.1 | 1718.9 | 0.983 |
+| zc+linc | 226.7 | 257.7 | 0.880 | 1556.7 | 1745.7 | 0.892 |
+| open    | 264.0 | 264.7 | 0.997 | 1582.2 | 1606.2 | 0.985 |
+| sum     | 722.7 | 750.0 | 0.964 | 4829.0 | 5070.8 | 0.952 |
+
+witgen/compact 0.0 everywhere (pooled-zeroed / aliased). The ONE
+surviving live win that resolves: **zc+lincheck −12% MT / −11% ST** —
+the ST agreement pins it on the lincheck NEON block-kernel rewrite
+(load-port fix), not scheduling; the round1 E-drain adds little
+beyond it at MT. commit and open are parity (hash8 leaf kernel gain
+is inside the ±2% floor here). Sum-of-buckets ≈ prove TOTAL −~12 ms
+unlabeled residue. `bind statement` one-time ~790 ms in all four
+cells (identical arms). ST/MT scaling ≈ 6.7× on 8 P-cores. Caveats:
+single cell per config, machine on 24% battery with interactive load;
+earlier trace-parse footgun fixed (open_batch/open_merged also print
+"TOTAL" — match "[prove_union] TOTAL").
+
+### Re-graft #1: zc compact-K + cascade wired onto the union grinding driver — 2026-08-31
+
+Ported the f035ddb round-2 branch (compact-K rounds 2..5 | integrated
+r2 lookahead | classic) and the 4→1 cascade tail into main's grinding
+driver: unified while-loop with `rho_prev`/`pending2` deferred-
+challenge state, one `sample_rho!` grind-or-sample per round message
+(nonce cadence identical on every route), two-challenge final binding.
+All kernels had survived in multilinear.rs; zerocheck.rs re-gains the
+two test oracles (ZC_COMPACT_K_DISABLE, RS_TAIL_LOOKAHEAD_DISABLE) and
+the three transcript-identity tests. New `PaddingSpec::
+effective_single_run()` — as_single_run modulo trailing all-zero runs
+(the fast path's implicit gap) — lets the single-type union's
+gap/useful/tail list serve the single-run kernels.
+
+**Measured verdict — sparse keeps the bench.** The union boolean
+region at m=32 is ~19% occupied (useful_cols/128), so main's
+support-proportional sparse path fires; with cascade priority forced,
+compact-K's producer pays a full-domain pass: r2+K+tail 145–190 ms vs
+sparse r2+tail 93–170 (K fold 31–48 + cascade tail 11–15 ARE cheaper
+than the sparse tail's 44–103, but the producer eats it). The old −5
+certification was on a ~fully-occupied witness; main's sparsity
+banked that win differently. Priority reverted: sparse dispatches
+first, the cascade serves dense single-run flows (where the sparse
+occupancy gate fails and the 2026-08-27 certification applies).
+Dispatch is visible under FLOCK_ZC_TIMING ("gates:" line).
+
+Suites: core 560 (3 new oracle tests), prover 76, all 13 proof pins
+UNCHANGED — transcript identity of every route, enforced. Takeaway
+for the queue: today's zc cost is round1 URM ~120 ms — stripe-C/
+AB-hoist (item #3) is the zc money now, not round 2/tail.
+
+### Re-graft #3 attempt: round-1 AB hoist onto the union commit — NULL, reverted — 2026-08-31
+
+Wired the certified 2026-08-27 join (prep beside commit on the
+all-core pool; `Round1AbPre` threaded through
+`prove_packed_padded_capture_s_hat_v_c_with_grinding`) onto the union
+driver. Mechanism buckets moved exactly as designed — round1 URM
+120 → 53–56 ms (6/6, −61 median), zc+lincheck −60 (6/6) — but the
+commit wall paid +52 (0/6): **net total 5/6 at only −3..−11 ms, a
+wash.** Second variant split `commit_lane_major` into fill/finalize
+and joined the prep beside NTT+Merkle only (the fill is the
+streamed-prep null's write-saturated phase): the fill ran clean
+(82 → 24 ms) but the NTT absorbed the same contention (90 → 150–160)
+— identical wall.
+
+The arithmetic says why, and it generalizes: the prep is ~480
+thread-ms; the union commit window is ALREADY all-core dense (the
+deep NTT pass recruits the E-cores itself, unlike the 2026-08-27
+tree), so overlap is zero-sum — wall grows by work/threads ≈ 48 ms
+for the 60 the zerocheck saves. There is no idle-slack window in this
+prover for challenge-independent prep to hide in; a future hoist only
+pays off if some phase leaves cores (not bandwidth) idle. Reverted
+per the measured-revert rule; suites stayed green throughout and the
+transcript never moved (prep is bit-identical by construction).
+
+### Re-graft #2: lane-major streaming commit — UNCERTIFIED, parked — 2026-08-31
+
+Ported the leaf pipeline to the union's integer-lane commit: factored
+`commit_into_pipelined`'s queue/helper engine into `leaf_pipeline_run`,
+added a lane-major variant (staged transpose fill, then the live-lane
+NTT deep pass publishing whole-position blocks — non-pow2 lane counts
+align by construction, so the pow2 gate is not needed there), plus a
+staged-vs-pipelined byte-identity oracle at non-pow2 t. Mechanically
+correct: merkle-top 116 → 0.2 ms, smoke commit 239–249 vs staged
+~250–270.
+
+**12 paired A/B vs 9c119e5, two rounds: commit bucket 6/12 med +2 ms,
+totals 6/12 med +3 — consistent with zero.** Round 1's apparent zclc
++19 side effect vanished in round 2 (machine texture, not the change).
+Reading: the queue fills and most leaf hashing lands inline on the
+publisher anyway — the work relocates into the NTT window; the real
+saving is only the codeword's DRAM re-read (~25 ms theoretical at
+m=32) and pipeline overhead eats most of it. Conditions were the worst
+of the day (19% battery, net-draining on AC, interactive load).
+
+PARKED on branch `regraft-2-lane-pipeline` (pushed) with the oracle
+test — re-run the A/B on a quiet charged machine, and at m=30/34
+where the codeword (and the re-read) is larger. Not merged: does not
+earn its ~120 lines on this evidence.
+
+### Zerocheck route A/B: sparse vs compact-K+cascade, SAME BINARY — 2026-08-31
+
+`FLOCK_SPARSE_GATE` (the existing env override on `SPARSE_TAIL_GATE`)
+makes the round-2 dispatch a same-binary A/B: gate=1 (default) takes
+main's sparse route, gate=huge forces the dense route, which now fires
+the re-grafted compact-K + cascade. 8 pairs, alternating, min-of-5 per
+invocation, m=32 grind-free blake3. ms:
+
+| bucket        | sparse | dense/cascade | sign |
+|---------------|--------|---------------|------|
+| round1 URM    | 117.6  | 118.0         | 5/8 (unaffected — same code) |
+| round 2       |  43.4  | 101.7         | 8/8 sparse |
+| compact-K fold|   —    |  30.3         | — |
+| rounds 3+ tail|  44.9  |  10.6         | **0/8 sparse — cascade 4.2× faster** |
+| r2+K+tail     |  89.3  | 142.7         | 8/8 sparse |
+| zc+lincheck   | 239.3  | 288.7         | 8/8 sparse |
+
+**Both halves are 8/8 disjoint, in OPPOSITE directions.** Sparse owns
+round 2 (−58 ms: it never materializes the dead region the compact
+producer sweeps); the cascade owns the tail (−34 ms: one 4→1 pass
+serves two rounds, and our dispatch currently forces an UNFUSED tail
+whenever round 2 went sparse — `tail_cascade` requires
+`dense_single_run`, zerocheck.rs:842). Neither route is optimal. A
+hybrid — sparse (or sparse-compact) round 2 handing a compacted state
+to a SPARSE 4→1 lookahead kernel — targets ~54 ms where we now pay
+89.3, i.e. ~−35 ms on the zc bucket. That kernel does not exist in
+either tree: main has sparsity without fusion, the challenge tree has
+fusion without sparsity. This is the one genuine "port the idea, not
+the code" item the zerocheck has left.
+
+CORRECTION to the re-graft #1 entry above: its "~19% occupancy" figure
+was asserted from a misread of `boolean_padding_spec` and is
+WITHDRAWN — the sparse route engages at this shape because
+`SPARSE_TAIL_GATE = 1` makes the gate `live ≤ n` (always true), not
+because the witness is very sparse. The gate's own doc describes the
+intended crossover as half utilization (`live·2 > n` stays dense), so
+the constant and the doc disagree; at 8/8 for sparse on round 2 the
+constant is right for round 2 and wrong for the tail. Re-graft #1's
+verdict (sparse keeps the bench) stands on the measurement, but its
+stated cause was wrong.
+
+### Zerocheck structural audit vs the challenge tree (Yukon) — 2026-08-31
+
+Consulted the Yukon benchmark `eigenlabs/flock-challenge` (public notes
++ the local checkout at /Users/buenz/flock-snark-fast-mac, which IS the
+challenge tree) to settle what of its zerocheck can still transfer.
+
+**Top-level: not the same statement.** Their m32_fast.toml is
+`field = "f128"`, analysis `johnson_ood_row_union_over_bchks25...`,
+queries 218, fold_grinding 19. Ours is `f256`, `f256_split_johnson_
+two_point_ood_query128_c3_...`, queries 244, claim-batch grinding.
+Their zerocheck has ZERO grinding, ZERO sparsity, ZERO union, and a
+Metal GPU commit (gpu_commit.rs, epool.rs). Scores are not comparable.
+
+STRUCTURALLY NON-TRANSFERABLE (with their own code as evidence):
+- **Everything paid for by GPU idleness.** Their AB precompute IS the
+  commit window's binding arm (58.2 ms arm ≈ 58.3 ms window, GPU graph
+  done 41–53 ms, 0.00 ms host wait). Their NT stores are justified
+  verbatim by "the streamed GPU commit is saturating the same memory
+  system"; the compact store "pays as contention relief on the commit
+  arm"; their hetero P+E AB drain records itself as measured DEAD in
+  the GPU-bound regime — which is ours. Matches our 0f1b5e6 null.
+- **GPU-native**: round-1 C-fold GPU prefix, ZC-window GPU idle fill,
+  and `stage_commit_tail_fill` (forked challenger starts work before
+  the transcript confirms it, byte-inert on mismatch). CPU-only rules.
+- **Shape/machine hardcodes**: the whole cascade family is gated
+  `(m == 32 || cfg!(test))` (their zerocheck.rs:783); the fastest
+  round-1 arm additionally requires k_log=14, useful=15_409,
+  n_chunks=2^19, main_threads==10, helper_threads==4.
+- **Their C fold4/fold8 tensor** feeds the direct fold4 open; our f256
+  split opening has no such consumer.
+- NOT a blocker: grinding. Our per-round zerocheck PoW is 2 bits
+  (`multilinear_round_bits` = bits_for(2)); compact-K + cascade landed
+  transcript-identical under it (9c119e5).
+
+**STRIPE-C: attempted, REVERTED — blocked by BATCH-MAJOR layout.**
+Agent tracing showed stripe-C was lost in the PR #26 merge (wired at
+7b2287b, gone at 8567563) and is complete + bit-identity-tested, so it
+looked like a free re-graft: C is the whole per-window bit transpose
+plus 32 of the drain's 48 gathers per lane (docs/zerocheck-
+optimizations.tex:311), previously −5.7% on round 1, 8/8. Wired it on
+the union path (single boolean slot, `c` aliases `z`, length-checked)
+— `prove_verify_ligerito_all_profiles` failed with
+`Zerocheck(SumcheckFinalFailed)`. Cause: the union commits BATCH-MAJOR
+(`blake3.rs:1621`, `union.rs:1140`, `schedule.rs:903`) while the
+stripe fold assumes the ROW-MAJOR stripe↔witness index relation — the
+challenge tree gates the same mechanism on `layout == RowMajor` for
+exactly this reason. The two padding models also disagree (union: whole
+dead chunk-COLUMNS; type: dead row prefix per 2^14 block). Adapting it
+means deriving a batch-major stripe fold, not porting one. Reverted;
+suites green.
+
+CORRECTED OCCUPANCY: the union boolean region at m=32 is **71.875%**
+useful (useful_bits = 11_707, k_log = 14, nu = 18 ⇒ useful_cols =
+ceil(11707/128) = 92 of 128; 376,832 of 524,288 windows live). The
+"~19%" in zerocheck.rs and two log entries above is wrong by ~3.8x.
+Round 1 DOES scale with this fraction — the AB prep, the C transpose
+and the drain all sit behind one `continue` on `n_b_med == 0`.
+
+### AG vs RS: the bench measures the wrong path, and ab_eq_fold has no AG landing spot — 2026-08-31
+
+**`Blake3Setup::prove_fast` (what blake3_proof benches, and every
+zerocheck number in this log today) takes the RS union path.** The AG
+path is a separate entry, `prove_fast_union_ag` →
+`prove_fast_ligerito_union_ag` → `BooleanZcKind::Ag`
+(blake3.rs:1726, prover.rs:675/770). Main is actively developing AG
+(38468bc, 4aef9ad, e661940 on origin/main).
+
+**AG's zerocheck is already ahead of RS's.** `ag_breakdown` at m=32,
+3 reps, 10 threads (medians):
+
+| AG phase | ms |
+|---|---|
+| round-1 URM (banks fused) | 66.7 |
+| skip→mlv fold (byte-dot u64) | 115.4 |
+| TOTAL prove (lookahead) | **164.2** |
+| [classic tail, no lookahead] | [283.5] |
+
+versus the RS path's ~206 ms of zerocheck at the same m (round1 117.6
++ r2 43.4 + tail 44.9, measured in the gate A/B above). **AG round 1
+is 43% cheaper than RS round 1**, and inside AG the *fold*, not round
+1, is the dominant phase.
+
+**AG already implements the sparse→cascade hybrid** this log proposed
+as "the win neither tree has": `mlv_tail_fs_sparse` (ag_skip.rs:1417)
+runs the support-proportional rounds "while the live set clears the
+gate and the domain keeps the fused threshold, then expands to dense
+ONCE and resumes the lookahead tail mid-stream"
+(`mlv_tail_fs_resume`, :1501). That gap is RS-driver-only; AG is the
+reference implementation. Retarget the hybrid item accordingly.
+
+**ab_eq_fold does not transfer — two independent reasons.**
+1. *AG round 1 is not table-driven.* The RS mechanism works because
+   the RS drain's per-chunk contribution is a convert-TABLE lookup
+   indexed by a byte (256 possible values), so `eq_top` can be
+   pre-multiplied into table copies once and the per-chunk multiply
+   disappears. AG round 1 computes `pr = (af&bx) ^ (ax&bf)` fresh per
+   block and folds it with `mul_acc_unred(res[p], eq, pr)`
+   (round1.rs:259-293, 592-610) — 160 AB + 128 C = **288 multiplies
+   by the same `eq_o` per block**, on full-rank 128-bit data. There is
+   no table whose scaling could absorb the weight; building a
+   per-block multiply table would cost ~4096 ops to save 288.
+2. *The AG fold, which IS table-driven (`build_w_tables`), already
+   applies eq once per block to a REDUCED SCALAR* — `let e = eo *
+   d1_inv; (e * s1.reduce(), e * s_inf.reduce())` (ag_skip.rs:296-300).
+   Two multiplies per block, not per lane. Nothing to fold away.
+
+**What the fold's 115 ms actually is: bandwidth.** It reads 512 MB of
+`a_packed` + 512 MB of `b_packed` and writes `a_mlv`/`b_mlv` at
+`n = 2^26` F128 each = **2 GB written** (each witness bit becomes a
+16-byte field element). ~3 GB of traffic ≈ 100 ms at this machine's
+achievable bandwidth — it is DRAM-bound, not multiply-bound. The
+transferable IDEA here is compact-K's principle, not ab_eq_fold's:
+**fuse the first mlv round(s) into the fold so the full-width
+intermediate is never materialized** (the code already fuses the first
+*message* accumulation — "no read-back of the folded array" — but
+still writes both full arrays). That targets the largest AG phase.
+
+Round-1 candidate that IS coding-scheme-independent: the challenge
+tree's static-B sniffing (~31.6% of B byte positions fixed by the
+BLAKE3 circuit regardless of witness). It is a property of the R1CS,
+not of RS vs AG, so it should apply to `encode_slp_derived(bp, bf)`
+and simplify `product_fold_bs` terms. Premise NOT yet verified against
+our BLAKE3 R1CS — measure before building.
+
+### Static-B census on OUR BLAKE3 R1CS — idea transfers, prize is ~12%, under the bar — 2026-08-31
+
+Measured before building (temporary structural probe over `b_0.rows`,
+K = 2^14, then reverted). Counts a row as structurally constant when
+it is empty (→ 0) or references only the const-wire pin (→ 1):
+
+| matrix | constant rows | of K |
+|---|---|---|
+| B_0 | 6086 (4677 empty + 1409 pin-only) | 37.15% |
+| A_0 | 4678 | 28.55% |
+
+**But the 4677 empty B rows are EXACTLY the padding tail**
+(K − USEFUL_BITS = 16384 − 11707 = 4677), which the run-list/coverage
+machinery already skips. The genuinely new structure is the 1409
+pin-only rows: **12.04% of the useful prefix**.
+
+Clustering (a bitsliced kernel cannot skip individual bits, only whole
+planes — this is what decides exploitability):
+
+| group | all-constant groups | starting inside USEFUL |
+|---|---|---|
+| 64 | 95 of 256 | 22 |
+| 128 (= one bitsliced plane) | 47 of 128 | **11** |
+| 512 (their b_med window) | 11 of 32 | 2 |
+| 8192 (one block) | 0 of 2 | 0 |
+
+The 1409 constant useful rows are almost perfectly aligned: 11 whole
+128-row groups = 1408 rows. So in AG terms, **11 of the ~92 useful
+128-bit B planes are constant across every block and every instance**,
+making their `encode_slp_derived` output hoistable — ~12% of the
+B-side plane work, i.e. low single-digit ms against round 1's 66.7 ms.
+
+VERDICT: the idea DOES transfer to AG (it is a property of the R1CS,
+not of the code) — but our circuit yields 12%, not the challenge
+tree's ~31.6% (their `useful_bits` is 15_409 of 16_384, a different
+BLAKE3 encoding with a much smaller padding tail, so more of their
+constant structure sits inside the live region). At ~2-3 ms, and
+needing the witness-safety apparatus (runtime compare + generic
+fallback) to be sound, it does not clear the bloat bar. Not built.
+Recorded so nobody re-derives it.
+
+### Fold fusion ("the swoop"): DEAD — the fold's writes are already free — 2026-08-31
+
+`mlv_tail_fs_resume` (ag_skip.rs:1518) carries a forward reference from
+main's own AG port to "the swoop's fold-level lookahead, which covers
+rounds 0–1 during the witness fold" — the fusion, with the resume entry
+already built for it. "swoop" appears nowhere else in the repo or its
+history, so it was designed and never implemented. Priced it before
+building.
+
+FIRST, the in-prove attribution (new `[ag-zc-timing]` fold/tail split,
+kept — the standalone `ag_breakdown` numbers overstate badly):
+
+| AG phase (m=32) | standalone | **in-prove, warm** |
+|---|---|---|
+| round-1 URM | 66.4 | 66.4 |
+| skip→mlv fold | 114.6 | **41–45** |
+| mlv tail (lookahead) | — | **~54** |
+| (classic tail, for scale) | — | ~174 |
+
+So the fold is 42 ms, not 115 — the standalone figure is cold-pool +
+2 GB allocation. AG zerocheck ≈ 66 + 42 + 54 ≈ 162 ms, matching the
+164 ms end-to-end.
+
+THEN three probes into `fold_block_at` (each applied, measured,
+reverted):
+
+| variant | fold ms | reading |
+|---|---|---|
+| baseline | 41–45 | — |
+| stores removed entirely | 55–58 | **slower** |
+| stores redirected to a stack buffer (2 GB DRAM traffic gone, store instructions kept) | 43–63 | **no gain** |
+| Horner message chain removed (byte-dots + stores kept) | 36–43 | −4…6 ms (~12%) |
+
+**The fold's 2 GB of state writes are free.** They hide behind the
+byte-dot work; removing them changes nothing, and removing the store
+instructions altogether makes it *slower* (the loop is then bound by
+the serial `shl2_xor` Horner dependency rather than overlapping with
+independent stores). The fold is bound by the byte-dot gathers:
+`n = 2^26` outputs × 8 table lookups × 2 operands ≈ 1.07e9 gathers
+≈ 36 of the 42 ms.
+
+**Therefore fusion cannot pay.** It would eliminate writes that cost
+nothing (and a 2 GB streaming read in the tail's first round) while
+adding a SECOND full byte-dot pass — the one part that is actually
+expensive. Materialize-vs-recompute is settled the other way here:
+`a_packed` is a 2× compression of `a_mlv`, but decompressing it costs
+~36 ms and storing it costs ~0. Not built.
+
+Residual idea if the fold is ever revisited: it is gather-bound, so
+the lever is the byte-dot table geometry (8 lookups/output from 8×256
+F128 = 32 KiB, L1-resident). A 16-bit-index table halves the gathers
+but needs 4 MiB, moving the working set to shared L2 — a real
+tradeoff, not an obvious win, and worth at most ~15 ms of a 42 ms
+phase that is ~5% of the prove.
+
+### Tex/memory sweep for portable ideas; recursive-commit fill fusion NULL — 2026-08-31
+
+Swept `docs/zerocheck-optimizations.tex` (21 documented wins) and the
+campaign memory against the current tree. Status of every entry:
+
+LIVE ALREADY: §blake3neon (merkle +41% GB/s), §lcfold (lincheck fold
+−32%), §pmull/§twolane/§zeroskip (round-1 kernel work, in the aarch64
+kernels main took), round-1 E-core hetero drain.
+
+DEAD BY PROTOCOL CHANGE (verified earlier today): §directopen +
+§directopenrefine (f256 split replaced the basis open), §stripe
+(batch-major), §composedfold / §inducetrunc / §lazyood / §boundaryjoin
+/ §blockedtranspose (all target the old open's basis-combine and
+sparse-prefix induce machinery — `sparse_prefix` no longer exists, and
+`ood_samples` dropped 5 → 1, shrinking §lazyood's prize 5×).
+§streamwit is moot (union witgen ≈ 0 ms). §compactk/§cascade landed but
+sparse wins on RS and AG already has the hybrid. §streamcommit parked.
+
+**§recursivefill: the one entry with a live target — TRIED, NULL,
+REVERTED.** `ligero_commit` (ligerito.rs:3045) still does
+`replicate_message_fill` + `from_layer`, and our dormant
+`from_message` machinery survives, so the swap is two lines and
+byte-identical (all 13 proof pins held). Measured:
+
+- open bucket A/B, 8 pairs: candidate won 2/8, **median +3.9 ms**
+  (commit, an unaffected control phase, drifted +1.7 — so the real
+  differential is ≈ +2 ms, i.e. slower).
+- New `[lig-timing]` per-level line (kept) gives the mechanism
+  directly — encode ms, candidate vs control:
+
+| level (log_cols / rate) | from_message | replicate+from_layer |
+|---|---|---|
+| 16, 1/8 | 17.79 / 18.12 | **16.00 / 14.96** |
+| 13, 1/32 | 7.10 / 6.95 | **6.63 / 6.61** |
+| 10, 1/128 | 3.22 / 3.85 | 3.83 / 2.88 |
+| 7, 1/512 | 1.36 | **1.29** |
+| 4, 1/2048 | 0.58 | **0.39** |
+
+Cause: **the recursive levels run at rate 1/8 … 1/2048**, not the
+rate-1/2 L0 shape the fused pass is built for. At `reps ≥ 8` the
+replicate is a cheap 1→2^r broadcast and the fused first pass re-reads
+`poly` per replica instead; the tex's −1.5 ms was measured on the OLD
+open's recursive geometry, which the f256 split changed. Third
+confirmation today of the same law: **deleting memory traffic is not a
+speedup unless the traffic was on the critical path.**
+
+USEFUL BYPRODUCT — the open's internals are now visible for the first
+time. At m=32 the recursive commits cost ≈ 30 ms encode + 21 ms merkle
+≈ **51 ms of the 264 ms open**, with the first recursive level
+(log_cols=16) alone ≈ 27 ms. So ~150 ms of the open's "inner ligerito"
+is NOT commits — it is the recursive sumcheck/query/induce work, and
+that is the largest unexamined block in the prover.
+
+### Current throughput, and what the surviving wins are worth — 2026-08-31 (quiet window)
+
+**Throughput now (production, grinding ON, verify passing):** best
+prove_fast **900.62 ms = 291,072 compressions/sec** at m=32 (2^18
+compressions, 8 P-cores, blake3 merkle + FS). Proof 449.76 KiB, verify
+6.59 ms, peak 8.52 GB. Grind-free reads 906.73 ms / 289,110 c/s — i.e.
+**grinding is now free** (main's per-challenge schedule is 2–16 bits),
+so the FLOCK_NO_GRIND measurement family is nearly redundant on this
+protocol; keep it only for comparability with the campaign's archive.
+
+Phase split (PCS_TRACE, total ~833–839 ms): zc+lincheck 300, open 273,
+commit 252, witgen/compact/claim-assembly ≈ 0. Three roughly equal
+blocks; witness generation is genuinely free (PooledZeroed + aliased
+compaction).
+
+**What the kept optimizations are worth: −2.7%, 8/8.** Branch vs a
+worktree at origin/main (8a36c91), PRODUCTION settings, blake3 pinned
+on BOTH arms so the default-hash flip is not confounded, 8 alternating
+pairs in a charging, quiet window:
+
+| | best | median |
+|---|---|---|
+| branch | 894.5 ms | 904.4 ms |
+| origin/main | 918.4 ms | 940.0 ms |
+
+median Δ −25.3 ms, median ratio 0.9729, **8/8 branch**; best-vs-best
+894.5 vs 918.4 = 1.027×. Throughput 293.1k vs 285.4k c/s. Per-pair Δ:
+−17 −37 −21 −44 −20 −45 −15 −30 (arm order alternating; no order bias).
+
+This supersedes the midday phase table (−3.6% MT / −4.8% ST, measured
+at 19% battery under foreign load) and agrees with it in sign and rough
+magnitude. Attribution is unchanged: essentially all of it is the
+lincheck NEON block kernel (zc+lincheck −12% MT / −11% ST), with
+commit and open at parity.
+
+**Perspective.** The campaign's headline was 1.59× MT on the OLD
+protocol (723.9 → 454.7 ms). After the main merge, the surviving,
+still-live wins are worth 1.027×. The rest died structurally, each
+verified this session: direct open (f256 split replaced the basis
+open), stripe-C (batch-major layout), AB hoist (no GPU to free the
+cores), compact-K/cascade (sparse wins on RS; AG already has the
+hybrid), recursive fill fusion (wrong rate regime). That is the honest
+accounting of the port campaign against today's protocol.
+
+### RS vs AG, end to end — and a 3.2× dispatch bug in the AG path — 2026-08-31
+
+> **SUPERSEDED 2026-09-01 — the sparse-route pathology below no longer
+> reproduces.** Re-measured paired on the same machine and binary: AG
+> sparse beats AG dense on EVERY stage (round1 55.65 vs 57.09, fold 41.06
+> vs 47.21, tail **47.75 vs 65.66**, zc+lincheck 183.19 vs 209.32) and
+> 4/4 end to end. The "tail 657 vs 120 ms" reading is gone. Attribution
+> is NOT established — the round-2 §wideneon/§qres kernel landed in
+> `fold_pair_run`, which is exactly the RS sparse pair kernel the AG
+> sparse tail routes through, but that is a −19% win and cannot by
+> itself explain 5.5×. Treat the numbers in this entry as unreliable;
+> the live verdict is the "AG promoted to default" entry at the end of
+> this log. **Do not raise FLOCK_SPARSE_GATE for AG.**
+
+Added `BLAKE3_ZC=rs|ag` to the blake3_proof bench (bench-only selector,
+same family as BLAKE3_PROFILE / FLOCK_MERKLE_HASH). `prove_fast_union_ag`
+is a true drop-in — same union commit, lincheck and merged opening,
+only zerocheck round 1 differs — so this isolates the flavors on one
+witness. Earlier AG numbers in this log came from `ag_breakdown`, which
+drives the kernels on a DENSE synthetic witness and does NOT reflect the
+union path; that comparison was invalid.
+
+**AS SHIPPED, RS WINS BY 3.7×: RS 900 ms vs AG 3.37 s** at m=32.
+
+Cause, from `[ag-zc-timing]`: the union's run-list makes AG take its
+SPARSE route (out n = 48,234,496 = 71.875% — our occupancy), and the AG
+sparse route is pathological:
+
+| AG stage | sparse (default) | dense (gate raised) |
+|---|---|---|
+| round 1 | 147 ms | 55–69 ms |
+| skip→mlv fold | 307 ms | 193 ms |
+| mlv tail | **657 ms** | **120 ms** |
+
+`FLOCK_SPARSE_GATE=999999999` (dense) takes the whole AG prove
+**3.37 s → 1.04 s**. Paired, alternating, each flavor at its best
+config: rs 943/966/889/910 vs ag-dense 886/873/896/900 — **AG wins 3/4,
+median ≈ −34 ms (~4%)**. So AG is at parity-to-slightly-ahead of RS
+*when dispatched correctly*, and 3.7× behind as shipped.
+
+**MECHANISM:** the AG sparse tail forfeits the friendly-Horner kernel.
+`fold_and_friendly_round_pair_into` (the γ-geometric kernel with no
+per-term `eq_lo` PMULL) is called ONLY from the dense
+`mlv_tail_fs_resume` (ag_skip.rs:1634-1640); `mlv_tail_fs_sparse`
+routes through RS's `fold_and_round_pair_sparse_into` "with the
+friendly constants riding as ordinary `r_next` weights" (:1412) — i.e.
+the general kernel. The early rounds are the biggest, so losing the
+friendly kernel there costs 5.5× on the tail.
+
+**This is the `SPARSE_TAIL_GATE = 1` issue from this morning, now with
+a price tag.** The constant makes the gate `live ≤ n` — always true —
+contradicting its own doc ("Full utilization itself stays dense
+(live·2 > n) ... the dense kernels are the calibrated choice there").
+The asymmetry is measured, not assumed: at 71.875% occupancy sparse
+WINS for RS (mech 89.3 vs 142.7 ms, 8/8) and LOSES catastrophically for
+AG (tail 657 vs 120 ms). A global gate change would fix AG and cost RS
+~53 ms, so the fix is a flavor-aware (or friendly-kernel-aware) gate,
+not a new constant. NOT changed here — flagged for a decision, since AG
+is main's direction of travel and this is the largest single effect
+found all session.
+
+### RS vs AG in their optimal configs — phase breakdown — 2026-08-31
+
+RS at its optimum (default = sparse round2/tail, which RS wins 8/8) vs
+AG at its optimum (dense route via FLOCK_SPARSE_GATE, since sparse costs
+AG 3.2x). Both under identical PCS_TRACE + FLOCK_ZC_TIMING load, 4
+alternating pairs, min-per-phase within each invocation, medians:
+
+**ZEROCHECK — the only phase whose code differs. AG WINS.**
+
+| stage | RS | AG |
+|---|---|---|
+| round 1 | 118.2 | **51.3** |
+| round 2 / skip→mlv fold | **63.1** | 79.5 |
+| tail | 92.9 | **83.9** |
+| zerocheck subtotal | 274.2 | **214.6** |
+| zc+lincheck bucket | 308.1 | **276.3** (0.897) |
+
+**AG's round 1 is 2.3× cheaper (51.3 vs 118.2 ms)** — the genus-95
+product-code round 1 vs the RS additive-NTT univariate skip. AG gives
+some back on the fold (it materializes the full 2^26 folded pair where
+RS's sparse round 2 does not) and is slightly ahead on the tail. Net
+−60 ms of zerocheck. This part is mechanism-local and well outside
+noise; it is the trustworthy half of this comparison.
+
+**SHARED PHASES — identical code, so measured deltas are artifacts.**
+commit +10.2 and open +27.6 for AG, but both arms run the same union
+commit, lincheck and merged opening. Most plausible mechanism is
+scratch-pool pressure: AG-dense holds a 2^26 F128 pair (~2 GB) where
+RS-sparse holds 0.72× that. Worth measuring; NOT a code difference.
+
+**END TO END — UNRESOLVED, do not quote a number.** Two runs disagree:
+untraced 4 pairs had AG ahead ~34 ms (3/4); traced 4 pairs had AG
+behind ~100 ms. Per-arm spread is ±100 ms, and the phase mins sum to
+within 38 ms of RS's total but 132 ms of AG's (AG's per-prove variance
+is higher, so min-of-phase and min-of-total come from different
+proves). A follow-up 8-pair untraced run was ABORTED after two pairs:
+absolute times had inflated to 1.07-1.40 s from 0.86 s, with WebKit at
+38% CPU and WindowServer at 44% (load avg 4.6) — foreign interactive
+load, the documented hazard. Battery was 98% charging, so not power.
+Re-run on a quiet machine.
+
+READING: AG is the better zerocheck, and the advantage is concentrated
+entirely in round 1. Its liabilities are a larger materialized
+intermediate and a currently catastrophic sparse route. Fixing the
+dispatch is what makes AG's round-1 advantage reachable end to end.
+
+### Statement-binding digest warmed at setup — first-prove latency −0.8 s — 2026-08-31
+
+`union.bind_statement` absorbs `Registry::digest()`, which materializes
+by BLAKE3-hashing every type's sparse A/B/C matrices (~21M nonzeros for
+BLAKE3) — ~0.8–1.3 s, paid inside the FIRST prove and cached in a
+`OnceLock` thereafter. The setup already warms the CSC fold circuit and
+prefaults the scratch pool for exactly this reason, so the digest now
+joins them (`blake3.rs`, `sha2.rs`: `let _ = registry.digest();`).
+
+Verified: first-prove `bind statement` **1297 → 0.01 ms**, first-prove
+TOTAL ~1.6–2.4 s → 843 ms. Pure cache-warm — the digest is a
+deterministic function of the registry, so this only moves WHEN the
+cache fills; suites green (core 560, prover 76) with all 13 proof pins
+unchanged. Steady-state throughput is unaffected (the second and later
+proves already hit the cache); this is first-proof latency only, which
+matters for one-shot provers and for any measurement that averages
+rather than takes a minimum.
+
+### Single-threaded RS vs AG, both dispatch routes — 2026-08-31 (quiet machine)
+
+`RAYON_NUM_THREADS=1`, m=32, 4 configs rotated over 2 rounds,
+min-per-phase per invocation, medians (ms). Repeatability 0.34–1.23%
+per config — the ST instrument the campaign always preferred:
+
+| config | total | commit | zc+linc | open | r1 | r2/fold | tail |
+|---|---|---|---|---|---|---|---|
+| rs_sparse | 5081 | 1721 | 1570 | 1580 | 899 | 280 | 273 |
+| rs_dense | 5383 | 1725 | 2004 | 1591 | 902 | 679 | 75 |
+| **ag_sparse** | **4526** | 1712 | **1012** | 1598 | **364** | 244 | 276 |
+| ag_dense | 4736 | 1716 | 1183 | 1597 | 365 | 266 | 421 |
+
+1. **AG is 10.9% faster than RS at ST** (4526 vs 5081, 1.123×), and
+   ALL of it is the zerocheck (1012 vs 1570 = −558 ms).
+2. **AG round 1 is 2.5× cheaper** (364 vs 899) — matches the MT ratio
+   (51 vs 118), so it is a kernel property, not a scheduling one.
+3. **Sparse is optimal for BOTH flavors at ST** — RS 1570 vs 2004,
+   AG 1012 vs 1183. This INVERTS the MT reading for AG (where sparse
+   measured 3.2× worse end to end), so the sparse route's problem is a
+   PARALLEL-scaling one, not a kernel-quality one.
+4. commit (1712–1725) and open (1580–1598) are flat across all four
+   configs — they are shared code, confirming the earlier MT
+   "commit +10 / open +28" deltas were measurement artifacts.
+
+CORRECTION to the RS-vs-AG entry above: the claim that AG's sparse
+route "forfeits the friendly-Horner kernel" and pays 5.5× for it is NOT
+supported. `mlv_tail_fs_sparse` runs sparse rounds and then expands
+once and RESUMES the lookahead/friendly tail, so it forfeits the
+friendly kernel only for the rounds it actually runs sparse — and at ST
+its tail (276) still beats the all-dense tail (421). The earlier
+per-phase MT attribution (tail 657 vs 120) was taken from the COLD
+first prove (its `bind statement` read 1297 ms) and is withdrawn. The
+warm MT phase table is the outstanding measurement.
+
+### Round 2: vector-resident accumulator ported (§wideneon) — −9.2% ST, 3/3 — 2026-08-31
+
+**The campaign's round-2 machinery was NOT live.** Main's shared round-2
+kernel `fold_pair_run` (multilinear.rs) accumulates the 256-bit message
+partials in `F256Unreduced` — the four-word GPR struct that §wideneon
+replaced — so every `mul_unreduced` pays six `vgetq_lane_u64` extracts
+to leave the vector file and every `^=` is four GPR XORs. Notably main's
+**x86 arm already accumulates wide** (`WideGhashX4`); only aarch64 was
+left on the scalar struct. `WideNeon` was sitting in
+`field/gf2_128/aarch64.rs` — with a doc comment describing this exact
+optimization — reachable only from the dormant compact-K block.
+
+Ported: the aarch64 arm of `fold_pair_run` now accumulates into two
+`WideNeon` vector registers via `wide_mul_unreduced_neon`, flushing to
+`F256Unreduced` once per run. Both round-2 routes (interval/sparse at
+:966 and dense at :996) call `fold_pair_run`, so both get it. Bit-
+identical: reduction is XOR-linear and the XOR multiset is unchanged;
+all 13 proof pins hold, suites green (core 560, prover 76).
+
+**ST paired A/B vs 8bd1a27, 3 alternating pairs (m=32, quiet machine):**
+
+| phase | cand | ctrl | delta | |
+|---|---|---|---|---|
+| **round 2** | **239.3** | **281.7** | **−26.0 (−9.2%)** | **3/3** |
+| round 1 | 900.5 | 899.3 | +0.5 | control, flat |
+| tail | 273.2 | 275.6 | −2.4 | control, flat |
+| zc+lincheck | 1544.6 | 1580.5 | −46.3 | 2/3 |
+| commit | 1720.1 | 1729.8 | −9.8 | control, noise |
+| total | 4928.9 | 4986.8 | −50.2 | 2/3 |
+
+Round 2 is 3/3 disjoint at −26 ms; round 1 and the tail are flat, which
+is the correct control signature (the change touches only round 2's
+accumulator). The tex measured −13.4% for this on the old tree; we get
+−9.2%, on a baseline that is already cheaper because main's sparse path
+folds ~72% of the domain.
+
+Round 2 ST: **281.7 → 239.3 ms** — versus the campaign's 312 ms best on
+the old protocol. §qres (the register-resident message loop, a further
+−13% there) is the untouched second half of that section: the loop still
+computes `g1 = a1 * b1` as a REDUCED scalar multiply before the unreduced
+eq product, which is exactly the register-file crossing §qres removed.
+
+### Why the commit bucket is noisy: it is the lane transpose fill — 2026-08-31
+
+Per-prove ST commit sub-timings (new `scan+take` / `lane fill` line under
+the existing FLOCK_COMMIT_TIMING knob):
+
+| prove | scan+take | lane fill | ntt | merkle | commit |
+|---|---|---|---|---|---|
+| 1 | 0.00 | 109.5 | ~644 | ~960 | 1720.4 |
+| 2 | 0.00 | 117.8 | ~636 | ~950 | 1740.6 |
+| 3 | 0.01 | **159.6** | ~646 | ~974 | 1766.5 |
+| 4 | 0.01 | **153.5** | ~637 | ~970 | 1767.2 |
+| 5 | 0.01 | 118.4 | ~644 | ~957 | 1732.7 |
+
+NTT varies 1.7%, merkle 2.5%, **the fill varies 46% (109–160 ms)** — and
+that accounts for essentially all of the commit bucket's ±34 ms swing.
+The allocation itself is free (0.00–0.01 ms: the scratch pool returns a
+warm buffer, so `prewarm_prover` is working).
+
+MECHANISM: `replicate_lane_major_fill` is the transpose
+`out[p·t + lane] = q[lane·d + p]`. It tiles over 64 positions but NOT
+over lanes, so it keeps **t concurrent read streams** open — one per
+lane, each walking a far-apart region of a 2 GB buffer — while writing
+with stride `t` elements. That is TLB/page-mapping bound, and page
+placement varies per process and per pool recycle: stable work, variable
+time. The NTT and Merkle are sequential streams over the same bytes and
+do not show it.
+
+**Methodological consequence: commit deltas below ~40 ms are not
+trustworthy on this host.** This retroactively explains the phantom
+"commit +10 / open +28" in the RS-vs-AG table (identical code both arms)
+and the ±34 commit swings in the round-2 A/B, where round 1 — a
+compute-bound phase — was flat to 0.2% in the same runs. Prefer
+compute-bound phases as controls.
+
+OPEN OPTIMIZATION: block the fill over lanes (e.g. 8 at a time) so the
+number of live read streams is bounded. Should cut both the mean and the
+variance of a 109–160 ms ST pass. Not attempted yet.
+
+### Lane-fill tiling: 1 KiB read bursts were starving the prefetcher — 2026-08-31
+
+Follow-up to the noise finding above. `replicate_lane_major_fill` tiled
+at 64 positions, and the tile length IS the per-lane read burst: 64
+F128 = 1 KiB, with `t` lanes whose source regions sit `d` elements
+(8 MiB at m=32) apart. The prefetcher never establishes a stream across
+61 far-separated 1 KiB bursts, so a pure copy ran at ~9 GB/s.
+
+Tile sweep, m=32, median of 5 proves per setting:
+
+| positions/tile | ST fill | MT fill |
+|---|---|---|
+| 64 (was) | 136 ms | ~31 ms |
+| 256 | 106 | ~32 |
+| **1024** | **94** | ~31 |
+| 4096 | 100 | — |
+| 2048 | — | ~30 |
+
+**ST −31%; MT is a wash** — at 8 workers the pass is bandwidth-saturated
+regardless of burst length, so this is an ST/low-thread win taken at
+zero MT cost. Shipped as a size-aware tile rather than a constant:
+`tile = (d / (4 * threads)).clamp(64, 1024)`, keeping ≥4 tiles per
+worker so small commits do not collapse to a single task. Verified after:
+ST fill median 136 → 103, min 124 → 63. Suites green (pure loop
+retiling; the commit byte-identity tests cover it).
+
+NOTE — this does NOT fix the commit bucket's variance. The residual
+spread is the same at every tile size (MT 16→35 ms within one process,
+ST 63→108), and it tracks prove ORDER, not geometry: the first proves
+of a process are consistently fastest. That points at scratch-pool /
+page state (the first proves get `prewarm_prover`'s prefaulted buffers,
+later ones get recycled ones), which is a separate lead. The
+"commit deltas under ~40 ms are untrustworthy" rule stands.
+
+### Round 2: the register-resident message loop (§qres) — −11.6% ST, 3/3 — 2026-08-31
+
+Second half of the tex's round-2 section, on top of §wideneon. All three
+per-pair vector/GPR crossings it targets were still present after the
+accumulator port: (1) `fold_one_row_neon_unchecked_8` extracted its
+vector accumulator to an `F128` GPR struct, (2) `g1 = a1 * b1` went
+through the scalar field multiply struct-in/struct-out, (3)
+`wide_mul_unreduced_neon` re-entered the vector file.
+
+Every q-resident primitive was ALREADY in the tree, reachable only from
+the dormant compact-K block — `mul_q`, `wide_mul_unreduced_q`, and
+`fold_one_row_neon_q_unchecked_8`, whose own doc says it exists "for
+callers that keep computing on it (the round-2 message chain)". The
+chain now runs fold → `mul_q` → `wide_mul_unreduced_q` → `WideNeon`
+with nothing leaving the vector file; per pair the only traffic left is
+the four required folded-value stores (`vst1q_u64`) and one eq load.
+
+Bit-identical: `F128` is `repr(C, align(16)) {lo, hi}` and the
+extraction convention is lane0→lo, lane1→hi, so the vector stores write
+the same bytes; reduction stays XOR-linear. 13 proof pins unchanged.
+
+**ST paired A/B vs c9c4533, 3 alternating pairs:**
+
+| phase | cand | ctrl | delta | |
+|---|---|---|---|---|
+| **round 2** | **236.1** | **267.2** | **−31.0 (−11.6%)** | **3/3** |
+| round 1 | 897.3 | 898.4 | −0.0 | control, flat |
+| tail | 274.1 | 277.8 | −4.4 | control |
+| zc+lincheck | 1537.2 | 1572.8 | −35.4 | 3/3 |
+| commit | 1667.7 | 1677.3 | −9.9 | (under the ~40 ms noise floor) |
+
+Matches the tex's −13.0% for this section closely.
+
+**Round 2 cumulative today: 281.7 → 236.1 ms ST (−16.2%)** across
+§wideneon (−9.2%, 3/3) and §qres (−11.6%, 3/3), against the campaign's
+312 ms best on the old protocol.
+
+ALSO FIXED: §wideneon (da4e4b8) referenced `gf2_128::aarch64` — which is
+gated on `target_feature = "aes"` — from a block gated only on
+`target_arch = "aarch64"`. That compiles on `aarch64-apple-darwin`
+(aes is default) but would break a non-aes aarch64 build. Both arms are
+now correctly gated, with the extracted-fold path kept as the non-PMULL
+fallback.
+
+### AG skip fold: the byte-dot was the scalar twin of an existing NEON kernel — −9% ST, −7.5% MT — 2026-08-31
+
+Targeted by evidence, not by analogy. The earlier probes put the AG
+fold's cost at ~85% byte-dot gathers and only ~12% message chain
+(removing the Horner + products entirely saved 4–6 ms of 42), so the
+§wideneon/§qres treatment that paid in RS round 2 does NOT apply here —
+the accumulator is not where the time is. The gather is.
+
+`byte_dot_u64` folds one 64-bit message through `8 x [F128; 256]` tables:
+eight gathers XORed. That is *exactly* what RS's
+`fold_one_row_neon_q_unchecked_8` does, with the identical table layout
+(contiguous, `STRIDE = 256*16`) — but AG's was written scalar
+(`*table.get_unchecked(j).get_unchecked(byte)` + `F128 +`) while RS's is
+NEON. Re-exported the RS kernel from `multilinear` as `fold_row_q_neon`
+and routed AG's `byte_dot` through it on aarch64; the scalar form stays
+as the non-aarch64 path.
+
+Paired A/B (min-of-proves per invocation, alternating), m=32:
+
+| | NEON | scalar | delta |
+|---|---|---|---|
+| MT pair 1 | 37.99 | 41.12 | −3.13 |
+| MT pair 2 | 40.84 | 41.78 | −0.94 |
+| MT pair 3 | 40.47 | 44.50 | −4.03 |
+| **MT median** | | | **−3.1 (−7.5%), 3/3** |
+| ST pair 1 | 278.22 | 305.16 | −26.9 |
+| ST pair 2 | 280.03 | 309.26 | −29.2 |
+| **ST** | | | **−28 (−9.0%), 2/2** |
+
+Bit-identical (same table entries, same XOR multiset): core 560 green,
+prover 76 green, and the heavy `prove_fast_union_ag_roundtrip` verifies.
+
+Smaller than hoped — LLVM was already emitting reasonable code for the
+16-byte-aligned `F128` table loads, so this recovers the remaining gap
+rather than a 2×. But it is the first improvement to the AG path, and it
+lands on AG's second-largest phase.
+
+### Measurement loop: 20 min → ~22 s (benchmarks/abq.sh) — 2026-08-31
+
+Timed the actual costs instead of assuming them. Corrections to how this
+session was working:
+
+| step | cost |
+|---|---|
+| full m=32 prove, **MT**, one invocation (5 proves + setup) | **6.9 s** |
+| same at **ST** | ~30 s |
+| `round2` micro-bench, whole m=16..29 sweep | **0.6 s** |
+| rebuild after touching a flock-core kernel (release) | **20.7 s** |
+| same build under `[profile.bench]` (lto=thin, cgu=1) | 54.3 s |
+
+So a 3-pair MT full-prove A/B is only ~41 s — my 10-20 minute A/Bs were
+all **ST**, where each prove is ~5 s. And once MT is used, **the BUILD is
+the dominant cost**, comparable to an entire A/B.
+
+Consequences, now encoded in `benchmarks/abq.sh`:
+- **Kernel work goes through the micro-benches**, which drive the same
+  kernels on a synthetic witness with no R1CS build, commit or open —
+  and most print a CHECKSUM, so bit-identity is proven for free instead
+  of by a 4-minute test suite. Validated: the round-2 ports measured
+  −16.2% on the full ST prove and **−19.5% here (3/3, checksums
+  identical) in 2 seconds**.
+- **Iterate under the RELEASE profile, not `cargo bench`'s.** The
+  workspace `[profile.bench]` (lto="thin", codegen-units=1) costs 54 s
+  vs 20 s and measured the SAME number on this kernel (54.11 vs
+  53.7-55.5 ms at m=29 ST). Re-measure under `cargo bench` only for a
+  published headline.
+- **Prefer MT for A/B, ST for certification.** ST is 4x more repeatable
+  (0.3-1.2%) but 4x slower per invocation.
+- **Explore parameters with a temporary runtime knob** (one build, many
+  configs — as the FLOCK_FILL_TILE sweep did), and remove it before
+  commit. That is the only way to get the 20 s build out of the loop.
+- abq.sh builds both arms concurrently and takes the FIRST matching
+  metric line inside an optional `-m <size>` section — grepping a whole
+  sweep and taking the min silently measures the smallest size.
+
+Usage: `benchmarks/abq.sh -b round2 -c <control-worktree> -m 29
+[-p 3] [-e "RAYON_NUM_THREADS=1"] [-a "32 3"] [-g "(best)"]`
+
+### More round-2 / AG-fold ILP: one marginal win, one regression — 2026-09-01
+
+Both loops are now gather-bound (32 table gathers per pair / per inner
+step), so the lever left is how many independent gather chains are in
+flight — the §twolane idea. Tried on both, using the new abq harness
+(each verdict took ~2 minutes rather than ~20).
+
+**Round 2, two pairs per iteration: −4.9% MT / −2.5% ST, 3/3, checksums
+identical.** Mechanism is loads-before-stores: with one pair the
+compiler cannot hoist the next iteration's gathers past the output
+stores, so eight chains only overlap if two pairs are folded before
+either is stored.
+**NOT KEPT — below the bloat bar.** 79 insertions for ~−2 ms MT
+(round 2 is ~43 ms of a ~900 ms prove, so 0.23% end to end). The log's
+own precedent rejected epool-zc at "−6..7 ms, ~200 lines"; this is a
+worse ratio. Patch preserved at
+`scratchpad/round2_2pair_unroll.patch` — restore with `git apply` if
+the bar ever moves.
+
+**AG fold, two inner steps per iteration: +15%, 0/3 — REGRESSION.**
+Same transformation, opposite sign. The AG fold writes into per-block
+128-element `am`/`bm` slices that are L1-resident, so its stores never
+blocked hoisting in the first place; doubling the live values (8 F128 +
+2 F256Unreduced) buys nothing and costs register pressure against a
+strictly serial γ²-Horner chain. Reverted.
+
+Worth recording as a rule: **round 2 and the AG fold look structurally
+identical — 32 gathers, four byte-dots, a wide accumulator — and
+respond OPPOSITELY to the same restructuring.** The difference is the
+output: round 2 streams into a large codeword-sized buffer, the AG fold
+into a small L1-resident block.
+
+Remaining untested lever for both: 16-bit gather indices (4 gathers per
+row fold instead of 8, from 4 x 65536-entry tables = 4 MiB). The
+campaign's performance model says "gather count and chain depth bind,
+table footprint under L1 is irrelevant" — but 4 MiB is far past L1, and
+the campaign already measured an 8x-smaller table as a −3.6%
+regression, so the sign is genuinely unknown. Cheap to settle with abq
+if anyone wants it.
+
+### CORRECTION: the AG-fold "+15% regression" was a cold-prove artifact — 2026-09-01
+
+The entry above reports the AG fold's two-step unroll as +15%, 0/3. **That
+number is wrong and is withdrawn.** `abq.sh` was taking the FIRST matching
+metric line, which for `ag_breakdown` is the COLD first prove (18.3 ms
+against a ~10 ms warm min), so both arms were cold and the comparison was
+noise. Round 2 was unaffected — its `(best)` line is already a min — which
+is why that result stands.
+
+Re-measured warm, same binary switched by a temporary knob, alternating:
+
+| pair | unroll | plain |
+|---|---|---|
+| 1 | 9.87 | 9.96 |
+| 2 | 9.94 | 10.05 |
+| 3 | 10.03 | 10.00 |
+
+**AG fold unroll is NEUTRAL (−0.9%, 2/3), not a regression.**
+
+Crossing the unroll against the Horner (one build, four configs) also
+shows no large effect: horner-on 10.04 vs 9.90, horner-off 8.83 vs 8.94
+— a ~2% swing either way, inside noise at single-shot resolution.
+
+So the real contrast is narrower than claimed: **round 2 gains ~5% MT
+from unrolling; the AG fold gains nothing.** The store destination
+remains the best explanation — round 2 streams into a codeword-sized
+buffer whose stores block the compiler from hoisting the next
+iteration's gathers, so folding two pairs before storing either exposes
+eight chains; the AG fold writes into 128-element `am`/`bm` slices that
+stay in L1, where the compiler could already interleave, so there is
+nothing left to expose. The earlier "register pressure against a serial
+Horner" story is NOT needed to explain a null.
+
+`abq.sh` now takes the MIN over matching lines inside the `-m` section
+(section bounded by the next `===` banner), with both traps documented
+in its header.
+
+### Round-2 unroll: NOT APPLIED — it is dense-only, and production is sparse — 2026-09-01
+
+Benedikt's call was that ~5% of a phase clears the bloat bar, so the
+two-pair unroll was re-applied and re-verified. It does not survive the
+production check:
+
+| measurement | result |
+|---|---|
+| `round2` micro-bench (DENSE padding), MT | −3.5%, 3/3 |
+| `round2` micro-bench (DENSE padding), ST | −2.3%, 3/3 |
+| **real prove, m=32 MT (SPARSE route)** | **+1.4 ms, 1/3** |
+| **real prove, m=32 ST (SPARSE route)** | **+16 ms = +6.8%, 0/3** |
+
+ST real-prove pairs: 255.0/252.2/251.9 (unrolled) vs 240.7/236.4/234.9
+(plain). Reverted — this is a REGRESSION where it matters, not a
+bloat-bar rejection.
+
+WHY: production at m=32 takes the sparse round-2 route, which calls
+`fold_pair_run` per live INTERVAL PIECE — short ranges writing into
+small, L1-resident output slices. That is the same regime as the AG
+fold, where the unroll also bought nothing: when the stores are already
+cache-resident the compiler can interleave across iterations anyway, so
+the restructure adds control flow (two closures, a mixed-liveness
+branch, a tail loop) for no scheduling gain. The dense route writes into
+a codeword-sized buffer where the stores DO block hoisting, which is the
+only regime the unroll helps.
+
+**METHODOLOGICAL LESSON, the second self-inflicted one today: the
+zerocheck micro-benches drive DENSE padding and are NOT a proxy for the
+production sparse dispatch.** They were validated against §wideneon and
+§qres (−19.5% micro vs −16.2% real) only because those changes help both
+routes equally — they touch the per-pair arithmetic, not the loop
+structure. Any change to LOOP STRUCTURE or dispatch must be confirmed on
+the real prove. This caveat was written into abq.sh's introduction and
+then ignored one experiment later. abq.sh header updated to say it
+outright.
+
+The two round-2 ports that DID land (§wideneon, §qres, 281.7 → 236.1 ms
+ST cumulative) were measured on the real prove throughout, so they are
+unaffected by this.
+
+### CORRECTION 2: the round-2 unroll is NEUTRAL on production, not a regression — 2026-09-01
+
+Benedikt pushed back that a kernel cannot be faster in isolation and
+slower in situ without something differing in how it is CALLED. He was
+right, and both of my explanations were wrong.
+
+First theory (short interval pieces) — **false**. Probed the actual
+argument: the sparse route calls `fold_pair_run` with pieces of 4096,
+3584, 3072, 2560, 2048, 1536, 1024 and 512 pairs. Long ranges; per-call
+overhead is not it.
+
+Second, the "+6.8% ST regression" itself — **an artifact of comparing
+two separately built BINARIES.** Re-measured with the unroll behind a
+runtime knob so ONE binary provides both arms, real prove, m=32 ST,
+7 alternating pairs: +11.7, −2.4, −1.7, +0.3, −1.4, +0.3, −4.9 →
+**median −1.4 ms (−0.6%), 4/7 — neutral.** The two-binary run's +16 ms
+was code layout/alignment, which at this effect size dominates: the
+control worktree was also three commits behind, so the binaries differed
+in more than the change.
+
+Corrected picture:
+
+| route | effect |
+|---|---|
+| dense (micro-bench) | −3.5% MT, −2.3% ST, 3/3 — real |
+| **sparse (production m=32)** | **neutral, −0.6%, 4/7** |
+
+So it is a genuine win on the DENSE round-2 route and buys nothing on
+the route production currently takes. Left unapplied (patch preserved in
+`scratchpad/round2_2pair_unroll.patch`), but note the coupling: **if the
+`SPARSE_TAIL_GATE` question is ever resolved toward dense dispatch, this
+becomes a live ~3% win** and should be revisited with it.
+
+**THIRD measurement error today, all one family:** cold-vs-warm proves,
+dense-vs-sparse routes, and now binary-vs-binary layout. Each time the
+two arms differed in more ways than the change. Rule going forward, and
+the one that actually settled this: **for effects under ~5%, switch the
+variant with a temporary runtime knob inside ONE binary.** Cross-binary
+A/B is only trustworthy for larger effects or when the trees differ by
+exactly the change.
+
+### Sparse vs dense in round 2 — the "sparse r2 + cascade tail" hybrid is REFUTED — 2026-09-01
+
+Benedikt asked why the micro-benches drive DENSE padding when production
+runs SPARSE, and whether round 2 should be dense at all. Both parts have
+answers, and the second one overturns this session's earlier claim.
+
+**Why the micro-benches are dense:** they predate the union/sparse work
+and call the dense entry point. That is a genuine tooling gap — it is why
+the two-pair unroll looked like a win. They remain valid for per-pair
+ARITHMETIC changes (wideneon/qres read −19.5% there vs −16.2% real), but
+not for anything touching dispatch or loop structure.
+
+**Should round 2 be dense? No.** Sparse round 2 costs 240 ms ST against
+the compact-K producer's 679 ms; it folds ~72% of the domain and wins
+outright.
+
+**And the hybrid this log proposed on 2026-08-31 — "sparse round 2
+handing off to the cascade tail, the win neither tree has" — is WRONG.**
+The claim rested on comparing the sparse tail (273 ms) with the dense
+route's cascade tail (75 ms). Those are not comparable: the dense route's
+tail starts at a QUARTER of the domain, because compact-K has already
+consumed rounds 2–5. Its cheap tail is bought by its expensive producer.
+
+Measured directly, one binary, temporary `FLOCK_ZC_TAILPOLICY` knob,
+real prove m=32 ST:
+
+| policy | round 2 | tail | zc+lincheck |
+|---|---|---|---|
+| sparse tail (today) | 240.6 | **277.3** | **1564.8** |
+| expand + cascade tail | 238.0 | **577.6** | 1855.2 |
+
+The hybrid is **2x WORSE on the tail**: it pays `expand_to_dense` at the
+largest size and then runs every tail round over the full domain instead
+of the 72% live span, and the cascade's pass-halving does not cover
+either cost. Reverted.
+
+CONCLUSION: **the current dispatch — sparse round 2, sparse tail — is
+correct**, and the zerocheck's route selection is not the open
+opportunity this log claimed it was. Both the "sparse 4→1 lookahead
+kernel neither tree has" item and the sparse-vs-cascade hybrid are
+closed. (The separate `SPARSE_TAIL_GATE` question for the AG path stands
+on its own evidence and is unaffected.)
+
+### Micro-benches fixed: they now drive the PRODUCTION sparse dispatch — 2026-09-01
+
+The zerocheck micro-benches predate the union/sparse work and measured a
+route the m=32 prove never takes. That gap produced a wrong verdict
+(a two-pair unroll read −3.5% on the dense bench and neutral on the real
+prove), so the benches are now shaped like the shipped witness.
+
+`benches/round2.rs` — rewritten to call
+`uni_skip_fold_and_round_pair_runs_sparse` under a run-list
+`PaddingSpec` matching the BLAKE3 union (`useful_bits = 11_707` of a
+2^14 block ⇒ `ceil(11707/128) = 92` useful chunk-columns of 128 =
+71.875% occupancy), with the dead column tail left honestly zero as the
+prover guarantees. **The dense entry is gone.** m starts at 20 because
+the block skip needs `k_log = m − 7 ≥ 13`.
+
+`benches/round1.rs` — the two-bank fusion variant now takes the same
+run-list instead of `PaddingSpec::dense(m)`.
+
+VALIDATED against the two things whose truth we already know from the
+real prove:
+
+| change | old DENSE bench | **new SPARSE bench** | real prove |
+|---|---|---|---|
+| §wideneon + §qres | −19.5% | **−13.1%, 3/3** | −16.2% |
+| two-pair unroll | −3.5%, 3/3 | **+0.24 ms, 1/3** | neutral, 4/7 |
+
+So it now both detects the real win and REJECTS the false positive that
+motivated the fix. Checksums identical in both cases.
+
+Note for future A/Bs: changing a bench's source means the control
+worktree must get the SAME bench file, or the two arms run different
+instruments — which shows up immediately as differing checksums (it did,
+because `cp` is aliased interactive and silently did not overwrite).
+
+STILL DENSE-ONLY: `rounds3plus.rs` benches
+`fold_and_compute_round_pair_optimized` and never the sparse tail
+(`fold_and_round_pair_sparse_into`), so tail work still needs a real
+prove to adjudicate. Fixing it needs a `LiveLayout` fixture, not just a
+padding spec.
+
+### 16-bit gather tables: REFUTED, −21..25% — 2026-09-01
+
+The last untested lever on the round-2 fold: index the row fold with
+16-bit chunks instead of bytes — 4 gathers per row from `4 x 65536`
+entries (4 MiB) instead of 8 gathers from `8 x 256` (32 KiB). Built
+`T16[j][v] = data[2j][v & 0xff] + data[2j+1][v >> 8]` (same XOR multiset,
+so the fold is value-identical) plus a `fold_one_row_neon_q_unchecked_4x16`
+kernel, selected by a runtime knob so ONE binary measured both.
+
+Measured on the fixed SPARSE round-2 bench, m=29:
+
+| | 8-bit (8 gathers, 32 KiB) | 16-bit (4 gathers, 4 MiB) |
+|---|---|---|
+| ST | **35.42 ms** | 44.21 ms (+25%) |
+| MT | **6.59 ms** | 7.98 ms (+21%) |
+
+Checksums identical, so the table construction is right; it is simply
+slower. Halving the gather COUNT does not pay for leaving L1: 4 MiB sits
+in (shared) L2, and the added latency per gather more than eats the four
+saved. Building the table also costs 0.08 → 0.63 ms per prove.
+
+**Model correction.** The campaign's rule — "table footprint under
+128 KiB L1D is irrelevant; gather count and chain depth are what bind" —
+holds only WITHIN L1. Past L1 the footprint dominates and the rule
+inverts. That is consistent with the campaign's own earlier datum that an
+8x-SMALLER table also regressed 3.6%: the current 32 KiB, 8-gather shape
+is a local optimum in both directions.
+
+Reverted. With this closed, round 2's fold has no untested lever left
+that this session can identify: the arithmetic is q-resident
+(§wideneon + §qres, −16.2% ST on the real prove), the loop structure is
+right for the sparse route, and the table geometry is optimal in both
+directions.
+
+### Round 1: §pmull is already live (RS); its AG analog (Karatsuba accumulate) REFUTED — 2026-09-01
+
+**RS round 1 already has §pmull.** The x^4-scaled gather table and the
+x^2 byte-doubling are in `univariate_skip_optimized/kernels/aarch64.rs`
+(:595, :635) — the multiplicative weight splitting survived the merge.
+Nothing to port.
+
+**The idea does not map to AG round 1 as written.** §pmull defers a
+per-product REDUCTION in F_{2^8}; AG round 1 has none to defer. Its
+products are bitsliced F_2 (`pr = (af&bx) ^ (ax&bf)` — AND/XOR, free),
+and its eq-weighting already accumulates unreduced into
+`UnredAcc = [ll, cross, hh]`. The "unreduced accumulation" half is
+therefore already present; there is no structured weight `x^K` to split,
+because the weight is one general `eq_o` per block.
+
+**What the same family did suggest, and it failed.** AG's accumulate is
+SCHOOLBOOK — 4 PMULL. Karatsuba forms the middle as
+`(eq.lo^eq.hi)·(xl^xh) = cross ^ ll ^ hh`, and since `ll`/`hh` are
+accumulated in their own lanes the correction defers to `reduce_unred`
+by linearity — structurally the same deferral §pmull uses. 3 PMULL, with
+`eq.lo^eq.hi` hoisting (eq is per-block constant).
+
+Value-identical (genus95 tests pass under both settings; the AG union
+roundtrip VERIFIES a real proof under Karatsuba). Measured on the REAL
+AG prove — `BLAKE3_ZC=ag`, the padded/coverage kernel, not
+`ag_breakdown` — ST, one binary, knob-switched, alternating:
+
+| pair | karatsuba | schoolbook | delta |
+|---|---|---|---|
+| 1 | 646.22 | 639.72 | +6.50 |
+| 2 | 644.60 | 639.75 | +4.85 |
+| 3 | 644.55 | 633.56 | +10.99 |
+
+**0/3, ~+1%. Reverted.** Third independent refutation of Karatsuba on
+this core (the campaign's NTT butterfly was +58%): trading one PMULL for
+two extra XORs and a longer dependency chain does not pay when PMULL
+throughput is not the binding constraint. The M1 model's
+"re-encoding fixed work never pays" rule now stands at 0/7.
+
+ALSO: `benches/ag_breakdown.rs` drives the DENSE
+`round1_slp_packed_banks_fused`, not the `_padded` coverage kernel
+production uses — the same dense-only flaw fixed in round1/round2. Any
+AG round-1 work must be measured on the real prove until that is fixed.
+
+### Round-1 optimizations, one by one, against AG — 2026-09-01
+
+`ag_breakdown` fixed first (87b88a5) so all of this is measured on the
+padded/sparse kernels production calls. m=30 production shape: round-1
+12.27 / fold 16.24 / tail 13.18 ms.
+
+**§pmull (unreduced accumulation + multiplicative weight splitting).**
+Already LIVE in RS round 1 (x^4-scaled gather table + x^2 doubling,
+`univariate_skip_optimized/kernels/aarch64.rs:595,635`). Does not map to
+AG: it defers an F_{2^8} product reduction, and AG has none — its
+products are bitsliced F_2 AND/XOR and its eq-weighting already
+accumulates unreduced. Nearest analog (Karatsuba, 4→3 PMULL, cross
+correction deferred to `reduce_unred` by linearity) measured **0/3, ~+1%
+on the real AG prove** — reverted, third Karatsuba refutation on this
+core.
+
+**§twolane (ILP in the gather drain). NOT APPLICABLE.** Its premise is
+that one lane exposes only THREE dependency chains, so processing two
+lanes doubles them to six. AG's `product_fold_bs` accumulates into 160
+independent `res[p]` accumulators plus 128 C banks — 160+ chains are
+already in flight, and there is no gather-table drain at all. The
+optimization has nothing to widen.
+
+**§zeroskip (structurally fixed b rows). ALREADY REALIZED.** It guards
+rows where `b = 0` because `T(0) = 0`. Our own census (2026-08-31) found
+B_0 has exactly **4677 empty rows = K − USEFUL_BITS = 16384 − 11707** —
+i.e. every structurally-zero b row in this circuit IS the padding tail,
+which `BlockCoverage::Dead` already skips wholesale before any kernel
+runs. Inside live blocks there are no zero b rows left to guard.
+
+**§structuredb (all-ones b shortcut). UNDER THE BAR.** The constant rows
+in our useful region are constant-ONE (1409 rows, 11 whole 128-bit
+planes = 12% of the ~92 useful planes), not zero. Two independent
+reasons to expect little: the ceiling is 12% of the b-encode, a
+sub-phase of a 12 ms phase; and the tex itself records that
+constant-folding all-ones rows in RS "returns 6 ms where 27 were
+predicted", because halving a row's loads halves its memory-level
+parallelism — "whole-row elimination is what pays", and whole rows are
+already gone via coverage.
+
+An attempt to upper-bound the b-encode empirically (skip it entirely,
+measure the ceiling) was **contaminated and is not reported**: the
+`LazyLock` guard sits in the per-block hot path, and removing the encode
+measured SLOWER (19.6 vs 12.2 ms) — the same guard-in-the-loop artifact
+seen in the AG fold store probe. A valid version needs a const-generic
+or a second binary; not pursued, since the census already bounds the
+prize below the bar.
+
+VERDICT: all four round-1 optimizations are accounted for — one live,
+one refuted by measurement, one inapplicable by structure, one already
+realized by the coverage mechanism, and the residual under the bar. AG
+round 1 has no untested lever left from the tex.
+
+### Structured-b for AG, measured cleanly: ceiling is 2% of round 1 — 2026-09-01
+
+Re-ran the b-encode ceiling probe without the contamination. The fix was
+to make the skip a **const generic** (`process_block_fused<const SKIP_B:
+bool>`, with the two public entries resolving the flag ONCE and
+dispatching to a monomorphised inner fn), so the hot path sees a
+compile-time constant instead of a `LazyLock` deref per block.
+
+Validation that it is clean: baseline reads 12.33 / 12.68 / 12.66 ms,
+matching the UNMODIFIED kernel's 12.2-12.3 — the earlier version moved
+the baseline and inverted the result.
+
+| | AG round 1, m=30, production shape |
+|---|---|
+| baseline | 12.66 ms |
+| b-encode removed entirely | 10.55 ms |
+| **whole b-encode** | **2.11 ms = 16.7% of round 1** |
+
+So even deleting 100% of the b-operand encode buys 16.7% of round 1.
+Structured-b targets the structurally-constant planes only — our census
+puts that at 11 of ~92 useful planes (12%) — so its **ceiling is
+0.25 ms, 2.0% of round 1**, which is ~0.6% of the AG zerocheck and under
+0.1% end to end. And that is a ceiling: a real implementation cannot
+skip individual input planes of `encode_slp_derived` (a straight-line
+program mixing all 64), so it would require regenerating a reduced SLP
+plus hoisting the constant planes' contribution — a code-generation job
+for at most a quarter of a millisecond.
+
+**Structured-b for AG is dead, now by measurement rather than by
+analogy.** With it, every round-1 optimization in the tex is closed
+against AG.
+
+TECHNIQUE WORTH KEEPING: to probe a hot path by removing work, resolve
+the switch OUTSIDE the loop and monomorphise (const generic), then
+verify the baseline arm still reproduces the unmodified timing before
+believing the other arm. Two probes today were wrecked by a flag read
+inside the loop.
+
+### §stripe (C-side from the lincheck stripe): RS blocked, AG unbuilt but PRICED — 2026-09-01
+
+**RS: blocked, measured.** Wiring `round1_..._stripe_c` on the union path
+fails with `Zerocheck(SumcheckFinalFailed)` — the union commits
+BatchMajor while the stripe fold assumes the RowMajor stripe↔witness
+index relation (the challenge tree gates the same mechanism on
+`layout == RowMajor`). Recorded 2026-08-31; unchanged.
+
+**AG: the mechanism does not exist and would need fresh derivation, so
+price it first.** AG's C side is a per-block bit transpose
+(`bitslice_block_into` / `transpose_fold_c_banks_2src`) plus 128
+`mul_acc_unred` into the even/odd friendly-bit banks — structurally the
+same thing §stripe deletes in RS ("removes the per-window bit transpose
+entirely; the drain's gathers drop from three to one").
+
+Priced with the const-generic probe (baseline reproduces the unmodified
+kernel at 12.29/12.32/12.49 ms, so this one is clean):
+
+| AG round 1, m=30 MT, production shape | |
+|---|---|
+| baseline | 12.32 ms |
+| C side removed entirely | 9.73 ms |
+| **whole C side** | **2.59 ms = 21.0% of round 1** |
+
+So the ceiling is 21% of round 1 — ~10 ms MT at m=32, where AG round 1
+is ~50 ms. RS's own §stripe captured −5.7% of its round 1 against a
+comparable share, i.e. roughly a quarter of its C side, since the stripe
+fold is not free either. Scaling that ratio suggests **~2-5 ms MT at
+m=32, ~1-3% of the AG zerocheck**.
+
+VERDICT: the only round-1 item with a non-trivial prize left, but it is
+NEW MATH, not a port — the AG C banks are over genus-95 code coordinates
+with the even/odd friendly split, and the derivation would have to
+target BatchMajor (the layout that killed the RS port) from the start.
+Not attempted; recorded with its price so the decision is informed.
+
+### §stripe re-derived for AG: the math works, the economics do not — 2026-09-01
+
+Derived rather than ported, since the RS implementation is RowMajor-bound.
+
+**THE DERIVATION (correct, recorded for reuse).** Batch-major addresses
+are `[7 in-word | n_log batch | k_log-7 chunk]`; AG splits the same
+address as `[skip(6) | inner(7) | outer]`. So
+
+- AG skip (bits 0-5) = in-word bits 0-5
+- AG parity = inner dim 0 (bit 6) = in-word bit 6
+- AG inner dims 1-6 (bits 7-12) = **batch** bits 0-5
+- AG outer (bits 13+) = remaining batch bits AND all chunk bits
+
+With `pf = Σ_i x^i·bit_i` split by parity of `i`, the banks are
+
+    bank_p[k] = Σ_o eq_o · Σ_{i ≡ p (2)} x^i · z[o·128 + i, k]
+
+`x^i = Π_j (x^{2^j})^{i_j}` is a product of per-dim factors and `eq_o` is
+an eq tensor, so **W is rank-1 over every folded dimension** — the
+condition for a per-dim fold. Keep in-word bits 0-6 unfolded (128
+values); then `bank_0[k] = v[k]` and `bank_1[k] = x · v[64+k]`. The extra
+`x` on the odd bank is independently confirmed by the existing
+`banks_to_message`, which applies `gamma_inv` to bank1 "because the
+kernel's odd-i bank carries an extra γ from friendly bit 0".
+
+**BatchMajor is NOT the blocker here** — that only killed the RS port
+because that code assumes a fixed RowMajor index relation. Deriving
+fresh, the sole consequence is that AG's friendly dims 1-6 sit in the
+INSTANCE index rather than the row index, so the outer fold carries
+`eq ⊗ friendly` instead of pure `eq`. Still rank-1, still foldable.
+
+**THE ECONOMICS KILL IT.** The replacement needs one O(2^m)
+`fold_stripe_outer` pass — the same kernel lincheck uses,
+`partial_fold_packed_z_best`. Timed at the production shape
+(m=30, k_log=14, useful_bits=11_707, 8 threads): **3.80 ms**, against the
+**2.59 ms** of C-side work it would delete (measured above).
+
+| | fold ADDED | work REMOVED | net | ratio |
+|---|---|---|---|---|
+| RS §stripe | 180 ms | 250 ms | **−70** | 0.72 |
+| **AG** | **3.80 ms** | **2.59 ms** | **+1.21** | **1.47** |
+
+The fold's cost is set by the WITNESS SIZE, not by how efficient round 1
+is. RS won because its C side was expensive (a bit transpose plus 32 of
+48 gathers per lane). AG's round 1 is already far leaner — its whole C
+side is 21% of a 12.3 ms phase — so the same fixed-cost pass no longer
+pays. Nor can the fold be shared with lincheck: lincheck folds at its
+own challenge point, not round 1's.
+
+NOT BUILT. The derivation above is the reusable part: if AG's C side ever
+grows, or a stripe fold becomes available for free from a neighbouring
+phase, it can be implemented directly from the formula.
+
+### AG's C side decomposed: the transpose is free, the multiplies are a roofline — 2026-09-01
+
+Follow-up to §stripe-for-AG ("any idea of how to not add work?"). Before
+inventing a cheaper C path it is worth knowing WHICH half of the C cost
+a cheaper path would have to beat. Split with a const-generic probe
+(`C_MODE`, resolved outside the loop — the LazyLock-in-hot-path
+contamination trap from earlier today) inside
+`transpose_fold_c_banks_2src`, guarding its two stages separately.
+ag_breakdown, m=30, production 92/128 shape, 10 threads, 3 reps, round-1
+URM median (ms):
+
+| arm | r1 URM | Δ vs base | share of C |
+|---|---|---|---|
+| baseline | 12.26 | — | — |
+| no bit transpose | 12.15 | **−0.11** | 4% |
+| no bank multiplies | 9.61 | **−2.64** | 96% |
+
+**The bit transpose is free; the whole C side is the 128 `mul_acc_unred`
+bank accumulates.** So every structural idea aimed at the transpose —
+fusing C's transpose into the AB `transpose_128x128_2src` as a 3-source
+transpose, hoisting the `ws` staging buffer, a stripe that "removes the
+per-window bit transpose" — is chasing 0.11 ms of a 12.26 ms round 1.
+
+And the 2.64 ms is at the PMULL roofline. m=30 is 2^30 bits = 2^17
+blocks of 8192; 128 `mul_acc_unred` per block at 4 PMULL each is 67.1 M
+PMULL. Eight P-cores at 3.2 GHz and 1 PMULL/cycle is 25.6 G PMULL/s =
+**2.62 ms predicted vs 2.64 ms measured.** The kernel is saturated.
+
+Why the count cannot be reduced. The bitmask `x` is treated as a GF
+polynomial, so ONE `eq · x` covers 128 outer positions at once — the sum
+over positions is already free inside the multiply. That leaves 128
+destination banks × one eq-weight per block, all distinct, so there is
+nothing to XOR-before-multiplying. The eq-factoring route (group 2^t
+blocks sharing a prefix, `eq = E_p · w_s` with the `w_s` constant across
+groups) does not help either: the inner `Σ_s w_s·x_s` is a sum of
+POLYNOMIAL products, not a table index, so it still costs 2^t multiplies.
+The subset-sum-table trick that makes this work on the RS side needs the
+`x_s` to be indices, and here they are field elements. Karatsuba would
+cut 4 PMULL to 3, and it has now been refuted three times on this core.
+
+**VERDICT: no. There is no way to make the C side cheaper without adding
+work, because the work is already minimal and running at machine peak.**
+The C side is 21.5% of AG round 1, which is 51.3 ms of the m=32 MT
+prove — so the entire theoretical prize here is ~11 ms of 900 ms (1.2%),
+and the reachable fraction of it is zero. Probe reverted; tree clean.
+
+**Where the AG headroom actually is, by contrast:** `prove_fast_union_ag`
+is a complete verifying path (roundtrip test at blake3.rs:2421) that is
+10.9% faster than RS single-threaded and −60 ms of zerocheck at MT, and
+it is NOT the default — `BLAKE3_ZC=ag` is opt-in, gated aarch64-only
+because the round-1 kernel is NEON. Promoting it (with an RS fallback
+for other targets) is worth ~30× what any remaining C-side kernel idea
+could return, and costs no new kernel code.
+
+### Promoting AG to the default: −5.8% end to end, MT, 4/4 — 2026-09-01
+
+The claim above ("worth ~30× any remaining C-side idea") should carry a
+number, so: paired alternating A/B of the two flavors at their MT optima
+on the real m=32 prove — arm A `rs_sparse` (today's default), arm B
+`ag_dense` (AG's MT optimum; sparse costs AG 3.2× at MT). Best
+prove_fast per invocation, 4 pairs, order rotated.
+
+| | best | median |
+|---|---|---|
+| rs (default) | 894.82 | 919.74 |
+| ag | **862.73** | **866.61** |
+
+**Median −53.1 ms = −5.8%, AG wins 4/4.** Throughput 292,955 → 303,853
+c/s at the best-of. AG also has the tighter spread (862.7–881.2 vs
+894.8–928.3), consistent with the ST reading where AG was 10.9% ahead.
+
+For scale: every optimization the whole port campaign kept is worth
+1.027× (−2.7%). **This one dispatch change is worth more than all of
+them combined**, and it is not new kernel code — the path exists, has a
+prove→verify roundtrip test (blake3.rs:2421), and is exercised by
+ag_breakdown. The work is dispatch and fallback: `prove_fast_union_ag`
+is aarch64-only because the genus-95 round-1 kernel is NEON, so making
+it the default means selecting AG on aarch64 and RS elsewhere, plus
+deciding whether the MT dense/sparse gate follows the flavor (it must:
+sparse is AG's ST optimum and its MT pessimum).
+
+### AG PROMOTED TO DEFAULT — −8.2% end to end, 4/4 — 2026-09-01
+
+Acting on the AG-default lever measured earlier today. Two corrections to
+the record came first, both from Benedikt's pushback that the "sparse
+costs AG 3.2×" reading smelled like a timing error. He was right:
+
+**1. Sparse is AG's optimum, on every stage.** Paired, m=32, MT, same
+binary, min-per-phase (ms):
+
+| stage | AG sparse | AG dense |
+|---|---|---|
+| round 1 | **55.65** | 57.09 |
+| skip→mlv fold | **41.06** | 47.21 |
+| mlv tail | **47.75** | 65.66 |
+| zc + lincheck | **183.19** | 209.32 |
+
+End to end AG sparse beats AG dense 4/4 (median −41.5 ms). The
+2026-08-31 entry claiming a 657 ms sparse tail is marked SUPERSEDED in
+place. Attribution unresolved — flagged, not chased.
+
+**2. The promotion, measured in the SHIPPED config** (both arms on the
+default sparse gate; AG via the new default, RS via `BLAKE3_ZC=rs`):
+
+| | best | median |
+|---|---|---|
+| rs | 934.97 | 966.10 |
+| ag | **851.36** | **894.75** |
+
+**Median −79.4 ms = −8.2%, AG 4/4** (deltas −111.7 / −83.6 / −75.1 /
+−67.6). Best-of throughput 280,377 → **307,912 c/s**. Larger than the
+−5.8% measured this morning, because that comparison used AG *dense*.
+Absolute numbers ran ~7% high across both arms in this batch (warmer
+machine than the morning window) — the paired delta is the signal.
+
+WHAT LANDED:
+- `blake3_proof` / `sha2_proof` benches: zerocheck flavor defaults to AG
+  on aarch64, RS elsewhere; `BLAKE3_ZC=rs` / `SHA2_ZC=rs` force the RS
+  arm. Same selector convention as the tower's `leaf_zc_ag()` /
+  `outer_zc_ag()`, which have defaulted to AG since Phase B/C — the flat
+  prover was the last un-promoted surface.
+- `Sha256HybridSetup::prove_fast_union_ag` + `verify_union_ag`, the
+  mechanical twin of the BLAKE3 pair (SHA-256 had no AG entry at all),
+  with `sha2_prove_fast_union_ag_roundtrip` covering verify + round-1
+  tamper + off-schedule-nonce rejection. Green.
+- `proof_io::R1csProofBundleLigeritoAg` on new wire flavor byte 5, plus
+  `BundleFlavor::R1csAg`. Needed because the blake3 bench previously
+  SKIPPED peak-memory/verify/proof-size whenever AG was selected — with
+  AG now the default that would have silently dropped three headline
+  lines from every report. Both arms now report all three.
+  AG's proof is ~1.5 KB larger than RS's (305,436 vs 303,936 B at m=24).
+
+WHAT IS **NOT** DONE — RS REMOVAL IS BLOCKED, and not by preference:
+`docs/ag-recursion-plan.md` Phase F.1 is explicit that the AG round-1
+prover kernel is aarch64-NEON-only (`genus95_curve_code/round1.rs` is
+`#[cfg(target_arch = "aarch64")]` with a bare `use std::arch::aarch64::*`),
+so deleting RS without an AVX-512 port **kills x86 proving outright** —
+and `.github/workflows/test.yml` runs a first-class x86_64 leg pinned to
+`sapphirerapids` precisely to exercise those kernels. Phase F.2 adds the
+same blocker for CUDA. RS also still owns every transcript byte pin
+(m6 merged fixtures, mixed-class pins, chain/Merkle/keccak3/sha2). So
+the parallel `*Ag` API stays until those kernels exist, exactly as the
+plan prescribes; `prove_fast` keeps its type and its callers.
+
+### Dead-scaffolding cleanup alongside the AG promotion — 2026-09-01
+
+Scope chosen by Benedikt: delete only what is genuinely unreachable, keep
+RS compiling as the x86 fallback. Method: take the dead-code list under
+`cargo clippy --release --workspace --all-targets` on BOTH arches
+(aarch64 natively, x86_64 via `--target x86_64-apple-darwin -C
+target-cpu=sapphirerapids`, which is what CI's x86 leg pins) and delete
+only the intersection — anything dead on one arch alone is a live
+fallback on the other.
+
+DELETED (dead on both):
+- `r1cs_hashes/common.rs`: the whole full-write witness cluster —
+  `drive_witness_packed_and_lincheck_full_write`, `witness_scratch_tag`,
+  `WITNESS_ROLE_{Z,A,B}` (~105 lines), plus `BitRecord::words()` whose
+  doc still pointed at a `PackedWordWriter::push_record` caller that no
+  longer calls it.
+- `zerocheck/multilinear/kernels/aarch64.rs`: `fold_and_message_neon`
+  and `lookahead_chunk_neon` (~250 lines) — zero references anywhere in
+  the workspace; superseded by the fused round-2 kernel and the cascade
+  tail.
+
+KEPT, with the reason recorded in code:
+- `ag_skip::byte_dot_u64` reads dead on aarch64 only because today's
+  NEON `byte_dot` bypasses it; it is the LIVE x86 path. Gated
+  `#[cfg(not(target_arch = "aarch64"))]` so it stops tripping the arm64
+  lint leg's `-D warnings` without removing the fallback.
+
+TWO PRE-EXISTING BUGS FOUND WHILE VALIDATING, both fixed:
+1. **A silently disabled test.** `stripe_c_banks_match_drain_banks`
+   (univariate_skip_optimized.rs) sits between two `#[test]` functions
+   but had lost its own attribute, so it had never run. Restored — it
+   PASSES, so this is recovered coverage, not a latent failure.
+2. **The x86 test crate did not compile.**
+   `neon_fused_inner_matches_scalar_inner` calls
+   `shift_reduce_inner_ab_fused_neon`, which does not exist off aarch64,
+   with no arch gate — so CI's x86_64 leg was failing to build
+   `flock-core`'s tests before any of today's work. Gated. Verified at
+   HEAD to confirm it was not introduced here.
+
+AFTER: zero dead-code warnings on aarch64, `--workspace --all-targets`
+compiles clean on BOTH arches, workspace tests **637 passed / 0 failed**
+(one more than before, from the restored test). Perf unchanged by the
+cleanup: 850.27 ms best = **308,307 c/s**.
+
+Full AG report at m=32 (the bench reports these under AG for the first
+time): peak memory **8065 MB** vs RS's 8525 — AG holds ~460 MB less —
+verify 6.17 ms, proof 451.22 KiB vs RS's 449.76 (+1.46 KiB).
+
+NOTE for future sessions: `cargo fmt --all` under rustfmt 1.8.0 rewrites
+~11 committed files that were formatted by an older stable, and local
+`clippy -D warnings` fails workspace-wide on pre-existing
+`unsafe_op_in_unsafe_fn` (E0133) and an unknown-lint name. Neither is
+actionable here; format and lint only the files you touch.
+
+### Witness generation attributed — 64 ms nobody was timing, and it is at roofline — 2026-09-01
+
+**The trace was lying about witgen.** `[prove_union] witgen` prints
+0.00 ms, but that timer only wraps `build_union_witness`, and with a
+single PREBUILT slot that is a passthrough. The actual generation runs in
+`generate_witness_batch_major_partial`, called by
+`prove_fast_union_ag` BEFORE `prove_fast_ligerito_union_ag` — i.e.
+entirely outside the `[prove_union]` region. It shows up only as the gap
+between `[prove_union] TOTAL` (788 ms) and `best prove_fast` (~850 ms):
+**~64 ms, 7.6% of the prove, unattributed by every previous session.**
+
+Also fixed the micro-bench, which had the same disease round-2 had:
+`genwitness_phase` drove `generate_witness_with_ab_packed_and_lincheck`,
+the legacy ROW-MAJOR generator reached only from the retired direct-AG
+route. Production is BatchMajor. Repointed at
+`generate_witness_batch_major_partial` and extended to m=32 (the shipped
+size), with a checksum. It reads **110 ms standalone** at m=32 (higher
+than the in-prove 64 ms because the prove has the pool warm).
+
+STAGE ATTRIBUTION (m=32, best-of, const-read-once env probe inside
+`drive_witness_batch_major_partial_into`; probes are NOT additive —
+removing one lets others overlap):
+
+| stage | cost | note |
+|---|---|---|
+| `flush_rows_nt` ×3 | 25.7 ms | 1.5 GB of NT stores = **~58 GB/s, roofline** |
+| `per_group` (BLAKE3 build) | 17.8 ms | the only real compute |
+| padding-suffix memset | 15.0 ms | 432 MB — **required, see below** |
+| `stripe_from_rows` | 12.8 ms | |
+| stripe tail clear | 7.8 ms | 153 MB |
+| per-group row fill | 6.2 ms | 1.15 GB, L1-resident |
+
+**TWO NULL RESULTS, both instructive:**
+
+1. **`UnionSlotProverInput::in_place` is NEUTRAL** (median +0.2 ms, 2/4)
+   despite its own doc saying "prefer in_place on the hot path: at M=30
+   the scatter is ~10 ms". Reason: for a SINGLE slot the prebuilt path
+   is already an aliasing passthrough, so there is no scatter to remove.
+   The doc's advice is about multi-slot unions.
+
+2. **The padding memsets cannot be elided here — a COMPLETENESS
+   constraint, not soundness.** (Benedikt caught me using the wrong
+   word: padding is written entirely prover-side, and a cheating prover
+   may put anything there, so it cannot affect what a verifier accepts.
+   What breaks is the HONEST prover's own proof.) At FULL utilization
+   `compaction_is_identity()` is true (single slot at offset 0,
+   `n_t == 1<<nu`), so q IS the padded buffer: the committed polynomial
+   includes the padding, while the zerocheck/lincheck claims are
+   computed as if it were zero. The opening then disagrees with the
+   claim.
+
+   VERIFIED, not argued — forcing `padding_unread` true at full
+   utilization on the in-place path (the only path that consults it;
+   the all-prebuilt path returns `PooledZeroed` unconditionally via
+   `assemble_witness`) makes the m=28 prove fail its own verify with
+   **`union-AG verify failed: PcsOpen(Ligerito)`** — exactly the
+   predicted failure site. At partial utilization the elide already
+   kicks in automatically and verify passes.
+
+   **This re-opens the 15 ms as a live target.** Because the constraint
+   is only that the committed padding BE zero — not that anything read
+   it — the fix is not "skip the writes" but "keep last prove's zeros".
+   The padding suffix is shape-invariant across proves, so a witness
+   buffer returned to a DEDICATED pool class comes back with its padding
+   already zero and needs no memset. The scratch pool already has the
+   machinery for exactly this: `take_f128_tagged` returns a `hit` flag
+   and `witness_scratch_tag`/`WITNESS_ROLE_*` were built to let a
+   builder "elide on a hit" — that cluster was unreferenced and got
+   deleted in today's cleanup, but its design is the right one and it is
+   recoverable from git. NOT attempted; sized at ~15 ms (1.8%).
+
+**VERDICT: witgen is MOSTLY irreducible** — ~26 ms of NT stores runs at
+bandwidth roofline and ~18 ms is the BLAKE3 witness compute. The one
+genuinely addressable item is the 15 ms padding memset, via a
+padding-preserving buffer pool (above), which is worth a session. The
+durable improvement landed today is the corrected micro-bench. Probes
+reverted.
+
+### Round 3 (AG/sparse tail): the friendly-Horner kernel is NEVER used — 2026-09-01
+
+Attribution only; no code change yet. The AG tail under the shipped
+sparse dispatch is 46–48 ms (of ~850 ms). The 2026-08-31 entry's
+MECHANISM claim survives even though its numbers did not:
+`fold_and_friendly_round_pair_into` (the γ-geometric Horner kernel with
+no per-term `eq_lo` PMULL) has exactly ONE production call site,
+`mlv_tail_fs_resume` (ag_skip.rs:1655), and it only fires for rounds
+`i ∈ 1..=5`. The other call site (:2124) is the
+`friendly_round_matches_general` test.
+
+`mlv_tail_fs_sparse` runs the sparse rounds with the general RS kernel
+(`fold_and_round_pair_sparse_into`, friendly constants riding as
+ordinary `r_next` weights), then expands to dense and resumes. **Probed
+at m=32: the sparse loop consumes rounds 0..18 and hands off at i=18** —
+so on the AG/sparse path the friendly rounds 1–5 are ALREADY GONE by the
+time the friendly-capable code is reached. The kernel never runs.
+
+Sizing the prize honestly: with the domain halving each round, rounds
+1–5 (2^24…2^20) are ~48% of the tail's 2^26 total work, so ~22 ms is
+addressable, and the friendly kernel's saving within that is the
+per-term `eq_lo` PMULL — call it 20–40%. **Realistic prize ≈ 5–10 ms,
+i.e. 0.6–1.2% of the prove.** Worth doing, not spectacular; it needs a
+new `fold_and_friendly_round_pair_sparse_into` mirroring the dense
+kernel over `LiveLayout` intervals. NOT started — flagged with the
+mechanism verified so the next session can start from the kernel.
+
+Note this also explains why AG-sparse beats AG-dense on the tail
+(47.75 vs 65.66) DESPITE forfeiting the friendly kernel: skipping the
+147,456 dead blocks is worth more than the friendly Horner. The two wins
+are independent and should compound.
+
+### Tagged witness-buffer pool: BUILT, and it structurally cannot hit — 2026-09-01
+
+Following up the completeness correction: since the padding suffix only
+has to BE zero, not go unread, the move is to keep last prove's zeros via
+the scratch pool's provenance tags. Built it end to end:
+
+- `UnionInstance::witness_buffer_tag(role)` — FNV over `m_total`, `n_log`,
+  and per type `k_log`/`useful_bits`/offset/`m_slot`/count, version-stamped,
+  namespaced so it cannot collide with another tag family. Everything the
+  suffix boundary `ceil(useful_bits/128) << n_log` depends on.
+- `UnionInstance::witness_buffers_are_passthrough()` — the single-slot
+  spanning case, where `assemble_witness` moves a slot's buffers through
+  unchanged so take-site and give-site layouts are provably identical.
+- `take_witness_buffers` takes `a`/`b` via `take_f128_tagged` and returns
+  hit flags; `SlotWitnessDest` carries `padding_already_zero: [bool; 3]`;
+  the driver skips exactly that buffer's suffix fill, with a
+  `debug_assert` re-verifying the suffix really is zero on a hit.
+  `z` is deliberately never tagged — the aliased open folds over it.
+- Give-back at prover.rs returns `a`/`b` tagged.
+- `prove_fast_union_ag` switched to `in_place`, the only path that reaches
+  `take_witness_buffers` at all.
+
+It builds, verifies, and the debug-assert vouch holds under
+`-C debug-assertions=on`. A 6-pair A/B on the witgen line read median
+−1.46 ms, 3/6 — noise. **Then the reason: the tag NEVER HITS.** Traced
+both ends: the give fires every prove with a stable tag
+(`0x571dac7a374f798e`) and matching length; every subsequent take returns
+`a_hit=false b_hit=false`, at m=28 and m=32 alike. So both A/B arms were
+executing identical code and the "null" measured nothing.
+
+**MECHANISM — and it is structural, not a bug.** The pool clears a tag on
+"any other custody event — an untagged take". The witness buffers are
+handed back MID-PROVE (right after the boolean zerocheck), and the open
+stage then runs and is the single largest consumer of pooled `F128`
+scratch; `take_f128` prefers the smallest capacity ≥ n, so it takes our
+just-returned buffer and strips the tag long before the next prove asks
+for it.
+
+The two fixes both lose more than they win:
+- Hold the witness buffers back until the prove ends → the open faults
+  fresh pages instead of reusing that memory, which the pool's own doc
+  records as a **+24% open_batch regression on M4**.
+- A separate reserved pool → ~1 GB extra residency for the same reason.
+
+So the mid-prove give-back is load-bearing, and it is worth far more than
+the ~10 ms the padding skip could return. **This is very likely why
+`witness_scratch_tag`/`WITNESS_ROLE_*` were built and then left
+unreferenced** — the design is sound, the lifetime is not. Reverted.
+
+REVISED VERDICT on witgen: irreducible after all, but now for a
+demonstrated reason rather than the wrong one I gave first. The 15 ms
+padding memset is real, is required (completeness), and cannot be
+amortized across proves without giving up a larger win in the open.
+
+### LANDED: a/b padding columns are never read — −10.9 ms witgen, −6.7 ms prove — 2026-09-01
+
+Benedikt pushed back that witgen spending only ~16% on actual BLAKE3 was
+weird and asked whether memory work could be deferred or omitted. It can,
+and I had mis-scoped the constraint earlier today.
+
+**The identity-compaction argument only ever applied to `z`.** Under
+identity compaction `q` IS the `z` buffer, so `z`'s padding words are
+COMMITTED and must be honest zeros. `a` and `b` are never committed —
+their only consumers are the run-list-gated zerocheck (Dead blocks
+skipped, Partial cleansed; both flavors) and the count-proportional
+lincheck. The old code zeroed all three because one predicate,
+`padding_unread`, conflated "is this committed" with "does anyone read
+it".
+
+PROVEN, not argued: poisoning the a/b padding suffix with
+`DEADBEEF/0BADF00D` instead of zeroing it leaves the serialized proof
+**byte-identical** — checked at m=32 AG (fnv 7b3455b91c9e8f8b) and m=28
+RS (52d35e07443300ae).
+
+WHAT LANDED:
+- `SlotWitnessDest::ab_padding_unread`, certified by the union in
+  `build_union_witness` as `!has_element() && m_total - n_log >=
+  LOG_PACKING` — i.e. the existing `padding_unread` predicate MINUS its
+  identity-compaction clause, which says nothing about a/b. The driver
+  then zeroes `z`'s suffix always and a/b's only when uncertified, so
+  the strict generator contract still holds for every direct caller and
+  `batch_major_partial_zeroes_dummy_rows` keeps passing unchanged.
+- `prove_fast_union_ag` (BLAKE3 and SHA-256) switched to
+  `UnionSlotProverInput::in_place` — the only path that reaches
+  `slot_dests`, so the only one that can carry the certification. Neutral
+  on its own, and it also makes `[prove_union] witgen` honest: it read
+  0.00 ms for a 64 ms phase because the single-slot prebuilt source is a
+  passthrough.
+- `ab_padding_columns_are_never_read` — a permanent guard that proves the
+  same witness twice, poisoning exactly that region on one run, and pins
+  the proofs byte-identical. It also asserts `ab_padding_unread` is set,
+  so it cannot silently stop exercising the skip.
+
+MEASURED: witgen micro-bench m=32 **−10.9 ms, 4/4** (101.4 vs 112.3
+median) — 288 MB of the 432 MB memset gone. End to end, paired,
+same-binary knob: **median −6.74 ms, skip wins 4/5**; best prove 795.10
+ms = **329,699 c/s**, and in-prove witgen 64 → 41.4 ms. The end-to-end
+figure is smaller than the micro-bench's because part of the memset
+overlaps other work.
+
+NOT DONE: `prove_fast` (the RS x86 fallback) still uses the allocating
+prebuilt path and so does not get this. Same win is available there, but
+RS owns the m6 transcript fixtures, so it wants its own byte-identity
+check first.
+
+Two things NOT the cause, both refuted en route: NT (`stnp`) zero-fill of
+the suffix (neutral 3/3 — macOS memset already avoids RFO), and the
+tagged-pool amortization (never hits; see the entry above).
+
+ALSO: `mixed_blake3_sha256_roundtrip_and_tamper` FAILS AT HEAD, before
+any of today's work — a tampered lincheck round now returns
+`InvalidGrindingNonce` where the test expects `ConsistencyFailed`. The
+honest proof still verifies; the test over-specifies which rejection
+fires. Verified by stashing every local change. Pre-existing, not
+investigated further, flagged here so the next session does not blame it
+on this change.
+
+### LANDED: stripe tail joins the dead-padding skip — −3.2 ms witgen — 2026-09-01
+
+Second half of the "omit the memory work" thread. The lincheck stripe's
+tail (rows `>= ceil(useful_bits/64)` of each 8-block group, 153 MB at
+m=32) was cleared on every prove.
+
+**Why it is dead:** the stripe has exactly ONE reader,
+`partial_fold_packed_z_rows_best` (lincheck/union.rs:369), and it is
+handed `ty.useful_bits` and `n_t` explicitly — its own doc says it
+"threads `useful_bits` through so the kernel can skip blocks past the
+useful region of each block". So the tail is never touched, on either
+the full (`partial_fold_packed_z_best`) or row-prefix
+(`partial_fold_packed_z_rows_padded`) arm.
+
+Rather than add a second flag, `SlotWitnessDest::ab_padding_unread` was
+generalized to **`dead_padding_unread`** covering both dead regions —
+a/b padding columns and the stripe tail — with each region's reader named
+in the doc. Same certification, same predicate, one extra `if`. `z` is
+still excluded: its padding is committed.
+
+MEASURED (genwitness_phase, m=32, 8 alternating pairs, min-of-run):
+**median −3.24 ms, skip wins 8/8** (82.99 vs 87.12) — every delta
+negative, range −0.76 to −4.67. Below the 5.4 ms the 153 MB would
+suggest at ~28 GB/s, so part of the clear was already overlapping.
+
+COMBINED with the a/b skip, end to end at m=32, paired, same-binary
+knob: **median −22.4 ms, 4/6**; best prove **825.59 ms = 317,523 c/s**
+(deltas −44.4/−28.9/−23.5/−21.2/+1.4/+16.6). Larger than the ~14 ms of
+witgen the two skips account for — the rest is knock-on (441 MB fewer
+dirty pages and less cache pollution ahead of the commit).
+
+The guard test is now `dead_padding_regions_are_never_read`: it poisons
+BOTH regions on one of two otherwise identical proves — a/b before
+generation, the stripe tail after, on its way to the lincheck — and pins
+the proofs byte-identical. It also asserts the certification flag is set,
+so it cannot silently stop exercising the skip.
+
+Workspace 637/637, x86 `--all-targets` clean, no probe knobs left in the
+tree.
+
+**Witgen scoreboard at m=32** (standalone micro-bench, was 110 ms):
+now ~83 ms. Remaining: `flush_rows_nt` ×3 ≈ 26 ms (1.5 GB of NT stores
+at ~58 GB/s — bandwidth roofline, and it is the required output),
+`per_group` BLAKE3 build ≈ 18 ms, `stripe_from_rows` ≈ 13 ms, `z`'s
+required padding memset ≈ 5 ms, per-group row fill ≈ 6 ms. The two
+skippable regions are now skipped; what is left is either the answer or
+the bus.
+
+### Does §elision ("write it once") apply to flush_rows_nt? Ceiling measured: ~1 ms — 2026-09-01
+
+Benedikt asked whether `flush_rows_nt` is what the LaTeX doc attacks —
+`docs/zerocheck-optimizations.tex` §sec:elision, "Witness constant-region
+elision via scratch provenance": tag a pooled buffer with its layout
+provenance and, on a hit, skip rewriting the regions identical across
+every prove of that layout ("$b$'s all-ones prefix and reserved-slot
+words and all three streams' zero tails").
+
+**Yes, that is the same idea — and today's dead-padding work already took
+the part of it that pays.** The doc lists three constant regions; "all
+three streams' zero tails" is exactly the padding suffix + stripe tail
+now skipped via `dead_padding_unread`, worth −22 ms end to end. What
+remains of §elision is the constant regions INSIDE the useful data,
+which is what would let `flush_rows_nt` write less.
+
+**Ceiling, measured directly** (three witnesses from independent seeds,
+n=2^8, counting useful F128 words identical across all three):
+
+| stream | input-independent |
+|---|---|
+| z | **0.0 %** |
+| a | **0.0 %** |
+| b | **12.0 %** |
+| lincheck stripe | 0.8 % |
+
+Consistent with §sec:zeroskip's own tally (38 of 256 eight-byte K-rows of
+`b` pinned regardless of input = 14.8% at 64-bit granularity; a 128-bit
+word is constant only if both halves are, hence 12%).
+
+So `flush_rows_nt` writes 1.5 GB of which **~4% is even theoretically
+skippable** (12% of the `b` third). Against its measured ~26 ms that is
+**~1 ms**, and it would cost a per-row branch inside a streaming NT-store
+loop. The doc's own number agrees this was never large: 4/5 paired,
+147.0–149.0 vs 148.3–152.7 ms.
+
+**Two further blockers specific to this branch:**
+1. §elision operated on the ROW-MAJOR full-write builder
+   (`drive_witness_packed_and_lincheck_full_write` + `witness_scratch_tag`
+   + `WITNESS_ROLE_*`). That cluster was UNREFERENCED at HEAD — production
+   is the batch-major union builder — and was deleted in today's cleanup.
+2. Its prerequisite does not hold here anyway: the provenance tag NEVER
+   HITS in the union pipeline (traced this session — the witness buffers
+   are returned mid-prove and the open stage, the largest consumer of
+   pooled F128 scratch, takes them and strips the tag).
+
+**VERDICT: `flush_rows_nt`'s ~26 ms is the required output at bandwidth
+roofline.** 96% of those bytes genuinely differ every prove. The "write
+it once" idea was right about the zero tails — which is where today's
+−22 ms came from — and is worth ~1 ms on everything else.
+
+### The open, audited — cold vs warm, one −13 ms fix, and a pool lesson — 2026-09-01
+
+Applying the doc's own rule ("audit where the buffers come from before
+porting compute") to the phase no campaign had profiled. Instrument:
+`LIG_PROVE_TRACE=1` — the production basis prover
+(`extension::recursive_prover_with_basis_impl`) already carries a full
+per-bucket breakdown behind that flag; `FLOCK_LIG_TIMING` only covers
+the per-level commits, which is why earlier sessions saw 49 of 279 ms
+and called the rest "unexamined".
+
+**FIRST FINDING: the 279 ms I had been quoting was the COLD prove.**
+The recursive prover is **~181 ms warm** at m=32. The ~100 ms gap is
+first-prove-in-process cost: ~26 ms is one `give_f256` whose pool
+eviction frees a multi-hundred-MB buffer (munmap), the rest is cold
+recursive folds (`fold_extension` collects fresh, page-faulting once)
+and a cold fold 5. `best prove_fast` is a warm minimum, so none of this
+was in the headline — but it is ~12% of first-prove latency and should
+be on the list for a serving deployment.
+
+**WARM recursive prover, 181 ms:**
+
+| bucket | ms | verdict |
+|---|---|---|
+| initial_k folds + switch | 76 | fold 1 = 40 (below), switch 9.5 (fixed) |
+| recursive commits | 47 | NTT 29 + merkle 18; examined earlier |
+| L0 OOD (eq build + eval) | 23 | ≈ memory roofline for 512 MB write + 1 GB read |
+| induce | 14 | not examined |
+| level OODs | 10.5 | not examined |
+| recursive folds + switches | 5.7 | nothing there warm |
+
+Fold 1 (`fused_first_fold2_virtual`, 2^25 → 2^23): **compute roofline.**
+Per output it does `13 + 3T` F128 multiplies (fold2 = 7, `la_msg_quad`
+= 6, virtual basis `scale·lo·hi` = 3 per term); ST 208 ms over 2^23
+outputs is ~79 cycles/output ≈ 16 PMULL-throughput multiplies. MT 40 ms
+= 5.2× on 8P+2E — the E-core dilution is the only slack (~10 ms).
+
+Outside the recursive prover: **W build 33 ms and combine 45 ms both
+scale ~7× ST→MT** (234→33, 334→45), so they are parallel and
+compute-bound (4–7 F128 muls per element), not allocation problems.
+
+**LANDED: the code switch's serial promotion.** `code_switch_message`
+did `words.into_iter().map(F256::from).collect()` — SERIAL over 2^20
+elements, 4.25 ms, into a fresh allocation — while its neighbour
+`introduce_ood_with_eval` uses `into_par_iter`. Parallelized, plus
+`alloc_uninit` instead of `vec![ZERO; …]` for the two split buffers
+(16 + 32 MB of zeroing gone). Init switch **9.52 → 3–4 ms**, fold 5
+12.6 → 6–7, **warm recursive prover 181 → 166–169 ms** over four warm
+proves. Bit-identical: the m6 transcript fixtures pass, proof size
+unchanged.
+
+**THE LESSON, which cost 20 minutes and is worth recording:** my first
+version ALSO routed the three switch buffers through the scratch pool
+(`take_f128`/`take_f256`/`give_f128`). The switch got faster still
+(2.2 ms) — and the NEXT fold went from 3 ms to 21–62 ms, wildly
+variable, and the recursive prover got SLOWER overall (206–269 ms).
+Mechanism: `MAX_POOLED = 24` with evict-from-most-populated-class. Three
+new 16–32 MB entries per switch tip the class balance, the policy
+evicts buffers the fold reuses, the fold's `take_f256` misses and
+page-faults (or an eviction munmap lands mid-fold). **Adding pool
+traffic is not a local change.** Fresh allocations for short-lived
+mid-phase buffers are malloc-recycled on warm proves and stay out of
+the pool's accounting — that is the right default for anything that is
+not one of the ~18 long-lived per-prove buffers the pool was sized for.
+
+Remaining in the open, warm: induce 14 + level OODs 10.5 (unexamined),
+the E-core dilution on fold 1 (~10), L0 OOD's materialized 512 MB eq
+table (a virtual-basis variant exists for the folds; ~10 ms if the eval
+sweep could use it — speculative). And the cold-prove tax.
+
+### The zc tail, per round — lookahead is a wash and friendly-Horner is 2–3× SLOWER — 2026-09-01
+
+Per-round probe inside `mlv_tail_fs_sparse` at m=32 (AG/sparse, warm
+prove 2). The live layout is ONE prefix interval every round (the 92/128
+useful chunk-columns are a prefix), at 71.9% of the domain.
+
+| round | domain | MT ms (8 thr, quiet) | ST ms | ST/MT |
+|---|---|---:|---:|---:|
+| 1 | 2^26 → 2^25 | 43.3 | 209.4 | 4.8× |
+| 2 | 2^25 | 12.2 | 80.0 | 6.6× |
+| 3 | 2^24 | 4.6 | 33.2 | 7.2× |
+| 4 | 2^23 | 2.4 | 16.6 | 7.0× |
+| 5 | 2^22 | 1.3 | 8.3 | 6.5× |
+| 6–17 | | ~2.5 | ~9 | |
+
+Round 1 is 59% of the tail and rounds 1–5 are 93%. Rounds 2–5 scale ~7×
+(compute-bound); round 1 ~5× (its 2.3 GB per pass is partly bus-bound).
+NOTE `RAYON_NUM_THREADS=8` bypasses the bench's perf pool and reads
+~35% worse than the default 10-thread pool (tail 66 vs 48) — do not use
+it to "match" another prover's thread count.
+
+**Lookahead ladder (dense `fold1/fold2_lookahead_into`): NULL per
+element.** Probed the dense route's passes at m=32: ST 338.5 (fold1-la,
+2^26→2^25) + 112.0 + 28.2 + 7.1 + … = 488 ms over 100% of 2^26 =
+7.3 ns/elt, against the sparse classic kernel's 356 ms over 71.9% =
+7.4 ns/elt. Counting multiplies explains it: the ENTRY pass `fold1-la`
+does 3 muls/input for a single halving (classic round 1: 2), so the
+ladder totals ~15% MORE arithmetic than classic, cancelling its ~23%
+traffic saving. Porting it to the sparse prefix would gain nothing.
+This also explains why AG-dense (with lookahead) loses to AG-sparse
+(without) on the tail: same per-element cost, 39% more elements.
+
+**Friendly-Horner on the sparse prefix: BUILT, correct, and 2–2.7×
+SLOWER.** With a single prefix interval the dense
+`fold_and_friendly_round_pair_into::<SHIFT>` runs on the compact buffer
+unchanged (its chunking follows `a_out.len()`, indexing is
+chunk-relative; only a debug_assert needed relaxing). Wired for rounds
+1..=5, same-binary A/B via a knob:
+
+| | friendly | general |
+|---|---:|---:|
+| MT round 1 | 86.1 | 43.0 |
+| MT tail | 156.6 | 66.4 |
+| ST round 1 | 552.4 | 203.2 |
+| ST tail | 1059.7 | 347.0 |
+
+Roundtrips (debug assertions on), verify, and
+`friendly_round_matches_general` all pass — it is bit-identical and
+simply slow. The kernel trades 2 unreduced eq_lo multiplies per pair
+(8 PMULL + 3 XOR, a 1-cycle accumulate chain) for 2 `shl_xor::<SHIFT>`
+on 384-bit `F256Unreduced` accumulators — more instructions AND a
+loop-carried shift chain. It was never load-bearing: in the dense resume
+it only fires when NOT in lookahead mode with len ≥ 1024, i.e. only
+under the `LOOKAHEAD_DISABLE` toggle. **The 2026-08-31 claim that the
+sparse tail "forfeits the friendly kernel at 5.5×" had the sign wrong:
+the sparse path is faster partly BECAUSE it never runs it.** Reverted.
+Flag for cleanup: the friendly branch in `mlv_tail_fs_resume` is dead
+in production and measurably worse than the general kernel where it
+would run.
+
+**Where the tail's time actually is:** the general sparse kernel's inner
+loop is scalar-style F128 arithmetic (`a0 + r*(a1+a0)`, `mul_unreduced`
+into `F256Unreduced`) — the same shape round 2's `fold_pair_run` had
+before §wideneon/§qres took it 281.7 → 236.1 ms ST (−16%). That NEON
+register-residency treatment is the remaining kernel-level lever on the
+tail: ~−55 ms ST, ~−8 ms MT on the 48 ms tail. Not started.
+
+Cross-prover: the challenge tree's tail is 28 ms MT to our 48 — but its
+"round 2 + tail" is 73 vs our "fold + tail" 89, and the domains and
+round boundaries differ, so the comparable gap is ~16 ms, not 20.
+
+### CORRECTION: lookahead is NOT a wash — the entry pass is; fold2-cascade pays — 2026-09-01
+
+The Yukon session pushed back on "lookahead null per element": their tail
+uses `fold2_and_message_lookahead_*` (two halvings + message per pass,
+cascaded all the way down), not the fold1 entry shape I measured. Also,
+"friendly" in their tree names round-1 CHALLENGE CONSTANTS (7 fixed
+constants so eq factors geometrically), not a Horner kernel — so my
+friendly-Horner refutation has no counterpart there; it stands on its
+own for AG.
+
+Re-deriving from my own dense-vs-classic probe, per PASS, scaled to equal
+element counts (classic sparse ÷ 0.71875):
+
+| pass | ST ladder | ST classic equiv | Δ | MT ladder | MT classic equiv | Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| entry fold1-la @2^26 (1 halving) | 338.5 | 291.3 | **+16%** | 53.7 | 60.2 | −11% |
+| fold2-la @2^25 (rounds 2+3) | 112.0 | 157.5 | **−29%** | 14.9 | 23.4 | **−36%** |
+| fold2-la @2^23 (rounds 4+5) | 28.2 | 34.6 | −19% | 3.8 | 5.1 | −25% |
+| fold2-la @2^21 (6+7) | 7.1 | 8.7 | −19% | 1.0 | 1.3 | −23% |
+| **total** | 488 | 495 | −1% | **74** | **92** | **−20%** |
+
+So the steady fold2 passes are 19–36% cheaper than the two classic rounds
+they replace; the ENTRY pass is 16% dearer than the one round it replaces
+and it is the biggest round, which is why the ST total nets to a wash.
+At MT the ladder is already −20% in total — I had compared it against a
+CONTENDED classic number (71 ms) and called it parity; the quiet figure
+(66) says otherwise. The earlier "porting the ladder to the sparse prefix
+would be null" is therefore WRONG at MT and right only at ST.
+
+**Revised lever — a prefix fold2-cascade tail:**
+1. `fold2_lookahead_into` on the live prefix: eq sized from `rest` (not
+   `a.len()`), iteration bounded by `a.len()`; the prefix is 23·2^k and
+   aligns to the eq-hi chunks for every round that matters.
+2. Enter at fold2, not fold1: have the sparse skip→mlv fold compute the
+   round-0/1 lookahead sums in its own sweep (the resume already accepts
+   `pending2` from a "fold-level lookahead" caller), so the tail's first
+   pass is a 4→1 fold. That removes the +16% entry pass entirely.
+Prize on the 48 ms MT tail: ~−10 ms with a fold1 entry (measured −20%),
+~−15 ms with a fold-level entry; ST ~−80 ms once the entry pass is gone.
+Cost: a real build (three pieces above), ~2% of the prove. Not started.
+
+### Design notes for the prefix fold2-cascade tail, from the challenge tree — 2026-09-01
+
+The revised lever ("enter at fold2 by forming the next rounds' lookahead
+aggregates in the producing sweep") is what the challenge tree already
+does, one round earlier in its numbering: its round-2 sweep forms
+round-3's lookahead aggregates while the group's outputs are still in
+registers (`fold_round2_compact_chunk_neon_lookahead_8`,
+multilinear/kernels/aarch64.rs:791 in that tree), and the cascade
+variants repeat the trick one level deeper (round-4 pairs visited four at
+a time so the six deferred round-5 aggregates form in-register, :1096) —
+the "composed 5+6 / 7+8 / 9+10 / 11+12" markers. So the ~10–15 ms MT bet
+is de-risked structurally; the layout question (prefix interval) remains
+ours to answer.
+
+Three details that make it pay, to steal when building it:
+
+1. **One weight per group, one scaling per row.** With r' = r_next[1]:
+   eq4(2y') = (1+r')·eq5(y') and eq4(2y'+1) = r'·eq5(y'), so the whole
+   group accumulates against the single odd-lane weight w = eq_lo[2t+1].
+   Pre-scale the four A outputs by w with four REDUCED multiplies, then
+   all eight lookahead products cost one UNREDUCED multiply each. The
+   constant rescalings (κ = (1+r')/r' on the even sums, r'^-1 on the six
+   deferred aggregates) are applied once by the driver, off the hot path.
+   If a fold2 kernel carries a per-term eq weight into each product, this
+   is where the multiplies go — and it is the same eq-factoring that our
+   own `SplitEqGhash` does at the lo/hi level, pushed one level further.
+2. **Don't pre-combine the parities.** Keep the even/odd halves split
+   when a producing pass hands off; XOR-ing them first forces the
+   consumer to recompute the odd half for the lookahead's W1/W2. Costs the
+   producer nothing, drops two of the eight products: 32 PMULL per group
+   instead of 38.
+3. **Group-level `b ≡ 1` shortcut.** When all four b outputs are ONE,
+   every difference product vanishes (b0+b1 = b2+b3 = 0) and only three
+   survive — three unreduced multiplies for the group; mixed groups take
+   the full path, value-identical. Worth checking how much of our b is
+   structurally one at tail depth (round 1 of the URM sees 22 of 256 all-
+   ones K-rows; after folding by random challenges that structure is
+   gone, so this likely only helps the first tail round — measure before
+   building).
+
+Cross-tree caveat they attached and I agree with: none of this is shown
+to transfer to a prefix-interval layout; the structural part ("enter at
+fold2, form aggregates in the producing sweep") is layout-independent
+and is exactly what the per-pass split says is the win.
+
+### LANDED (marginal): lookahead ladder on the sparse tail's prefix — −4.5 ms MT — 2026-09-01
+
+Built the prefix fold2-cascade ladder in `mlv_tail_fs_sparse`, in three
+measured steps:
+
+1. `lookahead_pass!` (fold1/fold2_lookahead_into) generalized to a PREFIX:
+   eq tables sized from `rest` (the challenge suffix), iteration bounded
+   by `a.len()`, partial last chunk safe. Full-domain callers unchanged —
+   kernel tests, RS m6 transcript pins, AG roundtrips, both m=32 routes
+   verify.
+2. The ladder itself, mirroring `mlv_tail_fs_resume`'s lookahead branch
+   on the compact buffer when the live layout is a single prefix interval
+   (the shipped shape), with the `pending2` invariant carried into the
+   dense resume at handoff. Transcript-identical (roundtrips with debug
+   assertions, sparse-tail tests, m=32 verify both ways). One real bug
+   found by the sha2 roundtrip: `fold_in_place_pair` asserted a power-of-
+   two length and the in-loop resolve runs on a non-pow2 prefix — the body
+   is exact for any even length, assert relaxed.
+3. "One scaling per row" (Yukon): pre-scale the four `a` values by eq
+   (4 reduced) so the 8 products carry the weight as single unreduced
+   multiplies — 16 → 12 per position. Bit-identical by bilinearity. ST:
+   fold1-la 256.7 → 239.4 (−6.7%), fold2-la 94.7 → 91.2 (−4%), exactly
+   what the PMULL count predicts (−32 unreduced + 24 reduced). Yukon's
+   further "one weight per GROUP" (κ) trick does NOT map here: their
+   group has 2 a-values per position so one weight spans two; ours has 4
+   per position and every product needs all four pre-scaled — 4 per
+   position is already the minimum.
+
+Per-pass, prefix ladder vs classic (ST, stable): fold1-la entry 239 vs
+classic r1 207 (+16%); fold2-la 91 vs r2+r3 112 (−19%); fold2-la 19.6 vs
+r4+r5 24.9 (−21%). The steady passes pay, the entry pass does not, and
+the entry is the biggest round.
+
+MEASURED, tail total, MT default pool, alternating, min of warm proves:
+**−4.86 / −4.54 / +0.36 ms, median −4.5 ms, ladder 2/3** (on a ~67 ms
+tail inflated by residual system load — macOS's on-device inference
+service, not Yukon). ST: wash (357 vs 351). ~0.5% of the prove: real,
+marginal, kept because it is bit-identical, ~90 lines, and the platform
+the fold-level entry stands on.
+
+The fold-level entry (form the round-0/1 lookahead sums inside the
+skip→mlv fold so the tail enters at fold2) is the remaining win: it
+turns the +16% entry pass into a −19% fold2 pass over 48M. Sized: tail
+passes −22 ms MT, MINUS whatever the extra 8-product accumulation costs
+inside the fold (per block: 32 quads × 12 multiplies against the
+current round-0 message's ~128 + Horner shifts → roughly +2 multiplies
+per output, ≈ +10 MT if compute-bound, less if the fold stays gather-
+bound). Net ~−12 ms MT with wide error bars — so it gets a cost PROBE
+inside the fold before any build.
+
+### The fold-level entry, PRICED and refuted: +19 ms MT in the fold vs −22 in the tail — 2026-09-01
+
+The ladder's remaining win required forming the round-0/1 lookahead
+aggregates inside the skip→mlv fold so the tail enters at fold2. Before
+building it, its cost was measured with a probe inside
+`fold_and_first_round_sparse`'s per-block closure: the real 32-quad
+lookahead accumulation (4 reduced pre-scalings + 8 unreduced products per
+quad, weighted by a 32-entry inner-eq table, eq_outer applied per block,
+reduced across blocks) over the just-folded outputs while they are still
+in L1, result black-boxed, messages untouched (verify unchanged).
+
+| | fold, base | fold, +accumulation | Δ |
+|---|---:|---:|---:|
+| MT (default pool), 3 alternating pairs | 60.6–62.7 | 80.6–82.8 | **+17.9 / +19.3 / +22.1** |
+| ST | 317.8 | 499.4 | **+181.6** |
+
+I had estimated +5–12 MT on the theory that the fold is gather-bound and
+would hide ALU work; it does not — the extra ~148 M multiplies cost the
+same ~1.2 ns each as in the tail kernels. Against the −22 ms MT the
+ladder's passes would save by entering at fold2, the net is ~0 at MT and
++70 ms at ST. **Dead.** NEON residency (the §wideneon treatment, −16% on
+round 2) could not close a 19-vs-22 gap.
+
+So the tail is settled: the ladder with a fold1 entry (−4.5 ms MT, ST
+wash) stays; the entry cannot be moved into the fold; the general
+kernel's NEON residency (~−8 ms MT) remains the last kernel-level item.
+Probe removed; `lookahead_accum` back to private.
+
+### Commit attributed: NTT 98 + merkle 116 + lane fill 18 — at the hash roofline for rate 1/4 — 2026-09-01
+
+`FLOCK_COMMIT_TIMING=1`, m=32, warm prove 2: lane fill 17.66, ntt 98.44,
+merkle 116.45, commit total 232.59 ms. L0 is the Fast profile's rate 1/4
+(`log_inv_rate = 2`), so the L0 codeword is 2^27 F128 = 2 GB.
+
+- NTT: 2 GB in 98 ms = 0.73 ns/element. The challenge tree's L0 encode is
+  175.6 ms for 2^26 (rate 1/2) = 2.6 ns/element — ours is ~3.5× faster
+  per element. Roughly 2.5 full passes over 2 GB at ~50 GB/s.
+- Merkle: 2 GB hashed in 116 ms = 17 GB/s. The doc's two-state BLAKE3
+  kernel does 2.3–2.4 GB/s per core; 8 P-cores = 19 GB/s. ~90% of the
+  hash roofline. Yukon's merkle is 49.7 ms for 1 GB = 20 GB/s — same
+  rate, half the bytes.
+- Lane fill 17.7 (tiled earlier today, −31% ST).
+
+So our commit costs ~232 vs their ~145 pure because it encodes 4× and
+hashes 2× the bytes for the same message — the rate, i.e. protocol.
+Nothing here clears the bloat bar as implementation: the streaming
+commit / leaf-pipelining idea measured null on this tree before
+(memory: 6/12, parked), four-layer NTT fusion spills (+19–26%), and
+hashing less is a security decision, not mine.
+
+### Thread pools, and the all-core (P+E) experiments: fold marginal-and-fragile, ladder worse, lincheck null — 2026-09-01
+
+FACTS (flock-core/src/lib.rs): the global rayon pool is `init_perf_thread_pool`
+= P-cores only (8 threads, 8 MB stacks); a separate `all_core_pool()`
+(10 threads) exists for flat parallel-fors with many small independent
+items and one join, where work-stealing drains around the slow E-cores
+(its documented win: the open's combine −29% on 4P+4E). Sites hop to it
+behind `ecore_rich_topology()` = `2·E ≥ P`, which is FALSE on this 8P+2E
+M1 Max; `FLOCK_ALLCORE=1` forces the gate. So "fold 1 scales 5.2×" is 65%
+efficiency on 8 P-threads, not E-core dilution — that hypothesis is dead.
+Also explains the `RAYON_NUM_THREADS=8` trap: it disables
+`init_perf_thread_pool` AND shrinks the all-core pool to 8.
+
+Three flat-shaped phases tried on the all-core pool, same binary, env
+knobs, MT warm-min, alternating:
+- skip→mlv fold (376k independent 128-slot blocks): −2.27 / −2.53 /
+  −2.54 / **+9.24**. The outlier landed exactly when external load
+  appeared (load avg 3.3 → 6.8): under contention the E-cores become
+  stragglers at the join. −2.4 ms (0.3%) with that tail risk is below
+  the bar. Not kept.
+- tail ladder passes (thousands of chunks, 8-accumulator reduce per
+  chunk): **+1.89 / +4.59** — worse. The reduce-heavy shape is the
+  doc's straggler case. Dead.
+- lincheck (`FLOCK_ALLCORE=1`, the stripe fold's gated hop): the one
+  quiet pair +1.11 (null); two more pairs ran under a load spike
+  (absolutes 199 → 246–269) and are unreadable. Consistent with the
+  gate's design. Dead on this topology.
+
+All knobs removed; ag_skip.rs is exactly the committed ladder.
+
+### Cross-tree NTT resolved, an E-core design worth parking, and a thermal caveat — 2026-09-01 (close of the unattended session)
+
+NTT per element-update, both trees on the same M1 Max. Ours: 128 lanes
+(the union's chunk-columns, inferred from the jagged trace), 92 live,
+per-sub-NTT 2^20 at k_code = 20, layers 2..20 (the replicate-fill
+pre-applies the rate layers) → 92·2^20·18 = 1.74e9 updates in 98.4 ms =
+**0.057 ns/update** (0.067 on their denominator, which includes the
+fill). Theirs: 0.138. The apparent 3.5× per-output-element decomposes
+as ~1.39× live-column skipping (ours, structural — their commit
+transforms every column) × ~2.1× that Yukon traced on their side: their
+`butterfly_fused_4layer_row` is gated x86_64+avx512+vpclmulqdq with NO
+aarch64 arm, so on Apple silicon it falls to portable scalar — the doc's
+"four-layer NTT fusion (+19–26%)" entry is an x86-only win. Their basis
+is LCH novel-polynomial over F_{2^128} (binius64-derived) with general
+F128 twiddles, plus zero-root/low-twiddle XOR-only fused kernels — so
+"cheap subfield early layers" was NOT the difference; I retract that
+guess. Net: no NTT implementation gap on OUR side to chase.
+
+E-CORES, the design that works for them and why ours didn't: a SEPARATE
+pool at QOS_CLASS_UTILITY draining a SHARED ATOMIC CHUNK QUEUE that the
+P pool also pulls from — no barrier, an E-core owns at most one tail
+chunk when the P-cores finish, byte-identical by construction. Their
+measured E-core share: 5–16% of fold8 blocks (a tail absorber, not a
+multiplier), and their own history records the same regression we
+measured when E-cores are folded into the main pool. Our tree already
+has the scaffolding (`set_utility_qos`, the `pull()`/scope pattern in
+lib.rs used by the merkle top). PARKED: applying it to the skip→mlv
+fold (376k independent blocks) is ~30 lines with an expected −2 to −4
+ms (the all-core hop measured −2.4 before it straggled) — below the bar
+on its own; worth doing only as part of a wider E-core pass over witgen
++ fold + lane fill (~8 ms combined ceiling on 8P+2E).
+
+THERMAL CAVEAT on the closing headline: after ~3.5 h of continuous
+benchmarking the machine is throttled — `best prove_fast` reads 964–987
+ms with verify at 9.6 ms against its normal 6.2, even at a 1-minute load
+under 3 (5-minute average 5.4; iTerm at 31% from trace output). **Do not
+record those as the state.** The last clean headline is 851 ms (AG
+promotion pair, cool machine); every win today was established by
+paired same-binary deltas, which do not depend on absolutes. Re-baseline
+cold before quoting a number.
+
+### CORRECTION to the NTT decomposition above — same basis on both trees; the ~2× is unexplained — 2026-09-01
+
+Two errors in the previous entry, one mine and one relayed:
+1. "1.39× live-column skipping" is NOT a factor: my 0.057 ns/update
+   already counts only the 92 live columns, so liveness is netted out.
+   Like-for-like, we execute 1.736e9 updates in 98.4 ms against their
+   1.275e9 in 175.6 — 1.36× MORE updates in 0.56× the time. The whole
+   gap is per-update: **2.43× on our denominator, 2.06× on theirs**
+   (98.4 + 17.7 fill vs their 175.6 which includes replicate-fill).
+2. Yukon's "4-layer fused butterfly falls to scalar on aarch64" is
+   retracted by them: the scheduling gate selects the NEON fused-3 path
+   on ARM; the scalar kernel is dead code there. And radix-16 is a
+   cache-associativity wall on this microarchitecture (16 row streams
+   into an 8-way L1D), not a missing port.
+
+That left "our tower basis's cheap subfield early layers" as the
+explanation by elimination — and OUR SOURCE REFUTES IT TOO:
+`crates/flock-core/src/ntt/additive_ntt_f128.rs` carries the same
+Irreducible/binius64 header as theirs — LCH novel polynomial basis over
+F_{2^128}, `NeighborsLastReference` skeleton, general twiddles
+`Ŵ_{ℓ-l-1}(z)`, the same XOR-only zero-root replica block, fused
+2-/3-layer NEON butterflies. Same algorithm family, both derived from
+the same reference. No subfield early layers here either.
+
+So the ~2× per element-update between two implementations of the same
+LCH NTT on the same machine is REAL and UNEXPLAINED. Candidates, none
+verified: (a) lane count — ours runs 128 interleaved sub-NTTs of 2^20,
+theirs 64 of 2^20, and the SoA butterfly's streaming/vectorization
+width follows the lane count; (b) kernel tuning — the fused-3 NEON
+kernels are each tree's own work on the shared skeleton; (c) counting —
+which layers each tree's fused kernels cover per pass. It is the
+largest cross-tree implementation delta either side found today, and it
+favors THIS tree, so it is not an action item here; it is one for the
+challenge tree, where a like-for-like kernel comparison would start
+from (a).
+
+Addendum (Yukon, closing): candidate (a) is theirs to run, as a
+DIAGNOSTIC — their `log_batch_size = 6` (64 lanes) is part of the
+committed PcsParams and the ranked harness gates on it, so a 128-lane run
+changes the commitment, not just the kernel. If the streaming width turns
+out to be the difference, their fix has to come from restructuring the
+kernel at 64 lanes. Also recorded: the "tower basis" claim originated as
+my hypothesis, was promoted to a conclusion on their side without a
+source check, and was caught by reading our header — the same failure
+mode as the friendly-kernel claim in the other direction. Verify from
+source before recording an explanation, in either direction.
+
+### LANDED: fold-level lookahead entry — the sparse tail enters at fold2 — −10 ms MT, −12 ST — 2026-09-02
+
+Benedikt pushed back on the "fold-level entry is dead" verdict ("I
+fundamentally think there should be a lot to gain here") and was right,
+because the probe that condemned it was wrong in one specific way: it
+ADDED the eight-product lookahead accumulation on top of the fold's
+existing round-0 Horner message. In a fused fold the sums REPLACE that
+message (round 0 falls out of them via `lookahead_msg_first`), so the
+fair cost is the difference. Measured in stages, each gated:
+
+1. Replacement probe (scalar `lookahead_accum` on the folded outputs,
+   `s1/s_inf` gone): fold **+10.5 ms MT** (+10.8/+10.3) and +98 ST —
+   half the add-on probe's +19/+182. Oracle: m=32 verifies with the
+   sums-derived round-0 message; all AG roundtrips pass.
+2. NEON-resident formation (`fold_block_at_la_neon`: byte-dots stay in
+   q-registers off `fold_row_q_neon`, four `mul_q` pre-scalings by the
+   quad's eq weight, eight `wide_mul_unreduced_q` into `WideNeon`
+   accumulators): fold cost **+5 ms** (67.4 vs 62–64 classic, vs 70 for
+   the scalar form).
+3. The entry: `fold_and_first_round_sparse` returns the sums;
+   `mlv_tail_fs_sparse` derives round 1's message at ρ₀ via
+   `lookahead_msg_second`, samples ρ₁, and starts the ladder at round 2
+   with `pending2 = Some(ρ₁)` — the tail's first pass is a fold2 over the
+   full 48M, no fold1 entry pass. Tail 62 → 45–47 in the same
+   conditions.
+
+fold+tail, MT, alternating, warm min, same binary (knob), on a
+partially loaded machine (load 3–6): scalar entry −11.7 / −7.5 / −9.8;
+NEON entry **−10.0 / −11.1 / −21.1** (the −21 is a contended classic
+arm). ST: **−11.9**. Call it −10 ms MT, ~1.2% of the prove, on top of
+the ladder's −4.5. Transcript-identical: m=32 verifies on both routes,
+RS m6 pins unchanged, roundtrips in release and with debug assertions.
+
+One bug caught by the suite, worth recording: `sparse_tail_matches_
+dense_at_low_utilization` failed because the ladder's resolve branch
+set `store` to a single prefix interval — previously safe, since
+`pending2` could only be `Some` after a lookahead pass, which required a
+prefix. The fold-level entry starts with a deferred challenge before
+any prefix is established, so on a multi-interval layout the resolve
+must halve every interval instead. Fixed; the in-place pairwise fold
+itself never straddles an interval (128-aligned).
+
+Now the default on the sparse route (NEON on aarch64+aes, scalar
+elsewhere; the dense folds keep the Horner message). The earlier
+"fold-level entry: DEAD" entry above stands as a record of a probe that
+measured the wrong thing — the lesson is "replace, don't add" when
+pricing a fusion.
+
+### Hiding round 1 under the commit: not here — but AG round 1 was leaving the E-cores idle — 2026-09-02
+
+Benedikt asked whether AG round 1's work could hide under the commit as
+the pre-merge RS prep did, and whether the E-cores could take it. The
+answer splits:
+
+HOISTING UNDER THE COMMIT — no gain available on this box. AG round 1
+is in fact MORE hoistable than RS's in principle (no in-round challenge:
+the per-block 160-vector and C banks depend only on the witness, and
+`r_outer` enters only as the eq weight at the accumulate), but the
+commit window has no idle capacity to hoist INTO: the NTT is at ~50 GB/s
+and its top tiles already run P+E via `run_hetero_chunks`; the merkle is
+at the hash roofline and hops to the all-core pool (`merkle.rs:663`).
+The RS AB-hoist measured zero-sum here for the same reason. Hoisting
+would also have to materialize ~0.4–1 GB of eq-independent partials and
+drain them after `r_outer`. Not built.
+
+USING THE E-CORES DURING ROUND 1 — yes, and it was a gap. The "round-1
+E-core hetero drain" the merge audit listed as live is the RS round 1
+(`univariate_skip_optimized.rs:1226`); AG round 1 ran a plain rayon
+`into_par_iter` on the 8 P-cores with the 2 E-cores idle for ~49 ms.
+`round1_slp_packed_banks_fused_padded` now runs its chunk loop through
+`run_hetero_chunks_stateful` — P workers plus two utility-QoS E-threads
+pulling from one atomic counter, per-worker sums merged after — with
+chunks 4× finer (32/thread) so an E-core's last chunk cannot hold the
+join. Fiat-Shamir untouched, bit-identical up to XOR order.
+
+Measured at m=32, round-1 line, MT, alternating, warm min, same binary:
+**−2.73 / −2.77 / −4.64 ms, 3/3** (the E-cores absorb ~6% of the block
+work). ~0.35% of the prove — below the bar on its own, kept because it
+is ~15 lines on existing infrastructure with no new code path, and it
+restores what the pre-merge RS round 1 had. Verify passes on both
+routes; genus95 + sparse-tail tests and AG roundtrips pass; 637/637.
+
+Same primitive, same shape, not yet applied: the skip→mlv fold's
+376k-block loop (the all-core POOL hop measured −2.4 but straggled under
+load; the shared queue has no barrier) and witgen's group loop. ~−2 to
+−3 ms each, next if wanted.
+
+### Shared hetero queue on the skip→mlv fold: +24 ms, 3/3 — E-cores only help compute-bound phases — 2026-09-02
+
+Same primitive that landed on round 1 (−2.8), applied to the fold's
+376k-block loop: P workers + two utility-QoS E-threads pulling 320
+chunks of ~1.2k blocks from one atomic counter, per-worker lookahead
+sums merged after; the P-only arm restructured identically (raw-pointer
+block writes, rayon map/reduce) so the A/B isolates the schedule.
+
+| fold, MT, warm min | hetero | P-only | Δ |
+|---|---:|---:|---:|
+| pair 1 | 94.14 | 69.56 | +24.58 |
+| pair 2 | 92.25 | 68.97 | +23.28 |
+| pair 3 | 94.39 | 71.15 | +23.24 |
+
+Verify passes (correct), and it is a third SLOWER. Straggle cannot
+explain it (a chunk is ~1 ms P / ~3 ms E). The difference from round 1
+is what the phase is bound by: round 1 is PMULL-bound (E-cores add ALU),
+the fold is a 1 GB gather + 1.5 GB NT-store stream at ~the bus, and two
+slow extra writers into a saturated memory system cost far more than the
+~6% of work they take — the doc's "bandwidth-on-bandwidth" null (stripe
+transpose on E-cores during the commit), measured here for the fold.
+Reverted. Witgen (NT stores at roofline) is the same shape and was not
+built on that basis; if anyone wants the number, the primitive is a
+15-line drop-in.
+
+RULE, now with three data points (round 1 −2.8, fold +24, all-core
+pool hops earlier): on 8P+2E the E-cores pay only on compute-bound
+flat loops with a barrier-free queue; never on a phase at the bus.
+
+### LANDED: witgen flushes 1 KB column bursts instead of 128-byte scatters — −12 ms ST, −3 to −6 ms MT — 2026-09-02
+
+Came out of Benedikt's "can commit and round 1 share one pass" question:
+they cannot (different inputs, a challenge between them), but reading
+the commit's lane fill next to witgen's flush exposed a store-pattern
+gap. The fill writes 2 GB + reads 0.5 GB in 17.7 ms — ~140 GB/s — while
+`flush_rows_nt` wrote 1.5 GB in 25.7 ms — 58 GB/s — on the same bus.
+The 58 was never the NT-store roofline; it was the roofline for
+92 scattered 128-byte stores per group at a 4 MB column stride (one per
+page). The layout cannot change (the open and the zerocheck kernels want
+column-major, and moving z into the codeword's position-major order
+would change the fold's variable order = the transcript), but the burst
+length can.
+
+`drive_witness_batch_major_partial_into` now stages WG = 8 consecutive
+groups (64 rows) per task and flushes each chunk-column as ONE
+contiguous 1 KB burst (`flush_rows_nt_burst`); the builder, dead-lane
+zeroing and the stripe are unchanged per group. Same words to the same
+addresses — `batch_major_partial_zeroes_dummy_rows` (which compares
+against the full generator word for word), the poison guard, the AG
+roundtrips, m6 pins and m=32 verify all pass.
+
+Measured, same binary, `FLOCK_WITGEN_GROUPS` knob, m=32:
+
+| | WG=1 (old) | WG=2 | WG=4 | WG=8 | WG=16 |
+|---|---:|---:|---:|---:|---:|
+| ST micro-bench | 351.6 | 339.1 | 340.5 | **339.4** | 353.2 |
+| in-prove witgen MT (pairs, Δ vs WG=1) | — | −3.1 / −1.7 | +4.8 / −2.1 | **−4.7 / −2.7** | −6.6 / −1.2 / −5.7 |
+
+The ST knee is clean: 96–384 KB of staging (WG 2–8) is a −12 ms win;
+768 KB (WG 16) spills L2 and gives it back. MT is noisy on a loaded
+machine (load 4–6 throughout) but negative at every WG ≥ 2 bar one
+pair; WG = 8 is the most consistent at MT and at the ST optimum. Kept
+at 8. The standalone micro-bench at MT was a wash-to-worse for WG 16
+(median +4) while the in-prove line was −5.7 3/3 — the production
+path (pooled, warm, `dead_padding_unread`) is the number that counts,
+and the burst is where its store traffic goes.
+
+Remaining witgen at m=32 after this: ~26 → ~15 ms of stores, ~18 BLAKE3
+compute, ~13 stripe_from_rows, ~5 z memset, ~6 row fill. The stripe's
+own writes are already group-major and contiguous.
+
+### PRICED, NOT BUILT: witgen computes the challenge-free half of round 1 — negative — 2026-09-02
+
+Benedikt's follow-up to the one-pass question: the walker builds a and b
+as it goes, and round 1's per-block product-code work does not depend on
+the zerocheck challenge (only the outer eq weight does), so witgen could
+compute that part, write it, and a post-challenge pass could form the
+message from the stored data — "maybe more writing and reading but better
+streaming". Three facts kill it on this box:
+
+**1. Round 1's reads are not exposed (measured).** Throwaway probe: the
+production padded kernel on the m=32 shape streamed from DRAM vs looped
+over a cache-resident window with the same live block count:
+
+| | ms per m=32 |
+|---|---:|
+| streamed, 1.2 GB from DRAM | 46.4 (25 GB/s) |
+| resident 96 MB window ×11 | 48.7 |
+| resident 24 MB window ×46 | 55.5 |
+| resident 6 MB window ×184 | 77.9 |
+
+Resident is never faster; the small-window arms are slower by the
+per-call join (≈0.17–0.2 ms × calls, the E-thread tail). Round 1 is
+compute-bound at a quarter of the bus. Moving its SLP into witgen
+relocates compute and saves no memory time.
+
+**2. The challenge-free intermediate is bigger than the inputs.** Per
+1024-byte block: `af∧bf` is 160 evaluation points × 128 lanes = 2560 B,
+the transposed C banks 1024 B — 3584 B vs the 3072 B of a+b+c it would
+replace (the code's rate is 64→160). Live: 1.35 GB written into a
+witgen that is already store-bound (+10–13 ms) and read back by the
+post-challenge accumulate pass (+the 288 unreduced muls/block that stay
+there anyway).
+
+**3. a and b must still cross the ρ₀ wall in full.** The skip→mlv fold
+is a ρ₀-dependent linear functional of the raw words, so the
+intermediate cannot replace them. Variants that drop the a/b writes by
+replaying the walker (a = A·z) need two replays (round 1 + fold) at
+≤ 17.8 ms each against ≤ 17 ms of savings (a/b stores ~10, fold's a/b
+read ~7); the replay-in-fold-only hybrid nets `X − 3` for a replay cost
+X. Nothing here is positive without the a/b derivation being under
+half the builder, which would need builder surgery to even measure.
+
+The streaming picture that comes out of this: everything before ρ₀
+(witgen, commit, round 1) is compute-bound; everything after it (fold,
+tail) is bandwidth-bound; and the data crossing the wall is the raw
+witness because the fold's functional depends on ρ₀. The commit/round-1
+fusion and the witgen/round-1 fusion both fail for the same reason —
+there is no exposed memory time on the near side of the wall to hide.
+
+### REFUTED: interleaving witgen's stores with compute — pipelined flush BUILT, bit-identical, no gain — 2026-09-02
+
+Benedikt's objection to the fusion verdict above: reads, compute and
+writes can be interleaved, so the bound is exposed memory time, not
+bytes moved. Right — so the two quantities that bound it were measured
+(throwaway knobs, m=32, MT, box at load 5–13 from macOS indexing
+throughout, so absolutes are inflated and only paired deltas count):
+
+**Round 1 splits 38.5 / 8.** Skipping the eq-weighted accumulate (both
+the 160 AB `mul_acc_unred` and the 128 C-bank ones, ANDs kept live):
+46.6/47.2 → 39.0/40.7 ms. The SLP + transposes + ANDs — the part that
+could move into witgen — are 38.5 ms; the challenge-dependent
+accumulate that must stay is ~8 ms of compute, under the ~13 ms it
+would take to re-read the 1.35 GB intermediate. A post-challenge pass
+would be memory-bound at ~13.
+
+**Witgen's stores ARE exposed: 12–18 ms.** Same instruction stream with
+the NT bursts redirected into a 16384-row window (SLC-resident):
+110.7→95.7, 105.2→93.3, 102.1→83.6 ms (micro-bench, 3/3). So the
+DRAM-destined stores cost ~15 ms that the core does not hide under its
+own compute today.
+
+Ideal-overlap bound for the witgen-computes-round-1 scheme, using
+those: today `W + 46.5`; scheme `W − 15 + 38.5 + 13 = W + 36.5` →
+−10 ms at best, requiring all 2.85 GB of stores to hide under witgen's
+compute and a large restructure (round-1 kernel hosted in the
+super-group loop, +1.35 GB footprint, partial-block cleansing moved).
+
+**The cheapest test of the thesis was built instead:** a
+software-pipelined flush inside witgen — double-buffered staging, the
+previous super-group's 1 KB column bursts issued one column slice per
+group in between this super-group's BLAKE3 builds, the last set
+flushed from the worker state's `Drop`. Bit-identical (dummy-rows
+contract both arms, poison guard). Measured, same binary, knob:
+
+| | pipelined | unpipelined (shipped) |
+|---|---|---|
+| ST micro (best) | 328.9 / 328.6 / 356.8 | 333.9 / 339.5 / 323.2 |
+| MT micro (best), 6 pairs | 3/6 negative | — |
+| in-prove witgen, WG=8, 4 pairs | 44.9 / 43.2 / 45.9 / 42.6 | 43.3 / 49.9 / 44.1 / 51.7 |
+| in-prove witgen, WG=4 (393 KB staging), 3 pairs | 47.4 / 49.8 / 48.9 | 46.8 / 50.4 / 51.1 |
+
+2/4 and 2/3 on the in-prove line, medians −3 and −0.7, totals worse or
+noise. Reverted: ~60 lines of double-buffer machinery for an effect
+that does not clear the noise floor is under the bloat bar. The
+reading: the ~15 ms is the memory system absorbing 8 cores' NT bursts,
+not a shortage of independent work in the instruction window —
+reordering the issue stream at group granularity, at two staging
+sizes, changes nothing. That is the same slack the fusion scheme would
+need to hide 1.35 GB more under, so the scheme stays refuted.
+
+Side result: in-prove witgen now reads **43–47 ms** (it was ~64 before
+the dead-padding skip and the burst flush), and `[prove_union] TOTAL`
+bests were 760.6–764.7 ms across these runs on a loaded box — in the
+760–770 window predicted from the landed deltas.
+
+### LANDED: the STATISTICS LADDER — open −80..−107 ms, prove −115..−138 ms (3/3), bit-identical — 2026-09-02
+
+Benedikt asked for the open ("look at the latex, Yukon and the pre-merge
+code"). Attribution first, warm MT, m=32, `PCS_TRACE` + `LIG_PROVE_TRACE`
++ a throwaway sub-bucket probe:
+
+| open_merged 262 | ms |
+|---|---:|
+| W build + round-0 prime (2^25) | 36.6 (ST 247, evaluation-bound, materialized by measurement) |
+| merged product sumcheck, 25 rounds | 19.5 (ST 85, bandwidth-bound) |
+| combine sweep (seeded EqPoint prime + lookahead) | 46.0 (ST 332) |
+| ligerito: L0 OOD sweep | 19.7 |
+| ligerito: init folds + switch (fold 1 = 34–37 at 13+3T muls/output) | 62.7 |
+| ligerito: recursive commits, 5 levels (L1 encode 18 + merkle 9–12) | 52 |
+| ligerito: level OODs / induce / rec folds | 10.4 / 10.5 / 4.3 |
+
+Config at m=32: log_n 25, initial_k 6, ks [4,4,4,4,4], rates
+[1,3,5,7,9,11], queries [244,79,48,35,29,25], ood [1,2,2,2,2,2].
+
+**The structure that was being paid for three times.** The L0 basis is a
+sum of T = 2 rank-1 eq tensors — the seeded merged-transport point and
+the one L0 OOD point — and the six initial rounds bind exactly the six
+lane-block bits (`fold_block = 2^19`, pairs of blocks). Write the index
+as `u = e·d + h`; each term is `s_t · blk_t[e] · within_t[h]`. Then every
+L0 round message is a function of the block statistics
+`G_t[e] = Σ_h f[e,h]·within_t[h]` — 64 values per term — and the six
+array folds compose into one 64-term fold `f'[h] = Σ_e eq(r,e)·f[e,h]`
+straight into F256. The incremental ladder instead swept the 2^25 witness
+for the combine's prime+lookahead (46), swept it again for the OOD (20),
+then folded it through five passes with the virtual basis evaluated per
+output (63). This is the challenge tree's "direct fold" (Yukon: rounds
+0..4 cost 0.13 ms there; their kill-switch A/B prices the chain at −14 MT
+/ −119 ST on their open), which the regraft verdicts had filed as "dead
+by protocol" because their CODE was tied to the 100-bit basis open. The
+ALGEBRA is not: it needs a rank-1 basis and lane-major block rounds,
+which the f256 ladder has. Re-derived, not ported.
+
+Built (`pcs::STATS_LADDER_OVERRIDE` / `FLOCK_NO_STATS_LADDER` same-binary
+knob; `extension::init_phase_statistics`): one sweep computes both terms'
+statistics (2 muls/element), the OOD eval and β come from the 64-entry
+tables, the round messages are `stats_round_msg` over the folded block
+tables (the `(u_0,u_2)` convention with each term's rank-1 factor
+hoisted: `Σ_h (f_0+f_1)(B_0+B_1) = (blk_0+blk_1)(G_0+G_1)`), the fold is
+`fold_blocks_by_eq` (64 mixed F256×F128 muls per output over h-chunks),
+the switch basis is `Σ_t s_t·blk_t[0]·within_t[h]`, and the existing
+`code_switch_and_push_message` takes over. The combine skips its sweep
+under the same gate. Same field elements in the same transcript slots,
+so proof bytes are identical — `tests/stats_ladder.rs` is the oracle
+(small geometry always-on; the m32 leaf as `--ignored` microbench).
+
+Measured. m32 leaf inner open (2^25 words, 56/64 lanes, alternating
+in-process arms on one committed stack): stats ladder = sweep 12 +
+rounds 0.01 + fold 9 + basis 0.4 + switch 11 ≈ 34 ms vs combine 42 +
+L0 OOD 21 + init folds 69 = 132 ms; open **204.6 vs 298.9 min (−94),
+−91 median, proof bytes identical**. In-prove, same binary, 3 pairs:
+
+| pair | open stats / ladder | TOTAL stats / ladder |
+|---|---|---|
+| 1 | 162.9 / 262.1 | 630.3 / 768.2 |
+| 2 | 177.8 / 257.2 | 643.5 / 758.7 |
+| 3 | 161.2 / 268.0 | 636.4 / 772.3 |
+
+**Open −80..−107, prove −115..−138 ms, 3/3; best prove 630.3 ms** (the
+previous best on this box was 760.6). The TOTAL moves ~35 ms more than
+the open bucket — the ladder no longer allocates fold 1's two 256 MB
+F256 transients and gives the 512 MB witness back right after its one
+fold, so the pool sees less churn (the non-local pool lesson, this time
+in our favour); not chased further.
+
+Certification: fold_lookahead oracle, stats_ladder oracle, prover
+roundtrips, poison guard, core ligerito (73) and pcs (164) suites pass;
+workspace suite, fmt, x86 check and an m=32 prove+verify below.
+
+What remains in the open after this (warm MT, ~163): recursive commits
+52 (L1 encode 18 at 7.5 G updates/s vs the main commit's 17.6 — Yukon's
+L1 runs 10.1 with EIGHT lanes, so lane count is not the cause; their
+reference is twiddle register residency across row tiles,
+`butterfly_fused_3layer_rows` hoisting the seven twiddle loads out of
+the row loop — a loop-nest change worth measuring here; their sizing
+caution: radix-8 fused-3 already sits AT the M-series 8-way L1D
+associativity limit (16 concurrent row streams alias into one set), so
+tile the rows but never widen the radix, and pair the tiling with the
+zero-root variant that keeps four twiddle registers live), W build 37,
+merged sumcheck 19.5 (an alternating skip/fold2 schedule would cut its
+traffic ~45%, ≈ −8 MT / −40 ST), level OODs + induce ~21 (F256
+promotions of base-valued 2^20 bases: ~−6 with mixed-field kernels),
+switch 11.
+
+### LANDED: W build with the column factor baked into per-column fold tables — −7 ms MT, −60 ST — 2026-09-03
+
+Benedikt: "there was a big win taking advantage of the eq tensor
+structure during open?" — that was the statistics ladder (and, before
+the merge, the virtual basis and the JIT W_rho: the same principle,
+never materialize an eq tensor). The one place left where an eq tensor
+was still multiplied element by element: the merged transport's weight
+`W[d] = Σ_i φ_i(eq_row_i[r]·eq_col_i[c])` — per element and per RS
+claim, one field multiply by the hoisted column factor, then the
+16-lookup byte-table map φ_i. The column factor is constant across a
+whole column segment and `x ↦ φ_i(eq_col[c]·x)` is F₂-linear, so its
+byte decomposition IS a fold table: bake `Ψ_c = φ_i ∘ (eq_col[c]·)` per
+column (92 live × 64 KB per claim, ~1 ms MT to build, parallel over
+columns) and the slot costs the 16 lookups only.
+
+| W build, m=32 | baked | multiply |
+|---|---:|---:|
+| MT (3 pairs) | 25.4 / 25.1 / 25.4 | 32.2 / 31.7 / 32.4 |
+| ST (1 pair) | 166.9 | 227.1 |
+
+Same field elements, so W and everything downstream are identical: the
+m6 merged-union proof-bytes pins pass, workspace 638/0, x86 check
+clean, m=32 verify passes. The probe knob and the multiply path were
+deleted (the baked form is unconditional).
+
+### REFUTED: tiled NEON radix-8 in the recursive commits' NTT — deep pass +1.0 ms, top −0.5, net loss — 2026-09-03
+
+Yukon's L1 finding (their recursive L1 encode runs FASTER per update
+than their main commit; ours 2.4× slower than ours) and their reference
+— twiddles held in vector registers across a tile of rows,
+`butterfly_fused_3layer_rows` — pointed at our recursive commits (52 ms,
+L1 encode 16–18). Our tree already HAS that kernel (the ranked top pass
+of the main commit uses it, hetero-scheduled), but the recursive commits
+enter through the generic `from_layer` driver: a portable per-row-group
+fused-3 top pass (one rayon item per 8 rows × 16 lanes = 2 KB) and a
+fused-2 (radix-4) + single-layer deep pass over 2 MB sub-groups.
+
+Built: the NEON tiled kernel with a `live` lane bound, used (a) in the
+generic top pass as (block, tile) jobs on the hetero queue and (b) in
+the deep pass wherever ≥ 3 layers remain, `zero_root` detected from the
+twiddles. Measured at m=32 with a top/deep split timer, same binary,
+3 pairs, L1 = log_d 19 / 16 lanes / start layer 3 / n_top 6:
+
+| L1 | radix-8 | shipped |
+|---|---|---|
+| top pass (layers 3–5) | 2.48 / 2.58 / 2.55 | 3.01 / 3.17 / 2.79 |
+| deep pass (13 layers) | 12.93 / 12.88 / 12.88 | 11.93 / 11.84 / 11.86 |
+| L1 encode | 16.90 / 16.95 / 17.03 | 16.42 / 16.61 / 16.27 |
+
+L2 (1/32) 7.1 vs 6.5–7.3, L3 (1/128) 2.95 vs 3.0–4.0: wash. The main
+commit never enters this driver (it takes `from_message`), so nothing
+moved there. Reverted. Reading: at 16 lanes a row is 256 B = 4 lines,
+and the radix-8 deep chain keeps 8 row streams live whose strides are
+multiples of the L1 set period — 32 lines contending for 8 ways, the
+wall Yukon's tree documents ("radix-8 is the widest fusion that fits";
+here it does not, at this lane width, in L2-resident sub-groups). The
+top pass gains from tiling/hetero but is only 3 ms. Yukon's own L1 at
+8 lanes runs 10.1 G updates/s to our 7.5 with a different layer
+schedule (`from_message_fused3` writing the first radix-8 result
+straight from the compact message); that is a from_message path for
+the recursive levels, a larger port, parked. Lane count is not the
+cause (their 8 lanes beat our 16).
+
+### REFUTED: alternating skip/double-fold schedule on the merged product sumcheck — 2026-09-03
+
+The L0 ladder's schedule (skip a round via lookahead coefficients,
+then fold two challenges in one pass) applied to the transport's
+25-round product sumcheck `Σ_d q[d]·W[d]` (19.5 MT / 85 ST; ~45% less
+traffic on paper). Built twice, both byte-identical (m6 pins, the
+lookahead and stats oracles, pcs suite), both measured against the
+saved baseline binary, alternating, 3 MT pairs + 1 ST pair:
+
+| | merged SC MT | W build MT | merged SC ST | W build ST |
+|---|---|---|---|---|
+| baseline | 17.9 / 17.9 / 17.7 | 25.0 / 25.0 / 25.1 | 81.6 | 166.4 |
+| A: round-1 lookahead fused into the W build | 11.6 / 12.1 / 11.4 | 29.8 / 30.8 / 29.2 | 79.0 | 205.9 |
+| B: entry at a round-0 fold+lookahead pass | 16.2 / 16.1 / 16.0 | 24.6 / 24.7 / 26.0 | 107.7 | 168.1 |
+
+A: −6.2 on the sumcheck but +5.0 on the evaluation-bound W build (+40
+ST) — net −1 MT, +37 ST. B: −1.8 MT, +26 ST. Neither clears the bar.
+Mechanism: these passes are one multiply per element and already
+within ~1.3× of compute-bound at MT; the lookahead's extra products
+(the 8-unreduced-mul quad accumulator) tip them over, so the traffic
+saved is repaid in PMULLs, and at ST it is pure loss. The zerocheck
+ladder won because its per-element compute (eq-weighted products)
+dwarfed the lookahead; the transport sumcheck has no such cover.
+Reverted; do not retry without a cheaper lookahead.
+
+### LANDED: mixed-field intake for the level OOD and induced bases — level OODs −5.7 MT, induce −3.3 MT (−24 / −13 ST) — 2026-09-03
+
+The recursive levels' OOD bases (`eq(z, ·)`, 2^20 at level 1, two per
+level) and the induced query basis (2^19, transported across the split
+as the pairs `(B_j, 0), (0, B_j)`) are base-valued, and so is the table
+`f` they meet — every level's OOD and induce run right after a code
+switch, on the split coordinate words. The intake nevertheless promoted
+each basis to F256 (a 32 MB allocation and write), formed the round
+message with F256×F256 products (three F128 multiplies each), split the
+induced basis into a second 64 MB array, and glued with F256×F128
+products into both limbs. Sub-bucket probe: OOD introduce 6.4, induce
+introduce 2.8, glue 3.4 ms MT — and these three scaled only ~3.5× ST→MT
+(page faults on the fresh 32–64 MB promotions).
+
+Now (`PendingBasis::{Base, PresplitBase}`): the OOD evaluation and its
+`(u_0, u_2)` are three F128 products per pair in one sweep; the
+presplit message is `u_0 = Σ f_0·B_j`, `u_2 = (S, S)` with
+`S = Σ (f_0+f_1)·B_j` (two products per pair, since `u·B = (0, B)` and
+`(1+u)·s = (s, s)` for base `s`); glue adds `B_j·β` into `c0` (Base) or
+into `c0` of the even slot and `c1` of the odd slot (PresplitBase).
+Same field elements, no promotion, no split array. Alternating against
+the saved baseline binary, m=32, warm min:
+
+| | level OODs | induce |
+|---|---|---|
+| MT new / base (3 pairs) | 5.6 / 4.7 / 4.6 vs 10.3 / 10.6 / 10.4 | 7.3 / 6.9 / 7.0 vs 11.0 / 10.0 / 10.0 |
+| ST new / base | 11.7 vs 35.9 | 23.0 vs 36.2 |
+
+Open (pairs 2–3) −17 / −16 ms; **best prove 601.4 ms**. Bit-identical:
+m6 merged-union proof-bytes pins, prover roundtrips, core pcs suite,
+the stats-ladder and fold-lookahead oracles. The promoted intake
+(`introduce_extension`) is deleted.
+
+### LANDED: the L0 Merkle was hashing every leaf on the generic path — merkle 116 → 39 ms MT, commit −78, prove −67..−90 — 2026-09-03
+
+Benedikt: "commit + zerocheck + lincheck should be cheaper now than
+before, because the AG skip is so much better — investigate." The
+investigation went through the 09-01 commit attribution, which had
+declared the merkle "at the hash roofline for rate 1/4, 2 GB". The
+L0 rate is 1/2 (`Blake3Setup::new` → `log_inv_rate 1`; the ligerito
+config's `log_inv_rates[0] = 1`), so the codeword is 2^26 F128 = 1 GB
+and 116 ms is 8.6 GB/s — HALF the roofline that entry itself quoted
+(2.3–2.4 GB/s per core), and half Yukon's 20 GB/s.
+
+Cause: `blake3_hash_many_leaves` dispatched the 8-way NEON kernel only
+for leaf sizes 64/128/256/512/1024 ("leaf sizes are `16 << log_batch_
+size`, so only powers of two arise" — true before the integer-lane
+commit). The union commits `commit_lanes` = 46 lanes at m=32, so the
+leaf is 736 bytes, and every one of the 2^20 leaves went to the generic
+per-leaf `blake3::Hasher` (parallel across leaves, single-stream
+inside). Fix: the kernel takes the last block's true length (a short
+final block is zero-padded, as BLAKE3 specifies — `compress2` now takes
+the block length instead of a constant 64), and the batcher accepts any
+single-chunk leaf (`1..=1024`), tail leaves on the generic path. Same
+chunk CVs, same roots.
+
+| m=32 | new | base |
+|---|---|---|
+| merkle MT (3 pairs) | 39.8 / 39.2 / 39.3 | 116.7 / 121.1 / 115.6 |
+| commit MT | 154.4 / 146.1 / 150.2 | 232.9 / 229.9 / 222.3 |
+| prove TOTAL MT | 583.8 / 554.4 / 540.4 | 651.1 / 643.5 / 625.7 |
+| merkle / commit / total ST | 314 / 1008 / 3206 | 941 / 1640 / 3938 |
+
+Yukon's correction on the bytes: the integer-lane L0 codeword stores
+only the 46 live lanes — 46 × 2^20 × 16 B = 736 MiB, not 1 GB — so the
+old merkle ran at 6.3 GB/s and the new one at 19.8 GB/s on the all-core
+pool, the same rate as theirs (21.6). **Best prove 540.4 ms under load
+17** — the previous best was 601. Certified: 24 merkle unit
+tests including the new sizes (1, 16, 32, 48, 63, 100, 736, 1000), m6
+merged-union proof-bytes pins (roots identical), roundtrips; workspace,
+fmt, x86 and m=32 verify below.
+
+And the answer to the question: pre-merge commit + zc + lincheck was
+262 + 120 + 19 = 401 (with ~130 ms of RS round-1 prep hidden under a
+stall-rich commit); now it is ~150 + ~170 + ~20 = 340 — cheaper by
+~60 ms, all of it from this fix. Before it, the sum was 405–415: the
+AG skip's saving (RS round 1 165 ms all-in → AG 48) was cancelled by
+round 1 no longer having a commit window with idle capacity to hide
+in, and by the merkle running at half speed.
+
+### E-cores, second pass: witgen and the W build join the P+E queue (−2 and −1.5 ms MT, 3/3); the statistics sweep does not — 2026-09-03
+
+Benedikt: "can we try again to engage the efficiency cores?" The rule
+from 09-01 stands (E-cores pay on compute-bound flat loops, never on
+phases at the bus), and three compute-bound loops had landed since:
+the statistics sweep and fused fold in the open, and the witness
+builder's super-group loop; the W build (lookup-bound) was the fourth
+candidate. All four went on the shared queue (`run_hetero_chunks` /
+`_stateful`, two utility-QoS E-threads) behind one knob; same outputs
+by construction (which worker runs a chunk cannot change its result;
+dummy-rows contract, m6 pins, pcs suite pass). Two alternating runs,
+3 pairs each, m=32 MT, warm min:
+
+| bucket | on / off (run 1, all four sites) | on / off (run 2, witgen + W build only) |
+|---|---|---|
+| witgen | 35.6 / 38.2, 37.2 / 38.5, 34.5 / 39.0 | 34.8 / 37.4, 37.4 / 38.7, 35.9 / 38.0 |
+| W build | 23.4 / 25.4, 23.3 / 25.8, 24.3 / 24.1 | 24.5 / 24.9, 23.9 / 25.7, 23.9 / 25.5 |
+| stats sweep | 14.0 / 10.8, 13.3 / 10.8, 13.7 / 10.9 | (rayon) |
+| fused fold | 8.6 / 8.7, 8.6 / 8.5, 8.4 / 8.6 | (rayon) |
+| prove TOTAL | 564 / 543, 552 / 539, 556 / 540 | 563 / 549, 538 / 535, 540 / 545 |
+
+Witgen −2.6/−1.3/−2.1 (6/6 across both runs) and the W build −0.4..−2.5
+(5/6) are kept, knob stripped: the builder is BLAKE3 compute and the W
+build is L1-table lookups, both flat. The statistics sweep LOSES
++2.5..+3.2 (3/3) — it streams 512 MB at ~47 GB/s, so two slow extra
+readers on a near-saturated bus hold the join (the fold/witgen lesson
+again); the fused fold is a wash. Both open sites reverted to rayon.
+The TOTAL cannot resolve a −3.5 ms bucket effect at load 7–13 (run 2:
++14 / +3 / −5); run 1's +12..+21 on the total is the sweep's loss plus
+noise. Kept on the same evidence standard as round 1's queue (−2.8,
+3/3 on its bucket).
+
+### Three-way, refreshed: pre-merge close vs the challenge tree vs now — 2026-09-03
+
+Yukon's column is their verified-quiet-window warm min (±2%); ours is
+today's traced run at load 6–10 (±5%; best clean total today 540).
+m=32, CPU-only, grinding off.
+
+| MT (ms) | pre-merge (08-27, old protocol) | Yukon (100-bit class, no union) | now (128-bit f256 split, union) |
+|---|---:|---:|---:|
+| witness | 30 | 28.6 | 35.4 |
+| commit | 262–266 (~130 of RS round-1 prep hidden inside) | 229.1 (ntt 175.6, merkle 49.7; 83 of round-1 A/B precompute hidden inside) | 151.4 (ntt 93.9, merkle 40.4, fill 16) |
+| zerocheck | ~120 (35 visible round 1) | 110.5 (round 1 30.8 visible, ≈114 true; round 2 48.2; tail 30.5) | round 1 48 + fold 41–67 + tail 46–72 |
+| lincheck | 19 | 17.2 | 14–18 |
+| open | 28–30 | 22.1 (recursive commits L1 7.1, L2 2.0) | 144.2 (ladder 34, W 25, merged SC 19, rec commits 48.5) |
+| **total** | **464.5** | **381.2 (687.7k c/s)** | **570 this run / 540 best (485k c/s)** |
+
+| ST (ms) | pre-merge | Yukon | now |
+|---|---:|---:|---:|
+| witness | 231 | 205 | 258 |
+| commit | 1268 | 1670 (ntt 733, merkle 383, A/B 552) | 1000 (ntt 630, merkle 312) |
+| zerocheck + lincheck | 1467 + 124 | 767 + 117 | 994 |
+| open | 147 | 101 | 760 |
+| **total** | **3230** | **2860** | **3149** |
+
+Reading: single-threaded we are now under pre-merge (3149 vs 3230) on
+the stronger protocol and within 10% of the challenge tree; the commit
+is the cheapest of the three at both widths (their ntt is 175.6 on 1.36×
+fewer element-updates — our NTT's ~2.5× per-update lead is now the
+largest single kernel difference in our favour, still unexplained on
+their side); zerocheck + lincheck at MT is ~165–175 clean against their
+127 visible / ~210 true; the open is the whole remaining gap (144 vs
+22) and is protocol: the f256 two-point-OOD split with per-level OOD
+binding and the union transport, whose five recursive commits alone
+(48.5) exceed their entire open. Ratios on the best total: 1.16× vs
+pre-merge (1.89× at merge time), 1.42× vs Yukon (2.1× at merge time).
+
+### BLOCKED BY THE RECURSIVE VERIFIER: four-level Fast/Slim ladder — proof −12.9 KB natively, but the tower envelope cannot hold the 16× residual — 2026-09-03
+
+From the measured proof breakdown at m=32 (462,052 B): L0 285,184
+(62%), L1 55,136, L2 33,280, L3 23,424, L4 19,072, L5 16,224 (its 25
+queries × (256 B row + paths) + cap, plus a 512 B residual). Dropping
+a level removes its block and replaces the clear residual with the
+previous level's, 16× larger per step (2^(dim+1) words: 512 B at L5,
+4 KB at L4, 32 KB at L3, 256 KB at L2). Four levels: −12.1 KB
+predicted, ~−3.5 ms prover (L5's commit + rounds + OODs + induce), and
+a smaller verifier (−25 leaf and −275 pair hashes, −254 FS compressions
+for the level's bytes, +64 for the residual; +450 residual multiplies
+against −400 query-consistency ones). Three levels would be a size
+wash for another ~5 ms; two levels is +203 KB. Benedikt chose four as
+the default.
+
+Where the level count lives: the security derivation
+(`LigeritoSecurityConfig::derive_profile_ladder` →
+`derive_ladder_shape_tuned`, stopping rule "recurse while the residual
+has > 5 column bits"), baked into the embedded TOMLs
+(`configs/ligerito/m{22..35}_{profile}.toml`, regenerated by
+`gen_ligerito_configs`) that the prover, the native verifier AND the
+tower's recursive verifier (`tower/geometry.rs`: "the allocation is
+config authority, never proof-derived") all read — so one rule change
+moves all three consistently. The rule is now per profile: Fast/Slim
+stop at ≤ 8 residual bits; Fast100/Slim100/Secure keep 5 (Fast100 is
+the frozen pre-list-decoding cost point, pinned by
+`ligerito_security_config_fast100_reproduces_pre_128_schedule`), and
+the legacy small-m `default_config` (the element R1CS path at
+`MIN_M_WORDS = 8`, which needs ≥ 1 level) keeps 5 too. 28 TOMLs
+changed (every Fast/Slim m loses exactly one level; at m=32 the ladder
+is 19 → 16 → 13 → 10 → 7, residual 2^8 words). The wire format is
+unchanged (same fields, shorter vectors), so proof-IO stays v22.
+
+Built and gated: the per-profile rule, 28 regenerated TOMLs, and the
+re-pins (m6 merged-union fixtures: 4 digests + the BLAKE3/SHA-256
+anchors; the 7 mixed-class fixtures; the element-only transcript shape;
+the m29 config test) — workspace 638/0, fmt, x86, and at m=32 **proof
+449,180 B (−12,872, −2.8%)**, verify passes, prove 537 ms. Then the
+tower's recursive-verifier e2e (`chain_spine_converges`, passing at
+HEAD in 81 s) FAILED: "slot 6 exceeded its 2^14 row capacity". The
+tower is a fixed envelope (nu = 14, every physical slot < 2^14 rows,
+pinned to the m29 node's measured geometry) and its residual
+consistency check is emitted per query per eight-word chunk of the
+clear residual, so the residual's size multiplies MAC rows. Census
+(`FILL_CENSUS=1`, node envelope, 5 → 4 levels; the probe widened nu to
+15 to get the counts):
+
+| slot | HEAD | four levels |
+|---|---:|---:|
+| el701 extension MAC (2^14 physical limit) | 16384 | 17158 |
+| el600 base MAC | 12316 | 19816 |
+| el882 eight-way residual accumulation | 742 | 5168 |
+| b3 BLAKE (the dropped level's paths) | 6808 | 6413 |
+
+The hash saving is real (b3 −395 rows) but the residual's MACs cost
+~13× more rows than that, el701 was already at exactly 2^14, and at
+nu = 15 a further slot overflowed. Making it fit means either nu = 15
+across the envelope (mu 23 → 24: roughly 2× rows per recursion node,
+far more than 12.9 KB per proof is worth) or a redesign of the in-circuit
+residual consistency (evaluate the residual's encoding once per level
+instead of per query). My earlier in-circuit estimate counted hashes
+and missed that this circuit's per-query residual MACs dominate.
+NOT LANDED. The complete change (rule, TOMLs, re-pins) is preserved as
+`scratchpad/four_levels.patch` (33 files); the tree is back at HEAD.
+Decision pending: revert (keep five), pay the envelope, or redesign
+the residual gate.
+
+### LANDED: the seeded term's block statistics come from the merged sumcheck — ladder sweep 10.6 → 6.6 ms MT — 2026-09-03
+
+Benedikt: keep five levels, keep pushing the open. Under this protocol
+the open's implementation floor is ~120 ms against ~144 now; this is
+the largest certain piece of that slack. The inner open's claim sits
+at the merged sumcheck's own point ρ (`PackedDirectClaim { point: rho,
+eq_ind: EqPoint(rho) }`), in the same coordinate convention the
+statistics ladder uses (coordinate j ↔ index bit j, LSB pairing), so
+the merged sumcheck's folded witness after `log_n − initial_k = 19` of
+its 25 rounds — the 64-entry `a` array before round 19 — IS
+`Σ_h f[e,h]·eq(ρ_{0..19}, h)` per lane block: the seeded term's block
+statistics, which the ladder had been sweeping the 512 MB witness a
+second time to recompute. Dead blocks past the live prefix are honest
+zeros of `q` (the trimmed fold never writes them), so the capture
+zeroes the untouched tail. The 64 values ride
+`open_batch_mixed_ligerito_seeded` → the prover impl →
+`init_phase_statistics`, whose sweep then covers the OOD term alone
+(one multiply per element instead of two). Exact: the same field
+elements by reassociation, so proof bytes are identical (m6 pins;
+the stats-ladder oracle still exercises the sweep path, which the
+microbench's claim without a merged sumcheck takes).
+
+Alternating vs the HEAD binary, m=32 MT, warm min, box at load 8–13:
+
+| | seeded stats | HEAD |
+|---|---|---|
+| ladder sweep | 6.68 / 6.84 / 6.43 | 10.41 / 10.96 / 10.38 |
+
+−3.9 ms, 3/3; the rest of the ladder (fold ~8.7, switch 5–17 under
+load) and the totals are noise at this load. Workspace, fmt, x86 gates
+below.
+
+### LANDED: the code switch fused into the ladder's fold and basis — switch 7.7 → 0.7 ms MT — 2026-09-03
+
+After the ladder's one fused fold, the code switch still ran three
+conversions before its message: `split_coordinates` (2^19 F256 → 2^20
+F128 words, 16 MB), the promotion back to F256 (32 MB), and
+`split_basis` (2^19 → 2^20 F256, 32 MB) — each a fresh allocation and
+a pass. The fold now writes its output directly in the switch's form
+(`fold_blocks_by_eq_split`: the split coordinate words `(c0, 0),
+(c1, 0)` at `2h, 2h+1`, promoted) and the basis is materialized already
+split (`materialize_folded_basis_split`: `B'[h], u·B'[h]`), so the
+switch is `round_msg_fbase` alone. Same field elements (m6 pins, the
+stats oracle).
+
+Alternating vs the seeded-statistics binary, m=32 MT, warm min, box
+at load 11–15:
+
+| | fused | HEAD |
+|---|---|---|
+| switch | 0.77 / 0.61 / 0.69 | 7.74 / 7.71 / 10.04 |
+| fold (now writes 32 MB split) | 11.6 / 11.1 / 9.5 | 8.6 / 8.6 / 9.6 |
+| basis | 0.56 / 0.56 / 0.59 | 0.43 / 0.32 / 0.54 |
+
+Switch −7 (3/3), fold +1..+3 at this load (pair 3 a wash; the extra
+16 MB of writes cannot cost 2 ms on a compute-bound pass, so most of
+that is the load), net ≈ −4 on the ladder; the open bucket resolved
+−0.4 / −1.0 in the two clean pairs, and the prove's best total is now
+**521.2 ms**. Workspace, fmt, x86 gates below.
+
+### REFUTED (below the bar): two transposed-NTT layers per pass in the induced-basis builder — 2026-09-03
+
+The L0 induced basis (`induce_sumcheck_poly_via_ntt`: scatter 244 query
+weights, apply the transposed additive NTT `Fᵀ` over 2^20, keep 2^19)
+ran its twelve dense layers past the sparse-window prefix as twelve
+passes over 16 MB. Fusing two layers per pass (inner sub-block
+butterflies, then the outer across-halves butterfly, per element — the
+same operation order, `induce_sumcheck_poly_via_ntt_matches_dense` and
+the m6 pins byte-identical) measured, alternating vs HEAD at m=32 MT:
+induce 6.73 / 6.33 / 6.71 vs 6.91 / 6.68 / 8.11 — −0.2 / −0.35 (/ −1.4
+under a load spike). The array is SLC-resident and the top layers stay
+single-layer anyway, so there was ~0.3 ms in it. Reverted; not worth
+its 40 lines. Prove best in this run: **500.2 ms** (both arms; load
+had dropped to ~8), open ~136 ms.
+
+### LANDED: block-first merged sumcheck from column statistics (stage 1 of the direct transport) — open 137 → 109 ms MT — 2026-09-04
+
+The merged reduction's prover side materialized the twisted weight W
+over the dense cube (2^25 words, 25 ms) and ran 25 rounds on (q, W)
+(21 ms). Neither is necessary when the committed stack is a
+full-height column prefix (identity compaction — the union at full
+utilization; `jagged::rectangular_prefix_columns`, public data):
+split the dense index as (block e of two lane columns | column bit c0
+| row r). Every ring-switch weight is then a sum of 256 RANK-1 terms
+`c_j · u(e)^{2^j} · (eq(z_col0,c0)·eq(z_row,r))^{2^j}` (linearized Φ +
+the eq tensor factoring over column bit 0 vs bits 1..6), masked to the
+live prefix on the e side, and a packed-direct group is two more. The
+first k−1 = 6 rounds bind the block coordinates from O(64) BLOCK
+STATISTICS per term, `S_{j,c0}[e] = (eq(z_col0,c0)·Σ_b β_b^{2^-j}
+T[2e+c0][b])^{2^j}`, where T is the column bit-bank
+`T[c][b] = Σ_r eq(z_row,r)·bit_b(q[c,r])` — for the AB claim exactly
+the lincheck's `z_vec` (free); for the C claim one more stripe fold at
+the zerocheck's row point (`lincheck::union_bitbank_fold`, 12.6 ms,
+outside the open). After the block rounds q is folded once over the
+bound coordinates (one read of q) and W′ is written in closed form on
+2^19 entries (block factor into the linearized coefficients, c0 into
+per-c0 byte tables); the 19 row rounds run on (q′, W′). ρ arrives in
+round order (blk, row) and is rotated into coordinate order before the
+assist/inner open; the verifier (`verify_batch_merged_core`) and the
+tower's replay (`child_walker.rs`: `w_coords` beside the round-order
+`w_rounds`) apply the same rotation under the same predicate. Proof
+size and verifier work unchanged. Doc: new §"The prover's transport:
+block-first rounds from column statistics" in
+`docs/capacity-free-ring-switching.tex`.
+
+Bug found on the way (caught by `element_only_union_roundtrip`,
+PcsOpen(VirtualOpen)): the scalar-group terms were unmasked past the
+live prefix. The verifier's Ŵ(ρ) is the MLE of the weight that is
+ZERO past the area, and the product sumcheck's messages see W at dead
+columns through each fold pair's cross terms even though q vanishes
+there — the mask is exact, not cosmetic. The prover's own debug oracle
+(`v == w_eval`) does not catch it; only the chain does.
+
+Costs (PCS_TRACE, m=32 MT): block statistics 3.6, block rounds + q′ +
+W′ 9.5, row rounds ~1 → merged sumcheck 14 ms (was 25 + 21). Against
+it: the C-claim bank fold 12.6 and the lost statistics-ladder seed
+(the seeded term was the merged sumcheck's fold at 2^19 in ITS
+coordinate order, which the block-first order no longer produces:
+ladder sweep 6.8 → 10.7).
+
+Alternating vs the HEAD binary (base4), m=32 MT, warm min, 3 pairs:
+
+| pair | new open / cfold / total | HEAD open / total |
+|---|---|---|
+| 1 | 109.5 / 12.6 / 510.8 | 137.3 / 539.4 |
+| 2 | 108.8 / 12.4 / 504.1 | 136.5 / 550.6 |
+| 3 | 108.2 / 12.7 / 511.1 | 136.7 / 518.5 |
+
+Open −28 ms 3/3; net of the C fold ≈ −15 expected, totals −27 mean
+(noisy at ±15). Prove best **504.1 ms**. Pins moved (full-utilization
+layouts only, as predicted): `merged-anchor-blake3-m22`,
+`merged-anchor-sha2-m22`, `elem-merged-nu12-full`; the partial
+fixtures and the transcript shape are byte-identical. Gates: fmt
+clean, workspace (release) 638 passed / 0 failed, tower e2e
+`chain_tower_e2e_with_lane` (--ignored) ok with the rotation, x86
+check ok.
+
+Next (stage 2, parked): re-seed the ladder from the block-first fold
+(the 2^19 q′ IS a fold of q over the top coordinates — the ladder
+wants the fold over its own initial coordinates; check which six it
+binds), and the full fusion (inner open at the F256 point).
+
+### ADJUDICATED (blocked by the tower envelope, not built): stage 2 — the full fusion of the transport into the Ligerito open — 2026-09-04
+
+Design (the "direct fold" completed): drop the merged sumcheck
+entirely and make W the inner open's L0 basis. Under the rectangular
+predicate W is 256 rank-1 terms per RS claim (+2 per scalar group) —
+the stage-1 `(A, S)` tables — so the ladder's six F256 block rounds run
+off the same statistics (`stats_round_msg` over 512 terms: ~0.5 ms),
+the existing fused fold gives the level-1 witness in F256, and the
+level-1 basis is W′ in F256 in closed form (byte tables with F256
+weights, ~2.5 ms). The OOD term keeps its sweep. Prover ceiling from
+the measured pieces: merged sumcheck 14 + ladder seed-sweep share 4 +
+F128 q′ fold folded into the F256 fold → **≈ −11 ms on the open**
+(109 → ~98), the assist prover disappears (it was off the critical
+path), the assist proof leaves the transcript (smaller proof, cheaper
+native verify).
+
+Why it is blocked: the verifier must then evaluate Ŵ at the ladder's
+F256 point (the residual pairing's `eval_b_residual`), i.e.
+Σ_j c′_j·eq(z^{2^j}, σ) with σ ∈ F256^{m−yr}. Every form of that is F256
+work: the closed form is 128 × (m − yr_log) F256 multiplies per claim
+(~4k F256 ≈ 12k F128 MAC rows for two claims, plus 6.4k squaring
+chains); the assist re-run at an F256 point triples its 3.2k
+square-root chains and 3.2k prefix products. The Frobenius trick that
+keeps the residual side cheap (yr is F128-valued per split coordinate,
+so ŷr(z^{2^j}) = ŷr(z)^{2^j}) does not help the bound coordinates. In
+the recursive verifier those rows are extension-field
+multiply-accumulates — type el701 — and the live census of
+`chain_tower_e2e_with_lane` today reads
+`el701 16384/16384` (el0 spine 9708, el600 mac 12316, el700 126):
+the type is AT its 2^14 ceiling, the same ceiling the four-level ladder
+overflowed by 774 rows. The fusion needs thousands there. The union's
+ν is shared by every slot, so ν = 15 doubles the node. No F128-point
+formulation exists: the moment W (or W′) is the Ligerito basis, its MLE
+is needed at the F256 challenges; the 25 F128 transport rounds are
+exactly the price of keeping the assist at an F128 point.
+
+Net: −11 ms (2%) of prover against an unlandable recursive verifier at
+ν = 14. Not built; parked behind a residual-gate redesign or ν = 15.
+
+What is still open on the F128 side of the transport tax (~13 ms at
+m=32 after stage 1): the C-claim bit-bank fold (12.6 ms, the stripe
+kernel at its lookup rate) could share ONE sweep with the lincheck's
+AB fold via a two-point sum table (32-byte entries, one lookup per
+byte for both points) — a kernel variant, est. −8..−9 ms if the fused
+lookup costs ~1.3× a single one; the q′ fold (5 ms) and the ladder's
+seed sweep (4 ms) are at the F128-multiply rate and have no cheaper
+form.
+
+### IN PROGRESS: full fusion, phase A (prover + native verifier) — checkpoint 2026-09-05
+
+Reversal of the adjudication above, on the user's push: the recursive
+verifier CAN take the fusion. Two facts changed the picture. (1) el701 is
+the residual-consistency row type (per query per 8-word chunk) and the
+basis never enters the query checks, so it stays at 16384 untouched; the
+fused verifier's F256 products are multiply-adds in SPINE form (el700,
+126 live of 16384) and its Frobenius twists act on the base-field claim
+point only (F128 squaring chains, el0, roughly offset by the assist
+gadget they replace). (2) Under the fusion the prover DEFINES the basis,
+so it uses the FULL-cube weight (q vanishes on dead columns, the target
+is identical) — then Ŵ at the ladder's point is a plain product of
+twisted eq factors with NO live-prefix term, i.e. count-independent: the
+fused verifier needs none of the tower's deferred layout claims (today's
+"count win" defers exactly the count-dependent W-side evaluations).
+
+Built and verified (phase A): `ligerito::extension::FusedL0` (rank-1
+terms + a level-1 builder) rides the statistics ladder in place of the eq
+basis (`init_phase_statistics` takes `seeded: Option`, `fused: Option`;
+the OOD term keeps its sweep; W′ is added to the split basis); the prover
+branch in `open_batch_merged` under `rectangular_prefix ∧ lane_major ∧
+initial_k + 1 == k_cols` (public) builds the unmasked terms, W′ from two
+F128 byte tables (the F256 coefficients' components), and calls
+`open_fused_ligerito` (label `flock-pcs-open-fused-v0`, no packed-direct
+intake); the verifier branch (`verify_fused_ligerito`) evaluates Ŵ at the
+residual through `recursive_verifier_with_basis_succinct`'s residual
+closure (`fused_weight_residual`, Frobenius powers incremental). The
+proof carries no merged rounds, no assist (`frobenius: Option`,
+`q_eval = 0`, all bound by the verifier). Round trips: lib 50/50,
+element-only, mixed-class tamper oracles, m6 anchors (BLAKE3 m22 is
+fused; SHA2 m22 and the element fixtures stay on stage 1 — their ladder
+does not bind exactly the block coordinates).
+
+Measured so far (desktop load 30–90, NOT a clean window): proof
+462,052 → 453,789 B (−8,263, the assist); native verify at parity after
+the Frobenius fix (was +2.7 ms with per-j recomputation); open −3.6 ms in
+the two unpolluted pairs against an expected ≈ −7..−10 from the buckets
+(merged sumcheck 14 → 0; ladder sweep −4; W′ +2.5; terms' F256 cast
++0.7). Clean A/B pending a quiet machine.
+
+Phase B (recursive verifier, `child_walker.rs` only — `real_walker`
+serves the jagged tower children): tape parser with optional multipoint
+region / packed-direct intake (fused label); native replay with
+`running = target`, the Ligerito spine seeded from the target, no anchor;
+the deferred JaggedAssertion empty (`verify_batch_merged_deferred` must
+fill it — today it panics on the fused branch, which is exactly how
+`chain_spine_converges` fails now); circuit: drop the multipoint/anchor
+gadgets, the 25 merged-round gates and the two `alslot` descents; the
+residual close-out without the eq(ρ) pd term (`query.rs`); the new
+pairing gadget per RS claim from `xab_pw`/`xc_pw`: squaring chains of
+the claim point (26 × 127, el0), bound products with the ladder
+challenges (≈ 20 per j, el700), `s_{c0,j}` via family-H coefficients,
+the two yr-half MLEs per split coordinate and their Frobenius chains,
+and the F256×F128 sums as spine256 rows. Budget from the live census:
+el0 ≈ 9.7k − 6.4k + 7.6k, el700 ≈ 0.1k + 6.5k, el600 ≈ 12.3k (keep the
+F256×F128 products in el700), el701 unchanged.
+
+### IN PROGRESS: full fusion, phase B (recursive verifier) — the residual twist repriced — 2026-09-05
+
+Built so far (compiles; `chain_spine_converges` reaches the circuit
+witness): the tape parser returns the multipoint region and the
+packed-direct intake as `Option`s; the child walker takes fused chain
+children (native replay seeds the Ligerito spine from the merged target,
+no anchor, `m_mp2` from the commitment; the circuit skips the multipoint
+intake, the ĝ/e_at kernel and the anchor-expect, opens the spine on an
+advice target connected to the in-circuit `tgt_w`, and closes the
+residual with a new pairing gadget); the residual close-out takes an
+optional eq(ρ) term; `emit_family_h` exposes the γ-scaled coefficient
+wires; the deferred layout export keeps its claim structure (honest
+claims at a fixed zero column point) so the accumulator and merge shapes
+are unchanged — the first-level fold accepts it. Real (mixed) children
+are untouched.
+
+The finding: the residual side does NOT twist for free. I had assumed
+`ŷr(z^{2^j}) = ŷr(z)^{2^j}` for the residual witness's MLE (it is
+base-field valued per split coordinate); that needs its COEFFICIENTS in
+F2, and they are F128 words — Frobenius is F2-linear, not F128-linear.
+Confirmed with a native oracle in the walker (`TEMPORARY PROBE`): the
+Frobenius-trick twin disagrees with `pcs::fused_weight_residual`; the
+direct per-position form agrees for both children (rs and scalar-group
+parts separately). The cheapest exact in-circuit form is the monomial
+one: `ŷr(z^{2^j}) = Σ_S Y_S·m_S^{2^j}` with `Y_S` the F2-combinations
+of the yr words (free) and `m_S` the 2^{yr_log−1} residual monomials, so
+per claim `Σ_{c0,S} Y_{c0,S}·Σ_j g_j·(κ_{c0} m_S)^{2^j}`: 32 squaring
+chains (4.1k rows) + 4.1k F256×F128 MACs on top of the point chains
+(20 coords, 2.5k) and the bound prefixes. Two claims ≈ 23k new rows
+against the ≈ 14.5k the assist and merged rounds free (incl. the 8,128
+el701 value-twist rows): net ≈ +8.5k rows per chain child (≈ +12% of
+the region), and it fits the 2^14 type ceilings only by splitting the
+chains and MACs across el700/el701/el0 (el700 ≈ 12k of 16k, el701 ≈
+12.5k, el0 ≈ 9k) — feasible, tight, and still to be built and debugged.
+
+Against it: leaf prover −7..−11 ms est. (clean A/B pending a quiet
+machine), proof −8,263 B, native verify ≈ parity. Decision handed back
+to Benedikt; the tree holds phase A + this partial phase B as WIP.
+
+### MEASURED: the fusion's leaf number, and a witgen cold-page hazard on this desktop — 2026-09-05
+
+Quiet-window A/B (a waiter ran it at 1-min load 3.3; 5 pairs, grind-free,
+min of 3 proves), fused (phase A) vs stage 1 (`base5`):
+open 108.0/106.6/106.2/104.1/107.0 vs 115.8/118.6/110.8/106.6/110.1 —
+fused wins 5/5, mean −6.0 ms. Totals went the OTHER way 5/5 (+16 ms
+mean). Steady-state A/B (bench knob `BLAKE3_RUNS=8`, min over 8 proves;
+both arms rebuilt with the same bench file): witgen 56 vs 36 ms (3/3),
+open −5 mean, commit / zc+lc / C fold equal — the whole loss is witgen,
+whose code is identical in both trees.
+
+Hunt (all same-binary, a prover-only `FLOCK_NO_FUSION` probe since
+stripped): the pool's big-class takes and misses are identical in both
+modes at steady state (three witness takes from the 2^25.5/2^26 classes,
+four 2^25.5 misses in the open — 3 GB of fresh mappings per prove, same
+both ways); the eviction traces are identical (≈20 evictions per prove
+pair, 3–4 in the 2^25 class); kernel decompression deltas are within the
+desktop's noise. The discriminator was a page-touch probe on the three
+witness buffers right after witgen takes them: 3–4.5 ms after a stage-1
+open, 44–100 ms after a fused open, same binary, same process. The
+buffers arrive COLD: this box holds ≈ 27 GB in the memory compressor
+(34 GB RAM, load 10–90 all day), idle pooled pages get compressed, and
+`try_take_f128` hands out the OLDEST equal-capacity buffer. A one-line
+"most recently returned first" tie-break FLIPPED it (fused touch 22–25,
+stage-1 touch 55–65, totals reversed by 40–100 ms) — so this is a
+pool-order accident amplified by memory pressure, not a property of
+either transport; reverted, nothing to fix in the pool.
+
+LESSON (benchmark discipline): on this desktop the witgen phase can
+swing ±20–60 ms per prove from which pooled buffer it receives; a change
+that alters the open's buffer traffic changes that lottery. Compare the
+phase you changed (per-phase buckets), and use the page-touch probe when
+a phase you did not touch moves.
+
+Verdict on the fusion's leaf: open −5..−8 ms (≈ 1–1.5%), less than the
+−11 estimate — the 513-term F256 ladder rounds, the F256 W′ build and
+the terms' F256 cast cost ≈ 5 ms the estimate underpriced. Proof
+−8,263 B, native verify at parity. The recursive-verifier gadget (above)
+would add ≈ +8.5k rows per chain child. Decision stays with Benedikt.
+
+### PARKED: the full fusion — code reverted to stage 1, patch saved — 2026-09-05
+
+Benedikt's call on the measured numbers: open −5..−8 ms (1–1.5%),
+proof −8 KB, native verify at parity, against ≈ +8.5k rows per chain
+child in the recursive verifier and several more hours to finish the
+monomial residual gadget. The code of phases A and B (25b62fd, caa80cd)
+is reverted to the stage-1 tree; the write-up stays here and in the
+LaTeX doc; the diff is saved as `fusion_phase_ab.patch` (scratchpad,
+2,976 lines) for a future tower with room in its extension row types.
+The bench's `BLAKE3_RUNS` knob and the cold-page lesson stay.
+
+### LANDED: scratch-pool retention 24 → 48 — the zerocheck's giants stop re-faulting every prove — prove best 444.5 ms — 2026-09-06
+
+Found while chasing the fusion's witgen lottery (above). With
+`FLOCK_POOL_TRACE` on an 8-prove process, the pool at steady state
+holds ≈ 25 entries (a dozen small ladder/query buffers plus the big set:
+witness ×3, codeword, the zerocheck's four 2^25.5-word giants, the fold
+outputs), so at `MAX_POOLED = 24` it overflowed on EVERY prove and the
+most-populated-class rule evicted the 2^25-class giants during the open's
+gives; the next zerocheck then missed four times ("MISS (fresh)",
+2^25.5 words each) and re-mapped ≈ 3 GB of fresh pages per prove —
+≈ 197k page reclaims per prove in `/usr/bin/time -l`. Lifting the cap to
+48 keeps the working set; peak RSS is unchanged (7.2–7.9 GB in every
+configuration — the buffers exist during every prove anyway; retention
+only adds idle footprint). A warm-first (LIFO) tie-break was tried in the
+same experiment and is harmful in both settings (it re-routes the giants
+onto the 2^26 buffers and the codeword misses instead; with cap 24 it
+also cold-starts witgen at 87–101 ms): the pool keeps oldest-first.
+
+Same binary (`FLOCK_POOL_MAX` probe, since stripped), steady state
+(`BLAKE3_RUNS=8`, min), 4 alternating pairs, load 13–17:
+
+| pair | cap 48 total / zc+lc / open | cap 24 total / zc+lc / open |
+|---|---|---|
+| 1 | 444.5 / 150.9 / 106.8 | 540.1 / 213.7 / 111.8 |
+| 2 | 462.0 / 154.2 / 105.6 | 525.3 / 194.8 / 110.7 |
+| 3 | 490.2 / 165.8 / 108.9 | 545.5 / 206.3 / 114.1 |
+| 4 | 490.1 / 172.1 / 106.9 | 546.7 / 185.1 / 113.8 |
+
+Total −55..−96 (mean −68, 4/4), zerocheck+lincheck −39 mean, open −5.5
+mean, witgen and commit unchanged, misses 45 → 12 per 9 proves (the
+warm-up only), page reclaims ≈ 2.0M → 1.0M. Prove best **444.5 ms**.
+The 2026-07-28 byte-budget experiment recorded in `scratch.rs` moved
+nothing because it ranked eviction by bytes at the same COUNT cap; the
+count was the constraint. Gates: fmt clean, workspace (release) 638
+passed / 0 failed, tower e2e `chain_spine_converges` (84 s) and
+`chain_tower_e2e_with_lane` (28 s) ok, x86 check ok.
+
+### MEASURED: no other leak — steady-state faults 660/prove, RSS flat; the storms are the compressor — 2026-09-06
+
+A per-phase probe (minor faults via `getrusage` + RSS via `ps`, since
+stripped) on the cap-48 tree, 5 proves: at steady state the whole prove
+takes ≈ 660 minor faults (≈ 10 MB: witgen 36, commit 2, zerocheck +
+lincheck 10, open 611 — the ladder's small transients), and RSS holds
+at 7.86–7.87 GB across proves (no drift, no leak). Zero pool misses
+after warm-up (one stray 2^25.5 take per ~7 proves when the count
+crosses 48 momentarily). The remaining fault load in `/usr/bin/time`'s
+per-process totals is storms: one prove in the run took +52,764 faults
+in witgen (824 MB, 165 ms) and +39,006 in commit (609 MB, 319 ms) while
+the desktop's load hit 34 — the kernel had compressed our resident
+buffers between proves and witgen/commit re-faulted them. That is the
+machine, not the prover: on a box without memory pressure it does not
+happen, and the only in-process mitigation (wiring the pool's ~7 GB
+with `mlock`) is a dedicated-box knob, not something to land blind.
+
+### REFUTED: wiring the pool with `mlock` — no benefit on a quiet box; prove best 438.3 ms — 2026-09-06
+
+Benedikt closed the desktop's heavy processes (load 5 → 8–10 during the
+run, compressor 27 GB → 7 GB, 14 GB free, `ulimit -l` unlimited). Same
+binary, an opt-in probe pinning every pooled buffer of 2^22 words and up
+(since stripped), 4 alternating pairs × 8 proves:
+
+| pair | pinned min / med / max | unpinned min / med / max |
+|---|---|---|
+| 1 | 442.3 / 446.0 / 498.6 | 438.3 / 455.2 / 521.7 |
+| 2 | 456.7 / 459.4 / 495.5 | 447.1 / 449.3 / 464.8 |
+| 3 | 457.9 / 459.9 / 497.9 | 464.8 / 466.8 / 484.4 |
+| 4 | 473.4 / 477.8 / 509.5 | 475.7 / 484.3 / 515.0 |
+
+No effect on the minimum, median or maximum (mixed signs, within ±10);
+per-phase minima equal (witgen 33.5–34.4 both, commit, zc+lc, open);
+pinning ADDS ≈ 63k minor faults per prove (the `mlock` walks) and holds
+the wired set out of the compressor's reach permanently. With nothing
+to pin against, nothing to gain — the storms of the loaded box did not
+recur (max within 10% of min in every run). Not landed. The quiet-box
+numbers themselves: prove best **438.3 ms** (min over 8), witgen 33.6,
+commit 147.2, zerocheck + lincheck 146.6, open 101.3 — the campaign's
+lowest, and the reference for the next A/Bs (`blake3_proof_base7` is
+the cap-48 binary).
+
+### REFUTED: fusing the C-claim bit-bank fold into the lincheck's sweep (two-point stripe kernel) — 2026-09-06
+
+The idea: the union lincheck's fold and stage 1's C-claim bank read the
+same 512 MB stripe with different row weights, and the C row point is
+known before the lincheck runs; a two-point kernel (32-byte sum-table
+entries holding both points' subset sums, sixteen NEON accumulators, one
+index computation and two adjacent loads per stripe byte) would sweep
+once. Built (`partial_fold_packed_z_neon_oblock_dual_padded` + dual
+dispatchers + `union_bitbank_fold2` + `..._with_grinding_and_bank`,
+375 lines; bit-identical to two single folds by unit test, and all
+proof-byte pins unchanged).
+
+First the regime: the production kernel at m=32 (useful bits 92·128)
+runs 85.9 ms on one thread, 22.6 on four, 14.4 on eight — 6.0× at
+eight, 37 GB/s of stripe. Per byte it sustains ≈ 1.4 lookups per cycle
+on one core: core-throughput-bound (extract, address, 16-byte load,
+XOR), not DRAM-bound; the 40 GB/s figure was a coincidence.
+
+Then the A/B (fused vs `base7`, 8-prove steady state, min, alternating):
+
+| pair | fused sweep (both points) | two passes (lincheck + C fold) |
+|---|---|---|
+| 1 | 25.4 | 14.4 + 13.5 = 27.8 |
+| 2 | 28.3 | 15.5 + 13.4 = 28.8 |
+| 3 | 27.2 | 14.0 + 13.4 = 27.3 |
+| 4 | 31.0 (load spike to 19) | 15.2 + 14.4 = 29.6 |
+
+Mean −0.3 ms; totals a wash. The second point costs its own load and
+XOR per stripe byte; only the extraction and addressing are shared
+(≈ 5% of the work), and halving the stripe traffic buys nothing for a
+kernel that is not bandwidth-bound. Reverted; the diff is saved as
+`dual_fold.patch` (scratchpad). Verdict on the transport tax: the
+C-claim fold (12.6 ms) is at the lookup rate and has no cheaper form;
+with the q′ fold (5) and the ladder's seed sweep (4) at the multiply
+rate, the remaining ≈ 13 ms of stage 1's tax is protocol-shaped.
+
+### MEASURED: three-way breakdown — pre-merge f035ddb / post-merge 0e973e3 / current, single- and multi-thread — 2026-09-06
+
+Asked for before merging main again: where the time went between the
+branch tip before the first main merge (f035ddb, 2026-08-27, the old
+`prove_fast` R1CS-Ligerito pipeline), the tip right after it (0e973e3,
+"merge main step 8", 2026-08-31, the union pipeline as merged) and the
+current tip (616f322 + cap-48, `blake3_proof_base7`). Three saved
+binaries from their own worktrees, m=32 BLAKE3, run in a quiet window
+(load 3.5–4.7, after the desktop's heavy processes were closed), 3
+measured proves each, per-phase minimum; grind off unless noted. The
+pre-merge pipeline is a different protocol (one direct Ligerito open,
+no ring switches, 24 KB smaller proof), so its phase labels are its own.
+
+Multi-thread (default pool), ms:
+
+| phase | pre f035ddb | post 0e973e3 | current |
+|---|---|---|---|
+| witness generation | 30.6 | ≈ 70 (outside the prove timer: bench best − prove total) | 35.0 |
+| commit | 262.6 | 233.0 | 151.8 |
+| zerocheck + lincheck | 118.1 + 22.1 = 140.2 | 284.1 | 149.4 + 12.7 (C-claim bank) = 162.1 |
+| open | 29.5 | 240.4 | 105.3 |
+| prove, bench best | **458.9** | **853.8** | **452.4** |
+| prove, grind on / verify | 470.4 / 5.1 | 867.1 / 6.9 | 453.2 / 6.1 |
+| proof bytes | 437,679 | 460,552 | 462,052 |
+
+Single-thread (`RAYON_NUM_THREADS=1`), ms:
+
+| phase | pre f035ddb | post 0e973e3 | current |
+|---|---|---|---|
+| witness generation | 234.2 | ≈ 335 (as above) | 263.3 |
+| commit | 1,310 | 1,711 | 1,017 |
+| zerocheck + lincheck | 1,510 + 125.5 = 1,635.5 | 1,566 (later runs ≈ 1,750) | 1,064.5 + 86.8 = 1,151.3 |
+| open | 148.0 | 1,377 | 571.6 |
+| prove, bench best | **3,280** | **5,250** | **2,920** |
+
+Reading. The union pipeline arrived at 1.86× the old pipeline's prove
+time (854 vs 459 ms MT; 5.25 vs 3.28 s ST) — every phase but commit
+slower, the open 8× (two ring-switched claims plus the merged open
+where the old path had one direct open). The campaign since took the
+union prove to 452 ms MT / 2.92 s ST: −47% / −44% against its own
+starting point, and now under the old pipeline on both threads (−1.4%
+MT, −11% ST) while carrying the union protocol's larger proof (+5.6%).
+Per phase against the old pipeline: commit −42% (leaf pipeline, 8-way
+NEON BLAKE3, any-size leaf batching), zerocheck + lincheck +16% (the AG
+zerocheck is faster than the old packed one, but the union lincheck and
+the C-claim bank are new work), open 3.6× (the transport that the
+block-first rounds and the ladder cut from 240 to 105 — the remaining
+gap to a single open is the protocol, see the stage-2 adjudication).
+Single-thread is the cleaner picture of work done: commit and zerocheck
+both under the old pipeline; open the one phase that costs more.
+
+### LANDED: origin/main (43f0eee) merged into the branch — phase-0 crate split absorbed, no prover regression — 2026-09-07
+
+Main moved on by 36 commits since the last merge (8a36c91): the phase-0
+refactor that splits `flock-core` into `flock-field`, `flock-hash`,
+`flock-merkle`, `flock-multilinear`, `flock-parallel`,
+`flock-transcript` (with re-export shims left in core), a repo-wide
+import normalization (explicit import lists, `wildcard_imports = deny`
+in the workspace lints, clippy `-D warnings` in CI), and the tower PRs
+#44–#47 (walker_common, driver, root verifier, wire). Thirty files
+conflicted; every conflict was import-shaped except the rename targets.
+What had to be re-homed by hand:
+
+- `run_hetero_chunks`, `run_hetero_chunks_stateful`, `set_utility_qos`
+  → `flock-parallel` (which owns the all-core pool), re-exported from
+  core so the eight call sites are unchanged.
+- The 8-message NEON BLAKE3 kernel (`blake3_neon.rs`) and the any-size
+  leaf batcher, serial leaf/parent hashers and prehashed-level tree
+  finisher → `flock-merkle::hashing` (+ its crate-parity test);
+  main's power-of-two-only dispatch replaced.
+- `FLOCK_NO_GRIND` and the BLAKE3 default in `FsChallenger::new` →
+  `flock-transcript`; `HashKind::default()` stays BLAKE3 in
+  `flock-hash` (the one semantic divergence from main, kept).
+- Stage 1's `w_coords` rotation re-applied in main's restructured
+  child walker (three sites + the residual-rotation parse).
+- Proof flavor: main's `FLAVOR_TOWER_ROOT = 5` collides with our AG
+  flavor, now `FLAVOR_R1CS_LIGERITO_AG = 6`.
+- Our benches taken whole where main only re-styled their imports.
+
+Gates: fmt; `cargo check --workspace --all-targets` clean (0 warnings);
+CI's `clippy --release --workspace --all-targets -- -D warnings` clean
+(25 function-local wildcard imports of ours rewritten to explicit
+lists; `-A unknown_lints` locally because CI's newer clippy knows a
+lint this toolchain doesn't); x86 leg (`--target x86_64-apple-darwin`,
+`-C target-cpu=sapphirerapids`) clean; workspace release tests
+644 passed / 0 failed / 78 ignored; tower `chain_spine_converges`
+(100 s), `chain_tower_e2e_with_lane` (30 s), and CI's two tape pins ok.
+All proof-byte pins unchanged (no fixture regeneration).
+
+Merged binary vs `blake3_proof_base7` (pre-merge control), m=32, grind
+off, 8-prove steady state, min, 4 alternating pairs:
+
+| pair | merged | control |
+|---|---|---|
+| 1 | 439.2 | 448.2 |
+| 2 | 463.5 | 460.2 |
+| 3 | 475.0 | 478.7 |
+| 4 | 479.5 | 476.4 |
+
+Mean −1.6 ms, mixed signs; every phase within ±4 ms with mixed signs
+(witgen 34.3–35.2 both; commit, zerocheck + lincheck, open all paired
+within noise). The box was not quiet (load 9–12), which the pairing
+absorbs. The merge costs nothing; `blake3_proof_merged` is the new
+control.
+
+### MEASURED: the Yukon `flock-challenge` frontier added to the comparison — GPU-assisted 1.65× us, CPU-only ≈ 10% MT / equal ST — 2026-09-07
+
+Benedikt asked for Yukon in the three-way. The Yukon benchmark
+(`eigenlabs/flock-challenge`, mac track; local checkout
+`/Users/buenz/flock-snark-fast-mac`) is the old direct-open `prove_fast`
+pipeline with a different statement — F128, SHA-256 Merkle, 19-bit fold
+grinding, no zerocheck grinding, no union — and a **Metal GPU** commit,
+GPU zerocheck fold, GPU grind and GPU keep-warm (`gpu_commit.rs`, 15k
+lines; kill switches `FLOCK_NO_GPU_*`). Its leaderboard frontier is
+f81bb5d (commit c35c1c4, 2026-08-27, pepedesigner): 1,851,759 c/s on the
+CI runner (10 P-cores, M3 Max class, median 141 ms). The local
+checkout is three weeks behind that (c576e683) and carries a codex
+agent's uncommitted measurement knobs; its last local score was 630,803
+c/s on 2026-08-25 and its last edit 2026-08-27 — no agent process is
+running now.
+
+Two arms built in sandbox clones (the agent's tree untouched): the
+frontier c35c1c4 and the local snapshot (c576e683 + the agent's diff),
+each with two measurement-only grafts (the agent's `FLOCK_NO_GRIND`
+knob; the bench's duplicate global allocator stubbed, which the newer
+library makes necessary). Same harness as the three-way: this M1 Max
+(8P+2E, 32 GB), m=32, best of 3, breakdown min of 3, grind off unless
+noted, load 3–6. The Yukon tree's breakdown pass is instrumented and
+its phases sum ABOVE its wall time (MT: 379 vs 266; ST: 3.38 s vs
+2.86 s), so its phases are upper bounds — compare wall times.
+
+| | current (ours) | Yukon frontier, as the benchmark runs it (GPU) | Yukon frontier, GPU off | local snapshot (GPU / GPU off) |
+|---|---|---|---|---|
+| prove MT, best | **438.0** | **265.6** | **383.9** | 268.1 / 414.9 |
+| prove ST, best | 2.91 s | 2.63 s (GPU still engaged) | 2.86 s | 2.60 / 2.87 s |
+| prove MT, grind on | 445.3 | 275.1 | 793.2 (CPU grind) | 273.6 / 386.9 |
+| verify | 6.0 | 3.6 | 6.2 | 3.1 / 2.9 |
+| proof bytes | 462,052 | 437,551 | 437,551 | 437,551 |
+
+Per phase, MT (ms, min of 3):
+
+| phase | current | Yukon frontier (GPU) | Yukon frontier (GPU off) |
+|---|---|---|---|
+| witness generation | 34.9 | 29.2 | 28.8 |
+| commit | 150.2 | 147.1 | 231.6 |
+| zerocheck + lincheck | 145.9 + 12.3 (C bank) = 158.2 | 115.2 + 12.7 = 127.9 | 124.2 + 17.7 = 141.9 |
+| open | 105.9 | 74.4 | 81.5 |
+| wall, best | 438.0 | 265.6 | 383.9 |
+
+Per phase, ST (ms; Yukon GPU off):
+
+| phase | current | Yukon frontier |
+|---|---|---|
+| witness generation | 266.8 | 212.5 |
+| commit | 1,012 | 1,670 |
+| zerocheck + lincheck | 1,055 + 86 = 1,141 | 860 + 117 = 977 |
+| open | 562 | 524 |
+| wall, best | 2,910 | 2,860 |
+
+Reading. As the benchmark runs it, the Yukon frontier proves in 266 ms
+on this box against our 438 — 1.65× — and 141 ms on the runner. Switch
+its GPU off and the gap is 384–407 vs 438–451 ms multi-threaded (≈ 10%)
+and nothing single-threaded (2.86 vs 2.91 s). So the CPU work is equal;
+Yukon's CPU-only edge is parallel efficiency (MT/ST 7.4× vs our 6.6×:
+its E-core helper pool drains and keep-alive spinners), and its real
+edge is the GPU, which our campaign rules exclude. Phase by phase,
+CPU-only: our commit is far cheaper (150 vs 232 MT, 1,012 vs 1,670 ST —
+8-way NEON BLAKE3 against SHA-256); their zerocheck and open are
+cheaper (F128 statement, no union lincheck, no zerocheck grinding, one
+direct open against our two ring switches plus merged open); their
+witness generation is 15–20% cheaper. Their proof is 5% smaller and
+verifies in half the time. Note for any future ST comparison: under
+`RAYON_NUM_THREADS=1` the Yukon tree still uses the GPU (2.63 vs
+2.86 s) — kill it explicitly. Binaries: `blake3_proof_flock-yukon`,
+`blake3_proof_flock-yukon-wip` (scratchpad); clones `/Users/buenz/
+flock-yukon` (c35c1c4 + grafts) and `/Users/buenz/flock-yukon-wip`.
+
+### LANDED: origin/main 3877687 (PRs #48–#51) merged on top — one fixture re-pin, prover unchanged within noise — 2026-09-07
+
+Main took four more PRs this morning (tower op-schedule #48, the span
+counter #49 with proof-IO v22 → v23, R1CS base-matrix sharing #50,
+the node CSC cache #51): 36 files, ten overlapping ours, all
+auto-merged except the m=6 proof-byte fixtures, where both sides had
+re-pinned (ours for the BLAKE3 default, main for the v23 header byte).
+Re-pinned from the merged tree: the four merged bundles moved, the
+header-less anchors did not; two deterministic print runs agreed.
+Gates: fmt, CI clippy, x86 leg, workspace release tests 649/0/78,
+tower spine/lane e2e and both tape pins. A/B (merged vs the previous
+merge, m=32 grind-free, 8-prove min, 4 alternating pairs): 440.3 /
+446.5 / 448.8 / 460.0 vs 443.1 / 444.1 / 443.4 / 446.2 — mean +4.7 ms
+with mixed signs, the last pair under a load spike (8.9–15); per phase
+every bucket within ±3 ms with mixed signs. Nothing in these PRs
+touches the m=32 prove path; treated as unchanged.

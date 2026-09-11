@@ -102,7 +102,7 @@ pub struct BlockR1cs {
     /// Useful bits per block: rows `[0, useful_bits)` of each block carry real
     /// witness data; rows `[useful_bits, 2^k_log)` are zero padding (and have
     /// empty rows in `a_0/b_0`). Default `1 << k_log` (no padding). The prover
-    /// can use this to skip URM work on chunks that fall entirely in padding.
+    /// can use this to skip univariate round message work on chunks that fall entirely in padding.
     pub useful_bits: usize,
     pub a_0: SparseBinaryMatrix,
     pub b_0: SparseBinaryMatrix,
@@ -261,7 +261,7 @@ impl BlockR1cs {
     // these).
     // -----------------------------------------------------------------------
 
-    /// Witness padding descriptor for URM / PCS work-skipping under this
+    /// Witness padding descriptor for univariate round message / PCS work-skipping under this
     /// layout. Both are single-run [`crate::zerocheck::PaddingSpec`]s tiling
     /// the whole domain (the kernels' fast path). RowMajor: per-block useful
     /// prefix (padding interleaved at each block's tail). BatchMajor: the
@@ -285,7 +285,7 @@ impl BlockR1cs {
     /// coordinates. RowMajor address order is `[inner-rest | batch]`;
     /// BatchMajor is `[dim6 | batch | chunk]` with the inner-rest coords
     /// being `[dim6, chunk…]`.
-    pub fn x_ab_from_mlv(&self, z_skip: SkipPoint, mlv: &[F128]) -> QuirkyPoint {
+    pub fn x_ab_from_multilinear_values(&self, z_skip: SkipPoint, mlv: &[F128]) -> QuirkyPoint {
         let inner_rest_len = self.k_log - self.k_skip;
         assert_eq!(mlv.len(), self.m - self.k_skip);
         match self.layout {

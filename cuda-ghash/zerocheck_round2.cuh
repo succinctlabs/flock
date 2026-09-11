@@ -1,6 +1,6 @@
 // Zerocheck round-2 fold-at-z on GPU — port of the fold half of
 // src/zerocheck/multilinear.rs::uni_skip_fold_and_round_pair_optimized_packed.
-// Folds the packed witness a/b at the URM challenge z (over the skip domain)
+// Folds the packed witness a/b at the univariate round message challenge z (over the skip domain)
 // into a_mlv/b_mlv (F128, length 2^(m-6)):
 //   a_mlv[row] = Σ_{j=0..8} foldtable[j*256 + a_packed[row*8 + j]]   (UniSkipFoldTable)
 // The first multilinear message is then the eq-weighted deg-2 message over

@@ -21,9 +21,9 @@
 
 \title{Capacity-Free Ring Switching for Jagged\\ Polynomial Commitments}
 \author{DRAFT --- author list and references to be settled}
-\date{July 27, 2026 --- revised September 3, 2026\\
-{\small (the shipped claim grouping, the coefficient closed form,
-pipeline status)}}
+\date{July 27, 2026 --- revised September 10, 2026\\
+{\small (protocol only; engineering measurements live in
+\texttt{docs/yukon-optimizations.tex})}}
 
 \begin{document}
 \maketitle
@@ -242,33 +242,32 @@ circuit} --- constant-lane folds at a wired transcript point.
 The twists can be moved off the claim points and onto $\rho$. Writing
 $a_d := \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c}, \colof(d))$,
 the $j$-th statement of Theorem~\ref{thm:main} is
-$\sum_d \eq(\rho, d)\, a_d^{2^j}$; since squaring is additive in
-characteristic $2$ and $\eq(\sigma, d)^2 = \eq(\sigma^2, d)$ at
-Boolean $d$ (Lemma~\ref{lem:transport} in the $\rho$-slot),
-\[
-  \textstyle\sum_d \eq(\rho, d)\, a_d^{2}
-  \;=\;
-  \bigl(\sum_d \eq(\rho^{2^{-1}}, d)\, a_d\bigr)^{2},
-\]
-and iterating,
+$\sum_d \eq(\rho, d)\, a_d^{2^j}$; pulling the $2^j$-th root through
+the sum (Frobenius is additive, and
+$\eq(\sigma, d)^{2^{-j}} = \eq(\sigma^{2^{-j}}, d)$ at Boolean $d$ ---
+Lemma~\ref{lem:transport} in the $\rho$-slot),
 \[
   \fjag\bigl(z_{\mathrm r}^{2^j}, z_{\mathrm c}^{2^j}, \rho\bigr)
   \;=\;
   \fjag\bigl(z_{\mathrm r}, z_{\mathrm c}, \rho^{2^{-j}}\bigr)^{2^j},
 \]
-where $\rho^{2^{-j}}$ is the coordinate-wise $j$-fold Frobenius
-inverse (iterated square roots --- cheap linear maps). In this form
-all $128$ statements evaluate the \emph{single untwisted} jagged
-multilinear at $128$ derived points: the batched assist is a
-multipoint-evaluation argument for $\fjag(z_{\mathrm r}, z_{\mathrm c},
-\cdot)$, and every $z$-side quantity in the assist (column weights,
-the $z$-half of each transition weight) becomes statement-independent.
+with $\rho^{2^{-j}}$ the coordinate-wise Frobenius inverse (iterated
+square roots --- cheap linear maps). In this form all $128$ statements
+evaluate the \emph{single untwisted} jagged multilinear at $128$
+derived points: a multipoint-evaluation problem for
+$\fjag(z_{\mathrm r}, z_{\mathrm c}, \cdot)$.
 No formulation collapses the family further: expanding the twisted
 factors over an $\Ftwo$-basis writes the $128$ statement values as the
 image, under the invertible Moore matrix, of $128$ independent
 bilinear contractions of the $\rho$-side data --- the batch width is
 information-inherent, and only the surrounding structure (points,
 coefficients, boundary combinatorics, verifier chains) can be shared.
+The significance of the move is deferred to \S\ref{sec:multipoint}: a
+twist sitting on $z$ twists the \emph{jagged} weight, which has no
+closed form; moved onto $\rho$ it twists only the \emph{eq} factor,
+which collapses (Lemma~\ref{lem:twisted-eq}) --- one closed form for
+the verifier, one $\Ftwo$-linear pass for the prover, and a single
+untwisted assist as the only jagged-shaped obligation left.
 \end{remark}
 
 \section{The batched assist}\label{sec:protocol}
@@ -355,21 +354,9 @@ on the same tree, its per-layer quadrant product
 $\eq(c,\sigma_{\mathrm c})\eq(d,\sigma_{\mathrm d})$ being likewise
 run-constant: one multiply per node against $2(m{+}1)$ per column.
 Everything here is distributivity and associativity over $\F$, so the
-transcript is bit-identical to the per-column form.
-
-Measured ($256$ statements, Apple silicon) against the per-column
-form: prove $5.3 \to 4.3$\,ms and verify $1.78 \to 0.54$\,ms at the
-worst case ($m = 23$, $368$ full-height columns, $\log n_t$ within a
-factor $1.6$ of $m$), with proportionate gains at smaller shapes. At
-$4096$ columns the collapse is sharper, the verifier especially
-(prove $68.5 \to 41.9$\,ms, verify $17.8 \to 3.5$\,ms, suffix state
-$1.7$\,GB $\to 940$\,MB) --- merely expensive rather than infeasible,
-and the crossover stands: the multipoint protocol proves the same
-statement in $24$\,ms in total. The single-statement assist ---
-\S\ref{sec:multipoint}'s anchor --- runs the same tree: $0.15 \to
-0.06$\,ms at $m = 21$, flat at thousands of columns where its
-per-layer column pass already fills the pool, its verifier still
-gaining $2.8\times$.
+transcript is bit-identical to the per-column form; the
+single-statement assist --- \S\ref{sec:multipoint}'s anchor --- runs
+the same tree.
 
 \begin{theorem}[soundness, sketch]\label{thm:soundness}
 Against the committed $q$: if the ring-switching statement is false
@@ -487,9 +474,9 @@ The deployed claim set is mixed: alongside the $K$ ring-switched
 claims, element and circuit proofs leave \emph{packed-direct} claims,
 whose fold map is the $\F$-scalar $\Phi(x) = \gamma x$ ---
 $\Ftwo$-linear, so they enter the merged reduction of
-\S\ref{sec:merged} through the same weight builder (one sweep against
-a pre-combined $\gamma$-summed column table serves a whole group), and
-the builder cannot tell them apart. In this protocol their batch width
+\S\ref{sec:merged} through the same weight builder (one sweep per
+group against its pre-combined column table), which cannot tell them
+apart. In this protocol their batch width
 collapses: $c_j = 0$ past index $0$, so a packed-direct claim costs a
 single \emph{untwisted} value, and claims sharing a row point merge by
 $\F$-homogeneity into one \emph{scalar group} costing one value in
@@ -533,46 +520,160 @@ the whole run --- times a high suffix that changes rarely. That is
 $O(1)$ per column after an $O(h)$ table, a win whenever
 $k \gtrsim h/\log h$.
 
-A prototype confirms all of it ($m = 23$, $K = 2$, Apple silicon;
-exact-value tests against the brute-force twisted weight, including
-non-power-of-two strided shapes): prove totals $17 / 24 / 31$\,ms
-across $368 / 4096 / 32768$ columns --- and $29$\,ms at $27962$
-columns of height $300$, the non-power-of-two stride --- of which the
-dense passes and sumcheck hold flat at ${\approx}15$\,ms, the values
-are $2 / 7.5 / 8.9$\,ms, and the single anchor assist is
-$0.4 / 1.7 / 7$\,ms (column-parallelized past ${\sim}2^{14}$ columns,
-and now also run-collapsed by the tree of \S\ref{par:runtree}; the
-largest remaining column-linear term). Verification measures
-$0.3 / 0.6 / 1.7$\,ms. The batched assist measures $5.5$\,ms at $368$
-columns and is memory-infeasible past a few thousand. Fused into the
-surrounding merged opening (shared dense context, byte-identical
-proofs), the marginal cost is $12 / 18 / 26$\,ms --- a net
-${\approx}5$--$8$\,ms saving over composing the standalone parts.
+\section{The prover's transport: block-first rounds from column
+statistics}\label{sec:blockfirst}
+
+Sections~\ref{sec:merged}--\ref{sec:protocol} price the
+\emph{verifier's} side of the merged reduction. On the prover's side
+the reduction as first implemented materializes $W$ over the dense cube
+and runs the $m$ product-sumcheck rounds on the pair $(q, W)$ --- a
+full-domain weight build (one fold-table application per word and
+claim) plus full-length rounds. Both are avoidable. The weight is a sum of
+\emph{rank-one} terms across a block/row split of the dense index, and
+the sumcheck may bind the block coordinates first: those rounds then
+need only $O(2^{k})$ \emph{block statistics} per term --- a Frobenius
+transform of a column bit-bank the lincheck already produces --- and
+the row rounds that follow run on a $2^{n+1}$-length pair. This is the
+``direct fold'' of a per-claim opening (fold the committed data by the
+claim's tensor, then open) recovered inside the batched protocol: the
+statistics \emph{are} the folded data, taken over lane blocks instead of
+over the whole cube, and the batching across claims survives because
+every claim contributes its own rank-one terms to one sumcheck.
+
+\paragraph{Predicate.} The rank-one split needs the column boundaries
+to respect the row cube: the transport below is used exactly when the
+committed stack is a \emph{full-height column prefix} --- columns
+$0..p{-}1$ of height $2^{n}$, every later column empty (in the code,
+\texttt{rectangular\_prefix\_columns}). This is the union at full
+utilization (identity compaction). Under partial utilization the
+jagged twist cuts rows and the materialized path stays; the predicate
+is public data, so prover, verifier and the recursive verifier agree on
+which order was used.
+
+\paragraph{The split.} Write the dense index as
+$d = e\cdot 2^{n+1} + c_0\cdot 2^{n} + r$: a \emph{block} $e \in
+\{0,1\}^{k-1}$ of two adjacent lane columns (the column's bits
+$1..k{-}1$), the column's low bit $c_0$, and the row $r \in
+\{0,1\}^{n}$. Since $\eq(z_{\mathrm c}, c) = \eq(z_{\mathrm c,0},
+c_0)\,\eq(z_{\mathrm c,1..}, e)$, a ring-switch claim's weight
+(Lemma~\ref{lem:restriction}) is, by the linearized form of $\Phi$,
+\[
+  W[e, c_0, r]
+  \;=\;
+  \mathbb{1}[2e{+}c_0 < p]\,
+  \sum_{j=0}^{127} c_j\;
+  u(e)^{2^j}\; v_{c_0}(r)^{2^j},
+  \qquad
+  u(e) = \eq(z_{\mathrm c,1..}, e),\;\;
+  v_{c_0}(r) = \eq(z_{\mathrm c,0}, c_0)\,\eq(z_{\mathrm r}, r),
+\]
+a sum of $256$ terms (over $j$ and $c_0$), each a product of a
+function of $e$ and a function of $(c_0, r)$. The live-prefix mask is a
+function of $(e, c_0)$ alone and is absorbed into the $e$-side factor
+$A_{j,c_0}(e) := c_j\,u(e)^{2^j}\,\mathbb{1}[2e{+}c_0 < p]$. A
+packed-direct claim (a scalar weight $\mathrm{cols}[c]\,\eq(z_{\mathrm
+r}, r)$) is two such terms, one per $c_0$. The mask matters: the
+verifier's $\widehat W(\rho)$ is the multilinear extension of the
+weight that is \emph{zero} past the live area, and the product
+sumcheck's messages see the weight at dead columns through the cross
+terms of each fold pair even though $q$ vanishes there.
+
+\paragraph{Block statistics.} For a term with row factor $B(c_0, r)$
+the $k{-}1$ block rounds need only $S(e) := \sum_{c_0, r} q[e, c_0, r]\,
+B(c_0, r)$ --- $2^{k-1}$ field elements. Writing $q[c, r] = \sum_b
+\mathrm{bit}_b(q[c,r])\,\beta_b$ over the bit basis and using that
+Frobenius fixes $\Ftwo$ and is additive,
+\[
+  S_{j,c_0}(e)
+  \;=\;
+  \sum_r q[2e{+}c_0, r]\; v_{c_0}(r)^{2^j}
+  \;=\;
+  \Bigl(\eq(z_{\mathrm c,0}, c_0)\sum_{b} \beta_b^{\,2^{-j}}\;
+        T[2e{+}c_0][b]\Bigr)^{2^j},
+  \qquad
+  T[c][b] := \sum_r \eq(z_{\mathrm r}, r)\,\mathrm{bit}_b(q[c, r]).
+\]
+$T$ is the \emph{column bit-bank} at the claim's row point: $128$
+values per lane column, $2^{k+7}$ in all. For the AB claim it is
+exactly the lincheck's own partial fold (the vector from which the
+ring switch's $\hat s_v$ is read), so the AB statistics cost nothing
+beyond a $128 \times 128$ transform per block; the C claim's row point
+is the zerocheck's, and its bank is one more stripe fold with the
+lincheck's kernel, outside the open. Given
+$T$, the $256$ statistics vectors of a claim cost $2^{k-1}\cdot 128^2$
+multiplications plus Frobenius powers.
+
+\paragraph{Rounds.} Rounds $0..k{-}2$ bind the block coordinates
+(LSB-first within $e$): each message is $\sum_{\text{terms}} \sum_{e}
+A(e)\,S(e)$ restricted to the usual odd/cross sums, and each fold halves
+every $A$ and $S$ table --- $O(256 \cdot 2^{k-1})$ work per round, no
+pass over $q$. After them $q$ is folded once over the bound
+coordinates, $q'[c_0, r] = \sum_{e} \eq(r_{\mathrm{blk}}, e)\, q[e,
+c_0, r]$ (one read of $q$), and the row-side weight is written in
+closed form on $2^{n+1}$ entries: the block factor folds into the
+coefficients,
+$c'_{j,c_0} = c_j \sum_{e:\,2e+c_0<p} \eq(r_{\mathrm{blk}}, e)\,
+\eq(z_{\mathrm c,1..}^{\,2^j}, e)$, and $c_0$ bakes
+$\eq(z_{\mathrm c,0}, c_0)^{2^j}$ into a per-$c_0$ byte table, so that
+$W'[c_0, r] = \sum_{\text{claims}} \Psi'_{c_0}(\eq(z_{\mathrm r}, r))
++ \sum_{\text{groups}} \mathrm{cols}'[c_0]\,\eq(z_{\mathrm r}, r)$ with
+$\Psi'_{c_0}$ the $\Ftwo$-linear map of linearized coefficients
+$c'_{j,c_0}\,\eq(z_{\mathrm c,0}, c_0)^{2^j}$. The remaining $n{+}1$
+rounds are the ordinary ones on $(q', W')$. The final evaluations
+$\hat q(\rho)$ and $\widehat W(\rho)$ are order-independent, so the
+only change downstream is bookkeeping: the challenges arrive in round
+order $(r_{\mathrm{blk}}, r_{\mathrm{row}})$ and are rotated into
+coordinate order $\rho = (r_{\mathrm{row}}, r_{\mathrm{blk}})$ before
+the assist and the inner opening. The verifier's running-claim chain
+is order-free; it applies the same rotation under the same predicate,
+as does the recursive verifier's replay. Proof size and the verifier's
+work are unchanged.
+
+\paragraph{The full fusion, and why it stops.} The row rounds still
+fold $(q', W')$ at $2^{n+1}$ and the inner Ligerito opening of
+$\hat q(\rho)$ still runs on the committed data. The full fusion
+drops the merged sumcheck altogether and makes $W$ the opening's
+level-0 basis: its rank-one terms are exactly the statistics above,
+the opening's own block rounds bind the block coordinates, and the
+\emph{full-cube} weight becomes admissible (it defines the basis, and
+$q$ vanishes on dead columns), so the verifier's evaluation of
+$\widehat W$ at the opening's point is a plain product of twisted eq
+factors, count-independent, and the assist leaves the transcript.
+The obstruction is the recursive verifier: at the opening's
+extension-field point there is no prover-assisted batching of the
+$128$ twists, and the residual pairing does not twist for free either
+--- the residual witness's multilinear extension has base-field
+\emph{coefficients}, and Frobenius is only $\F_2$-linear, so it must
+be evaluated at all $128$ twisted points. The native build was
+declined on that row budget and parked. The partial-utilization case
+would need the rank-one split under the jagged twist, which the twist
+does not admit column by column; there the materialized weight stays.
+
+The transport's measured costs, and the experiments around it (the
+C-fold fusion, the parked full fusion), are recorded in the
+optimizations note (\texttt{docs/yukon-optimizations.tex},
+\S\emph{Block-first merged sumcheck from column statistics}).
 
 \section{Implementation}\label{sec:eval}
 
 The construction is implemented in the Flock proof system (batch-hash
 proving over $\F_{2^{128}}$, jagged integer-lane Ligerito commitment
 \cite{ligero,ligerito}) --- originally side by side with the standard
-pipeline, which supplied the comparison below and has since been
-retired: the merged reduction, opened through the two-product
-multipoint transport of Remark~\ref{rem:grouping}, is now the only
-path in-tree.
-Theorem~\ref{thm:main}, the coefficient extraction, and the batched
-assist are each pinned by exact tests against brute-force oracles
-(random non-power-of-two heights, zero-height columns, powers through
-$j = 40$); the full pipeline round-trips with a tamper matrix on real
-mixed instances. At a production-scale workload ($2^{30}$-bit virtual
-domain at the right-sized capacity tier), the standard pipeline's
-ring-switching stage measured $12.3 / 23.0 / 44.7$\,ms at
-$100\%/50\%/25\%$ utilization --- linear in the virtual domain ---
-while the merged pipeline's corresponding stages
-($\Phi$-pass ${\approx}4$\,ms, merged sumcheck ${\approx}4$\,ms,
-batched assist ${\approx}7$\,ms at $K = 2$) are tier-independent: prove-time
-growth from the right-sized to the $4\times$ tier is $+14$\,ms versus
-$+41$\,ms, with right-sized totals at parity and the standard
-pipeline's multi-hundred-MB weight transient eliminated. Verifier
-overhead is below $1$\,ms at the deployed layout.
+pipeline, since retired: the merged reduction, opened through the
+two-product multipoint transport of Remark~\ref{rem:grouping}, is the
+only path in-tree. Theorem~\ref{thm:main}, the coefficient
+extraction, and the batched assist are each pinned by exact tests
+against brute-force oracles; the full pipeline round-trips with a
+tamper matrix on real mixed instances. The construction's defining
+measurement: at a $2^{30}$-bit virtual domain, the standard
+pipeline's ring-switching stage was linear in the virtual domain
+($12.3 / 23.0 / 44.7$\,ms at $100\%/50\%/25\%$ utilization) while the
+merged stages are tier-independent ($+14$\,ms versus $+41$\,ms of
+prove-time growth from the right-sized to the $4\times$ tier), with
+the standard pipeline's multi-hundred-MB weight transient eliminated
+and verifier overhead below $1$\,ms. All other measurements ---
+transport costs, pipeline standings, the experiments around both ---
+live in the optimizations note.
 
 \begin{remark}
 The technique needs only an $\Ftwo$-linear per-word fold map, an

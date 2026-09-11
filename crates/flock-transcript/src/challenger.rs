@@ -4,7 +4,7 @@
 //! [`FsChallenger`] supports SHA-256 and BLAKE3.
 //! `RandomChallenger` supports tests and benchmarks only.
 
-use std::array::from_fn;
+use std::{array::from_fn, env::var_os, sync::LazyLock};
 
 use blake3::{Hasher, IncrementCounter, hash, platform::Platform};
 use flock_field::{F128, F256};
@@ -191,10 +191,11 @@ pub trait Challenger: Send {
     /// The hash backing this transcript, for protocol components that derive
     /// auxiliary randomness outside the challenger itself (e.g. the AG-skip
     /// `r₁` nonce-grind DRBG) and must follow the transcript's hash choice so
-    /// no second primitive enters the soundness argument. Default SHA-256
-    /// (`RandomChallenger` and legacy implementations inherit it).
+    /// no second primitive enters the soundness argument. Defaults to the
+    /// crate default (`RandomChallenger` and legacy implementations inherit
+    /// it).
     fn hash_kind(&self) -> HashKind {
-        HashKind::Sha256
+        HashKind::default()
     }
 }
 
@@ -596,13 +597,14 @@ pub struct FsChallenger {
 
 impl FsChallenger {
     /// New challenger seeded with a domain-separation tag (e.g.
-    /// `b"flock-r1cs-v0"`), using SHA-256.
+    /// `b"flock-r1cs-v0"`), using the default hash ([`HashKind::default`],
+    /// BLAKE3 — the ranked worker's configuration).
     ///
     /// The domain is length-prefixed before being absorbed so two domains
     /// where one is a prefix of the other cannot produce the same initial
-    /// state. For the BLAKE3 transcript, see [`Self::with_hash`].
+    /// state. For an explicit choice, see [`Self::with_hash`].
     pub fn new(domain: &[u8]) -> Self {
-        Self::with_hash(domain, HashKind::Sha256)
+        Self::with_hash(domain, HashKind::default())
     }
 
     /// New challenger over an explicit hash.
@@ -866,6 +868,11 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
+        // Measurement knob: FLOCK_NO_GRIND=1 skips all PoW grinding (nonce 0,
+        // no hashing). Grind time is nonce-search luck, so it adds variance
+        // that paired A/B can't cancel; proofs made this way fail verification.
+        static NO_GRIND: LazyLock<bool> = LazyLock::new(|| var_os("FLOCK_NO_GRIND").is_some());
+        let bits = if *NO_GRIND { 0 } else { bits };
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
         // Aggregate-aware parallelism: decide on the grind's *expected hash
@@ -1271,7 +1278,7 @@ mod tests {
     /// is preserved — sampling after PoW gives identical challenges on both
     /// sides.
     #[test]
-    fn fs_challenger_pow_roundtrip() {
+    fn fiat_shamir_challenger_pow_roundtrip() {
         for kind in KINDS {
             for bits in [0u32, 5, 10, 14] {
                 let mut prover = FsChallenger::with_hash(b"pow-test", kind);
@@ -1297,7 +1304,7 @@ mod tests {
 
     /// `verify_pow` rejects a wrong nonce when grinding bits > 0.
     #[test]
-    fn fs_challenger_pow_rejects_wrong_nonce() {
+    fn fiat_shamir_challenger_pow_rejects_wrong_nonce() {
         for kind in KINDS {
             let mut prover = FsChallenger::with_hash(b"pow-test", kind);
             prover.observe_bytes(b"root");
@@ -1317,7 +1324,7 @@ mod tests {
     /// (what `grind_pow(0)` emits) but rejects any non-zero nonce, so a proof
     /// can't be made malleable by swapping in an arbitrary nonce.
     #[test]
-    fn fs_challenger_pow_zero_bits_requires_canonical_nonce() {
+    fn fiat_shamir_challenger_pow_zero_bits_requires_canonical_nonce() {
         for kind in KINDS {
             let mk = || {
                 let mut ch = FsChallenger::with_hash(b"pow-test", kind);
@@ -1335,26 +1342,27 @@ mod tests {
         }
     }
 
-    /// `new` must stay SHA-256: 300-odd call sites construct challengers that
-    /// way, and silently moving them to another hash would invalidate every
-    /// proof they produce.
+    /// `new` follows the repo default (BLAKE3): every plain-constructed
+    /// challenger moves with `HashKind::default()`, so this pin makes a
+    /// default flip a deliberate, test-visible event rather than a silent
+    /// transcript change.
     #[test]
-    fn fs_challenger_new_defaults_to_sha256() {
-        assert_eq!(FsChallenger::new(b"d").hash_kind(), HashKind::Sha256);
+    fn fiat_shamir_challenger_new_defaults_to_blake3() {
+        assert_eq!(FsChallenger::new(b"d").hash_kind(), HashKind::Blake3);
         for kind in KINDS {
             assert_eq!(FsChallenger::with_hash(b"d", kind).hash_kind(), kind);
         }
-        // The default constructor must be exactly the SHA-256 one, transcript
+        // The default constructor must be exactly the BLAKE3 one, transcript
         // and all — not merely tagged the same.
         let mut a = FsChallenger::new(b"d");
-        let mut b = FsChallenger::with_hash(b"d", HashKind::Sha256);
+        let mut b = FsChallenger::with_hash(b"d", HashKind::Blake3);
         assert_eq!(a.sample_f128_vec(4), b.sample_f128_vec(4));
     }
 
     /// The two transcript hashes must produce different challenges from the
     /// same script — otherwise the option would be doing nothing.
     #[test]
-    fn fs_challenger_hashes_diverge() {
+    fn fiat_shamir_challenger_hashes_diverge() {
         let script = |ch: &mut FsChallenger| {
             ch.observe_label(b"phase");
             ch.observe_bytes(b"root");
@@ -1369,7 +1377,7 @@ mod tests {
     /// A verifier on the wrong transcript hash must reject: the PoW check is
     /// against a different digest, and the challenges diverge from there.
     #[test]
-    fn fs_challenger_pow_rejects_the_other_hash() {
+    fn fiat_shamir_challenger_pow_rejects_the_other_hash() {
         for kind in KINDS {
             let other = match kind {
                 HashKind::Sha256 => HashKind::Blake3,
@@ -1393,7 +1401,7 @@ mod tests {
     /// i.e. `sample_f128_vec(n)` is one XOF read of `16n` bytes, not `n`
     /// independent reads. Pins the stream layout for both hashes.
     #[test]
-    fn fs_challenger_long_squeeze_is_prefix_stable() {
+    fn fiat_shamir_challenger_long_squeeze_is_prefix_stable() {
         for kind in KINDS {
             // Two challengers on identical scripts, one squeezing 8 values and
             // one squeezing 8 values in a single call, must agree — this is
@@ -1448,7 +1456,7 @@ mod tests {
     /// Proof determinism depends on it: a different nonce is a different
     /// transcript and therefore a different proof.
     #[test]
-    fn fs_challenger_grind_returns_smallest_nonce() {
+    fn fiat_shamir_challenger_grind_returns_smallest_nonce() {
         for kind in KINDS {
             // 4 bits stays sequential; 14 crosses PARALLEL_GRIND_MIN_HASHES.
             for bits in [4u32, 14] {
@@ -1548,7 +1556,7 @@ mod tests {
     // ---- FsChallenger ------------------------------------------------------
 
     #[test]
-    fn fs_challenger_identical_scripts_produce_identical_output() {
+    fn fiat_shamir_challenger_identical_scripts_produce_identical_output() {
         for kind in KINDS {
             let mut c1 = FsChallenger::with_hash(b"flock-test", kind);
             let mut c2 = FsChallenger::with_hash(b"flock-test", kind);
@@ -1565,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_different_domains_diverge() {
+    fn fiat_shamir_challenger_different_domains_diverge() {
         for kind in KINDS {
             let mut c1 = FsChallenger::with_hash(b"flock-a", kind);
             let mut c2 = FsChallenger::with_hash(b"flock-b", kind);
@@ -1574,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_different_observations_diverge() {
+    fn fiat_shamir_challenger_different_observations_diverge() {
         for kind in KINDS {
             let mut c1 = FsChallenger::with_hash(b"flock", kind);
             let mut c2 = FsChallenger::with_hash(b"flock", kind);
@@ -1585,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_label_changes_output() {
+    fn fiat_shamir_challenger_label_changes_output() {
         for kind in KINDS {
             let mut c1 = FsChallenger::with_hash(b"flock", kind);
             let mut c2 = FsChallenger::with_hash(b"flock", kind);
@@ -1596,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_scalar_vs_slice_dont_collide() {
+    fn fiat_shamir_challenger_scalar_vs_slice_dont_collide() {
         for kind in KINDS {
             // observe_f128_slice(&[v]) must NOT produce the same state as
             // observe_f128(v) — the length prefix and kind tag must defeat this.
@@ -1610,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_two_scalars_dont_collide_with_one_slice_of_two() {
+    fn fiat_shamir_challenger_two_scalars_dont_collide_with_one_slice_of_two() {
         for kind in KINDS {
             let a = F128 { lo: 1, hi: 2 };
             let b = F128 { lo: 3, hi: 4 };
@@ -1624,7 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_sample_one_vs_sample_vec_one_differ() {
+    fn fiat_shamir_challenger_sample_one_vs_sample_vec_one_differ() {
         for kind in KINDS {
             // Squeeze tag differs (KIND_SCALAR vs KIND_SLICE+len), so a single
             // sample_f128 must not equal sample_f128_vec(1)[0].
@@ -1635,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_challenger_sample_advances_state() {
+    fn fiat_shamir_challenger_sample_advances_state() {
         for kind in KINDS {
             // After a sample, the next observation should not collapse to the
             // pre-sample state (the squeezed bytes are re-absorbed).

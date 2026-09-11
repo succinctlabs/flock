@@ -31,6 +31,7 @@ use std::{
 
 use env::args;
 use flock_core::test_rng::Rng;
+use flock_hash::HashKind;
 use flock_prover::{
     challenger::{Challenger, FsChallenger},
     field::{F128, F256},
@@ -43,7 +44,8 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "challenger_vectors.bin".to_string());
     let domain = b"flock-ligerito-test-v0";
 
-    let mut ch = FsChallenger::new(domain);
+    // cuda-ghash hashes with SHA-256 only: pin it, never the repo default.
+    let mut ch = FsChallenger::with_hash(domain, HashKind::Sha256);
     let mut rng = Rng::new(0xC0FFEE);
 
     let mut w = BufWriter::new(File::create(&path)?);

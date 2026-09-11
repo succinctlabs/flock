@@ -159,7 +159,7 @@ standalone BLAKE3 PoW row in the recursive circuit.
   - `CvSource::RowHi`, `squeeze_words`, and `block_word_counts` carry those
     choices explicitly into circuit construction.
 - `crates/flock-prover/tests/circuit_merkle.rs`
-  - `emit_fs_chain` wires the exact row inputs and high-half chain link.
+- `emit_fiat_shamir_chain` wires the exact row inputs and high-half chain link.
   - `emit_pow_checks` emits only nonce-width/canonicality and prefix masks.
   - `emit_recorded_pow_checks` locates every fused predicate and nonce in a
     recorded verifier transcript.

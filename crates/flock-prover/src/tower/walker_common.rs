@@ -25,7 +25,7 @@ use crate::{
         ChildSlots, F128, GkrLayerRec, GkrRec, InnerPd, Lvl, MergedChain, MixedProof, MpRec,
         OpenLevel, PdRec, RoundRec, ShapeBuilder, Wire, ZskipTapeRec, ZskipWires,
         assert_chain_replays, duplex_row_count_model, emit_family_h, emit_spine256,
-        level_query_phase_b3_rows, merge_chain, squeeze_word_wire,
+        level_query_phase_blake3_rows, merge_chain, squeeze_word_wire,
     },
 };
 
@@ -260,7 +260,7 @@ pub(super) fn census_levels_and_chain_rows(
     trace: &FsChainTrace,
 ) {
     for g in geo.iter() {
-        let (leaf, path, cap) = level_query_phase_b3_rows(g);
+        let (leaf, path, cap) = level_query_phase_blake3_rows(g);
         eprintln!(
             "    level: q {} depth {} row_words {} -> leaf {} + path {} + cap {}",
             g.q, g.depth, g.raw_row_words, leaf, path, cap,

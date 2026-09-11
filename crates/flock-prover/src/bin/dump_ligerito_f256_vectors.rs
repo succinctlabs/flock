@@ -24,6 +24,7 @@ use std::{
 
 use env::args;
 use flock_core::test_rng::Rng;
+use flock_hash::HashKind;
 use flock_prover::{
     challenger::FsChallenger,
     field::F128,
@@ -61,8 +62,10 @@ fn main() -> Result<()> {
     let m: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(22);
     let log_n = m - LOG_PACKING;
 
-    let cfg = prover_config_for(log_n, 6, LigeritoProfile::Fast)
+    let mut cfg = prover_config_for(log_n, 6, LigeritoProfile::Fast)
         .unwrap_or_else(|e| panic!("no fast config for m={m}: {e}"));
+    // cuda-ghash hashes with SHA-256 only: pin it, never the repo default.
+    cfg.merkle_hash = HashKind::Sha256;
     let initial_k = cfg.initial_k;
     let r = cfg.recursive_steps;
     let len = 1usize << log_n;
@@ -85,7 +88,7 @@ fn main() -> Result<()> {
         cfg.merkle_hash,
     );
 
-    let mut ch = FsChallenger::new(domain);
+    let mut ch = FsChallenger::with_hash(domain, HashKind::Sha256);
     let proof = recursive_prover_with_basis(
         &cfg,
         f.clone(),

@@ -26,7 +26,7 @@ on aarch64 and the whole pipeline replays it. What landed, all in
 
 1. `MixedProof` flavor enum (`Rs | Ag`) with `wiring()/pcs_open()/element()`
    accessors; `build_chain_proof` proves AG behind the private
-   `leaf_zc_ag()` switch — aarch64 only (the round-1 kernel), with
+`leaf_zerocheck_ag()` switch — aarch64 only (the round-1 kernel), with
    `TOWER_LEAF_ZC=rs` as the A/B override. No public TowerConfig change.
 2. `ChildTape::new` AG arm: flavored recording verify; anchor
    `flock-ag-skip-v1` (and the OTHER flavor's label asserted absent);
@@ -36,7 +36,7 @@ on aarch64 and the whole pipeline replays it. What landed, all in
    as `ZskipTapeRec::Ag { seed_ch, seed_fins, nonce_payload }`); the
    `.phi8()` pin replaced by the native point pin (seed rebuilt from the
    located chals, `decode_ag_point` under
-   `pcs.zerocheck_grinding().ag_r1_bits()`, compared to
+   `pcs.zerocheck_grinding().ag_round_one_bits()`, compared to
    `bool_assert.z_skip`).
 3. Tier 0 landed as PUBLISH-THE-WHOLE-SURFACE: per AG child the FL
    publishes `[seed₂ (wire-connected), nonce (wire-connected to the
@@ -120,7 +120,7 @@ boolean space (swap 12250/16384, spread 1060/16384, pow 4096/16384 at
 nu* = 14) is now skipped, not scanned, under AG.
 
 **Phase C COMPLETE (same day, evening 4)** — the envelope outers (FL /
-internal / spine) prove under AG behind the private `outer_zc_ag()`
+internal / spine) prove under AG behind the private `outer_zerocheck_ag()`
 switch (`TOWER_OUTER_ZC=rs` A/B override). `LeafOuter.proof` is the
 shared `MixedProof` (with `boolean_lincheck()` +
 `verify_circuit{,_deferred}` dispatch methods); `RealTape`/`RealRegion`
@@ -138,7 +138,7 @@ driver COLLAPSED at the envelope — its per-column run structure is
 19,920 full / 228 partial / 110,924 dead blocks at m30 (~15% live,
 ~450 segments), and per-segment rayon bridges made round 1 cost 28–43 ms
 (2–3× the FULL dense scan). Fixed by
-`round1_slp_packed_banks_fused_padded` — ONE parallel pass over the
+`round1_straight_line_program_packed_banks_fused_padded` — ONE parallel pass over the
 live-block list (Full pairs keep the 2src c-transpose, Partials cleanse
 inline; char-2 addition makes visit order irrelevant) — now 2.4–4.7 ms,
 count-proportional parity. The segment driver survives only as the
@@ -270,7 +270,7 @@ Decode-canonicity (which AS root) either pinned via linear functionals
 **Phase A — native entries + hygiene (small).**
 - `R1csProofCircuitMergedAg` + `prove_fast_ligerito_union_circuit_ag`
   (aarch64) + `verify_ligerito_union_circuit_ag{,_deferred}` — thin over the
-  already-flavored shared bodies (`prove_union_with_binding_zc`,
+already-flavored shared bodies (`prove_union_with_binding_zerocheck`,
   `verify_union_piops`/`BooleanPiopRef`). Lift the boolean-only assert for the
   mixed/circuit AG arms (element region is flavor-independent; the AG flavor
   already forces honest-zero witness mode).

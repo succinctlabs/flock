@@ -15,8 +15,9 @@ use crate::{
     tower::{
         ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, RootBundle,
         RootDischargeFailure, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
-        UnionInstance, build_chain_proof, build_fl_node, build_node_outer_app, chain_blake_r1cs,
-        chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
+        UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
+        chain_blake_r1cs, chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base,
+        env_pass_base,
         envelope::STEADY_OVERRIDE,
         envelope_shape,
         gates_blake3::Rng,
@@ -74,7 +75,7 @@ pub(super) fn chain_spine_converges() {
         cps.push(cp);
     }
     let fls: Vec<FlNode> = (0..4)
-        .map(|i| build_fl_node(cfg, &cps[2 * i], &cps[2 * i + 1]))
+        .map(|i| build_first_level_node(cfg, &cps[2 * i], &cps[2 * i + 1]))
         .collect();
     let app_fl = fls[0].stmt_base;
     assert_eq!(
@@ -431,8 +432,8 @@ pub(super) fn chain_tower_e2e_with_lane() {
     let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
     let cp2 = build_chain_proof(cfg, cp1.h_end, n_blocks);
     let cp3 = build_chain_proof(cfg, cp2.h_end, n_blocks);
-    let fl0 = build_fl_node(cfg, &cp0, &cp1);
-    let fl1 = build_fl_node(cfg, &cp2, &cp3);
+    let fl0 = build_first_level_node(cfg, &cp0, &cp1);
+    let fl1 = build_first_level_node(cfg, &cp2, &cp3);
     assert_eq!(
         fl0.fold_pub_base, fl1.fold_pub_base,
         "one fold-block layout"
@@ -661,8 +662,8 @@ pub(super) fn chain_tower_m32_headline() {
     assert_eq!(cp3.h_end, h_all, "the four segments ARE the chain");
 
     let t_fl = Instant::now();
-    let fl0 = build_fl_node(cfg, &cp0, &cp1);
-    let fl1 = build_fl_node(cfg, &cp2, &cp3);
+    let fl0 = build_first_level_node(cfg, &cp0, &cp1);
+    let fl1 = build_first_level_node(cfg, &cp2, &cp3);
     let _fl_ms = t_fl.elapsed().as_secs_f64() * 1e3 / 2.0;
 
     let chain_registry = &cp0.inner.built.shape.registry;
@@ -825,7 +826,7 @@ pub(super) fn tower_online_bench() {
     // spine's FRESH child — the EARLIEST segments, since a spine PREPENDS —
     // so the measured leaf and FL become the tower's own materials. ----
     STEADY_OVERRIDE.store(runs, Ordering::Relaxed); // +1: iteration 0 is the shape warmup (setup tier)
-    let fresh = build_fl_node(cfg, &cp0, &cp1);
+    let fresh = build_first_level_node(cfg, &cp0, &cp1);
     let fl = fresh.onlines.clone();
     STEADY_OVERRIDE.store(0, Ordering::Relaxed);
 
@@ -841,8 +842,8 @@ pub(super) fn tower_online_bench() {
         let cp4 = build_chain_proof(cfg, cp3.h_end, n_blocks);
         let cp5 = build_chain_proof(cfg, cp4.h_end, n_blocks);
         (
-            build_fl_node(cfg, &cp2, &cp3),
-            build_fl_node(cfg, &cp4, &cp5),
+            build_first_level_node(cfg, &cp2, &cp3),
+            build_first_level_node(cfg, &cp4, &cp5),
         )
     };
     drop(cp1);

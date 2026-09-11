@@ -13,8 +13,9 @@ use flock_prover::{
     field::F128,
     init_perf_thread_pool,
     pcs::ring_switch::{
-        build_eq_split, fold_1b_rows_1way_mfr_8wide_k4, fold_1b_rows_1way_mfr_16wide_k4,
-        fold_1b_rows_2way_mfr_8wide_padded, fold_1b_rows_split, split_n_lo,
+        build_eq_split, fold_1b_rows_1way_method_of_four_russians_8wide_k4,
+        fold_1b_rows_1way_method_of_four_russians_16wide_k4,
+        fold_1b_rows_2way_method_of_four_russians_8wide_padded, fold_1b_rows_split, split_n_lo,
     },
     zerocheck::{PaddingSpec, univariate_skip::build_eq},
 };
@@ -51,8 +52,8 @@ fn bench_one(m: usize, n_runs: usize) {
     };
 
     // Correctness: 16-wide 1-way must match the 8-wide reference exactly.
-    let r8 = fold_1b_rows_1way_mfr_8wide_k4(&witness, &t0);
-    let r16 = fold_1b_rows_1way_mfr_16wide_k4(&witness, &t0);
+    let r8 = fold_1b_rows_1way_method_of_four_russians_8wide_k4(&witness, &t0);
+    let r16 = fold_1b_rows_1way_method_of_four_russians_16wide_k4(&witness, &t0);
     assert_eq!(r8, r16, "1way 16-wide diverges from 8-wide");
     // Correctness: the tensor-split fold must be byte-identical to the 16-wide
     // materialized kernel for every split width we bench.
@@ -70,7 +71,8 @@ fn bench_one(m: usize, n_runs: usize) {
     // Old production k=2 path: one fused 2-way 8-wide fold.
     bench("2way-8w", &|| {
         let t = Instant::now();
-        let r = fold_1b_rows_2way_mfr_8wide_padded(&witness, &t0, &t1, &padding);
+        let r =
+            fold_1b_rows_2way_method_of_four_russians_8wide_padded(&witness, &t0, &t1, &padding);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         black_box(&r);
         ms
@@ -79,15 +81,15 @@ fn bench_one(m: usize, n_runs: usize) {
     // the full t tensor twice).
     bench("2x1w-16w", &|| {
         let t = Instant::now();
-        let r0 = fold_1b_rows_1way_mfr_16wide_k4(&witness, &t0);
-        let r1 = fold_1b_rows_1way_mfr_16wide_k4(&witness, &t1);
+        let r0 = fold_1b_rows_1way_method_of_four_russians_16wide_k4(&witness, &t0);
+        let r1 = fold_1b_rows_1way_method_of_four_russians_16wide_k4(&witness, &t1);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         black_box((&r0, &r1));
         ms
     });
     bench("1way-16w", &|| {
         let t = Instant::now();
-        let r = fold_1b_rows_1way_mfr_16wide_k4(&witness, &t0);
+        let r = fold_1b_rows_1way_method_of_four_russians_16wide_k4(&witness, &t0);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         black_box(&r);
         ms

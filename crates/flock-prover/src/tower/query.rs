@@ -36,7 +36,7 @@ use crate::{
         CHUNK_END, CHUNK_START, CollapsedSlots, F128, F256, Lvl, MacGate, MacGate256, MixedProof,
         OpenLevel, PARENT, PcsParams, PrefixGate, PrefixGate256, ResidualAccGate256,
         ResidualPrefix3Gate256, ResidualWeightsGate256, RoundRec, SLOT_WORDS, ShapeBuilder, Wire,
-        cw, emit_mac256, hash_to_digest, l0_ood_z_index, pack_params, slot_cached,
+        cw, emit_mac256, hash_to_digest, level_zero_ood_z_index, pack_params, slot_cached,
         squeeze_word_wire,
     },
 };
@@ -529,7 +529,7 @@ pub(super) fn emit_residual_region(
         let folded = od.z_len - yr_log;
         assert_eq!(folded, ris_full.len(), "L0 OOD spans every fold");
         let initial_k = levels[0].fold_fins.len();
-        let z_index = |j| l0_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
+        let z_index = |j| level_zero_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
         let mut factors: Vec<([Wire; 2], [Wire; 2])> = (0..folded)
             .map(|j| {
                 (
@@ -706,7 +706,7 @@ pub(super) fn check_residual_publics(
             let folded = od.z_len - yr_log;
             assert_eq!(folded, pl_full, "L0 OOD spans every fold");
             let initial_k = levels[0].fold_chs.len();
-            let z_index = |j| l0_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
+            let z_index = |j| level_zero_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
             let mut t = F256::from(chals[od.beta_ch]);
             for j in 0..folded {
                 t *= F256::ONE + F256::from(chals[od.z_ch + z_index(j)]) + ris_v[j];
@@ -1247,7 +1247,7 @@ pub(super) fn emit_opening(
     (cv, position_w)
 }
 
-/// The leaf outer's artifacts (built inside [`build_fl_node_k`] and
+/// The leaf outer's artifacts (built inside [`build_first_level_node_k`] and
 /// [`build_node_outer_app`]) so the
 /// recursion swap can consume the proof as ITS inner: the circuit shape
 /// (owning registry + counts — `UnionInstance::new(&shape.registry,

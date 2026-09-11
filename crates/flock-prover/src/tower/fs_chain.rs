@@ -52,7 +52,7 @@ pub(super) fn bytes_payload_mask(ops: &[TranscriptOp]) -> Vec<bool> {
 }
 
 /// The 32-byte AG sampling seed from its two transcript squeezes — the
-/// exact layout `ag_skip::r1_seed` writes: s0.lo, s0.hi, s1.lo, s1.hi,
+/// exact layout `ag_skip::round_one_seed` writes: s0.lo, s0.hi, s1.lo, s1.hi,
 /// each LE.
 pub(super) fn ag_seed_bytes(s0: F128, s1: F128) -> [u8; 32] {
     let mut seed = [0u8; 32];
@@ -101,7 +101,7 @@ pub(super) fn decode_ag_point(
 /// Still open, and cheaper still: the child chain could CONTINUE from the
 /// fork-point CV under a domain byte instead of seed-squeeze-then-absorb.
 /// That drops the two seed rows and takes the fork's cost to ~one row.
-pub(super) fn emit_fs_chain(
+pub(super) fn emit_fiat_shamir_chain(
     sb: &mut ShapeBuilder,
     b3: SlotId,
     iv: [Wire; 2],
@@ -113,7 +113,7 @@ pub(super) fn emit_fs_chain(
     pub_payloads: &[bool],
     cross: &[Option<(usize, usize)>],
 ) -> (Vec<Vec<Wire>>, Vec<Option<Wire>>) {
-    emit_fs_chain_partitioned(
+    emit_fiat_shamir_chain_partitioned(
         sb,
         b3,
         None,
@@ -128,10 +128,10 @@ pub(super) fn emit_fs_chain(
     )
 }
 
-/// As [`emit_fs_chain`], with rows at and after `primary_rows` emitted into
+/// As [`emit_fiat_shamir_chain`], with rows at and after `primary_rows` emitted into
 /// a second slot carrying the same BLAKE3 relation. Wires may cross the slot
 /// boundary normally; the circuit's copy constraints preserve the chain.
-pub(super) fn emit_fs_chain_partitioned(
+pub(super) fn emit_fiat_shamir_chain_partitioned(
     sb: &mut ShapeBuilder,
     b3: SlotId,
     alternate: Option<(SlotId, usize)>,

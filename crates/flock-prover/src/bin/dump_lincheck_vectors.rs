@@ -48,6 +48,7 @@ use std::{
 
 use env::args;
 use flock_core::test_rng::Rng;
+use flock_hash::HashKind;
 use flock_prover::{
     challenger::{Challenger, FsChallenger},
     field::F128,
@@ -160,7 +161,8 @@ fn main() -> Result<()> {
     };
 
     // --- Run the REAL prover (captures the exact pre-sumcheck z_vec).
-    let mut ch = FsChallenger::new(DOMAIN);
+    // cuda-ghash hashes with SHA-256 only: pin it, never the repo default.
+    let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Sha256);
     let (proof, claim, z_vec_pre) = prove_padded_capture_z_vec(
         &z_packed,
         m,
@@ -178,7 +180,7 @@ fn main() -> Result<()> {
     // --- Recover the deterministic intermediates with the same public helpers.
     //     α is the challenger's first sample after the domain-label observe; a
     //     fresh identical challenger replays exactly that prefix.
-    let mut ch2 = FsChallenger::new(DOMAIN);
+    let mut ch2 = FsChallenger::with_hash(DOMAIN, HashKind::Sha256);
     ch2.observe_label(b"flock-lincheck-v0");
     let alpha = ch2.sample_f128();
     let eq_inner = build_quirky_eq_table(x_ab.z_skip.phi8(), &x_ab.x_inner_rest, k_skip);

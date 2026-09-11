@@ -55,7 +55,6 @@ use flock_core::{
     },
     proof::{R1csClaim, R1csProofMergedLigerito},
     r1cs::{BlockR1cs, SparseBinaryMatrix},
-    scratch::prewarm_prover,
     union::{SlotWitnessDest, UnionInstance},
     verifier::{FlockVerifyError, verify_ligerito_union},
 };
@@ -75,7 +74,7 @@ use crate::{
         drive_witness_packed_and_lincheck, fused_add3_parts, fused_add4_parts, or_bit_at,
         or_u32_at_bit,
     },
-    schedule::{Registry, TableType},
+    schedule::Registry,
 };
 /// Inner-dimension log: `K = 2^15 = 32,768` rows per block.
 pub const K_LOG: usize = 15;
@@ -1213,8 +1212,18 @@ impl Sha256HybridSetup {
         // first prove/verify, and pre-fault the prove-cycle scratch buffers
         // so even the first prove performs no page faults.
         r1cs.csc_lincheck_circuit();
-        prewarm_prover(r1cs.m);
-        let registry = Registry::new(vec![TableType::from_block_r1cs(&r1cs)], n_log);
+        flock_core::scratch::prewarm_prover(r1cs.m);
+        let registry = crate::schedule::Registry::new(
+            vec![crate::schedule::TableType::from_block_r1cs(&r1cs)],
+            n_log,
+        );
+        // Warm the registry digest too: `bind_statement` absorbs it before
+        // any challenge, and materializing it BLAKE3-hashes every type's
+        // sparse A/B/C matrices (~21M nonzeros here), which measured ~0.8 s
+        // inside the FIRST prove's statement binding. It is cached in a
+        // `OnceLock` and is a pure function of the registry, so warming it
+        // here only moves when the cache is filled — no transcript effect.
+        let _ = registry.digest();
         let pcs_params = {
             let union = UnionInstance::new(&registry, vec![n_compressions]);
             let m = union.dense_m();
@@ -1263,7 +1272,65 @@ impl Sha256HybridSetup {
         prove_fast_ligerito_union(&union, &self.pcs_params, vec![slot], challenger)
     }
 
-    pub fn verify<Ch: Challenger>(
+    /// [`Self::prove_fast`] with the **AG-skip** boolean zerocheck — the SAME
+    /// single-slot union commit, lincheck, and merged opening; only round 1
+    /// of the zerocheck differs. The preferred entry on aarch64 (measured
+    /// −5.8% end to end on the BLAKE3 twin at m=32). aarch64-only, because
+    /// the AG round-1 kernel is NEON SLP; x86 stays on [`Self::prove_fast`]
+    /// until the AVX-512 port lands (docs/ag-recursion-plan.md Phase F.1).
+    /// Verify with [`Self::verify_union_ag`].
+    #[cfg(target_arch = "aarch64")]
+    pub fn prove_fast_union_ag<Ch: flock_core::challenger::Challenger>(
+        &self,
+        compressions: &[([u32; 8], [u32; 16])],
+        challenger: &mut Ch,
+    ) -> (
+        flock_core::proof::R1csProofMergedLigeritoAg,
+        flock_core::pcs::Commitment,
+        flock_core::proof::R1csClaim,
+    ) {
+        assert_eq!(compressions.len(), self.n_compressions);
+        let union =
+            flock_core::union::UnionInstance::new(&self.registry, vec![self.n_compressions]);
+        let nu = self.n_blocks_log();
+        // IN-PLACE, as in the BLAKE3 twin: the only path that reaches
+        // `UnionInstance::slot_dests`, where the union certifies
+        // `ab_padding_unread` and the driver skips the a/b padding memset.
+        let slot = crate::prover::UnionSlotProverInput::in_place(
+            move |dst| generate_witness_batch_major_partial_into(compressions, nu, dst),
+            self.r1cs.csc_lincheck_circuit(),
+        );
+        crate::prover::prove_fast_ligerito_union_ag(
+            &union,
+            &self.pcs_params,
+            vec![slot],
+            challenger,
+        )
+    }
+
+    /// Verify a [`Self::prove_fast_union_ag`] proof. (Unlike the prove side,
+    /// this runs on every target.)
+    pub fn verify_union_ag<Ch: flock_core::challenger::Challenger>(
+        &self,
+        commitment: &flock_core::pcs::Commitment,
+        proof: &flock_core::proof::R1csProofMergedLigeritoAg,
+        challenger: &mut Ch,
+    ) -> Result<flock_core::proof::R1csClaim, FlockVerifyError> {
+        let union =
+            flock_core::union::UnionInstance::new(&self.registry, vec![self.n_compressions]);
+        let circuit = self.r1cs.csc_lincheck_circuit();
+        let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [circuit];
+        flock_core::verifier::verify_ligerito_union_ag(
+            &union,
+            &circs,
+            commitment,
+            proof,
+            &self.pcs_params,
+            challenger,
+        )
+    }
+
+    pub fn verify<Ch: flock_core::challenger::Challenger>(
         &self,
         commitment: &Commitment,
         proof: &R1csProofMergedLigerito,
@@ -1389,7 +1456,7 @@ struct BmRows<'a> {
 
 /// z = a = v, b = all-ones (free-witness tautology rows).
 #[inline(always)]
-fn bm_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
+fn batch_major_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
     or_u32_row(rows.z, bit, vals);
     or_u32_row(rows.a, bit, vals);
     or_u32_row(rows.b, bit, &[0xFFFF_FFFF; BM_V]);
@@ -1397,7 +1464,7 @@ fn bm_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
 
 /// Inline add: carry rows only.
 #[inline(always)]
-fn bm_add_inline(
+fn batch_major_add_inline(
     rows: &mut BmRows<'_>,
     x: &[u32; BM_V],
     y: &[u32; BM_V],
@@ -1414,7 +1481,13 @@ fn bm_add_inline(
 /// [`build_block_ab_packed_into`] field-for-field (the lockstep test below
 /// pins byte-equality against the row-major driver).
 #[inline(always)]
-fn bm_triple(rows: &mut BmRows<'_>, bit: usize, l: &[u32; BM_V], r: &[u32; BM_V], p: &[u32; BM_V]) {
+fn batch_major_triple(
+    rows: &mut BmRows<'_>,
+    bit: usize,
+    l: &[u32; BM_V],
+    r: &[u32; BM_V],
+    p: &[u32; BM_V],
+) {
     or_u32_row(rows.z, bit, p);
     or_u32_row(rows.a, bit, l);
     or_u32_row(rows.b, bit, r);
@@ -1423,7 +1496,7 @@ fn bm_triple(rows: &mut BmRows<'_>, bit: usize, l: &[u32; BM_V], r: &[u32; BM_V]
 /// V-wide fused 4-operand add: maj1/maj2/ripple triples at the given bits.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn bm_fused_add4(
+fn batch_major_fused_add4(
     rows: &mut BmRows<'_>,
     x: &[u32; BM_V],
     y: &[u32; BM_V],
@@ -1446,15 +1519,15 @@ fn bm_fused_add4(
             rp[t][j] = a3[t];
         }
     }
-    bm_triple(rows, maj1_bit, &m1[0], &m1[1], &m1[2]);
-    bm_triple(rows, maj2_bit, &m2[0], &m2[1], &m2[2]);
-    bm_triple(rows, rip_bit, &rp[0], &rp[1], &rp[2]);
+    batch_major_triple(rows, maj1_bit, &m1[0], &m1[1], &m1[2]);
+    batch_major_triple(rows, maj2_bit, &m2[0], &m2[1], &m2[2]);
+    batch_major_triple(rows, rip_bit, &rp[0], &rp[1], &rp[2]);
     sum
 }
 
 /// V-wide fused 3-operand add.
 #[inline(always)]
-fn bm_fused_add3(
+fn batch_major_fused_add3(
     rows: &mut BmRows<'_>,
     x: &[u32; BM_V],
     y: &[u32; BM_V],
@@ -1473,14 +1546,19 @@ fn bm_fused_add3(
             rp[t][j] = a2[t];
         }
     }
-    bm_triple(rows, maj_bit, &mj[0], &mj[1], &mj[2]);
-    bm_triple(rows, rip_bit, &rp[0], &rp[1], &rp[2]);
+    batch_major_triple(rows, maj_bit, &mj[0], &mj[1], &mj[2]);
+    batch_major_triple(rows, rip_bit, &rp[0], &rp[1], &rp[2]);
     sum
 }
 
 /// V-wide constant add `k + y`.
 #[inline(always)]
-fn bm_const_add(rows: &mut BmRows<'_>, k: u32, y: &[u32; BM_V], bit: usize) -> [u32; BM_V] {
+fn batch_major_const_add(
+    rows: &mut BmRows<'_>,
+    k: u32,
+    y: &[u32; BM_V],
+    bit: usize,
+) -> [u32; BM_V] {
     let mut sum = [0u32; BM_V];
     let mut tr = [[0u32; BM_V]; 3];
     for j in 0..BM_V {
@@ -1490,7 +1568,7 @@ fn bm_const_add(rows: &mut BmRows<'_>, k: u32, y: &[u32; BM_V], bit: usize) -> [
         tr[1][j] = r;
         tr[2][j] = p;
     }
-    bm_triple(rows, bit, &tr[0], &tr[1], &tr[2]);
+    batch_major_triple(rows, bit, &tr[0], &tr[1], &tr[2]);
     sum
 }
 
@@ -1513,17 +1591,17 @@ fn build_group_batch_major(
     or_bit_row(rows.b, Z_CONST_POS);
 
     for w in 0..H_WORDS {
-        bm_write_lin(&mut rows, h_bit(w, 0), &h_in[w]);
+        batch_major_write_lin(&mut rows, h_bit(w, 0), &h_in[w]);
     }
     for i in 0..M_WORDS {
-        bm_write_lin(&mut rows, m_bit(i, 0), &m[i]);
+        batch_major_write_lin(&mut rows, m_bit(i, 0), &m[i]);
     }
 
     // Message schedule.
     let mut w_sched: Vec<[u32; BM_V]> = Vec::with_capacity(64);
     w_sched.extend_from_slice(&m);
     for t in 16..64 {
-        let w_t = bm_fused_add4(
+        let w_t = batch_major_fused_add4(
             &mut rows,
             &map_v(&w_sched[t - 2], small_sigma1),
             &map_v(&w_sched[t - 15], small_sigma0),
@@ -1561,8 +1639,8 @@ fn build_group_batch_major(
         or_u32_row(rows.b, maj_and_bit(r, 0), &c_xor_a);
         let maj_out = xor_v(&maj_and_v, &aa);
 
-        let hk = bm_const_add(&mut rows, SHA256_K[r], &hh, round_bit(r, RC_ADDK));
-        let t1 = bm_fused_add4(
+        let hk = batch_major_const_add(&mut rows, SHA256_K[r], &hh, round_bit(r, RC_ADDK));
+        let t1 = batch_major_fused_add4(
             &mut rows,
             &hk,
             &map_v(&ee, big_sigma1),
@@ -1572,7 +1650,7 @@ fn build_group_batch_major(
             round_bit(r, RC_MAJ2),
             round_bit(r, RC_RIP),
         );
-        let a_new = bm_fused_add3(
+        let a_new = batch_major_fused_add3(
             &mut rows,
             &t1,
             &map_v(&aa, big_sigma0),
@@ -1580,10 +1658,10 @@ fn build_group_batch_major(
             round_bit(r, RC_AMAJ),
             round_bit(r, RC_ARIP),
         );
-        let e_new = bm_add_inline(&mut rows, &dd, &t1, round_bit(r, RC_ENEW));
+        let e_new = batch_major_add_inline(&mut rows, &dd, &t1, round_bit(r, RC_ENEW));
         if r % EA_PERIOD == EA_PERIOD - 1 {
-            bm_write_lin(&mut rows, a_new_bit(r, 0), &a_new);
-            bm_write_lin(&mut rows, e_new_bit(r, 0), &e_new);
+            batch_major_write_lin(&mut rows, a_new_bit(r, 0), &a_new);
+            batch_major_write_lin(&mut rows, e_new_bit(r, 0), &e_new);
         }
 
         hh = gg;
@@ -1599,8 +1677,8 @@ fn build_group_batch_major(
     // Output feed-forward.
     let final_state = [aa, bb, cc, dd, ee, ff, gg, hh];
     for w in 0..N_OUT_WORDS {
-        let sum = bm_add_inline(&mut rows, &final_state[w], &h_in[w], out_carry_bit(w, 0));
-        bm_write_lin(&mut rows, h_out_bit(w, 0), &sum);
+        let sum = batch_major_add_inline(&mut rows, &final_state[w], &h_in[w], out_carry_bit(w, 0));
+        batch_major_write_lin(&mut rows, h_out_bit(w, 0), &sum);
     }
 }
 
@@ -1832,6 +1910,49 @@ mod tests {
         assert!(
             setup.verify(&commitment, &bad, &mut ch).is_err(),
             "tampered batch-major proof accepted"
+        );
+    }
+
+    /// UNION-AG e2e for SHA-256: `prove_fast_union_ag` → `verify_union_ag`
+    /// roundtrip + tamper rejection. The twin of the BLAKE3
+    /// `prove_fast_union_ag_roundtrip` — same union transport and merged
+    /// opening, AG round 1 on `SkipPoint::Ag` claim points.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore] // Heavy — run with `cargo test sha2_prove_fast_union_ag_roundtrip -- --ignored`
+    fn sha2_prove_fast_union_ag_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+
+        let setup = Sha256HybridSetup::new(128);
+        let mut rng = Rng::new(0x5A2_A901);
+        let inputs: Vec<([u32; 8], [u32; 16])> = (0..128)
+            .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
+            .collect();
+
+        let mut ch_p = FsChallenger::new(b"flock-sha2-union-ag-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast_union_ag(&inputs, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-sha2-union-ag-v0");
+        let claim_v = setup
+            .verify_union_ag(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("sha2 union-AG verify rejected honest proof: {e:?}"));
+        assert_eq!(claim_p, claim_v, "sha2 union-AG claim mismatch");
+
+        // Tampering an AG round-1 message must reject.
+        let mut bad = proof.clone();
+        bad.boolean.ag.round1_ab[0] += flock_core::field::F128::ONE;
+        let mut ch = FsChallenger::new(b"flock-sha2-union-ag-v0");
+        assert!(
+            setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+            "must reject a tampered sha2 union-AG round-1 message"
+        );
+
+        // A nonce vector off the grinding schedule must reject.
+        let mut bad = proof.clone();
+        bad.boolean.ag.grinding_nonces.push(0);
+        let mut ch = FsChallenger::new(b"flock-sha2-union-ag-v0");
+        assert!(
+            setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+            "must reject a sha2 proof with an off-schedule nonce count"
         );
     }
 
@@ -2072,7 +2193,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn cv_to_phys_bits_roundtrips() {
+    fn chaining_value_to_phys_bits_roundtrips() {
         // Round-trip a fixed CV through bool-pack and assert the per-word bits
         // are recovered (sanity check on the within-slot layout convention).
         let cv: [u32; 8] = [

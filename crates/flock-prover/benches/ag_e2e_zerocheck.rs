@@ -3,7 +3,7 @@
 //! claims; this times the prover phases of each from the same thermal state.
 //!
 //! Phases (comparable rows):
-//!   - Round-1 URM:   AG `round1_slp_packed` (Paar SLP)        vs  RS additive-NTT URM.
+//!   - Round-1 univariate round message:   AG `round1_straight_line_program_packed` (Paar SLP)        vs  RS additive-NTT univariate round message.
 //!   - skip→mlv fold: AG `fold_and_first_round` (fused, γ-Horner) vs RS fused fold+round2.
 //!   - r1 sample:     AG-only (rejection sample of a curve point).
 //!   - mlv tail:      AG fused `fold_and_compute_round_pair_into` vs RS fused tail
@@ -38,7 +38,7 @@ mod aarch64_only {
         challenger::{Challenger, FsChallenger},
         field::{F8, F128},
         genus95_curve_code::{
-            Sha256Rng, base_evaluation_functional, round1::round1_slp_packed,
+            Sha256Rng, base_evaluation_functional, round1::round1_straight_line_program_packed,
             sample_random_evaluation_point,
         },
         init_perf_thread_pool,
@@ -146,7 +146,7 @@ mod aarch64_only {
     /// Returns `(elapsed_ms, round messages, final bound (a,b))`. Classic and lookahead
     /// bind the identical challenge sequence (`rho_at(0), rho_at(1), …`), so both must
     /// return identical messages and final values — asserted by the callers.
-    fn mlv_tail(
+    fn multilinear_values_tail(
         mut a_mlv: Vec<F128>,
         mut b_mlv: Vec<F128>,
         r_rest: &[F128],
@@ -317,14 +317,16 @@ mod aarch64_only {
         let refold = || {
             uni_skip_fold_and_round_pair_optimized_packed(a, b, m, K_SKIP, &fold_table, &mlv_arg)
         };
-        let (t_tail_classic, msgs_c, fin_c) = mlv_tail(a_mlv, b_mlv, r_rest, Sched::Classic);
+        let (t_tail_classic, msgs_c, fin_c) =
+            multilinear_values_tail(a_mlv, b_mlv, r_rest, Sched::Classic);
         if !tails_all() {
             return (t_round1, t_fold, t_tail_classic, 0.0, 0.0);
         }
         let (a2, b2, _, _) = refold();
-        let (t_tail_la, msgs_la, fin_la) = mlv_tail(a2, b2, r_rest, Sched::Lookahead);
+        let (t_tail_la, msgs_la, fin_la) =
+            multilinear_values_tail(a2, b2, r_rest, Sched::Lookahead);
         let (a3, b3, _, _) = refold();
-        let (t_tail_un, msgs_un, fin_un) = mlv_tail(a3, b3, r_rest, Sched::Uniform);
+        let (t_tail_un, msgs_un, fin_un) = multilinear_values_tail(a3, b3, r_rest, Sched::Uniform);
         check_tails("RS", &msgs_c, fin_c, &msgs_la, fin_la, &msgs_un, fin_un);
         (t_round1, t_fold, t_tail_classic, t_tail_la, t_tail_un)
     }
@@ -336,8 +338,9 @@ mod aarch64_only {
         let r_outer = ch.sample_f128_vec(m - K_SKIP - N_INNER);
         let eq = build_eq(&r_outer);
 
-        let (t_round1, (res_ab, wbar)) =
-            time_ms(|| round1_slp_packed(black_box(a), black_box(b), black_box(c), &eq));
+        let (t_round1, (res_ab, wbar)) = time_ms(|| {
+            round1_straight_line_program_packed(black_box(a), black_box(b), black_box(c), &eq)
+        });
         let di = d_inv();
         let ab_fresh: Vec<F128> = (0..158).map(|s| di * res_ab[s]).collect();
         let c_msg: Vec<F128> = (0..64).map(|i| di * wbar[i]).collect();
@@ -369,14 +372,16 @@ mod aarch64_only {
 
         // Tail: rounds 1..n_mlv, classic then lookahead (same shared loop as RS).
         debug_assert_eq!(a_mlv.len(), 1usize << r_rest.len());
-        let (t_tail_classic, msgs_c, fin_c) = mlv_tail(a_mlv, b_mlv, &r_rest, Sched::Classic);
+        let (t_tail_classic, msgs_c, fin_c) =
+            multilinear_values_tail(a_mlv, b_mlv, &r_rest, Sched::Classic);
         if !tails_all() {
             return (t_round1, t_r1, t_fold, t_tail_classic, 0.0, 0.0);
         }
         let (a2, b2, _, _) = fold_and_first_round(a, b, &w, &r_rest);
-        let (t_tail_la, msgs_la, fin_la) = mlv_tail(a2, b2, &r_rest, Sched::Lookahead);
+        let (t_tail_la, msgs_la, fin_la) =
+            multilinear_values_tail(a2, b2, &r_rest, Sched::Lookahead);
         let (a3, b3, _, _) = fold_and_first_round(a, b, &w, &r_rest);
-        let (t_tail_un, msgs_un, fin_un) = mlv_tail(a3, b3, &r_rest, Sched::Uniform);
+        let (t_tail_un, msgs_un, fin_un) = multilinear_values_tail(a3, b3, &r_rest, Sched::Uniform);
         check_tails("AG", &msgs_c, fin_c, &msgs_la, fin_la, &msgs_un, fin_un);
         (t_round1, t_r1, t_fold, t_tail_classic, t_tail_la, t_tail_un)
     }

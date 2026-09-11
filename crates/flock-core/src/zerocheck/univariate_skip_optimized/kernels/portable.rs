@@ -78,6 +78,25 @@ pub(super) fn accumulate_convert(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// AB-only drain: used when the C banks come from the lincheck-stripe fold,
+/// so the C transpose and gathers are skipped entirely.
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn accumulate_convert_ab_only(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+) {
+    for lane in 0..64 {
+        let mut converted_ab = F128::ZERO;
+        for b_med in 0..n_b_med {
+            converted_ab += convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
+        }
+        partial_ab[lane] += converted_ab * eq_lo_val;
+    }
+}
+
 #[cfg(not(any(
     target_arch = "aarch64",
     all(

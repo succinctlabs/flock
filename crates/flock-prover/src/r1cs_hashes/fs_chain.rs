@@ -573,7 +573,7 @@ impl FsChainSponge {
         self.rows.len() - 1
     }
 
-    fn cv_link(&self) -> Link {
+    fn chaining_value_link(&self) -> Link {
         Link {
             cv: self.cv_source,
             right: None,
@@ -587,7 +587,7 @@ impl FsChainSponge {
         while self.buf.len() >= BLOCK_BYTES {
             let m = words(&self.buf[..BLOCK_BYTES]);
             let out = blake3_compress(&self.cv, &m, 0, BLOCK_BYTES as u32, CHAIN_ABSORB);
-            let link = self.cv_link();
+            let link = self.chaining_value_link();
             let row = self.emit(
                 (self.cv, m, 0, BLOCK_BYTES as u32, CHAIN_ABSORB),
                 link,
@@ -615,7 +615,7 @@ impl FsChainSponge {
     fn compress_absorb_block(&mut self) {
         let m = words(&self.buf[..BLOCK_BYTES]);
         let out = blake3_compress(&self.cv, &m, 0, BLOCK_BYTES as u32, CHAIN_ABSORB);
-        let link = self.cv_link();
+        let link = self.chaining_value_link();
         let row = self.emit(
             (self.cv, m, 0, BLOCK_BYTES as u32, CHAIN_ABSORB),
             link,
@@ -651,7 +651,7 @@ impl FsChainSponge {
                 ([0u32; 16], 0u32, None)
             };
             let o = blake3_compress(&self.cv, &m, 0, blen, CHAIN_SQUEEZE);
-            let link = self.cv_link();
+            let link = self.chaining_value_link();
             let row = self.emit(
                 (self.cv, m, 0, blen, CHAIN_SQUEEZE),
                 link,
@@ -695,7 +695,7 @@ impl FsChainSponge {
         let m = words(&self.buf);
         let counter = pow_squeeze_counter(bits, self.buf.len());
         let out = blake3_compress(&self.cv, &m, counter, BLOCK_BYTES as u32, CHAIN_SQUEEZE);
-        let link = self.cv_link();
+        let link = self.chaining_value_link();
         let row = self.emit(
             (self.cv, m, counter, BLOCK_BYTES as u32, CHAIN_SQUEEZE),
             link,
@@ -718,7 +718,7 @@ impl FsChainSponge {
         while sources.len() < wanted_words {
             let zero = [0u32; 16];
             let o = blake3_compress(&self.cv, &zero, 0, 0, CHAIN_SQUEEZE);
-            let link = self.cv_link();
+            let link = self.chaining_value_link();
             let continuation = self.emit((self.cv, zero, 0, 0, CHAIN_SQUEEZE), link, None, 0);
             self.cv = o[..8].try_into().expect("8 words");
             self.cv_source = CvSource::Row(continuation);

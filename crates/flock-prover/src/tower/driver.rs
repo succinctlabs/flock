@@ -29,7 +29,7 @@ use crate::tower::{
     F128,
     chain::{ChainProof, build_chain_proof},
     config::TowerConfig,
-    fl_node::{FlNode, build_fl_node, chain_blake_r1cs, chain_jagged_params},
+    fl_node::{FlNode, build_first_level_node, chain_blake_r1cs, chain_jagged_params},
     gates_blake3::pack4,
     node::{
         ChainLane, NodeOut, SpineIn, build_node_outer_app, digest_f128, entry_live,
@@ -142,7 +142,7 @@ impl Tower {
             let cp0 = build_chain_proof(cfg, h, blocks_per_leaf);
             let cp1 = build_chain_proof(cfg, cp0.h_end, blocks_per_leaf);
             h = cp1.h_end;
-            fls.push(build_fl_node(cfg, &cp0, &cp1));
+            fls.push(build_first_level_node(cfg, &cp0, &cp1));
             // Leaf 0 survives as the lane's chain-side material owner
             // (one shape for every leaf); every other leaf drops here.
             chain.get_or_insert(cp0);

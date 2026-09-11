@@ -4,7 +4,7 @@ initial_k = 4
 target_security_bits = 100
 analysis_version = "f256_split_johnson_two_point_ood_query128_c3_algebraic_row_union_over_bchks25_thm_4_6"
 field = "f256"
-hash = "sha256"
+hash = "blake3"
 grinding_step = "post_commit_pre_queries"
 
 [[levels]]

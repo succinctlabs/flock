@@ -144,7 +144,7 @@ pub use crate::lincheck::kernels::{
 };
 pub use crate::lincheck::union::{
     MatrixAssertion, UnionLincheckSlot, eq_prefix_sum, eq_prefix_weight, prove_union_capture_z_vec,
-    prove_union_capture_z_vec_with_grinding, union_comb_partial, verify_union,
+    prove_union_capture_z_vec_with_grinding, union_bitbank_fold, union_comb_partial, verify_union,
     verify_union_deferred, verify_union_deferred_with_grinding, verify_union_with_grinding,
 };
 use crate::{
@@ -985,7 +985,7 @@ const NEON_TILE_T: usize = 8;
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel
 /// can skip blocks past the useful region of each block (byte-identical to
 /// the dense path on honestly-padded witnesses).
-fn partial_fold_packed_z_best(
+pub fn partial_fold_packed_z_best(
     z_packed: &[u8],
     m: usize,
     k_log: usize,
@@ -1220,7 +1220,7 @@ impl SkipPoint {
     /// `z_partial`) so the point is post-commitment for Schwartz-Zippel. The AG
     /// arm seeds a hash-matched DRBG (`FsRng`, following the transcript hash)
     /// from two F128 squeezes and replays the rejection sampler on both sides (unlike the zerocheck's `r₁`, which now uses the
-    /// prover-side nonce grind — see `ag_skip::sample_r1_prover`).
+    /// prover-side nonce grind — see `ag_skip::sample_round_one_prover`).
     pub fn sample_fresh<Ch: Challenger>(&self, ch: &mut Ch) -> SkipPoint {
         match self {
             SkipPoint::Phi8(_) => SkipPoint::Phi8(ch.sample_f128()),

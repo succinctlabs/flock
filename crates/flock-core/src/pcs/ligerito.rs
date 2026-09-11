@@ -40,7 +40,7 @@ use std::{
 };
 
 use extension::recursive_prover_with_basis_impl;
-use merkle::{cap_layer, hash_leaf, merkle_proof_capped, merkle_tree, verify_merkle_proof_capped};
+use merkle::{cap_layer, hash_leaf, merkle_proof_capped, verify_merkle_proof_capped};
 use rayon::{
     current_num_threads,
     prelude::{
@@ -58,10 +58,7 @@ use crate::{
     lincheck::build_eq_table,
     merkle::{self, Hash, HashKind},
     ntt::additive_ntt_f128::AdditiveNttF128,
-    pcs::{
-        LOG_PACKING, commit::replicate_message_fill, ring_switch::build_eq_scaled_parallel,
-        stratified,
-    },
+    pcs::{LOG_PACKING, ring_switch::build_eq_scaled_parallel, stratified},
     scratch::{give_f128, take_f128},
 };
 
@@ -231,10 +228,10 @@ impl ProverConfig {
     }
 
     /// The L0 cap depth this config implies — the ONE rule commit-time
-    /// sizing (`PcsParams::l0_cap_depth`), the open entries'
+    /// sizing (`PcsParams::level_zero_cap_depth`), the open entries'
     /// belt-and-braces asserts, and the prover's own absorb must share:
     /// the L0 schedule's cap (top set bit).
-    pub fn l0_cap_depth(&self) -> usize {
+    pub fn level_zero_cap_depth(&self) -> usize {
         self.stratified[0].cap_depth()
     }
 }
@@ -296,8 +293,8 @@ impl VerifierConfig {
     }
 
     /// The L0 cap depth this config implies; see
-    /// [`ProverConfig::l0_cap_depth`].
-    pub fn l0_cap_depth(&self) -> usize {
+    /// [`ProverConfig::level_zero_cap_depth`].
+    pub fn level_zero_cap_depth(&self) -> usize {
         self.stratified[0].cap_depth()
     }
 }
@@ -1741,7 +1738,7 @@ impl LigeritoSecurityConfig {
             target_security_bits,
             analysis_version: "f256_split_no_row_union_over_ben_sasson_2025_cor_1_4".into(),
             field: "f256".into(),
-            hash: "sha256".into(),
+            hash: "blake3".into(),
             grinding_step: GrindingStep::PostCommitPreQueries,
             levels,
             final_block: FinalBlockConfig { yr_log_n },
@@ -2021,7 +2018,7 @@ impl LigeritoSecurityConfig {
             target_security_bits: target_bits,
             analysis_version: analysis_version.into(),
             field: "f256".into(),
-            hash: "sha256".into(),
+            hash: "blake3".into(),
             grinding_step: GrindingStep::PostCommitPreQueries,
             levels,
             final_block: FinalBlockConfig {
@@ -3079,22 +3076,39 @@ pub fn ligero_commit(
 
     // LSB-lane layout: input matches the SoA layout `data[pos * num_interleaved + lane]`
     // directly. The first `log_inv_rate` NTT layers on the zero-padded
-    // coefficients are pure copies, so fill the matrix with 2^log_inv_rate
-    // replicas of `poly` (same write cost as copy + zero-fill) and start the
-    // transform past those layers — see `pcs::commit::replicate_message_fill`.
+    // coefficients are pure copies, so the encode starts past those layers
+    // with `poly` replicated `2^log_inv_rate` times.
+    //
+    // Fill fusion (`from_message`, which sources the first pass's rows from
+    // `poly` and skips the replicate write) was tried here and measured
+    // SLOWER — see the 2026-08-31 log entry. These levels run at rate 1/8
+    // .. 1/2048, where the replicate is a cheap 1->2^r broadcast, unlike the
+    // rate-1/2 L0 shape the fused pass is tuned for.
     let codeword_len = block_len * num_interleaved;
-    let mut mat = take_f128(codeword_len);
-    replicate_message_fill(&mut mat, poly);
+    let mut mat = crate::scratch::take_f128(codeword_len);
 
     // RS-encode every lane in one call (each lane is one independent NTT).
+    let lig_timing = std::env::var_os("FLOCK_LIG_TIMING").is_some();
+    let t_enc = std::time::Instant::now();
+    super::commit::replicate_message_fill(&mut mat, poly);
     ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+    let t_enc = t_enc.elapsed();
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
     let leaf_size_bytes = num_interleaved * size_of::<F128>();
     let data_bytes: &[u8] =
         unsafe { from_raw_parts(mat.as_ptr() as *const u8, mat.len() * size_of::<F128>()) };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let tree = merkle_tree(data_bytes, block_len, kind);
+    let t_mk = std::time::Instant::now();
+    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
+    if lig_timing {
+        eprintln!(
+            "[lig-timing] ligero_commit log_cols={log_msg_cols} lanes={num_interleaved} rate=1/{}: encode {:.2} ms + merkle {:.2} ms",
+            1usize << log_inv_rate,
+            t_enc.as_secs_f64() * 1e3,
+            t_mk.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     LigeroWitness {
         mat,
@@ -4639,7 +4653,7 @@ pub fn recursive_prover<Ch: Challenger>(
 /// would produce at the same `(log_msg_cols_0 = log_n - initial_k, initial_k,
 /// log_inv_rates[0])`. In practice this means using `PcsParams` with
 /// `log_batch_size = config.initial_k` and `log_inv_rate = config.log_inv_rates[0]`.
-pub fn recursive_prover_with_l0<Ch: Challenger>(
+pub fn recursive_prover_with_level_zero<Ch: Challenger>(
     config: &ProverConfig,
     poly: &[F128],
     l0_codeword: Vec<F128>,
@@ -4744,6 +4758,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         None,
         None,
+        None,
         challenger,
     )
 }
@@ -4781,6 +4796,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_2: round0_uv.1,
         }),
         round1_lookahead,
+        None,
         challenger,
     )
 }
@@ -4809,6 +4825,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
     round1_lookahead: Option<FoldLookahead>,
     l0_jit_basis: Option<BasisWindowFn<'_>>,
     l0_virtual_basis: Option<VirtualEqBasis>,
+    seeded_stats: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     recursive_prover_with_basis_impl(
@@ -4827,6 +4844,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
             u_2: round0_uv.1,
         }),
         round1_lookahead,
+        seeded_stats,
         challenger,
     )
 }
@@ -5472,7 +5490,7 @@ mod tests {
                 induce_sumcheck_poly_via_ntt, ligero_commit, merkle_paths_for, paper_ood_bits,
                 paper_per_query_bits, partial_eval_lsb, partial_eval_lsb_one, prover_config_for,
                 recursive_prover, recursive_prover_with_basis,
-                recursive_prover_with_basis_precomputed_round0, recursive_prover_with_l0,
+                recursive_prover_with_basis_precomputed_round0, recursive_prover_with_level_zero,
                 recursive_verifier, round_msg_and_eval_blocked,
                 round_msg_and_eval_eq_point_blocked, round_msg_eval_and_lookahead, round1,
                 sample_queries, transpose_forward_ntt, transpose_forward_ntt_sparse, udr_queries,
@@ -5526,7 +5544,7 @@ mod tests {
     }
 
     #[test]
-    fn l0_ood_accounting_includes_the_ring_switch_degree() {
+    fn level_zero_ood_accounting_includes_the_ring_switch_degree() {
         let cfg = LigeritoSecurityConfig::from_toml_str(include_str!(
             "../../configs/ligerito/m22_fast.toml"
         ))
@@ -5664,7 +5682,7 @@ mod tests {
         // m29 Fast is the one initial_k-5 config (the recursion-node
         // row-width choice — see `derive_profile`).
         assert_eq!(cfg.initial_k, 5);
-        assert_eq!(cfg.hash, "sha256");
+        assert_eq!(cfg.hash, "blake3");
         assert_eq!(cfg.levels.len(), 5);
         // Fast = JohnsonOod profile with 16-bit query PoW at every level:
         // 244 L0 queries put the raw query term at ~112 bits and the PoW
@@ -5878,21 +5896,21 @@ mod tests {
     #[test]
     fn ligerito_security_config_hash_field_selects_merkle_hash() {
         let mut cfg = blake3_m29_udr_example();
-        assert_eq!(cfg.hash, "sha256", "example config baseline");
-        let (p, v) = cfg.to_prover_verifier_configs().expect("sha256 configs");
-        assert_eq!(p.merkle_hash, HashKind::Sha256);
-        assert_eq!(v.merkle_hash, HashKind::Sha256);
-
-        cfg.hash = "blake3".into();
+        assert_eq!(cfg.hash, "blake3", "example config baseline");
         let (p, v) = cfg.to_prover_verifier_configs().expect("blake3 configs");
         assert_eq!(p.merkle_hash, HashKind::Blake3);
         assert_eq!(v.merkle_hash, HashKind::Blake3);
 
+        cfg.hash = "sha256".into();
+        let (p, v) = cfg.to_prover_verifier_configs().expect("sha256 configs");
+        assert_eq!(p.merkle_hash, HashKind::Sha256);
+        assert_eq!(v.merkle_hash, HashKind::Sha256);
+
         // Survives a TOML round-trip, so the option is settable from a file.
-        cfg.validate().expect("blake3 config validates");
+        cfg.validate().expect("sha256 config validates");
         let back = LigeritoSecurityConfig::from_toml_str(&cfg.to_toml_string().unwrap())
             .expect("toml roundtrip");
-        assert_eq!(back.merkle_hash().unwrap(), HashKind::Blake3);
+        assert_eq!(back.merkle_hash().unwrap(), HashKind::Sha256);
     }
 
     /// A `hash` we do not implement must fail at validation rather than
@@ -6183,7 +6201,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -6199,7 +6217,7 @@ mod tests {
             HashKind::Sha256,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"pow-test");
         let proof = recursive_prover_with_basis(
@@ -6227,7 +6245,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -6317,7 +6335,7 @@ mod tests {
                 claim_batch_grinding_bits: vec![0; 2],
                 consistency_batch_grinding_bits: vec![0; 2],
                 ood_samples: vec![0; 2],
-                merkle_hash: Default::default(),
+                merkle_hash: HashKind::Sha256,
                 stratified: vec![],
             }
             .with_default_stratified();
@@ -6335,7 +6353,7 @@ mod tests {
                 claim_batch_grinding_bits: vec![0; 2],
                 consistency_batch_grinding_bits: vec![0; 2],
                 ood_samples: vec![0; 2],
-                merkle_hash: Default::default(),
+                merkle_hash: HashKind::Sha256,
                 stratified: vec![],
             }
             .with_default_stratified();
@@ -6913,7 +6931,7 @@ mod tests {
     /// End-to-end roundtrip: prover proves `poly(z) = v`, verifier accepts.
     /// R = 1 (one recursive step).
     #[test]
-    fn ligerito_r1_roundtrip_accepts() {
+    fn ligerito_round_one_roundtrip_accepts() {
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
@@ -6949,7 +6967,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -6967,7 +6985,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7036,7 +7054,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; r + 1],
             consistency_batch_grinding_bits: vec![0; r + 1],
             ood_samples: vec![0; r + 1],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7054,7 +7072,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; r + 1],
             consistency_batch_grinding_bits: vec![0; r + 1],
             ood_samples: vec![0; r + 1],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7342,7 +7360,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 3],
             consistency_batch_grinding_bits: vec![0; 3],
             ood_samples: vec![0; 3],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7360,7 +7378,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 3],
             consistency_batch_grinding_bits: vec![0; 3],
             ood_samples: vec![0; 3],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7407,7 +7425,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7476,7 +7494,7 @@ mod tests {
 
         // And the proof is a real one.
         let v_cfg = verifier_config_for(log_n, 6, LigeritoProfile::Fast).unwrap();
-        let cap = wtns.cap(v_cfg.l0_cap_depth()).to_vec();
+        let cap = wtns.cap(v_cfg.level_zero_cap_depth()).to_vec();
         let mut v_ch = FsChallenger::new(b"la-test");
         assert!(recursive_verifier_with_basis_succinct(
             &v_cfg,
@@ -7535,7 +7553,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7551,7 +7569,7 @@ mod tests {
             HashKind::Sha256,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"basis-test");
         let proof = recursive_prover_with_basis(
@@ -7578,7 +7596,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7978,7 +7996,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7994,7 +8012,7 @@ mod tests {
             HashKind::Sha256,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"succ-cmp");
         let proof = recursive_prover_with_basis(
@@ -8021,7 +8039,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8075,7 +8093,7 @@ mod tests {
             claim_batch_grinding_bits: vec![3; r + 1],
             consistency_batch_grinding_bits: vec![4; r + 1],
             ood_samples: ood_samples.clone(),
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8093,7 +8111,7 @@ mod tests {
             claim_batch_grinding_bits: vec![3; r + 1],
             consistency_batch_grinding_bits: vec![4; r + 1],
             ood_samples,
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8140,7 +8158,7 @@ mod tests {
             HashKind::Sha256,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"ood-test");
         let proof = recursive_prover_with_basis(
@@ -8277,10 +8295,10 @@ mod tests {
             initial_k,
             1,
             &ntt_0,
-            HashKind::Sha256,
+            p_cfg.merkle_hash,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"m22-fast");
         let proof = recursive_prover_with_basis(
@@ -8329,12 +8347,14 @@ mod tests {
         assert!(!verify(&bad), "mutated coordinate row opening must reject");
     }
 
-    /// End-to-end under BLAKE3: the same recursion, every Merkle commitment
-    /// (L0 and each recursive level) built and checked with the other hash.
-    /// Also pins the failure mode of a hash mismatch — a verifier configured
-    /// for the wrong hash must reject, since the roots commit to the hash.
+    /// End-to-end under SHA-256 (the non-default hash): the same recursion,
+    /// every Merkle commitment (L0 and each recursive level) built and
+    /// checked with the other hash. Also pins the failure mode of a hash
+    /// mismatch — a verifier configured for the wrong hash must reject,
+    /// since the roots commit to the hash.
     #[test]
-    fn ligerito_m22_roundtrip_under_blake3() {
+    fn ligerito_m22_roundtrip_under_sha256() {
+        use crate::challenger::Challenger;
         let m = 22usize;
         let log_n = m - LOG_PACKING;
         let initial_k = 6;
@@ -8342,11 +8362,11 @@ mod tests {
             .expect("m22 fast prover config");
         let mut v_cfg = verifier_config_for(log_n, initial_k, LigeritoProfile::Fast)
             .expect("m22 fast verifier config");
-        // The embedded configs all declare sha256; override to exercise the
+        // The embedded configs all declare blake3; override to exercise the
         // other arm of the option end to end.
-        assert_eq!(p_cfg.merkle_hash, HashKind::Sha256);
-        p_cfg.merkle_hash = HashKind::Blake3;
-        v_cfg.merkle_hash = HashKind::Blake3;
+        assert_eq!(p_cfg.merkle_hash, HashKind::Blake3);
+        p_cfg.merkle_hash = HashKind::Sha256;
+        v_cfg.merkle_hash = HashKind::Sha256;
 
         let mut rng = RandomChallenger::new(0xB1A5_E300);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
@@ -8366,10 +8386,10 @@ mod tests {
             initial_k,
             1,
             &ntt_0,
-            HashKind::Blake3,
+            p_cfg.merkle_hash,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"m22-blake3");
         let proof = recursive_prover_with_basis(
@@ -8394,14 +8414,14 @@ mod tests {
                 |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                 &mut v_ch,
             ),
-            "blake3 Merkle proof must verify"
+            "sha256 Merkle proof must verify"
         );
 
-        // Same proof, verifier configured for SHA-256 → every opening's
+        // Same proof, verifier configured for BLAKE3 → every opening's
         // recomputed root disagrees, so it must reject.
         let mut wrong_cfg = v_cfg.clone();
-        wrong_cfg.merkle_hash = HashKind::Sha256;
-        let mut w_ch = FsChallenger::new(b"m22-blake3");
+        wrong_cfg.merkle_hash = HashKind::Blake3;
+        let mut w_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
         assert!(
             !recursive_verifier_with_basis_succinct(
                 &wrong_cfg,
@@ -8449,8 +8469,9 @@ mod tests {
                 let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + 1);
                 let wtns_0 =
                     ligero_commit(&poly, log_msg_cols_0, initial_k, 1, &ntt_0, merkle_hash);
-                let initial_cap =
-                    |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+                let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
+                    wtns_0.cap(cfg.level_zero_cap_depth()).to_vec()
+                };
 
                 let mut p_ch = FsChallenger::with_hash(b"m22-matrix", fs_hash);
                 let proof = recursive_prover_with_basis(
@@ -8552,7 +8573,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8568,7 +8589,7 @@ mod tests {
             HashKind::Sha256,
         );
         let initial_cap =
-            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.level_zero_cap_depth()).to_vec() };
 
         let mut p_ch = FsChallenger::new(b"batched");
         let proof = recursive_prover_with_basis(
@@ -8595,7 +8616,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8613,11 +8634,11 @@ mod tests {
         assert!(ok, "batched-basis verifier rejected valid proof");
     }
 
-    /// `recursive_prover_with_l0` (external L0 path, for integration with
+    /// `recursive_prover_with_level_zero` (external L0 path, for integration with
     /// Flock's `pcs::commit`) produces a byte-identical proof to
     /// `recursive_prover` when given a matching pre-built L0.
     #[test]
-    fn recursive_prover_with_l0_matches_full() {
+    fn recursive_prover_with_level_zero_matches_full() {
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
@@ -8648,7 +8669,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8669,7 +8690,7 @@ mod tests {
             HashKind::Sha256,
         );
         let mut p_ch_b = FsChallenger::new(b"l0-test");
-        let proof_b = recursive_prover_with_l0(
+        let proof_b = recursive_prover_with_level_zero(
             &cfg,
             &poly,
             take(&mut wtns_0_external.mat),
@@ -8710,7 +8731,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8720,7 +8741,7 @@ mod tests {
 
     /// Mutation rejection: change one element of yr → verify should fail.
     #[test]
-    fn ligerito_r1_rejects_mutated_yr() {
+    fn ligerito_round_one_rejects_mutated_yr() {
         let log_n = 14;
         let initial_k = 3;
         let k_0 = 2;
@@ -8753,7 +8774,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8771,7 +8792,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();

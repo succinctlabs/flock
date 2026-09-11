@@ -53,8 +53,7 @@ use flock_core::{
 use flock_field::F128;
 use flock_transcript::challenger::Challenger;
 use lincheck::{
-    LincheckCircuit, LincheckProof, SparseMatrixCircuit, UnionLincheckSlot,
-    prove_padded_capture_z_vec_with_grinding, prove_union_capture_z_vec_with_grinding,
+    LincheckCircuit, LincheckProof, SparseMatrixCircuit, prove_padded_capture_z_vec_with_grinding,
 };
 use pcs::{
     BatchOpeningProofLigerito, DirectEqInd, LOG_PACKING, MergedOpenProof, OpeningGrinding,
@@ -188,7 +187,8 @@ pub fn prove_ligerito<Ch: Challenger>(
         challenger,
     );
 
-    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
+    let x_ab =
+        r1cs.x_ab_from_multilinear_values(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 
     let lc_circuit = SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
     let (lc_proof, lc_claim, z_vec_pre) = prove_padded_capture_z_vec_with_grinding(
@@ -465,7 +465,18 @@ fn build_union_witness(
     }
 
     let (mut z, mut a, mut b, mode) = union.take_witness_buffers(padding_unread);
-    let elide = mode != WitnessBufMode::PooledZeroed;
+    let elide = mode != flock_core::union::WitnessBufMode::PooledZeroed;
+    // The dead regions (a/b padding columns, lincheck stripe tail) are read
+    // by nobody on the merged pipeline: the
+    // boolean zerocheck is run-list gated on BOTH flavors (Dead blocks
+    // skipped, Partial cleansed) and the lincheck is count-proportional. This
+    // is the `padding_unread` predicate MINUS its identity-compaction clause,
+    // which exists only because `q` aliases the COMMITTED `z` buffer — an
+    // argument that says nothing about `a`/`b`. Element registries are
+    // excluded for the same reason they are there: their `a`/`b` are derived
+    // by gather rather than run-list gated.
+    let dead_padding_unread =
+        !union.has_element() && union.m_total() - union.n_log() >= pcs::LOG_PACKING;
     let nu = union.n_log();
     // Live-only element `pa`/`pb` derivation: when the region zerocheck will
     // take its sparse arm, dead rows of `a`/`b` are unread everywhere (their
@@ -474,7 +485,7 @@ fn build_union_witness(
     // by the zerocheck's OWN predicate so the two cannot drift.
     let elem_live = union.has_element() && dead_rows_unread(union);
     let stripes = union
-        .slot_dests(&mut z, &mut a, &mut b, elide)
+        .slot_dests(&mut z, &mut a, &mut b, elide, dead_padding_unread)
         .into_iter()
         .zip(sources)
         .enumerate()
@@ -638,7 +649,7 @@ pub fn prove_fast_ligerito_union<Ch: Challenger>(
 }
 
 /// Which zerocheck the boolean class runs inside
-/// [`prove_union_with_binding_zc`]. The lincheck, claims, and opening are
+/// [`prove_union_with_binding_zerocheck`]. The lincheck, claims, and opening are
 /// flavor-generic ([`SkipPoint`] carries the difference).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BooleanZcKind {
@@ -679,7 +690,7 @@ pub fn prove_fast_ligerito_union_circuit_ag<Ch: Challenger>(
         circuit.check_public(public),
         "the public segment must have the circuit's declared length and fixed constants"
     );
-    let (out, commitment) = prove_union_with_binding_zc(
+    let (out, commitment) = prove_union_with_binding_zerocheck(
         union,
         UnionProveBinding::Circuit(CircuitProverInput { circuit, public }),
         BooleanZcKind::Ag,
@@ -730,7 +741,7 @@ enum UnionZcProof {
     Ag(AgProof),
 }
 
-/// The boolean sub-proof [`prove_union_with_binding_zc`] hands back — the
+/// The boolean sub-proof [`prove_union_with_binding_zerocheck`] hands back — the
 /// prove-side counterpart of the verifier's `BooleanPiopRef`.
 enum UnionBooleanProof {
     Rs(BooleanPiopProof),
@@ -770,7 +781,7 @@ pub fn prove_fast_ligerito_union_ag<Ch: Challenger>(
         !union.has_element(),
         "the AG union route is boolean-only; element registries go through          the RS mixed-class entry"
     );
-    let (out, commitment) = prove_union_with_binding_zc(
+    let (out, commitment) = prove_union_with_binding_zerocheck(
         union,
         UnionProveBinding::Mixed,
         BooleanZcKind::Ag,
@@ -819,7 +830,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     element_slots: Vec<UnionElementSlotInput<'_>>,
     challenger: &mut Ch,
 ) -> (UnionProveOutput, Commitment) {
-    prove_union_with_binding_zc(
+    prove_union_with_binding_zerocheck(
         union,
         binding,
         BooleanZcKind::Rs,
@@ -831,7 +842,7 @@ fn prove_union_with_binding<Ch: Challenger>(
 }
 
 /// [`prove_union_with_binding`] with the boolean zerocheck flavor explicit.
-fn prove_union_with_binding_zc<Ch: Challenger>(
+fn prove_union_with_binding_zerocheck<Ch: Challenger>(
     union: &UnionInstance<'_>,
     binding: UnionProveBinding,
     bool_zc: BooleanZcKind,
@@ -1128,28 +1139,26 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
                 }
             };
 
-            let x_ab = union.x_ab_from_mlv(z_skip, &mlv_challenges);
+            let x_ab = union.x_ab_from_multilinear_values(z_skip, &mlv_challenges);
 
             // M2: the union-column lincheck — one sumcheck over the boolean
             // column domain against the per-slot stripes and circuits. On the M1
             // single-type registries it is byte-identical to invoking the slot's
             // own lincheck (the union of one slot has m = M_bool = M).
-            let (lc_proof, lc_claim, z_vec_pre) = {
-                let lc_slots: Vec<UnionLincheckSlot<'_>> = linchecks
-                    .iter()
-                    .map(|(stripe, circuit)| UnionLincheckSlot {
-                        z_lincheck: stripe,
-                        circuit: *circuit,
-                    })
-                    .collect();
-                prove_union_capture_z_vec_with_grinding(
-                    union,
-                    &lc_slots,
-                    &x_ab,
-                    pcs_params.lincheck_grinding(),
-                    challenger,
-                )
-            };
+            let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
+                .iter()
+                .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
+                    z_lincheck: stripe,
+                    circuit: *circuit,
+                })
+                .collect();
+            let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_union_capture_z_vec_with_grinding(
+                union,
+                &lc_slots,
+                &x_ab,
+                pcs_params.lincheck_grinding(),
+                challenger,
+            );
 
             let ab = ZClaim {
                 point: union.ab_claim_point(
@@ -1201,7 +1210,26 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
                     lincheck: lc_proof,
                 }),
             };
-            (piop, R1csClaim { ab, c }, s_hat_v_ab, s_hat_v_c)
+            // Block-first transport inputs (`pcs::open_batch_merged`): the
+            // column bit-banks at both ring-switch claims' row points. AB's is
+            // the lincheck's own fold; C's row point is the zerocheck's, so it
+            // costs one more stripe fold — spent only when the open will use it.
+            let nu = union.n_log();
+            let banks = if pcs::rectangular_prefix_columns(&union.jagged_heights(), nu).is_some() {
+                let t_b = std::time::Instant::now();
+                assert!(zc_r_rest.len() > nu, "C claim point too short");
+                let bank_c = lincheck::union_bitbank_fold(union, &lc_slots, &zc_r_rest[1..1 + nu]);
+                if std::env::var("PCS_TRACE").is_ok() {
+                    eprintln!(
+                        "  [prove_union] C-claim bit-bank fold: {:6.2} ms",
+                        t_b.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                Some((z_vec_pre, bank_c))
+            } else {
+                None
+            };
+            (piop, R1csClaim { ab, c }, s_hat_v_ab, s_hat_v_c, banks)
         })
     };
     let (boolean, wiring_pre) = if par_transcript {
@@ -1349,13 +1377,18 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
     let t = Instant::now();
     let heights = union.jagged_heights();
     let t_h = t.elapsed().as_secs_f64() * 1e3;
-    let t = Instant::now();
-    let (z_claims, pre): (Vec<ZClaim>, Vec<Option<&[F128]>>) = match &boolean {
-        Some((_, claim, s_hat_v_ab, s_hat_v_c)) => (
+    let t = std::time::Instant::now();
+    type Pre<'a> = Vec<Option<&'a [F128]>>;
+    let (z_claims, pre, banks): (Vec<ZClaim>, Pre<'_>, Pre<'_>) = match &boolean {
+        Some((_, claim, s_hat_v_ab, s_hat_v_c, banks)) => (
             vec![claim.ab.clone(), claim.c.clone()],
             vec![s_hat_v_ab.as_deref(), Some(s_hat_v_c.as_slice())],
+            match banks {
+                Some((ab, c)) => vec![Some(ab.as_slice()), Some(c.as_slice())],
+                None => vec![None, None],
+            },
         ),
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
     let t_z = t.elapsed().as_secs_f64() * 1e3;
     let t = Instant::now();
@@ -1398,6 +1431,7 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
         &commitment,
         &x_refs,
         &pre,
+        &banks,
         &packed_direct,
         &padding,
         &heights,
@@ -1440,7 +1474,7 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
 
     (
         UnionProveOutput {
-            boolean: boolean.map(|(piop, claim, _, _)| (piop, claim)),
+            boolean: boolean.map(|(piop, claim, _, _, _)| (piop, claim)),
             element,
             wiring,
             pcs_open,
@@ -1575,7 +1609,8 @@ pub fn prove_fast_ligerito_ag_from_witness<Ch: Challenger>(
     // ---- Translate AG zerocheck output → lincheck input. Structurally
     // identical to the RS path (`mlv_challenges` binds the m−k_skip non-skip
     // bits low→high, address-ordered), only the skip basis differs (Ag vs Phi8).
-    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Ag(ag_claim.r1), &ag_claim.mlv_challenges);
+    let x_ab =
+        r1cs.x_ab_from_multilinear_values(SkipPoint::Ag(ag_claim.r1), &ag_claim.mlv_challenges);
 
     let (lc_proof, lc_claim, z_vec_pre) = prove_padded_capture_z_vec(
         &z_packed_lincheck,
@@ -1749,7 +1784,8 @@ fn prove_fast_core_with_codeword<Ch: Challenger>(
     give_f128(a_packed_f128);
     give_f128(b_packed_f128);
 
-    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
+    let x_ab =
+        r1cs.x_ab_from_multilinear_values(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).

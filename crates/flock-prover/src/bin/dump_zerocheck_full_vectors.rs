@@ -20,6 +20,7 @@ use std::{
 
 use env::args;
 use flock_core::test_rng::Rng;
+use flock_hash::HashKind;
 use flock_prover::{
     challenger::FsChallenger,
     field::{F8, F128},
@@ -53,7 +54,8 @@ fn main() -> Result<()> {
     let b_packed = pack_bits(&b);
     let c_packed = pack_bits(&c);
 
-    let mut ch = FsChallenger::new(DOMAIN);
+    // cuda-ghash hashes with SHA-256 only: pin it, never the repo default.
+    let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Sha256);
     let (proof, _claim) = prove_packed(&a_packed, &b_packed, &c_packed, m, &mut ch);
 
     // Extension matrix M and F8 mul table (for the round-1 kernel).

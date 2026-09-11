@@ -10,12 +10,13 @@ use rayon::current_num_threads;
 #[cfg(feature = "hash-count")]
 pub use crate::hashing::hash_count;
 pub use crate::hashing::{
-    Blake3MerkleHash, Hash, HashKind, MerkleHash, Sha256MerkleHash, hash_leaf, hash_pair,
+    Blake3MerkleHash, Hash, HashKind, MerkleHash, Sha256MerkleHash, hash_leaf, hash_leaves_serial,
+    hash_pair, hash_parents_serial, merkle_tree_from_prehashed_level,
 };
 #[cfg(test)]
 use crate::hashing::{
-    blake3_hash_many_leaves, blake3_hash_many_parents, blake3_leaf_cv,
-    blake3_leaf_size_is_batchable, blake3_parent_cv,
+    blake3_hash_many_leaves, blake3_hash_many_parents, blake3_leaf_chaining_value,
+    blake3_leaf_size_is_batchable, blake3_parent_chaining_value,
 };
 mod hashing;
 
@@ -334,10 +335,10 @@ mod tests {
 
     use crate::{
         Blake3MerkleHash, Hash, HashKind, Sha256MerkleHash, blake3_hash_many_leaves,
-        blake3_hash_many_parents, blake3_leaf_cv, blake3_leaf_size_is_batchable, blake3_parent_cv,
-        cap_depth, cap_layer, hash_leaf, hash_pair, merkle_proof, merkle_proof_capped, merkle_root,
-        merkle_tree, merkle_tree_sequential, merkle_tree_with, verify_merkle_proof,
-        verify_merkle_proof_capped,
+        blake3_hash_many_parents, blake3_leaf_chaining_value, blake3_leaf_size_is_batchable,
+        blake3_parent_chaining_value, cap_depth, cap_layer, hash_leaf, hash_pair, merkle_proof,
+        merkle_proof_capped, merkle_root, merkle_tree, merkle_tree_sequential, merkle_tree_with,
+        verify_merkle_proof, verify_merkle_proof_capped,
     };
 
     /// Every structural test runs against both hashes: the tree and path
@@ -454,12 +455,20 @@ mod tests {
             for i in 0..n {
                 let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
                 let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
-                assert_eq!(batched[i], blake3_parent_cv(l, r), "parent {i} of {n}");
+                assert_eq!(
+                    batched[i],
+                    blake3_parent_chaining_value(l, r),
+                    "parent {i} of {n}"
+                );
             }
         }
 
-        // Leaves, at every size the batched path claims to handle.
-        for leaf_size in [64usize, 128, 256, 512, 1024] {
+        // Leaves, at every size the batched path claims to handle —
+        // including the integer-lane commit's `lanes × 16` (736 at m=32)
+        // and short/odd last blocks.
+        for leaf_size in [
+            1usize, 16, 32, 48, 63, 64, 100, 128, 256, 512, 736, 1000, 1024,
+        ] {
             for n in counts {
                 let data: Vec<u8> = (0..=255u8).cycle().take(n * leaf_size).collect();
                 let mut batched = vec![[0u8; 32]; n];
@@ -470,7 +479,7 @@ mod tests {
                 for i in 0..n {
                     assert_eq!(
                         batched[i],
-                        blake3_leaf_cv(&data[i * leaf_size..(i + 1) * leaf_size]),
+                        blake3_leaf_chaining_value(&data[i * leaf_size..(i + 1) * leaf_size]),
                         "leaf {i} of {n} at size {leaf_size}"
                     );
                 }

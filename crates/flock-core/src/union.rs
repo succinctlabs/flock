@@ -523,7 +523,7 @@ impl<'r> UnionInstance<'r> {
 
     // -----------------------------------------------------------------------
     // Layout-aware claim points — the union counterparts of the BlockR1cs
-    // BatchMajor bookkeeping (`x_ab_from_mlv` / `ab_claim_point` /
+    // BatchMajor bookkeeping (`x_ab_from_multilinear_values` / `ab_claim_point` /
     // `c_claim_point`). The union address order is `[6 skip | dim6 | nu batch
     // | col_log chunk]`, so the formulas are the BatchMajor ones with
     // `(m, n_log) = (M, nu)`; they depend on no per-slot data, which is what
@@ -542,9 +542,9 @@ impl<'r> UnionInstance<'r> {
     /// Lincheck's **semantic** quirky point from the boolean zerocheck claim:
     /// split the address-ordered `mlv` challenges (length `M_bool − 6`) into
     /// `x_inner_rest = [dim6, chunk…]` and `x_outer = batch`. Union analog of
-    /// [`BlockR1cs::x_ab_from_mlv`] (BatchMajor). Stays in BOOLEAN-REGION
+    /// [`BlockR1cs::x_ab_from_multilinear_values`] (BatchMajor). Stays in BOOLEAN-REGION
     /// coordinates — the boolean lincheck's column domain is `M_bool − nu`.
-    pub fn x_ab_from_mlv(&self, z_skip: SkipPoint, mlv: &[F128]) -> QuirkyPoint {
+    pub fn x_ab_from_multilinear_values(&self, z_skip: SkipPoint, mlv: &[F128]) -> QuirkyPoint {
         let nu = self.n_log();
         assert_eq!(mlv.len(), self.m_bool() - K_SKIP);
         let mut x_inner_rest = Vec::with_capacity(1 + self.boolean_col_log());
@@ -781,6 +781,7 @@ impl<'r> UnionInstance<'r> {
         a: &'d mut [F128],
         b: &'d mut [F128],
         elide_padding_writes: bool,
+        dead_padding_unread: bool,
     ) -> Vec<SlotWitnessDest<'d>> {
         for buf in [&*z, &*a, &*b] {
             assert_eq!(buf.len(), self.packed_len(), "padded buffer length");
@@ -803,6 +804,7 @@ impl<'r> UnionInstance<'r> {
                 a: carve(&mut ar, skip, words),
                 b: carve(&mut br, skip, words),
                 elide_padding_writes,
+                dead_padding_unread,
             });
             cursor = range.end;
         }
@@ -1084,6 +1086,28 @@ pub struct SlotWitnessDest<'d> {
     /// already zero (`FreshZeroed`) or its dropped words are never read
     /// (`PooledDirty`). See [`UnionInstance::take_witness_buffers`].
     pub elide_padding_writes: bool,
+    /// The caller certifies that every consumer of these buffers is
+    /// support-gated, so the driver may leave two DEAD regions exactly as it
+    /// found them instead of zeroing them:
+    ///
+    /// 1. the `a`/`b` PADDING COLUMNS (chunk-columns `>= ceil(useful_bits
+    ///    /128)`) — `a`/`b` are never committed, and their only readers are
+    ///    the run-list-gated zerocheck (Dead blocks skipped, Partial
+    ///    cleansed, both flavors) and the count-proportional lincheck;
+    /// 2. the LINCHECK STRIPE TAIL (rows `>= ceil(useful_bits/64)` of each
+    ///    group) — the stripe's only reader is
+    ///    `partial_fold_packed_z_rows_best`, which takes `useful_bits` and
+    ///    skips whole blocks past the useful region of each block.
+    ///
+    /// Strictly weaker than `elide_padding_writes`, and deliberately does
+    /// NOT cover `z`: under identity compaction `q` IS the `z` buffer, so
+    /// `z`'s padding is COMMITTED and must be honest zeros or the prover's
+    /// own opening disagrees with its claims.
+    ///
+    /// Worth 288 MB + 153 MB of memset at m=32. Pinned end to end by
+    /// `dead_padding_regions_are_never_read`, which poisons both regions and
+    /// asserts the proof stays byte-identical.
+    pub dead_padding_unread: bool,
 }
 
 #[cfg(test)]
@@ -1172,9 +1196,12 @@ mod tests {
         for _ in 0..16 {
             let z_skip = rng.f128();
             let mlv = rng.f128_vec(m - K_SKIP);
-            let x_ab_union = union.x_ab_from_mlv(SkipPoint::Phi8(z_skip), &mlv);
-            let x_ab_r1cs = r1cs.x_ab_from_mlv(SkipPoint::Phi8(z_skip), &mlv);
-            assert_eq!(x_ab_union, x_ab_r1cs, "x_ab_from_mlv diverged");
+            let x_ab_union = union.x_ab_from_multilinear_values(SkipPoint::Phi8(z_skip), &mlv);
+            let x_ab_r1cs = r1cs.x_ab_from_multilinear_values(SkipPoint::Phi8(z_skip), &mlv);
+            assert_eq!(
+                x_ab_union, x_ab_r1cs,
+                "x_ab_from_multilinear_values diverged"
+            );
 
             let r_inner_skip = rng.f128();
             let r_inner_rest = rng.f128_vec(k_log - K_SKIP);
@@ -1479,7 +1506,7 @@ mod tests {
             union.zero_gaps(buf);
         }
         for (d, w) in union
-            .slot_dests(&mut z, &mut a, &mut b, false)
+            .slot_dests(&mut z, &mut a, &mut b, false, false)
             .into_iter()
             .zip([&slot_a, &slot_b])
         {
@@ -1952,7 +1979,7 @@ mod tests {
             assert!(buf[96..128].iter().all(|w| *w == F128::ZERO), "class gap");
             assert!(buf[192..].iter().all(|w| *w == F128::ZERO), "region tail");
         }
-        let dests = union.slot_dests(&mut z, &mut a, &mut b, false);
+        let dests = union.slot_dests(&mut z, &mut a, &mut b, false, false);
         assert_eq!(dests.len(), 3);
         assert_eq!(dests[2].z.len(), 64, "element slot block is 2^(nu+kappa)");
         // A driver writing every word of its block leaves no poison behind.
@@ -1979,7 +2006,7 @@ mod tests {
         let mut rng = Rng::new(0xE1E_C7);
 
         let mlv = rng.f128_vec(m_bool - K_SKIP);
-        let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(rng.f128()), &mlv);
+        let x_ab = union.x_ab_from_multilinear_values(SkipPoint::Phi8(rng.f128()), &mlv);
         assert_eq!(x_ab.x_outer.len(), union.n_log());
         assert_eq!(
             x_ab.x_inner_rest.len(),

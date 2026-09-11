@@ -20,6 +20,7 @@ use std::{
 };
 
 use b3::build_block_r1cs;
+use flock_core::merkle::HashKind;
 use flock_cuda_ffi::gpu::device_count;
 use flock_prover::{
     challenger::FsChallenger,
@@ -42,6 +43,10 @@ use lincheck::SparseMatrixCircuit;
 use verifier::verify_ligerito;
 
 const DOMAIN: &[u8] = b"flock-lig-r1cs-v0";
+/// cuda-ghash hashes Merkle trees and the Fiat–Shamir transcript with
+/// SHA-256 only (`merkle.cuh`, `challenger.hpp`), so every Rust twin pins
+/// it instead of inheriting the repo default (BLAKE3).
+const CUDA_HASH: HashKind = HashKind::Sha256;
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 static BLAKE3_CSC_MATRICES: OnceLock<CscMatrices> = OnceLock::new();
 
@@ -130,7 +135,7 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
 }
 
 // Zerocheck round-1 kernel tables (same as dump_zerocheck_full_vectors).
-fn zc_tables() -> (Vec<u8>, Vec<u8>) {
+fn zerocheck_tables() -> (Vec<u8>, Vec<u8>) {
     let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
     let mut mcol = vec![0u8; 64 * 64];
@@ -217,7 +222,7 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
         log_batch_size: 6,
         profile: Default::default(),
         num_lanes: None,
-        merkle_hash: Default::default(),
+        merkle_hash: CUDA_HASH,
     };
     let cfg = pcs_params
         .ligerito_prover_config()
@@ -238,7 +243,7 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
             b_rows,
         }
     });
-    let (mcol, f8mul) = zc_tables();
+    let (mcol, f8mul) = zerocheck_tables();
 
     let to_i32 = |v: &[usize]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
     let log_inv_rates = to_i32(&cfg.log_inv_rates);
@@ -437,7 +442,7 @@ fn roundtrip<const N_BLOCKS_LOG: usize, const TAMPER: bool>() {
     let m = r1cs.m;
     let lc_circuit = SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
     let t1 = Instant::now();
-    let mut ch_v = FsChallenger::new(DOMAIN);
+    let mut ch_v = FsChallenger::with_hash(DOMAIN, CUDA_HASH);
     let claim = verify_ligerito(
         &r1cs,
         &commitment,
@@ -460,7 +465,7 @@ fn roundtrip<const N_BLOCKS_LOG: usize, const TAMPER: bool>() {
         // Flip one bit of the final-level clear polynomial -> reject.
         let mut bad = proof.clone();
         bad.pcs_open.ligerito.final_proof.yr[0].lo ^= 1;
-        let mut ch_t = FsChallenger::new(DOMAIN);
+        let mut ch_t = FsChallenger::with_hash(DOMAIN, CUDA_HASH);
         assert!(
             verify_ligerito(
                 &r1cs,
@@ -476,7 +481,7 @@ fn roundtrip<const N_BLOCKS_LOG: usize, const TAMPER: bool>() {
         // Corrupt one zerocheck round message -> transcript replay rejects.
         let mut bad = proof.clone();
         bad.zerocheck.multilinear_rounds[0].0.hi ^= 1;
-        let mut ch_t = FsChallenger::new(DOMAIN);
+        let mut ch_t = FsChallenger::with_hash(DOMAIN, CUDA_HASH);
         assert!(
             verify_ligerito(
                 &r1cs,
@@ -555,7 +560,7 @@ fn gpu_debug_diff<const M: usize>() {
         })
         .collect();
 
-    let mut ch = FsChallenger::new(DOMAIN);
+    let mut ch = FsChallenger::with_hash(DOMAIN, CUDA_HASH);
     let (rp, rcomm, _claim) = prove_ligerito(&art.r1cs, z, &art.pcs_params, &mut ch);
     let gp = &art.proof;
 

@@ -102,7 +102,7 @@ jobs:
       # The two #[ignore] tape-region pin tests — the byte-format gate for
       # the tower tape walkers (tower::chain / tower::node). Both arch legs
       # run them: off aarch64 the leaf/outer zerocheck dispatch takes the RS
-      # arms (config::leaf_zc_ag / outer_zc_ag are compile-time false), so
+      # arms (config::leaf_zerocheck_ag / outer_zerocheck_ag are compile-time false), so
       # the tests compile and pass on x86_64 too. Names + --ignored select
       # exactly these two (the rest of the ignored tower suite stays out);
       # the release test binary is already built by the step above, so this

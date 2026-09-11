@@ -32,11 +32,11 @@ use crate::{
         PdRec, PiopRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ZskipTapeRec,
         ZskipWires, ag_seed_bytes, bytes_payload_mask, cap_payloads, cap_wires,
         check_residual_publics, circuit_structure_claim_wires, cw, decode_ag_point,
-        emit_boolean_reported_check, emit_element_reported_check, emit_fs_chain, emit_mac256,
-        emit_pow_checks, emit_publics_hash, emit_query_phase, emit_recombination,
+        emit_boolean_reported_check, emit_element_reported_check, emit_fiat_shamir_chain,
+        emit_mac256, emit_pow_checks, emit_publics_hash, emit_query_phase, emit_recombination,
         emit_residual_region, emit_spine256, flatten_ops, leaf_boolean_lcs, level_geometry,
         level_sources, observed_f256, outer_union, pack8, parse_open_levels, payload_words,
-        pin_recombination, query_phase_b3_rows, replay_ligerito_spine256, squeeze_word_wire,
+        pin_recombination, query_phase_blake3_rows, replay_ligerito_spine256, squeeze_word_wire,
         strat_scheds, walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
@@ -575,7 +575,7 @@ fn parse_chain_materials(
         cross,
         ..
     } = walker_common::merge_and_replay_chain(t_shape, domain, values, payloads, ops, chals);
-    let b3_rows = trace.rows.len() + h_rows + query_phase_b3_rows(geo);
+    let b3_rows = trace.rows.len() + h_rows + query_phase_blake3_rows(geo);
     if var("B3_CENSUS").is_ok() {
         let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
         let blocks = trace.rows.len() - parents;
@@ -1108,7 +1108,7 @@ fn parse_anchor_boolean_replica(
                 let pt = decode_ag_point(
                     &ag_seed_bytes(chals[*seed_ch], chals[*seed_ch + 1]),
                     nonce,
-                    lo.pcs.zerocheck_grinding().ag_r1_bits(),
+                    lo.pcs.zerocheck_grinding().ag_round_one_bits(),
                 );
                 assert_eq!(
                     mat_assert.z_skip,
@@ -1817,7 +1817,7 @@ pub(super) fn emit_real_child_region(
         sb.fixed_public_input(iv_w[0]),
         sb.fixed_public_input(iv_w[1]),
     ];
-    let (outs, ww) = emit_fs_chain(
+    let (outs, ww) = emit_fiat_shamir_chain(
         sb,
         b3_slot,
         iv2,

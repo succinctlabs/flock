@@ -260,7 +260,7 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
     float det_r1k=0, det_r2k=0, det_eqb=0;
     double det_r2host=0, tr_wall[40]={0}; float tr_gpu[40]={0}; int tr_n=0, tr_round[40]={0};
     long long tr_op[40]={0};
-    // round-1 URM. CPU-structured only needs eq_out = eq(r[13..m]) (the stride-128 subsample),
+    // round-1 univariate round message. CPU-structured only needs eq_out = eq(r[13..m]) (the stride-128 subsample),
     // Build eq(r[13..m]) and apply the fixed-round scale separately.
     { std::vector<F128> ro13(r.begin() + 13, r.end()); build_eq_device(d_eq, ro13.data(), m - 13); }
     F128 r1scale = ONE; for (int i = 6; i < 13; i++) r1scale = f128_mul_hd(r1scale, f128_add_hd(ONE, r[i]));

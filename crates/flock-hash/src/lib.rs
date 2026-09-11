@@ -1,6 +1,7 @@
 //! Hash functions for commitments and Fiat-Shamir transcripts.
 //!
-//! Each protocol component selects its hash independently. The default is SHA-256.
+//! Each protocol component selects its hash independently. The default is BLAKE3 (the faster hash on this codebase's NEON
+//! multi-lane kernels); SHA-256 remains selectable per component.
 
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
@@ -12,8 +13,8 @@ pub type Digest = [u8; 32];
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HashKind {
-    #[default]
     Sha256,
+    #[default]
     Blake3,
 }
 
@@ -55,7 +56,7 @@ pub const BLAKE3_IV: [u32; 8] = [
 
 const B3_MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
-fn b3_g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+fn blake3_g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
     state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
     state[d] = (state[d] ^ state[a]).rotate_right(16);
     state[c] = state[c].wrapping_add(state[d]);
@@ -66,15 +67,15 @@ fn b3_g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, 
     state[b] = (state[b] ^ state[c]).rotate_right(7);
 }
 
-fn b3_round(state: &mut [u32; 16], block: &[u32; 16]) {
-    b3_g(state, 0, 4, 8, 12, block[0], block[1]);
-    b3_g(state, 1, 5, 9, 13, block[2], block[3]);
-    b3_g(state, 2, 6, 10, 14, block[4], block[5]);
-    b3_g(state, 3, 7, 11, 15, block[6], block[7]);
-    b3_g(state, 0, 5, 10, 15, block[8], block[9]);
-    b3_g(state, 1, 6, 11, 12, block[10], block[11]);
-    b3_g(state, 2, 7, 8, 13, block[12], block[13]);
-    b3_g(state, 3, 4, 9, 14, block[14], block[15]);
+fn blake3_round(state: &mut [u32; 16], block: &[u32; 16]) {
+    blake3_g(state, 0, 4, 8, 12, block[0], block[1]);
+    blake3_g(state, 1, 5, 9, 13, block[2], block[3]);
+    blake3_g(state, 2, 6, 10, 14, block[4], block[5]);
+    blake3_g(state, 3, 7, 11, 15, block[6], block[7]);
+    blake3_g(state, 0, 5, 10, 15, block[8], block[9]);
+    blake3_g(state, 1, 6, 11, 12, block[10], block[11]);
+    blake3_g(state, 2, 7, 8, 13, block[12], block[13]);
+    blake3_g(state, 3, 4, 9, 14, block[14], block[15]);
 }
 
 /// BLAKE3 compression. Returns the full 16-word output state
@@ -108,7 +109,7 @@ pub fn blake3_compress(
     let mut block = *block_words;
     for r in 0..7 {
         let mut permuted = [0u32; 16];
-        b3_round(&mut state, &block);
+        blake3_round(&mut state, &block);
         if r + 1 < 7 {
             for i in 0..16 {
                 permuted[i] = block[B3_MSG_PERMUTATION[i]];
@@ -141,7 +142,7 @@ mod tests {
         assert_eq!(HashKind::parse("BLAKE3").unwrap(), HashKind::Blake3);
         assert_eq!(HashKind::parse("sha-256").unwrap(), HashKind::Sha256);
         assert_eq!(HashKind::parse("  blake3 ").unwrap(), HashKind::Blake3);
-        assert_eq!(HashKind::default(), HashKind::Sha256);
+        assert_eq!(HashKind::default(), HashKind::Blake3);
         // An unrecognized hash must be an error, never a silent SHA-256.
         assert!(HashKind::parse("keccak").is_err());
         assert!(HashKind::parse("").is_err());
