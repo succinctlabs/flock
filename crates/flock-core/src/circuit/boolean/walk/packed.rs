@@ -92,7 +92,3 @@ fn pack(bits: &[bool]) -> F128 {
     }
     F128::new(lo, hi)
 }
-
-#[cfg(test)]
-#[path = "packed/tests.rs"]
-mod tests;

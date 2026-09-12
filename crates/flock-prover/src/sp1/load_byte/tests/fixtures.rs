@@ -36,13 +36,11 @@ pub(super) fn advice_inputs(chip: &LoadByteCircuit, active: bool, advice: u64) -
     })
 }
 
-pub(super) fn input_cases(chip: &LoadByteCircuit) -> Vec<(Vec<bool>, bool)> {
+// None means rejection; Some gives the expected output of the first row.
+pub(super) fn input_cases(chip: &LoadByteCircuit) -> Vec<(String, Vec<bool>, Option<u64>)> {
     assert_eq!(chip.capacity(), 2);
     let row = event(LoadByteOpcode::Lb, 0x1_0000, 7, 0x8070_6050_4030_2010);
     let valid = chip.honest_inputs(&[row]);
-    let non_prefix = chip.encode_rows(&[None, Some(row)]);
-    let bad_address = chip.honest_inputs(&[event(LoadByteOpcode::Lb, 0xffff, 0, 0)]);
-    let high_address = chip.honest_inputs(&[event(LoadByteOpcode::Lbu, 1 << 48, 0, 0)]);
     let mut bad_advice = valid.clone();
     let advice = chip.columns()[0].selected_byte[7];
     let advice_input = chip
@@ -55,13 +53,50 @@ pub(super) fn input_cases(chip: &LoadByteCircuit) -> Vec<(Vec<bool>, bool)> {
     let mut both_selectors = valid.clone();
     both_selectors[0] = true;
     both_selectors[1] = true;
-    vec![
-        (valid, true),
-        (chip.honest_inputs(&[]), true),
-        (non_prefix, false),
-        (bad_address, false),
-        (high_address, false),
-        (bad_advice, false),
-        (both_selectors, false),
-    ]
+    let mut cases = vec![
+        ("signed".into(), valid, Some(row.result())),
+        ("padding".into(), chip.honest_inputs(&[]), Some(0)),
+        (
+            "non-prefix".into(),
+            chip.encode_rows(&[None, Some(row)]),
+            None,
+        ),
+        ("bad advice".into(), bad_advice, None),
+        ("both selectors".into(), both_selectors, None),
+    ];
+    let memory = 0xc342_8101_ff80_7f00;
+    for (name, opcode, b, c, valid) in [
+        ("below guard", LoadByteOpcode::Lb, 0xffff, 0, false),
+        ("above range", LoadByteOpcode::Lbu, 1 << 48, 0, false),
+        ("lower bound", LoadByteOpcode::Lbu, 1 << 16, 0, true),
+        ("upper bound", LoadByteOpcode::Lbu, (1 << 48) - 1, 0, true),
+        ("lower carry", LoadByteOpcode::Lbu, 0xffff, 1, true),
+        (
+            "47-bit carry",
+            LoadByteOpcode::Lb,
+            0x7fff_ffff_ffff,
+            1,
+            true,
+        ),
+        ("64-bit wrap", LoadByteOpcode::Lbu, u64::MAX, 0x1_0001, true),
+        ("upper carry", LoadByteOpcode::Lbu, (1 << 48) - 1, 1, false),
+    ] {
+        let row = event(opcode, b, c, memory);
+        cases.push((
+            name.into(),
+            chip.honest_inputs(&[row]),
+            valid.then(|| row.result()),
+        ));
+    }
+    for opcode in [LoadByteOpcode::Lb, LoadByteOpcode::Lbu] {
+        for offset in 0..8 {
+            let row = event(opcode, 0x1_0000, offset, memory);
+            cases.push((
+                format!("{opcode:?} offset {offset}"),
+                chip.honest_inputs(&[row]),
+                Some(row.result()),
+            ));
+        }
+    }
+    cases
 }

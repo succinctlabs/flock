@@ -1,6 +1,9 @@
 //! Internal consistency checks run when a circuit is finished.
 
-use super::*;
+use super::{
+    CircuitBuilder, ExpressionNode, LinearExprId, RowId, RowKind, ValueId, ValueIndex,
+    symmetric_difference,
+};
 
 impl CircuitBuilder {
     pub(super) fn validate(&self) -> Vec<RowId> {

@@ -1,11 +1,7 @@
-use super::super::dsl::tests::{check_hash_lowering, read_word};
+use super::super::dsl::tests::{
+    check_hash_lowering, check_hash_trace, prove_and_verify, read_word,
+};
 use super::*;
-use crate::prover::prove_ligerito;
-use flock_core::challenger::FsChallenger;
-use flock_core::field::F128;
-use flock_core::lincheck::LincheckCircuit;
-use flock_core::pcs::{self, PcsParams};
-use flock_core::verifier;
 
 const EMPTY_FLAGS: u32 = (1 << 0) | (1 << 1) | (1 << 3);
 const BLAKE3_EMPTY: [u8; 32] = [
@@ -67,7 +63,7 @@ fn dsl_outputs_and_walks_match_reference() {
         &blake3_relation_projection(3)
     ));
     let plan = blake3_walk_projection();
-    check_hash_lowering(dsl.circuit(), dsl.layout(), &matrix);
+    check_hash_lowering(dsl.circuit(), dsl.layout(), &matrix, plan);
     for (case, (cv, message, counter, block_len, flags)) in cases().into_iter().enumerate() {
         let (cols, _) = dsl.generate_trace(&cv, &message, counter, block_len, flags);
         let output: [u32; 16] = std::array::from_fn(|i| {
@@ -79,7 +75,7 @@ fn dsl_outputs_and_walks_match_reference() {
         });
         assert_eq!(
             output,
-            blake3::blake3_compress(&cv, &message, counter, block_len, flags)
+            flock_hash::blake3_compress(&cv, &message, counter, block_len, flags)
         );
         if case == 1 {
             assert_eq!(output_bytes(&output), BLAKE3_EMPTY);
@@ -91,32 +87,17 @@ fn dsl_outputs_and_walks_match_reference() {
                 blake3::K_LOG,
             )
             .unwrap();
-        assert_eq!(walked.z, witness);
-        assert_eq!(walked.a_z.repeat(8), matrix.apply_a(&witness.repeat(8)));
-        assert_eq!(walked.b_z.repeat(8), matrix.apply_b(&witness.repeat(8)));
-        assert_eq!(walked.c_z.repeat(8), matrix.apply_c(&witness.repeat(8)));
-        assert!(matrix.satisfies(&witness.repeat(8)));
-        let mut invalid = witness.repeat(8);
-        let output_column = dsl.circuit().column(OUT_LO_FIELD).unwrap();
-        invalid[dsl
-            .layout()
-            .value_position(output_column.values[0])
-            .unwrap()] ^= true;
-        assert!(!matrix.satisfies(&invalid));
-        let mut invalid = witness.repeat(8);
-        invalid[dsl.layout().useful_bits()] = true;
-        assert!(!matrix.satisfies(&invalid));
+        let output = dsl.circuit().column(OUT_LO_FIELD).unwrap();
+        check_hash_trace(
+            &matrix,
+            walked,
+            &witness,
+            [
+                dsl.layout().value_position(output.values[0]).unwrap(),
+                dsl.layout().useful_bits(),
+            ],
+        );
     }
-    let alpha = F128::new(0x1234, 0x5678);
-    let eq: Vec<_> = (0..blake3::K).map(|i| F128::new(i as u64, 7)).collect();
-    assert_eq!(
-        plan.lincheck_circuit(blake3::K_LOG)
-            .unwrap()
-            .fold_alpha_batched(alpha, &eq),
-        matrix
-            .sparse_lincheck_circuit()
-            .fold_alpha_batched(alpha, &eq)
-    );
 }
 
 #[test]
@@ -126,38 +107,5 @@ fn dsl_relation_proves_and_verifies_with_walk_adapter() {
     let r1cs = dsl.to_block_r1cs(8);
     let one_block = dsl.evaluate_block(&blake3::BLAKE3_IV, &[0; 16], 0, 0, EMPTY_FLAGS);
     let witness = one_block.repeat(1 << 8);
-    assert!(r1cs.satisfies(&witness));
-
-    let pcs_params = PcsParams {
-        m: r1cs.m,
-        log_inv_rate: 1,
-        log_batch_size: 6,
-        profile: Default::default(),
-        num_lanes: None,
-        merkle_hash: Default::default(),
-    };
-    let mut prover_challenger = FsChallenger::new(b"blake3-dsl-proof-v0");
-    let (proof, commitment, prover_claim) = prove_ligerito(
-        &r1cs,
-        pcs::pack_witness(&witness, r1cs.m),
-        &pcs_params,
-        &mut prover_challenger,
-    );
-
-    let plan = dsl.walk_plan();
-    let adapter = plan
-        .lincheck_circuit(blake3::K_LOG)
-        .expect("BLAKE3 walk fits its base dimension");
-    assert_eq!(adapter.const_pin_col(), r1cs.const_pin);
-    let mut verifier_challenger = FsChallenger::new(b"blake3-dsl-proof-v0");
-    let verifier_claim = verifier::verify_ligerito(
-        &r1cs,
-        &commitment,
-        &proof,
-        &adapter,
-        &pcs_params,
-        &mut verifier_challenger,
-    )
-    .expect("the BLAKE3 DSL proof must verify through the walk adapter");
-    assert_eq!(prover_claim, verifier_claim);
+    prove_and_verify(&r1cs, &dsl.walk_plan(), &witness, b"blake3-dsl-proof-v0");
 }

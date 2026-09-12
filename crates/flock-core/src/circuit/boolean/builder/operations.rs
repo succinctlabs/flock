@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::*;
+use super::{CircuitBuilder, ExpressionNode, Interaction, LinearExpr, Row, ValueId};
 use crate::circuit::boolean::{OperationWord, SchemaOperation, Selector, Var};
 
 impl CircuitBuilder {

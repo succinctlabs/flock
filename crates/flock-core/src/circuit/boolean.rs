@@ -13,8 +13,8 @@
 //! The IR keeps both the structural XOR DAG and normalized linear supports.
 //! The DAG drives circuit walking; the supports drive sparse R1CS emission.
 //! General `A z * B z = C z` constraints are retained; identity C is optional.
-//! Logical identifiers are separate from physical matrix positions. Source
-//! order is the default; compatibility layouts may permute it.
+//! Logical identifiers are separate from physical matrix positions. Placement
+//! follows evaluation order, adjusted for aligned words and identity-C rows.
 
 mod builder;
 mod interface;
@@ -121,8 +121,9 @@ impl Bit {
 
 /// A virtual linear expression over materialized bits.
 ///
-/// A `LinearExpr` has no witness position. Only [`CircuitBuilder::and`] or
-/// [`CircuitBuilder::materialize`] can turn one into a new [`Bit`].
+/// A `LinearExpr` has no witness position. Use [`CircuitBuilder::define_linear`]
+/// to store its value in a reserved column, or [`CircuitBuilder::define_and`]
+/// to store the product of two expressions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LinearExpr {
     id: LinearExprId,

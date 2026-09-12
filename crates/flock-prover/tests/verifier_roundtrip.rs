@@ -49,7 +49,7 @@ fn identity_r1cs(m: usize, k_log: usize, k_skip: usize, useful_bits: usize) -> B
 #[should_panic(expected = "prove_ligerito currently requires identity C")]
 fn prover_rejects_non_identity_c_before_proving() {
     let mut r1cs = identity_r1cs(7, 1, 0, 2);
-    r1cs.c_0.rows.swap(0, 1);
+    std::sync::Arc::make_mut(&mut r1cs.c_0.rows).swap(0, 1);
     let pcs_params = PcsParams {
         m: 7,
         log_inv_rate: 1,

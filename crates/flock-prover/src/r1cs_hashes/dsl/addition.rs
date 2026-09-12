@@ -1,4 +1,4 @@
-use super::*;
+use super::{CircuitBuilder, ColumnRole, ColumnVisitor, Var, Word, constant};
 
 pub struct Add32<T> {
     pub carry_product: [T; 31],

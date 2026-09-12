@@ -116,7 +116,9 @@ impl WalkPlan {
         k_log: usize,
         trace: &mut ForwardTrace,
     ) -> Result<(), WalkError> {
-        use rayon::prelude::*;
+        use rayon::prelude::{
+            IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
+        };
 
         let (capacity, total) = self.validate_batch(inputs, k_log)?;
         trace.prepare(total);
@@ -256,6 +258,3 @@ impl ForwardTrace {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

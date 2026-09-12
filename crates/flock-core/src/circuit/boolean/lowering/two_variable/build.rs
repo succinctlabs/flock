@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    AssertionAux, BooleanCircuit, Expression, ExpressionNode, LayoutError, LinearExprId,
+    LoweredCircuit, LoweringMode, PhysicalLayout, Row, RowId, ValueId,
+};
 use crate::circuit::boolean::builder::{fresh_circuit_id, symmetric_difference};
 use crate::circuit::boolean::{RowKind, ValueIndex};
 

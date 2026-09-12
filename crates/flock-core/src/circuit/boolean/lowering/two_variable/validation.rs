@@ -1,4 +1,4 @@
-use super::*;
+use super::{ExpressionNode, LoweredCircuit, RowId};
 use crate::circuit::boolean::builder::symmetric_difference;
 use crate::circuit::boolean::{RowKind, ValueIndex};
 

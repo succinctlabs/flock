@@ -1,4 +1,4 @@
-use super::*;
+use super::LoweredCircuit;
 use crate::circuit::boolean::EvaluationError;
 
 impl LoweredCircuit {

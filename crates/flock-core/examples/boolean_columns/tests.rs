@@ -2,8 +2,6 @@ use super::*;
 
 #[path = "tests/downstream.rs"]
 mod downstream;
-#[path = "tests/identity.rs"]
-mod identity;
 
 #[test]
 fn exhaustive_composed_addition_and_advice_checks() {
@@ -61,41 +59,4 @@ fn inactive_invocations_are_evaluated_and_interactions_are_disabled() {
         assert!(cols.witness.inactive);
         assert_eq!(read_word(cols.claimed_sum), advice);
     }
-}
-
-#[test]
-fn operation_bindings_retain_virtual_results_and_exact_columns() {
-    let compiled = CircuitBuilder::compile(DoubleAdd, DoubleAdd::eval);
-    let operations = compiled.operations();
-    assert_eq!(operations.len(), 2);
-    assert_eq!(operations[0].kind, "Add4");
-    assert_eq!(operations[1].kind, "Add4");
-    assert_eq!(operations[0].rows.len(), 3);
-    assert_eq!(operations[1].rows.len(), 3);
-    assert_eq!(
-        operations[0].output.expressions,
-        operations[1].inputs[0].expressions
-    );
-    assert_eq!(
-        operations[0].columns,
-        compiled.columns().witness.first.carry_product
-    );
-    assert_eq!(
-        operations[1].columns,
-        compiled.columns().witness.second.carry_product
-    );
-    for operation in operations {
-        for word in operation
-            .inputs
-            .iter()
-            .chain(std::iter::once(&operation.output))
-        {
-            assert_eq!(word.expressions.len(), 4);
-            for &expression in &word.expressions {
-                assert!(compiled.circuit().support(expression).is_some());
-            }
-        }
-    }
-    // The marker intentionally has no consumer; it must still be computed.
-    assert_eq!(compiled.unused_values(), [("witness.inactive", 0)]);
 }

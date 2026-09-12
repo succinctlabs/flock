@@ -11,7 +11,7 @@ use super::{ProjectionCache, blake3};
 
 mod columns;
 mod eval;
-pub use columns::{Blake3Cols, Blake3Schema};
+pub use columns::{Blake3Cols, Blake3Schema, FirstC, GCols};
 
 const CV_FIELD: &str = "cv";
 const MESSAGE_FIELD: &str = "message";

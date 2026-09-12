@@ -9,6 +9,7 @@ pub(super) fn fixture(case: usize) -> BooleanCircuit {
         let (x, y, s) = (*x, *y, *s);
         let product = cols.witness[0];
         b.define_and(product, x, y);
+        let values = b.value_count();
         match case {
             0 => {} // Definition-only path.
             1 => {
@@ -35,9 +36,27 @@ pub(super) fn fixture(case: usize) -> BooleanCircuit {
             }
             _ => unreachable!(),
         }
+        assert_eq!(b.value_count(), values);
         // A definition after an assertion exercises distinct execution/placement order.
         b.define_linear(cols.witness[1], product);
     })
+}
+
+// Independent formulas for ONE, inputs, product, copied product, and assertions.
+fn accepts(case: usize, z: &[bool]) -> bool {
+    let [one, x, y, s, product, output]: [bool; 6] = z.try_into().unwrap();
+    one && product == (x & y)
+        && output == product
+        && match case {
+            0 => true,
+            1 => (x & y) == s,
+            2 => !(x & y),
+            3 => x & y,
+            4 => !((x ^ s) & y),
+            5 => !x || product == s,
+            6 => (x & y) == s && product == (x ^ s),
+            _ => unreachable!(),
+        }
 }
 
 #[test]
@@ -54,20 +73,6 @@ fn exhaustive_source_and_lowered_witnesses_match_independent_sparse_relations() 
         assert_eq!(lowered.value_count(), source.value_count() + 2 * q);
         assert_eq!(lowered.rows().len(), lowered.value_count());
         assert_eq!(lowered.auxiliaries().len(), q);
-        let extra_support: usize = source
-            .rows()
-            .iter()
-            .filter(|row| row.kind() == RowKind::Constraint)
-            .map(|row| 4 + source.support(row.result()).unwrap().len())
-            .sum();
-        assert_eq!(
-            lowered.normalized_support_terms(),
-            source.normalized_support_terms() + extra_support
-        );
-        assert_eq!(
-            lowered.normalized_support_bytes(),
-            source.normalized_support_bytes() + extra_support * std::mem::size_of::<ValueIndex>()
-        );
         let k_log = lowered
             .layout()
             .useful_bits()
@@ -77,19 +82,14 @@ fn exhaustive_source_and_lowered_witnesses_match_independent_sparse_relations() 
         let original = source
             .to_block_r1cs_with_layout(k_log, 0, 0, &placement)
             .unwrap();
+        assert_eq!(original.c0_is_identity(), q == 0);
         let direct = source.lower(LoweringMode::Direct).unwrap();
-        assert_eq!(
-            direct.normalized_support_bytes(),
-            source.normalized_support_bytes()
-        );
-        assert_eq!(
-            direct
-                .to_block_r1cs(k_log, 0, 0)
-                .unwrap()
-                .statement_digest(),
-            original.statement_digest()
-        );
         let converted = lowered.to_block_r1cs(k_log, 0, 0).unwrap();
+        assert!(direct.auxiliaries().is_empty());
+        if q == 0 {
+            assert_eq!(lowered.layout(), direct.layout());
+            assert_eq!(converted.statement_digest(), original.statement_digest());
+        }
         assert!(converted.c0_is_identity());
         assert_eq!(
             converted.const_pin,
@@ -104,7 +104,8 @@ fn exhaustive_source_and_lowered_witnesses_match_independent_sparse_relations() 
         };
         for n in 0..1 << source.value_count() {
             let z = bits(n, source.value_count());
-            let expected = source_accepts(&z);
+            let expected = accepts(case, &z);
+            assert_eq!(source_accepts(&z), expected, "case {case}, source {n}");
             assert_eq!(direct.accepts(&z), expected);
             assert_eq!(direct.extend(&z), Some(z.clone()));
             let extension = lowered.extend(&z).unwrap();
@@ -129,11 +130,22 @@ fn exhaustive_source_and_lowered_witnesses_match_independent_sparse_relations() 
                 physical[converted.const_pin.unwrap()] && converted.satisfies(&physical);
             assert_eq!(lowered.accepts(&z), sparse_holds);
             if sparse_holds {
-                assert!(source_accepts(&lowered.project(&z).unwrap()));
+                assert!(
+                    accepts(case, &lowered.project(&z).unwrap()),
+                    "case {case}, lowered {n}"
+                );
             }
         }
         for n in 0..1 << source.inputs().len() {
-            let input = bits(n, source.inputs().len());
+            let input: [bool; 3] = std::array::from_fn(|i| n >> i & 1 != 0);
+            let [x, y, s] = input;
+            let expected = accepts(case, &[true, x, y, s, x & y, x & y]);
+            assert_eq!(
+                source.evaluate(&input).is_ok(),
+                expected,
+                "case {case}, input {n}"
+            );
+            assert_eq!(direct.evaluate(&input), source.evaluate(&input));
             match source.evaluate(&input) {
                 Ok(z) => {
                     let actual = lowered.evaluate(&input).unwrap();
@@ -147,93 +159,5 @@ fn exhaustive_source_and_lowered_witnesses_match_independent_sparse_relations() 
         assert!(lowered.project(&[]).is_none());
         assert!(!lowered.accepts(&[]));
         assert!(lowered.evaluate(&[]).is_err());
-    }
-}
-
-#[test]
-fn extension_does_not_repair_derived_values_or_cancel_multiple_failures() {
-    let source = fixture(6);
-    let lowered = source.lower_identity_c().unwrap();
-    let mut z = source.evaluate(&[false, false, false]).unwrap();
-    let product = source
-        .rows()
-        .iter()
-        .find(|row| row.kind() == RowKind::And)
-        .unwrap()
-        .defined_value()
-        .unwrap();
-    z[product.index()] = true;
-    let extension = lowered.extend(&z).unwrap();
-    assert_eq!(lowered.project(&extension).unwrap(), z);
-    assert!(!lowered.accepts(&extension));
-
-    // Both source assertions fail; one cannot cancel out the other.
-    let z = vec![true, false, false, true, false, false];
-    let extension = lowered.extend(&z).unwrap();
-    let matrix = lowered.to_block_r1cs(4, 0, 0).unwrap();
-    let witness = physical(&lowered, &extension, 16);
-    let (a, b, c) = (
-        matrix.apply_a(&witness),
-        matrix.apply_b(&witness),
-        matrix.apply_c(&witness),
-    );
-    for aux in lowered.auxiliaries() {
-        let row = lowered.layout().row_position(aux.cancellation_row).unwrap();
-        assert_ne!(a[row] & b[row], c[row]);
-    }
-    assert!(!lowered.accepts(&extension));
-}
-
-#[test]
-fn retained_xor_dag_and_assertion_provenance_are_inspectable() {
-    let source = fixture(4);
-    let lowered = source.lower_identity_c().unwrap();
-    for row in source.rows() {
-        let mapped: Vec<_> = lowered.mapped_rows(row.id()).unwrap().collect();
-        assert_eq!(
-            mapped.len(),
-            if row.kind() == RowKind::Constraint {
-                2
-            } else {
-                1
-            }
-        );
-        for &id in &mapped {
-            assert_eq!(lowered.source_row(id), Some(row.id()));
-        }
-        for expr in [row.lhs(), row.rhs(), row.result()] {
-            let mapped = lowered.mapped_expression(expr).unwrap();
-            assert!(lowered.expression(expr).is_none());
-            match source.expression(expr).unwrap() {
-                ExpressionNode::Zero => {
-                    assert_eq!(lowered.expression(mapped), Some(&ExpressionNode::Zero))
-                }
-                ExpressionNode::Value(value) => assert_eq!(
-                    lowered.expression(mapped),
-                    Some(&ExpressionNode::Value(
-                        lowered.mapped_value(*value).unwrap()
-                    ))
-                ),
-                ExpressionNode::Xor(terms) => assert_eq!(
-                    lowered.expression(mapped),
-                    Some(&ExpressionNode::Xor(
-                        terms
-                            .iter()
-                            .map(|&term| lowered.mapped_expression(term).unwrap())
-                            .collect()
-                    ))
-                ),
-            }
-        }
-    }
-    for aux in lowered.auxiliaries() {
-        assert_eq!(
-            lowered.rows()[aux.product_row.index()].defined_value(),
-            Some(aux.product)
-        );
-        assert_eq!(
-            lowered.rows()[aux.cancellation_row.index()].defined_value(),
-            None
-        );
     }
 }

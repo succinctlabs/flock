@@ -1,6 +1,9 @@
 //! Named column reservation, definitions, and final numbering.
 
-use super::*;
+use super::{
+    Bit, CircuitBuilder, ExpressionNode, LinearExpr, Row, RowId, RowKind, ValueId, ValueIndex,
+    fresh_circuit_id, symmetric_difference,
+};
 use crate::circuit::boolean::schema::{
     ColumnRole, ColumnSchema, ColumnVisitor, CompiledColumns, SchemaColumn, Var,
 };

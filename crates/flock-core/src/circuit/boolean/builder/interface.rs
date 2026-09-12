@@ -1,6 +1,6 @@
 //! Selectors and interaction declarations.
 
-use super::*;
+use super::{Bit, CircuitBuilder, Interaction, LinearExpr, RowId, ValueId};
 use crate::circuit::boolean::{
     InteractionDirection, InteractionEncoding, InteractionField, InteractionScope, Selector,
 };

@@ -291,11 +291,6 @@ impl BooleanCircuit {
     ) -> Result<BlockR1cs, R1csBuildError> {
         self.relation().to_block_r1cs(k_log, k_skip, n_log, layout)
     }
-
-    #[cfg(test)]
-    pub(super) fn eval_expression(&self, id: LinearExprId, values: &[bool]) -> bool {
-        self.relation().eval_expression(id, values)
-    }
 }
 
 /// A reference-evaluation failure.

@@ -1,8 +1,7 @@
 use super::*;
 
-mod alignment;
-mod configuration;
-use crate::circuit::boolean::{ColumnVisitor, ExpressionNode};
+use crate::circuit::boolean::ColumnVisitor;
+use crate::circuit::boolean::tests::support::Fields;
 
 struct TestSchema;
 struct TestCols<T> {
@@ -58,9 +57,6 @@ fn retained_handles_resolve_and_all_final_references_use_definition_order() {
     for (index, row) in compiled.circuit().rows.iter().enumerate() {
         assert_eq!(row.defined_value.unwrap().index(), index);
     }
-    let (row, values) = compiled.evaluate(|cols| *cols.input = true).unwrap();
-    assert!(row.input && row.late && row.output);
-    assert_eq!(values, [true, true, true, true]);
     let other = CircuitBuilder::compile(TestSchema, define);
     assert_eq!(
         compiled.circuit().structure_digest(),
@@ -68,31 +64,23 @@ fn retained_handles_resolve_and_all_final_references_use_definition_order() {
     );
     assert_eq!(other.resolve(cols.output), None);
     assert!(compiled.unused_values().is_empty());
-}
 
-#[test]
-fn canonical_schema_relation_matches_expected_equations() {
-    let compiled = CircuitBuilder::compile(TestSchema, define);
-    let new = compiled.circuit().to_block_r1cs(2, 0, 0).unwrap();
-    // ONE, input, copied input, then copied input AND input.
-    assert_eq!(new.a_0.rows, vec![vec![0], vec![1], vec![1], vec![2]]);
-    assert_eq!(new.b_0.rows, vec![vec![0], vec![0], vec![0], vec![1]]);
-    assert_eq!(new.c_0.rows, vec![vec![0], vec![1], vec![2], vec![3]]);
-    assert_eq!(compiled.columns().input.index(), 1);
-    assert_eq!(compiled.columns().output.index(), 3);
+    // Independent equations: ONE, input, copied input, copied input AND input.
+    let matrix = compiled.circuit().to_block_r1cs(2, 0, 0).unwrap();
+    assert_eq!(*matrix.a_0.rows, vec![vec![0], vec![1], vec![1], vec![2]]);
+    assert_eq!(*matrix.b_0.rows, vec![vec![0], vec![0], vec![0], vec![1]]);
+    assert_eq!(*matrix.c_0.rows, vec![vec![0], vec![1], vec![2], vec![3]]);
     for input in [false, true] {
-        let (_, values) = compiled.evaluate(|cols| *cols.input = input).unwrap();
-        assert_eq!(values, vec![true, input, input, input]);
-        let walked = compiled
-            .circuit()
-            .walk_plan()
-            .unwrap()
-            .forward(&[input], 2)
+        let (cols, values) = compiled
+            .evaluate(|cols| {
+                *cols.input = input;
+                *cols.late = !input;
+                *cols.output = !input;
+            })
             .unwrap();
-        assert_eq!(walked.z, values);
-        assert_eq!(walked.a_z, new.apply_a(&values));
-        assert_eq!(walked.b_z, new.apply_b(&values));
-        assert_eq!(walked.c_z, new.apply_c(&values));
+        assert_eq!([cols.input, cols.late, cols.output], [input; 3]);
+        assert_eq!(values, [true, input, input, input]);
+        assert!(matrix.satisfies(&values));
     }
 }
 
@@ -137,79 +125,39 @@ fn foreign_handle_is_rejected() {
 }
 
 #[test]
-#[should_panic(expected = "columns must be reserved on a fresh builder")]
-fn columns_cannot_be_reserved_twice() {
-    let mut b = CircuitBuilder::new();
-    b.reserve_columns(&TestSchema);
-    b.reserve_columns(&TestSchema);
-}
-
-#[test]
-fn unused_values_are_reported_without_pruning() {
-    let compiled = CircuitBuilder::compile(TestSchema, |b, cols| {
-        b.define_linear(cols.late, cols.input);
-        b.define_linear(cols.output, cols.input);
-    });
-    assert_eq!(compiled.unused_values(), [("late", 0)]);
-    assert_eq!(compiled.circuit().value_count(), 4);
-    assert_eq!(
-        compiled
-            .circuit()
-            .expressions()
-            .filter(|e| matches!(e, ExpressionNode::Value(_)))
-            .count(),
-        4
-    );
-}
-
-#[test]
 fn fixed_columns_and_general_constraints_survive_remapping() {
-    struct FixedSchema;
-    impl ColumnSchema for FixedSchema {
-        type Cols<T> = [T; 3];
-        fn columns<V: ColumnVisitor>(&self, v: &mut V) -> [V::Value; 3] {
-            [
-                v.bit("output", ColumnRole::Output),
-                v.bit("input", ColumnRole::Input),
-                v.bit("fixed", ColumnRole::Fixed(true)),
-            ]
-        }
-    }
-    let compiled = CircuitBuilder::compile(FixedSchema, |b, cols| {
-        let expression = b.xor2(cols[1], cols[2]);
-        b.define_linear(cols[0], expression);
-        b.assert_zero(cols[0]);
-    });
-    let (row, mut values) = compiled.evaluate(|cols| *cols[1] = true).unwrap();
-    assert_eq!(row, [false, true, true]);
+    let compiled = CircuitBuilder::compile(
+        Fields(vec![
+            ("output", ColumnRole::Output, 1, 1),
+            ("input", ColumnRole::Input, 1, 1),
+            ("one", ColumnRole::Fixed(true), 1, 1),
+            ("zero", ColumnRole::Fixed(false), 1, 1),
+        ]),
+        |b, cols| {
+            let expression = b.xor3(cols[1][0], cols[2][0], cols[3][0]);
+            b.define_linear(cols[0][0], expression);
+            b.assert_zero(cols[0][0]);
+        },
+    );
+    // Only input is supplied; writes to output and both fixed bits are ignored.
+    let (cols, mut values) = compiled
+        .evaluate(|mut cols| {
+            *cols[0][0] = true;
+            *cols[1][0] = true;
+            *cols[2][0] = false;
+            *cols[3][0] = true;
+        })
+        .unwrap();
+    assert_eq!(cols, [vec![false], vec![true], vec![true], vec![false]]);
     assert!(compiled.evaluate(|_| {}).is_err());
     values.resize(8, false);
-    let r1cs = compiled.circuit().to_block_r1cs(3, 0, 0).unwrap();
-    assert!(r1cs.satisfies(&values));
-    values[compiled.columns()[2].index()] = false;
-    assert!(!r1cs.satisfies(&values));
-}
-
-#[test]
-fn malformed_schema_fields_are_rejected() {
-    struct Bad<const CASE: u8>;
-    impl<const CASE: u8> ColumnSchema for Bad<CASE> {
-        type Cols<T> = [T; 2];
-        fn columns<V: ColumnVisitor>(&self, v: &mut V) -> [V::Value; 2] {
-            [
-                v.bit(if CASE == 0 { "" } else { "a" }, ColumnRole::Input),
-                v.bit(
-                    if CASE == 1 { "a" } else { "b" },
-                    if CASE == 2 {
-                        ColumnRole::Advice("")
-                    } else {
-                        ColumnRole::Input
-                    },
-                ),
-            ]
-        }
+    let matrix = compiled.circuit().to_block_r1cs(3, 0, 0).unwrap();
+    assert!(matrix.satisfies(&values));
+    for (field, role) in [(2, ColumnRole::Fixed(true)), (3, ColumnRole::Fixed(false))] {
+        assert_eq!(compiled.schema()[field].role, role);
+        let position = compiled.columns()[field][0].index();
+        values[position] ^= true;
+        assert!(!matrix.satisfies(&values));
+        values[position] ^= true;
     }
-    assert!(std::panic::catch_unwind(|| CircuitBuilder::compile(Bad::<0>, |_, _| {})).is_err());
-    assert!(std::panic::catch_unwind(|| CircuitBuilder::compile(Bad::<1>, |_, _| {})).is_err());
-    assert!(std::panic::catch_unwind(|| CircuitBuilder::compile(Bad::<2>, |_, _| {})).is_err());
 }

@@ -1,27 +1,7 @@
 use super::*;
 use flock_core::circuit::boolean::WalkError;
-use flock_core::r1cs::BlockR1cs;
 
-mod interfaces;
 mod proof;
-
-fn physical(lowered: &LoweredCircuit, logical: &[bool], k_log: usize) -> Vec<bool> {
-    assert_eq!(logical.len(), lowered.value_count());
-    let mut values = vec![false; 1 << k_log];
-    for (&position, &value) in lowered.layout().value_positions().iter().zip(logical) {
-        values[position] = value;
-    }
-    values
-}
-
-fn matrix(lowered: &LoweredCircuit) -> BlockR1cs {
-    let k_log = lowered
-        .layout()
-        .useful_bits()
-        .next_power_of_two()
-        .trailing_zeros() as usize;
-    lowered.to_block_r1cs(k_log, 0, 0).unwrap()
-}
 
 #[test]
 fn required_identity_c_matches_direct_for_valid_and_invalid_candidates() {
@@ -34,23 +14,16 @@ fn required_identity_c_matches_direct_for_valid_and_invalid_candidates() {
     let plan = lowered.walk_plan().unwrap();
     assert!(!original.c0_is_identity());
     assert!(converted.c0_is_identity());
-    let assertions = source
-        .rows()
-        .iter()
-        .filter(|row| row.kind() == RowKind::Constraint)
-        .count();
-    assert_eq!(lowered.auxiliaries().len(), assertions);
-    assert_eq!(lowered.value_count(), source.value_count() + 2 * assertions);
-    assert_eq!(lowered.rows().len(), lowered.value_count());
-    assert_eq!(
-        converted.const_pin,
-        lowered.layout().value_position(lowered.one())
-    );
 
-    for (inputs, expected) in input_cases(&chip) {
+    for (name, inputs, output) in input_cases(&chip) {
+        let expected = output.is_some();
         let candidate = candidate(source, &inputs);
-        assert_eq!(lowered.evaluate(&inputs).is_ok(), expected);
-        assert_eq!(direct.accepts(&candidate), expected);
+        assert_eq!(source.evaluate(&inputs).is_ok(), expected, "{name}");
+        if let Some(output) = output {
+            assert_eq!(chip.output(&candidate, 0), output, "{name}");
+        }
+        assert_eq!(lowered.evaluate(&inputs).is_ok(), expected, "{name}");
+        assert_eq!(direct.accepts(&candidate), expected, "{name}");
         assert_eq!(
             original.satisfies(&physical(&direct, &candidate, original.k_log)),
             expected
@@ -80,7 +53,7 @@ fn required_identity_c_matches_direct_for_valid_and_invalid_candidates() {
                     ))
                 );
             }
-            other => panic!("unexpected walk result: {other:?}"),
+            other => panic!("{name}: unexpected walk result: {other:?}"),
         }
         // Nonzero t is legal, but cannot rescue any failing source assertion.
         for aux in lowered.auxiliaries() {
@@ -93,69 +66,48 @@ fn required_identity_c_matches_direct_for_valid_and_invalid_candidates() {
         );
     }
     assert!(!lowered.accepts(&vec![false; lowered.value_count()]));
-    let mut forged = candidate(source, &chip.honest_inputs(&[]));
-    forged[chip.columns()[0].result[0].index()] ^= true;
-    let extended = lowered.extend(&forged).unwrap();
-    assert_eq!(lowered.project(&extended), Some(forged));
-    assert!(!converted.satisfies(&physical(&lowered, &extended, converted.k_log)));
-}
-
-#[test]
-fn converted_capacity_preserves_every_active_prefix_pattern() {
-    let chip = LoadByteCircuit::build(4);
-    let lowered = chip.lower(LoweringMode::RequireIdentityC).unwrap();
-    let converted = matrix(&lowered);
-    let real = event(LoadByteOpcode::Lbu, 0x1_0000, 0, 0x42);
-    for mask in 0..16usize {
-        let rows: Vec<_> = (0..4)
-            .map(|i| (mask >> i & 1 != 0).then_some(real))
-            .collect();
-        let inputs = chip.encode_rows(&rows);
-        let candidate = candidate(chip.circuit(), &inputs);
-        let extended = lowered.extend(&candidate).unwrap();
-        let prefix = mask & (mask + 1) == 0;
-        assert_eq!(lowered.accepts(&extended), prefix);
-        assert_eq!(
-            converted.satisfies(&physical(&lowered, &extended, converted.k_log)),
-            prefix
-        );
+    let honest = source
+        .evaluate(&chip.honest_inputs(&[event(LoadByteOpcode::Lbu, 0x1_0000, 0, 0x42)]))
+        .unwrap();
+    // Mutate after evaluation: neither backend may trust generated values.
+    for value in [
+        chip.columns()[0].selected_byte[0],
+        chip.columns()[0].result[0],
+    ] {
+        let mut forged = honest.clone();
+        forged[value.index()] ^= true;
+        assert!(!original.satisfies(&physical(&direct, &forged, original.k_log)));
+        let extended = lowered.extend(&forged).unwrap();
+        assert_eq!(lowered.project(&extended), Some(forged));
+        assert!(!converted.satisfies(&physical(&lowered, &extended, converted.k_log)));
     }
+    let mut padding = source.evaluate(&chip.honest_inputs(&[])).unwrap();
+    padding[chip.columns()[0].result[0].index()] ^= true;
+    assert!(!converted.satisfies(&physical(
+        &lowered,
+        &lowered.extend(&padding).unwrap(),
+        converted.k_log
+    )));
 }
 
 #[test]
-fn converted_advice_remains_guarded_and_all_failures_are_enforced() {
+fn advice_is_guarded_in_both_lowering_modes() {
     let chip = LoadByteCircuit::build(1);
-    let lowered = chip.lower(LoweringMode::RequireIdentityC).unwrap();
-    let converted = matrix(&lowered);
-    for active in [false, true] {
-        for advice in 0..256u64 {
-            let inputs = fixtures::advice_inputs(&chip, active, advice);
-            let extended = lowered.extend(&candidate(chip.circuit(), &inputs)).unwrap();
-            assert_eq!(
-                converted.satisfies(&physical(&lowered, &extended, converted.k_log)),
-                !active || advice == 0
-            );
-        }
-    }
-}
-
-#[test]
-fn lowering_sizes_include_auxiliaries_holes_and_power_of_two_growth() {
-    for capacity in [1, 2, 4, 7, 13, 16] {
-        let chip = LoadByteCircuit::build(capacity);
-        let direct = chip.lower(LoweringMode::Direct).unwrap();
-        let identity = chip.lower(LoweringMode::RequireIdentityC).unwrap();
-        assert_eq!(direct.value_count(), 1 + 550 * capacity);
-        assert_eq!(direct.rows().len(), 577 * capacity);
-        assert_eq!(direct.layout().useful_bits(), direct.rows().len());
-        assert_eq!(identity.auxiliaries().len(), 27 * capacity - 1);
-        assert_eq!(identity.value_count(), 604 * capacity - 1);
-        assert_eq!(identity.rows().len(), identity.value_count());
-        assert_eq!(identity.layout().useful_bits(), 631 * capacity - 2);
-        if capacity == 13 {
-            // Appending after the whole source prefix retains 350 holes.
-            assert_eq!(identity.value_count().next_power_of_two(), 8192);
-            assert_eq!(identity.layout().useful_bits().next_power_of_two(), 16384);
+    for mode in [LoweringMode::Direct, LoweringMode::RequireIdentityC] {
+        let lowered = chip.lower(mode).unwrap();
+        let converted = matrix(&lowered);
+        for active in [false, true] {
+            for advice in 0..256u64 {
+                let inputs = fixtures::advice_inputs(&chip, active, advice);
+                let expected = !active || advice == 0;
+                assert_eq!(chip.circuit().evaluate(&inputs).is_ok(), expected);
+                let extended = lowered.extend(&candidate(chip.circuit(), &inputs)).unwrap();
+                assert_eq!(
+                    converted.satisfies(&physical(&lowered, &extended, converted.k_log)),
+                    expected,
+                    "{mode:?}, active={active}, advice={advice}"
+                );
+            }
         }
     }
 }

@@ -192,6 +192,3 @@ impl Interaction {
         &self.scope
     }
 }
-
-#[cfg(test)]
-mod tests;

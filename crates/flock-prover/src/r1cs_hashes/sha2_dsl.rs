@@ -11,7 +11,7 @@ use super::{ProjectionCache, sha2};
 
 mod columns;
 mod eval;
-pub use columns::{Sha256Cols, Sha256Schema};
+pub use columns::{RoundCols, Sha256Cols, Sha256Schema, StateCols};
 
 const H_FIELD: &str = "h_in";
 const MESSAGE_FIELD: &str = "message";

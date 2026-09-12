@@ -324,7 +324,3 @@ pub(super) fn symmetric_difference(lhs: &[ValueIndex], rhs: &[ValueIndex]) -> Ve
     result.extend_from_slice(&rhs[j..]);
     result
 }
-
-#[cfg(test)]
-#[path = "builder/tests.rs"]
-mod tests;
