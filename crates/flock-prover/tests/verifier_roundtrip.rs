@@ -45,6 +45,23 @@ fn identity_r1cs(m: usize, k_log: usize, k_skip: usize, useful_bits: usize) -> B
     }
 }
 
+#[test]
+#[should_panic(expected = "prove_ligerito currently requires identity C")]
+fn prover_rejects_non_identity_c_before_proving() {
+    let mut r1cs = identity_r1cs(7, 1, 0, 2);
+    std::sync::Arc::make_mut(&mut r1cs.c_0.rows).swap(0, 1);
+    let pcs_params = PcsParams {
+        m: 7,
+        log_inv_rate: 1,
+        log_batch_size: 0,
+        profile: Default::default(),
+        num_lanes: None,
+        merkle_hash: Default::default(),
+    };
+    let mut challenger = FsChallenger::new(b"reject-general-c");
+    prove_ligerito(&r1cs, Vec::new(), &pcs_params, &mut challenger);
+}
+
 /// End-to-end R1CS roundtrip using the Ligerito PCS backend, plus
 /// mutation-rejection checks on the lincheck and PCS-open transcript pieces.
 /// Ligerito's per-level query counts demand block_len ≥ ~243 at L0, so
