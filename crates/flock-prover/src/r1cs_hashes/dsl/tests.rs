@@ -2,38 +2,36 @@ use super::*;
 use flock_core::circuit::boolean::ColumnSchema;
 
 use flock_core::r1cs::BlockR1cs;
-use std::time::{Duration, Instant};
-
-pub(crate) fn median_time(iterations: usize, mut operation: impl FnMut()) -> Duration {
-    let mut samples = Vec::with_capacity(iterations);
-    for _ in 0..iterations {
-        let start = Instant::now();
-        operation();
-        samples.push(start.elapsed());
-    }
-    samples.sort_unstable();
-    samples[iterations / 2]
+pub(crate) fn read_word(bits: [bool; 32]) -> u32 {
+    bits.into_iter()
+        .enumerate()
+        .fold(0, |word, (bit, value)| word | (u32::from(value) << bit))
 }
 
-#[track_caller]
-pub(crate) fn assert_relation_equal(context: &str, actual: &BlockR1cs, expected: &BlockR1cs) {
-    assert_eq!(actual.m, expected.m);
-    assert_eq!(actual.k_log, expected.k_log);
-    assert_eq!(actual.k_skip, expected.k_skip);
-    assert_eq!(actual.useful_bits, expected.useful_bits);
-    assert_eq!(actual.layout, expected.layout);
-    assert_eq!(actual.const_pin, expected.const_pin);
-    for (side, actual, expected) in [
-        ("A", &actual.a_0.rows, &expected.a_0.rows),
-        ("B", &actual.b_0.rows, &expected.b_0.rows),
-        ("C", &actual.c_0.rows, &expected.c_0.rows),
-    ] {
-        assert_eq!(actual.len(), expected.len(), "{context}: {side} row count");
-        for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-            assert_eq!(actual, expected, "{context}: {side} differs at row {row}");
+pub(crate) fn check_hash_lowering(
+    circuit: &flock_core::circuit::boolean::BooleanCircuit,
+    layout: &flock_core::circuit::boolean::PhysicalLayout,
+    matrix: &BlockR1cs,
+) {
+    for column in circuit
+        .schema()
+        .iter()
+        .filter(|column| column.role != ColumnRole::Witness)
+    {
+        let start = layout.value_position(column.values[0]).unwrap();
+        assert_eq!(start % column.alignment_bits, 0);
+        for (offset, &value) in column.values.iter().enumerate() {
+            assert_eq!(layout.value_position(value), Some(start + offset));
         }
     }
-    assert_eq!(actual.statement_digest(), expected.statement_digest());
+    let identity = circuit.lower_identity_c().unwrap();
+    assert!(identity.c_is_identity());
+    assert!(identity.auxiliaries().is_empty());
+    assert_eq!(identity.layout(), layout);
+    let converted = identity
+        .to_block_r1cs(matrix.k_log, matrix.k_skip, 3)
+        .unwrap();
+    assert_eq!(converted.statement_digest(), matrix.statement_digest());
 }
 
 struct Fixture(u32);

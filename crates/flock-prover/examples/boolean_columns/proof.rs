@@ -1,6 +1,6 @@
 use super::*;
 use flock_core::challenger::FsChallenger;
-use flock_core::circuit::boolean::{LoweringMode, PhysicalLayout, RowPlacement};
+use flock_core::circuit::boolean::LoweringMode;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::{self, PcsParams};
 use flock_core::verifier;
@@ -11,13 +11,7 @@ use flock_prover::prover::prove_ligerito;
 fn double_add_proves_and_verifies() {
     let compiled = CircuitBuilder::compile(DoubleAdd, DoubleAdd::eval);
     let source = compiled.circuit();
-    let lowered = source
-        .lower(
-            LoweringMode::RequireIdentityC,
-            &PhysicalLayout::source_order(source),
-            RowPlacement::AllowReordering,
-        )
-        .unwrap();
+    let lowered = source.lower(LoweringMode::RequireIdentityC).unwrap();
     assert_eq!(lowered.auxiliaries().len(), 4);
     assert_eq!(lowered.value_count(), 37);
     assert_eq!(lowered.layout().useful_bits(), 41);
@@ -99,13 +93,7 @@ fn double_add_proves_and_verifies() {
         b.assert_zero(cols.inputs.a[0]);
     });
     let other_source = other.circuit();
-    let other_lowered = other_source
-        .lower(
-            LoweringMode::RequireIdentityC,
-            &PhysicalLayout::source_order(other_source),
-            RowPlacement::AllowReordering,
-        )
-        .unwrap();
+    let other_lowered = other_source.lower(LoweringMode::RequireIdentityC).unwrap();
     let other_matrix = other_lowered
         .to_block_r1cs(k_log, flock_core::zerocheck::K_SKIP, n_log)
         .unwrap();

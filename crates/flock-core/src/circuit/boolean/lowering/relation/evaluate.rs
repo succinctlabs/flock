@@ -4,10 +4,7 @@ use super::RelationRef;
 use crate::circuit::boolean::{EvaluationError, LinearExprId, RowKind};
 
 impl RelationRef<'_> {
-    pub(in crate::circuit::boolean) fn evaluate(
-        &self,
-        inputs: &[bool],
-    ) -> Result<Vec<bool>, EvaluationError> {
+    pub(crate) fn evaluate(&self, inputs: &[bool]) -> Result<Vec<bool>, EvaluationError> {
         if inputs.len() != self.input_values.len() {
             return Err(EvaluationError::InputCount {
                 expected: self.input_values.len(),
@@ -48,11 +45,7 @@ impl RelationRef<'_> {
         Ok(values)
     }
 
-    pub(in crate::circuit::boolean) fn eval_expression(
-        &self,
-        id: LinearExprId,
-        values: &[bool],
-    ) -> bool {
+    pub(crate) fn eval_expression(&self, id: LinearExprId, values: &[bool]) -> bool {
         self.expressions[id.index]
             .support
             .iter()

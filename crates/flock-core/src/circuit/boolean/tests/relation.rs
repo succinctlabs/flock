@@ -2,31 +2,30 @@ use super::*;
 
 #[test]
 fn evaluator_and_sparse_r1cs_agree() {
-    let mut builder = CircuitBuilder::new();
-    let a = builder.input();
-    let b = builder.input();
-    let xor = builder.xor([a.expr(), b.expr()]);
-    let xor_bit = builder.materialize(xor);
-    let product = builder.and(xor, a.expr());
-    let circuit = builder.finish();
+    let compiled = support::compile(2, 2, |builder, cols| {
+        let xor = builder.xor2(cols.input[0], cols.input[1]);
+        builder.define_linear(cols.witness[0], xor);
+        builder.define_and(cols.witness[1], xor, cols.input[0]);
+    });
+    let [xor_bit, product] = compiled.columns().witness[..] else {
+        unreachable!()
+    };
+    let circuit = compiled.circuit;
     let r1cs = circuit.to_block_r1cs(3, 0, 0).unwrap();
 
     for inputs in [[false, false], [false, true], [true, false], [true, true]] {
         let witness = circuit.evaluate_r1cs(&inputs, 3).unwrap();
-        assert_eq!(witness[xor_bit.value_id().index()], inputs[0] ^ inputs[1]);
+        assert_eq!(witness[xor_bit.index()], inputs[0] ^ inputs[1]);
         assert_eq!(
-            witness[product.value_id().index()],
+            witness[product.index()],
             (inputs[0] ^ inputs[1]) & inputs[0]
         );
         assert!(r1cs.satisfies(&witness));
         assert_eq!(
-            r1cs.apply_a(&witness)[product.value_id().index()],
+            r1cs.apply_a(&witness)[product.index()],
             inputs[0] ^ inputs[1]
         );
-        assert_eq!(
-            r1cs.apply_b(&witness)[product.value_id().index()],
-            inputs[0]
-        );
+        assert_eq!(r1cs.apply_b(&witness)[product.index()], inputs[0]);
     }
 }
 
@@ -36,10 +35,9 @@ fn constant_is_pinned_and_padding_is_forced_to_zero() {
     use crate::field::F128;
     use crate::lincheck::{self, LincheckCircuit, QuirkyPoint, SkipPoint};
 
-    let mut builder = CircuitBuilder::new();
-    let input = builder.input();
-    builder.materialize(input.expr());
-    let circuit = builder.finish();
+    let circuit = support::circuit(1, 1, |b, cols| {
+        b.define_linear(cols.witness[0], cols.input[0]);
+    });
     let r1cs = circuit.to_block_r1cs(3, 0, 0).unwrap();
 
     assert_eq!(r1cs.const_pin, Some(circuit.one().index()));
@@ -117,14 +115,16 @@ fn constant_is_pinned_and_padding_is_forced_to_zero() {
 
 #[test]
 fn general_constraint_emits_non_identity_c_without_materializing() {
-    let mut builder = CircuitBuilder::new();
-    let a = builder.input();
-    let b = builder.input();
-    let values_before = builder.value_count();
-    let assertion = builder.assert_zero_product(a.expr(), b.expr());
-    assert_eq!(builder.value_count(), values_before);
-
-    let circuit = builder.finish();
+    let compiled = support::compile(2, 0, |b, cols| {
+        let values_before = b.value_count();
+        b.assert_zero_product(cols.input[0], cols.input[1]);
+        assert_eq!(b.value_count(), values_before);
+    });
+    let [a, b] = compiled.columns().input[..] else {
+        unreachable!()
+    };
+    let circuit = compiled.circuit;
+    let assertion = circuit.rows()[3].id();
     assert_eq!(
         circuit.rows()[assertion.index()].kind(),
         RowKind::Constraint
@@ -141,8 +141,8 @@ fn general_constraint_emits_non_identity_c_without_materializing() {
     // The same rejected assignment also fails the emitted relation.
     let mut rejected = vec![false; 4];
     rejected[circuit.one().index()] = true;
-    rejected[a.value_id().index()] = true;
-    rejected[b.value_id().index()] = true;
+    rejected[a.index()] = true;
+    rejected[b.index()] = true;
     assert!(!r1cs.satisfies(&rejected));
 }
 
@@ -157,55 +157,40 @@ fn deterministic_random_circuits_agree_with_bool_and_packed_matrices() {
 
     for circuit_seed in 1u64..=8 {
         let mut state = circuit_seed;
-        let mut builder = CircuitBuilder::new();
-        let inputs = builder.input_bits::<8>("input");
-        let one = builder.one();
-        let mut expressions: Vec<LinearExpr> = inputs.iter().map(|bit| bit.expr()).collect();
-        for _ in 0..40 {
-            let lhs = expressions[next(&mut state) as usize % expressions.len()];
-            let rhs = expressions[next(&mut state) as usize % expressions.len()];
-            match next(&mut state) % 4 {
-                0 => {
-                    let expression = builder.xor2(lhs, rhs);
-                    expressions.push(expression);
-                }
-                1 => {
-                    let bit = builder.and(lhs, rhs);
-                    expressions.push(bit.expr());
-                }
-                2 => {
-                    let bit = builder.materialize(lhs);
-                    expressions.push(bit.expr());
-                }
-                _ => {
-                    // A general-C tautology exercises non-definitional rows
-                    // without restricting the random input assignment.
-                    builder.constrain(lhs, one, lhs);
+        // Choose the circuit shape before reserving its computed columns.
+        let steps: Vec<_> = (0..40)
+            .map(|_| (next(&mut state), next(&mut state), next(&mut state) % 4))
+            .collect();
+        let witnesses = 1 + steps.iter().filter(|step| matches!(step.2, 1 | 2)).count();
+        let circuit = support::circuit(8, witnesses, |builder, cols| {
+            let one = builder.one();
+            let mut stored = cols.witness.iter().copied();
+            let mut expressions: Vec<LinearExpr> =
+                cols.input.iter().map(|&var| var.into()).collect();
+            for (lhs, rhs, kind) in steps {
+                let lhs = expressions[lhs as usize % expressions.len()];
+                let rhs = expressions[rhs as usize % expressions.len()];
+                match kind {
+                    0 => expressions.push(builder.xor2(lhs, rhs)),
+                    1 => {
+                        let bit = stored.next().unwrap();
+                        builder.define_and(bit, lhs, rhs);
+                        expressions.push(bit.into());
+                    }
+                    2 => {
+                        let bit = stored.next().unwrap();
+                        builder.define_linear(bit, lhs);
+                        expressions.push(bit.into());
+                    }
+                    _ => {
+                        builder.constrain(lhs, one, lhs);
+                    }
                 }
             }
-        }
-        let output = builder.materialize(*expressions.last().unwrap());
-        builder.output("output", [output]);
-        let circuit = builder.finish();
+            builder.define_linear(stored.next().unwrap(), *expressions.last().unwrap());
+            assert!(stored.next().is_none());
+        });
         let r1cs = circuit.to_block_r1cs(7, 0, 0).unwrap();
-        let mut layout = circuit.layout();
-        for &row_id in &circuit.definition_rows {
-            let value = circuit.rows[row_id.index].defined_value.unwrap();
-            layout
-                .place_definition(value, circuit.value_count() - 1 - value.index)
-                .unwrap();
-        }
-        let mut constraint_position = circuit.value_count();
-        for row in circuit
-            .rows()
-            .iter()
-            .filter(|row| row.kind() == RowKind::Constraint)
-        {
-            layout.place_row(row.id(), constraint_position).unwrap();
-            constraint_position += 1;
-        }
-        let layout = layout.finish().unwrap();
-        let permuted_r1cs = circuit.to_block_r1cs_with_layout(7, 0, 0, &layout).unwrap();
 
         for _ in 0..16 {
             let input: [bool; 8] = std::array::from_fn(|_| next(&mut state) & 1 == 1);
@@ -223,20 +208,6 @@ fn deterministic_random_circuits_agree_with_bool_and_packed_matrices() {
                 assert_eq!(a[index], circuit.eval_expression(row.lhs(), &logical));
                 assert_eq!(b[index], circuit.eval_expression(row.rhs(), &logical));
                 assert_eq!(c[index], circuit.eval_expression(row.result(), &logical));
-            }
-
-            let permuted_witness = circuit
-                .evaluate_r1cs_with_layout(&input, 7, &layout)
-                .unwrap();
-            assert!(permuted_r1cs.satisfies(&permuted_witness));
-            let a = permuted_r1cs.apply_a(&permuted_witness);
-            let b = permuted_r1cs.apply_b(&permuted_witness);
-            let c = permuted_r1cs.apply_c(&permuted_witness);
-            for row in circuit.rows() {
-                let position = layout.row_position(row.id()).unwrap();
-                assert_eq!(a[position], circuit.eval_expression(row.lhs(), &logical));
-                assert_eq!(b[position], circuit.eval_expression(row.rhs(), &logical));
-                assert_eq!(c[position], circuit.eval_expression(row.result(), &logical));
             }
         }
 

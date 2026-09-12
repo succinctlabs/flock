@@ -13,7 +13,7 @@ impl ColumnSchema for Aligned {
 }
 
 #[test]
-fn configured_width_and_port_alignment_survive_resolution() {
+fn configured_width_and_alignment_survive_resolution() {
     let compiled = CircuitBuilder::compile(
         Aligned {
             width: 7,
@@ -23,15 +23,8 @@ fn configured_width_and_port_alignment_survive_resolution() {
     );
     assert_eq!(compiled.schema()[0].alignment_bits, 8);
     let circuit = compiled.circuit();
-    assert_eq!(
-        circuit.port("input").unwrap().encoding(),
-        crate::circuit::boolean::PortEncoding::LittleEndianWord { alignment_bits: 8 }
-    );
-    assert!(circuit.to_block_r1cs(4, 0, 0).is_err());
-    let mut layout = circuit.layout();
-    assert!(layout.place_port("input", 1).is_err());
-    layout.place_port("input", 8).unwrap();
-    let layout = layout.finish().unwrap();
+    assert_eq!(circuit.column("input").unwrap().alignment_bits, 8);
+    let layout = circuit.layout().unwrap();
     let inputs = compiled.inputs(|cols| {
         for bit in cols {
             *bit = true;

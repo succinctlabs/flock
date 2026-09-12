@@ -1,7 +1,7 @@
 use super::super::dsl::{Add3, Add32, AddConst32, words};
 use super::{
-    BLOCK_LEN_PORT, COUNTER_PORT, CV_PORT, FLAGS_PORT, MESSAGE_PORT, OUT_HI_PORT, OUT_LO_PORT,
-    blake3,
+    BLOCK_LEN_FIELD, COUNTER_FIELD, CV_FIELD, FLAGS_FIELD, MESSAGE_FIELD, OUT_HI_FIELD,
+    OUT_LO_FIELD, blake3,
 };
 use flock_core::circuit::boolean::{ColumnRole, ColumnSchema, ColumnVisitor};
 
@@ -35,11 +35,11 @@ impl ColumnSchema for Blake3Schema {
     type Cols<T> = Blake3Cols<T>;
     fn columns<V: ColumnVisitor>(&self, v: &mut V) -> Self::Cols<V::Value> {
         Blake3Cols {
-            cv: words(v, CV_PORT, ColumnRole::Input, blake3::SLOT_BITS),
-            message: words(v, MESSAGE_PORT, ColumnRole::Input, blake3::SLOT_BITS),
-            counter: words(v, COUNTER_PORT, ColumnRole::Input, 32),
-            block_len: v.word_aligned(BLOCK_LEN_PORT, ColumnRole::Input, 32),
-            flags: v.word_aligned(FLAGS_PORT, ColumnRole::Input, 32),
+            cv: words(v, CV_FIELD, ColumnRole::Input, blake3::SLOT_BITS),
+            message: words(v, MESSAGE_FIELD, ColumnRole::Input, blake3::SLOT_BITS),
+            counter: words(v, COUNTER_FIELD, ColumnRole::Input, 32),
+            block_len: v.word_aligned(BLOCK_LEN_FIELD, ColumnRole::Input, 32),
+            flags: v.word_aligned(FLAGS_FIELD, ColumnRole::Input, 32),
             rounds: (0..7)
                 .map(|r| {
                     std::array::from_fn(|i| {
@@ -62,8 +62,8 @@ impl ColumnSchema for Blake3Schema {
                     })
                 })
                 .collect(),
-            out_lo: words(v, OUT_LO_PORT, ColumnRole::Output, blake3::SLOT_BITS),
-            out_hi: words(v, OUT_HI_PORT, ColumnRole::Output, blake3::SLOT_BITS / 2),
+            out_lo: words(v, OUT_LO_FIELD, ColumnRole::Output, blake3::SLOT_BITS),
+            out_hi: words(v, OUT_HI_FIELD, ColumnRole::Output, blake3::SLOT_BITS / 2),
         }
     }
 }

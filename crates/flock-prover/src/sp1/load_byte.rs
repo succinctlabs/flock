@@ -2,7 +2,7 @@
 
 use flock_core::circuit::boolean::{
     BooleanCircuit, CircuitBuilder, CompiledColumns, LayoutError, LoweredCircuit, LoweringMode,
-    PhysicalLayout, RowPlacement, ValueId,
+    ValueId,
 };
 
 mod columns;
@@ -67,11 +67,7 @@ impl LoadByteCircuit {
     /// Lower the entire capacity, including constraints between invocations.
     /// Source columns keep their positions; identity C may expand and reorder rows.
     pub fn lower(&self, mode: LoweringMode) -> Result<LoweredCircuit, LayoutError> {
-        self.circuit().lower(
-            mode,
-            &PhysicalLayout::source_order(self.circuit()),
-            RowPlacement::AllowReordering,
-        )
+        self.circuit().lower(mode)
     }
 
     pub fn compiled(&self) -> &CompiledColumns<LoadByteSchema> {
@@ -86,9 +82,9 @@ impl LoadByteCircuit {
     pub fn output(&self, values: &[bool], row: usize) -> u64 {
         assert!(row < self.capacity, "load-byte row is out of range");
         self.circuit()
-            .port(&format!("load-byte.row-{row}.result"))
+            .column(&format!("load-byte.row-{row}.result"))
             .unwrap()
-            .values()
+            .values
             .iter()
             .enumerate()
             .fold(0, |word, (bit, value)| {

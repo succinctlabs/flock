@@ -195,9 +195,9 @@ enum RawAction {
 }
 
 impl BooleanCircuit {
-    /// Compile a source-order structural walk.
+    /// Compile a structural walk with automatic aligned placement.
     pub fn walk_plan(&self) -> Result<WalkPlan, LayoutError> {
-        WalkPlan::compile(&self.relation(), &PhysicalLayout::source_order(self), [])
+        WalkPlan::compile(&self.relation(), &self.layout()?, [])
     }
 
     /// Compile a structural walk for an explicit physical layout.

@@ -13,7 +13,7 @@ fn unpack(words: &[F128], block: usize) -> Vec<bool> {
 
 #[test]
 fn converted_batches_match_sparse_results_and_preserve_failure_contracts() {
-    let lowered = fixture(1, true, LoweringMode::RequireIdentityC);
+    let lowered = fixture(1, LoweringMode::RequireIdentityC);
     let plan = lowered.walk_plan().unwrap();
     let matrix = lowered.to_block_r1cs(8, 0, 0).unwrap();
     let inputs = valid_inputs(&lowered);
@@ -67,7 +67,7 @@ fn converted_batches_match_sparse_results_and_preserve_failure_contracts() {
 
 #[test]
 fn converted_packed_batches_match_sparse_outputs_and_respect_elision() {
-    let lowered = fixture(1, true, LoweringMode::RequireIdentityC);
+    let lowered = fixture(1, LoweringMode::RequireIdentityC);
     let plan = lowered.walk_plan().unwrap();
     let matrix = lowered.to_block_r1cs(8, 0, 0).unwrap();
     let inputs = valid_inputs(&lowered);

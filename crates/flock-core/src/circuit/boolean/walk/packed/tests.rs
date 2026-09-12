@@ -1,15 +1,16 @@
 use super::*;
-use crate::circuit::boolean::{BooleanCircuit, CircuitBuilder, WalkPlan};
+use crate::circuit::boolean::tests::support;
+use crate::circuit::boolean::{BooleanCircuit, WalkPlan};
 
 fn identity_fixture() -> BooleanCircuit {
-    let mut builder = CircuitBuilder::new();
-    let input = builder.input_bits::<8>("input");
-    let xor = builder.xor([input[0], input[1], input[2], input[3]]);
-    let product = builder.and(xor, input[4]);
-    let output = builder.xor([product, input[5], input[6], input[7]]);
-    let output = builder.materialize(output);
-    builder.output("output", [output]);
-    builder.finish()
+    support::circuit(8, 2, |builder, cols| {
+        let input = &cols.input;
+        let xor = builder.xor([input[0], input[1], input[2], input[3]]);
+        let product = cols.witness[0];
+        builder.define_and(product, xor, input[4]);
+        let output = builder.xor([product, input[5], input[6], input[7]]);
+        builder.define_linear(cols.witness[1], output);
+    })
 }
 
 fn unpack(words: &[F128], batch_capacity: usize, block: usize, bits: usize) -> Vec<bool> {
@@ -26,8 +27,13 @@ fn unpack(words: &[F128], batch_capacity: usize, block: usize, bits: usize) -> V
 }
 
 fn inputs(count: usize) -> Vec<Vec<bool>> {
+    // Distinct block patterns make permutations visible.
     (0..count)
-        .map(|block| (0..8).map(|bit| (block + bit * 3) & 1 == 1).collect())
+        .map(|block| {
+            (0..8)
+                .map(|bit| ((block * 73 + 0x35) >> bit) & 1 == 1)
+                .collect()
+        })
         .collect()
 }
 
@@ -171,10 +177,11 @@ fn union_slot_elision_and_validation_follow_the_destination_contract() {
     ));
     assert_eq!((z, a, b), original, "validation must precede writes");
 
-    let mut builder = CircuitBuilder::new();
-    let input = builder.input();
-    builder.assert_zero(input);
-    let general_c = builder.finish().walk_plan().unwrap();
+    let general_c = support::circuit(1, 0, |b, cols| {
+        b.assert_zero(cols.input[0]);
+    })
+    .walk_plan()
+    .unwrap();
     let mut z = vec![F128::ONE; batch_capacity];
     let mut a = vec![F128::ONE; batch_capacity];
     let mut b = vec![F128::ONE; batch_capacity];

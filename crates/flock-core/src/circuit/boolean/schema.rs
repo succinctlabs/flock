@@ -78,7 +78,7 @@ pub trait ColumnVisitor {
     }
 }
 
-/// One named word, including internal witnesses that are not exported ports.
+/// One declared little-endian field, including internal witnesses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchemaColumn {
     pub name: String,
@@ -94,10 +94,10 @@ pub struct OperationWord {
     pub expressions: Vec<LinearExprId>,
 }
 
-/// Prototype composition metadata; ranges refer to the same canonical circuit.
+/// One operation call; ranges refer to the same canonical circuit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchemaOperation {
-    pub name: String,
+    /// A label such as `Add32`, shared by calls of the same operation.
     pub kind: String,
     pub columns: Vec<ValueId>,
     pub inputs: Vec<OperationWord>,
@@ -107,7 +107,7 @@ pub struct SchemaOperation {
     pub interactions: Range<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct SchemaState {
     pub columns: Vec<SchemaColumn>,
     pub defined: Vec<bool>,
@@ -119,7 +119,6 @@ pub(super) struct SchemaState {
 pub struct CompiledColumns<S: ColumnSchema> {
     pub(super) construction_id: CircuitId,
     pub(super) circuit: BooleanCircuit,
-    pub(super) columns: Vec<SchemaColumn>,
     pub(super) resolved: Vec<ValueId>,
     pub(super) operations: Vec<SchemaOperation>,
     pub(super) schema: S,
@@ -132,7 +131,7 @@ impl<S: ColumnSchema> CompiledColumns<S> {
 
     /// Prototype inspection data; this is not a serialized v1 artifact.
     pub fn schema(&self) -> &[SchemaColumn] {
-        &self.columns
+        &self.circuit.columns
     }
 
     pub fn operations(&self) -> &[SchemaOperation] {
@@ -163,7 +162,7 @@ impl<S: ColumnSchema> CompiledColumns<S> {
                 ExpressionNode::Xor(terms) => pending.extend(terms),
             }
         }
-        for column in &self.columns {
+        for column in &self.circuit.columns {
             if column.role == ColumnRole::Output {
                 for value in &column.values {
                     used[value.index] = true;
@@ -181,7 +180,7 @@ impl<S: ColumnSchema> CompiledColumns<S> {
             }
         }
         let mut unused = Vec::new();
-        for column in &self.columns {
+        for column in &self.circuit.columns {
             for (offset, value) in column.values.iter().enumerate() {
                 if !used[value.index] {
                     unused.push((column.name.as_str(), offset));
@@ -220,10 +219,12 @@ impl<S: ColumnSchema> CompiledColumns<S> {
         let mut supplied = vec![false; self.circuit.value_count()];
         // Schema handles enumerate distinct values in reservation order.
         let mut cells = supplied[1..].iter_mut();
-        supply(self.visit(|_| cells.next().expect("schema width changed")));
+        // Give each declared bit a mutable cell in declaration order.
+        let cols = self.visit(|_| cells.next().expect("schema width changed"));
+        supply(cols);
         let mut inputs = Vec::new();
         let mut offset = 1;
-        for column in &self.columns {
+        for column in &self.circuit.columns {
             if column.role.is_input() {
                 inputs.extend_from_slice(&supplied[offset..offset + column.values.len()]);
             }
@@ -234,7 +235,7 @@ impl<S: ColumnSchema> CompiledColumns<S> {
 
     fn visit<T>(&self, map: impl FnMut(ValueId) -> T) -> S::Cols<T> {
         let mut visitor = ResolvedVisitor {
-            columns: self.columns.iter(),
+            columns: self.circuit.columns.iter(),
             map,
         };
         let result = self.schema.columns(&mut visitor);

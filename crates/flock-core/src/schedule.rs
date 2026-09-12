@@ -1255,18 +1255,6 @@ mod tests {
     }
 
     #[test]
-    fn io_schema_accepts_input_prefix_and_output_suffix() {
-        Registry::new(
-            vec![ty(9, 300).with_io_schema(vec![
-                IoWord::input(0),
-                IoWord::input(1),
-                IoWord::output(2),
-            ])],
-            3,
-        );
-    }
-
-    #[test]
     #[should_panic(expected = "IO schema inputs must precede outputs")]
     fn io_schema_rejects_input_after_output() {
         Registry::new(

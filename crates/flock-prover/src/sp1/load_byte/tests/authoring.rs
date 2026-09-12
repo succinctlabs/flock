@@ -69,7 +69,6 @@ fn typed_trace_and_bindings_match_the_canonical_witness() {
 #[test]
 fn every_real_row_pattern_obeys_the_prefix_constraint() {
     let chip = LoadByteCircuit::build(4);
-    let checker = chip.circuit().identity_checker();
     let event = event(LoadByteOpcode::Lbu, 0x1_0000, 0, 0x42);
     for mask in 0..16usize {
         let rows: Vec<_> = (0..4)
@@ -78,8 +77,6 @@ fn every_real_row_pattern_obeys_the_prefix_constraint() {
         let prefix = mask & (mask + 1) == 0;
         let inputs = chip.encode_rows(&rows);
         assert_eq!(chip.circuit().evaluate(&inputs).is_ok(), prefix);
-        let witness = candidate(chip.circuit(), &inputs);
-        assert_eq!(checker.accepts(&checker.extend(&witness).unwrap()), prefix);
     }
 }
 

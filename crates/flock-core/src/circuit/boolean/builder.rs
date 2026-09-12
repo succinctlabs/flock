@@ -3,12 +3,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    Bit, BooleanCircuit, CircuitId, Component, Expression, ExpressionNode, Interaction, LinearExpr,
-    LinearExprId, Port, PortDirection, PortEncoding, PortOrigin, Row, RowId, RowKind, ValueId,
-    ValueIndex,
+    Bit, BooleanCircuit, CircuitId, Expression, ExpressionNode, Interaction, LinearExpr,
+    LinearExprId, Row, RowId, RowKind, ValueId, ValueIndex,
 };
 
-mod allocating;
 mod interface;
 mod operations;
 mod schema;
@@ -30,24 +28,15 @@ pub struct CircuitBuilder {
     rows: Vec<Row>,
     value_count: usize,
     input_values: Vec<ValueId>,
-    ports: Vec<Port>,
-    components: Vec<Component>,
-    active_components: Vec<usize>,
     interactions: Vec<Interaction>,
     one: Bit,
     zero: LinearExpr,
-    schema: Option<crate::circuit::boolean::schema::SchemaState>,
-}
-
-impl Default for CircuitBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
+    schema: crate::circuit::boolean::schema::SchemaState,
 }
 
 impl CircuitBuilder {
     /// Start a circuit with canonical zero and verifier-pinned ONE nodes.
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         let id = fresh_circuit_id();
 
         let zero = LinearExpr {
@@ -93,13 +82,14 @@ impl CircuitBuilder {
             }],
             value_count: 1,
             input_values: Vec::new(),
-            ports: Vec::new(),
-            components: Vec::new(),
-            active_components: Vec::new(),
             interactions: Vec::new(),
             one,
             zero,
-            schema: None,
+            schema: crate::circuit::boolean::schema::SchemaState {
+                columns: Vec::new(),
+                defined: vec![true],
+                operations: Vec::new(),
+            },
         }
     }
 
@@ -275,11 +265,7 @@ impl CircuitBuilder {
     }
 
     /// Complete and validate the circuit.
-    pub fn finish(self) -> BooleanCircuit {
-        assert!(
-            self.schema.is_none(),
-            "schema circuits require finish_columns"
-        );
+    fn finish(self) -> BooleanCircuit {
         let definition_rows = self.validate();
         BooleanCircuit {
             id: self.id,
@@ -288,34 +274,10 @@ impl CircuitBuilder {
             definition_rows,
             value_count: self.value_count,
             input_values: self.input_values,
-            ports: self.ports,
-            components: self.components,
+            columns: self.schema.columns,
             interactions: self.interactions,
             one: self.one.value,
         }
-    }
-
-    fn push_computed(&mut self, kind: RowKind, lhs: LinearExprId, rhs: LinearExprId) -> Bit {
-        self.assert_legacy_allocation();
-        let value = ValueId {
-            circuit: self.id,
-            index: self.value_count,
-        };
-        self.value_count += 1;
-        let expression = self.push_value_expression(value);
-        let row = RowId {
-            circuit: self.id,
-            index: self.rows.len(),
-        };
-        self.rows.push(Row {
-            id: row,
-            kind,
-            lhs,
-            rhs,
-            result: expression,
-            defined_value: Some(value),
-        });
-        Bit { value, expression }
     }
 
     fn push_value_expression(&mut self, value: ValueId) -> LinearExprId {
@@ -334,14 +296,6 @@ impl CircuitBuilder {
         assert_eq!(
             circuit, self.id,
             "expression belongs to another circuit builder"
-        );
-    }
-
-    fn assert_new_port_name(&self, name: &str) {
-        assert!(!name.is_empty(), "port name must not be empty");
-        assert!(
-            self.ports.iter().all(|port| port.name != name),
-            "duplicate port name `{name}`"
         );
     }
 }

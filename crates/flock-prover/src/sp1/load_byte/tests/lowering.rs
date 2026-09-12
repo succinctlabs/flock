@@ -2,7 +2,6 @@ use super::*;
 use flock_core::circuit::boolean::WalkError;
 use flock_core::r1cs::BlockR1cs;
 
-mod costs;
 mod interfaces;
 mod proof;
 
@@ -136,6 +135,27 @@ fn converted_advice_remains_guarded_and_all_failures_are_enforced() {
                 converted.satisfies(&physical(&lowered, &extended, converted.k_log)),
                 !active || advice == 0
             );
+        }
+    }
+}
+
+#[test]
+fn lowering_sizes_include_auxiliaries_holes_and_power_of_two_growth() {
+    for capacity in [1, 2, 4, 7, 13, 16] {
+        let chip = LoadByteCircuit::build(capacity);
+        let direct = chip.lower(LoweringMode::Direct).unwrap();
+        let identity = chip.lower(LoweringMode::RequireIdentityC).unwrap();
+        assert_eq!(direct.value_count(), 1 + 550 * capacity);
+        assert_eq!(direct.rows().len(), 577 * capacity);
+        assert_eq!(direct.layout().useful_bits(), direct.rows().len());
+        assert_eq!(identity.auxiliaries().len(), 27 * capacity - 1);
+        assert_eq!(identity.value_count(), 604 * capacity - 1);
+        assert_eq!(identity.rows().len(), identity.value_count());
+        assert_eq!(identity.layout().useful_bits(), 631 * capacity - 2);
+        if capacity == 13 {
+            // Appending after the whole source prefix retains 350 holes.
+            assert_eq!(identity.value_count().next_power_of_two(), 8192);
+            assert_eq!(identity.layout().useful_bits().next_power_of_two(), 16384);
         }
     }
 }

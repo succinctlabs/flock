@@ -1,5 +1,5 @@
 use super::super::dsl::{Add3, Add4, Add32, AddConst32, words};
-use super::{H_OUT_PORT, H_PORT, MESSAGE_PORT, sha2};
+use super::{H_FIELD, H_OUT_FIELD, MESSAGE_FIELD, sha2};
 use flock_core::circuit::boolean::{ColumnRole, ColumnSchema, ColumnVisitor};
 
 pub struct Sha256Cols<T> {
@@ -33,8 +33,8 @@ impl ColumnSchema for Sha256Schema {
     type Cols<T> = Sha256Cols<T>;
     fn columns<V: ColumnVisitor>(&self, v: &mut V) -> Self::Cols<V::Value> {
         Sha256Cols {
-            h_in: words(v, H_PORT, ColumnRole::Input, sha2::SLOT_BITS),
-            message: words(v, MESSAGE_PORT, ColumnRole::Input, sha2::SLOT_BITS),
+            h_in: words(v, H_FIELD, ColumnRole::Input, sha2::SLOT_BITS),
+            message: words(v, MESSAGE_FIELD, ColumnRole::Input, sha2::SLOT_BITS),
             schedule: (16..64)
                 .map(|t| Add4::columns(v, &format!("schedule.{t}")))
                 .collect(),
@@ -61,7 +61,7 @@ impl ColumnSchema for Sha256Schema {
                 })
                 .collect(),
             output_add: std::array::from_fn(|i| Add32::columns(v, &format!("output-add.{i}"))),
-            h_out: words(v, H_OUT_PORT, ColumnRole::Output, sha2::SLOT_BITS),
+            h_out: words(v, H_OUT_FIELD, ColumnRole::Output, sha2::SLOT_BITS),
         }
     }
 }

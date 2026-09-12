@@ -1,8 +1,16 @@
-use crate::circuit::boolean::{CircuitBuilder, ColumnRole, ColumnSchema, ColumnVisitor, Var};
+use crate::circuit::boolean::tests::support::Fields;
+use crate::circuit::boolean::{
+    CircuitBuilder, ColumnRole, ColumnSchema, ColumnVisitor, InteractionDirection,
+    InteractionField, InteractionScope, Var,
+};
 
 struct Nested {
     direct_field: bool,
 }
+
+const PAIR: Nested = Nested {
+    direct_field: false,
+};
 
 struct Cols<T> {
     input: T,
@@ -17,11 +25,11 @@ impl ColumnSchema for Nested {
     fn columns<V: ColumnVisitor>(&self, v: &mut V) -> Cols<V::Value> {
         Cols {
             input: v.bit("input", ColumnRole::Input),
-            left: v.bit("parent.left.out", ColumnRole::Witness),
-            right: v.bit("parent.right.out", ColumnRole::Witness),
+            left: v.bit("left", ColumnRole::Witness),
+            right: v.bit("right", ColumnRole::Witness),
             direct: self
                 .direct_field
-                .then(|| v.bit("parent.out", ColumnRole::Witness)),
+                .then(|| v.bit("direct", ColumnRole::Witness)),
         }
     }
 }
@@ -64,9 +72,9 @@ fn check_nested(direct_field: bool) {
     let cols = compiled.columns();
     let ops = compiled.operations();
     assert_eq!(ops.len(), 3);
-    assert_eq!(ops[0].name, "parent.right");
-    assert_eq!(ops[1].name, "parent.left");
-    assert_eq!(ops[2].name, "parent");
+    assert_eq!(ops[0].kind, "Not");
+    assert_eq!(ops[1].kind, "Copy");
+    assert_eq!(ops[2].kind, "Parent");
     assert_eq!(ops[0].columns, [cols.right]);
     assert_eq!(ops[1].columns, [cols.left]);
     assert_eq!(
@@ -112,20 +120,175 @@ fn parent_can_start_with_nested_fields_before_a_direct_field() {
 }
 
 #[test]
-#[should_panic(expected = "operation must own its exact schema instance")]
-fn parent_cannot_omit_its_direct_field() {
+#[should_panic(expected = "operation columns already defined")]
+fn nested_parent_cannot_be_reused() {
     CircuitBuilder::compile(Nested { direct_field: true }, |b, cols| {
-        b.operation("Incomplete", &[cols.left, cols.right], [], |_| {
-            [cols.input.into()]
+        eval(b, cols);
+        eval(b, cols);
+    });
+}
+
+#[test]
+#[should_panic(expected = "operation result must be nonempty")]
+fn variable_width_operation_cannot_return_an_empty_word() {
+    use crate::circuit::boolean::LinearExpr;
+
+    CircuitBuilder::compile(
+        Fields(vec![("copy.out", ColumnRole::Witness, 1, 1)]),
+        |b, cols| {
+            b.operation("Copy", &cols[0], [], |b| {
+                b.define_linear(cols[0][0], b.one());
+                Vec::<LinearExpr>::new()
+            });
+        },
+    );
+}
+
+#[test]
+fn repeated_kinds_can_define_parts_of_one_field_in_any_order() {
+    let compiled = CircuitBuilder::compile(
+        Fields(vec![
+            ("input", ColumnRole::Input, 1, 1),
+            ("outputs", ColumnRole::Witness, 2, 1),
+        ]),
+        |b, cols| {
+            for &output in cols[1].iter().rev() {
+                b.operation(
+                    "Copy",
+                    &[output],
+                    [("input", vec![cols[0][0].into()])],
+                    |b| {
+                        b.define_linear(output, cols[0][0]);
+                        [output.into()]
+                    },
+                );
+            }
+        },
+    );
+    let cols = compiled.columns();
+    let ops = compiled.operations();
+    assert_eq!(ops.len(), 2);
+    assert!(ops.iter().all(|op| op.kind == "Copy"));
+    assert_eq!(ops[0].columns, [cols[1][1]]);
+    assert_eq!(ops[1].columns, [cols[1][0]]);
+    assert_eq!(ops[0].rows, 2..3);
+    assert_eq!(ops[1].rows, 3..4);
+    for input in [false, true] {
+        let (cols, values) = compiled.evaluate(|mut cols| *cols[0][0] = input).unwrap();
+        assert_eq!(cols[1], [input, input]);
+        assert!(
+            compiled
+                .circuit()
+                .to_block_r1cs(2, 0, 0)
+                .unwrap()
+                .satisfies(&values)
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "duplicate operation column")]
+fn duplicate_columns_are_rejected() {
+    CircuitBuilder::compile(PAIR, |b, cols| {
+        b.operation("Copy", &[cols.left, cols.left], [], |_| [cols.input.into()]);
+    });
+}
+
+#[test]
+#[should_panic(expected = "expression belongs to another circuit builder")]
+fn foreign_columns_are_rejected() {
+    CircuitBuilder::compile(PAIR, |_, foreign| {
+        CircuitBuilder::compile(PAIR, |b, cols| {
+            b.operation("Copy", &[foreign.left], [], |_| [cols.input.into()]);
         });
     });
 }
 
 #[test]
 #[should_panic(expected = "operation columns already defined")]
-fn nested_parent_cannot_be_reused() {
-    CircuitBuilder::compile(Nested { direct_field: true }, |b, cols| {
-        eval(b, cols);
-        eval(b, cols);
+fn supplied_columns_cannot_be_owned() {
+    CircuitBuilder::compile(PAIR, |b, cols| {
+        b.operation("Copy", &[cols.input], [], |_| [cols.input.into()]);
+    });
+}
+
+#[test]
+#[should_panic(expected = "operation left columns undefined")]
+fn every_owned_column_must_be_defined() {
+    CircuitBuilder::compile(PAIR, |b, cols| {
+        b.operation(
+            "Copy",
+            &[cols.left, cols.right],
+            [("input", vec![cols.input.into()])],
+            |b| {
+                b.define_linear(cols.left, cols.input);
+                [cols.left.into()]
+            },
+        );
+    });
+}
+
+#[test]
+#[should_panic(expected = "operation defined a column it does not own")]
+fn definitions_outside_the_owned_columns_are_rejected() {
+    CircuitBuilder::compile(PAIR, |b, cols| {
+        b.operation(
+            "Copy",
+            &[cols.left],
+            [("input", vec![cols.input.into()])],
+            |b| {
+                b.define_linear(cols.left, cols.input);
+                b.define_linear(cols.right, cols.input);
+                [cols.left.into()]
+            },
+        );
+    });
+}
+
+#[test]
+#[should_panic(expected = "operation reads an undeclared argument")]
+fn canceled_reads_still_require_an_argument() {
+    CircuitBuilder::compile(PAIR, |b, cols| {
+        b.operation("Zero", &[cols.left], [], |b| {
+            let zero = b.xor2(cols.input, cols.input);
+            b.define_linear(cols.left, zero);
+            [cols.left.into()]
+        });
+    });
+}
+
+#[test]
+#[should_panic(expected = "interaction reads an undeclared operation argument")]
+fn interaction_reads_require_an_argument() {
+    CircuitBuilder::compile(PAIR, |b, cols| {
+        b.operation("Send", &[cols.left], [], |b| {
+            b.define_linear(cols.left, b.zero());
+            b.interaction(
+                "test",
+                "bit",
+                InteractionDirection::Send,
+                [InteractionField::column_bits("value", [cols.input])],
+                [b.one()],
+                b.selector(b.one()),
+                InteractionScope::new("Test", 0),
+            );
+            [cols.left.into()]
+        });
+    });
+}
+
+#[test]
+#[should_panic(expected = "operation defined a column it does not own")]
+fn parent_must_own_its_child_definitions() {
+    CircuitBuilder::compile(PAIR, |b, cols| {
+        b.operation(
+            "Parent",
+            &[cols.left],
+            [("input", vec![cols.input.into()])],
+            |b| {
+                eval(b, cols);
+                [cols.left.into()]
+            },
+        );
     });
 }

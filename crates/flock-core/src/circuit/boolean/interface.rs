@@ -1,17 +1,6 @@
 //! VM-facing interface metadata that does not alter local arithmetic.
 
-use std::ops::Range;
-
 use super::{Bit, LinearExpr, ValueId, Var};
-
-/// Who supplies or derives the values in a named port.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PortOrigin {
-    Witness,
-    Advice { advice_type: String },
-    Fixed,
-    Derived,
-}
 
 /// A materialized Boolean column used to guard constraints or interactions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,43 +24,11 @@ impl From<Selector> for LinearExpr {
     }
 }
 
-/// One named build-time component instance.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Component {
-    pub(super) name: String,
-    pub(super) parent: Option<usize>,
-    pub(super) expressions: Range<usize>,
-    pub(super) values: Range<usize>,
-    pub(super) rows: Range<usize>,
-}
-
-impl Component {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub const fn parent(&self) -> Option<usize> {
-        self.parent
-    }
-
-    pub fn expressions(&self) -> Range<usize> {
-        self.expressions.clone()
-    }
-
-    pub fn values(&self) -> Range<usize> {
-        self.values.clone()
-    }
-
-    pub fn rows(&self) -> Range<usize> {
-        self.rows.clone()
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteractionDirection {
-    /// This component contributes the tuple to the named channel.
+    /// This circuit contributes the tuple to the named channel.
     Send,
-    /// This component consumes the tuple from the named channel.
+    /// This circuit consumes the tuple from the named channel.
     Receive,
 }
 
@@ -185,7 +142,6 @@ pub struct Interaction {
     pub(super) multiplicity: Vec<ValueId>,
     pub(super) selector: ValueId,
     pub(super) scope: InteractionScope,
-    pub(super) component: Option<usize>,
 }
 
 impl Interaction {
@@ -234,10 +190,6 @@ impl Interaction {
 
     pub fn scope(&self) -> &InteractionScope {
         &self.scope
-    }
-
-    pub const fn component(&self) -> Option<usize> {
-        self.component
     }
 }
 

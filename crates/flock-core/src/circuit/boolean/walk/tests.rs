@@ -1,3 +1,4 @@
+use crate::circuit::boolean::tests::support::{self, TestSchema};
 use crate::circuit::boolean::{
     BooleanCircuit, CircuitBuilder, ForwardTrace, LinearExpr, WalkError,
 };
@@ -15,27 +16,45 @@ fn next(state: &mut u64) -> u64 {
 
 fn random_circuit(seed: u64) -> BooleanCircuit {
     let mut state = seed;
-    let mut builder = CircuitBuilder::new();
-    let inputs = builder.input_bits::<8>("input");
-    let mut expressions: Vec<LinearExpr> = inputs.iter().map(|bit| bit.expr()).collect();
+    let steps: Vec<_> = (0..48)
+        .map(|step| {
+            let lhs = next(&mut state);
+            let rhs = next(&mut state);
+            let kind = next(&mut state) % 4;
+            let check = (step % 11 == 0).then(|| next(&mut state));
+            (lhs, rhs, kind, check)
+        })
+        .collect();
+    let witnesses = 1 + steps.iter().filter(|step| step.2 >= 2).count();
+    support::circuit(8, witnesses, |builder, cols| {
+        let inputs = cols.input.iter().map(|var| var.0).collect::<Vec<_>>();
+        let mut stored = cols.witness.iter().copied();
+        let mut expressions: Vec<LinearExpr> = inputs.iter().map(|bit| bit.expr()).collect();
 
-    for step in 0..48 {
-        let lhs = expressions[next(&mut state) as usize % expressions.len()];
-        let rhs = expressions[next(&mut state) as usize % expressions.len()];
-        match next(&mut state) % 4 {
-            0 | 1 => expressions.push(builder.xor2(lhs, rhs)),
-            2 => expressions.push(builder.and(lhs, rhs).expr()),
-            _ => expressions.push(builder.materialize(lhs).expr()),
+        for (lhs, rhs, kind, check) in steps {
+            let lhs = expressions[lhs as usize % expressions.len()];
+            let rhs = expressions[rhs as usize % expressions.len()];
+            expressions.push(match kind {
+                0 | 1 => builder.xor2(lhs, rhs),
+                2 => {
+                    let out = stored.next().unwrap();
+                    builder.define_and(out, lhs, rhs);
+                    out.into()
+                }
+                _ => {
+                    let out = stored.next().unwrap();
+                    builder.define_linear(out, lhs);
+                    out.into()
+                }
+            });
+            if let Some(index) = check {
+                let expression = expressions[index as usize % expressions.len()];
+                builder.constrain(expression, builder.one(), expression);
+            }
         }
-        if step % 11 == 0 {
-            let expression = expressions[next(&mut state) as usize % expressions.len()];
-            let one = builder.one();
-            builder.constrain(expression, one, expression);
-        }
-    }
-    let output = builder.materialize(*expressions.last().unwrap());
-    builder.output("output", [output]);
-    builder.finish()
+        builder.define_linear(stored.next().unwrap(), *expressions.last().unwrap());
+        assert!(stored.next().is_none());
+    })
 }
 
 fn capacity_log(required: usize) -> usize {
@@ -81,31 +100,14 @@ mod batches;
 mod transpose;
 
 #[test]
-fn forward_walk_matches_sparse_matrices_on_random_circuits() {
-    for seed in 0..16 {
-        let circuit = random_circuit(0x51a7_0000 + seed);
-        let plan = circuit.walk_plan().unwrap();
-        let k_log = capacity_log(plan.useful_bits());
-        let capacity = 1 << k_log;
-        let inputs: Vec<bool> = (0..circuit.inputs().len())
-            .map(|index| (seed as usize + index * 3) & 1 == 1)
-            .collect();
-
-        let walked = plan.forward(&inputs, k_log).unwrap();
-        let r1cs = circuit.to_block_r1cs(k_log, 0, 0).unwrap();
-        assert_eq!(walked.z, circuit.evaluate_r1cs(&inputs, k_log).unwrap());
-        assert_eq!(walked.a_z, r1cs.apply_a(&walked.z));
-        assert_eq!(walked.b_z, r1cs.apply_b(&walked.z));
-        assert_eq!(walked.c_z, r1cs.apply_c(&walked.z));
-        assert!(r1cs.satisfies(&walked.z));
-        assert_eq!(walked.z.len(), capacity);
-    }
-}
-
-#[test]
 fn edge_case_xors_and_nested_general_c_match_sparse_walks() {
     let mut builder = CircuitBuilder::new();
-    let inputs = builder.input_bits::<2>("input");
+    let schema = TestSchema {
+        inputs: 2,
+        witnesses: 2,
+    };
+    let cols = builder.reserve_columns(&schema);
+    let inputs: Vec<_> = cols.input.iter().map(|var| var.0).collect();
     let empty = builder.xor(std::iter::empty::<LinearExpr>());
     let shared = builder.xor2(inputs[0], inputs[1]);
     let duplicate = builder.xor([shared, shared, inputs[1].expr()]);
@@ -113,9 +115,20 @@ fn edge_case_xors_and_nested_general_c_match_sparse_walks() {
     let nested_c = builder.xor([shared, inputs[0].expr(), inputs[0].expr()]);
     let one = builder.one();
     builder.constrain(shared, one, nested_c);
-    let outputs = [builder.materialize(empty), builder.materialize(single)];
-    builder.output("output", outputs);
-    let circuit = builder.finish();
+    builder.define_linear(cols.witness[0], empty);
+    builder.define_linear(cols.witness[1], single);
+    let compiled = builder.finish_columns(schema);
+    let inputs: Vec<_> = cols
+        .input
+        .iter()
+        .map(|&var| support::resolved(&compiled, var))
+        .collect();
+    let circuit = compiled.circuit;
+    let empty = support::expression(&circuit, empty);
+    let duplicate = support::expression(&circuit, duplicate);
+    let single = support::expression(&circuit, single);
+    let nested_c = support::expression(&circuit, nested_c);
+    let shared = support::expression(&circuit, shared);
 
     assert_eq!(circuit.support(empty.id()), Some(vec![]));
     assert_eq!(
@@ -151,26 +164,10 @@ fn edge_case_xors_and_nested_general_c_match_sparse_walks() {
 }
 
 #[test]
-fn walks_match_sparse_oracles_under_permuted_layouts() {
-    for seed in 0..8usize {
+fn walks_match_sparse_oracles() {
+    for seed in 0..16usize {
         let circuit = random_circuit(0xc01a_0000 + seed as u64);
-        let values: Vec<_> = circuit
-            .rows()
-            .iter()
-            .filter_map(|row| row.defined_value())
-            .collect();
-        let mut layout = circuit.layout();
-        for (index, &value) in values.iter().enumerate() {
-            layout
-                .place_value(value, (values.len() - 1 - index + seed) % values.len())
-                .unwrap();
-        }
-        for (index, row) in circuit.rows().iter().enumerate() {
-            layout
-                .place_row(row.id(), (index + seed) % circuit.row_count())
-                .unwrap();
-        }
-        let layout = layout.finish().unwrap();
+        let layout = circuit.layout().unwrap();
         let plan = circuit.walk_plan_with_layout(&layout).unwrap();
         let k_log = capacity_log(plan.useful_bits());
         let capacity = 1 << k_log;
@@ -178,12 +175,15 @@ fn walks_match_sparse_oracles_under_permuted_layouts() {
             .map(|index| (seed + index) & 1 == 1)
             .collect();
         let walked = plan.forward(&inputs, k_log).unwrap();
+        assert_eq!(walked.z, circuit.evaluate_r1cs(&inputs, k_log).unwrap());
+        assert_eq!(walked.z.len(), capacity);
         let r1cs = circuit
             .to_block_r1cs_with_layout(k_log, 0, 0, &layout)
             .unwrap();
         assert_eq!(walked.a_z, r1cs.apply_a(&walked.z));
         assert_eq!(walked.b_z, r1cs.apply_b(&walked.z));
         assert_eq!(walked.c_z, r1cs.apply_c(&walked.z));
+        assert!(r1cs.satisfies(&walked.z));
 
         let e_a = weights(capacity, 0xa000 + seed as u64);
         let e_b = weights(capacity, 0xb000 + seed as u64);
@@ -199,25 +199,25 @@ fn walks_match_sparse_oracles_under_permuted_layouts() {
 
 #[test]
 fn forward_walk_enforces_general_constraints() {
-    let mut builder = CircuitBuilder::new();
-    let input = builder.input();
-    let row = builder.assert_zero(input);
-    let plan = builder.finish().walk_plan().unwrap();
+    let circuit = support::circuit(1, 0, |b, cols| {
+        b.assert_zero(cols.input[0]);
+    });
+    let row = circuit.rows()[2].id();
+    let plan = circuit.walk_plan().unwrap();
     let error = plan.forward(&[true], capacity_log(plan.useful_bits()));
     assert_eq!(error, Err(WalkError::UnsatisfiedRow(row)));
 }
 
 #[test]
 fn deep_and_reused_xors_follow_structural_edges_and_liveness() {
-    let mut builder = CircuitBuilder::new();
-    let inputs = builder.input_bits::<8>("input");
-    let mut expression = inputs[0].expr();
-    for index in 0..20_000 {
-        expression = builder.xor2(expression, inputs[index % inputs.len()]);
-    }
-    let output = builder.materialize(expression);
-    builder.output("output", [output]);
-    let deep = builder.finish();
+    let deep = support::circuit(8, 1, |builder, cols| {
+        let inputs: Vec<_> = cols.input.iter().map(|var| var.0).collect();
+        let mut expression = inputs[0].expr();
+        for index in 0..20_000 {
+            expression = builder.xor2(expression, inputs[index % inputs.len()]);
+        }
+        builder.define_linear(cols.witness[0], expression);
+    });
     let deep_plan = deep.walk_plan().unwrap();
     assert_eq!(deep_plan.stats().xor_nodes, 20_000);
     assert_eq!(deep_plan.stats().max_live_temporaries, 1);
@@ -247,15 +247,19 @@ fn deep_and_reused_xors_follow_structural_edges_and_liveness() {
     );
 
     let mut builder = CircuitBuilder::new();
-    let inputs = builder.input_bits::<128>("input");
-    let shared = builder.xor(inputs);
+    let schema = TestSchema {
+        inputs: 128,
+        witnesses: 1,
+    };
+    let cols = builder.reserve_columns(&schema);
+    let shared = builder.xor(cols.input.iter().copied());
     let one = builder.one();
     for _ in 0..128 {
         builder.constrain(shared, one, shared);
     }
-    let output = builder.materialize(shared);
-    builder.output("output", [output]);
-    let reused = builder.finish();
+    builder.define_linear(cols.witness[0], shared);
+    let reused = builder.finish_columns(schema).circuit;
+    let shared = support::expression(&reused, shared);
     let plan = reused.walk_plan().unwrap();
     let k_log = capacity_log(plan.useful_bits());
     let r1cs = reused.to_block_r1cs(k_log, 0, 0).unwrap();

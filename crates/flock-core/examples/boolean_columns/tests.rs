@@ -68,8 +68,8 @@ fn operation_bindings_retain_virtual_results_and_exact_columns() {
     let compiled = CircuitBuilder::compile(DoubleAdd, DoubleAdd::eval);
     let operations = compiled.operations();
     assert_eq!(operations.len(), 2);
-    assert_eq!(operations[0].name, "witness.first");
-    assert_eq!(operations[1].name, "witness.second");
+    assert_eq!(operations[0].kind, "Add4");
+    assert_eq!(operations[1].kind, "Add4");
     assert_eq!(operations[0].rows.len(), 3);
     assert_eq!(operations[1].rows.len(), 3);
     assert_eq!(
@@ -98,42 +98,4 @@ fn operation_bindings_retain_virtual_results_and_exact_columns() {
     }
     // The marker intentionally has no consumer; it must still be computed.
     assert_eq!(compiled.unused_values(), [("witness.inactive", 0)]);
-}
-
-#[test]
-#[should_panic(expected = "operation must own its exact schema instance")]
-fn operation_cannot_mix_columns_from_two_instances() {
-    CircuitBuilder::compile(DoubleAdd, |b, cols| {
-        let mixed = Add4 {
-            carry_product: [
-                cols.witness.first.carry_product[0],
-                cols.witness.second.carry_product[1],
-                cols.witness.first.carry_product[2],
-            ],
-        };
-        Add4::eval(
-            b,
-            cols.inputs.a.map(Into::into),
-            cols.inputs.b.map(Into::into),
-            &mixed,
-        );
-    });
-}
-
-#[test]
-#[should_panic(expected = "operation reads an undeclared argument")]
-fn operation_cannot_hide_a_captured_input() {
-    CircuitBuilder::compile(DoubleAdd, |b, cols| {
-        b.operation(
-            "BadAdd",
-            &cols.witness.first.carry_product,
-            [("a", cols.inputs.a.map(Into::into).to_vec())],
-            |b| {
-                for &product in &cols.witness.first.carry_product {
-                    b.define_linear(product, cols.inputs.c[0]);
-                }
-                cols.inputs.a.map(Into::into)
-            },
-        );
-    });
 }

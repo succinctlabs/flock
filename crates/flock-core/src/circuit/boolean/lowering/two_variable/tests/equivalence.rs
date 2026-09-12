@@ -1,47 +1,51 @@
 use super::*;
+use crate::circuit::boolean::tests::support;
 
 pub(super) fn fixture(case: usize) -> BooleanCircuit {
-    let mut b = CircuitBuilder::new();
-    let [x, y, s] = b.input_bits("input");
-    let product = b.and(x, y);
-    match case {
-        0 => {} // Definition-only path.
-        1 => {
-            b.constrain(x, y, s);
+    support::circuit(3, 2, |b, cols| {
+        let [x, y, s] = cols.input.as_slice() else {
+            unreachable!()
+        };
+        let (x, y, s) = (*x, *y, *s);
+        let product = cols.witness[0];
+        b.define_and(product, x, y);
+        match case {
+            0 => {} // Definition-only path.
+            1 => {
+                b.constrain(x, y, s);
+            }
+            2 => {
+                b.assert_zero_product(x, y);
+            }
+            3 => {
+                b.constrain(x, y, b.one());
+            }
+            4 => {
+                let shared = b.xor2(x, s);
+                let canceled = b.xor2(shared, shared);
+                b.constrain(shared, y, canceled);
+            }
+            5 => {
+                b.assert_when_eq(b.column_selector(x), product, s);
+            }
+            6 => {
+                b.constrain(x, y, s);
+                let result = b.xor2(x, s);
+                b.constrain(product, b.one(), result);
+            }
+            _ => unreachable!(),
         }
-        2 => {
-            b.assert_zero_product(x, y);
-        }
-        3 => {
-            b.constrain(x, y, b.one());
-        }
-        4 => {
-            let shared = b.xor2(x, s);
-            let canceled = b.xor2(shared, shared);
-            b.constrain(shared, y, canceled);
-        }
-        5 => {
-            b.assert_when_eq(b.selector(x), product, s);
-        }
-        6 => {
-            b.constrain(x, y, s);
-            let result = b.xor2(x, s);
-            b.constrain(product, b.one(), result);
-        }
-        _ => unreachable!(),
-    }
-    // A definition after an assertion exercises distinct execution/placement order.
-    let output = b.materialize(product);
-    b.output("output", [output]);
-    b.finish()
+        // A definition after an assertion exercises distinct execution/placement order.
+        b.define_linear(cols.witness[1], product);
+    })
 }
 
 #[test]
 fn exhaustive_source_and_lowered_witnesses_match_independent_sparse_relations() {
     for case in 0..7 {
         let source = fixture(case);
-        let placement = source.layout().finish().unwrap();
-        let lowered = source.lower_identity_c(&placement).unwrap();
+        let placement = source.layout().unwrap();
+        let lowered = source.lower_identity_c().unwrap();
         let q = source
             .rows()
             .iter()
@@ -73,9 +77,7 @@ fn exhaustive_source_and_lowered_witnesses_match_independent_sparse_relations() 
         let original = source
             .to_block_r1cs_with_layout(k_log, 0, 0, &placement)
             .unwrap();
-        let direct = source
-            .lower(LoweringMode::Direct, &placement, RowPlacement::Preserve)
-            .unwrap();
+        let direct = source.lower(LoweringMode::Direct).unwrap();
         assert_eq!(
             direct.normalized_support_bytes(),
             source.normalized_support_bytes()
@@ -151,9 +153,7 @@ fn exhaustive_source_and_lowered_witnesses_match_independent_sparse_relations() 
 #[test]
 fn extension_does_not_repair_derived_values_or_cancel_multiple_failures() {
     let source = fixture(6);
-    let lowered = source
-        .lower_identity_c(&source.layout().finish().unwrap())
-        .unwrap();
+    let lowered = source.lower_identity_c().unwrap();
     let mut z = source.evaluate(&[false, false, false]).unwrap();
     let product = source
         .rows()
@@ -187,9 +187,7 @@ fn extension_does_not_repair_derived_values_or_cancel_multiple_failures() {
 #[test]
 fn retained_xor_dag_and_assertion_provenance_are_inspectable() {
     let source = fixture(4);
-    let lowered = source
-        .lower_identity_c(&source.layout().finish().unwrap())
-        .unwrap();
+    let lowered = source.lower_identity_c().unwrap();
     for row in source.rows() {
         let mapped: Vec<_> = lowered.mapped_rows(row.id()).unwrap().collect();
         assert_eq!(

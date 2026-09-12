@@ -1,43 +1,28 @@
-//! Schema-only construction. Legacy allocating calls are rejected in this mode.
+//! Named column reservation, definitions, and final numbering.
 
 use super::*;
 use crate::circuit::boolean::schema::{
-    ColumnRole, ColumnSchema, ColumnVisitor, CompiledColumns, SchemaColumn, SchemaState, Var,
+    ColumnRole, ColumnSchema, ColumnVisitor, CompiledColumns, SchemaColumn, Var,
 };
 
 impl CircuitBuilder {
-    pub(super) fn assert_legacy_allocation(&self) {
-        assert!(
-            self.schema.is_none(),
-            "cannot mix schema and legacy allocation"
-        );
-    }
-
     pub(super) fn assert_available(&self, expression: LinearExpr) {
         self.assert_circuit(expression.id.circuit);
-        if let Some(schema) = &self.schema
-            && let ExpressionNode::Value(value) = self.expressions[expression.id.index].node
-        {
+        if let ExpressionNode::Value(value) = self.expressions[expression.id.index].node {
             assert!(
-                schema.defined[value.index],
+                self.schema.defined[value.index],
                 "structural read before definition"
             );
         }
         // XOR operands were checked when their structural node was recorded.
     }
 
-    /// Reserve all columns on a fresh builder; schema and legacy allocation cannot mix.
-    pub fn reserve_columns<S: ColumnSchema>(&mut self, schema: &S) -> S::Cols<Var> {
-        assert!(self.schema.is_none(), "schema already reserved");
+    /// Reserve the complete schema before recording definitions.
+    pub(crate) fn reserve_columns<S: ColumnSchema>(&mut self, schema: &S) -> S::Cols<Var> {
         assert!(
             self.value_count == 1 && self.rows.len() == 1 && self.expressions.len() == 2,
-            "cannot mix schema and legacy allocation"
+            "columns must be reserved on a fresh builder"
         );
-        self.schema = Some(SchemaState {
-            columns: Vec::new(),
-            defined: vec![true],
-            operations: Vec::new(),
-        });
         schema.columns(&mut ReservingVisitor(self))
     }
 
@@ -60,10 +45,7 @@ impl CircuitBuilder {
         self.assert_circuit(output.0.value.circuit);
         self.assert_available(lhs);
         self.assert_available(rhs);
-        let schema = self
-            .schema
-            .as_mut()
-            .expect("definition requires reserved columns");
+        let schema = &mut self.schema;
         assert!(
             !schema.defined[output.0.value.index],
             "column defined twice"
@@ -83,9 +65,8 @@ impl CircuitBuilder {
     }
 
     /// Canonicalize definition order and retain a resolver for construction handles.
-    pub fn finish_columns<S: ColumnSchema>(mut self, shape: S) -> CompiledColumns<S> {
+    pub(crate) fn finish_columns<S: ColumnSchema>(mut self, shape: S) -> CompiledColumns<S> {
         self.validate();
-        let schema = self.schema.take().expect("no schema reserved");
         let construction_id = self.id;
         // Reject any construction-era IDs leaked through compatibility metadata APIs.
         let finalized_id = fresh_circuit_id();
@@ -135,11 +116,6 @@ impl CircuitBuilder {
         for value in &mut self.input_values {
             *value = resolved[value.index];
         }
-        for port in &mut self.ports {
-            for value in &mut port.values {
-                *value = resolved[value.index];
-            }
-        }
         for interaction in &mut self.interactions {
             interaction.selector = resolved[interaction.selector.index];
             for value in &mut interaction.multiplicity {
@@ -155,13 +131,12 @@ impl CircuitBuilder {
         self.one.value = resolved[0];
         self.one.expression.circuit = finalized_id;
         self.zero.id.circuit = finalized_id;
-        let mut columns = schema.columns;
-        for column in &mut columns {
+        for column in &mut self.schema.columns {
             for value in &mut column.values {
                 *value = resolved[value.index];
             }
         }
-        let mut operations = schema.operations;
+        let mut operations = std::mem::take(&mut self.schema.operations);
         for operation in &mut operations {
             for value in &mut operation.columns {
                 *value = resolved[value.index];
@@ -179,7 +154,6 @@ impl CircuitBuilder {
         let compiled = CompiledColumns {
             construction_id,
             circuit: self.finish(),
-            columns,
             resolved,
             operations,
             schema: shape,
@@ -210,14 +184,12 @@ impl ColumnVisitor for ReservingVisitor<'_> {
         );
         assert!(
             role != ColumnRole::Witness || alignment_bits == 1,
-            "internal columns have no port alignment"
+            "internal columns require alignment one"
         );
         assert!(!name.is_empty(), "schema field name must not be empty");
         assert!(
             builder
                 .schema
-                .as_ref()
-                .unwrap()
                 .columns
                 .iter()
                 .all(|column| column.name != name),
@@ -234,10 +206,10 @@ impl ColumnVisitor for ReservingVisitor<'_> {
                 };
                 builder.value_count += 1;
                 let expression = builder.push_value_expression(value);
-                builder.schema.as_mut().unwrap().defined.push(false);
+                builder.schema.defined.push(false);
                 let var = Var(Bit { value, expression });
                 if role.is_input() {
-                    builder.schema.as_mut().unwrap().defined[value.index] = true;
+                    builder.schema.defined[value.index] = true;
                     builder.rows.push(Row {
                         id: RowId {
                             circuit: builder.id,
@@ -264,28 +236,7 @@ impl ColumnVisitor for ReservingVisitor<'_> {
             })
             .collect();
         let values: Vec<ValueId> = vars.iter().map(|var| var.0.value).collect();
-        let port_role = match &role {
-            ColumnRole::Input => Some((PortDirection::Input, PortOrigin::Witness)),
-            ColumnRole::Advice(kind) => Some((
-                PortDirection::Input,
-                PortOrigin::Advice {
-                    advice_type: (*kind).into(),
-                },
-            )),
-            ColumnRole::Output => Some((PortDirection::Output, PortOrigin::Derived)),
-            ColumnRole::Fixed(_) => Some((PortDirection::Fixed, PortOrigin::Fixed)),
-            ColumnRole::Witness => None,
-        };
-        if let Some((direction, origin)) = port_role {
-            builder.ports.push(Port {
-                name: name.into(),
-                direction,
-                origin,
-                encoding: PortEncoding::LittleEndianWord { alignment_bits },
-                values: values.clone(),
-            });
-        }
-        builder.schema.as_mut().unwrap().columns.push(SchemaColumn {
+        builder.schema.columns.push(SchemaColumn {
             name: name.into(),
             role,
             values,

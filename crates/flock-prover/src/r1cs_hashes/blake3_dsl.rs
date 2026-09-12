@@ -1,4 +1,4 @@
-//! BLAKE3 compression with declared columns and a separate compatibility layout.
+//! BLAKE3 compression with declared columns and a separate aligned layout.
 
 use std::sync::{Arc, OnceLock};
 
@@ -11,18 +11,17 @@ use super::{ProjectionCache, blake3};
 
 mod columns;
 mod eval;
-mod layout;
 pub use columns::{Blake3Cols, Blake3Schema};
 
-const CV_PORT: &str = "cv";
-const MESSAGE_PORT: &str = "message";
-const COUNTER_PORT: &str = "counter";
-const BLOCK_LEN_PORT: &str = "block_len";
-const FLAGS_PORT: &str = "flags";
-const OUT_LO_PORT: &str = "out_lo";
-const OUT_HI_PORT: &str = "out_hi";
+const CV_FIELD: &str = "cv";
+const MESSAGE_FIELD: &str = "message";
+const COUNTER_FIELD: &str = "counter";
+const BLOCK_LEN_FIELD: &str = "block_len";
+const FLAGS_FIELD: &str = "flags";
+const OUT_LO_FIELD: &str = "out_lo";
+const OUT_HI_FIELD: &str = "out_hi";
 
-/// One reusable BLAKE3 DSL artifact and its legacy-compatible placement.
+/// One reusable BLAKE3 DSL artifact and its automatic aligned placement.
 #[derive(Debug)]
 pub struct Blake3DslCircuit {
     compiled: CompiledColumns<Blake3Schema>,
@@ -42,7 +41,7 @@ impl Blake3DslCircuit {
         &self.layout
     }
 
-    /// Lower to the same block-diagonal shape as the legacy relation.
+    /// Build the repeated block relation used by the prover.
     pub fn to_block_r1cs(&self, n_blocks_log: usize) -> BlockR1cs {
         assert!(
             n_blocks_log >= 3,
@@ -50,10 +49,10 @@ impl Blake3DslCircuit {
         );
         self.circuit()
             .to_block_r1cs_with_layout(blake3::K_LOG, blake3::K_SKIP, n_blocks_log, &self.layout)
-            .expect("the fixed BLAKE3 compatibility layout must be valid")
+            .expect("the fixed BLAKE3 aligned layout must be valid")
     }
 
-    /// Evaluate one compression in legacy physical witness order.
+    /// Evaluate one compression in physical witness order.
     pub fn evaluate_block(
         &self,
         cv: &[u32; 8],
@@ -86,11 +85,11 @@ impl Blake3DslCircuit {
             .expect("BLAKE3 has no rejecting general constraints")
     }
 
-    /// Compile the structural execution plan at the compatibility layout.
+    /// Compile the structural execution plan at the aligned layout.
     pub fn walk_plan(&self) -> WalkPlan {
         self.circuit()
             .walk_plan_with_layout(&self.layout)
-            .expect("the fixed BLAKE3 compatibility layout must be valid")
+            .expect("the fixed BLAKE3 aligned layout must be valid")
     }
 }
 
@@ -122,9 +121,10 @@ pub fn blake3_relation_projection(n_blocks_log: usize) -> Arc<BlockR1cs> {
 
 fn build_blake3_circuit() -> Blake3DslCircuit {
     let compiled = CircuitBuilder::compile(Blake3Schema, eval::eval);
-    assert_eq!(compiled.circuit().value_count(), blake3::USEFUL_BITS);
-    assert_eq!(compiled.circuit().row_count(), blake3::USEFUL_BITS);
-    let layout = layout::layout(compiled.circuit(), &compiled.columns());
+    let layout = compiled
+        .circuit()
+        .layout()
+        .expect("valid aligned hash layout");
     Blake3DslCircuit { compiled, layout }
 }
 

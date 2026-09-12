@@ -5,14 +5,13 @@ use std::fmt;
 pub(super) mod relation;
 
 mod two_variable;
-pub use two_variable::{AssertionAux, LoweredCircuit, LoweringMode, RowPlacement};
+pub use two_variable::{AssertionAux, LoweredCircuit, LoweringMode};
 
 use crate::r1cs::BlockR1cs;
 
 use super::{
-    BooleanCircuit, Component, ExpressionNode, Interaction, LayoutBuilder, LayoutError,
-    LinearExprId, PhysicalLayout, Port, PortDirection, PortEncoding, Row, RowId, RowKind, ValueId,
-    ValueIndex,
+    BooleanCircuit, ColumnRole, ExpressionNode, Interaction, LayoutError, LinearExprId,
+    PhysicalLayout, Row, RowId, RowKind, SchemaColumn, ValueId, ValueIndex,
 };
 
 impl BooleanCircuit {
@@ -61,23 +60,17 @@ impl BooleanCircuit {
         &self.input_values
     }
 
-    /// Named ports, in declaration order.
-    pub fn ports(&self) -> &[Port] {
-        &self.ports
+    /// Declared fields, in declaration order.
+    pub fn schema(&self) -> &[SchemaColumn] {
+        &self.columns
     }
 
-    /// Find a named port.
-    pub fn port(&self, name: &str) -> Option<&Port> {
-        self.ports.iter().find(|port| port.name == name)
+    /// Find a declared field by name.
+    pub fn column(&self, name: &str) -> Option<&SchemaColumn> {
+        self.columns.iter().find(|column| column.name == name)
     }
 
-    /// Named build-time component ranges. They organize the authored IR but
-    /// do not change its arithmetic.
-    pub fn components(&self) -> &[Component] {
-        &self.components
-    }
-
-    /// Deferred global interactions referenced by this local component.
+    /// Deferred global interactions referenced by this circuit.
     pub fn interactions(&self) -> &[Interaction] {
         &self.interactions
     }
@@ -90,14 +83,13 @@ impl BooleanCircuit {
         self.definition_rows.get(value.index).copied()
     }
 
-    /// Begin an explicit physical layout for this circuit.
-    pub fn layout(&self) -> LayoutBuilder<'_> {
-        LayoutBuilder::new(self)
+    /// Place values automatically, keeping input/advice/output/fixed words contiguous and aligned.
+    pub fn layout(&self) -> Result<PhysicalLayout, LayoutError> {
+        PhysicalLayout::new(self)
     }
 
-    /// Deterministic digest of the authored local relation and port shape.
-    /// Runtime circuit IDs and higher-level interface metadata (advice origin,
-    /// component ranges, and interactions) are excluded.
+    /// Deterministic digest of the authored local relation and input/output/fixed field shape.
+    /// Runtime circuit IDs, advice labels, internal field metadata, and interactions are excluded.
     pub fn structure_digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"flock-boolean-structure-v1");
@@ -147,26 +139,24 @@ impl BooleanCircuit {
         for value in &self.input_values {
             absorb_usize(&mut hasher, value.index);
         }
-        absorb_usize(&mut hasher, self.ports.len());
-        for port in &self.ports {
-            absorb_usize(&mut hasher, port.name.len());
-            hasher.update(port.name.as_bytes());
-            hasher.update(&[match port.direction {
-                PortDirection::Input => 0,
-                PortDirection::Output => 1,
-                PortDirection::Fixed => 2,
+        let columns = self
+            .columns
+            .iter()
+            .filter(|column| column.role != ColumnRole::Witness);
+        absorb_usize(&mut hasher, columns.clone().count());
+        for column in columns {
+            absorb_usize(&mut hasher, column.name.len());
+            hasher.update(column.name.as_bytes());
+            hasher.update(&[match column.role {
+                ColumnRole::Input | ColumnRole::Advice(_) => 0,
+                ColumnRole::Output => 1,
+                ColumnRole::Fixed(_) => 2,
+                ColumnRole::Witness => unreachable!(),
             }]);
-            match port.encoding {
-                PortEncoding::Bits => {
-                    hasher.update(&[0]);
-                }
-                PortEncoding::LittleEndianWord { alignment_bits } => {
-                    hasher.update(&[1]);
-                    absorb_usize(&mut hasher, alignment_bits);
-                }
-            }
-            absorb_usize(&mut hasher, port.values.len());
-            for value in &port.values {
+            hasher.update(&[1]); // Little-endian word tag in the v1 digest.
+            absorb_usize(&mut hasher, column.alignment_bits);
+            absorb_usize(&mut hasher, column.values.len());
+            for value in &column.values {
                 absorb_usize(&mut hasher, value.index);
             }
         }
@@ -237,13 +227,13 @@ impl BooleanCircuit {
         self.relation().evaluate(inputs)
     }
 
-    /// Evaluate and pad one block to `2^k_log` bits in source-order layout.
+    /// Evaluate and pad one block to `2^k_log` bits in automatic layout.
     pub fn evaluate_r1cs(
         &self,
         inputs: &[bool],
         k_log: usize,
     ) -> Result<Vec<bool>, EvaluationError> {
-        let layout = PhysicalLayout::source_order(self);
+        let layout = self.layout().map_err(EvaluationError::InvalidLayout)?;
         self.evaluate_r1cs_with_layout(inputs, k_log, &layout)
     }
 
@@ -273,7 +263,7 @@ impl BooleanCircuit {
         Ok(physical)
     }
 
-    /// Emit source-order sparse matrices for one repeated block.
+    /// Emit automatically placed sparse matrices for one repeated block.
     ///
     /// `n_log` chooses how many identical blocks the returned instance tiles;
     /// it does not alter the base circuit. Padding rows use `0 * 0 = z[i]`.
@@ -287,7 +277,7 @@ impl BooleanCircuit {
         k_skip: usize,
         n_log: usize,
     ) -> Result<BlockR1cs, R1csBuildError> {
-        let layout = PhysicalLayout::source_order(self);
+        let layout = self.layout().map_err(R1csBuildError::InvalidLayout)?;
         self.to_block_r1cs_with_layout(k_log, k_skip, n_log, &layout)
     }
 
@@ -302,6 +292,7 @@ impl BooleanCircuit {
         self.relation().to_block_r1cs(k_log, k_skip, n_log, layout)
     }
 
+    #[cfg(test)]
     pub(super) fn eval_expression(&self, id: LinearExprId, values: &[bool]) -> bool {
         self.relation().eval_expression(id, values)
     }

@@ -1,14 +1,7 @@
+use super::super::dsl::tests::{check_hash_lowering, read_word};
 use super::*;
-
-use std::hint::black_box;
-use std::sync::Arc;
-use std::time::Instant;
-
-use super::super::dsl::tests::{assert_relation_equal, median_time};
-
 use crate::prover::prove_ligerito;
 use flock_core::challenger::FsChallenger;
-use flock_core::circuit::boolean::{LoweringMode, PortDirection, PortEncoding, RowPlacement};
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::{self, PcsParams};
@@ -34,219 +27,64 @@ fn block_inputs(h_in: &[u32; 8], message: &[u32; 16]) -> Vec<bool> {
 }
 
 #[test]
-#[ignore = "builds and compares large SHA artifacts; run explicitly"]
-fn dsl_matches_legacy_relation_and_witness() {
+#[ignore = "large hash relation and walk checks; run explicitly"]
+fn dsl_outputs_and_walks_match_reference() {
     let dsl = sha256_circuit();
-    let actual_r1cs = sha256_relation_projection(3);
-    assert!(Arc::ptr_eq(&actual_r1cs, &sha256_relation_projection(3)));
-    let expected_r1cs = sha2::build_block_r1cs(3);
-
-    assert_relation_equal("legacy", &actual_r1cs, &expected_r1cs);
-    drop(expected_r1cs);
-
-    let identity = dsl
-        .circuit()
-        .lower(
-            LoweringMode::RequireIdentityC,
-            dsl.layout(),
-            RowPlacement::Preserve,
-        )
-        .unwrap();
-    assert!(identity.c_is_identity());
-    assert!(identity.auxiliaries().is_empty());
-    assert_eq!(identity.layout(), dsl.layout());
-    let identity_r1cs = identity
-        .to_block_r1cs(sha2::K_LOG, sha2::K_SKIP, 3)
-        .unwrap();
-    assert_relation_equal("required identity C", &identity_r1cs, &actual_r1cs);
-    drop(identity_r1cs);
-
-    for (name, direction, len, position) in [
-        (
-            H_PORT,
-            PortDirection::Input,
-            sha2::H_WORDS * sha2::WORD_BITS,
-            sha2::H_BASE,
-        ),
-        (
-            MESSAGE_PORT,
-            PortDirection::Input,
-            sha2::M_WORDS * sha2::WORD_BITS,
-            sha2::M_BASE,
-        ),
-        (
-            H_OUT_PORT,
-            PortDirection::Output,
-            sha2::N_OUT_WORDS * sha2::WORD_BITS,
-            sha2::H_OUT_BASE,
-        ),
-    ] {
-        let port = dsl.circuit().port(name).unwrap();
-        assert_eq!(port.direction(), direction);
-        assert_eq!(port.values().len(), len);
-        assert_eq!(
-            port.encoding(),
-            PortEncoding::LittleEndianWord {
-                alignment_bits: sha2::SLOT_BITS,
-            }
-        );
-        for (offset, &value) in port.values().iter().enumerate() {
-            assert_eq!(dsl.layout().value_position(value), Some(position + offset));
-        }
-    }
-    assert_eq!(
-        dsl.layout().value_position(dsl.circuit().one()),
-        Some(sha2::Z_CONST_POS)
-    );
-
+    let matrix = sha256_relation_projection(3);
+    assert!(std::sync::Arc::ptr_eq(
+        &matrix,
+        &sha256_relation_projection(3)
+    ));
     let plan = sha256_walk_projection();
-    let identity_plan = identity.walk_plan().unwrap();
-    assert_eq!(identity_plan.stats(), plan.stats());
-    assert!(std::ptr::eq(plan, sha256_walk_projection()));
-    assert!(plan.c_is_identity());
-    assert_eq!(dsl.circuit().expression_count(), 116_982);
-    assert_eq!(plan.stats().actions, 116_981);
-    assert_eq!(plan.stats().structural_edges, 285_800);
-    assert!(plan.stats().max_live_temporaries < 2_000);
-    assert_eq!(plan.stats().xor_term_allocations, plan.stats().xor_nodes);
-    assert!(plan.stats().action_bytes < 16 * 1024 * 1024);
-    assert!(plan.stats().xor_term_bytes < 4 * 1024 * 1024);
-    assert!(dsl.circuit().normalized_support_bytes() < 320 * 1024 * 1024);
-
+    check_hash_lowering(dsl.circuit(), dsl.layout(), &matrix);
     let mut rng = flock_core::test_rng::Rng::new(0x5A25_6D51);
+    let mut abc = [0; 16];
+    abc[0] = 0x6162_6380;
+    abc[15] = 24;
     let cases = [
-        ([0u32; 8], [0u32; 16]),
-        (sha2::SHA256_IV, [0u32; 16]),
-        (
-            sha2::SHA256_IV,
-            [
-                0x6162_6380,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0x0000_0018,
-            ],
-        ),
-        (
-            std::array::from_fn(|i| 0x1020_3040u32.wrapping_mul(i as u32 + 1)),
-            std::array::from_fn(|i| 0xA5A5_5A5Au32.rotate_left(i as u32)),
-        ),
+        ([0; 8], [0; 16]),
+        (sha2::SHA256_IV, abc),
         (
             std::array::from_fn(|_| rng.next_u32()),
             std::array::from_fn(|_| rng.next_u32()),
         ),
     ];
-    let mut active_witness = None;
-    for (case, &(h_in, message)) in cases.iter().enumerate() {
-        let actual_witness = dsl.evaluate_block(&h_in, &message);
-        let expected_witness = sha2::build_block_witness(&h_in, &message);
-        let identity_logical = identity.evaluate(&block_inputs(&h_in, &message)).unwrap();
-        assert_eq!(
-            super::super::dsl::physical_witness(
-                &identity_logical,
-                identity.layout(),
-                1 << sha2::K_LOG
-            ),
-            expected_witness,
-        );
+    for (case, (h_in, message)) in cases.into_iter().enumerate() {
         let (cols, _) = dsl.generate_trace(&h_in, &message);
-        assert_eq!(
-            cols.h_out.into_iter().flatten().collect::<Vec<_>>(),
-            expected_witness[sha2::H_OUT_BASE..sha2::H_OUT_BASE + 256]
-        );
-        assert_eq!(actual_witness, expected_witness);
-        assert_eq!(
-            pcs::pack_witness(&actual_witness, sha2::K_LOG),
-            pcs::pack_witness(&expected_witness, sha2::K_LOG)
-        );
+        let output = cols.h_out.map(read_word);
+        assert_eq!(output, sha2::sha256_compress(&h_in, &message));
+        if case == 1 {
+            assert_eq!(output, SHA256_ABC);
+        }
+        let witness = dsl.evaluate_block(&h_in, &message);
         let walked = plan
             .forward(&block_inputs(&h_in, &message), sha2::K_LOG)
-            .expect("the structural walk must evaluate SHA-256");
-        assert_eq!(walked.z, actual_witness);
-        assert_eq!(
-            identity_plan
-                .forward(&block_inputs(&h_in, &message), sha2::K_LOG)
-                .unwrap(),
-            walked
-        );
-        let batched_witness: Vec<bool> = actual_witness.repeat(1 << 3);
-        assert!(actual_r1cs.satisfies(&batched_witness));
-        let h_out = sha2::read_h_out(&actual_witness);
-        assert_eq!(h_out, sha2::sha256_compress(&h_in, &message));
-        if case == 2 {
-            assert_eq!(h_out, SHA256_ABC);
-            active_witness = Some(actual_witness);
-        }
-    }
-
-    // Standalone block padding contains complete valid compressions because
-    // the statement pins ONE in every block.
-    let active_witness = active_witness.unwrap();
-    let zero_padding = dsl.evaluate_block(&[0; 8], &[0; 16]);
-    let mut partially_filled = active_witness.clone();
-    for _ in 1..1 << 3 {
-        partially_filled.extend_from_slice(&zero_padding);
-    }
-    assert!(actual_r1cs.satisfies(&partially_filled));
-
-    let mut invalid_column_padding = active_witness.repeat(1 << 3);
-    invalid_column_padding[sha2::USEFUL_BITS] = true;
-    assert!(!actual_r1cs.satisfies(&invalid_column_padding));
-
-    // The union's partial-count format has a different contract: active rows
-    // equal the DSL walk, while inactive rows are entirely zero.
-    let partial_inputs = &cases[..2];
-    let (partial_z, partial_a, partial_b, _) =
-        sha2::generate_witness_batch_major_partial(partial_inputs, 3);
-    let chunks_per_block = sha2::K / 128;
-    for (block, (h_in, message)) in partial_inputs.iter().enumerate() {
-        let walked = plan
-            .forward(&block_inputs(h_in, message), sha2::K_LOG)
             .unwrap();
-        for (actual, expected) in [
-            (&partial_z, pcs::pack_witness(&walked.z, sha2::K_LOG)),
-            (&partial_a, pcs::pack_witness(&walked.a_z, sha2::K_LOG)),
-            (&partial_b, pcs::pack_witness(&walked.b_z, sha2::K_LOG)),
-        ] {
-            for chunk in 0..chunks_per_block {
-                assert_eq!(actual[(chunk << 3) + block], expected[chunk]);
-            }
-        }
+        assert_eq!(walked.z, witness);
+        assert_eq!(walked.a_z.repeat(8), matrix.apply_a(&witness.repeat(8)));
+        assert_eq!(walked.b_z.repeat(8), matrix.apply_b(&witness.repeat(8)));
+        assert_eq!(walked.c_z.repeat(8), matrix.apply_c(&witness.repeat(8)));
+        assert!(matrix.satisfies(&witness.repeat(8)));
+        let mut invalid = witness.repeat(8);
+        let output_column = dsl.circuit().column(H_OUT_FIELD).unwrap();
+        invalid[dsl
+            .layout()
+            .value_position(output_column.values[0])
+            .unwrap()] ^= true;
+        assert!(!matrix.satisfies(&invalid));
+        let mut invalid = witness.repeat(8);
+        invalid[dsl.layout().useful_bits()] = true;
+        assert!(!matrix.satisfies(&invalid));
     }
-    for values in [&partial_z, &partial_a, &partial_b] {
-        for block in partial_inputs.len()..1 << 3 {
-            for chunk in 0..chunks_per_block {
-                assert_eq!(values[(chunk << 3) + block], F128::ZERO);
-            }
-        }
-    }
-
-    let const_pin = actual_r1cs.const_pin;
-    drop(actual_r1cs);
-    let adapter = plan
-        .lincheck_circuit(sha2::K_LOG)
-        .expect("SHA walk fits its base dimension");
-    assert_eq!(adapter.const_pin_col(), const_pin);
-    let legacy = sha2::Sha2LincheckCircuit;
-    let alpha = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
-    let eq: Vec<F128> = (0..sha2::K)
-        .map(|i| F128::new(i as u64, (i as u64).rotate_left(17)))
-        .collect();
-    assert_eq!(adapter.const_pin_col(), Some(sha2::Z_CONST_POS));
+    let alpha = F128::new(0x1234, 0x5678);
+    let eq: Vec<_> = (0..sha2::K).map(|i| F128::new(i as u64, 7)).collect();
     assert_eq!(
-        adapter.fold_alpha_batched(alpha, &eq),
-        legacy.fold_alpha_batched(alpha, &eq)
+        plan.lincheck_circuit(sha2::K_LOG)
+            .unwrap()
+            .fold_alpha_batched(alpha, &eq),
+        matrix
+            .sparse_lincheck_circuit()
+            .fold_alpha_batched(alpha, &eq)
     );
 }
 
@@ -291,84 +129,4 @@ fn dsl_relation_proves_and_verifies_with_walk_adapter() {
     )
     .expect("the SHA DSL proof must verify through the walk adapter");
     assert_eq!(prover_claim, verifier_claim);
-}
-
-/// Run with:
-/// `/usr/bin/time -v cargo +stable test --release -p flock-prover --lib \
-/// r1cs_hashes::sha2_dsl::tests::performance_profile -- --ignored --exact --nocapture`
-#[test]
-#[ignore = "diagnostic Phase 4 profile; run alone with --nocapture"]
-fn performance_profile() {
-    let start = Instant::now();
-    let dsl = sha256_circuit();
-    let dsl_build = start.elapsed();
-
-    let start = Instant::now();
-    let plan = dsl.walk_plan();
-    let plan_build = start.elapsed();
-
-    let start = Instant::now();
-    let relation = dsl.to_block_r1cs(3);
-    black_box(relation.statement_digest());
-    let dsl_lower = start.elapsed();
-    drop(relation);
-
-    let start = Instant::now();
-    let relation = sha2::build_block_r1cs(3);
-    black_box(relation.statement_digest());
-    let legacy_setup = start.elapsed();
-    drop(relation);
-
-    let h_in = sha2::SHA256_IV;
-    let message = [0u32; 16];
-    let inputs = block_inputs(&h_in, &message);
-    let reference_witness = dsl.evaluate_block(&h_in, &message);
-    let walked = plan.forward(&inputs, sha2::K_LOG).unwrap();
-    let optimized_witness = sha2::build_block_witness(&h_in, &message);
-    assert_eq!(walked.z, reference_witness);
-    assert_eq!(optimized_witness, reference_witness);
-
-    let reference_eval = median_time(3, || {
-        black_box(dsl.evaluate_block(&h_in, &message));
-    });
-    let forward_walk = median_time(21, || {
-        black_box(plan.forward(&inputs, sha2::K_LOG).unwrap());
-    });
-    let optimized_eval = median_time(21, || {
-        black_box(sha2::build_block_witness(&h_in, &message));
-    });
-
-    let alpha = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
-    let eq: Vec<F128> = (0..sha2::K)
-        .map(|i| F128::new(i as u64, (i as u64).rotate_left(17)))
-        .collect();
-    let adapter = plan.lincheck_circuit(sha2::K_LOG).unwrap();
-    let legacy = sha2::Sha2LincheckCircuit;
-    assert_eq!(
-        adapter.fold_alpha_batched(alpha, &eq),
-        legacy.fold_alpha_batched(alpha, &eq)
-    );
-    let reverse_walk = median_time(21, || {
-        black_box(adapter.fold_alpha_batched(alpha, &eq));
-    });
-    let legacy_reverse = median_time(21, || {
-        black_box(legacy.fold_alpha_batched(alpha, &eq));
-    });
-
-    println!("SHA-256 Phase 4 profile (median unless noted):");
-    println!("  DSL build (once):       {dsl_build:?}");
-    println!("  walk-plan build (once): {plan_build:?}");
-    println!("  DSL sparse lowering:    {dsl_lower:?}");
-    println!("  legacy sparse setup:    {legacy_setup:?}");
-    println!("  DSL reference witness:  {reference_eval:?}");
-    println!("  structural forward:     {forward_walk:?}");
-    println!("  optimized witness:      {optimized_eval:?}");
-    println!("  structural reverse:     {reverse_walk:?}");
-    println!("  legacy reverse:         {legacy_reverse:?}");
-    println!(
-        "  normalized supports:    {} terms / {} bytes",
-        dsl.circuit().normalized_support_terms(),
-        dsl.circuit().normalized_support_bytes()
-    );
-    println!("  walk storage:           {:?}", plan.stats());
 }

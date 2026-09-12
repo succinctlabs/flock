@@ -1,4 +1,4 @@
-//! Selector, component, and interaction authoring.
+//! Selectors and interaction declarations.
 
 use super::*;
 use crate::circuit::boolean::{
@@ -11,44 +11,6 @@ impl CircuitBuilder {
     pub fn selector(&self, bit: Bit) -> Selector {
         self.assert_circuit(bit.value.circuit);
         Selector { bit }
-    }
-
-    /// Build one named component and record the ranges it emitted. The closure
-    /// runs now; only the resulting ordinary IR and numeric ranges survive.
-    pub fn component<T>(
-        &mut self,
-        name: impl Into<String>,
-        build: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        let name = name.into();
-        assert!(!name.is_empty(), "component name must not be empty");
-        assert!(
-            self.components
-                .iter()
-                .all(|component| component.name != name),
-            "duplicate component name `{name}`"
-        );
-
-        let index = self.components.len();
-        let expression_start = self.expressions.len();
-        let value_start = self.value_count;
-        let row_start = self.rows.len();
-        self.components.push(Component {
-            name,
-            parent: self.active_components.last().copied(),
-            expressions: expression_start..expression_start,
-            values: value_start..value_start,
-            rows: row_start..row_start,
-        });
-        self.active_components.push(index);
-        let result = build(self);
-        assert_eq!(self.active_components.pop(), Some(index));
-
-        let component = &mut self.components[index];
-        component.expressions.end = self.expressions.len();
-        component.values.end = self.value_count;
-        component.rows.end = self.rows.len();
-        result
     }
 
     /// Record a deferred global interaction. Its effective multiplicity is
@@ -86,7 +48,6 @@ impl CircuitBuilder {
             multiplicity,
             selector: selector.bit.value,
             scope,
-            component: self.active_components.last().copied(),
         });
     }
 
@@ -110,95 +71,7 @@ impl CircuitBuilder {
         self.assert_when_zero(selector, difference)
     }
 
-    pub(super) fn validate_interface(&self) {
-        self.validate_ports();
-        self.validate_components();
-        self.validate_interactions();
-    }
-
-    fn validate_ports(&self) {
-        for (index, port) in self.ports.iter().enumerate() {
-            assert!(!port.name.is_empty(), "port name must not be empty");
-            if let PortEncoding::LittleEndianWord { alignment_bits } = port.encoding {
-                assert!(alignment_bits > 0, "word alignment must be nonzero");
-            }
-            assert!(
-                self.ports[..index]
-                    .iter()
-                    .all(|other| other.name != port.name),
-                "duplicate port name `{}`",
-                port.name
-            );
-            assert!(!port.values.is_empty(), "port `{}` is empty", port.name);
-            let mut values = port.values.clone();
-            values.sort_unstable();
-            assert!(
-                values.windows(2).all(|pair| pair[0] != pair[1]),
-                "port `{}` repeats a value",
-                port.name
-            );
-            assert!(
-                values
-                    .iter()
-                    .all(|value| value.circuit == self.id && value.index < self.value_count),
-                "port `{}` contains an invalid value",
-                port.name
-            );
-            if port.direction == PortDirection::Input {
-                assert!(
-                    port.values
-                        .iter()
-                        .all(|value| self.input_values.contains(value)),
-                    "input port `{}` contains a computed value",
-                    port.name
-                );
-            }
-            match (&port.direction, &port.origin) {
-                (PortDirection::Input, PortOrigin::Witness)
-                | (PortDirection::Fixed, PortOrigin::Fixed)
-                | (PortDirection::Output, PortOrigin::Derived) => {}
-                (PortDirection::Input, PortOrigin::Advice { advice_type }) => {
-                    assert!(!advice_type.is_empty(), "advice type must not be empty");
-                }
-                _ => panic!("port `{}` has an invalid direction/origin pair", port.name),
-            }
-        }
-    }
-
-    fn validate_components(&self) {
-        assert!(
-            self.active_components.is_empty(),
-            "component scope left open"
-        );
-        for (index, component) in self.components.iter().enumerate() {
-            assert!(
-                !component.name.is_empty(),
-                "component name must not be empty"
-            );
-            assert!(
-                self.components[..index]
-                    .iter()
-                    .all(|other| other.name != component.name),
-                "duplicate component name `{}`",
-                component.name
-            );
-            assert_range(&component.expressions, self.expressions.len(), "expression");
-            assert_range(&component.values, self.value_count, "value");
-            assert_range(&component.rows, self.rows.len(), "row");
-            if let Some(parent) = component.parent {
-                assert!(parent < index, "component parent must precede its child");
-                let parent = &self.components[parent];
-                assert!(
-                    contains(&parent.expressions, &component.expressions)
-                        && contains(&parent.values, &component.values)
-                        && contains(&parent.rows, &component.rows),
-                    "component lies outside its parent"
-                );
-            }
-        }
-    }
-
-    fn validate_interactions(&self) {
+    pub(super) fn validate_interactions(&self) {
         for interaction in &self.interactions {
             assert!(
                 !interaction.channel.is_empty(),
@@ -215,12 +88,6 @@ impl CircuitBuilder {
             assert!(
                 !interaction.scope.chip().is_empty(),
                 "interaction chip scope must not be empty"
-            );
-            assert!(
-                interaction
-                    .component
-                    .is_none_or(|index| index < self.components.len()),
-                "interaction has an invalid component scope"
             );
             assert!(
                 interaction.selector.circuit == self.id
@@ -271,15 +138,4 @@ impl CircuitBuilder {
             }
         }
     }
-}
-
-fn assert_range(range: &std::ops::Range<usize>, bound: usize, what: &str) {
-    assert!(
-        range.start <= range.end && range.end <= bound,
-        "component {what} range is invalid"
-    );
-}
-
-fn contains(outer: &std::ops::Range<usize>, inner: &std::ops::Range<usize>) -> bool {
-    outer.start <= inner.start && inner.end <= outer.end
 }

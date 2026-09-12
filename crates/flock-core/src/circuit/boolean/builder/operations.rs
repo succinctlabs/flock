@@ -1,4 +1,6 @@
-//! Operation boundaries for the typed authoring prototype.
+//! Named operation columns, arguments, results, and dependency checks.
+
+use std::collections::BTreeSet;
 
 use super::*;
 use crate::circuit::boolean::{OperationWord, SchemaOperation, Selector, Var};
@@ -10,27 +12,31 @@ impl CircuitBuilder {
         self.selector(var.0)
     }
 
-    /// Record an operation over one complete schema instance and a virtual word result.
-    /// The instance path is inferred from its owned columns, not supplied by the caller.
-    pub fn operation<const N: usize>(
+    /// Record an operation over explicit columns and a word result.
+    /// Calls may share a kind; column names do not determine ownership.
+    pub fn operation<R: AsRef<[LinearExpr]>>(
         &mut self,
         kind: &str,
         columns: &[Var],
         inputs: impl IntoIterator<Item = (&'static str, Vec<LinearExpr>)>,
-        eval: impl FnOnce(&mut Self) -> [LinearExpr; N],
-    ) -> [LinearExpr; N] {
-        assert!(
-            !kind.is_empty() && N > 0,
-            "operation kind and result must be nonempty"
-        );
+        eval: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        assert!(!kind.is_empty(), "operation kind must be nonempty");
+        assert!(!columns.is_empty(), "operation must own columns");
+        let mut owned = BTreeSet::new();
         let values: Vec<ValueId> = columns
             .iter()
             .map(|var| {
-                self.assert_circuit(var.0.value.circuit);
-                var.0.value
+                let value = var.0.value;
+                self.assert_circuit(value.circuit);
+                assert!(owned.insert(value), "duplicate operation column");
+                assert!(
+                    !self.schema.defined[value.index],
+                    "operation columns already defined"
+                );
+                value
             })
             .collect();
-        let name = self.operation_instance(&values);
         let inputs: Vec<OperationWord> = inputs
             .into_iter()
             .map(|(name, expressions)| {
@@ -57,80 +63,42 @@ impl CircuitBuilder {
         let expression_start = self.expressions.len();
         let interaction_start = self.interactions.len();
         let result = eval(self);
-        for &expression in &result {
+        let word = result.as_ref();
+        assert!(!word.is_empty(), "operation result must be nonempty");
+        for &expression in word {
             self.assert_available(expression);
         }
-        self.validate_operation_dependencies(
-            columns,
-            &inputs,
-            &result,
-            &self.rows[row_start..],
-            &self.interactions[interaction_start..],
-        );
-        let schema = self.schema.as_mut().unwrap();
         assert!(
-            values.iter().all(|value| schema.defined[value.index]),
+            values.iter().all(|value| self.schema.defined[value.index]),
             "operation left columns undefined"
         );
         assert!(
             self.rows[row_start..]
                 .iter()
                 .filter_map(|row| row.defined_value)
-                .all(|value| values.contains(&value)),
-            "operation defined another instance's column"
+                .all(|value| owned.contains(&value)),
+            "operation defined a column it does not own"
         );
-        schema.operations.push(SchemaOperation {
-            name,
+        self.validate_operation_dependencies(
+            columns,
+            &inputs,
+            word,
+            &self.rows[row_start..],
+            &self.interactions[interaction_start..],
+        );
+        self.schema.operations.push(SchemaOperation {
             kind: kind.into(),
             columns: values,
             inputs,
             output: OperationWord {
                 name: "result".into(),
-                expressions: result.iter().map(|expression| expression.id).collect(),
+                expressions: word.iter().map(|expression| expression.id).collect(),
             },
             rows: row_start..self.rows.len(),
             expressions: expression_start..self.expressions.len(),
             interactions: interaction_start..self.interactions.len(),
         });
         result
-    }
-
-    fn operation_instance(&self, values: &[ValueId]) -> String {
-        let schema = self.schema.as_ref().expect("operation requires a schema");
-        let first = schema
-            .columns
-            .iter()
-            .find(|field| field.values.first() == values.first())
-            .expect("operation must own complete schema fields");
-        let (mut name, _) = first
-            .name
-            .rsplit_once('.')
-            .expect("operation fields need an instance path");
-        // Find the deepest enclosing scope, including fields in child operations.
-        let expected = loop {
-            let prefix = format!("{name}.");
-            let expected: Vec<_> = schema
-                .columns
-                .iter()
-                .filter(|field| field.name.starts_with(&prefix))
-                .flat_map(|field| field.values.iter().copied())
-                .collect();
-            if values.iter().all(|value| expected.contains(value)) {
-                break expected;
-            }
-            (name, _) = name
-                .rsplit_once('.')
-                .expect("operation must own its exact schema instance");
-        };
-        assert_eq!(
-            values, expected,
-            "operation must own its exact schema instance"
-        );
-        assert!(
-            values.iter().all(|value| !schema.defined[value.index]),
-            "operation columns already defined"
-        );
-        name.to_owned()
     }
 
     fn validate_operation_dependencies(
@@ -142,7 +110,7 @@ impl CircuitBuilder {
         interactions: &[Interaction],
     ) {
         // Every external dependency must be accounted for by a named argument.
-        let mut boundaries: std::collections::BTreeSet<_> = inputs
+        let mut boundaries: BTreeSet<_> = inputs
             .iter()
             .flat_map(|word| word.expressions.iter().map(|expression| expression.index))
             .collect();

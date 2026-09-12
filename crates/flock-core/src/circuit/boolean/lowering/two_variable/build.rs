@@ -7,16 +7,9 @@ impl LoweredCircuit {
         source: &BooleanCircuit,
         placement: &PhysicalLayout,
         mode: LoweringMode,
-        row_placement: RowPlacement,
     ) -> Result<Self, LayoutError> {
         placement.validate_for(source)?;
         let require_identity = mode == LoweringMode::RequireIdentityC;
-        if require_identity
-            && row_placement == RowPlacement::Preserve
-            && !source.relation().c_is_identity(placement)
-        {
-            return Err(LayoutError::IdentityCRequired);
-        }
         let assertions = source
             .rows
             .iter()
@@ -55,9 +48,10 @@ impl LoweredCircuit {
                 }
             }
         }
-        let mut ports = source.ports.clone();
-        for port in &mut ports {
-            port.values
+        let mut columns = source.columns.clone();
+        for column in &mut columns {
+            column
+                .values
                 .iter_mut()
                 .for_each(|value| *value = map_value(*value));
         }
@@ -82,7 +76,7 @@ impl LoweredCircuit {
             rows: Vec::with_capacity(source.rows.len() + assertions),
             input_values: source.input_values.iter().copied().map(map_value).collect(),
             one: map_value(source.one),
-            ports,
+            columns,
             interactions,
             source_rows: Vec::with_capacity(source.rows.len()),
             auxiliaries: Vec::with_capacity(assertions),
@@ -146,9 +140,7 @@ impl LoweredCircuit {
         };
         lowered.validate();
         lowered.layout.validate_relation(&lowered.relation())?;
-        if require_identity && !lowered.c_is_identity() {
-            return Err(LayoutError::IdentityCRequired);
-        }
+        assert!(!require_identity || lowered.c_is_identity());
         Ok(lowered)
     }
 

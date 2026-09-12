@@ -1,197 +1,95 @@
 use super::*;
+use support::Fields;
 
 #[test]
-fn named_ports_and_layout_stay_out_of_the_arithmetic_definition() {
-    // This is the intended authoring style: named typed boundaries and
-    // direct bit/expression operands, with no logical or physical IDs.
-    let mut builder = CircuitBuilder::new();
-    let a = builder.input_bits::<2>("a");
-    let b = builder.input_bits::<2>("b");
-    let sum_0_expr = builder.xor2(a[0], b[0]);
-    let sum_1_expr = builder.xor2(a[1], b[1]);
-    let sum = [
-        builder.materialize(sum_0_expr),
-        builder.materialize(sum_1_expr),
-    ];
-    builder.output("sum", sum);
-    let circuit = builder.finish();
-
-    assert_eq!(circuit.port("a").unwrap().direction(), PortDirection::Input);
-    assert_eq!(
-        circuit.port("sum").unwrap().direction(),
-        PortDirection::Output
+fn automatic_layout_groups_interleaved_words_and_preserves_identity_c() {
+    let compiled = CircuitBuilder::compile(
+        Fields(vec![
+            ("input", ColumnRole::Input, 2, 4),
+            ("output", ColumnRole::Output, 2, 8),
+            ("intermediate", ColumnRole::Witness, 2, 1),
+        ]),
+        |b, cols| {
+            // Output bits are declared forwards, but defined backwards with work between them.
+            b.define_linear(cols[1][1], cols[0][1]);
+            b.define_and(cols[2][1], cols[0][0], cols[0][1]);
+            b.define_linear(cols[1][0], cols[2][1]);
+            b.define_linear(cols[2][0], cols[2][1]);
+        },
     );
-
-    // Compatibility placement is a separate concern. Reserving the first
-    // four positions and moving ports does not change the circuit code.
-    let mut layout = circuit.layout();
-    layout.reserve(0..4).unwrap();
-    layout.place_port("a", 8).unwrap();
-    layout.place_port("sum", 12).unwrap();
-    let layout = layout.finish().unwrap();
-    assert_eq!(layout.value_position(a[0].value_id()), Some(8));
-    assert_eq!(layout.value_position(a[1].value_id()), Some(9));
-    assert_eq!(layout.value_position(sum[0].value_id()), Some(12));
-    assert_eq!(layout.value_position(sum[1].value_id()), Some(13));
-    assert_eq!(layout.useful_bits(), 14);
-
-    let r1cs = circuit.to_block_r1cs_with_layout(4, 0, 0, &layout).unwrap();
-    let witness = circuit
-        .evaluate_r1cs_with_layout(&[true, false, false, true], 4, &layout)
-        .unwrap();
-    assert!(r1cs.c0_is_identity());
-    assert!(r1cs.satisfies(&witness));
-    assert!(witness[12]);
-    assert!(witness[13]);
-    assert_eq!(r1cs.const_pin, layout.value_position(circuit.one()));
-    assert_eq!(r1cs.c_0.rows[14], vec![14]);
-    assert_eq!(r1cs.c_0.rows[15], vec![15]);
-}
-
-#[test]
-fn word_ports_enforce_contiguous_aligned_layout() {
-    let mut builder = CircuitBuilder::new();
-    let word = builder.input_word_aligned::<8>("word", 8);
-    let bits = builder.input_bits::<8>("bits");
-    let circuit = builder.finish();
-
-    assert_eq!(
-        circuit.port("word").unwrap().encoding(),
-        PortEncoding::LittleEndianWord { alignment_bits: 8 }
-    );
-    assert_eq!(circuit.port("bits").unwrap().encoding(), PortEncoding::Bits);
-    assert!(matches!(
-        circuit.to_block_r1cs(5, 0, 0),
-        Err(R1csBuildError::InvalidLayout(
-            LayoutError::MisalignedPort {
-                ref name,
-                start: 1,
-                alignment_bits: 8,
-            }
-        )) if name == "word"
-    ));
-    assert!(matches!(
-        circuit.walk_plan(),
-        Err(LayoutError::MisalignedPort {
-            ref name,
-            start: 1,
-            alignment_bits: 8,
-        }) if name == "word"
-    ));
-
-    let mut layout = circuit.layout();
-    assert!(matches!(
-        layout.place_port("word", 4),
-        Err(LayoutError::MisalignedPort {
-            ref name,
-            start: 4,
-            alignment_bits: 8,
-        }) if name == "word"
-    ));
-    layout.place_port("word", 8).unwrap();
-    layout.place_port("bits", 24).unwrap();
-    let layout = layout.finish().unwrap();
-    for (offset, bit) in word.iter().enumerate() {
-        assert_eq!(layout.value_position(bit.value_id()), Some(8 + offset));
+    let cols = compiled.columns();
+    let circuit = compiled.circuit();
+    let layout = circuit.layout().unwrap();
+    assert_eq!(layout, circuit.layout().unwrap());
+    assert_eq!(layout.value_position(circuit.one()), Some(0));
+    assert_eq!(layout.value_position(cols[0][0]), Some(4));
+    assert_eq!(layout.value_position(cols[0][1]), Some(5));
+    assert_eq!(layout.value_position(cols[1][0]), Some(8));
+    assert_eq!(layout.value_position(cols[1][1]), Some(9));
+    // Internal witness fields follow evaluation order, not field bit order.
+    assert_eq!(layout.value_position(cols[2][1]), Some(10));
+    assert_eq!(layout.value_position(cols[2][0]), Some(11));
+    assert_eq!(layout.useful_bits(), 12);
+    let matrix = circuit.to_block_r1cs(4, 0, 0).unwrap();
+    let plan = circuit.walk_plan().unwrap();
+    assert!(matrix.c0_is_identity());
+    for input in [[false, false], [false, true], [true, false], [true, true]] {
+        let walked = plan.forward(&input, 4).unwrap();
+        assert_eq!(walked.z, circuit.evaluate_r1cs(&input, 4).unwrap());
+        assert_eq!(walked.a_z, matrix.apply_a(&walked.z));
+        assert_eq!(walked.b_z, matrix.apply_b(&walked.z));
+        assert_eq!(walked.c_z, matrix.apply_c(&walked.z));
+        assert!(matrix.satisfies(&walked.z));
+        assert_eq!(walked.z[8], input[0] & input[1]);
+        assert_eq!(walked.z[9], input[1]);
+        for gap in [1, 2, 3, 6, 7, 12, 15] {
+            let mut invalid = walked.z.clone();
+            invalid[gap] = true;
+            assert!(!matrix.satisfies(&invalid));
+        }
     }
-    assert_eq!(layout.value_position(bits[0].value_id()), Some(24));
-
-    let mut scattered = circuit.layout();
-    for (offset, bit) in word.iter().enumerate() {
-        scattered
-            .place_definition(bit.value_id(), 8 + 2 * offset)
-            .unwrap();
-    }
-    assert!(matches!(
-        scattered.finish(),
-        Err(LayoutError::NonContiguousPort {
-            ref name,
-            offset: 1,
-            expected: 9,
-            actual: 10,
-        }) if name == "word"
-    ));
-}
-
-#[test]
-fn layout_rejects_overlaps_and_cross_circuit_reuse() {
-    let mut first = CircuitBuilder::new();
-    let bits = first.input_bits::<2>("bits");
-    let first = first.finish();
-    let mut layout = first.layout();
-    layout.place_definition(bits[0].value_id(), 7).unwrap();
-    assert!(matches!(
-        layout.place_definition(bits[1].value_id(), 7),
-        Err(LayoutError::PositionOccupied {
-            kind: PositionKind::Column,
-            position: 7,
-            ..
-        })
-    ));
-
-    let first_layout = layout.finish().unwrap();
-    let mut second_builder = CircuitBuilder::new();
-    let second_bit = second_builder.input();
-    let second = second_builder.finish();
-    let mut second_layout = second.layout();
-    assert!(matches!(
-        second_layout.place_value(bits[0].value_id(), 0),
-        Err(LayoutError::WrongCircuit)
-    ));
-    let foreign_row = first.definition_row(bits[0].value_id()).unwrap();
-    assert!(matches!(
-        second_layout.place_row(foreign_row, 0),
-        Err(LayoutError::WrongCircuit)
-    ));
+    let weights: Vec<_> = (0..16).map(|i| crate::field::F128::new(i, i + 1)).collect();
+    use crate::lincheck::LincheckCircuit;
+    let alpha = crate::field::F128::new(13, 7);
     assert_eq!(
-        PhysicalLayout::source_order(&second).value_position(bits[0].value_id()),
-        None
+        plan.lincheck_circuit(4)
+            .unwrap()
+            .fold_alpha_batched(alpha, &weights),
+        matrix
+            .sparse_lincheck_circuit()
+            .fold_alpha_batched(alpha, &weights)
     );
-    assert_eq!(second.expression(bits[0].expr().id()), None);
-    second_layout
-        .place_definition(second_bit.value_id(), 0)
-        .unwrap();
+
+    let other = support::circuit(0, 0, |_, _| {});
     assert!(matches!(
-        second.to_block_r1cs_with_layout(3, 0, 0, &first_layout),
+        other.to_block_r1cs_with_layout(4, 0, 0, &layout),
         Err(R1csBuildError::InvalidLayout(LayoutError::WrongCircuit))
     ));
 }
 
 #[test]
-fn sha_sized_layouts_are_deterministic() {
-    const N: usize = 25_500;
-    fn build() -> (BooleanCircuit, Vec<Bit>) {
-        let mut builder = CircuitBuilder::new();
-        let bits = (0..N).map(|_| builder.input()).collect();
-        (builder.finish(), bits)
-    }
-
-    let (first, first_bits) = build();
-    let automatic = first.layout().finish().unwrap();
-    assert_eq!(automatic.useful_bits(), N + 1);
-    let mut first_layout = first.layout();
-    for (i, bit) in first_bits.into_iter().enumerate() {
-        first_layout
-            .place_definition(bit.value_id(), N - 1 - i)
-            .unwrap();
-    }
-    let first_layout = first_layout.finish().unwrap();
-
-    let (second, second_bits) = build();
-    let mut second_layout = second.layout();
-    for (i, bit) in second_bits.into_iter().enumerate() {
-        second_layout
-            .place_definition(bit.value_id(), N - 1 - i)
-            .unwrap();
-    }
-    let second_layout = second_layout.finish().unwrap();
-    assert_eq!(first_layout, second_layout);
-    assert_eq!(first_layout.useful_bits(), N + 1);
+fn unaligned_fields_keep_evaluation_order_and_alignment_overflow_is_reported() {
+    let circuit = support::circuit(2, 1, |b, cols| {
+        b.define_and(cols.witness[0], cols.input[0], cols.input[1]);
+    });
+    assert_eq!(circuit.layout().unwrap().value_positions(), &[0, 1, 2, 3]);
+    let huge = 1usize << (usize::BITS - 1);
+    let compiled = CircuitBuilder::compile(
+        Fields(vec![
+            ("a", ColumnRole::Input, 1, huge),
+            ("b", ColumnRole::Input, 1, huge),
+        ]),
+        |_, _| {},
+    );
+    assert_eq!(
+        compiled.circuit().layout(),
+        Err(LayoutError::PositionOverflow)
+    );
 }
 
 #[test]
 fn rejects_unrepresentable_total_dimension() {
-    let circuit = CircuitBuilder::new().finish();
+    let circuit = support::circuit(0, 0, |_, _| {});
     assert!(matches!(
         circuit.to_block_r1cs(0, 0, usize::BITS as usize),
         Err(R1csBuildError::DimensionOverflow)
@@ -202,11 +100,7 @@ fn rejects_unrepresentable_total_dimension() {
 fn capacity_boundaries_are_exact_across_backends() {
     use crate::field::F128;
 
-    let mut builder = CircuitBuilder::new();
-    for _ in 0..7 {
-        builder.input();
-    }
-    let circuit = builder.finish();
+    let circuit = support::circuit(7, 0, |_, _| {});
     let inputs = [false; 7];
     let plan = circuit.walk_plan().unwrap();
 

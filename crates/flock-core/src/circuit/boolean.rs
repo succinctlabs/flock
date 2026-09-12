@@ -10,18 +10,12 @@
 //! define reserved columns. Additional backend variables, when needed, belong to
 //! [lowering](BooleanCircuit::lower), not the authored column schema.
 //!
-//! Allocating construction is also supported: start with [`CircuitBuilder::new`],
-//! allocate inputs with [`CircuitBuilder::input`], then use [`CircuitBuilder::and`]
-//! or [`CircuitBuilder::materialize`] to allocate outputs and their defining rows.
-//! Schema and allocating construction cannot be mixed in one builder.
-//!
 //! The IR keeps both the structural XOR DAG and normalized linear supports.
 //! The DAG drives circuit walking; the supports drive sparse R1CS emission.
 //! General `A z * B z = C z` constraints are retained; identity C is optional.
 //! Logical identifiers are separate from physical matrix positions. Source
 //! order is the default; compatibility layouts may permute it.
 
-mod acceptance_checker;
 mod builder;
 mod interface;
 mod layout;
@@ -29,16 +23,13 @@ mod lowering;
 mod schema;
 mod walk;
 
-pub use acceptance_checker::{IdentityChecker, LoweringAux, LoweringPurpose};
 pub use builder::CircuitBuilder;
 pub use interface::{
-    Component, Interaction, InteractionDirection, InteractionEncoding, InteractionField,
-    InteractionScope, PortOrigin, Selector,
+    Interaction, InteractionDirection, InteractionEncoding, InteractionField, InteractionScope,
+    Selector,
 };
-pub use layout::{LayoutBuilder, LayoutError, PhysicalLayout, PositionKind};
-pub use lowering::{
-    AssertionAux, EvaluationError, LoweredCircuit, LoweringMode, R1csBuildError, RowPlacement,
-};
+pub use layout::{LayoutError, PhysicalLayout};
+pub use lowering::{AssertionAux, EvaluationError, LoweredCircuit, LoweringMode, R1csBuildError};
 pub use schema::{
     ColumnRole, ColumnSchema, ColumnVisitor, CompiledColumns, OperationWord, SchemaColumn,
     SchemaOperation, Var,
@@ -46,7 +37,7 @@ pub use schema::{
 pub use walk::{ForwardTrace, WalkError, WalkLincheckCircuit, WalkPlan, WalkStats};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct CircuitId(u64);
+pub(crate) struct CircuitId(u64);
 
 /// Compact circuit-local index used in normalized support storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -162,59 +153,6 @@ impl From<&LinearExpr> for LinearExpr {
     }
 }
 
-/// The statement-facing role of a named materialized port.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PortDirection {
-    Input,
-    Output,
-    Fixed,
-}
-
-/// The statement-facing encoding of a named port.
-///
-/// Words always use little-endian bit order: `values()[0]` is the least
-/// significant bit. Their physical values form one contiguous region whose
-/// start is aligned to `alignment_bits`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PortEncoding {
-    /// An ordered collection of bits with no numeric interpretation.
-    Bits,
-    /// A little-endian word with an explicit physical alignment requirement.
-    LittleEndianWord { alignment_bits: usize },
-}
-
-/// A named ordered group of materialized bits.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Port {
-    name: String,
-    direction: PortDirection,
-    encoding: PortEncoding,
-    origin: PortOrigin,
-    values: Vec<ValueId>,
-}
-
-impl Port {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub const fn direction(&self) -> PortDirection {
-        self.direction
-    }
-
-    pub const fn encoding(&self) -> PortEncoding {
-        self.encoding
-    }
-
-    pub fn origin(&self) -> &PortOrigin {
-        &self.origin
-    }
-
-    pub fn values(&self) -> &[ValueId] {
-        &self.values
-    }
-}
-
 /// One node in the authored structural expression DAG.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExpressionNode {
@@ -284,7 +222,7 @@ impl Row {
 }
 
 #[derive(Clone, Debug)]
-struct Expression {
+pub(crate) struct Expression {
     node: ExpressionNode,
     /// Sorted, duplicate-free materialized values with odd coefficient.
     support: Vec<ValueIndex>,
@@ -299,8 +237,7 @@ pub struct BooleanCircuit {
     definition_rows: Vec<RowId>,
     value_count: usize,
     input_values: Vec<ValueId>,
-    ports: Vec<Port>,
-    components: Vec<Component>,
+    columns: Vec<SchemaColumn>,
     interactions: Vec<Interaction>,
     one: ValueId,
 }

@@ -313,16 +313,16 @@ pub fn io_schema() -> Vec<IoWord> {
 // Within-G bit offsets (relative to `G_BASE[g]`). The two fused ADDs carry
 // a 31-bit majority group and a 30-bit ripple group each; ADD_C1's width
 // varies per G (`g_c1_rows`), shifting the second half.
-pub(super) const OFF_MAJ1: usize = 0;
-pub(super) const OFF_RIP1: usize = CARRY_BITS_PER_ADD; // 31
-pub(super) const OFF_C1: usize = FADD_BITS; // 61
-pub(super) const fn off_maj2(g: usize) -> usize {
+const OFF_MAJ1: usize = 0;
+const OFF_RIP1: usize = CARRY_BITS_PER_ADD; // 31
+const OFF_C1: usize = FADD_BITS; // 61
+const fn off_maj2(g: usize) -> usize {
     OFF_C1 + g_c1_rows(g)
 }
-pub(super) const fn off_rip2(g: usize) -> usize {
+const fn off_rip2(g: usize) -> usize {
     off_maj2(g) + CARRY_BITS_PER_ADD
 }
-pub(super) const fn off_c2(g: usize) -> usize {
+const fn off_c2(g: usize) -> usize {
     off_rip2(g) + RIPPLE_BITS_PER_FADD
 }
 // Generic-G (g ≥ 4, c1 = 31) offsets, const for the packed writer's
@@ -342,7 +342,7 @@ fn m_bit(i: usize, b: usize) -> usize {
     M_BASE + WORD_BITS * i + b
 }
 #[inline]
-pub(super) fn g_bit(g: usize, off: usize) -> usize {
+fn g_bit(g: usize, off: usize) -> usize {
     debug_assert!(g < N_G && off < g_block_bits(g));
     G_BASE[g] + off
 }

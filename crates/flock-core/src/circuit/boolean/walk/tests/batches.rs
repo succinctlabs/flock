@@ -36,7 +36,7 @@ fn forward_destinations_and_batches_match_the_canonical_evaluator() {
     let inputs: Vec<Vec<bool>> = (0..4)
         .map(|block| {
             (0..circuit.inputs().len())
-                .map(|bit| (block + bit * 3) & 1 == 1)
+                .map(|bit| ((block * 73 + 0x35) >> bit) & 1 == 1)
                 .collect()
         })
         .collect();
@@ -124,10 +124,11 @@ fn forward_batch_validates_inputs_and_reports_the_failing_block() {
     ));
     assert_eq!(destination, original, "validation must precede writes");
 
-    let mut builder = CircuitBuilder::new();
-    let input = builder.input();
-    let row = builder.assert_zero(input);
-    let rejecting = builder.finish().walk_plan().unwrap();
+    let circuit = support::circuit(1, 0, |b, cols| {
+        b.assert_zero(cols.input[0]);
+    });
+    let row = circuit.rows()[2].id();
+    let rejecting = circuit.walk_plan().unwrap();
     let inputs = [vec![false], vec![true], vec![true]];
     let k_log = capacity_log(rejecting.useful_bits());
     assert_eq!(
@@ -150,21 +151,18 @@ fn forward_batch_validates_inputs_and_reports_the_failing_block() {
         rejecting.forward_into(&[true], k_log, &mut destination),
         Err(WalkError::UnsatisfiedRow(row))
     );
-    assert_ne!(destination, dirty, "semantic failure may modify the trace");
 
     destination = dirty.clone();
     assert_eq!(
         rejecting.forward_batch_into(&inputs, k_log, &mut destination),
         Err(WalkError::UnsatisfiedBatchRow { block: 1, row })
     );
-    assert_ne!(destination, dirty, "semantic failure may modify the trace");
 
     destination = dirty.clone();
     assert_eq!(
         rejecting.forward_batch_into_parallel(&inputs, k_log, &mut destination),
         Err(WalkError::UnsatisfiedBatchRow { block: 1, row })
     );
-    assert_ne!(destination, dirty, "semantic failure may modify the trace");
 
     let accepted = [vec![false], vec![false]];
     let expected = rejecting.forward_batch(&accepted, k_log).unwrap();

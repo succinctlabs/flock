@@ -11,14 +11,13 @@ use super::{ProjectionCache, sha2};
 
 mod columns;
 mod eval;
-mod layout;
 pub use columns::{Sha256Cols, Sha256Schema};
 
-const H_PORT: &str = "h_in";
-const MESSAGE_PORT: &str = "message";
-const H_OUT_PORT: &str = "h_out";
+const H_FIELD: &str = "h_in";
+const MESSAGE_FIELD: &str = "message";
+const H_OUT_FIELD: &str = "h_out";
 
-/// One reusable SHA-256 DSL artifact and its legacy-compatible placement.
+/// One reusable SHA-256 DSL artifact and its automatic aligned placement.
 #[derive(Debug)]
 pub struct Sha256DslCircuit {
     compiled: CompiledColumns<Sha256Schema>,
@@ -38,8 +37,7 @@ impl Sha256DslCircuit {
         &self.layout
     }
 
-    /// Lower the DSL artifact to the same block-diagonal shape as the legacy
-    /// SHA-256 relation.
+    /// Lower the DSL artifact to the block-diagonal shape used by the prover.
     pub fn to_block_r1cs(&self, n_blocks_log: usize) -> BlockR1cs {
         assert!(
             n_blocks_log >= 3,
@@ -47,10 +45,10 @@ impl Sha256DslCircuit {
         );
         self.circuit()
             .to_block_r1cs_with_layout(sha2::K_LOG, sha2::K_SKIP, n_blocks_log, &self.layout)
-            .expect("the fixed SHA-256 compatibility layout must be valid")
+            .expect("the fixed SHA-256 aligned layout must be valid")
     }
 
-    /// Reference evaluation of one compression, returned in legacy physical
+    /// Reference evaluation of one compression, returned in physical
     /// witness order and padded to `K` bits.
     pub fn evaluate_block(&self, h_in: &[u32; 8], message: &[u32; 16]) -> Vec<bool> {
         let (_, logical) = self.generate_trace(h_in, message);
@@ -71,12 +69,11 @@ impl Sha256DslCircuit {
             .expect("SHA-256 has no rejecting general constraints")
     }
 
-    /// Compile the structural forward/reverse execution plan at the legacy
-    /// physical layout.
+    /// Compile the structural forward/reverse execution plan with aligned input/output words.
     pub fn walk_plan(&self) -> WalkPlan {
         self.circuit()
             .walk_plan_with_layout(&self.layout)
-            .expect("the fixed SHA-256 compatibility layout must be valid")
+            .expect("the fixed SHA-256 aligned layout must be valid")
     }
 }
 
@@ -108,9 +105,10 @@ pub fn sha256_relation_projection(n_blocks_log: usize) -> Arc<BlockR1cs> {
 
 fn build_sha256_circuit() -> Sha256DslCircuit {
     let compiled = CircuitBuilder::compile(Sha256Schema, eval::eval);
-    assert_eq!(compiled.circuit().value_count(), sha2::USEFUL_BITS);
-    assert_eq!(compiled.circuit().row_count(), sha2::USEFUL_BITS);
-    let layout = layout::layout(compiled.circuit(), &compiled.columns());
+    let layout = compiled
+        .circuit()
+        .layout()
+        .expect("valid aligned hash layout");
     Sha256DslCircuit { compiled, layout }
 }
 

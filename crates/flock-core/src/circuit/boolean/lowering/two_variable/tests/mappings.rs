@@ -64,12 +64,10 @@ fn eval(b: &mut CircuitBuilder, cols: &Cols<Var>) {
 }
 
 #[test]
-fn maps_nested_operations_ports_advice_and_interactions_without_changing_the_schema() {
+fn maps_nested_operations_columns_advice_and_interactions_without_changing_the_schema() {
     let compiled = CircuitBuilder::compile(Schema, eval);
     let source = compiled.circuit();
-    let lowered = source
-        .lower_identity_c(&source.layout().finish().unwrap())
-        .unwrap();
+    let lowered = source.lower_identity_c().unwrap();
     assert_eq!(
         lowered.inputs(),
         source
@@ -78,14 +76,13 @@ fn maps_nested_operations_ports_advice_and_interactions_without_changing_the_sch
             .map(|&id| lowered.mapped_value(id).unwrap())
             .collect::<Vec<_>>()
     );
-    for (old, new) in source.ports().iter().zip(lowered.ports()) {
-        assert_eq!(old.name(), new.name());
-        assert_eq!(old.direction(), new.direction());
-        assert_eq!(old.encoding(), new.encoding());
-        assert_eq!(old.origin(), new.origin());
+    for (old, new) in source.schema().iter().zip(lowered.schema()) {
+        assert_eq!(old.name, new.name);
+        assert_eq!(old.role, new.role);
+        assert_eq!(old.alignment_bits, new.alignment_bits);
         assert_eq!(
-            new.values(),
-            old.values()
+            new.values,
+            old.values
                 .iter()
                 .map(|&id| lowered.mapped_value(id).unwrap())
                 .collect::<Vec<_>>()
@@ -123,7 +120,6 @@ fn maps_nested_operations_ports_advice_and_interactions_without_changing_the_sch
     assert_eq!(old.kind(), new.kind());
     assert_eq!(old.direction(), new.direction());
     assert_eq!(old.scope(), new.scope());
-    assert_eq!(old.component(), new.component());
     assert_eq!(
         new.selector(),
         lowered.mapped_value(old.selector()).unwrap()
@@ -183,41 +179,4 @@ fn maps_nested_operations_ports_advice_and_interactions_without_changing_the_sch
     assert!(lowered.mapped_rows(lowered.rows()[0].id()).is_none());
     assert!(lowered.source_row(source.rows()[0].id()).is_none());
     assert!(lowered.layout().value_position(source.one()).is_none());
-}
-
-#[test]
-fn component_ranges_remain_source_metadata_with_explicit_row_mapping() {
-    let mut b = CircuitBuilder::new();
-    let [input] = b.advice_bits("input", "bit");
-    b.component("parent", |b| {
-        b.component("child", |b| {
-            b.assert_zero(input);
-            let output = b.materialize(input);
-            b.interaction(
-                "test",
-                "bit",
-                InteractionDirection::Send,
-                [InteractionField::bits("value", [output])],
-                [b.one()],
-                b.selector(input),
-                InteractionScope::new("Child", 0),
-            );
-        });
-    });
-    let source = b.finish();
-    let lowered = source
-        .lower_identity_c(&source.layout().finish().unwrap())
-        .unwrap();
-    assert_eq!(lowered.interactions()[0].component(), Some(1));
-    for component in source.components() {
-        let mapped: Vec<_> = source.rows()[component.rows()]
-            .iter()
-            .flat_map(|row| lowered.mapped_rows(row.id()).unwrap())
-            .collect();
-        assert_eq!(mapped.len(), component.rows().len() + 1);
-        assert_eq!(
-            lowered.source_row(mapped[0]),
-            Some(source.rows()[component.rows().start].id())
-        );
-    }
 }

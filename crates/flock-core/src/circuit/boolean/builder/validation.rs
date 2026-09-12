@@ -154,7 +154,7 @@ impl CircuitBuilder {
                 }
             }
         }
-        self.validate_interface();
+        self.validate_interactions();
         definition_rows
     }
 }

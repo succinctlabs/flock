@@ -1,15 +1,12 @@
 use super::*;
-use crate::circuit::boolean::CircuitBuilder;
+use crate::circuit::boolean::tests::support;
 
 #[test]
 fn execution_initializes_cancellation_boundaries_even_in_dirty_storage() {
-    let mut b = CircuitBuilder::new();
-    let [input] = b.input_bits("input");
-    b.assert_zero(input);
-    let source = b.finish();
-    let lowered = source
-        .lower_identity_c(&source.layout().finish().unwrap())
-        .unwrap();
+    let source = support::circuit(1, 0, |b, cols| {
+        b.assert_zero(cols.input[0]);
+    });
+    let lowered = source.lower_identity_c().unwrap();
     let plan = lowered.walk_plan().unwrap();
     let expected = plan.forward(&[false], 3).unwrap();
     let mut dirty = ForwardTrace {

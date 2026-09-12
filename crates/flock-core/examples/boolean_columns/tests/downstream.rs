@@ -53,31 +53,6 @@ pub(super) fn inspected_matrices(
     matrices
 }
 
-fn layouts(compiled: &CompiledColumns<DoubleAdd>) -> [PhysicalLayout; 2] {
-    let circuit = compiled.circuit();
-    let mut permuted = circuit.layout();
-    // Reverse field groups, retain each word's bit order, and leave interior holes.
-    let mut position = 3;
-    for field in compiled.schema().iter().rev() {
-        for &value in &field.values {
-            permuted.place_value(value, position).unwrap();
-            position += 1;
-        }
-        position += 1;
-    }
-    permuted.place_value(circuit.one(), position).unwrap();
-    // Row order is independent of column placement.
-    for row in circuit.rows() {
-        permuted
-            .place_row(row.id(), circuit.row_count() - 1 - row.id().index())
-            .unwrap();
-    }
-    [
-        PhysicalLayout::source_order(circuit),
-        permuted.finish().unwrap(),
-    ]
-}
-
 fn weights(capacity: usize, seed: u64) -> Vec<F128> {
     (0..capacity)
         .map(|i| F128::new(seed + i as u64, seed.rotate_left(i as u32)))
@@ -95,18 +70,17 @@ fn dot(bits: &[bool], weights: &[F128]) -> F128 {
 #[test]
 fn public_inspection_reconstructs_the_complete_sparse_relation() {
     let compiled = CircuitBuilder::compile(DoubleAdd, DoubleAdd::eval);
-    for layout in layouts(&compiled) {
-        let circuit = compiled.circuit();
-        let capacity = layout.useful_bits().next_power_of_two();
-        let r1cs = circuit
-            .to_block_r1cs_with_layout(capacity.trailing_zeros() as usize, 0, 0, &layout)
-            .unwrap();
-        let [a, b, c] = inspected_matrices(circuit, &layout, capacity);
-        assert_eq!(a, r1cs.a_0.rows);
-        assert_eq!(b, r1cs.b_0.rows);
-        assert_eq!(c, r1cs.c_0.rows);
-        assert_eq!(r1cs.const_pin, layout.value_position(circuit.one()));
-    }
+    let layout = compiled.circuit().layout().unwrap();
+    let circuit = compiled.circuit();
+    let capacity = layout.useful_bits().next_power_of_two();
+    let r1cs = circuit
+        .to_block_r1cs_with_layout(capacity.trailing_zeros() as usize, 0, 0, &layout)
+        .unwrap();
+    let [a, b, c] = inspected_matrices(circuit, &layout, capacity);
+    assert_eq!(a, r1cs.a_0.rows);
+    assert_eq!(b, r1cs.b_0.rows);
+    assert_eq!(c, r1cs.c_0.rows);
+    assert_eq!(r1cs.const_pin, layout.value_position(circuit.one()));
 }
 
 #[test]
@@ -123,64 +97,62 @@ fn schema_witnesses_match_sparse_and_forward_consumers() {
         .collect();
     let trace = generate_trace(&compiled, &events).unwrap();
     let circuit = compiled.circuit();
-    for layout in layouts(&compiled) {
-        let plan = circuit.walk_plan_with_layout(&layout).unwrap();
-        let k_log = layout.useful_bits().next_power_of_two().trailing_zeros() as usize;
-        let r1cs = circuit
-            .to_block_r1cs_with_layout(k_log, 0, 0, &layout)
-            .unwrap();
-        for (_, logical) in &trace {
-            let inputs: Vec<_> = circuit
-                .inputs()
-                .iter()
-                .map(|v| logical[v.index()])
-                .collect();
-            let forward = plan.forward(&inputs, k_log).unwrap();
-            assert_eq!(
-                forward.z,
-                circuit
-                    .evaluate_r1cs_with_layout(&inputs, k_log, &layout)
-                    .unwrap()
-            );
-            for field in compiled.schema() {
-                for &value in &field.values {
-                    assert_eq!(
-                        forward.z[layout.value_position(value).unwrap()],
-                        logical[value.index()]
-                    );
-                }
-            }
-            assert_eq!(forward.a_z, r1cs.apply_a(&forward.z));
-            assert_eq!(forward.b_z, r1cs.apply_b(&forward.z));
-            assert_eq!(forward.c_z, r1cs.apply_c(&forward.z));
-            assert!(r1cs.satisfies(&forward.z));
-        }
-        let mut bad = trace[1].1.clone();
-        bad[compiled.columns().claimed_sum[0].index()] ^= true;
-        let inputs: Vec<_> = circuit.inputs().iter().map(|v| bad[v.index()]).collect();
-        let EvaluationError::UnsatisfiedRow(row) = circuit.evaluate(&inputs).unwrap_err() else {
-            panic!("expected a failed advice check")
-        };
+    let layout = compiled.circuit().layout().unwrap();
+    let plan = circuit.walk_plan_with_layout(&layout).unwrap();
+    let k_log = layout.useful_bits().next_power_of_two().trailing_zeros() as usize;
+    let r1cs = circuit
+        .to_block_r1cs_with_layout(k_log, 0, 0, &layout)
+        .unwrap();
+    for (_, logical) in &trace {
+        let inputs: Vec<_> = circuit
+            .inputs()
+            .iter()
+            .map(|v| logical[v.index()])
+            .collect();
+        let forward = plan.forward(&inputs, k_log).unwrap();
         assert_eq!(
-            plan.forward(&inputs, k_log),
-            Err(WalkError::UnsatisfiedRow(row))
+            forward.z,
+            circuit
+                .evaluate_r1cs_with_layout(&inputs, k_log, &layout)
+                .unwrap()
         );
+        for field in compiled.schema() {
+            for &value in &field.values {
+                assert_eq!(
+                    forward.z[layout.value_position(value).unwrap()],
+                    logical[value.index()]
+                );
+            }
+        }
+        assert_eq!(forward.a_z, r1cs.apply_a(&forward.z));
+        assert_eq!(forward.b_z, r1cs.apply_b(&forward.z));
+        assert_eq!(forward.c_z, r1cs.apply_c(&forward.z));
+        assert!(r1cs.satisfies(&forward.z));
     }
+    let mut bad = trace[1].1.clone();
+    bad[compiled.columns().claimed_sum[0].index()] ^= true;
+    let inputs: Vec<_> = circuit.inputs().iter().map(|v| bad[v.index()]).collect();
+    let EvaluationError::UnsatisfiedRow(row) = circuit.evaluate(&inputs).unwrap_err() else {
+        panic!("expected a failed advice check")
+    };
+    assert_eq!(
+        plan.forward(&inputs, k_log),
+        Err(WalkError::UnsatisfiedRow(row))
+    );
 }
 
 #[test]
 fn reverse_walk_matches_all_matrix_columns_and_lincheck() {
     let compiled = CircuitBuilder::compile(DoubleAdd, DoubleAdd::eval);
-    for layout in layouts(&compiled) {
-        assert!(
-            !compiled
-                .circuit()
-                .walk_plan_with_layout(&layout)
-                .unwrap()
-                .c_is_identity()
-        );
-        check_reverse(compiled.circuit(), &layout);
-    }
+    let layout = compiled.circuit().layout().unwrap();
+    assert!(
+        !compiled
+            .circuit()
+            .walk_plan_with_layout(&layout)
+            .unwrap()
+            .c_is_identity()
+    );
+    check_reverse(compiled.circuit(), &layout);
 }
 
 pub(super) fn check_reverse(circuit: &BooleanCircuit, layout: &PhysicalLayout) {
@@ -245,8 +217,8 @@ fn schema_and_operation_inspection_are_complete_and_stable() {
     for (a, b) in first.operations().iter().zip(second.operations()) {
         assert_eq!(a.inputs.len(), b.inputs.len());
         assert_eq!(
-            (&a.name, &a.kind, &a.rows, &a.expressions, &a.interactions),
-            (&b.name, &b.kind, &b.rows, &b.expressions, &b.interactions)
+            (&a.kind, &a.rows, &a.expressions, &a.interactions),
+            (&b.kind, &b.rows, &b.expressions, &b.interactions)
         );
         assert_eq!(indices(&a.columns), indices(&b.columns));
         let defined: Vec<_> = first.circuit().rows()[a.rows.clone()]

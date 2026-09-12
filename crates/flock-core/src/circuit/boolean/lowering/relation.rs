@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 
 use crate::circuit::boolean::{
-    BooleanCircuit, CircuitId, Expression, LinearExprId, PhysicalLayout, Port, Row, ValueId,
+    BooleanCircuit, CircuitId, Expression, LinearExprId, PhysicalLayout, Row, SchemaColumn, ValueId,
 };
 use crate::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 
@@ -14,37 +14,37 @@ use super::{R1csBuildError, checked_capacity};
 
 mod evaluate;
 
-pub(in crate::circuit::boolean) struct RelationRef<'a> {
+pub(crate) struct RelationRef<'a> {
     pub id: CircuitId,
     pub expressions: &'a [Expression],
     pub rows: &'a [Row],
     pub value_count: usize,
     pub input_values: &'a [ValueId],
-    pub ports: &'a [Port],
+    pub columns: &'a [SchemaColumn],
     pub one: ValueId,
 }
 
 impl BooleanCircuit {
-    pub(in crate::circuit::boolean) fn relation(&self) -> RelationRef<'_> {
+    pub(crate) fn relation(&self) -> RelationRef<'_> {
         RelationRef {
             id: self.id,
             expressions: &self.expressions,
             rows: &self.rows,
             value_count: self.value_count,
             input_values: &self.input_values,
-            ports: &self.ports,
+            columns: &self.columns,
             one: self.one,
         }
     }
 }
 
 impl RelationRef<'_> {
-    pub(in crate::circuit::boolean) fn normalized_support_terms(&self) -> usize {
+    pub(crate) fn normalized_support_terms(&self) -> usize {
         self.expressions.iter().map(|expr| expr.support.len()).sum()
     }
 
     /// The layout must already have passed uniqueness, shape, and bounds checks.
-    pub(in crate::circuit::boolean) fn c_is_identity(&self, layout: &PhysicalLayout) -> bool {
+    pub(crate) fn c_is_identity(&self, layout: &PhysicalLayout) -> bool {
         self.rows.len() == self.value_count
             && self.rows.iter().all(|row| {
                 let support = &self.expressions[row.result.index].support;
@@ -54,7 +54,7 @@ impl RelationRef<'_> {
             })
     }
 
-    pub(in crate::circuit::boolean) fn to_block_r1cs(
+    pub(crate) fn to_block_r1cs(
         &self,
         k_log: usize,
         k_skip: usize,

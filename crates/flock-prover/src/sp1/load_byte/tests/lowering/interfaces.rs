@@ -4,7 +4,7 @@ use super::*;
 fn converted_outputs_and_interactions_preserve_source_bindings() {
     let chip = LoadByteCircuit::build(2);
     let lowered = chip.lower(LoweringMode::RequireIdentityC).unwrap();
-    assert_eq!(chip.circuit().ports().len(), lowered.ports().len());
+    assert_eq!(chip.circuit().schema().len(), lowered.schema().len());
     assert_eq!(
         chip.circuit().interactions().len(),
         lowered.interactions().len()
@@ -18,13 +18,12 @@ fn converted_outputs_and_interactions_preserve_source_bindings() {
             assert_eq!(projected, trace.values);
             assert_eq!(chip.output(&projected, 0), event.result());
             assert_eq!(chip.output(&projected, 1), 0);
-            for (old, new) in chip.circuit().ports().iter().zip(lowered.ports()) {
-                assert_eq!(old.name(), new.name());
-                assert_eq!(old.direction(), new.direction());
-                assert_eq!(old.encoding(), new.encoding());
-                assert_eq!(old.origin(), new.origin());
-                assert_eq!(old.values().len(), new.values().len());
-                for (&old, &new) in old.values().iter().zip(new.values()) {
+            for (old, new) in chip.circuit().schema().iter().zip(lowered.schema()) {
+                assert_eq!(old.name, new.name);
+                assert_eq!(old.role, new.role);
+                assert_eq!(old.alignment_bits, new.alignment_bits);
+                assert_eq!(old.values.len(), new.values.len());
+                for (&old, &new) in old.values.iter().zip(&new.values) {
                     assert_eq!(lowered.mapped_value(old), Some(new));
                     assert_eq!(trace.values[old.index()], values[new.index()]);
                 }
@@ -39,7 +38,6 @@ fn converted_outputs_and_interactions_preserve_source_bindings() {
                 assert_eq!(old.kind(), new.kind());
                 assert_eq!(old.direction(), new.direction());
                 assert_eq!(old.scope(), new.scope());
-                assert_eq!(old.component(), new.component());
                 assert_eq!(lowered.mapped_value(old.selector()), Some(new.selector()));
                 assert_eq!(
                     old.effective_multiplicity_bits(&trace.values),

@@ -6,27 +6,8 @@ use crate::r1cs::SparseBinaryMatrix;
 mod batches;
 mod transpose;
 
-fn fixture(case: usize, permuted: bool, mode: LoweringMode) -> LoweredCircuit {
-    let source = super::equivalence::fixture(case);
-    let placement = if permuted {
-        let mut placement = source.layout();
-        for row in source.rows() {
-            if let Some(value) = row.defined_value() {
-                placement
-                    .place_value(value, 2 * (source.value_count() - 1 - value.index()) + 1)
-                    .unwrap();
-            }
-            placement
-                .place_row(row.id(), 3 * row.id().index() + 2)
-                .unwrap();
-        }
-        placement.finish().unwrap()
-    } else {
-        PhysicalLayout::source_order(&source)
-    };
-    source
-        .lower(mode, &placement, RowPlacement::AllowReordering)
-        .unwrap()
+fn fixture(case: usize, mode: LoweringMode) -> LoweredCircuit {
+    super::equivalence::fixture(case).lower(mode).unwrap()
 }
 
 fn reference(lowered: &LoweredCircuit, matrix: &BlockR1cs, input: &[bool]) -> ForwardTrace {
@@ -58,61 +39,57 @@ fn sparse_transpose(matrix: &SparseBinaryMatrix, weights: &[F128]) -> Vec<F128> 
 }
 
 #[test]
-fn selected_walks_match_reference_and_sparse_evaluation_in_both_layouts() {
+fn selected_walks_match_reference_and_sparse_evaluation() {
     for mode in [LoweringMode::Direct, LoweringMode::RequireIdentityC] {
         for case in 0..7 {
-            for permuted in [false, true] {
-                let lowered = fixture(case, permuted, mode);
-                // Compile before emitting matrices: walks need only the shared relation view.
-                let plan = lowered.walk_plan().unwrap();
-                let matrix = lowered.to_block_r1cs(7, 0, 0).unwrap();
-                assert_eq!(plan.c_is_identity(), matrix.c0_is_identity());
-                let mut reused = ForwardTrace {
-                    z: vec![true; 256],
-                    a_z: vec![true; 256],
-                    b_z: vec![true; 256],
-                    c_z: vec![true; 256],
-                };
-                for input in (0..8).map(|n| bits(n, 3)) {
-                    match lowered.evaluate(&input) {
-                        Ok(_) => {
-                            plan.forward_into(&input, 7, &mut reused).unwrap();
-                            assert_eq!(reused, reference(&lowered, &matrix, &input));
-                            if plan.c_is_identity() {
-                                assert_eq!(reused.c_z, reused.z);
-                            }
-                            for aux in lowered.auxiliaries() {
-                                assert!(
-                                    !reused.z[lowered
-                                        .layout()
-                                        .value_position(aux.cancellation)
-                                        .unwrap()]
-                                );
-                            }
+            let lowered = fixture(case, mode);
+            // Compile before emitting matrices: walks need only the shared relation view.
+            let plan = lowered.walk_plan().unwrap();
+            let matrix = lowered.to_block_r1cs(7, 0, 0).unwrap();
+            assert_eq!(plan.c_is_identity(), matrix.c0_is_identity());
+            let mut reused = ForwardTrace {
+                z: vec![true; 256],
+                a_z: vec![true; 256],
+                b_z: vec![true; 256],
+                c_z: vec![true; 256],
+            };
+            for input in (0..8).map(|n| bits(n, 3)) {
+                match lowered.evaluate(&input) {
+                    Ok(_) => {
+                        plan.forward_into(&input, 7, &mut reused).unwrap();
+                        assert_eq!(reused, reference(&lowered, &matrix, &input));
+                        if plan.c_is_identity() {
+                            assert_eq!(reused.c_z, reused.z);
                         }
-                        Err(EvaluationError::UnsatisfiedRow(source)) => {
-                            let Err(WalkError::UnsatisfiedRow(target)) =
-                                plan.forward_into(&input, 7, &mut reused)
-                            else {
-                                panic!("failed source assertion must reject in the walk");
-                            };
-                            assert_eq!(lowered.source_row(target), Some(source));
+                        for aux in lowered.auxiliaries() {
+                            assert!(
+                                !reused.z
+                                    [lowered.layout().value_position(aux.cancellation).unwrap()]
+                            );
                         }
-                        Err(other) => panic!("unexpected reference error: {other}"),
                     }
+                    Err(EvaluationError::UnsatisfiedRow(source)) => {
+                        let Err(WalkError::UnsatisfiedRow(target)) =
+                            plan.forward_into(&input, 7, &mut reused)
+                        else {
+                            panic!("failed source assertion must reject in the walk");
+                        };
+                        assert_eq!(lowered.source_row(target), Some(source));
+                    }
+                    Err(other) => panic!("unexpected reference error: {other}"),
                 }
-                let saved = reused.clone();
-                assert!(matches!(
-                    plan.forward_into(&[], 7, &mut reused),
-                    Err(WalkError::InputCount { .. })
-                ));
-                assert_eq!(reused, saved);
-                assert!(matches!(
-                    plan.forward_into(&[false; 3], 0, &mut reused),
-                    Err(WalkError::Capacity { .. })
-                ));
-                assert_eq!(reused, saved);
             }
+            let saved = reused.clone();
+            assert!(matches!(
+                plan.forward_into(&[], 7, &mut reused),
+                Err(WalkError::InputCount { .. })
+            ));
+            assert_eq!(reused, saved);
+            assert!(matches!(
+                plan.forward_into(&[false; 3], 0, &mut reused),
+                Err(WalkError::Capacity { .. })
+            ));
+            assert_eq!(reused, saved);
         }
     }
 }

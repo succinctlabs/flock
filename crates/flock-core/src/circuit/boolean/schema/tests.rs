@@ -2,7 +2,7 @@ use super::*;
 
 mod alignment;
 mod configuration;
-use crate::circuit::boolean::{ColumnVisitor, ExpressionNode, PhysicalLayout};
+use crate::circuit::boolean::{ColumnVisitor, ExpressionNode};
 
 struct TestSchema;
 struct TestCols<T> {
@@ -40,18 +40,11 @@ fn retained_handles_resolve_and_all_final_references_use_definition_order() {
     assert_eq!(resolved.late.index(), 2);
     assert_eq!(resolved.output.index(), 3);
     assert_eq!(compiled.resolve(cols.output), Some(resolved.output));
-    let layout = PhysicalLayout::source_order(compiled.circuit());
+    let layout = compiled.circuit().layout().unwrap();
     assert_eq!(layout.value_position(stale), None);
     assert_eq!(layout.value_position(resolved.output), Some(3));
-    assert!(
-        compiled
-            .circuit()
-            .layout()
-            .place_definition(stale, 7)
-            .is_err()
-    );
     assert_eq!(
-        compiled.circuit().port("output").unwrap().values(),
+        compiled.circuit().column("output").unwrap().values,
         &[resolved.output]
     );
     assert_eq!(
@@ -78,22 +71,18 @@ fn retained_handles_resolve_and_all_final_references_use_definition_order() {
 }
 
 #[test]
-fn canonical_schema_relation_matches_legacy_construction() {
+fn canonical_schema_relation_matches_expected_equations() {
     let compiled = CircuitBuilder::compile(TestSchema, define);
-    let mut b = CircuitBuilder::new();
-    let [input] = b.input_word::<1>("input");
-    let late = b.materialize(input);
-    let output = b.and(late, input);
-    b.output_word("output", [output]);
-    let legacy = b.finish();
-    let old = legacy.to_block_r1cs(2, 0, 0).unwrap();
     let new = compiled.circuit().to_block_r1cs(2, 0, 0).unwrap();
-    assert_eq!(old.statement_digest(), new.statement_digest());
-    assert_eq!(input.value_id().index(), 1);
-    assert_eq!(output.value_id().index(), 3);
+    // ONE, input, copied input, then copied input AND input.
+    assert_eq!(new.a_0.rows, vec![vec![0], vec![1], vec![1], vec![2]]);
+    assert_eq!(new.b_0.rows, vec![vec![0], vec![0], vec![0], vec![1]]);
+    assert_eq!(new.c_0.rows, vec![vec![0], vec![1], vec![2], vec![3]]);
+    assert_eq!(compiled.columns().input.index(), 1);
+    assert_eq!(compiled.columns().output.index(), 3);
     for input in [false, true] {
         let (_, values) = compiled.evaluate(|cols| *cols.input = input).unwrap();
-        assert_eq!(values, legacy.evaluate(&[input]).unwrap());
+        assert_eq!(values, vec![true, input, input, input]);
         let walked = compiled
             .circuit()
             .walk_plan()
@@ -148,41 +137,11 @@ fn foreign_handle_is_rejected() {
 }
 
 #[test]
-fn allocation_modes_cannot_mix_in_either_direction() {
-    for operation in 0..5 {
-        assert!(
-            std::panic::catch_unwind(|| {
-                let mut b = CircuitBuilder::new();
-                b.reserve_columns(&TestSchema);
-                match operation {
-                    0 => {
-                        b.input();
-                    }
-                    1 => {
-                        b.and(b.one(), b.one());
-                    }
-                    2 => {
-                        b.materialize(b.one());
-                    }
-                    3 => {
-                        b.fixed_word::<1>("constant", 1);
-                    }
-                    _ => {
-                        b.output("alias", [b.one()]);
-                    }
-                }
-            })
-            .is_err()
-        );
-    }
-    assert!(
-        std::panic::catch_unwind(|| {
-            let mut b = CircuitBuilder::new();
-            b.input();
-            b.reserve_columns(&TestSchema);
-        })
-        .is_err()
-    );
+#[should_panic(expected = "columns must be reserved on a fresh builder")]
+fn columns_cannot_be_reserved_twice() {
+    let mut b = CircuitBuilder::new();
+    b.reserve_columns(&TestSchema);
+    b.reserve_columns(&TestSchema);
 }
 
 #[test]

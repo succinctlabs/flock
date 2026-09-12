@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use crate::circuit::boolean::{
     BooleanCircuit, CircuitId, Expression, ExpressionNode, Interaction, LayoutError, LinearExprId,
-    PhysicalLayout, Port, Row, RowId, ValueId, ValueIndex, WalkPlan,
+    PhysicalLayout, Row, RowId, SchemaColumn, ValueId, ValueIndex, WalkPlan,
 };
 use crate::r1cs::BlockR1cs;
 
@@ -24,14 +24,6 @@ pub enum LoweringMode {
     RequireIdentityC,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RowPlacement {
-    /// Preserve every source row position; reject incompatible identity-C requests.
-    Preserve,
-    /// Permit identity-C lowering to replace/reposition rows. Direct mode never moves them.
-    AllowReordering,
-}
-
 /// Two fresh coordinates and replacement rows for one source assertion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssertionAux {
@@ -45,9 +37,8 @@ pub struct AssertionAux {
 
 /// A separately identified selected relation, with no new acceptance pin.
 ///
-/// Source columns remain a logical prefix. Ports and interactions use target IDs;
-/// operation/component metadata stays on the source and uses the explicit maps.
-/// Interaction component indices still refer to those source components.
+/// Source columns remain a logical prefix. Declared columns and interactions use target IDs;
+/// operation records stay on the source and use the explicit maps.
 #[derive(Debug)]
 pub struct LoweredCircuit {
     id: CircuitId,
@@ -58,7 +49,7 @@ pub struct LoweredCircuit {
     rows: Vec<Row>,
     input_values: Vec<ValueId>,
     one: ValueId,
-    ports: Vec<Port>,
+    columns: Vec<SchemaColumn>,
     interactions: Vec<Interaction>,
     source_rows: Vec<Range<usize>>,
     auxiliaries: Vec<AssertionAux>,
@@ -66,28 +57,15 @@ pub struct LoweredCircuit {
 }
 
 impl BooleanCircuit {
-    /// Select equations and placement together. Source value positions are always preserved.
-    /// A failed identity-C requirement returns an error, never a general-C fallback.
-    pub fn lower(
-        &self,
-        mode: LoweringMode,
-        layout: &PhysicalLayout,
-        rows: RowPlacement,
-    ) -> Result<LoweredCircuit, LayoutError> {
-        LoweredCircuit::build(self, layout, mode, rows)
+    /// Select the authored equations or enforce identity C. Placement is automatic.
+    pub fn lower(&self, mode: LoweringMode) -> Result<LoweredCircuit, LayoutError> {
+        LoweredCircuit::build(self, &self.layout()?, mode)
     }
 
-    /// Replace every assertion with a product and cancellation check.
-    ///
-    /// Preserves source value positions and appends auxiliaries after `useful_bits`.
-    /// Row positions are rebuilt to match C-side coordinates, not preserved.
-    /// Proof dimensions are chosen separately by `to_block_r1cs`; they never grow silently.
-    pub fn lower_identity_c(&self, layout: &PhysicalLayout) -> Result<LoweredCircuit, LayoutError> {
-        self.lower(
-            LoweringMode::RequireIdentityC,
-            layout,
-            RowPlacement::AllowReordering,
-        )
+    /// Replace each assertion with two rows and two appended variables.
+    /// Source value positions stay unchanged; each C-side value chooses its row position.
+    pub fn lower_identity_c(&self) -> Result<LoweredCircuit, LayoutError> {
+        self.lower(LoweringMode::RequireIdentityC)
     }
 }
 
@@ -133,8 +111,9 @@ impl LoweredCircuit {
         &self.input_values
     }
 
-    pub fn ports(&self) -> &[Port] {
-        &self.ports
+    /// Declared fields with lowered value IDs. Added bits are listed by `auxiliaries()`.
+    pub fn schema(&self) -> &[SchemaColumn] {
+        &self.columns
     }
 
     pub fn interactions(&self) -> &[Interaction] {
@@ -220,7 +199,7 @@ impl LoweredCircuit {
             rows: &self.rows,
             value_count: self.value_count(),
             input_values: &self.input_values,
-            ports: &self.ports,
+            columns: &self.columns,
             one: self.one,
         }
     }

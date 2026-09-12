@@ -49,7 +49,6 @@ pub(super) fn eval(builder: &mut CircuitBuilder, cols: &Blake3Cols<Var>) {
             message = std::array::from_fn(|i| message[blake3::MSG_PERMUTATION[i]]);
         }
     }
-    // Keep expression and materialization order identical to the compatibility relation.
     let out_lo: [Word; 8] = std::array::from_fn(|i| builder.xor2_words(state[i], state[i + 8]));
     let out_hi: [Word; 8] = std::array::from_fn(|i| builder.xor2_words(state[i + 8], cv[i]));
     for (cols, word) in cols.out_lo.iter().zip(out_lo) {
