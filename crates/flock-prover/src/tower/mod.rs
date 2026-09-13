@@ -41,7 +41,7 @@ use {
 };
 
 pub use crate::tower::{
-    chain::{ChainProof, build_chain_proof},
+    chain::{ChainOnlineMs, ChainProof, build_chain_proof},
     config::TowerConfig,
     driver::{ChainStatement, RootDischargeFailure, Tower},
     fl_node::{FlNode, build_first_level_node, build_first_level_node_k},
