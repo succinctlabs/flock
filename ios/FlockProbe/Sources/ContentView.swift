@@ -71,8 +71,12 @@ func runPlan(_ emit: (String) -> Void) {
         let code = flock_mobile_leaf_demo(n, &r)
         let wall = Date().timeIntervalSince(t0)
         if code != 0 { emit("leaf \(n): FAILED rc \(code)"); continue }
-        emit(String(format: "leaf %d: cold %.1f ms | warm %.1f ms | wall %.1f s | peak RSS %@ | budget left %@",
-                    n, r.prove_ms, r.prove_warm_ms, wall, mib(r.peak_rss_bytes), mib(UInt64(os_proc_available_memory()))))
+        let rate = Double(n) / (r.online_wall_ms / 1000)
+        emit(String(format: "leaf %d: %.0fk blake3/sec", n, rate / 1000))
+        emit(String(format: "         online %.1f ms = walk %.1f + witgen %.1f + prove %.1f",
+                    r.online_wall_ms, r.online_walk_ms, r.online_witgen_ms, r.online_prove_ms))
+        emit(String(format: "         cold %.1f ms | warm whole call %.1f ms | wall %.1f s", r.prove_ms, r.prove_warm_ms, wall))
+        emit(String(format: "         peak RSS %@ | budget left %@", mib(r.peak_rss_bytes), mib(UInt64(os_proc_available_memory()))))
     }
     if let t = tower, t.count == 2 {
         var r = FlockMobileReport()

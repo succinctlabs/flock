@@ -11,7 +11,11 @@ extern "C" {
 typedef struct {
     uint64_t n_blocks;        /* total compressions proved */
     double   prove_ms;        /* Tower::prove wall time; leaf: cold prove incl. per-shape setup */
-    double   prove_warm_ms;   /* leaf only: second prove over the cached shape; 0 for tower */
+    double   prove_warm_ms;   /* leaf only: whole second build over the cached shape (incl. its self-verify); 0 for tower */
+    double   online_wall_ms;  /* leaf only: the ONLINE leaf = walk+witgen+prove, one timer — n_blocks/online_wall_ms is the honest rate */
+    double   online_walk_ms;  /* leaf only: chain compute */
+    double   online_witgen_ms;/* leaf only: witness generation */
+    double   online_prove_ms; /* leaf only: commit + zerocheck + lincheck + open */
     double   discharge_ms;    /* Tower::discharge_root wall time */
     double   root_proof_kib;  /* root proof size, KiB */
     uint64_t peak_rss_bytes;  /* process peak resident set, bytes */

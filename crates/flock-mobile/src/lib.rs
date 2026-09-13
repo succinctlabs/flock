@@ -30,9 +30,21 @@ pub struct FlockMobileReport {
     /// the per-shape setup (circuit emission, the BLAKE3 matrices, the CSC
     /// lincheck circuit) that a production prover pays once per process.
     pub prove_ms: f64,
-    /// Leaf only: a SECOND prove of the same shape, setup already cached —
-    /// the per-statement cost. Zero for the tower.
+    /// Leaf only: the whole SECOND `build_chain_proof` call over the cached
+    /// shape — which still includes that function's own deferred verify and
+    /// discharge checks. Zero for the tower.
     pub prove_warm_ms: f64,
+    /// Leaf only, from the warm run: the ONLINE leaf — one timer around
+    /// walk → witgen → prove, what a prover pays per statement. This is the
+    /// number `tower_online_bench` reports; `n_blocks / online_wall_ms` is the
+    /// honest compressions-per-second. Zero for the tower.
+    pub online_wall_ms: f64,
+    /// Leaf only, from the warm run: the chain compute itself.
+    pub online_walk_ms: f64,
+    /// Leaf only, from the warm run: the bit-level trace, packed.
+    pub online_witgen_ms: f64,
+    /// Leaf only, from the warm run: commit, zerocheck, lincheck, PCS open.
+    pub online_prove_ms: f64,
     /// `Tower::discharge_root` wall time.
     pub discharge_ms: f64,
     /// Size of the root proof, in KiB.
@@ -133,7 +145,8 @@ pub extern "C" fn flock_mobile_peak_rss_bytes() -> u64 {
 /// leaf's footprint scales with `n_blocks`.
 ///
 /// Proves the leaf twice: `prove_ms` is the cold run that pays the per-shape
-/// setup, `prove_warm_ms` the second run over the cached shape. Fills those,
+/// setup, `prove_warm_ms` the second run over the cached shape, and the
+/// `online_*` fields are that warm run's prover-only phases. Fills those,
 /// `n_blocks`, `peak_rss_bytes`, and the two thread counts of `*out`; the
 /// rest stay zero. Return codes as [`flock_mobile_tower_demo`].
 ///
@@ -165,11 +178,16 @@ pub fn leaf_demo(n_blocks: usize) -> FlockMobileReport {
     let t1 = Instant::now();
     let proof = build_chain_proof(TowerConfig::Chain128, [0u32; 16], n_blocks);
     let prove_warm_ms = t1.elapsed().as_secs_f64() * 1e3;
+    let online = proof.online_ms();
     drop(proof);
     FlockMobileReport {
         n_blocks: n_blocks as u64,
         prove_ms,
         prove_warm_ms,
+        online_wall_ms: online.wall_ms,
+        online_walk_ms: online.walk_ms,
+        online_witgen_ms: online.witgen_ms,
+        online_prove_ms: online.prove_ms,
         peak_rss_bytes: peak_rss_bytes(),
         threads,
         all_core_threads,
@@ -198,6 +216,10 @@ pub fn tower_demo(n_leaves: usize, blocks_per_leaf: usize) -> FlockMobileReport 
         n_blocks: s.n_blocks as u64,
         prove_ms,
         prove_warm_ms: 0.0,
+        online_wall_ms: 0.0,
+        online_walk_ms: 0.0,
+        online_witgen_ms: 0.0,
+        online_prove_ms: 0.0,
         discharge_ms,
         root_proof_kib: tower.root_proof_kib(),
         peak_rss_bytes: peak_rss_bytes(),
