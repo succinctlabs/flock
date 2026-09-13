@@ -71,12 +71,13 @@ func runPlan(_ emit: (String) -> Void) {
         let code = flock_mobile_leaf_demo(n, &r)
         let wall = Date().timeIntervalSince(t0)
         if code != 0 { emit("leaf \(n): FAILED rc \(code)"); continue }
-        let rate = Double(n) / (r.online_wall_ms / 1000)
-        emit(String(format: "leaf %d: %.0fk blake3/sec", n, rate / 1000))
-        let proveRate = Double(n) / (r.online_prove_ms / 1000)
-        emit(String(format: "         prove only %.0fk blake3/sec (the benchmark's metric)", proveRate / 1000))
-        emit(String(format: "         online %.1f ms = walk %.1f + witgen %.1f + prove %.1f",
-                    r.online_wall_ms, r.online_walk_ms, r.online_witgen_ms, r.online_prove_ms))
+        // The headline: witness generation + proving. Not the chain compute
+        // (the application's own hashing) and not the self-verify.
+        let provingMs = r.online_witgen_ms + r.online_prove_ms
+        emit(String(format: "leaf %d: %.0fk blake3/sec  (witgen %.1f + prove %.1f = %.1f ms)",
+                    n, Double(n) / (provingMs / 1000) / 1000, r.online_witgen_ms, r.online_prove_ms, provingMs))
+        emit(String(format: "         walk %.1f ms | prove only %.0fk/s | online incl. walk %.1f ms",
+                    r.online_walk_ms, Double(n) / (r.online_prove_ms / 1000) / 1000, r.online_wall_ms))
         emit(String(format: "         cold %.1f ms | warm whole call %.1f ms | wall %.1f s", r.prove_ms, r.prove_warm_ms, wall))
         emit(String(format: "         peak RSS %@ | budget left %@", mib(r.peak_rss_bytes), mib(UInt64(os_proc_available_memory()))))
     }

@@ -53,16 +53,17 @@ fn main() {
             let r = leaf_demo(n_blocks);
             println!(
                 "FLOCK MOBILE PROBE leaf ({} compressions, global {} / all-core {} threads, init rc {rc})\n  \
-                 online leaf {:.1} ms = {:.0}k blake3/sec (walk {:.1} + witgen {:.1} + prove {:.1})\n  \
+                 witgen + prove {:.1} ms = {:.0}k blake3/sec (witgen {:.1} + prove {:.1}; walk {:.1}, online incl. walk {:.1})\n  \
                  cold {:.1} ms | warm whole call {:.1} ms | peak RSS {:.1} MiB",
                 r.n_blocks,
                 r.threads,
                 r.all_core_threads,
-                r.online_wall_ms,
-                r.n_blocks as f64 / (r.online_wall_ms / 1e3) / 1e3,
-                r.online_walk_ms,
+                r.online_witgen_ms + r.online_prove_ms,
+                r.n_blocks as f64 / ((r.online_witgen_ms + r.online_prove_ms) / 1e3) / 1e3,
                 r.online_witgen_ms,
                 r.online_prove_ms,
+                r.online_walk_ms,
+                r.online_wall_ms,
                 r.prove_ms,
                 r.prove_warm_ms,
                 r.peak_rss_bytes as f64 / (1024.0 * 1024.0),
