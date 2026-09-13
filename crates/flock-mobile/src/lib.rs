@@ -30,11 +30,11 @@ pub struct FlockMobileReport {
     /// the per-shape setup (circuit emission, the BLAKE3 matrices, the CSC
     /// lincheck circuit) that a production prover pays once per process.
     pub prove_ms: f64,
-    /// Leaf only: the whole SECOND `build_chain_proof` call over the cached
-    /// shape — which still includes that function's own deferred verify and
-    /// discharge checks. Zero for the tower.
+    /// Leaf only: the whole `build_chain_proof` call of the MEDIAN warm
+    /// iteration (three over the cached shape) — which still includes that
+    /// function's own deferred verify and discharge checks. Zero for the tower.
     pub prove_warm_ms: f64,
-    /// Leaf only, from the warm run: the ONLINE leaf — one timer around
+    /// Leaf only, from the median warm iteration: the ONLINE leaf — one timer around
     /// walk → witgen → prove, what a prover pays per statement. This is the
     /// number `tower_online_bench` reports; `n_blocks / online_wall_ms` is the
     /// honest compressions-per-second. Zero for the tower.
@@ -175,11 +175,22 @@ pub fn leaf_demo(n_blocks: usize) -> FlockMobileReport {
     let proof = build_chain_proof(TowerConfig::Chain128, [0u32; 16], n_blocks);
     let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
     drop(proof);
-    let t1 = Instant::now();
-    let proof = build_chain_proof(TowerConfig::Chain128, [0u32; 16], n_blocks);
-    let prove_warm_ms = t1.elapsed().as_secs_f64() * 1e3;
-    let online = proof.online_ms();
-    drop(proof);
+    // Warm: three more leaves over the cached shape, the MEDIAN by
+    // witgen + prove. One warm iteration is not steady state — it still
+    // first-touches multi-GiB buffers (at m=32 that alone is ~400 ms), while a
+    // prover that proves leaf after leaf reuses them. Same discipline as
+    // `tower_online_bench`.
+    let mut warm: Vec<(f64, f64, flock_prover::tower::ChainOnlineMs)> = (0..3)
+        .map(|_| {
+            let t1 = Instant::now();
+            let proof = build_chain_proof(TowerConfig::Chain128, [0u32; 16], n_blocks);
+            let whole_ms = t1.elapsed().as_secs_f64() * 1e3;
+            let online = proof.online_ms();
+            (online.witgen_ms + online.prove_ms, whole_ms, online)
+        })
+        .collect();
+    warm.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (_, prove_warm_ms, online) = warm[1];
     FlockMobileReport {
         n_blocks: n_blocks as u64,
         prove_ms,
