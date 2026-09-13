@@ -73,6 +73,8 @@ func runPlan(_ emit: (String) -> Void) {
         if code != 0 { emit("leaf \(n): FAILED rc \(code)"); continue }
         let rate = Double(n) / (r.online_wall_ms / 1000)
         emit(String(format: "leaf %d: %.0fk blake3/sec", n, rate / 1000))
+        let proveRate = Double(n) / (r.online_prove_ms / 1000)
+        emit(String(format: "         prove only %.0fk blake3/sec (the benchmark's metric)", proveRate / 1000))
         emit(String(format: "         online %.1f ms = walk %.1f + witgen %.1f + prove %.1f",
                     r.online_wall_ms, r.online_walk_ms, r.online_witgen_ms, r.online_prove_ms))
         emit(String(format: "         cold %.1f ms | warm whole call %.1f ms | wall %.1f s", r.prove_ms, r.prove_warm_ms, wall))
