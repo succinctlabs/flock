@@ -107,7 +107,7 @@ mod sha256x4;
 mod blake3_neon;
 
 /// Sixteen-message BLAKE3 on Apple SME2 (M4 and later), ahead of the NEON
-/// kernel on single-threaded pools. See the module docs.
+/// kernel for one thread per CPU cluster at a time. See the module docs.
 #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 #[path = "merkle/blake3_sme2.rs"]
 mod blake3_sme2;
@@ -398,9 +398,9 @@ fn blake3_hash_many<const N: usize>(
 /// last block carrying its true length. The integer-lane commit's leaves
 /// are `lanes × 16` bytes — 736 at the BLAKE3 union's m=32 (46 lanes) — and
 /// the old power-of-two-only dispatch sent every one of them to the generic
-/// per-leaf hasher at half the hash roofline. On a single-threaded pool with
-/// SME2, whole groups of sixteen go to the SME2 kernel first (leaf sizes that
-/// are a whole number of words). Tail leaves (fewer than eight) take the
+/// per-leaf hasher at half the hash roofline. With SME2 and its cluster's
+/// unit free, whole groups of sixteen go to the SME2 kernel first (leaf sizes
+/// that are a whole number of words). Tail leaves (fewer than eight) take the
 /// generic path, which computes the same chunk CV.
 pub(crate) fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> bool {
     if !blake3_leaf_size_is_batchable(leaf_size) {
@@ -453,11 +453,13 @@ pub(crate) fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [
 
 /// Hash the leading whole groups of sixteen equal-shape messages (`stride`
 /// bytes apart, `n_blocks` blocks, the last `last_len` bytes) on the SME2
-/// kernel, and return the part still to hash. Engaged only on a
-/// single-threaded pool: Apple M4 has one SME unit per CPU cluster, shared by
-/// the cluster's cores, so concurrent callers would queue on it instead of
-/// running their own NEON pipes. Returns everything untouched when the kernel
-/// is unavailable, does not take the shape, or refuses.
+/// kernel, and return the part still to hash. Apple M4 has one SME unit per
+/// CPU cluster, so the call first claims its cluster's unit; while another
+/// thread holds it, this call stays on NEON. A pool of hashing threads thus
+/// runs one SME2 stream per cluster beside NEON on the rest (M4, 736 B leaves:
+/// 3 NEON + 1 SME2 P-cores 16.5 GB/s against 13.4 for 4 NEON). Returns
+/// everything untouched when the kernel is unavailable, does not take the
+/// shape, is claimed, or refuses.
 #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 #[allow(clippy::too_many_arguments)]
 fn blake3_sme2_prefix<'d, 'o>(
@@ -471,13 +473,12 @@ fn blake3_sme2_prefix<'d, 'o>(
     out: &'o mut [Hash],
 ) -> (&'d [u8], &'o mut [Hash]) {
     let groups = out.len() / blake3_sme2::LANES;
-    if groups == 0
-        || !blake3_sme2::takes(n_blocks, last_len)
-        || rayon::current_num_threads() != 1
-        || !blake3_sme2::available()
-    {
+    if groups == 0 || !blake3_sme2::takes(n_blocks, last_len) || !blake3_sme2::available() {
         return (data, out);
     }
+    let Some(_claim) = blake3_sme2::try_claim() else {
+        return (data, out);
+    };
     let full = groups * blake3_sme2::LANES;
     // SAFETY: the kernel is available; messages 0..full are whole `stride`-
     // byte rows of `data` (the callers' layout), each read only within its
@@ -900,21 +901,19 @@ mod tests {
         assert_eq!(sme2(64, 64, (BLAKE3_PARENT, 0, 0), 64), want, "parents");
     }
 
-    /// On a single-threaded pool the batched entry points route whole groups
-    /// of sixteen to SME2 and the rest to NEON and the crate; the result must
-    /// equal the scalar specification for every count and for leaf sizes the
-    /// kernel does not take (not a whole number of words).
+    /// The batched entry points route whole groups of sixteen to SME2 when
+    /// the caller's cluster unit is free and to NEON when it is claimed, the
+    /// rest to NEON and the crate; the result must equal the scalar
+    /// specification for every count and for leaf sizes the kernel does not
+    /// take (not a whole number of words). Run once alone (the claim is free)
+    /// and from eight threads at once (claims contested, most calls on NEON).
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     #[test]
     fn blake3_sme2_dispatch_matches_spec() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap();
         let data: Vec<u8> = (0..1100u32 * 1024)
             .map(|i| ((i * 2654435761) >> 13) as u8)
             .collect();
-        pool.install(|| {
+        let check = || {
             for leaf_size in [64usize, 100, 512, 736, 1024] {
                 for count in [15usize, 16, 17, 33, 1029] {
                     let input = &data[..count * leaf_size];
@@ -939,6 +938,12 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(got, want, "parents count={count}");
+            }
+        };
+        check();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(check);
             }
         });
     }

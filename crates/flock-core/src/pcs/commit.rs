@@ -415,19 +415,56 @@ fn leaf_pipeline_enabled(params: &PcsParams) -> bool {
     commit_leaf_pipeline_shape(params) && rayon::current_num_threads() > 1
 }
 
-/// Streaming commit (challenge-tree architecture): the deep NTT pass
-/// publishes each finished sub-group as ~1-MiB leaf jobs into a small
+/// [`leaf_pipeline_enabled`] for [`commit_lane_major`]: any lane count
+/// streams, since the deep pass's sub-groups are whole positions whatever the
+/// stride. `FLOCK_NO_LANE_PIPELINE=1` keeps the staged NTT-then-Merkle path
+/// (the A/B knob; the tree is byte-identical either way).
+fn lane_pipeline_enabled(params: &PcsParams) -> bool {
+    params.merkle_hash == crate::merkle::HashKind::Blake3
+        && params.n_positions() * params.num_ntts() >= (1 << 22)
+        && rayon::current_num_threads() > 1
+        && var_os("FLOCK_NO_LANE_PIPELINE").is_none_or(|v| v != *"1")
+}
+
+/// [`pipelined_commit`] over the from-message transform: the replicate fill
+/// is fused into the first top pass.
+fn commit_into_pipelined(
+    z_packed: &[F128],
+    params: &PcsParams,
+    codeword: Vec<F128>,
+) -> (Commitment, ProverData) {
+    let num_ntts = params.num_ntts();
+    let ntt = AdditiveNttF128::standard(params.k_code());
+    // Fill fused into the first top pass (from-message): the prep arm
+    // overlaps the ENTIRE encode+leaves window instead of a standalone
+    // replicate stage burning the overlap budget first — this, not E-core
+    // count, is where the challenge tree's commit wall comes from.
+    pipelined_commit(codeword, params, |codeword, on_sub| {
+        ntt.forward_transform_interleaved_from_message_with(
+            codeword,
+            z_packed,
+            num_ntts,
+            Some(on_sub),
+        );
+    })
+}
+
+/// Streaming commit (challenge-tree architecture): `transform` encodes
+/// `codeword` in place, and its deep NTT pass publishes each finished
+/// sub-group (through the hook it is handed) as ~1-MiB leaf jobs into a small
 /// bounded queue drained by utility-QoS helper threads — on Apple Silicon
 /// the scheduler runs those on the efficiency cores, so leaf hashing (plus
 /// each job's aligned local parent subtree, hashed while its lines are hot)
 /// rides BESIDE the P-core transform instead of costing a serial Merkle
 /// stage after it. A full queue makes the publisher hash inline, bounding
-/// the unhashed window without ever blocking the NTT. Tree and root are
-/// bit-identical to the staged path (same leaves, same shape).
-fn commit_into_pipelined(
-    z_packed: &[F128],
-    params: &PcsParams,
+/// the unhashed window without ever blocking the NTT. Every job, helper or
+/// inline, takes its cluster's SME2 unit when it is free (M4), so each
+/// cluster streams one SME2 hash beside the transform's PMULL work. Tree and
+/// root are bit-identical to the staged path (same leaves, same shape).
+fn pipelined_commit(
     mut codeword: Vec<F128>,
+    params: &PcsParams,
+    transform: impl FnOnce(&mut [F128], &(dyn Fn(usize, &[F128]) + Sync)),
 ) -> (Commitment, ProverData) {
     use crate::merkle;
     use std::sync::Mutex;
@@ -449,6 +486,8 @@ fn commit_into_pipelined(
     let job_leaves = (1usize << 10).min(n_leaves);
     let mut tree: Vec<Hash> = crate::alloc_uninit_vec(2 * n_leaves - 1);
     let min_local_levels = AtomicUsize::new(usize::MAX);
+    // Leaf jobs hashed by [helpers, the publisher inline, the tail drain].
+    let jobs_by: [AtomicUsize; 3] = Default::default();
 
     let t_ntt = std::time::Instant::now();
     {
@@ -519,7 +558,10 @@ fn commit_into_pipelined(
                     loop {
                         let job = receiver.lock().unwrap().recv();
                         match job {
-                            Ok(j) => hash_job(j),
+                            Ok(j) => {
+                                hash_job(j);
+                                jobs_by[0].fetch_add(1, Ordering::Relaxed);
+                            }
                             Err(_) => break,
                         }
                     }
@@ -533,23 +575,15 @@ fn commit_into_pipelined(
                     let len = job_leaves.min(total - off);
                     match sender.try_send((base + off, len)) {
                         Ok(()) => {}
-                        Err(TrySendError::Full(j) | TrySendError::Disconnected(j)) => hash_job(j),
+                        Err(TrySendError::Full(j) | TrySendError::Disconnected(j)) => {
+                            hash_job(j);
+                            jobs_by[1].fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     off += len;
                 }
             };
-            // Fill fused into the first top pass (from-message): the prep
-            // arm overlaps the ENTIRE encode+leaves window instead of a
-            // standalone replicate stage burning the overlap budget first —
-            // this, not E-core count, is where the challenge tree's commit
-            // wall comes from.
-            let ntt = AdditiveNttF128::standard(params.k_code());
-            ntt.forward_transform_interleaved_from_message_with(
-                &mut codeword,
-                z_packed,
-                num_ntts,
-                Some(&on_sub),
-            );
+            transform(&mut codeword, &on_sub);
             drop(sender);
             // No more jobs can arrive; pull the queued tail onto the main
             // pool while already-claimed helper jobs complete concurrently.
@@ -561,12 +595,14 @@ fn commit_into_pipelined(
                 }
             }
             use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+            jobs_by[2].fetch_add(tail.len(), Ordering::Relaxed);
             tail.into_par_iter().for_each(hash_job);
         });
     }
     if timing {
+        let [helpers, inline, tail] = jobs_by.each_ref().map(|n| n.load(Ordering::Relaxed));
         eprintln!(
-            "[commit-timing] ntt+leaves: {:.2} ms",
+            "[commit-timing] ntt+leaves: {:.2} ms (leaf jobs: helpers {helpers}, inline {inline}, tail {tail})",
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -723,6 +759,20 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
             t_take.as_secs_f64() * 1e3,
             t_fill.elapsed().as_secs_f64() * 1e3
         );
+    }
+    if lane_pipeline_enabled(params) {
+        // Hash finished deep sub-groups while the transform continues, as
+        // the power-of-two commit does: same leaves, same tree.
+        let ntt = AdditiveNttF128::standard(params.k_code());
+        return pipelined_commit(codeword, params, |codeword, on_sub| {
+            ntt.forward_transform_interleaved_live_from_layer_with(
+                codeword,
+                t,
+                live,
+                params.log_inv_rate,
+                Some(on_sub),
+            );
+        });
     }
     finalize_commit(codeword, live, params)
 }
@@ -955,7 +1005,8 @@ mod tests {
                 BatchedGrinding, F128, FoldGrinding, Grinding, HashKind, LOG_PACKING,
                 LincheckGrinding, OpeningGrinding, PcsParams, ZerocheckGrinding, commit,
                 commit_encode, commit_into_pipelined, commit_lane_major, commit_merkle,
-                dense_lanes, finalize_commit, lane_grid_from_lane_major, replicate_lane_major_fill,
+                dense_lanes, finalize_commit, lane_grid_from_lane_major, lane_pipeline_enabled,
+                replicate_lane_major_fill,
             },
             ligerito::LigeritoProfile,
             pack::pack_witness,
@@ -1093,6 +1144,55 @@ mod tests {
                     );
                 }
             });
+        }
+    }
+
+    /// The streaming integer-lane commit (`lane_pipeline_enabled`) builds the
+    /// same codeword, tree and cap as the staged full transform, over pool
+    /// sizes that change the deep pass's sub-group (hence leaf-job) shapes,
+    /// with every lane live, with dead lanes, and with an all-zero message
+    /// (no transform; the hook sees the whole buffer once). The leaf jobs
+    /// take SME2 claims where the machine has the unit.
+    #[test]
+    fn lane_pipelined_commit_matches_staged() {
+        // 2^17 positions x 33 lanes: just over the streaming threshold.
+        let (m, log_inv_rate, log_batch_size, t) = (28usize, 2usize, 6usize, 33usize);
+        let params = PcsParams {
+            m,
+            log_inv_rate,
+            log_batch_size,
+            profile: Default::default(),
+            num_lanes: Some(t),
+            merkle_hash: HashKind::Blake3,
+        };
+        let d = 1usize << (m - LOG_PACKING - log_batch_size);
+        let mut rng = Rng::new(0x1A4E_5EED);
+        for c in [t, 20, 0] {
+            let mut q = vec![F128::ZERO; 1usize << (m - LOG_PACKING)];
+            let content = rng.f128_vec(c * d);
+            q[..c * d].copy_from_slice(&content);
+            let mut codeword = take_f128(params.codeword_len_f128());
+            replicate_lane_major_fill(&mut codeword, &q, t, d);
+            let (c_ref, pd_ref) = finalize_commit(codeword, t, &params);
+            for threads in [2usize, 8, 32] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                pool.install(|| {
+                    assert!(lane_pipeline_enabled(&params), "shape must stream");
+                    let (c_pipe, pd_pipe) = commit_lane_major(&q, &params);
+                    assert_eq!(c_pipe.cap, c_ref.cap, "cap (c={c}, threads={threads})");
+                    assert!(
+                        pd_pipe.codeword == pd_ref.codeword,
+                        "codeword (c={c}, threads={threads})"
+                    );
+                    assert!(
+                        pd_pipe.merkle_tree == pd_ref.merkle_tree,
+                        "tree (c={c}, threads={threads})"
+                    );
+                });
+            }
         }
     }
 

@@ -510,6 +510,28 @@ impl AdditiveNttF128 {
         live: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_live_from_layer_with(
+            data,
+            num_ntts,
+            live,
+            start_layer,
+            None,
+        );
+    }
+
+    /// [`Self::forward_transform_interleaved_live_from_layer`] with the deep
+    /// pass's per-sub-group completion hook (see
+    /// [`Self::forward_transform_interleaved_parallel_from_layer_with`]) —
+    /// the streaming integer-lane commit. An all-dead transform hands the
+    /// hook the whole (already final) buffer once.
+    pub fn forward_transform_interleaved_live_from_layer_with(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        live: usize,
+        start_layer: usize,
+        on_sub: Option<&(dyn Fn(usize, &[F128]) + Sync)>,
+    ) {
         // `num_ntts` may be any positive integer (integer-lane commit): the
         // per-lane butterfly kernels iterate over the lane stride, and the
         // SIMD kernels handle the `num_ntts % SIMD_WIDTH` tail lanes with the
@@ -530,7 +552,11 @@ impl AdditiveNttF128 {
             "dead lanes must be identically zero"
         );
         if live == 0 {
-            return; // an all-zero message's codeword is already in place
+            // An all-zero message's codeword is already in place.
+            if let Some(cb) = on_sub {
+                cb(0, data);
+            }
+            return;
         }
 
         // Scalar; SIMD/parallel variants below dispatch from `forward_transform_interleaved`
@@ -540,7 +566,7 @@ impl AdditiveNttF128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         {
-            self.interleaved_parallel_live_from_layer(data, num_ntts, live, start_layer, None);
+            self.interleaved_parallel_live_from_layer(data, num_ntts, live, start_layer, on_sub);
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -548,6 +574,9 @@ impl AdditiveNttF128 {
         )))]
         {
             self.interleaved_scalar_live_from_layer(data, num_ntts, live, start_layer);
+            if let Some(cb) = on_sub {
+                cb(0, data);
+            }
         }
     }
 

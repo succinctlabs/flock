@@ -16,10 +16,19 @@
 //! `flags | flags_end` and its true length, zero-padded. Byte-identical by test
 //! (`blake3_sme2_matches_crate`).
 //!
-//! Apple M4 has one SME unit per CPU cluster, shared by the cluster's cores, so
-//! the callers engage this kernel only from a single-threaded pool.
+//! Apple M4 has one SME unit per CPU cluster, shared by the cluster's cores:
+//! two threads streaming on one unit split its throughput while each still
+//! occupies a core. [`try_claim`] hands out at most one claim per unit, keyed
+//! by the cluster the caller is running on, so any number of hashing threads
+//! put one SME2 stream on each cluster and the rest on their own NEON pipes.
 
-use std::{env::var_os, sync::OnceLock};
+use std::{
+    env::var_os,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 core::arch::global_asm!(include_str!("blake3_sme2.S"), options(raw));
 
@@ -89,8 +98,75 @@ pub(super) fn takes(n_blocks: usize, last_len: usize) -> bool {
     (1..=16).contains(&n_blocks) && last_len.is_multiple_of(4) && last_len >= 4
 }
 
+/// Most SME units a claim can name; CPUs beyond the last share its claim,
+/// which only costs concurrency.
+const MAX_UNITS: usize = 8;
+
+static UNIT_CLAIMED: [AtomicBool; MAX_UNITS] = [const { AtomicBool::new(false) }; MAX_UNITS];
+
+/// Exclusive use of one cluster's SME unit, released on drop.
+pub(super) struct Claim(usize);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        UNIT_CLAIMED[self.0].store(false, Ordering::Release);
+    }
+}
+
+/// Claim the SME unit of the cluster the calling thread is running on, or
+/// `None` if another thread holds it. A thread that migrates mid-call keeps a
+/// claim on the cluster it left, which is harmless: at worst two streams share
+/// a unit for the rest of that call.
+pub(super) fn try_claim() -> Option<Claim> {
+    let unit = current_unit();
+    UNIT_CLAIMED[unit]
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| Claim(unit))
+}
+
+/// The SME unit (CPU cluster) of the CPU this thread is running on.
+///
+/// Apple Silicon numbers the efficiency cores first, then the performance
+/// cores (M4: CPUs 0-5 E, 6-9 P), and every `cpusperl2` consecutive CPUs of a
+/// perf level share an L2 and an SME unit.
+fn current_unit() -> usize {
+    // (efficiency CPUs, efficiency per cluster, performance per cluster).
+    static GEOMETRY: OnceLock<(usize, usize, usize)> = OnceLock::new();
+    let &(e_cpus, e_per, p_per) = GEOMETRY.get_or_init(|| {
+        let get = |key: &std::ffi::CStr| sysctl_u32(key).map_or(0, |v| v as usize);
+        match get(c"hw.nperflevels") {
+            2 => (
+                get(c"hw.perflevel1.logicalcpu"),
+                get(c"hw.perflevel1.cpusperl2").max(1),
+                get(c"hw.perflevel0.cpusperl2").max(1),
+            ),
+            _ => (0, 1, get(c"hw.perflevel0.cpusperl2").max(1)),
+        }
+    });
+    unsafe extern "C" {
+        fn pthread_cpu_number_np(cpu_number_out: *mut usize) -> i32;
+    }
+    let mut cpu = 0usize;
+    // SAFETY: `cpu` is a writable `usize`.
+    if unsafe { pthread_cpu_number_np(&raw mut cpu) } != 0 {
+        return 0;
+    }
+    let unit = if cpu < e_cpus {
+        cpu / e_per
+    } else {
+        e_cpus.div_ceil(e_per) + (cpu - e_cpus) / p_per
+    };
+    unit.min(MAX_UNITS - 1)
+}
+
 /// One integer `sysctl` flag, read in-process; absent or unreadable is false.
 fn apple_feature(key: &std::ffi::CStr) -> bool {
+    sysctl_u32(key) == Some(1)
+}
+
+/// One 32-bit integer `sysctl`, read in-process.
+fn sysctl_u32(key: &std::ffi::CStr) -> Option<u32> {
     unsafe extern "C" {
         fn sysctlbyname(
             name: *const std::ffi::c_char,
@@ -112,5 +188,5 @@ fn apple_feature(key: &std::ffi::CStr) -> bool {
             0,
         )
     };
-    rc == 0 && len == size_of::<u32>() && value == 1
+    (rc == 0 && len == size_of::<u32>()).then_some(value)
 }
