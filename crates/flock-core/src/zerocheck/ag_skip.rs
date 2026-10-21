@@ -110,6 +110,27 @@ pub fn d_inv() -> F128 {
     d_const().inv()
 }
 
+/// Run one wide prover pass on the all-core (P+E) pool when it covers at
+/// least 64 MB and that pool is wider than the caller's.
+///
+/// Round 1, the skip→mlv fold and the tail's wide passes are flat parallel
+/// maps over thousands of independent blocks with a single reduce: the shape
+/// that drains cleanly around slower E-cores, which is why the NTT's deep
+/// pass and large Merkle trees hop too. M4 (4P+6E), blake3_proof 2^18 on the
+/// 4-P-core pool: round 1 81 → 58 ms, fold 73 → 43, tail 55 → 34 (zerocheck +
+/// lincheck 245 → 170 ms). Pool choice cannot change output bits: every block
+/// writes only its own rows, and the reduce is exact field addition. A
+/// one-thread run stays on one thread (the all-core pool honours
+/// `RAYON_NUM_THREADS`).
+fn on_all_cores<T: Send>(bytes: usize, pass: impl FnOnce() -> T + Send) -> T {
+    let pool = crate::all_core_pool();
+    if bytes >= (64 << 20) && pool.current_num_threads() > rayon::current_num_threads() {
+        pool.install(pass)
+    } else {
+        pass()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Round 1: prover message + verifier evaluation at r₁.
 // ---------------------------------------------------------------------------
@@ -1287,7 +1308,9 @@ pub fn prove<C: Challenger>(
     let r_outer = challenger.sample_f128_vec(m - K_SKIP - N_INNER);
     let eq = build_eq(&r_outer);
 
-    let msg = prove_round1(a_packed, b_packed, c_packed, &eq);
+    let msg = on_all_cores(3 * a_packed.len(), || {
+        prove_round1(a_packed, b_packed, c_packed, &eq)
+    });
     prove_from_round1(
         a_packed,
         b_packed,
@@ -1330,7 +1353,9 @@ pub fn prove_capture_s_hat_v_c<C: Challenger>(
     let r_outer = challenger.sample_f128_vec(m - K_SKIP - N_INNER);
     let eq = build_eq(&r_outer);
 
-    let (msg, s_hat_v_c) = prove_round1_banks(a_packed, b_packed, c_packed, &eq);
+    let (msg, s_hat_v_c) = on_all_cores(3 * a_packed.len(), || {
+        prove_round1_banks(a_packed, b_packed, c_packed, &eq)
+    });
     let (proof, claim) = prove_from_round1(
         a_packed,
         b_packed,
@@ -1393,7 +1418,9 @@ pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
     };
     let eq = build_eq(&r_outer);
     let t_r1 = Instant::now();
-    let (msg, s_hat_v_c) = prove_round1_banks_padded(a_packed, b_packed, c_packed, &eq, &coverage);
+    let (msg, s_hat_v_c) = on_all_cores(3 * a_packed.len(), || {
+        prove_round1_banks_padded(a_packed, b_packed, c_packed, &eq, &coverage)
+    });
     if zc_timing {
         let (mut full, mut part, mut dead) = (0usize, 0usize, 0usize);
         for c in &coverage {
@@ -1539,14 +1566,15 @@ fn prove_from_round1<C: Challenger>(
     let t_fold = std::time::Instant::now();
     let (a_mlv, b_mlv, g1_0, ginf_0, store, la_sums) = if sparse {
         let cov = coverage.expect("sparse implies coverage");
-        let (a, b, g1, gi, st, la) =
-            fold_and_first_round_sparse(a_packed, b_packed, &w, &r_rest, cov);
+        let (a, b, g1, gi, st, la) = on_all_cores(2 * a_packed.len(), || {
+            fold_and_first_round_sparse(a_packed, b_packed, &w, &r_rest, cov)
+        });
         (a, b, g1, gi, Some(st), la)
     } else {
-        let (a, b, g1, gi) = match coverage {
+        let (a, b, g1, gi) = on_all_cores(2 * a_packed.len(), || match coverage {
             Some(cov) => fold_and_first_round_padded(a_packed, b_packed, &w, &r_rest, cov),
             None => fold_and_first_round(a_packed, b_packed, &w, &r_rest),
-        };
+        });
         (a, b, g1, gi, None, None)
     };
     if zc_timing {
@@ -1740,18 +1768,19 @@ pub(super) fn multilinear_values_tail_fiat_shamir_sparse<C: Challenger>(
                 live / 2
             };
             let (ao, bo) = (&mut a_nxt[..out_len], &mut b_nxt[..out_len]);
-            let q = if let Some(r2) = pending2 {
-                fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r_rest[i + 2..])
-            } else {
-                fold1_lookahead_into(
+            let q = on_all_cores(32 * a_mlv.len(), || match pending2 {
+                Some(r2) => {
+                    fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r_rest[i + 2..])
+                }
+                None => fold1_lookahead_into(
                     &a_mlv,
                     &b_mlv,
                     ao,
                     bo,
                     (rho_prev, F128::ZERO),
                     &r_rest[i + 2..],
-                )
-            };
+                ),
+            });
             std::mem::swap(&mut a_mlv, &mut a_nxt);
             std::mem::swap(&mut b_mlv, &mut b_nxt);
             a_mlv.truncate(out_len);
@@ -1804,16 +1833,18 @@ pub(super) fn multilinear_values_tail_fiat_shamir_sparse<C: Challenger>(
         let log_before = domain.trailing_zeros() as usize;
         let mut r_next = vec![F128::ONE; log_before - 1];
         r_next[1..].copy_from_slice(&r_rest[i + 1..]);
-        let (m1, mi, store_out) = fold_and_round_pair_sparse_into(
-            &a_mlv,
-            &b_mlv,
-            &mut a_nxt[..cap],
-            &mut b_nxt[..cap],
-            rho_prev,
-            &r_next,
-            &store,
-            domain,
-        );
+        let (m1, mi, store_out) = on_all_cores(32 * a_mlv.len(), || {
+            fold_and_round_pair_sparse_into(
+                &a_mlv,
+                &b_mlv,
+                &mut a_nxt[..cap],
+                &mut b_nxt[..cap],
+                rho_prev,
+                &r_next,
+                &store,
+                domain,
+            )
+        });
         swap(&mut a_mlv, &mut a_nxt);
         swap(&mut b_mlv, &mut b_nxt);
         a_mlv.truncate(store_out.len());
@@ -1909,18 +1940,19 @@ pub(super) fn multilinear_values_tail_fiat_shamir_resume<C: Challenger>(
             // accumulators spill. Deleted 2026-08-27 with its `LOOKAHEAD_FRIENDLY`
             // toggle; see git history if M4 Max-class DRAM bandwidth makes it
             // worth re-measuring.)
-            let q = if let Some(r2) = pending2 {
-                fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r_rest[i + 2..])
-            } else {
-                fold1_lookahead_into(
+            let q = on_all_cores(32 * a_mlv.len(), || match pending2 {
+                Some(r2) => {
+                    fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r_rest[i + 2..])
+                }
+                None => fold1_lookahead_into(
                     &a_mlv,
                     &b_mlv,
                     ao,
                     bo,
                     (rho_prev, F128::ZERO),
                     &r_rest[i + 2..],
-                )
-            };
+                ),
+            });
             swap(&mut a_mlv, &mut a_nxt);
             swap(&mut b_mlv, &mut b_nxt);
             a_mlv.truncate(out_len);
@@ -3035,6 +3067,73 @@ mod tests {
             assert_eq!(sv0, sv1, "s_hat_v_c");
             verify_with_grinding(m, &p1, g, &mut mk()).expect("the sparse-path proof verifies");
         }
+    }
+
+    /// `on_all_cores` is invisible: a prove whose round 1, fold and first
+    /// tail pass all clear the 64 MB hop (m=28, a 72% live prefix, garbage
+    /// in the dead regions) gives the same proof, claims and `s_hat_v_c`
+    /// from a 2-thread pool, which hops onto the all-core pool, as from a
+    /// pool at least as wide as the all-core pool, which never hops.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn all_core_hop_is_invisible() {
+        let all = crate::all_core_pool().current_num_threads();
+        if all <= 2 {
+            eprintln!("all-core pool has {all} threads; no hop to test");
+            return;
+        }
+        let m = 28usize;
+        let n_blocks = (1usize << m) >> 13;
+        let live = n_blocks * 23 / 32;
+        let spec = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 1 << 13,
+                n_blocks: live,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 0,
+                n_blocks: n_blocks - live,
+            },
+        ]);
+        let (a0, b0, c0) = random_witness(m, 0xA1);
+        let cut = live << 10;
+        let dirty = |v: &[u8], g: u8| -> Vec<u8> {
+            let mut v = v.to_vec();
+            v[cut..].fill(g);
+            v
+        };
+        let (a, b, c) = (dirty(&a0, 0xC3), dirty(&b0, 0x3C), dirty(&c0, 0xFF));
+        let prove_in = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                prove_capture_s_hat_v_c_with_grinding(
+                    &a,
+                    &b,
+                    &c,
+                    m,
+                    &spec,
+                    ZerocheckGrinding::disabled(),
+                    &mut FsChallenger::new(b"flock-ag-all-core-test"),
+                )
+            })
+        };
+        let (p_hop, cl_hop, sv_hop) = prove_in(2);
+        let (p_stay, cl_stay, sv_stay) = prove_in(all);
+        assert_eq!(p_hop, p_stay, "proof bytes");
+        assert_eq!(cl_hop, cl_stay, "claims");
+        assert_eq!(sv_hop, sv_stay, "s_hat_v_c");
+        verify_with_grinding(
+            m,
+            &p_hop,
+            ZerocheckGrinding::disabled(),
+            &mut FsChallenger::new(b"flock-ag-all-core-test"),
+        )
+        .expect("the all-core proof verifies");
     }
 
     /// Full grinding roundtrip on the fused transcript + fused-nonce tamper
