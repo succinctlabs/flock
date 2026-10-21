@@ -106,6 +106,12 @@ mod sha256x4;
 #[path = "merkle/blake3_neon.rs"]
 mod blake3_neon;
 
+/// Sixteen-message BLAKE3 on Apple SME2 (M4 and later), ahead of the NEON
+/// kernel on single-threaded pools. See the module docs.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+#[path = "merkle/blake3_sme2.rs"]
+mod blake3_sme2;
+
 /// Global Merkle hash call/compression counters, enabled with
 /// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
 /// Relaxed atomics — exact totals, no ordering guarantees across threads.
@@ -325,9 +331,13 @@ fn blake3_hash_many<const N: usize>(
     flags_end: u8,
 ) {
     debug_assert_eq!(data.len(), out.len() * N);
-    // Full groups of eight go through the interleaved two×4-wide NEON kernel;
-    // the tail (< 8 messages) falls through to the crate's `hash_many`.
-    // Byte-identical either way (`blake3_neon8_matches_crate`).
+    // Full groups of sixteen go to the SME2 kernel when it is engaged
+    // (`blake3_sme2_prefix`), full groups of eight through the interleaved
+    // two×4-wide NEON kernel; the tail (< 8 messages) falls through to the
+    // crate's `hash_many`. Byte-identical every way
+    // (`blake3_neon8_matches_crate`, `blake3_sme2_matches_crate`).
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    let (data, out) = blake3_sme2_prefix(data, N, N / 64, 64, flags, flags_start, flags_end, out);
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     let (data, out) = {
         let full = (out.len() / 8) * 8;
@@ -388,13 +398,30 @@ fn blake3_hash_many<const N: usize>(
 /// last block carrying its true length. The integer-lane commit's leaves
 /// are `lanes × 16` bytes — 736 at the BLAKE3 union's m=32 (46 lanes) — and
 /// the old power-of-two-only dispatch sent every one of them to the generic
-/// per-leaf hasher at half the hash roofline. Tail leaves (fewer than
-/// eight) take the generic path, which computes the same chunk CV.
+/// per-leaf hasher at half the hash roofline. On a single-threaded pool with
+/// SME2, whole groups of sixteen go to the SME2 kernel first (leaf sizes that
+/// are a whole number of words). Tail leaves (fewer than eight) take the
+/// generic path, which computes the same chunk CV.
 pub(crate) fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> bool {
     if !blake3_leaf_size_is_batchable(leaf_size) {
         return false;
     }
     debug_assert_eq!(data.len(), out.len() * leaf_size);
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    let (data, out) = {
+        let n_blocks = leaf_size.div_ceil(64);
+        let last = leaf_size - 64 * (n_blocks - 1);
+        blake3_sme2_prefix(
+            data,
+            leaf_size,
+            n_blocks,
+            last,
+            0,
+            BLAKE3_CHUNK_START,
+            BLAKE3_CHUNK_END,
+            out,
+        )
+    };
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     let (data, out) = {
         let n_blocks = leaf_size.div_ceil(64);
@@ -422,6 +449,58 @@ pub(crate) fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [
         *o = blake3_leaf_chaining_value(leaf);
     }
     true
+}
+
+/// Hash the leading whole groups of sixteen equal-shape messages (`stride`
+/// bytes apart, `n_blocks` blocks, the last `last_len` bytes) on the SME2
+/// kernel, and return the part still to hash. Engaged only on a
+/// single-threaded pool: Apple M4 has one SME unit per CPU cluster, shared by
+/// the cluster's cores, so concurrent callers would queue on it instead of
+/// running their own NEON pipes. Returns everything untouched when the kernel
+/// is unavailable, does not take the shape, or refuses.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+#[allow(clippy::too_many_arguments)]
+fn blake3_sme2_prefix<'d, 'o>(
+    data: &'d [u8],
+    stride: usize,
+    n_blocks: usize,
+    last_len: usize,
+    flags: u8,
+    flags_start: u8,
+    flags_end: u8,
+    out: &'o mut [Hash],
+) -> (&'d [u8], &'o mut [Hash]) {
+    let groups = out.len() / blake3_sme2::LANES;
+    if groups == 0
+        || !blake3_sme2::takes(n_blocks, last_len)
+        || rayon::current_num_threads() != 1
+        || !blake3_sme2::available()
+    {
+        return (data, out);
+    }
+    let full = groups * blake3_sme2::LANES;
+    // SAFETY: the kernel is available; messages 0..full are whole `stride`-
+    // byte rows of `data` (the callers' layout), each read only within its
+    // first `(n_blocks - 1) * 64 + last_len <= stride` bytes; `out[..full]`
+    // is `full * 32` writable bytes (`Hash` is `[u8; 32]`).
+    let hashed = unsafe {
+        blake3_sme2::hash16(
+            data.as_ptr(),
+            stride,
+            n_blocks,
+            last_len,
+            flags,
+            flags_start,
+            flags_end,
+            out.as_mut_ptr().cast(),
+            groups,
+        )
+    };
+    if hashed {
+        (&data[full * stride..], &mut out[full..])
+    } else {
+        (data, out)
+    }
 }
 
 /// Whether [`blake3_hash_many_leaves`] batches this leaf size — any single
@@ -753,5 +832,114 @@ mod tests {
         for count in [1usize, 7, 8, 9, 16] {
             check!(1024, &data, count);
         }
+    }
+
+    /// The SME2 kernel must be byte-identical to the blake3 crate's leaf and
+    /// parent chaining values for every leaf shape it takes, across several
+    /// groups and with a stride wider than the message. Skipped (passing)
+    /// where the kernel cannot run.
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    #[test]
+    fn blake3_sme2_matches_crate() {
+        if !blake3_sme2::available() {
+            eprintln!("SME2 kernel unavailable on this host; skipped");
+            return;
+        }
+        let mut state = 0x0fed_cba9_8765_4321u64;
+        let data: Vec<u8> = (0..48 * 1024 + 4096)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (state >> 32) as u8
+            })
+            .collect();
+        let sme2 = |stride: usize, len: usize, flags: (u8, u8, u8), count: usize| {
+            let n_blocks = len.div_ceil(64);
+            let mut out = vec![[0u8; 32]; count];
+            // SAFETY: available; `data` holds `count` rows of `stride` bytes
+            // plus slack; `out` holds `count` hashes.
+            let ran = unsafe {
+                blake3_sme2::hash16(
+                    data.as_ptr(),
+                    stride,
+                    n_blocks,
+                    len - 64 * (n_blocks - 1),
+                    flags.0,
+                    flags.1,
+                    flags.2,
+                    out.as_mut_ptr().cast(),
+                    count / blake3_sme2::LANES,
+                )
+            };
+            assert!(ran, "kernel refused");
+            out
+        };
+        let leaf = (0, BLAKE3_CHUNK_START, BLAKE3_CHUNK_END);
+        for len in (4..=1024).step_by(4) {
+            let want: Vec<Hash> = data
+                .chunks(len)
+                .take(48)
+                .map(blake3_leaf_chaining_value)
+                .collect();
+            assert_eq!(sme2(len, len, leaf, 48), want, "leaf of {len} bytes");
+        }
+        // Messages 1024 bytes apart, only the first 736 hashed.
+        let want: Vec<Hash> = data
+            .chunks(1024)
+            .take(32)
+            .map(|row| blake3_leaf_chaining_value(&row[..736]))
+            .collect();
+        assert_eq!(sme2(1024, 736, leaf, 32), want, "strided leaves");
+        let want: Vec<Hash> = data
+            .chunks(64)
+            .take(64)
+            .map(|pair| {
+                let (l, r) = pair.split_at(32);
+                blake3_parent_chaining_value(l.try_into().unwrap(), r.try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(sme2(64, 64, (BLAKE3_PARENT, 0, 0), 64), want, "parents");
+    }
+
+    /// On a single-threaded pool the batched entry points route whole groups
+    /// of sixteen to SME2 and the rest to NEON and the crate; the result must
+    /// equal the scalar specification for every count and for leaf sizes the
+    /// kernel does not take (not a whole number of words).
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    #[test]
+    fn blake3_sme2_dispatch_matches_spec() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let data: Vec<u8> = (0..1100u32 * 1024)
+            .map(|i| ((i * 2654435761) >> 13) as u8)
+            .collect();
+        pool.install(|| {
+            for leaf_size in [64usize, 100, 512, 736, 1024] {
+                for count in [15usize, 16, 17, 33, 1029] {
+                    let input = &data[..count * leaf_size];
+                    let mut got = vec![[0u8; 32]; count];
+                    assert!(blake3_hash_many_leaves(input, leaf_size, &mut got));
+                    let want: Vec<Hash> = input
+                        .chunks(leaf_size)
+                        .map(blake3_leaf_chaining_value)
+                        .collect();
+                    assert_eq!(got, want, "leaf_size={leaf_size} count={count}");
+                }
+            }
+            for count in [15usize, 16, 17, 1029] {
+                let input = &data[..count * 64];
+                let mut got = vec![[0u8; 32]; count];
+                blake3_hash_many_parents(input, &mut got);
+                let want: Vec<Hash> = input
+                    .chunks(64)
+                    .map(|pair| {
+                        let (l, r) = pair.split_at(32);
+                        blake3_parent_chaining_value(l.try_into().unwrap(), r.try_into().unwrap())
+                    })
+                    .collect();
+                assert_eq!(got, want, "parents count={count}");
+            }
+        });
     }
 }
