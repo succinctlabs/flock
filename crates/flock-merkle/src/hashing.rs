@@ -504,6 +504,19 @@ fn blake3_sme2_prefix<'d, 'o>(
     }
 }
 
+/// Whether BLAKE3 hashing here runs on SME2 when a cluster's unit is free:
+/// Apple M4 and later, unless `FLOCK_NO_SME2=1`.
+pub fn blake3_sme2_available() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    {
+        blake3_sme2::available()
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+    {
+        false
+    }
+}
+
 /// Whether [`blake3_hash_many_leaves`] batches this leaf size — any single
 /// BLAKE3 chunk. `blake3_batch_dispatch_agrees` holds the two together.
 #[inline]

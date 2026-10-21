@@ -31,7 +31,7 @@ use crate::{
     lincheck::LincheckGrinding,
     matrix_fold::FoldGrinding,
     merkle::{self, Hash, HashKind},
-    ntt::AdditiveNttF128,
+    ntt::{AdditiveNttF128, DeepPassHook},
     pcs::{
         OpeningGrinding,
         ligerito::{
@@ -439,12 +439,12 @@ fn commit_into_pipelined(
     // overlaps the ENTIRE encode+leaves window instead of a standalone
     // replicate stage burning the overlap budget first — this, not E-core
     // count, is where the challenge tree's commit wall comes from.
-    pipelined_commit(codeword, params, |codeword, on_sub| {
+    pipelined_commit(codeword, params, |codeword, hook| {
         ntt.forward_transform_interleaved_from_message_with(
             codeword,
             z_packed,
             num_ntts,
-            Some(on_sub),
+            Some(hook),
         );
     })
 }
@@ -458,13 +458,12 @@ fn commit_into_pipelined(
 /// rides BESIDE the P-core transform instead of costing a serial Merkle
 /// stage after it. A full queue makes the publisher hash inline, bounding
 /// the unhashed window without ever blocking the NTT. Every job, helper or
-/// inline, takes its cluster's SME2 unit when it is free (M4), so each
-/// cluster streams one SME2 hash beside the transform's PMULL work. Tree and
-/// root are bit-identical to the staged path (same leaves, same shape).
+/// inline, takes its cluster's SME2 unit when it is free (M4). Tree and root
+/// are bit-identical to the staged path (same leaves, same shape).
 fn pipelined_commit(
     mut codeword: Vec<F128>,
     params: &PcsParams,
-    transform: impl FnOnce(&mut [F128], &(dyn Fn(usize, &[F128]) + Sync)),
+    transform: impl FnOnce(&mut [F128], DeepPassHook<'_>),
 ) -> (Commitment, ProverData) {
     use crate::merkle;
     use std::sync::Mutex;
@@ -540,19 +539,32 @@ fn pipelined_commit(
             }
         };
 
-        // Two helpers = this host's E-core count (M1 Max); utility QoS steers
-        // them off the P-cores the transform (and the AB-prep join partner)
-        // occupy. Queue depth 2× helpers bounds the unhashed window.
-        const N_HELPERS: usize = 2;
+        // Utility QoS steers the helpers off the P-cores the transform (and
+        // the AB-prep join partner) occupy. Without SME2: two helpers (this
+        // host's E-core count on M1 Max), and the deep pass also hops onto
+        // every core. With SME2 the E-cores hash instead of transforming: a
+        // helper on every core outside the caller's pool but one (left to
+        // the OS; on M4 all six measured no better), one of them on the E-cluster's
+        // SME2 unit (M4: 4.8 GB/s against 1.5 for an E-core's NEON), while
+        // the deep pass stays on the caller's P-cores. At the blake3_proof
+        // 2^18 commit (M4) the E-side then hashes 95-99% of the leaves
+        // inside the transform: ntt+leaves 135 ms against 130 for the P-core
+        // transform alone, and 141 with the all-core deep pass and two
+        // helpers. Queue depth 2× helpers bounds the unhashed window.
+        let spare_cores = crate::all_core_pool()
+            .current_num_threads()
+            .saturating_sub(current_num_threads());
+        let e_core_hashing = merkle::blake3_sme2_available() && spare_cores >= 2;
+        let n_helpers = if e_core_hashing { spare_cores - 1 } else { 2 };
         // Shallow queue: bounds the unhashed (cache-warm) window; a full
         // queue makes the publisher hash inline on the transform worker.
         // (A deep queue was measured WORSE: by drain time the codeword is
         // DRAM-cold and the staged Merkle read is back, plus overhead.)
-        let queue_capacity = 2 * N_HELPERS;
+        let queue_capacity = 2 * n_helpers;
         let (sender, receiver) = sync_channel::<(usize, usize)>(queue_capacity);
         let receiver = Mutex::new(receiver);
         std::thread::scope(|scope| {
-            for _ in 0..N_HELPERS {
+            for _ in 0..n_helpers {
                 scope.spawn(|| {
                     crate::set_utility_qos();
                     loop {
@@ -583,7 +595,13 @@ fn pipelined_commit(
                     off += len;
                 }
             };
-            transform(&mut codeword, &on_sub);
+            transform(
+                &mut codeword,
+                DeepPassHook {
+                    on_sub: &on_sub,
+                    caller_pool_only: e_core_hashing,
+                },
+            );
             drop(sender);
             // No more jobs can arrive; pull the queued tail onto the main
             // pool while already-claimed helper jobs complete concurrently.
@@ -764,13 +782,13 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
         // Hash finished deep sub-groups while the transform continues, as
         // the power-of-two commit does: same leaves, same tree.
         let ntt = AdditiveNttF128::standard(params.k_code());
-        return pipelined_commit(codeword, params, |codeword, on_sub| {
+        return pipelined_commit(codeword, params, |codeword, hook| {
             ntt.forward_transform_interleaved_live_from_layer_with(
                 codeword,
                 t,
                 live,
                 params.log_inv_rate,
-                Some(on_sub),
+                Some(hook),
             );
         });
     }
