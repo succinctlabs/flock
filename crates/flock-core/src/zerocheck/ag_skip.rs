@@ -111,20 +111,30 @@ pub fn d_inv() -> F128 {
 }
 
 /// Run one wide prover pass on the all-core (P+E) pool when it covers at
-/// least 64 MB and that pool is wider than the caller's.
+/// least 64 MB, the E-cluster is large enough to pay (see
+/// [`crate::ecore_rich_topology`]), and that pool is wider than the caller's.
 ///
 /// Round 1, the skip→mlv fold and the tail's wide passes are flat parallel
 /// maps over thousands of independent blocks with a single reduce: the shape
 /// that drains cleanly around slower E-cores, which is why the NTT's deep
 /// pass and large Merkle trees hop too. M4 (4P+6E), blake3_proof 2^18 on the
 /// 4-P-core pool: round 1 81 → 58 ms, fold 73 → 43, tail 55 → 34 (zerocheck +
-/// lincheck 245 → 170 ms). Pool choice cannot change output bits: every block
-/// writes only its own rows, and the reduce is exact field addition. A
-/// one-thread run stays on one thread (the all-core pool honours
-/// `RAYON_NUM_THREADS`).
+/// lincheck 245 → 170 ms). These passes are compute-bound like lincheck's
+/// partial fold, whose hop is a ~13% loss on 10P+4E, so this hop takes the
+/// same topology gate (`FLOCK_ALLCORE=1` overrides it for re-measurement).
+/// `ZC_PCORES_ONLY=1` keeps every pass on the caller's pool (kill switch and
+/// A/B toggle).
+///
+/// Pool choice cannot change output bits: every block writes only its own
+/// rows, and the reduce is exact field addition. A one-thread run stays on
+/// one thread (the all-core pool honours `RAYON_NUM_THREADS`).
 fn on_all_cores<T: Send>(bytes: usize, pass: impl FnOnce() -> T + Send) -> T {
     let pool = crate::all_core_pool();
-    if bytes >= (64 << 20) && pool.current_num_threads() > rayon::current_num_threads() {
+    if bytes >= (64 << 20)
+        && std::env::var_os("ZC_PCORES_ONLY").is_none()
+        && crate::ecore_rich_topology()
+        && pool.current_num_threads() > rayon::current_num_threads()
+    {
         pool.install(pass)
     } else {
         pass()
@@ -3069,11 +3079,15 @@ mod tests {
         }
     }
 
-    /// `on_all_cores` is invisible: a prove whose round 1, fold and first
-    /// tail pass all clear the 64 MB hop (m=28, a 72% live prefix, garbage
-    /// in the dead regions) gives the same proof, claims and `s_hat_v_c`
-    /// from a 2-thread pool, which hops onto the all-core pool, as from a
-    /// pool at least as wide as the all-core pool, which never hops.
+    /// `on_all_cores` is invisible: a prove whose round 1, fold and tail
+    /// passes all clear the 64 MB hop (m=28) gives the same proof, claims
+    /// and `s_hat_v_c` from a 2-thread pool, which hops onto the all-core
+    /// pool, as from a pool one thread wider than the all-core pool, which
+    /// never hops. The widths differ in every pass (2 or `all` against
+    /// `all + 1`), so this also catches output that depends on pool width.
+    /// Three witness shapes cover each fold and tail entry: a 72% live
+    /// prefix with garbage in the dead regions (sparse fold), full coverage
+    /// with one partial block (padded fold), and dense.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn all_core_hop_is_invisible() {
@@ -3085,18 +3099,13 @@ mod tests {
         let m = 28usize;
         let n_blocks = (1usize << m) >> 13;
         let live = n_blocks * 23 / 32;
-        let spec = PaddingSpec::from_runs(vec![
-            PaddingRun {
-                k_log: 13,
-                useful_bits_per_block: 1 << 13,
-                n_blocks: live,
-            },
-            PaddingRun {
-                k_log: 13,
-                useful_bits_per_block: 0,
-                n_blocks: n_blocks - live,
-            },
-        ]);
+        let run = |useful_bits_per_block: usize, n_blocks: usize| PaddingRun {
+            k_log: 13,
+            useful_bits_per_block,
+            n_blocks,
+        };
+        let sparse = PaddingSpec::from_runs(vec![run(1 << 13, live), run(0, n_blocks - live)]);
+        let padded = PaddingSpec::from_runs(vec![run(1 << 13, n_blocks - 1), run(3001, 1)]);
         let (a0, b0, c0) = random_witness(m, 0xA1);
         let cut = live << 10;
         let dirty = |v: &[u8], g: u8| -> Vec<u8> {
@@ -3105,35 +3114,41 @@ mod tests {
             v
         };
         let (a, b, c) = (dirty(&a0, 0xC3), dirty(&b0, 0x3C), dirty(&c0, 0xFF));
-        let prove_in = |threads: usize| {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap();
-            pool.install(|| {
-                prove_capture_s_hat_v_c_with_grinding(
-                    &a,
-                    &b,
-                    &c,
-                    m,
-                    &spec,
-                    ZerocheckGrinding::disabled(),
-                    &mut FsChallenger::new(b"flock-ag-all-core-test"),
-                )
-            })
-        };
-        let (p_hop, cl_hop, sv_hop) = prove_in(2);
-        let (p_stay, cl_stay, sv_stay) = prove_in(all);
-        assert_eq!(p_hop, p_stay, "proof bytes");
-        assert_eq!(cl_hop, cl_stay, "claims");
-        assert_eq!(sv_hop, sv_stay, "s_hat_v_c");
-        verify_with_grinding(
-            m,
-            &p_hop,
-            ZerocheckGrinding::disabled(),
-            &mut FsChallenger::new(b"flock-ag-all-core-test"),
-        )
-        .expect("the all-core proof verifies");
+        for (name, spec, (a, b, c)) in [
+            ("sparse", &sparse, (&a, &b, &c)),
+            ("padded", &padded, (&a0, &b0, &c0)),
+            ("dense", &PaddingSpec::dense(m), (&a0, &b0, &c0)),
+        ] {
+            let prove_in = |threads: usize| {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                pool.install(|| {
+                    prove_capture_s_hat_v_c_with_grinding(
+                        a,
+                        b,
+                        c,
+                        m,
+                        spec,
+                        ZerocheckGrinding::disabled(),
+                        &mut FsChallenger::new(b"flock-ag-all-core-test"),
+                    )
+                })
+            };
+            let (p_hop, cl_hop, sv_hop) = prove_in(2);
+            let (p_stay, cl_stay, sv_stay) = prove_in(all + 1);
+            assert_eq!(p_hop, p_stay, "{name}: proof bytes");
+            assert_eq!(cl_hop, cl_stay, "{name}: claims");
+            assert_eq!(sv_hop, sv_stay, "{name}: s_hat_v_c");
+            verify_with_grinding(
+                m,
+                &p_hop,
+                ZerocheckGrinding::disabled(),
+                &mut FsChallenger::new(b"flock-ag-all-core-test"),
+            )
+            .expect("the all-core proof verifies");
+        }
     }
 
     /// Full grinding roundtrip on the fused transcript + fused-nonce tamper
