@@ -35,8 +35,8 @@
 # Confirm anything structural with a full prove.
 #
 # The full prove now defaults to the AG zerocheck on aarch64 (-5.8% vs RS,
-# 2026-09-01); use BLAKE3_ZC=rs to drive the RS arm. Do NOT raise
-# FLOCK_SPARSE_GATE for AG — sparse is AG's optimum on both ST and MT.
+# 2026-09-01); use BLAKE3_ZC=rs to drive the RS arm. Sparse is AG's optimum
+# on both ST and MT; the tail gate is a constant (SPARSE_TAIL_GATE).
 set -u
 
 BENCH=""; CTL=""; PAIRS=3; ENVS=""; BARGS=""; PAT="(best)"; SECT=""

@@ -122,8 +122,8 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     // 866.6 median vs RS 894.8 / 919.7 — **−5.8%, AG 4/4**. Both arms run
     // the DEFAULT (sparse) tail gate: an earlier reading that sparse cost AG
     // 3.2× was a measurement artifact, and re-testing it paired shows AG
-    // sparse beating AG dense 4/4 (median −41.5 ms). Do not raise
-    // FLOCK_SPARSE_GATE for AG.
+    // sparse beating AG dense 4/4 (median −41.5 ms). The gate is a
+    // constant (`SPARSE_TAIL_GATE`); the env override was removed.
     //
     // `prove_fast_union_ag` is the same union commit / lincheck / merged
     // opening — only zerocheck round 1 differs — so `BLAKE3_ZC=rs` still

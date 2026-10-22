@@ -133,6 +133,9 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
 ///
 /// Returns the proof bundle, the witness commitment, and the two claims (which
 /// the verifier needs to know to check the openings).
+///
+/// This two-claim backend requires identity `C`. General-`C` relations need
+/// the deferred backend that routes the C claim through lincheck.
 pub fn prove_ligerito<Ch: Challenger>(
     r1cs: &BlockR1cs,
     z_packed: Vec<F128>,
@@ -146,6 +149,10 @@ pub fn prove_ligerito<Ch: Challenger>(
          (block-diagonal apply + lincheck stripe packing); batch-major \
          setups must use the per-hash prove_fast paths"
     );
+    assert!(
+        r1cs.c0_is_identity(),
+        "prove_ligerito currently requires identity C"
+    );
     assert_eq!(z_packed.len(), 1usize << (r1cs.m - 7));
     assert_eq!(pcs_params.m, r1cs.m);
 
@@ -156,24 +163,15 @@ pub fn prove_ligerito<Ch: Challenger>(
     let (commitment, prover_data) = commit(&z_packed, pcs_params);
     bind_statement(challenger, r1cs, &commitment);
 
-    // a = A·z, b = B·z; for the C = I convention c aliases z.
+    // a = A·z, b = B·z; c aliases z because C = I.
     let a_packed_f128 = r1cs.apply_a_packed(&z_packed);
     let b_packed_f128 = r1cs.apply_b_packed(&z_packed);
-    let c_packed_f128: Vec<F128> = if r1cs.c0_is_identity() {
-        Vec::new()
-    } else {
-        r1cs.apply_c_packed(&z_packed)
-    };
     let cast = |v: &[F128]| -> &[u8] {
         unsafe { from_raw_parts(v.as_ptr() as *const u8, size_of_val(v)) }
     };
     let a_packed: &[u8] = cast(&a_packed_f128);
     let b_packed: &[u8] = cast(&b_packed_f128);
-    let c_packed: &[u8] = if c_packed_f128.is_empty() {
-        cast(&z_packed)
-    } else {
-        cast(&c_packed_f128)
-    };
+    let c_packed: &[u8] = cast(&z_packed);
     let z_packed_lincheck = pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
 
     let padding = r1cs.padding_spec();

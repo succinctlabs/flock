@@ -1,0 +1,141 @@
+//! Selectors and interaction declarations.
+
+use super::{Bit, CircuitBuilder, Interaction, LinearExpr, RowId, ValueId};
+use crate::circuit::boolean::{
+    InteractionDirection, InteractionEncoding, InteractionField, InteractionScope, Selector,
+};
+
+impl CircuitBuilder {
+    /// Treat an existing materialized bit as a constraint/interaction guard.
+    /// This is a typed view and allocates nothing.
+    pub fn selector(&self, bit: Bit) -> Selector {
+        self.assert_circuit(bit.value.circuit);
+        Selector { bit }
+    }
+
+    /// Record a deferred global interaction. Its effective multiplicity is
+    /// `selector * decode_le(multiplicity)`. This references existing bits and
+    /// allocates no values, expressions, or constraint rows.
+    pub fn interaction(
+        &mut self,
+        channel: impl Into<String>,
+        kind: impl Into<String>,
+        direction: InteractionDirection,
+        message: impl IntoIterator<Item = InteractionField>,
+        multiplicity: impl IntoIterator<Item = Bit>,
+        selector: Selector,
+        scope: InteractionScope,
+    ) {
+        self.assert_circuit(selector.bit.value.circuit);
+        let message: Vec<InteractionField> = message.into_iter().collect();
+        for field in &message {
+            for value in &field.values {
+                self.assert_circuit(value.circuit);
+            }
+        }
+        let multiplicity: Vec<ValueId> = multiplicity
+            .into_iter()
+            .map(|bit| {
+                self.assert_circuit(bit.value.circuit);
+                bit.value
+            })
+            .collect();
+        self.interactions.push(Interaction {
+            channel: channel.into(),
+            kind: kind.into(),
+            direction,
+            message,
+            multiplicity,
+            selector: selector.bit.value,
+            scope,
+        });
+    }
+
+    /// Assert `selector * expression = 0`.
+    pub fn assert_when_zero(
+        &mut self,
+        selector: Selector,
+        expression: impl Into<LinearExpr>,
+    ) -> RowId {
+        self.assert_zero_product(selector, expression)
+    }
+
+    /// Assert equality only when `selector` is one.
+    pub fn assert_when_eq<L: Into<LinearExpr>, R: Into<LinearExpr>>(
+        &mut self,
+        selector: Selector,
+        lhs: L,
+        rhs: R,
+    ) -> RowId {
+        let difference = self.xor2(lhs, rhs);
+        self.assert_when_zero(selector, difference)
+    }
+
+    pub(super) fn validate_interactions(&self) {
+        for interaction in &self.interactions {
+            assert!(
+                !interaction.channel.is_empty(),
+                "interaction channel must not be empty"
+            );
+            assert!(
+                !interaction.kind.is_empty(),
+                "interaction kind must not be empty"
+            );
+            assert!(
+                !interaction.message.is_empty(),
+                "interaction message must not be empty"
+            );
+            assert!(
+                !interaction.scope.chip().is_empty(),
+                "interaction chip scope must not be empty"
+            );
+            assert!(
+                interaction.selector.circuit == self.id
+                    && interaction.selector.index < self.value_count,
+                "interaction selector is invalid"
+            );
+            assert!(
+                !interaction.multiplicity.is_empty(),
+                "interaction multiplicity must not be empty"
+            );
+            assert!(
+                interaction
+                    .multiplicity
+                    .iter()
+                    .all(|value| { value.circuit == self.id && value.index < self.value_count }),
+                "interaction multiplicity contains an invalid value"
+            );
+            for (field_index, field) in interaction.message.iter().enumerate() {
+                assert!(
+                    !field.name.is_empty(),
+                    "interaction field name must not be empty"
+                );
+                assert!(
+                    interaction.message[..field_index]
+                        .iter()
+                        .all(|other| other.name != field.name),
+                    "duplicate interaction field `{}`",
+                    field.name
+                );
+                assert!(!field.values.is_empty(), "interaction field is empty");
+                assert!(
+                    field.values.iter().all(|value| {
+                        value.circuit == self.id && value.index < self.value_count
+                    }),
+                    "interaction field contains an invalid value"
+                );
+                if let InteractionEncoding::LittleEndian { element_bits } = field.encoding {
+                    assert!(
+                        element_bits > 0,
+                        "interaction element width must be nonzero"
+                    );
+                    assert_eq!(
+                        field.values.len() % element_bits,
+                        0,
+                        "interaction field width is not a multiple of its element width"
+                    );
+                }
+            }
+        }
+    }
+}

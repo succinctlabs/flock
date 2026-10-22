@@ -386,12 +386,42 @@ pub struct ChainProof {
     pub(super) n_blocks: usize,
     /// What the leaf cost, split SETUP vs ONLINE — see [`Online`]. The
     /// LAST online iteration under steady repetition. Read by the in-file
-    /// `#[test]` benches only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `#[test]` benches and by [`ChainProof::online_ms`].
     pub(super) t: Online,
     /// One record per online iteration (1 + steady_reps of them).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) onlines: Vec<Online>,
+}
+
+/// A chain leaf's online phase timings in milliseconds: what a prover pays
+/// PER STATEMENT once the shape is cached. `wall_ms` is one timer around
+/// walk → witgen → prove; the three phases sum to a lower bound of it.
+/// Excludes the per-shape setup and the deferred-verify / discharge checks
+/// that [`build_chain_proof`] runs on its own output, which a prover never
+/// pays — so `n_blocks / wall_ms` is the honest compressions-per-second.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChainOnlineMs {
+    /// The chain compute itself: `n_blocks` native compressions through the
+    /// gate schedule — the application's own sequential work.
+    pub walk_ms: f64,
+    /// The bit-level trace of every compression, packed batch-major.
+    pub witgen_ms: f64,
+    /// Commit, zerocheck, lincheck, and the PCS open.
+    pub prove_ms: f64,
+    /// The measured online span, walk through prove.
+    pub wall_ms: f64,
+}
+
+impl ChainProof {
+    /// The leaf's online phase timings — see [`ChainOnlineMs`].
+    pub fn online_ms(&self) -> ChainOnlineMs {
+        ChainOnlineMs {
+            walk_ms: self.t.walk_ms,
+            witgen_ms: self.t.witgen_ms,
+            prove_ms: self.t.prove_ms,
+            wall_ms: self.t.wall_ms,
+        }
+    }
 }
 
 /// A chain leaf. The SHAPE build is per-shape setup (statement-independent
