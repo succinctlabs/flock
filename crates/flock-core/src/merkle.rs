@@ -3,7 +3,7 @@
 #[cfg(feature = "hash-count")]
 pub use flock_merkle::hash_count;
 pub use flock_merkle::{
-    Blake3MerkleHash, Hash, HashKind, MerkleHash, Sha256MerkleHash, blake3_sme2_available,
+    Blake3MerkleHash, Hash, HashKind, MerkleHash, Sha256MerkleHash, blake3_sme2_takes_leaves,
     cap_depth, cap_layer, hash_leaf, hash_leaves_serial, hash_pair, hash_parents_serial,
     merkle_proof, merkle_proof_capped, merkle_root, merkle_root_with, merkle_tree,
     merkle_tree_from_prehashed_level, merkle_tree_sequential, merkle_tree_sequential_with,

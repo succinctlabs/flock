@@ -504,15 +504,20 @@ fn blake3_sme2_prefix<'d, 'o>(
     }
 }
 
-/// Whether BLAKE3 hashing here runs on SME2 when a cluster's unit is free:
-/// Apple M4 and later, unless `FLOCK_NO_SME2=1`.
-pub fn blake3_sme2_available() -> bool {
+/// Whether BLAKE3 leaves of `leaf_size` bytes hash on SME2 when a cluster's
+/// unit is free: Apple M4 and later, unless `FLOCK_NO_SME2=1`, for a single
+/// chunk that is a whole number of 32-bit words.
+pub fn blake3_sme2_takes_leaves(leaf_size: usize) -> bool {
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     {
-        blake3_sme2::available()
+        let n_blocks = leaf_size.div_ceil(64);
+        blake3_leaf_size_is_batchable(leaf_size)
+            && blake3_sme2::takes(n_blocks, leaf_size - 64 * (n_blocks - 1))
+            && blake3_sme2::available()
     }
     #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
     {
+        let _ = leaf_size;
         false
     }
 }
@@ -912,6 +917,188 @@ mod tests {
             })
             .collect();
         assert_eq!(sme2(64, 64, (BLAKE3_PARENT, 0, 0), 64), want, "parents");
+    }
+
+    /// A storm of signals aimed at a thread inside the SME2 kernel must not
+    /// change a single hash. XNU runs the handler in streaming mode and the
+    /// Z registers come back cut to 128 bits; without `hash16`'s signal mask
+    /// this corrupts about half the hashes of every run.
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    #[test]
+    fn sme2_survives_signals() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        if !blake3_sme2::available() {
+            eprintln!("SME2 kernel unavailable on this host; skipped");
+            return;
+        }
+        unsafe extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+            fn pthread_kill(thread: usize, sig: i32) -> i32;
+            fn pthread_self() -> usize;
+        }
+        const SIGUSR1: i32 = 30;
+        static HANDLED: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn on_signal(_: i32) {
+            HANDLED.fetch_add(1, SeqCst);
+        }
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, SeqCst);
+            }
+        }
+        let (len, count) = (736usize, 16 * 4096);
+        let data: Vec<u8> = (0..(count * len) as u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+            .collect();
+        let want: Vec<Hash> = data.chunks(len).map(blake3_leaf_chaining_value).collect();
+        // SAFETY: the handler only bumps an atomic; the old one is restored.
+        let previous = unsafe { signal(SIGUSR1, on_signal as extern "C" fn(i32) as usize) };
+        let (stop, target, sent) = (
+            AtomicBool::new(false),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let bad = std::thread::scope(|s| {
+            let hasher = s.spawn(|| {
+                let _stop = StopOnDrop(&stop);
+                target.store(unsafe { pthread_self() }, SeqCst);
+                let mut bad = 0;
+                for _ in 0..16 {
+                    let mut out = vec![[0u8; 32]; count];
+                    // SAFETY: available; `data` holds `count` 736-byte leaves
+                    // and `out` `count` hashes.
+                    let ran = unsafe {
+                        blake3_sme2::hash16(
+                            data.as_ptr(),
+                            len,
+                            12,
+                            len - 64 * 11,
+                            0,
+                            BLAKE3_CHUNK_START,
+                            BLAKE3_CHUNK_END,
+                            out.as_mut_ptr().cast(),
+                            count / blake3_sme2::LANES,
+                        )
+                    };
+                    assert!(ran, "kernel refused");
+                    bad += out.iter().zip(&want).filter(|(a, b)| a != b).count();
+                }
+                bad
+            });
+            while target.load(SeqCst) == 0 {
+                std::hint::spin_loop();
+            }
+            while !stop.load(SeqCst) {
+                // SAFETY: the hasher thread is alive until `stop` is set.
+                unsafe { pthread_kill(target.load(SeqCst), SIGUSR1) };
+                sent.fetch_add(1, SeqCst);
+                for _ in 0..2000 {
+                    std::hint::spin_loop();
+                }
+            }
+            hasher.join().unwrap()
+        });
+        // SAFETY: restores the handler this test replaced.
+        unsafe { signal(SIGUSR1, previous) };
+        assert!(sent.load(SeqCst) > 100, "the storm never got going");
+        assert!(HANDLED.load(SeqCst) > 0, "no signal was delivered");
+        assert_eq!(bad, 0, "hashes corrupted by signals during the kernel");
+    }
+
+    /// The SME2 kernel reads nothing past a message's last byte. Every leaf
+    /// shape it takes, at strides `len + {0, 1, 3, 4, 13}` (so unaligned
+    /// rows), one to three groups, with the last message ending exactly at a
+    /// `PROT_NONE` page; then parents ending at that page and an unaligned
+    /// output pointer. Any over-read faults.
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    #[test]
+    fn sme2_reads_stay_in_bounds() {
+        if !blake3_sme2::available() {
+            eprintln!("SME2 kernel unavailable on this host; skipped");
+            return;
+        }
+        unsafe extern "C" {
+            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
+            -> *mut u8;
+            fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+            fn munmap(addr: *mut u8, len: usize) -> i32;
+        }
+        const PROT_NONE: i32 = 0;
+        const PROT_READ_WRITE: i32 = 3;
+        const MAP_PRIVATE_ANON: i32 = 0x2 | 0x1000;
+        const PAGE: usize = 16384;
+        let size = 64 * PAGE;
+        // SAFETY: a fresh anonymous mapping whose page after `size` is then
+        // made inaccessible; `buf` covers only the accessible part.
+        let buf = unsafe {
+            let base = mmap(
+                std::ptr::null_mut(),
+                size + PAGE,
+                PROT_READ_WRITE,
+                MAP_PRIVATE_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(base as isize, -1, "mmap");
+            assert_eq!(mprotect(base.add(size), PAGE, PROT_NONE), 0, "mprotect");
+            core::slice::from_raw_parts_mut(base, size)
+        };
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for b in buf.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (state >> 33) as u8;
+        }
+        // Hash `count` messages of `len` bytes `stride` apart, the last one
+        // ending at the guard page, and check each against `spec`.
+        let check = |len: usize,
+                     stride: usize,
+                     count: usize,
+                     flags: (u8, u8, u8),
+                     out_offset: usize,
+                     spec: &dyn Fn(&[u8]) -> Hash| {
+            let data = &buf[size - ((count - 1) * stride + len)..];
+            let n_blocks = len.div_ceil(64);
+            let mut out = vec![0u8; count * 32 + out_offset];
+            // SAFETY: available; `data` holds the `count` messages exactly and
+            // `out` `count` hashes past `out_offset`.
+            let ran = unsafe {
+                blake3_sme2::hash16(
+                    data.as_ptr(),
+                    stride,
+                    n_blocks,
+                    len - 64 * (n_blocks - 1),
+                    flags.0,
+                    flags.1,
+                    flags.2,
+                    out.as_mut_ptr().add(out_offset),
+                    count / blake3_sme2::LANES,
+                )
+            };
+            assert!(ran, "kernel refused");
+            for (i, got) in out[out_offset..].chunks(32).enumerate() {
+                let msg = &data[i * stride..i * stride + len];
+                assert_eq!(got, spec(msg), "len {len}, stride {stride}, message {i}");
+            }
+        };
+        let leaf = (0, BLAKE3_CHUNK_START, BLAKE3_CHUNK_END);
+        for len in (4..=1024).step_by(4) {
+            for stride in [0, 1, 3, 4, 13].map(|extra| len + extra) {
+                for count in [16, 32, 48] {
+                    check(len, stride, count, leaf, 0, &blake3_leaf_chaining_value);
+                }
+            }
+        }
+        let parent = |pair: &[u8]| {
+            let (l, r) = pair.split_at(32);
+            blake3_parent_chaining_value(l.try_into().unwrap(), r.try_into().unwrap())
+        };
+        check(64, 64, 48, (BLAKE3_PARENT, 0, 0), 0, &parent);
+        check(736, 736, 32, leaf, 3, &blake3_leaf_chaining_value);
+        // SAFETY: the mapping made above, no longer borrowed.
+        unsafe { munmap(buf.as_mut_ptr(), size + PAGE) };
     }
 
     /// The batched entry points route whole groups of sixteen to SME2 when

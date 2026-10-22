@@ -542,7 +542,8 @@ fn pipelined_commit(
         // Utility QoS steers the helpers off the P-cores the transform (and
         // the AB-prep join partner) occupy. Without SME2: two helpers (this
         // host's E-core count on M1 Max), and the deep pass also hops onto
-        // every core. With SME2 the E-cores hash instead of transforming: a
+        // every core. With SME2 and leaves it takes (whole words, at most 1 KiB:
+        // 64 lanes) the E-cores hash instead of transforming: a
         // helper on every core outside the caller's pool but one (left to
         // the OS; on M4 all six measured no better), one of them on the E-cluster's
         // SME2 unit (M4: 4.8 GB/s against 1.5 for an E-core's NEON), while
@@ -554,7 +555,7 @@ fn pipelined_commit(
         let spare_cores = crate::all_core_pool()
             .current_num_threads()
             .saturating_sub(current_num_threads());
-        let e_core_hashing = merkle::blake3_sme2_available() && spare_cores >= 2;
+        let e_core_hashing = merkle::blake3_sme2_takes_leaves(leaf_size) && spare_cores >= 2;
         let n_helpers = if e_core_hashing { spare_cores - 1 } else { 2 };
         // Shallow queue: bounds the unhashed (cache-warm) window; a full
         // queue makes the publisher hash inline on the transform worker.

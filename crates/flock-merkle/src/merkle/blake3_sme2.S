@@ -34,7 +34,9 @@
 // The hash entry point refuses (returns 0) if TPIDR2_EL0 is non-null, i.e. if a
 // caller's ZA contents are dormant awaiting a lazy save, so it never clobbers
 // live ZA. It saves d8-d15 (smstart and smstop zero the vector registers) and
-// leaves streaming mode and ZA off on return.
+// leaves streaming mode and ZA off on return. Callers must block signals around
+// the hash entry point: XNU runs a handler that interrupts streaming mode in
+// streaming mode and returns with the Z registers cut to 128 bits.
 
 .arch_extension sme2
 

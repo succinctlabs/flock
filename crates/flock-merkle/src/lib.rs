@@ -10,7 +10,7 @@ use rayon::current_num_threads;
 #[cfg(feature = "hash-count")]
 pub use crate::hashing::hash_count;
 pub use crate::hashing::{
-    Blake3MerkleHash, Hash, HashKind, MerkleHash, Sha256MerkleHash, blake3_sme2_available,
+    Blake3MerkleHash, Hash, HashKind, MerkleHash, Sha256MerkleHash, blake3_sme2_takes_leaves,
     hash_leaf, hash_leaves_serial, hash_pair, hash_parents_serial,
     merkle_tree_from_prehashed_level,
 };

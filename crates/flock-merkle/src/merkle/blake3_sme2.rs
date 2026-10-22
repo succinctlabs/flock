@@ -68,6 +68,14 @@ pub(super) fn available() -> bool {
 /// chaining values at `out + i * 32`. Returns `false`, having written
 /// nothing, if the kernel refuses because the caller's ZA state is dormant.
 ///
+/// Signals are blocked for the length of the call. XNU runs a handler that
+/// interrupts streaming mode still in streaming mode, and on return the Z
+/// registers keep only their low 128 bits, so a signal mid-kernel silently
+/// corrupts the hashes in flight (and a handler that touches Advanced SIMD
+/// dies with SIGILL: M4 has no FEAT_SME_FA64). A signal that arrives during
+/// the call is delivered when it returns. The mask costs ~275 ns per call,
+/// against ~110 µs for a 1024-leaf batch (`sme2_survives_signals`).
+///
 /// # Safety
 /// [`available`] must have returned `true`. `data` must hold
 /// `(groups * 16 - 1) * stride + (n_blocks - 1) * 64 + last_len` readable
@@ -87,8 +95,28 @@ pub(super) unsafe fn hash16(
     debug_assert!((1..=16).contains(&n_blocks));
     debug_assert!((4..=64).contains(&last_len) && last_len.is_multiple_of(4));
     let packed = flags as u32 | (flags_start as u32) << 8 | (flags_end as u32) << 16;
-    // SAFETY: forwarded from the caller.
-    unsafe { flock_blake3_sme2_hash16(data, stride, n_blocks, last_len, packed, out, groups) == 1 }
+    let mut old: SigSet = 0;
+    // SAFETY: both sets are valid `sigset_t`s (a `u32` on Darwin). The kernel
+    // cannot unwind, so the mask is always restored. Blocking a synchronous
+    // fault signal is harmless: a fault in the kernel is fatal either way.
+    unsafe {
+        pthread_sigmask(SIG_BLOCK, &ALL_SIGNALS, &raw mut old);
+        // SAFETY: forwarded from the caller.
+        let hashed =
+            flock_blake3_sme2_hash16(data, stride, n_blocks, last_len, packed, out, groups) == 1;
+        pthread_sigmask(SIG_SETMASK, &old, std::ptr::null_mut());
+        hashed
+    }
+}
+
+/// Darwin's `sigset_t`, and the `how` values of `pthread_sigmask`.
+type SigSet = u32;
+const SIG_BLOCK: i32 = 1;
+const SIG_SETMASK: i32 = 3;
+const ALL_SIGNALS: SigSet = !0;
+
+unsafe extern "C" {
+    fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
 }
 
 /// Whether the kernel takes messages of this shape: whole 32-bit words in a
