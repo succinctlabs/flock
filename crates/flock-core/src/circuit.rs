@@ -90,6 +90,7 @@ use crate::{
     union::UnionInstance,
     zerocheck::univariate_skip::build_eq,
 };
+pub mod boolean;
 pub mod builder;
 
 /// Domain label of the circuit digest — versioned, since the digest covers the

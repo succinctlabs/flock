@@ -151,7 +151,10 @@ pub struct TableType {
     /// and the state in which this type absorbs no schema bytes into
     /// [`Registry::digest`]. The order is the type's contribution to the
     /// cell-slot enumeration ([`crate::circuit::CellSpace`]), so it is
-    /// digest-visible and must not be permuted casually.
+    /// digest-visible and must not be permuted casually. Inputs must form a
+    /// prefix and outputs a suffix; [`Registry::new`] enforces this because
+    /// circuit builders use those two contiguous regions as gate arguments
+    /// and results.
     pub io_schema: Vec<IoWord>,
 }
 
@@ -356,7 +359,14 @@ impl Registry {
             // it).
             let used_cols = ty.used_word_cols();
             let mut seen = BTreeSet::new();
+            let mut saw_output = false;
             for w in &ty.io_schema {
+                match w.dir {
+                    IoDirection::In => {
+                        assert!(!saw_output, "IO schema inputs must precede outputs")
+                    }
+                    IoDirection::Out => saw_output = true,
+                }
                 assert!(
                     w.word_col < used_cols,
                     "IO schema word-column {} is outside the type's {used_cols} used columns",
@@ -1187,13 +1197,22 @@ mod tests {
         let mk = |schema: Vec<IoWord>| {
             Registry::new(vec![ty(10, 700).with_io_schema(schema), ty(9, 300)], 3).digest()
         };
-        let base = mk(vec![IoWord::input(0), IoWord::output(2)]);
+        let base = mk(vec![IoWord::input(0), IoWord::input(1), IoWord::output(2)]);
         let cases = [
             ("presence", mk(Vec::new())),
-            ("entry count", mk(vec![IoWord::input(0)])),
-            ("word column", mk(vec![IoWord::input(1), IoWord::output(2)])),
-            ("direction", mk(vec![IoWord::output(0), IoWord::output(2)])),
-            ("order", mk(vec![IoWord::output(2), IoWord::input(0)])),
+            ("entry count", mk(vec![IoWord::input(0), IoWord::output(2)])),
+            (
+                "word column",
+                mk(vec![IoWord::input(0), IoWord::input(3), IoWord::output(2)]),
+            ),
+            (
+                "direction",
+                mk(vec![IoWord::input(0), IoWord::output(1), IoWord::output(2)]),
+            ),
+            (
+                "order",
+                mk(vec![IoWord::input(1), IoWord::input(0), IoWord::output(2)]),
+            ),
         ];
         for (what, d) in cases {
             assert_ne!(base, d, "digest insensitive to {what}");
@@ -1202,7 +1221,11 @@ mod tests {
         let other = Registry::new(
             vec![
                 ty(10, 700),
-                ty(9, 300).with_io_schema(vec![IoWord::input(0), IoWord::output(2)]),
+                ty(9, 300).with_io_schema(vec![
+                    IoWord::input(0),
+                    IoWord::input(1),
+                    IoWord::output(2),
+                ]),
             ],
             3,
         );
@@ -1227,6 +1250,15 @@ mod tests {
     fn io_schema_duplicate_word_column() {
         Registry::new(
             vec![ty(9, 300).with_io_schema(vec![IoWord::input(1), IoWord::output(1)])],
+            3,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "IO schema inputs must precede outputs")]
+    fn io_schema_rejects_input_after_output() {
+        Registry::new(
+            vec![ty(9, 300).with_io_schema(vec![IoWord::output(0), IoWord::input(1)])],
             3,
         );
     }
