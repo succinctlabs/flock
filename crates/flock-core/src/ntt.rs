@@ -8,7 +8,7 @@
 //! that batch a/b/c with shared twiddles can be added later if the round-1 univariate round message
 //! hot path needs them.
 
-pub use additive_ntt_f128::AdditiveNttF128;
+pub use additive_ntt_f128::{AdditiveNttF128, DeepPassHook};
 pub use inv_table::InvNttTableByteSingleGf8;
 
 use crate::field::F8;

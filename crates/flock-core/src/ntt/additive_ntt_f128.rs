@@ -129,6 +129,22 @@ fn span_get(basis: &[F128], idx: usize) -> F128 {
     acc
 }
 
+/// The deep pass's per-sub-group completion hook, for streaming commits.
+///
+/// `on_sub(start_element, sub)` runs inside the deep pass's task right after
+/// that sub-group's final layer, while its lines are still cache-hot.
+/// Positions in a sub-group are final once its deep loop ends (all remaining
+/// layers pair within the sub-group), so the hook sees finished codeword data.
+/// Fallback paths (scalar / no deep split) invoke it once over the whole
+/// buffer.
+#[derive(Clone, Copy)]
+pub struct DeepPassHook<'a> {
+    pub on_sub: &'a (dyn Fn(usize, &[F128]) + Sync),
+    /// Keep the deep pass on the caller's pool rather than hopping to the
+    /// all-core pool, leaving the other cores to whatever consumes the hook.
+    pub caller_pool_only: bool,
+}
+
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
 ///
 /// The basis is `{1, x, x², …, x^(ℓ-1)}` in F_{2^128} = F_2[x]/(GHASH-poly).
@@ -398,7 +414,7 @@ impl AdditiveNttF128 {
         data: &mut [F128],
         msg: &[F128],
         num_ntts: usize,
-        on_sub: Option<&(dyn Fn(usize, &[F128]) + Sync)>,
+        hook: Option<DeepPassHook<'_>>,
     ) {
         let n_total = data.len();
         assert!(num_ntts.is_power_of_two() && num_ntts > 0);
@@ -419,7 +435,7 @@ impl AdditiveNttF128 {
             && self.interleaved_n_top(log_d, num_ntts) <= 10
         {
             self.ranked_top_from_message(msg, data, num_ntts);
-            self.forward_transform_interleaved_parallel_from_layer_with(data, num_ntts, 10, on_sub);
+            self.forward_transform_interleaved_parallel_from_layer_with(data, num_ntts, 10, hook);
             return;
         }
 
@@ -443,7 +459,7 @@ impl AdditiveNttF128 {
                 data,
                 num_ntts,
                 start_layer,
-                on_sub,
+                hook,
             );
             return;
         }
@@ -472,7 +488,7 @@ impl AdditiveNttF128 {
             data,
             num_ntts,
             start_layer + 2,
-            on_sub,
+            hook,
         );
     }
 
@@ -510,6 +526,28 @@ impl AdditiveNttF128 {
         live: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_live_from_layer_with(
+            data,
+            num_ntts,
+            live,
+            start_layer,
+            None,
+        );
+    }
+
+    /// [`Self::forward_transform_interleaved_live_from_layer`] with the deep
+    /// pass's per-sub-group completion hook (see
+    /// [`Self::forward_transform_interleaved_parallel_from_layer_with`]) —
+    /// the streaming integer-lane commit. An all-dead transform hands the
+    /// hook the whole (already final) buffer once.
+    pub fn forward_transform_interleaved_live_from_layer_with(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        live: usize,
+        start_layer: usize,
+        hook: Option<DeepPassHook<'_>>,
+    ) {
         // `num_ntts` may be any positive integer (integer-lane commit): the
         // per-lane butterfly kernels iterate over the lane stride, and the
         // SIMD kernels handle the `num_ntts % SIMD_WIDTH` tail lanes with the
@@ -530,7 +568,11 @@ impl AdditiveNttF128 {
             "dead lanes must be identically zero"
         );
         if live == 0 {
-            return; // an all-zero message's codeword is already in place
+            // An all-zero message's codeword is already in place.
+            if let Some(hook) = hook {
+                (hook.on_sub)(0, data);
+            }
+            return;
         }
 
         // Scalar; SIMD/parallel variants below dispatch from `forward_transform_interleaved`
@@ -540,7 +582,7 @@ impl AdditiveNttF128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         {
-            self.interleaved_parallel_live_from_layer(data, num_ntts, live, start_layer, None);
+            self.interleaved_parallel_live_from_layer(data, num_ntts, live, start_layer, hook);
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -548,6 +590,9 @@ impl AdditiveNttF128 {
         )))]
         {
             self.interleaved_scalar_live_from_layer(data, num_ntts, live, start_layer);
+            if let Some(hook) = hook {
+                (hook.on_sub)(0, data);
+            }
         }
     }
 
@@ -636,31 +681,20 @@ impl AdditiveNttF128 {
     }
 
     /// [`Self::forward_transform_interleaved_parallel_from_layer`] with an
-    /// optional per-sub-group completion hook: `on_sub(start_element, sub)`
-    /// runs inside the deep pass's task right after that sub-group's final
-    /// layer, while its lines are still cache-hot. Positions in a sub-group
-    /// are final once its deep loop ends (all remaining layers pair within
-    /// the sub-group), so the hook sees finished codeword data. Fallback
-    /// paths (scalar / no deep split) invoke it once over the whole buffer.
+    /// optional per-sub-group completion hook (see [`DeepPassHook`]).
     pub fn forward_transform_interleaved_parallel_from_layer_with(
         &self,
         data: &mut [F128],
         num_ntts: usize,
         start_layer: usize,
-        on_sub: Option<&(dyn Fn(usize, &[F128]) + Sync)>,
+        hook: Option<DeepPassHook<'_>>,
     ) {
         #[cfg(any(
             all(target_arch = "aarch64", target_feature = "aes"),
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         {
-            self.interleaved_parallel_live_from_layer(
-                data,
-                num_ntts,
-                num_ntts,
-                start_layer,
-                on_sub,
-            );
+            self.interleaved_parallel_live_from_layer(data, num_ntts, num_ntts, start_layer, hook);
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -670,8 +704,8 @@ impl AdditiveNttF128 {
             // Portable targets have no deep split: transform in place and
             // hand the hook the whole finished buffer once.
             self.interleaved_scalar_live_from_layer(data, num_ntts, num_ntts, start_layer);
-            if let Some(cb) = on_sub {
-                cb(0, data);
+            if let Some(hook) = hook {
+                (hook.on_sub)(0, data);
             }
         }
     }
@@ -691,7 +725,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         live: usize,
         start_layer: usize,
-        on_sub: Option<&(dyn Fn(usize, &[F128]) + Sync)>,
+        hook: Option<DeepPassHook<'_>>,
     ) {
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
@@ -699,8 +733,8 @@ impl AdditiveNttF128 {
         let n_top = self.interleaved_n_top(log_d, num_ntts);
         if n_top == 0 || log_d < 8 {
             self.interleaved_scalar_live_from_layer(data, num_ntts, live, start_layer);
-            if let Some(cb) = on_sub {
-                cb(0, data);
+            if let Some(hook) = hook {
+                (hook.on_sub)(0, data);
             }
             return;
         }
@@ -887,8 +921,8 @@ impl AdditiveNttF128 {
                             layer += 1;
                         }
                     }
-                    if let Some(cb) = on_sub {
-                        cb(sub_base, sub_data);
+                    if let Some(hook) = hook {
+                        (hook.on_sub)(sub_base, sub_data);
                     }
                 });
         };
@@ -902,11 +936,13 @@ impl AdditiveNttF128 {
         // drain (≥ 4× workers) and ≥ 64 MB of data so the pool switch and
         // E-core L2 pressure can't hurt small/recursive commits.
         let n_subs = data.len() / sub_bytes;
-        let use_all_cores = std::mem::size_of_val(data) >= (64 << 20) && {
-            let pool = all_core_pool();
-            pool.current_num_threads() > current_num_threads()
-                && n_subs >= 4 * pool.current_num_threads()
-        };
+        let use_all_cores = !hook.is_some_and(|h| h.caller_pool_only)
+            && std::mem::size_of_val(data) >= (64 << 20)
+            && {
+                let pool = all_core_pool();
+                pool.current_num_threads() > current_num_threads()
+                    && n_subs >= 4 * pool.current_num_threads()
+            };
         if use_all_cores {
             all_core_pool().install(|| deep(data));
         } else {
