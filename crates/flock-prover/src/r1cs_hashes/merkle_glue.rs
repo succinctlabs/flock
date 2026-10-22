@@ -133,8 +133,9 @@ fn scatter_zab(
 /// copy-free assembly path ([`flock_core::union::SlotWitnessDest`]'s
 /// contract, mirroring `common::drive_witness_batch_major_partial_into`):
 /// live rows' words are written at their BatchMajor addresses; under
-/// `elide_padding_writes` the dummy remainder is skipped (already zero, or
-/// dirty-but-unread per the mode), otherwise the whole block is zero-filled
+/// `elide_padding_writes` the all-dummy groups are skipped (already zero, or
+/// dirty-but-unread per the mode) while the trailing partial group still
+/// zero-flushes its dead lanes, otherwise the whole block is zero-filled
 /// first. The stripe is pooled; only the groups the count-proportional
 /// lincheck reads are cleared under elide.
 pub(crate) fn scatter_zab_into(
@@ -162,6 +163,19 @@ pub(crate) fn scatter_zab_into(
     if !elide_padding_writes {
         for buf in [&mut *z, &mut *a, &mut *b] {
             buf.par_chunks_mut(1 << 16).for_each(|c| c.fill(F128::ZERO));
+        }
+    } else {
+        // Elision covers the all-dummy groups only. The trailing partial
+        // group's dead lanes are READ even on a dirty pooled destination: the
+        // RS zerocheck's round 1 takes whole 512-bit sub-windows (4 rows of a
+        // chunk-column) up to the last live row, so stale words there break
+        // the proof.
+        let live_rows = per_row.len().next_multiple_of(8);
+        for w in 0..words_per_block {
+            let column = w << nu;
+            for buf in [&mut *z, &mut *a, &mut *b] {
+                buf[column + per_row.len()..column + live_rows].fill(F128::ZERO);
+            }
         }
     }
     for (i, [pz, pa, pb]) in per_row.iter().enumerate() {
