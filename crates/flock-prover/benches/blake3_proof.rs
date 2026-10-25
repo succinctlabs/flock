@@ -245,7 +245,9 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
                 });
                 let bundle =
                     flock_prover::proof_io::R1csProofBundleLigeritoAg { commitment, proof };
-                report(peak, verify, bundle.to_bytes().len());
+                let bytes = bundle.to_bytes();
+                println!("  proof digest: {}", blake3::hash(&bytes).to_hex());
+                report(peak, verify, bytes.len());
                 black_box(&bundle);
             }
         } else {

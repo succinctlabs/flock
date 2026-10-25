@@ -1933,6 +1933,7 @@ pub fn lookahead_msg_second(q: &LookaheadSums, rho: F128) -> (F128, F128) {
 /// position against the 16 of "8 reduced products, then 8 unreduced eq
 /// weightings". Exact: every product is bilinear, so `(eq·a)·b = eq·(a·b)` in
 /// the field, and the unreduced accumulators reduce to the same sums.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
 #[inline(always)]
 pub(crate) fn lookahead_accum(
     ga: &[F128; 4],
@@ -1967,6 +1968,94 @@ pub(crate) fn lookahead_finish(s: [F128; 8]) -> LookaheadSums {
         sinf0,
         s1: [c0, t11 + c0 + c2, c2],
         sinf: [d0, dt + d0 + d2, d2],
+    }
+}
+
+/// NEON-resident body of one [`lookahead_pass!`] chunk: the folds are
+/// `mul_q` in q registers, the four `a` values are eq-scaled with `mul_q`,
+/// and the eight products accumulate in [`WideNeon`] registers — the
+/// [`lookahead_accum`] sums with no F128 register-file round trip per value.
+/// `PER_U` 8 folds one pending variable (`rhos.0`), 16 folds two.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn lookahead_chunk_neon<const PER_U: usize>(
+    a: &[F128],
+    b: &[F128],
+    ao: &mut [F128],
+    bo: &mut [F128],
+    base_u: usize,
+    eq_lo: &[F128],
+    rhos: (F128, F128),
+) -> [F256Unreduced; 8] {
+    use crate::field::gf2_128::aarch64::{WideNeon, mul_q, wide_mul_unreduced_q};
+    use core::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64};
+    unsafe {
+        let ld = |p: *const F128| vld1q_u64(p as *const u64);
+        let r0 = ld(&rhos.0);
+        let r1 = ld(&rhos.1);
+        let fold = |p: *const F128| -> uint64x2_t {
+            let e0 = ld(p);
+            let e1 = ld(p.add(1));
+            let x0 = veorq_u64(e0, mul_q(r0, veorq_u64(e0, e1)));
+            if PER_U == 16 {
+                let e2 = ld(p.add(2));
+                let e3 = ld(p.add(3));
+                let x1 = veorq_u64(e2, mul_q(r0, veorq_u64(e2, e3)));
+                veorq_u64(x0, mul_q(r1, veorq_u64(x0, x1)))
+            } else {
+                x0
+            }
+        };
+        let mut acc = [WideNeon::zero(); 8];
+        let (ap, bp) = (a.as_ptr(), b.as_ptr());
+        let (aop, bop) = (ao.as_mut_ptr() as *mut u64, bo.as_mut_ptr() as *mut u64);
+        for u_lo in 0..ao.len() / 4 {
+            let base = (base_u + u_lo) * PER_U;
+            let q = PER_U / 4;
+            let a00 = fold(ap.add(base));
+            let a10 = fold(ap.add(base + q));
+            let a01 = fold(ap.add(base + 2 * q));
+            let a11 = fold(ap.add(base + 3 * q));
+            let b00 = fold(bp.add(base));
+            let b10 = fold(bp.add(base + q));
+            let b01 = fold(bp.add(base + 2 * q));
+            let b11 = fold(bp.add(base + 3 * q));
+            let o = 8 * u_lo;
+            vst1q_u64(aop.add(o), a00);
+            vst1q_u64(aop.add(o + 2), a10);
+            vst1q_u64(aop.add(o + 4), a01);
+            vst1q_u64(aop.add(o + 6), a11);
+            vst1q_u64(bop.add(o), b00);
+            vst1q_u64(bop.add(o + 2), b10);
+            vst1q_u64(bop.add(o + 4), b01);
+            vst1q_u64(bop.add(o + 6), b11);
+            let w = ld(eq_lo.as_ptr().add(u_lo));
+            let (e00, e10, e01, e11) = (mul_q(w, a00), mul_q(w, a10), mul_q(w, a01), mul_q(w, a11));
+            let sxa0 = veorq_u64(e00, e10);
+            let sxb0 = veorq_u64(b00, b10);
+            let sxa1 = veorq_u64(e01, e11);
+            let sxb1 = veorq_u64(b01, b11);
+            let dca = veorq_u64(e00, e01);
+            let dcb = veorq_u64(b00, b01);
+            let dsa = veorq_u64(sxa0, sxa1);
+            let dsb = veorq_u64(sxb0, sxb1);
+            acc[0].xor_assign(wide_mul_unreduced_q(e10, b10));
+            acc[1].xor_assign(wide_mul_unreduced_q(sxa0, sxb0));
+            acc[2].xor_assign(wide_mul_unreduced_q(e01, b01));
+            acc[3].xor_assign(wide_mul_unreduced_q(e11, b11));
+            acc[4].xor_assign(wide_mul_unreduced_q(sxa1, sxb1));
+            acc[5].xor_assign(wide_mul_unreduced_q(dca, dcb));
+            acc[6].xor_assign(wide_mul_unreduced_q(
+                veorq_u64(dca, dsa),
+                veorq_u64(dcb, dsb),
+            ));
+            acc[7].xor_assign(wide_mul_unreduced_q(dsa, dsb));
+        }
+        let mut out = [F256Unreduced::ZERO; 8];
+        for k in 0..8 {
+            out[k] = acc[k].to_unreduced();
+        }
+        out
     }
 }
 
@@ -2014,9 +2103,18 @@ macro_rules! lookahead_pass {
                 .zip(b_out.par_chunks_mut(4 * lo_size))
                 .enumerate()
                 .map(|(u_hi, (ao, bo))| {
-                    let mut acc = [F256Unreduced::ZERO; 8];
                     let base_u = u_hi * lo_size;
+                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                    let acc = {
+                        let _ = &fold;
+                        // SAFETY: aes is statically enabled; the slices are
+                        // in range by the length asserts above.
+                        unsafe { lookahead_chunk_neon::<PER_U>(a, b, ao, bo, base_u, &eq_lo, rhos) }
+                    };
+                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+                    let mut acc = [F256Unreduced::ZERO; 8];
                     // A prefix's last chunk may be partial.
+                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
                     for u_lo in 0..ao.len() / 4 {
                         let u = base_u + u_lo;
                         let mut ga = [F128::ZERO; 4];
