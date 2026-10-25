@@ -38,13 +38,19 @@ run_bench() {
 	local threads="$1"
 	echo
 	echo "=== hash throughput: ${threads} thread(s), batches 2^[${LOG2S}] ==="
-	(
-		cd "$ROOT"
-		RAYON_NUM_THREADS="$threads" \
-			HASH_BENCH_LOG2S="$LOG2S" \
-			HASH_BENCH_RUNS="$RUNS" \
-			cargo bench --bench hash_throughput
-	) 2>&1 | tee "$work/run-${threads}.log"
+	# One process per batch size: the scratch pool keeps the buffers of
+	# earlier (smaller) sizes resident, which pushed the largest SHA-256 batch
+	# into memory pressure (2^18: 2.4 s in a shared process vs 0.82 s alone on
+	# a 36 GiB M4 Max).
+	for log2 in $LOG2S; do
+		(
+			cd "$ROOT"
+			RAYON_NUM_THREADS="$threads" \
+				HASH_BENCH_LOG2S="$log2" \
+				HASH_BENCH_RUNS="$RUNS" \
+				cargo bench --bench hash_throughput
+		) 2>&1 | tee -a "$work/run-${threads}.log"
+	done
 	awk -F '\t' '$1 == "RESULT"' "$work/run-${threads}.log" >> "$results"
 }
 
