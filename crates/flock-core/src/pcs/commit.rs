@@ -712,6 +712,31 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
     }
     let codeword_len = params.n_positions() * t;
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    // RANKED TOP: with every lane live and the rate-1/2 radix-8 shape, the
+    // transposed message is built ONCE (half the replicate fill's writes) and
+    // the dual-destination first pass sources both replicas from it — the
+    // fill and the first top sweep's re-read are gone. Same butterflies,
+    // byte-identical codeword.
+    let ntt = AdditiveNttF128::standard(params.k_code());
+    let log_d = params.k_code();
+    if live == t && ntt.ranked_top_from_message_applies(log_d, t, 1 << params.log_inv_rate) {
+        let t_fill = std::time::Instant::now();
+        let mut msg = crate::scratch::take_f128(t * d);
+        replicate_lane_major_fill(&mut msg, q, t, d);
+        let t_fill = t_fill.elapsed();
+        let mut codeword = crate::scratch::take_f128(codeword_len);
+        let t_ntt = std::time::Instant::now();
+        ntt.forward_transform_interleaved_from_message_with(&mut codeword, &msg, t, None);
+        if timing {
+            eprintln!(
+                "[commit-timing] transpose {:.2} ms | ranked ntt: {:.2} ms",
+                t_fill.as_secs_f64() * 1e3,
+                t_ntt.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        crate::scratch::give_f128(msg);
+        return commit_merkle(codeword, params);
+    }
     let t_take = std::time::Instant::now();
     let mut codeword = crate::scratch::take_f128(codeword_len);
     let t_take = t_take.elapsed();
