@@ -1137,6 +1137,13 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
                 }
             };
 
+            if trace {
+                eprintln!(
+                    "  [prove_union]   zerocheck: {:7.2} ms",
+                    t_bool.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            let t_lc = Instant::now();
             let x_ab = union.x_ab_from_multilinear_values(z_skip, &mlv_challenges);
 
             // M2: the union-column lincheck — one sumcheck over the boolean
@@ -1158,6 +1165,12 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
                 challenger,
             );
 
+            if trace {
+                eprintln!(
+                    "  [prove_union]   lincheck: {:7.2} ms",
+                    t_lc.elapsed().as_secs_f64() * 1e3
+                );
+            }
             let ab = ZClaim {
                 point: union.ab_claim_point(
                     lc_claim.r_inner_skip,
