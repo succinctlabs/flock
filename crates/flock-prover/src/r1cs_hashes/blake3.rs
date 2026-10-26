@@ -2086,6 +2086,76 @@ pub fn generate_witness_batch_major_partial_into(
     )
 }
 
+/// One BLAKE3 compression as a wiring-layer gate type, wired as
+/// [`io_schema`] lays out: inputs `cv` (2 words), `m` (4 words) and the
+/// params word ([`params_word`]), outputs `out_lo` (2 words, the next
+/// chaining value) and `out_hi` (2 words). The relation pins none of the
+/// inputs, so a circuit wires `cv` and the params word to constants or to
+/// other gates' outputs.
+pub struct Blake3Gate {
+    pub nu: usize,
+}
+
+/// The params word: the 64-bit block counter in `lo`; `block_len` in the low
+/// half of `hi` and `flags` in its high half.
+pub fn params_word(counter: u64, block_len: u32, flags: u32) -> F128 {
+    F128::new(counter, block_len as u64 | (flags as u64) << 32)
+}
+
+/// Eight `u32`s as two words, four little-endian `u32`s per word.
+fn pack_u32x8(w: &[u32]) -> [F128; 2] {
+    let word = |w: &[u32]| {
+        F128::new(
+            w[0] as u64 | (w[1] as u64) << 32,
+            w[2] as u64 | (w[3] as u64) << 32,
+        )
+    };
+    [word(&w[..4]), word(&w[4..8])]
+}
+
+fn unpack_u32x4(v: F128) -> [u32; 4] {
+    [
+        v.lo as u32,
+        (v.lo >> 32) as u32,
+        v.hi as u32,
+        (v.hi >> 32) as u32,
+    ]
+}
+
+impl flock_core::circuit::builder::GateType for Blake3Gate {
+    type Row = Compression;
+    type Hint = ();
+
+    fn table(&self) -> flock_core::schedule::TableType {
+        flock_core::schedule::TableType::from_block_r1cs(&build_block_r1cs(self.nu))
+            .with_io_schema(io_schema())
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Compression {
+        let mut cv = [0u32; 8];
+        cv[..4].copy_from_slice(&unpack_u32x4(inputs[0]));
+        cv[4..].copy_from_slice(&unpack_u32x4(inputs[1]));
+        let mut m = [0u32; 16];
+        for (i, chunk) in m.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *chunk = unpack_u32x4(inputs[2 + i]);
+        }
+        let params = inputs[6];
+        let (counter, block_len, flags) = (params.lo, params.hi as u32, (params.hi >> 32) as u32);
+        let out = flock_hash::blake3_compress(&cv, &m, counter, block_len, flags);
+        outputs.extend(pack_u32x8(&out[..8]));
+        outputs.extend(pack_u32x8(&out[8..]));
+        (cv, m, counter, block_len, flags)
+    }
+
+    fn witness(
+        &self,
+        _rows: &[Compression],
+        _nu: usize,
+    ) -> flock_core::circuit::builder::SlotWitness {
+        flock_core::circuit::builder::SlotWitness::DeferredToRows
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{array::from_fn, collections::HashSet};
