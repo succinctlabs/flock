@@ -63,14 +63,32 @@ Throughput in thousands of hashes per second (`k hashes/s`; higher is better):
 | BLAKE3 | 65536 | 64.8 | 540.4 |
 | BLAKE3 | 262144 | 64.8 | 629.8 |
 
-The figures measure the full default Ligerito `prove_fast` path, including
-witness generation and proof construction. SHA-256 and BLAKE3 count compression
+Hash proving throughput on an **Apple M4 Max** (10 performance + 4 efficiency
+cores, 36 GB RAM), measured on macOS on 2026-10-25 with the AG zerocheck (the
+aarch64 default). Multi-threaded runs use the 10 performance cores:
+
+| Hash | Batch | 1T | 10T |
+|---|---:|---:|---:|
+| SHA-256 | 1024 | 12.6 | 54.7 |
+| SHA-256 | 4096 | 30.9 | 156.0 |
+| SHA-256 | 16384 | 43.2 | 262.7 |
+| SHA-256 | 65536 | 56.5 | 431.7 |
+| SHA-256 | 262144 | 58.2 | 497.9 |
+| BLAKE3 | 1024 | 19.2 | 84.0 |
+| BLAKE3 | 4096 | 52.1 | 228.0 |
+| BLAKE3 | 16384 | 68.0 | 384.7 |
+| BLAKE3 | 65536 | 118.9 | 817.1 |
+| BLAKE3 | 262144 | 123.1 | 957.7 |
+
+The figures measure the full default prover — the union AG zerocheck on
+aarch64, the RS zerocheck (`prove_fast`) elsewhere — including witness
+generation and proof construction. SHA-256 and BLAKE3 count compression
 functions. “Batch” is the number of
 independent hash operations proved together. Each value is the best of three
 measured proofs after one untimed warm-up; the warm-up proof is also verified.
 The SHA-256 and
-BLAKE3 encoders have shrunk substantially since this table was measured
-(2026-08-14 zk.golf-derived fused adders), so current numbers run higher —
+BLAKE3 encoders have shrunk substantially since the x86-64 table was measured
+(2026-08-14 zk.golf-derived fused adders), so current numbers there run higher —
 regenerate before quoting.
 
 Regenerate the complete table with:

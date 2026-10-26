@@ -1,8 +1,10 @@
 //! Reproducible headline proving-throughput matrix for the README.
 //!
-//! Measures SHA-256 compressions and BLAKE3 compressions. Thread count is controlled through
-//! `RAYON_NUM_THREADS`; `benchmarks/bench_hash_throughput.sh` runs the complete
-//! single- and multi-threaded matrix and renders it as Markdown.
+//! Measures SHA-256 compressions and BLAKE3 compressions with the default
+//! prover: the union AG zerocheck on aarch64, the RS zerocheck elsewhere.
+//! Thread count is controlled through `RAYON_NUM_THREADS`;
+//! `benchmarks/bench_hash_throughput.sh` runs the complete single- and
+//! multi-threaded matrix and renders it as Markdown.
 
 use std::{
     array::from_fn,
@@ -76,18 +78,36 @@ fn bench_sha2(batch: usize, runs: usize) {
         })
         .collect();
 
-    let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
-    let (proof, commitment, _) = setup.prove_fast(&input_sets[0], &mut challenger);
-    let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
-    setup
-        .verify(&commitment, &proof, &mut challenger)
-        .expect("SHA-256 warm-up proof failed verification");
-    black_box(proof);
-
-    let best = best_of(&input_sets, runs, |inputs| {
+    // The default prover: the AG zerocheck on aarch64 (its round-1 kernel
+    // is NEON-only), the RS zerocheck elsewhere.
+    #[cfg(target_arch = "aarch64")]
+    let best = {
         let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
-        setup.prove_fast(inputs, &mut challenger)
-    });
+        let (proof, commitment, _) = setup.prove_fast_union_ag(&input_sets[0], &mut challenger);
+        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+        setup
+            .verify_union_ag(&commitment, &proof, &mut challenger)
+            .expect("SHA-256 warm-up proof failed verification");
+        black_box(proof);
+        best_of(&input_sets, runs, |inputs| {
+            let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+            setup.prove_fast_union_ag(inputs, &mut challenger)
+        })
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let best = {
+        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+        let (proof, commitment, _) = setup.prove_fast(&input_sets[0], &mut challenger);
+        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+        setup
+            .verify(&commitment, &proof, &mut challenger)
+            .expect("SHA-256 warm-up proof failed verification");
+        black_box(proof);
+        best_of(&input_sets, runs, |inputs| {
+            let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+            setup.prove_fast(inputs, &mut challenger)
+        })
+    };
     report("sha2", batch, best);
 }
 
@@ -101,18 +121,36 @@ fn bench_blake3(batch: usize, runs: usize) {
         })
         .collect();
 
-    let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
-    let (proof, commitment, _) = setup.prove_fast(&input_sets[0], &mut challenger);
-    let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
-    setup
-        .verify(&commitment, &proof, &mut challenger)
-        .expect("BLAKE3 warm-up proof failed verification");
-    black_box(proof);
-
-    let best = best_of(&input_sets, runs, |inputs| {
+    // The default prover: the AG zerocheck on aarch64 (its round-1 kernel
+    // is NEON-only), the RS zerocheck elsewhere.
+    #[cfg(target_arch = "aarch64")]
+    let best = {
         let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
-        setup.prove_fast(inputs, &mut challenger)
-    });
+        let (proof, commitment, _) = setup.prove_fast_union_ag(&input_sets[0], &mut challenger);
+        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+        setup
+            .verify_union_ag(&commitment, &proof, &mut challenger)
+            .expect("BLAKE3 warm-up proof failed verification");
+        black_box(proof);
+        best_of(&input_sets, runs, |inputs| {
+            let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+            setup.prove_fast_union_ag(inputs, &mut challenger)
+        })
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let best = {
+        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+        let (proof, commitment, _) = setup.prove_fast(&input_sets[0], &mut challenger);
+        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+        setup
+            .verify(&commitment, &proof, &mut challenger)
+            .expect("BLAKE3 warm-up proof failed verification");
+        black_box(proof);
+        best_of(&input_sets, runs, |inputs| {
+            let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+            setup.prove_fast(inputs, &mut challenger)
+        })
+    };
     report("blake3", batch, best);
 }
 
@@ -170,9 +208,14 @@ fn main() {
     let batches = parse_log2_batches();
     let runs = parse_runs();
     eprintln!(
-        "Flock hash proving throughput: {} thread(s), {}, best of {runs} after one warm-up",
+        "Flock hash proving throughput: {} thread(s), {}, {} zerocheck, best of {runs} after one warm-up",
         current_num_threads(),
         enabled_x86_features(),
+        if cfg!(target_arch = "aarch64") {
+            "AG"
+        } else {
+            "RS"
+        },
     );
 
     for &log2 in &batches {
