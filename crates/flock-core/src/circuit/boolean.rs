@@ -17,6 +17,7 @@
 //! follows evaluation order, adjusted for aligned words and identity-C rows.
 
 mod builder;
+mod gate;
 mod interface;
 mod layout;
 mod lowering;
@@ -24,6 +25,7 @@ mod schema;
 mod walk;
 
 pub use builder::CircuitBuilder;
+pub use gate::{BooleanGate, BooleanGateError, NativeEval};
 pub use interface::{
     Interaction, InteractionDirection, InteractionEncoding, InteractionField, InteractionScope,
     Selector,
