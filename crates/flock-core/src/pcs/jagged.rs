@@ -102,20 +102,29 @@ use crate::{
     scratch::{give_f128, take_f128},
 };
 
-/// The block-first transport predicate (`pcs::open_batch_merged`): `Some(p)`
-/// when the committed stack is a full-height column prefix — columns `0..p`
-/// of height `2^n`, every later column empty. Public data, so prover and
-/// verifier agree on the coordinate order of the merged sumcheck.
-pub fn rectangular_prefix_columns(heights: &[u64], n: usize) -> Option<usize> {
-    if heights.len() < 2 || !heights.len().is_power_of_two() {
+/// The block-first transport predicate (`pcs::open_batch_merged`): the used
+/// columns, in order, when every used column is FULL (height `2^n`) and the
+/// `2^dense_log`-word stack has at least one column coordinate. Empty
+/// columns may sit anywhere: the stack holds the used columns back to back,
+/// so dense column `t` (bits `n..dense_log` of the dense index) is column
+/// `used[t]`, and every row lines up with the row cube. Public data, so
+/// prover and verifier agree on the coordinate order of the merged sumcheck.
+/// A full-height column prefix (identity compaction) is the case `used =
+/// 0..p`.
+pub fn full_height_columns(heights: &[u64], n: usize, dense_log: usize) -> Option<Vec<usize>> {
+    if heights.len() < 2 || !heights.len().is_power_of_two() || dense_log <= n {
         return None;
     }
     let full = 1u64 << n;
-    let p = heights
-        .iter()
-        .position(|&h| h != full)
-        .unwrap_or(heights.len());
-    (p >= 1 && heights[p..].iter().all(|&h| h == 0)).then_some(p)
+    let mut used = Vec::new();
+    for (y, &h) in heights.iter().enumerate() {
+        match h {
+            0 => {}
+            h if h == full => used.push(y),
+            _ => return None,
+        }
+    }
+    (!used.is_empty()).then_some(used)
 }
 
 /// Configuration of a jagged function: the (zero-padded to `2^k`) column

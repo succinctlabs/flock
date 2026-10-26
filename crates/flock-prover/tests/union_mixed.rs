@@ -32,7 +32,7 @@ use flock_core::{
     field::F128,
     lincheck::{LincheckCircuit, LincheckError},
     pcs::{
-        PcsOpenError, PcsParams, commit, commit_lane_major,
+        PcsOpenError, PcsParams, commit, commit_lane_major, full_height_columns,
         ligerito::{LigeritoProfile, embedded_initial_k_or_default},
     },
     proof::R1csProofMergedLigerito,
@@ -626,6 +626,106 @@ fn mixed_area_saving_roundtrip() {
         verify(&union_bad).is_err(),
         "wrong counts must reject against the count-sized commitment"
     );
+}
+
+/// FULL-HEIGHT COMMIT: partial counts committed with every used column at
+/// full height `2^nu` (dummy rows as zeros), so the opening takes the
+/// block-first transport over a stack with gaps (BLAKE3 uses 92 of its 128
+/// chunk-columns, SHA-256 199 of 256) instead of materializing the jagged
+/// weight. Each count vector proves without the option first, so the
+/// full-height prove draws dirty pooled buffers and must zero the dummy
+/// rows it commits. The option is statement data: a verifier without it
+/// (or with it, against a natural proof) rejects, and so do wrong counts.
+#[test]
+fn full_height_commit_roundtrip_and_statement_binding() {
+    let nu = 7usize; // capacity 128 per type; padded 2^16 words
+    let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
+    let sha2_circuit = sha2_r1cs.csc_lincheck_circuit();
+    let blake3_circuit = blake3_r1cs.csc_lincheck_circuit();
+    let circuits: [&dyn LincheckCircuit; 2] = [sha2_circuit, blake3_circuit];
+    let mut rng = Rng::new(0x_F0_11_4E_16);
+
+    // Counts in slot order (SHA-256, BLAKE3): both partial, and one empty.
+    for counts in [[50usize, 37], [0, 37]] {
+        let sha2_inputs = random_sha2_inputs(&mut rng, counts[0]);
+        let blake3_inputs = random_blake3_inputs(&mut rng, counts[1]);
+        let slots = || {
+            vec![
+                UnionSlotProverInput::new(
+                    generate_sha2_witness_batch_major_partial(&sha2_inputs, nu),
+                    sha2_circuit,
+                ),
+                UnionSlotProverInput::new(
+                    generate_blake3_witness_batch_major_partial(&blake3_inputs, nu),
+                    blake3_circuit,
+                ),
+            ]
+        };
+        let natural = UnionInstance::new(&registry, counts.to_vec());
+        let mut full = UnionInstance::new(&registry, counts.to_vec());
+        full.set_full_height_commit();
+        let used = 199 * usize::from(counts[0] > 0) + 92;
+        assert_eq!(full.dense_words(), used << nu, "every used column is full");
+        let fast = |u: &UnionInstance<'_>| {
+            full_height_columns(&u.jagged_heights(), nu, u.dense_m() - 7).is_some()
+        };
+        assert!(fast(&full), "full height takes the block-first transport");
+        assert!(
+            !fast(&natural),
+            "partial columns keep the materialized weight"
+        );
+
+        let prove = |u: &UnionInstance<'_>| {
+            let params = union_pcs_params(u);
+            let mut ch_p = FsChallenger::new(DOMAIN);
+            prove_fast_ligerito_union(u, &params, slots(), &mut ch_p)
+        };
+        // The verifier sizes its PCS params from ITS statement.
+        let verify = |u: &UnionInstance<'_>, proof: &R1csProofMergedLigerito, commitment| {
+            let mut ch_v = FsChallenger::new(DOMAIN);
+            let params = union_pcs_params(u);
+            verify_ligerito_union(u, &circuits, commitment, proof, &params, &mut ch_v)
+        };
+        let (proof_n, commitment_n, claim_n) = prove(&natural);
+        let (proof_f, commitment_f, claim_f) = prove(&full);
+        assert_eq!(commitment_f.params.m, full.dense_m());
+
+        let claim_v = verify(&full, &proof_f, &commitment_f)
+            .unwrap_or_else(|e| panic!("full-height proof rejected (counts {counts:?}): {e:?}"));
+        assert_eq!(claim_v, claim_f);
+        let claim_v =
+            verify(&natural, &proof_n, &commitment_n).expect("the natural proof still verifies");
+        assert_eq!(claim_v, claim_n);
+
+        assert!(
+            verify(&natural, &proof_f, &commitment_f).is_err(),
+            "a verifier without the option must reject a full-height proof"
+        );
+        assert!(
+            verify(&full, &proof_n, &commitment_n).is_err(),
+            "a verifier with the option must reject a natural proof"
+        );
+        let mut bad = UnionInstance::new(&registry, vec![counts[0] + 1, counts[1]]);
+        bad.set_full_height_commit();
+        assert!(
+            verify(&bad, &proof_f, &commitment_f).is_err(),
+            "wrong counts must reject under full height"
+        );
+        // A forged opening value fails the inner Ligerito opening of the
+        // committed stack (run before the merged sumcheck's final check),
+        // on the block-first path as on the materialized one.
+        for (u, proof, commitment) in [
+            (&full, &proof_f, &commitment_f),
+            (&natural, &proof_n, &commitment_n),
+        ] {
+            let mut forged = proof.clone();
+            forged.pcs_open.q_eval.lo ^= 1;
+            match verify(u, &forged, commitment) {
+                Err(FlockVerifyError::PcsOpen(PcsOpenError::Ligerito)) => {}
+                other => panic!("tampered q_eval: expected PcsOpen(Ligerito), got {other:?}"),
+            }
+        }
+    }
 }
 
 /// Mis-ordered per-slot inputs (BLAKE3 before SHA-256) can never produce a

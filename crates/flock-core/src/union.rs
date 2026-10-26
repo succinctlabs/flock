@@ -63,6 +63,9 @@ pub struct UnionInstance<'r> {
     /// `2^(m*−7)` words regardless of content. See
     /// [`Self::set_dense_floor`].
     dense_floor_m: Option<usize>,
+    /// Commit every used chunk-column at full height `2^nu`, the dummy rows
+    /// as zeros. See [`Self::set_full_height_commit`].
+    full_height: bool,
 }
 
 impl<'r> UnionInstance<'r> {
@@ -76,6 +79,42 @@ impl<'r> UnionInstance<'r> {
         Self {
             instance,
             dense_floor_m: None,
+            full_height: false,
+        }
+    }
+
+    /// Commit every used chunk-column of a non-empty slot at full height
+    /// `2^nu`, its dummy rows `[n_t, 2^nu)` as zeros, instead of the declared
+    /// `n_t`-row prefix. The committed stack grows by the dummy rows, but
+    /// every used column is then full, which is what the opening's
+    /// block-first transport needs ([`crate::pcs::full_height_columns`]):
+    /// partial columns force the materialized weight.
+    ///
+    /// The PIOP is unchanged: the zerocheck and lincheck still run over the
+    /// declared rows, and the dummy rows they treat as zero are committed as
+    /// zero. Soundness is unchanged too: the dummy rows enter the committed
+    /// polynomial like any row, so the zerocheck constrains them, the const
+    /// pin's count target holds their pin at `0`, and nothing (wiring,
+    /// publics) references them.
+    ///
+    /// STATEMENT data, like the counts and the dense floor: prover and
+    /// verifier must construct their instances alike. Boolean-only
+    /// registries (the element class keeps its own dead-row handling).
+    pub fn set_full_height_commit(&mut self) {
+        assert!(
+            !self.has_element(),
+            "full-height commit is for boolean-only registries"
+        );
+        self.full_height = true;
+    }
+
+    /// Committed rows of a slot's used columns: `n_t`, or `2^nu` for a
+    /// non-empty slot under [`Self::set_full_height_commit`].
+    fn committed_rows(&self, n_t: usize) -> usize {
+        if self.full_height && n_t > 0 {
+            1usize << self.n_log()
+        } else {
+            n_t
         }
     }
 
@@ -310,7 +349,7 @@ impl<'r> UnionInstance<'r> {
         {
             let col_offset = slot.offset >> (7 + nu);
             for h in &mut heights[col_offset..col_offset + self.used_cols(ty)] {
-                *h = n_t as u64;
+                *h = self.committed_rows(n_t) as u64;
             }
         }
         heights
@@ -329,13 +368,14 @@ impl<'r> UnionInstance<'r> {
 
     /// Words of the un-padded dense stack: `Σ_t n_t · used_cols_t` — the
     /// jagged area (= `Σ` [`Self::jagged_heights`]), count-proportional
-    /// under height-`n_t` stacking.
+    /// under height-`n_t` stacking (`n_t` → `2^nu` per non-empty slot under
+    /// [`Self::set_full_height_commit`]).
     pub fn dense_words(&self) -> usize {
         self.registry()
             .types()
             .iter()
             .zip(self.counts())
-            .map(|(ty, &n_t)| self.used_cols(ty) * n_t)
+            .map(|(ty, &n_t)| self.used_cols(ty) * self.committed_rows(n_t))
             .sum()
     }
 
@@ -425,7 +465,8 @@ impl<'r> UnionInstance<'r> {
 
     /// Assemble the committed dense stack `q` from the padded union buffer:
     /// per slot in order, the DECLARED `n_t`-row prefix of each of its used
-    /// chunk-columns, stacked contiguously, zero-padded to
+    /// chunk-columns (followed by zeros up to `2^nu` under
+    /// [`Self::set_full_height_commit`]), stacked contiguously, zero-padded to
     /// [`Self::committed_words`]. Dummy rows `[n_t, 2^nu)`, useless
     /// chunk-columns, and the inter-slot/trailing gaps are dropped. This is
     /// exactly the map the `col_prefix_sums`/`unrank` of
@@ -480,16 +521,21 @@ impl<'r> UnionInstance<'r> {
             .zip(self.counts())
         {
             let used_cols = self.used_cols(ty);
-            let (dst, tail) = rest.split_at_mut(used_cols * n_t);
+            let h_t = self.committed_rows(n_t);
+            let (dst, tail) = rest.split_at_mut(used_cols * h_t);
             rest = tail;
-            cursor += used_cols * n_t;
+            cursor += used_cols * h_t;
             if n_t == 0 {
                 continue; // an empty slot contributes no chunk (and `par_chunks_mut(0)` panics)
             }
             let start = slot.offset >> 7;
-            dst.par_chunks_mut(n_t).enumerate().for_each(|(c, out)| {
+            // Full-height columns commit the dummy rows as zeros, whatever
+            // the (possibly dirty) buffer holds there.
+            dst.par_chunks_mut(h_t).enumerate().for_each(|(c, out)| {
                 let col = start + (c << nu);
-                out.copy_from_slice(&z_padded[col..col + n_t]);
+                let (live, dummy) = out.split_at_mut(n_t);
+                live.copy_from_slice(&z_padded[col..col + n_t]);
+                dummy.fill(F128::ZERO);
             });
         }
         debug_assert_eq!(cursor, self.dense_words());

@@ -205,6 +205,14 @@ fn merged_bundle_digest(
 #[test]
 // Default-run (~2 s for both anchors): these pins are what makes the
 // "fixture anchors byte-stable" claim enforceable in CI.
+// Re-pinned 2026-10-26 (merged-nu10-1024-1024 only): the block-first
+// transport now covers every layout whose used columns are all full height,
+// gaps allowed (`pcs::full_height_columns`), not just a full-height prefix.
+// At full counts SHA-256's 199 used chunk-columns of 256 leave a gap before
+// BLAKE3's, so this fixture's merged sumcheck now binds the dense column
+// coordinates first. The partial and zero-count fixtures and both anchors
+// held byte-identical; the same full-count mix round-trips (with tampers)
+// in `union_mixed`. Two deterministic print runs agreed.
 // Re-pinned 2026-09-07: main's proof-IO v23 (the tower span counter) merged
 // onto the BLAKE3 default — the four merged bundles moved with the header
 // byte, the header-less anchors did not. Two deterministic print runs agreed.
@@ -216,7 +224,7 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "19114ba0625a23655be4dd2d8514527c2a51df83c52376a868b5bc81c2c4625d",
+            "7a4af618435e3b67e7dea3f1f466a2aa843b73751ff7390cc51b67ceb86a2e14",
         ),
         (
             "merged-nu10-50-37",

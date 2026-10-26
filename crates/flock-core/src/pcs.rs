@@ -26,7 +26,7 @@ pub use commit::{
     commit_lane_major, commit_leaf_pipeline_shape, commit_merkle, dense_lanes,
     prefault_codeword_during,
 };
-pub use jagged::rectangular_prefix_columns;
+pub use jagged::full_height_columns;
 use jagged::{
     FrobeniusClaim, JaggedParams, MergedWeightClaim, MultipointDefer, MultipointGrinding,
     MultipointTwistedProof, ScalarGroupClaim, fold_round_claim,
@@ -1527,8 +1527,8 @@ struct BlockFirstClaim<'a> {
     z_col: &'a [F128],
     /// `linearized_coefficients` of its γ-scaled fold table.
     coeffs: &'a [F128],
-    /// Column bit-bank at `z_row`:
-    /// `bank[c·128 + b] = Σ_r eq(z_row, r)·bit_b(q[c·2^n + r])`.
+    /// Column bit-bank at `z_row`, by column (not dense rank):
+    /// `bank[y·128 + b] = Σ_r eq(z_row, r)·bit_b(column y's row r)`.
     bank: &'a [F128],
 }
 
@@ -1585,17 +1585,35 @@ fn round_message_pairs(a: &[F128], b: &[F128]) -> (F128, F128) {
         .reduce(|| (F128::ZERO, F128::ZERO), |x, y| (x.0 + y.0, x.1 + y.1))
 }
 
-/// Reference column bit-bank of the dense stack at `z_row` (the union prover
-/// supplies these from its stripe kernels; this is the slow oracle).
-fn column_bitbank_reference(q: &[F128], z_row: &[F128], n_log: usize, k_cols: usize) -> Vec<F128> {
+/// Reference column bit-bank of the dense stack at `z_row`, by column (the
+/// union prover supplies these from its stripe kernels; this is the slow
+/// oracle). `used[t]` is the column at dense rank `t`; empty columns read
+/// zero.
+fn column_bitbank_reference(
+    q: &[F128],
+    z_row: &[F128],
+    n_log: usize,
+    k_cols: usize,
+    used: &[usize],
+) -> Vec<F128> {
     use rayon::prelude::{IntoParallelIterator, ParallelIterator};
     let eq_row = crate::lincheck::build_eq_table(z_row);
     let n_rows = 1usize << n_log;
+    let mut rank = vec![usize::MAX; 1usize << k_cols];
+    for (t, &y) in used.iter().enumerate() {
+        rank[y] = t;
+    }
     (0..1usize << k_cols)
         .into_par_iter()
-        .flat_map_iter(|c| {
+        .flat_map_iter(|y| {
             let mut acc = vec![F128::ZERO; 1 << LOG_PACKING];
-            for (r, w) in q[c * n_rows..(c + 1) * n_rows].iter().enumerate() {
+            let c = rank[y];
+            let column = if c == usize::MAX {
+                &[][..]
+            } else {
+                &q[c * n_rows..(c + 1) * n_rows]
+            };
+            for (r, w) in column.iter().enumerate() {
                 let e = eq_row[r];
                 let mut lo = w.lo;
                 while lo != 0 {
@@ -1615,24 +1633,31 @@ fn column_bitbank_reference(q: &[F128], z_row: &[F128], n_log: usize, k_cols: us
 
 /// The block-first phase of the merged sumcheck (docs, "direct transport").
 ///
-/// The dense index is `d = e·2^(n+1) + c0·2^n + r` (block `e` of two lane
-/// columns, column bit `c0`, row `r`). Every weight term is rank-1 across the
-/// `(e | c0, r)` split once the fold map is linearized:
-/// `W_i[e, (c0, r)] = Σ_j c_ij·u_i(e)^(2^j)·(eq(z_col[0], c0)·eq(z_row, r))^(2^j)`
-/// with `u_i(e) = eq(z_col[1..], e)`, masked to the live column prefix. The
-/// `k−1` block rounds therefore need only, per term, the block statistics
-/// `S_ij[e] = (eq(z_col[0], c0)·Σ_b β_b^(2^-j)·bank[(2e+c0)·128 + b])^(2^j)`
-/// — a Frobenius transform of the column bit-bank — against
-/// `A_ij[e] = c_ij·eq(z_col[1..]^(2^j), e)`. After them, `q` is folded over
-/// the bound block coordinates and the row-side weight `W'` is written in
-/// closed form (the block factor folds into the linearized coefficients, the
-/// `c0` bit into the byte tables), ready for the ordinary row rounds.
+/// The dense index is `d = e·2^(n+1) + c0·2^n + r` (block `e` of two dense
+/// columns, the dense column's low bit `c0`, row `r`). Every used column is
+/// full height, so dense column `t = 2e + c0` is column `used[t]` with its
+/// rows in place, and every weight term is rank-1 across the `(e | c0, r)`
+/// split once the fold map is linearized:
+/// `W_i[e, (c0, r)] = Σ_j c_ij·eq(z_col, used[2e+c0])^(2^j)·eq(z_row, r)^(2^j)`,
+/// zero past the `p = used.len()` live dense columns. The `kd−1` block rounds
+/// therefore need only, per term, the block statistics
+/// `S_ij[e] = (Σ_b β_b^(2^-j)·bank[used[2e+c0]·128 + b])^(2^j)` — a Frobenius
+/// transform of the column bit-bank — against
+/// `A_ij[e] = c_ij·eq(z_col^(2^j), used[2e+c0])`. After them, `q` is folded
+/// over the bound block coordinates and the row-side weight `W'` is written in
+/// closed form (the column factors fold into the linearized coefficients, one
+/// byte table per `c0`), ready for the ordinary row rounds.
+///
+/// `kd = dense_log − n` is the dense column bit count. On a full-height
+/// column prefix (`used = 0..p`) the messages are the field elements of the
+/// prefix-only form, which split `eq(z_col, ·)` as `eq(z_col[0], c0)` on the
+/// row side times `eq(z_col[1..], e)` on the block side.
 #[allow(clippy::too_many_arguments)]
 fn block_first_phase<Ch: Challenger>(
     q: &[F128],
     n_log: usize,
-    k_cols: usize,
-    live_cols: usize,
+    kd: usize,
+    used: &[usize],
     rs: &[BlockFirstClaim<'_>],
     pd_groups: &[(&[F128], Vec<F128>)],
     grinding: OpeningGrinding,
@@ -1647,12 +1672,19 @@ fn block_first_phase<Ch: Challenger>(
     };
     const NB: usize = 1 << LOG_PACKING;
     let t = std::time::Instant::now();
-    let kb = k_cols - 1;
+    let kb = kd - 1;
     let n_e = 1usize << kb;
     let blk = 1usize << (n_log + 1);
     let n_rows = 1usize << n_log;
-    // Live blocks per column bit: column `2e + c0` is live iff `2e + c0 < p`.
+    let live_cols = used.len();
+    assert!(
+        live_cols >= 1 && live_cols <= 2 * n_e,
+        "used columns fit the dense stack"
+    );
+    // Live blocks per column bit: dense column `2e + c0` is live iff
+    // `2e + c0 < p`; it is column `used[2e + c0]`.
     let live_e = |c0: usize| (live_cols + 1 - c0) / 2;
+    let col = |e: usize, c0: usize| used[2 * e + c0];
     // Frobenius powers of the bit basis: `pw[b][k] = β_b^(2^k)`.
     let pw: Vec<Vec<F128>> = (0..NB)
         .map(|b| {
@@ -1664,27 +1696,39 @@ fn block_first_phase<Ch: Challenger>(
             row
         })
         .collect();
+    // `eq(z_col^(2^j), ·)` over every column, per claim and live `j`.
+    let eq_cols: Vec<Vec<Vec<F128>>> = rs
+        .iter()
+        .map(|cl| {
+            (0..NB)
+                .into_par_iter()
+                .map(|j| {
+                    if cl.coeffs[j] == F128::ZERO {
+                        return Vec::new();
+                    }
+                    let zj: Vec<F128> = cl.z_col.iter().map(|&z| frob(z, j)).collect();
+                    crate::lincheck::build_eq_table(&zj)
+                })
+                .collect()
+        })
+        .collect();
 
     // Rank-1 terms on the block cube.
     let mut terms: Vec<(Vec<F128>, Vec<F128>)> = Vec::new();
-    for cl in rs {
-        let z0 = cl.z_col[0];
-        let z_hi = &cl.z_col[1..];
+    for (cl, eq_col) in rs.iter().zip(&eq_cols) {
         let per_j: Vec<(Vec<F128>, Vec<F128>)> = (0..NB)
             .into_par_iter()
             .filter(|&j| cl.coeffs[j] != F128::ZERO)
             .flat_map_iter(|j| {
                 let pw = &pw;
-                let zj: Vec<F128> = z_hi.iter().map(|&z| frob(z, j)).collect();
-                let eq_hi = crate::lincheck::build_eq_table(&zj);
+                let eq_col = &eq_col[j];
                 let kinv = (NB - j) % NB;
                 (0..2).map(move |c0| {
-                    let kappa = if c0 == 0 { F128::ONE + z0 } else { z0 };
                     let live = live_e(c0);
                     let a: Vec<F128> = (0..n_e)
                         .map(|e| {
                             if e < live {
-                                cl.coeffs[j] * eq_hi[e]
+                                cl.coeffs[j] * eq_col[col(e, c0)]
                             } else {
                                 F128::ZERO
                             }
@@ -1692,12 +1736,16 @@ fn block_first_phase<Ch: Challenger>(
                         .collect();
                     let s: Vec<F128> = (0..n_e)
                         .map(|e| {
-                            let bank = &cl.bank[(2 * e + c0) * NB..(2 * e + c0 + 1) * NB];
+                            if e >= live {
+                                return F128::ZERO;
+                            }
+                            let y = col(e, c0);
+                            let bank = &cl.bank[y * NB..(y + 1) * NB];
                             let mut acc = F128::ZERO;
                             for b in 0..NB {
                                 acc += pw[b][kinv] * bank[b];
                             }
-                            frob(kappa * acc, j)
+                            frob(acc, j)
                         })
                         .collect();
                     (a, s)
@@ -1708,17 +1756,13 @@ fn block_first_phase<Ch: Challenger>(
     }
     for (z_row, cols) in pd_groups {
         let eq_row = crate::lincheck::build_eq_table(z_row);
-        let f: Vec<F128> = (0..1usize << k_cols)
+        let f: Vec<F128> = (0..live_cols)
             .into_par_iter()
-            .map(|c| {
-                if c < live_cols {
-                    q[c * n_rows..(c + 1) * n_rows]
-                        .iter()
-                        .zip(&eq_row)
-                        .fold(F128::ZERO, |acc, (&x, &y)| acc + x * y)
-                } else {
-                    F128::ZERO
-                }
+            .map(|t| {
+                q[t * n_rows..(t + 1) * n_rows]
+                    .iter()
+                    .zip(&eq_row)
+                    .fold(F128::ZERO, |acc, (&x, &y)| acc + x * y)
             })
             .collect();
         for c0 in 0..2 {
@@ -1726,13 +1770,15 @@ fn block_first_phase<Ch: Challenger>(
             let a: Vec<F128> = (0..n_e)
                 .map(|e| {
                     if e < live {
-                        cols[2 * e + c0]
+                        cols[col(e, c0)]
                     } else {
                         F128::ZERO
                     }
                 })
                 .collect();
-            let s: Vec<F128> = (0..n_e).map(|e| f[2 * e + c0]).collect();
+            let s: Vec<F128> = (0..n_e)
+                .map(|e| if e < live { f[2 * e + c0] } else { F128::ZERO })
+                .collect();
             terms.push((a, s));
         }
     }
@@ -1784,32 +1830,27 @@ fn block_first_phase<Ch: Challenger>(
     });
 
     // W'[(c0, r)] = Σ_{e live for c0} eq(r_blk, e)·W[e, (c0, r)], in closed
-    // form: the block factor folds into the linearized coefficients,
-    // c'_{j,c0} = c_j·Σ_e eq(r_blk, e)·eq(z_col[1..]^(2^j), e), and the
-    // column bit bakes eq(z_col[0], c0) into the per-c0 byte tables.
+    // form: the column factor folds into the linearized coefficients,
+    // c'_{j,c0} = c_j·Σ_e eq(r_blk, e)·eq(z_col^(2^j), used[2e+c0]), one byte
+    // table per c0.
     let eq_rows: Vec<Vec<F128>> = rs
         .iter()
         .map(|cl| crate::lincheck::build_eq_table(cl.z_row))
         .collect();
     let tabs: Vec<[Vec<F128>; 2]> = rs
         .iter()
-        .map(|cl| {
-            let z0 = cl.z_col[0];
-            let z_hi = &cl.z_col[1..];
-            let eq_hi_j: Vec<Vec<F128>> = (0..NB)
-                .map(|j| {
-                    let zj: Vec<F128> = z_hi.iter().map(|&z| frob(z, j)).collect();
-                    crate::lincheck::build_eq_table(&zj)
-                })
-                .collect();
+        .zip(&eq_cols)
+        .map(|(cl, eq_col)| {
             [0usize, 1].map(|c0| {
-                let kappa = if c0 == 0 { F128::ONE + z0 } else { z0 };
                 let live = live_e(c0);
                 let cp: Vec<F128> = (0..NB)
                     .map(|j| {
-                        let s =
-                            (0..live).fold(F128::ZERO, |acc, e| acc + eq_blk[e] * eq_hi_j[j][e]);
-                        cl.coeffs[j] * s * frob(kappa, j)
+                        if cl.coeffs[j] == F128::ZERO {
+                            return F128::ZERO;
+                        }
+                        let s = (0..live)
+                            .fold(F128::ZERO, |acc, e| acc + eq_blk[e] * eq_col[j][col(e, c0)]);
+                        cl.coeffs[j] * s
                     })
                     .collect();
                 let w: Vec<F128> = (0..NB)
@@ -1824,7 +1865,7 @@ fn block_first_phase<Ch: Challenger>(
         .map(|(z_row, cols)| {
             let eq_row = crate::lincheck::build_eq_table(z_row);
             let s = [0usize, 1].map(|c0| {
-                (0..live_e(c0)).fold(F128::ZERO, |acc, e| acc + eq_blk[e] * cols[2 * e + c0])
+                (0..live_e(c0)).fold(F128::ZERO, |acc, e| acc + eq_blk[e] * cols[col(e, c0)])
             });
             (eq_row, s)
         })
@@ -2119,14 +2160,15 @@ pub fn open_batch_merged<Ch: Challenger>(
         Vec::with_capacity((grinding.merged_round_bits != 0) as usize * dense_log);
     let mut rho = Vec::with_capacity(dense_log);
     let seed_len = 1usize << lig_config.initial_k;
-    let (q_eval, w_eval, seeded_stats) = if let Some(live_cols) =
-        jagged::rectangular_prefix_columns(heights, n_log)
+    let (q_eval, w_eval, seeded_stats) = if let Some(used) =
+        jagged::full_height_columns(heights, n_log, dense_log)
     {
-        // Block-first transport (docs, "direct transport"): a full-height
-        // column prefix lets the lane-block coordinates be bound first
+        // Block-first transport (docs, "direct transport"): full-height
+        // used columns let the dense column coordinates be bound first
         // from O(2^k) block statistics — no 2^m weight vector — and the
         // row rounds then run on the block-folded pair. The verifier
         // rotates ρ back into coordinate order under the same predicate.
+        let kd = dense_log - n_log;
         let banks: Vec<std::borrow::Cow<'_, [F128]>> = x_outers
             .iter()
             .enumerate()
@@ -2146,6 +2188,7 @@ pub fn open_batch_merged<Ch: Challenger>(
                         &x[1..1 + n_log],
                         n_log,
                         k_cols,
+                        &used,
                     ))
                 }
             })
@@ -2164,8 +2207,8 @@ pub fn open_batch_merged<Ch: Challenger>(
         let (qp, wp) = block_first_phase(
             &q,
             n_log,
-            k_cols,
-            live_cols,
+            kd,
+            &used,
             &rs,
             &pd_groups,
             grinding,
@@ -2189,9 +2232,9 @@ pub fn open_batch_merged<Ch: Challenger>(
             &mut merged_round_nonces,
             &mut rho,
         );
-        // Round order → coordinate order: the first k−1 rounds bound the
+        // Round order → coordinate order: the first kd−1 rounds bound the
         // block coordinates n+1.. of the dense index.
-        rho.rotate_left(k_cols - 1);
+        rho.rotate_left(kd - 1);
         (q_eval, w_eval, None)
     } else {
         // The twisted weight over the dense cube (count-proportional
@@ -2697,10 +2740,10 @@ fn verify_batch_merged_core<Ch: Challenger>(
     let t = Instant::now();
     let params = JaggedParams::from_heights(heights, n_log, dense_log);
     let k_cols = params.k;
-    if jagged::rectangular_prefix_columns(heights, n_log).is_some() {
-        // Block-first transport: the prover bound the k−1 block coordinates
-        // first; put ρ back into coordinate order.
-        rho.rotate_left(k_cols - 1);
+    if jagged::full_height_columns(heights, n_log, dense_log).is_some() {
+        // Block-first transport: the prover bound the kd−1 block coordinates
+        // first (kd = dense_log − n); put ρ back into coordinate order.
+        rho.rotate_left(dense_log - n_log - 1);
     }
     if trace {
         eprintln!(

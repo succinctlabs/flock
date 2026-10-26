@@ -1232,7 +1232,13 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
             // the lincheck's own fold; C's row point is the zerocheck's, so it
             // costs one more stripe fold — spent only when the open will use it.
             let nu = union.n_log();
-            let banks = if pcs::rectangular_prefix_columns(&union.jagged_heights(), nu).is_some() {
+            let banks = if pcs::full_height_columns(
+                &union.jagged_heights(),
+                nu,
+                union.dense_m() - LOG_PACKING,
+            )
+            .is_some()
+            {
                 let t_b = std::time::Instant::now();
                 assert!(zc_r_rest.len() > nu, "C claim point too short");
                 let bank_c = lincheck::union_bitbank_fold(union, &lc_slots, &zc_r_rest[1..1 + nu]);
