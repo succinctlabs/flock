@@ -315,28 +315,33 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
         }
     }
 
-    // ---- Tamper: PIOP (a lincheck round message) — rejects through the
-    // existing union-lincheck error path.
+    // ---- Tamper: PIOP (a lincheck round message). Every lincheck round's
+    // challenge is ground, so the tampered message moves the transcript and
+    // its nonce no longer verifies — rejected before the final check.
     {
         let mut bad = proof.clone();
         bad.lincheck.rounds[0].0.lo ^= 1;
         match verify(&union, &bad) {
-            Err(FlockVerifyError::Lincheck(LincheckError::ConsistencyFailed { .. })) => {}
+            Err(FlockVerifyError::Lincheck(LincheckError::InvalidGrindingNonce {
+                which: "sumcheck-round",
+            })) => {}
             other => panic!(
-                "tampered lincheck round: expected Lincheck(ConsistencyFailed), got {other:?}"
+                "tampered lincheck round: expected Lincheck(InvalidGrindingNonce), got {other:?}"
             ),
         }
     }
 
-    // ---- Tamper: opening (the merged sumcheck's claimed `q_eval`) —
-    // rejects through the existing opening error path (the merged final
-    // check maps to the same `VirtualOpen` error class).
+    // ---- Tamper: opening (the merged sumcheck's claimed `q_eval`). The
+    // verifier opens the committed stack at ρ against `q_eval` before the
+    // merged sumcheck's final check (the assist runs on a forked transcript
+    // beside the inner opening), so the forged value fails the inner
+    // Ligerito opening.
     {
         let mut bad = proof.clone();
         bad.pcs_open.q_eval.lo ^= 1;
         match verify(&union, &bad) {
-            Err(FlockVerifyError::PcsOpen(PcsOpenError::VirtualOpen)) => {}
-            other => panic!("tampered q_eval: expected PcsOpen(VirtualOpen), got {other:?}"),
+            Err(FlockVerifyError::PcsOpen(PcsOpenError::Ligerito)) => {}
+            other => panic!("tampered q_eval: expected PcsOpen(Ligerito), got {other:?}"),
         }
     }
 }
