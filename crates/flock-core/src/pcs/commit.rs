@@ -780,6 +780,21 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
         replicate_lane_major_fill(&mut msg, q, t, d);
         let t_fill = t_fill.elapsed();
         let mut codeword = crate::scratch::take_f128(codeword_len);
+        if lane_pipeline_enabled(params) {
+            if timing {
+                eprintln!(
+                    "[commit-timing] transpose {:.2} ms",
+                    t_fill.as_secs_f64() * 1e3
+                );
+            }
+            // The ranked top's deep pass takes the leaf hook, so it streams
+            // like the paths below: same leaves, same tree.
+            let committed = pipelined_commit(codeword, params, |codeword, hook| {
+                ntt.forward_transform_interleaved_from_message_with(codeword, &msg, t, Some(hook));
+            });
+            crate::scratch::give_f128(msg);
+            return committed;
+        }
         let t_ntt = std::time::Instant::now();
         ntt.forward_transform_interleaved_from_message_with(&mut codeword, &msg, t, None);
         if timing {
@@ -1199,8 +1214,16 @@ mod tests {
     /// take SME2 claims where the machine has the unit.
     #[test]
     fn lane_pipelined_commit_matches_staged() {
-        // 2^17 positions x 33 lanes: just over the streaming threshold.
-        let (m, log_inv_rate, log_batch_size, t) = (28usize, 2usize, 6usize, 33usize);
+        // 2^17 positions x 33 lanes, just over the streaming threshold, with
+        // all, some and no lanes live (the live-lane transform); then 34
+        // lanes at rate 1/2, all live (the ranked radix-8 top on aarch64).
+        for (m, log_inv_rate, t, contents) in [(28, 2, 33, &[33, 20, 0][..]), (29, 1, 34, &[34])] {
+            lane_pipeline_case(m, log_inv_rate, t, contents);
+        }
+    }
+
+    fn lane_pipeline_case(m: usize, log_inv_rate: usize, t: usize, contents: &[usize]) {
+        let log_batch_size = 6;
         let params = PcsParams {
             m,
             log_inv_rate,
@@ -1209,9 +1232,20 @@ mod tests {
             num_lanes: Some(t),
             merkle_hash: HashKind::Blake3,
         };
+        let ranked = AdditiveNttF128::standard(params.k_code()).ranked_top_from_message_applies(
+            params.k_code(),
+            t,
+            1 << log_inv_rate,
+        );
+        let ranked_target = cfg!(all(target_arch = "aarch64", target_feature = "aes"));
+        assert_eq!(
+            ranked,
+            ranked_target && t.is_multiple_of(2),
+            "ranked top (t={t})"
+        );
         let d = 1usize << (m - LOG_PACKING - log_batch_size);
         let mut rng = Rng::new(0x1A4E_5EED);
-        for c in [t, 20, 0] {
+        for &c in contents {
             let mut q = vec![F128::ZERO; 1usize << (m - LOG_PACKING)];
             let content = rng.f128_vec(c * d);
             q[..c * d].copy_from_slice(&content);
