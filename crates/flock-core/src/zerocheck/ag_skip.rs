@@ -1726,18 +1726,31 @@ pub(super) fn multilinear_values_tail_fiat_shamir_sparse<C: Challenger>(
         // Output storage is bounded by the input's: shrinking pairs can
         // only round outward by one slot per interval end.
         let cap = store.len() + 2 * store.intervals().len() + 2;
-        if a_nxt.len() < cap {
+        let out_len = if pending2.is_some() {
+            live / 4
+        } else {
+            live / 2
+        };
+        // Size the output for the pass that actually runs: a lookahead pass
+        // writes `out_len` (a quarter of the input on the fold-level entry),
+        // the deferred-fold resolve below works in place, and only the
+        // classic round needs `cap`. Sizing every pass for `cap` made the
+        // first pass take two input-sized buffers (~3 GB at m=33) and fill a
+        // quarter of them.
+        let need = if lookahead {
+            out_len
+        } else if pending2.is_some() {
+            0
+        } else {
+            cap
+        };
+        if a_nxt.len() < need {
             give_f128(a_nxt);
             give_f128(b_nxt);
-            a_nxt = take_f128(cap);
-            b_nxt = take_f128(cap);
+            a_nxt = take_f128(need);
+            b_nxt = take_f128(need);
         }
         if lookahead {
-            let out_len = if pending2.is_some() {
-                live / 4
-            } else {
-                live / 2
-            };
             let (ao, bo) = (&mut a_nxt[..out_len], &mut b_nxt[..out_len]);
             let q = if let Some(r2) = pending2 {
                 fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r_rest[i + 2..])
