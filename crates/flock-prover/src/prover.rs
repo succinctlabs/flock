@@ -61,7 +61,10 @@ use pcs::{
     open_batch_merged, open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding,
     ring_switch::s_hat_v_from_z_vec,
 };
-use rayon::join;
+use rayon::{
+    join,
+    prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator},
+};
 use zerocheck::{PaddingSpec, ZerocheckProof, prove_packed_padded_capture_s_hat_v_c_with_grinding};
 #[cfg(target_arch = "aarch64")]
 use {
@@ -482,9 +485,12 @@ fn build_union_witness(
     // same pay-per-live discipline the boolean side's run-lists apply. Gated
     // by the zerocheck's OWN predicate so the two cannot drift.
     let elem_live = union.has_element() && dead_rows_unread(union);
+    // Slots are disjoint blocks of the buffers, so their drivers run
+    // concurrently: a registry of many small slots would otherwise leave
+    // most cores idle while each small driver runs.
     let stripes = union
         .slot_dests(&mut z, &mut a, &mut b, elide, dead_padding_unread)
-        .into_iter()
+        .into_par_iter()
         .zip(sources)
         .enumerate()
         .map(|(i, (dst, source))| match source {
