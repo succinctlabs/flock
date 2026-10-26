@@ -288,11 +288,27 @@ impl AdditiveNttF128 {
     /// Whether the ranked radix-8 top applies: the streaming commit's
     /// rate-1/2 shape on NEON (dual from-message first pass + hetero tiles).
     fn ranked_top_from_message_ok(log_d: usize, num_ntts: usize, reps: usize) -> bool {
+        // The radix-8 row kernels stage ≤ 64 lanes and store lane PAIRS
+        // (`stnp`), so any even lane count ≤ 64 qualifies — the integer-lane
+        // commit's non-power-of-two `t` included.
         cfg!(all(target_arch = "aarch64", target_feature = "aes"))
             && reps == 2
             && log_d >= 13
             && (2..=64).contains(&num_ntts)
-            && num_ntts.is_power_of_two()
+            && num_ntts.is_multiple_of(2)
+    }
+
+    /// Whether [`Self::forward_transform_interleaved_from_message_with`] takes
+    /// the ranked radix-8 top for this shape (`data.len() = reps · msg.len()`,
+    /// `2^log_d` positions per lane).
+    pub fn ranked_top_from_message_applies(
+        &self,
+        log_d: usize,
+        num_ntts: usize,
+        reps: usize,
+    ) -> bool {
+        Self::ranked_top_from_message_ok(log_d, num_ntts, reps)
+            && self.interleaved_n_top(log_d, num_ntts) <= 10
     }
 
     /// Ranked top for the streaming commit's rate-1/2 shape: layers 1..9 as
@@ -417,9 +433,18 @@ impl AdditiveNttF128 {
         hook: Option<DeepPassHook<'_>>,
     ) {
         let n_total = data.len();
-        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert!(num_ntts > 0);
         assert_eq!(n_total % msg.len(), 0);
         let reps = n_total / msg.len();
+        assert!(
+            num_ntts.is_power_of_two()
+                || self.ranked_top_from_message_applies(
+                    log2_pow2(n_total / num_ntts),
+                    num_ntts,
+                    reps
+                ),
+            "a non-power-of-two lane count needs the ranked top"
+        );
         assert!(reps.is_power_of_two() && reps >= 2, "need a blow-up ≥ 2");
         assert_eq!(msg.len() % num_ntts, 0);
         let start_layer = log2_pow2(reps);
@@ -1926,6 +1951,42 @@ mod tests {
                 got, expect,
                 "from_message mismatch at log_msg={log_msg_positions}, num_ntts={num_ntts}, reps={reps}"
             );
+        }
+    }
+
+    /// The ranked radix-8 top on NON-power-of-two (even, ≤ 64) lane counts —
+    /// the integer-lane commit's shape — equals replicate + `from_layer`.
+    /// Shapes the ranked top does not take on this target are skipped (they
+    /// are rejected by `from_message`'s assert by design).
+    #[test]
+    fn ranked_from_message_matches_on_integer_lanes() {
+        let mut rng = Rng::new(0x46_1A6E);
+        let mut ran = 0;
+        for (log_msg_positions, num_ntts) in [(12usize, 46usize), (13, 6), (13, 62), (14, 46)] {
+            let log_d = log_msg_positions + 1;
+            let ntt = AdditiveNttF128::standard(log_d);
+            if !ntt.ranked_top_from_message_applies(log_d, num_ntts, 2) {
+                continue;
+            }
+            ran += 1;
+            let msg = rand_vec(&mut rng, (1 << log_msg_positions) * num_ntts);
+            let n_total = (1 << log_d) * num_ntts;
+            let mut expect = rand_vec(&mut rng, n_total);
+            // Plain per-replica copy: `replicate_interleaved` assumes
+            // power-of-two sizes.
+            for rep in expect.chunks_mut(msg.len()) {
+                rep.copy_from_slice(&msg);
+            }
+            ntt.forward_transform_interleaved_from_layer(&mut expect, num_ntts, 1);
+            let mut got = rand_vec(&mut rng, n_total);
+            ntt.forward_transform_interleaved_from_message(&mut got, &msg, num_ntts);
+            assert_eq!(
+                got, expect,
+                "ranked mismatch at log_msg={log_msg_positions}, t={num_ntts}"
+            );
+        }
+        if cfg!(all(target_arch = "aarch64", target_feature = "aes")) {
+            assert!(ran > 0, "no shape took the ranked top on aarch64");
         }
     }
 
