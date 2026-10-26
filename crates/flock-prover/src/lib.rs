@@ -18,6 +18,7 @@ pub use flock_core::{
     verifier, zerocheck,
 };
 
+pub mod leanxmss;
 pub mod mixed;
 pub mod proof_io;
 pub mod prover;
