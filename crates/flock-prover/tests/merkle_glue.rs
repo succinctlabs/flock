@@ -9,21 +9,37 @@
 use std::array::from_fn;
 
 use flock_core::{
+    field::F128,
+    lincheck::LincheckCircuit,
+    pcs::{
+        PcsParams,
+        ligerito::{LigeritoProfile, embedded_initial_k_or_default},
+    },
     r1cs::BlockR1cs,
     schedule::{IoDirection, IoWord},
+    scratch::{give_f128, take_f128},
     test_rng::Rng,
+    union::SlotWitnessDest,
 };
 use flock_hash::BLAKE3_IV;
 use flock_hash::blake3_compress;
-use flock_prover::r1cs_hashes::{
-    blake3::build_matrices,
-    merkle_glue::{
-        BitSpreadInput, BitSpreadTable, PowMaskInput, PowMaskTable, SwapInput, SwapTable,
+use flock_prover::{
+    challenger::FsChallenger,
+    prover::{UnionSlotProverInput, prove_fast_ligerito_union},
+    r1cs_hashes::{
+        blake3::build_matrices,
+        merkle_glue::{
+            BitSpreadInput, BitSpreadTable, FamilyTransposeTileInput, FamilyTransposeTileTable,
+            PowMaskInput, PowMaskTable, SwapInput, SwapTable,
+        },
+        merkle_r1cs::{
+            BLAKE3_FLAG_CHUNK_END, BLAKE3_FLAG_CHUNK_START, BLAKE3_FLAG_PARENT, ChunkPathInput,
+            MerkleTreeLayout, NODE_BLOCK_LEN, NODE_COUNTER, SLOT_WORDS, blake3_spec,
+        },
     },
-    merkle_r1cs::{
-        BLAKE3_FLAG_CHUNK_END, BLAKE3_FLAG_CHUNK_START, BLAKE3_FLAG_PARENT, ChunkPathInput,
-        MerkleTreeLayout, NODE_BLOCK_LEN, NODE_COUNTER, SLOT_WORDS, blake3_spec,
-    },
+    schedule::{Registry, TableType},
+    union::UnionInstance,
+    verifier::verify_ligerito_union,
 };
 /// One compression's output chaining value.
 fn chaining_value(h: &[u32; 8], m: &[u32; 16], flags: u32) -> [u32; SLOT_WORDS] {
@@ -349,4 +365,291 @@ fn glue_is_negligible_against_blake3() {
         swap + spread < b3 / 1000,
         "glue ({swap} + {spread}) is not negligible against blake3 ({b3})"
     );
+}
+
+/// Stale pool contents, as a recycled witness buffer would hold them.
+const STALE: F128 = F128 {
+    lo: 0xDEAD_BEEF_DEAD_BEEF,
+    hi: 0xDEAD_BEEF_DEAD_BEEF,
+};
+
+/// Row counts around the 8-row group boundary at capacity `2^5`: empty, a
+/// partial first group, exact multiples of 8, partial later groups, and full
+/// capacity.
+const DIRTY_DESTINATION_COUNTS: [usize; 10] = [0, 1, 4, 7, 8, 9, 15, 16, 31, 32];
+const DIRTY_DESTINATION_NU: usize = 5;
+
+/// Run an in-place glue driver over a destination full of stale words and
+/// compare it against the copying driver's `canonical` output.
+///
+/// Without elision the whole block must match. With elision the driver may
+/// leave all-dummy groups as it found them, but every row of a group that
+/// holds a live row must match — the trailing partial group's dead lanes
+/// included, because the RS zerocheck's round 1 reads whole 512-bit
+/// sub-windows up to the last live row.
+fn assert_in_place_matches_canonical_on_dirty_destination(
+    count: usize,
+    nu: usize,
+    canonical: (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>),
+    generate: impl Fn(SlotWitnessDest<'_>) -> Vec<u8>,
+) {
+    let (canonical_z, canonical_a, canonical_b, canonical_stripe) = canonical;
+    let capacity = 1usize << nu;
+    let columns = canonical_z.len() / capacity;
+    let group_bytes = canonical_stripe.len() / (capacity / 8);
+    let live_rows = count.next_multiple_of(8);
+    for elide_padding_writes in [false, true] {
+        for dead_padding_unread in [false, true] {
+            let mode = format!(
+                "count {count}, elide_padding_writes {elide_padding_writes}, \
+                 dead_padding_unread {dead_padding_unread}"
+            );
+            let mut z = vec![STALE; canonical_z.len()];
+            let mut a = z.clone();
+            let mut b = z.clone();
+
+            let stripe = generate(SlotWitnessDest {
+                z: &mut z,
+                a: &mut a,
+                b: &mut b,
+                elide_padding_writes,
+                dead_padding_unread,
+            });
+
+            let written_rows = if elide_padding_writes {
+                live_rows
+            } else {
+                capacity
+            };
+            for (name, actual, expected) in [
+                ("z", &z, &canonical_z),
+                ("a", &a, &canonical_a),
+                ("b", &b, &canonical_b),
+            ] {
+                for column in 0..columns {
+                    let start = column * capacity;
+                    assert_eq!(
+                        actual[start..start + written_rows],
+                        expected[start..start + written_rows],
+                        "{name} chunk-column {column} ({mode})"
+                    );
+                    // Elision still skips the all-dummy groups.
+                    assert!(
+                        actual[start + written_rows..start + capacity]
+                            .iter()
+                            .all(|word| *word == STALE),
+                        "{name} chunk-column {column} wrote an all-dummy group ({mode})"
+                    );
+                }
+            }
+            let stripe_bytes = written_rows / 8 * group_bytes;
+            assert_eq!(
+                stripe[..stripe_bytes],
+                canonical_stripe[..stripe_bytes],
+                "stripe ({mode})"
+            );
+        }
+    }
+}
+
+/// Every glue table's in-place driver leaves the rows a prover reads exactly
+/// as the copying driver does, whatever the destination held before.
+#[test]
+fn in_place_drivers_zero_trailing_group_in_dirty_destination() {
+    let nu = DIRTY_DESTINATION_NU;
+    let mut rng = Rng(0x_D1_27_7A_11);
+    let spread = BitSpreadTable::new(24);
+    let pow_mask = PowMaskTable;
+    for count in DIRTY_DESTINATION_COUNTS {
+        let swap_rows: Vec<SwapInput> = (0..count)
+            .map(|_| SwapInput {
+                bit_word: rng.word(),
+                prev: rng.digest(),
+                sib: rng.digest(),
+            })
+            .collect();
+        assert_in_place_matches_canonical_on_dirty_destination(
+            count,
+            nu,
+            SwapTable::generate_witness_batch_major(&swap_rows, nu),
+            |dst| SwapTable::generate_witness_batch_major_into(&swap_rows, dst),
+        );
+
+        let spread_rows: Vec<BitSpreadInput> = (0..count)
+            .map(|_| BitSpreadInput {
+                word: rng.word(),
+                zero_mask: 0,
+                position_mask: 0xff,
+                position_prefix: 0x100,
+            })
+            .collect();
+        assert_in_place_matches_canonical_on_dirty_destination(
+            count,
+            nu,
+            spread.generate_witness_batch_major(&spread_rows, nu),
+            |dst| spread.generate_witness_batch_major_into(&spread_rows, dst),
+        );
+
+        let pow_mask_rows: Vec<PowMaskInput> = (0..count)
+            .map(|_| PowMaskInput {
+                pred: rng.word() << 16,
+                nonce: rng.word() >> 64,
+                mask: 0xffff,
+            })
+            .collect();
+        assert_in_place_matches_canonical_on_dirty_destination(
+            count,
+            nu,
+            pow_mask.generate_witness_batch_major(&pow_mask_rows, nu),
+            |dst| pow_mask.generate_witness_batch_major_into(&pow_mask_rows, dst),
+        );
+
+        let tile_rows: Vec<FamilyTransposeTileInput> = (0..count)
+            .map(|_| FamilyTransposeTileInput {
+                rows: from_fn(|_| {
+                    let word = rng.word();
+                    F128::new(word as u64, (word >> 64) as u64)
+                }),
+                selector: rng.next_u32() as u8,
+            })
+            .collect();
+        assert_in_place_matches_canonical_on_dirty_destination(
+            count,
+            nu,
+            FamilyTransposeTileTable::generate_witness_batch_major(&tile_rows, nu),
+            |dst| FamilyTransposeTileTable::generate_witness_batch_major_into(&tile_rows, dst),
+        );
+    }
+}
+
+/// End to end, through the real scratch pool: a union proof whose glue slots
+/// are generated in place over recycled, stale witness buffers is
+/// byte-identical to the proof from prebuilt (copied) witnesses, and verifies.
+///
+/// Nothing is injected into the destinations — the pool is drained and then
+/// handed stale buffers, exactly what a long-running prover's pool holds
+/// after unrelated work, and the prover picks its own buffer mode. Covers a
+/// partial trailing group, counts that are multiples of 8, empty slots, and
+/// full capacity (the one shape that does not elide padding writes).
+#[test]
+fn in_place_glue_proof_ignores_stale_pool_buffers() {
+    const DOMAIN: &[u8] = b"flock-glue-stale-pool-v0";
+    let nu = 9usize;
+    let capacity = 1usize << nu;
+    let spread = BitSpreadTable::new(24);
+    let spread_r1cs = spread.build_block_r1cs(nu);
+    let swap_r1cs = SwapTable::build_block_r1cs(nu);
+    // Slot order is capacity area descending: bit spread, then swap.
+    let registry = Registry::new(
+        vec![
+            TableType::from_block_r1cs(&swap_r1cs),
+            TableType::from_block_r1cs(&spread_r1cs),
+        ],
+        nu,
+    );
+    assert_eq!(registry.types()[0].k_log, spread.k_log());
+    let spread_circuit = spread_r1cs.csc_lincheck_circuit();
+    let swap_circuit = swap_r1cs.csc_lincheck_circuit();
+    let circuits: [&dyn LincheckCircuit; 2] = [spread_circuit, swap_circuit];
+    let mut rng = Rng(0x_57_A1_E0_01);
+
+    for counts in [[4usize, 78], [1, 9], [8, 80], [0, 0], [capacity, capacity]] {
+        let spread_rows: Vec<BitSpreadInput> = (0..counts[0])
+            .map(|_| BitSpreadInput {
+                word: rng.word(),
+                zero_mask: 0,
+                position_mask: 0xff,
+                position_prefix: 0x100,
+            })
+            .collect();
+        let swap_rows: Vec<SwapInput> = (0..counts[1])
+            .map(|_| SwapInput {
+                bit_word: rng.word(),
+                prev: rng.digest(),
+                sib: rng.digest(),
+            })
+            .collect();
+        let union = UnionInstance::new(&registry, counts.to_vec());
+        let log_batch_size = embedded_initial_k_or_default(union.dense_m(), LigeritoProfile::Fast);
+        let pcs_params = PcsParams {
+            m: union.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size,
+            profile: LigeritoProfile::Fast,
+            num_lanes: union.commit_lanes(log_batch_size),
+            merkle_hash: Default::default(),
+        };
+        let prove = |slots: Vec<UnionSlotProverInput<'_>>| {
+            let mut challenger = FsChallenger::new(DOMAIN);
+            let (proof, commitment, _claim) =
+                prove_fast_ligerito_union(&union, &pcs_params, slots, &mut challenger);
+            (proof, commitment)
+        };
+
+        let (prebuilt_proof, prebuilt_commitment) = prove(vec![
+            UnionSlotProverInput::new(
+                spread.generate_witness_batch_major(&spread_rows, nu),
+                spread_circuit,
+            ),
+            UnionSlotProverInput::new(
+                SwapTable::generate_witness_batch_major(&swap_rows, nu),
+                swap_circuit,
+            ),
+        ]);
+
+        // Empty the pool of every buffer that could serve the witness
+        // request, then stock it with stale ones.
+        let len = union.packed_len();
+        for _ in 0..64 {
+            drop(take_f128(len));
+        }
+        for _ in 0..6 {
+            give_f128(vec![STALE; len]);
+        }
+        // The destinations really arrive stale — otherwise this test would
+        // pass without exercising anything.
+        let arrived_stale = |dst: &SlotWitnessDest<'_>| {
+            assert!(
+                [&*dst.z, &*dst.a, &*dst.b]
+                    .iter()
+                    .all(|block| block.iter().all(|word| *word == STALE)),
+                "the pool did not hand out the stale buffers at counts {counts:?}"
+            );
+        };
+        let (in_place_proof, in_place_commitment) = prove(vec![
+            UnionSlotProverInput::in_place(
+                |dst| {
+                    arrived_stale(&dst);
+                    spread.generate_witness_batch_major_into(&spread_rows, dst)
+                },
+                spread_circuit,
+            ),
+            UnionSlotProverInput::in_place(
+                |dst| {
+                    arrived_stale(&dst);
+                    SwapTable::generate_witness_batch_major_into(&swap_rows, dst)
+                },
+                swap_circuit,
+            ),
+        ]);
+
+        let mut challenger = FsChallenger::new(DOMAIN);
+        verify_ligerito_union(
+            &union,
+            &circuits,
+            &in_place_commitment,
+            &in_place_proof,
+            &pcs_params,
+            &mut challenger,
+        )
+        .unwrap_or_else(|e| panic!("in-place proof rejected at counts {counts:?}: {e:?}"));
+        assert_eq!(
+            prebuilt_commitment.cap, in_place_commitment.cap,
+            "commitment root differs at counts {counts:?}"
+        );
+        assert!(
+            prebuilt_proof == in_place_proof,
+            "proof differs at counts {counts:?}"
+        );
+    }
 }
