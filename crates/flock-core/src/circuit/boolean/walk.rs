@@ -15,6 +15,7 @@ use super::{
 
 mod forward;
 mod packed;
+mod sliced;
 
 pub use forward::ForwardTrace;
 
@@ -35,6 +36,9 @@ pub struct WalkPlan {
     occupied_positions: Vec<usize>,
     expression_fanout: Vec<usize>,
     stats: WalkStats,
+    /// The flat instruction stream of [`Self::forward_sliced_compact`],
+    /// built on first use.
+    sliced: std::sync::OnceLock<sliced::SlicedProgram>,
 }
 
 /// Capacity-bound lincheck view of a structural [`WalkPlan`].
@@ -359,6 +363,7 @@ impl WalkPlan {
                 xor_term_bytes,
                 xor_term_allocations: xor_nodes,
             },
+            sliced: std::sync::OnceLock::new(),
         })
     }
 

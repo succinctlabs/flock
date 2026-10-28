@@ -100,3 +100,5 @@ fn reference(circuit: &LoweredCircuit, matrix: &BlockR1cs, input: &[bool]) -> Fo
 mod batches;
 #[path = "tests/packed.rs"]
 mod packed;
+#[path = "tests/sliced.rs"]
+mod sliced;

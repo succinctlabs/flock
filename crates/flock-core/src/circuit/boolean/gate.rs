@@ -311,22 +311,31 @@ impl BooleanGate {
             .par_chunks_mut(k)
             .take(zeroed)
             .for_each(|g| g.fill(0));
-        // Row-major (z, A·z, B·z) words, `w` per row each.
-        let mut words = vec![[0u128; 3]; n * w];
-        words
-            .par_chunks_mut(64 * w)
+        // Each 64-row group writes its own run of every column: rows
+        // `64g..64g + 64` of column `col` are `buf[(col << nu) + 64g..]`.
+        let mut runs: Vec<[Vec<&mut [F128]>; 3]> = (0..n.div_ceil(64))
+            .map(|_| std::array::from_fn(|_| Vec::with_capacity(w)))
+            .collect();
+        for (side, buf) in [z, a, b].into_iter().enumerate() {
+            for column in buf.chunks_mut(1 << nu).take(w) {
+                for (g, run) in column[..n].chunks_mut(64).enumerate() {
+                    runs[g][side].push(run);
+                }
+            }
+        }
+        runs.par_iter_mut()
             .zip(stripe[..live_groups * k].par_chunks_mut(8 * k))
             .zip(rows.par_chunks(64))
-            .for_each_init(SlicedScratch::default, |sc, ((out, stripe), rows)| {
+            .for_each_init(SlicedScratch::default, |sc, ((runs, stripe), rows)| {
                 self.walk_sliced(rows, sc);
-                for (side, planes) in [&sc.z, &sc.a, &sc.b].into_iter().enumerate() {
-                    for col in 0..w {
+                for (planes, runs) in [&sc.z, &sc.a, &sc.b].into_iter().zip(runs.iter_mut()) {
+                    for (col, run) in runs.iter_mut().enumerate() {
                         let lo = transpose64(planes[128 * col..128 * col + 64].try_into().unwrap());
                         let hi = transpose64(
                             planes[128 * col + 64..128 * col + 128].try_into().unwrap(),
                         );
-                        for r in 0..rows.len() {
-                            out[r * w + col][side] = lo[r] as u128 | (hi[r] as u128) << 64;
+                        for (r, o) in run.iter_mut().enumerate() {
+                            *o = F128::new(lo[r], hi[r]);
                         }
                     }
                 }
@@ -336,14 +345,6 @@ impl BooleanGate {
                     }
                 }
             });
-        for (side, buf) in [&mut *z, &mut *a, &mut *b].into_iter().enumerate() {
-            for col in 0..w {
-                buf[col << nu..(col << nu) + n]
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(row, o)| *o = to_f128(words[row * w + col][side]));
-            }
-        }
         stripe
     }
 
@@ -369,15 +370,10 @@ impl BooleanGate {
                 .iter()
                 .map(|&(w, bit)| sc.in_planes[128 * w as usize + bit as usize]),
         );
-        if let Err(e) = self.plan.forward_sliced_into(
-            &sc.inputs,
-            live,
-            self.r1cs.k_log,
-            &mut sc.z,
-            &mut sc.a,
-            &mut sc.b,
-            &mut sc.temporaries,
-        ) {
+        if let Err(e) = self
+            .plan
+            .forward_sliced_compact(&sc.inputs, live, &mut sc.z, &mut sc.a, &mut sc.b)
+        {
             panic!(
                 "{}: the gadget's constraints reject a row ({e:?})",
                 self.name
@@ -415,10 +411,6 @@ fn transpose64(mut m: [u64; 64]) -> [u64; 64] {
         mask ^= mask << width;
     }
     m
-}
-
-fn to_f128(v: u128) -> F128 {
-    F128::new(v as u64, (v >> 64) as u64)
 }
 
 impl GateType for BooleanGate {
