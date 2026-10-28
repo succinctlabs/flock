@@ -354,7 +354,7 @@ impl WalkPlan {
         self.sliced().positions
     }
 
-    fn sliced(&self) -> &SlicedProgram {
+    pub(crate) fn sliced(&self) -> &SlicedProgram {
         self.sliced.get_or_init(|| SlicedProgram::new(self))
     }
 

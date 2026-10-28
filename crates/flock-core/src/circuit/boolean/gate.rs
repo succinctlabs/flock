@@ -17,12 +17,14 @@
 //! [`CircuitBuilder`]: super::CircuitBuilder
 //! [`ShapeBuilder`]: crate::circuit::builder::ShapeBuilder
 
-use std::{cell::RefCell, collections::HashMap, ops::Range, sync::Arc};
-
-use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator, ParallelSlice,
-    ParallelSliceMut,
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    ops::Range,
+    sync::{Arc, Mutex},
 };
+
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
 use super::{
     BooleanCircuit, ColumnRole, ExpressionNode, LayoutError, LoweringMode, OperationKernel,
@@ -34,6 +36,7 @@ use crate::{
     circuit::builder::{GateType, SlotWitness},
     field::F128,
     r1cs::BlockR1cs,
+    run_hetero_chunks_stateful,
     schedule::{IoWord, TableType},
     scratch::take_u8,
     union::SlotWitnessDest,
@@ -426,9 +429,10 @@ impl BooleanGate {
     /// `A·z` and `B·z` into the BatchMajor buffers of `dst` (rows past
     /// `rows.len()` stay zero) and returns the lincheck stripe.
     ///
-    /// Rows are walked 64 at a time, bit-sliced ([`WalkPlan::forward_sliced_into`]):
-    /// each position's 64 lanes are the stripe's bytes for 8 row groups as
-    /// they stand, and a 64×64 bit transpose turns them into row words.
+    /// Rows are walked 64 at a time, bit-sliced, and 64×64 bit transposes
+    /// turn the walk's planes into row words; the rows then stream out to
+    /// the column runs and become the stripe, as the hand-written
+    /// generators' rows do.
     pub fn pack_into(&self, rows: &[Box<[F128]>], dst: SlotWitnessDest<'_>) -> Vec<u8> {
         let k_log = self.r1cs.k_log;
         let k = 1usize << k_log;
@@ -477,58 +481,39 @@ impl BooleanGate {
                 }
             }
         }
-        runs.par_iter_mut()
-            .zip(stripe[..live_groups * k].par_chunks_mut(8 * k))
-            .zip(rows.par_chunks(64))
-            .for_each_init(SlicedScratch::default, |sc, ((runs, stripe), rows)| {
-                if let Some(kernels) = &self.kernels {
-                    self.pack_group_with_kernels(rows, sc, kernels, runs, stripe);
-                    return;
-                }
-                self.walk_sliced(rows, sc);
-                for (planes, runs) in [&sc.z, &sc.a, &sc.b].into_iter().zip(runs.iter_mut()) {
-                    for (col, run) in runs.iter_mut().enumerate() {
-                        let lo = transpose64(planes[128 * col..128 * col + 64].try_into().unwrap());
-                        let hi = transpose64(
-                            planes[128 * col + 64..128 * col + 128].try_into().unwrap(),
-                        );
-                        for (r, o) in run.iter_mut().enumerate() {
-                            *o = F128::new(lo[r], hi[r]);
-                        }
-                    }
-                }
-                for (g, group) in stripe.chunks_mut(k).enumerate() {
-                    for (byte, &plane) in group[..useful].iter_mut().zip(&sc.z) {
-                        *byte = (plane >> (8 * g)) as u8;
-                    }
-                }
-            });
+        let (program, sites, words) = match &self.kernels {
+            Some(k) => (&k.program, &k.sites[..], &k.words[..]),
+            None => (self.plan.sliced(), &[][..], &[][..]),
+        };
+        let groups: Vec<_> = runs
+            .into_iter()
+            .zip(stripe[..live_groups * k].chunks_mut(8 * k))
+            .map(Mutex::new)
+            .collect();
+        // Groups drain on the P-cores and two E-core helpers, as the
+        // hand-written generators' do.
+        run_hetero_chunks_stateful(groups.len(), SlicedScratch::default, |sc, g| {
+            let (runs, stripe) = &mut *groups[g].lock().unwrap();
+            let rows = &rows[64 * g..n.min(64 * g + 64)];
+            self.pack_group(rows, sc, program, sites, words, runs, stripe);
+        });
+        drop(groups);
         stripe
     }
 
-    /// Up to 64 rows at once: their `z`, `A·z` and `B·z` as bit planes in `sc`.
-    fn walk_sliced(&self, rows: &[Box<[F128]>], sc: &mut SlicedScratch) {
-        let live = self.input_planes(rows, sc);
-        if let Err(e) = self
-            .plan
-            .forward_sliced_compact(&sc.inputs, live, &mut sc.z, &mut sc.a, &mut sc.b)
-        {
-            panic!(
-                "{}: the gadget's constraints reject a row ({e:?})",
-                self.name
-            );
-        }
-    }
-
-    /// Up to 64 rows, with kernels: the walk fills `sc`'s planes but for the
-    /// kernel sites, whose rows the kernels write in row form into `sc.rows`;
-    /// then each column run of `runs` and each 8-row group of `stripe` takes
-    /// the planes' bits, the kernels' bits, or both.
-    fn pack_group_with_kernels(
+    /// Up to 64 rows: the walk fills `sc`'s planes but for the kernel
+    /// sites, whose rows the kernels write in row form into `sc.rows`.
+    /// Every word the kernels do not fully cover (`words`, missing words
+    /// uncovered) is then transposed into row form too, and the rows go out
+    /// to the column runs and the stripe.
+    #[allow(clippy::too_many_arguments)]
+    fn pack_group(
         &self,
         rows: &[Box<[F128]>],
         sc: &mut SlicedScratch,
-        kernels: &Kernels,
+        program: &SlicedProgram,
+        sites: &[Site],
+        words: &[Cover],
         runs: &mut [Vec<&mut [F128]>; 3],
         stripe: &mut [u8],
     ) {
@@ -550,7 +535,7 @@ impl BooleanGate {
         for side in rm.iter_mut() {
             side.resize(8 * per_block, [0; 8]);
             for batch in side.chunks_mut(per_block) {
-                for (word, cover) in batch.iter_mut().zip(&kernels.words) {
+                for (word, cover) in batch.iter_mut().zip(words) {
                     if *cover != Cover::None {
                         *word = [0; 8];
                     }
@@ -558,8 +543,8 @@ impl BooleanGate {
             }
         }
         let [rz, ra, rb] = rm;
-        let walked = kernels.program.run(inputs, live, z, a, b, &mut |s, z| {
-            let site = &kernels.sites[s];
+        let walked = program.run(inputs, live, z, a, b, &mut |s, z| {
+            let site = &sites[s];
             let arg_words = site.args.len().div_ceil(64);
             args.clear();
             args.extend(
@@ -598,14 +583,14 @@ impl BooleanGate {
                     }
                 }
             }
-            // The result, back into the walk's planes.
+            // The result, back into the walk's planes, a word at a time.
+            let mut planes = (usize::MAX, [0u64; 64]);
             for &p in &site.results {
-                let (w, bit) = (p / 64, p % 64);
-                let mut plane = 0u64;
-                for r in 0..lanes {
-                    plane |= ((rz[(r / 8) * per_block + w][r % 8] >> bit) & 1) << r;
+                let w = p / 64;
+                if planes.0 != w {
+                    planes = (w, transpose64(std::array::from_fn(|r| row_word(rz, r, w))));
                 }
-                z[p] = plane;
+                z[p] = planes.1[p % 64];
             }
         });
         if let Err(e) = walked {
@@ -614,58 +599,58 @@ impl BooleanGate {
                 self.name
             );
         }
-        let row_word = |side: &[[u64; 8]], r: usize, w: usize| side[(r / 8) * per_block + w][r % 8];
-        for ((planes, runs), side) in [&*z, &*a, &*b]
+        let columns = runs[0].len();
+        for (planes, side) in [&*z, &*a, &*b]
             .into_iter()
-            .zip(runs.iter_mut())
-            .zip([&*rz, &*ra, &*rb])
+            .zip([&mut *rz, &mut *ra, &mut *rb])
         {
-            for (col, run) in runs.iter_mut().enumerate() {
-                let cover = [
-                    kernels.words[2 * col],
-                    *kernels.words.get(2 * col + 1).unwrap_or(&Cover::None),
-                ];
-                if cover == [Cover::Full; 2] {
-                    for (r, o) in run.iter_mut().enumerate() {
-                        *o = F128::new(row_word(side, r, 2 * col), row_word(side, r, 2 * col + 1));
-                    }
+            for w in 0..2 * columns {
+                let cover = *words.get(w).unwrap_or(&Cover::None);
+                if cover == Cover::Full {
                     continue;
                 }
-                let lo = transpose64(planes[128 * col..128 * col + 64].try_into().unwrap());
-                let hi = transpose64(planes[128 * col + 64..128 * col + 128].try_into().unwrap());
-                if cover == [Cover::None; 2] {
-                    for (r, o) in run.iter_mut().enumerate() {
-                        *o = F128::new(lo[r], hi[r]);
-                    }
+                let plane: &[u64; 64] = planes[64 * w..64 * w + 64].try_into().unwrap();
+                let t = if plane.iter().any(|&x| x != 0) {
+                    transpose64(*plane)
                 } else {
-                    for (r, o) in run.iter_mut().enumerate() {
-                        *o = F128::new(
-                            lo[r] | row_word(side, r, 2 * col),
-                            hi[r] | row_word(side, r, 2 * col + 1),
-                        );
+                    [0; 64]
+                };
+                for (batch, t) in t.as_chunks::<8>().0.iter().enumerate() {
+                    let word = &mut side[batch * per_block + w];
+                    if cover == Cover::None {
+                        *word = *t;
+                    } else {
+                        for (word, &t) in word.iter_mut().zip(t) {
+                            *word |= t;
+                        }
+                    }
+                }
+            }
+        }
+        for (runs, side) in runs.iter_mut().zip([&*rz, &*ra, &*rb]) {
+            for (col, run) in runs.iter_mut().enumerate() {
+                for (batch, run) in run.chunks_mut(8).enumerate() {
+                    let lo = &side[batch * per_block + 2 * col];
+                    let hi = &side[batch * per_block + 2 * col + 1];
+                    let out: [F128; 8] = std::array::from_fn(|j| F128::new(lo[j], hi[j]));
+                    if let Ok(run) = <&mut [F128; 8]>::try_from(&mut *run) {
+                        store_streaming(run, &out);
+                    } else {
+                        run.copy_from_slice(&out[..run.len()]);
                     }
                 }
             }
         }
         let useful = self.r1cs.useful_bits;
         for (g, group) in stripe.chunks_mut(k).enumerate() {
-            let mut bytes = [0u8; 64];
-            for (w, cover) in kernels.words.iter().enumerate() {
-                let span = 64 * w..(64 * w + 64).min(useful);
-                if *cover != Cover::Full {
-                    for (byte, &plane) in group[span.clone()].iter_mut().zip(&z[span.clone()]) {
-                        *byte = (plane >> (8 * g)) as u8;
-                    }
-                }
-                if *cover != Cover::None {
-                    transpose_8_u64s_to_64_bytes(&rz[g * per_block + w], &mut bytes);
-                    for (byte, &b) in group[span.clone()].iter_mut().zip(&bytes) {
-                        if *cover == Cover::Full {
-                            *byte = b;
-                        } else {
-                            *byte |= b;
-                        }
-                    }
+            let rows = &rz[g * per_block..];
+            for (w, bytes) in group[..useful].chunks_mut(64).enumerate() {
+                if bytes.len() == 64 {
+                    transpose_8_u64s_to_64_bytes(&rows[w], bytes);
+                } else {
+                    let mut full = [0u8; 64];
+                    transpose_8_u64s_to_64_bytes(&rows[w], &mut full);
+                    bytes.copy_from_slice(&full[..bytes.len()]);
                 }
             }
         }
@@ -715,8 +700,140 @@ struct SlicedScratch {
     arg_rows: Vec<u64>,
 }
 
+/// `*dst = *src` for a run the caller will not read back soon: on aarch64 a
+/// non-temporal store, which skips reading the destination lines in.
+#[inline(always)]
+fn store_streaming(dst: &mut [F128; 8], src: &[F128; 8]) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: both are 128 valid bytes, and `dst` is exclusively borrowed.
+    unsafe {
+        std::arch::asm!(
+            "ldp {t0:q}, {t1:q}, [{s}]",
+            "stnp {t0:q}, {t1:q}, [{d}]",
+            "ldp {t0:q}, {t1:q}, [{s}, #32]",
+            "stnp {t0:q}, {t1:q}, [{d}, #32]",
+            "ldp {t0:q}, {t1:q}, [{s}, #64]",
+            "stnp {t0:q}, {t1:q}, [{d}, #64]",
+            "ldp {t0:q}, {t1:q}, [{s}, #96]",
+            "stnp {t0:q}, {t1:q}, [{d}, #96]",
+            s = in(reg) src.as_ptr(),
+            d = in(reg) dst.as_mut_ptr(),
+            t0 = out(vreg) _,
+            t1 = out(vreg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        *dst = *src;
+    }
+}
+
+/// Row `r`'s word `w` of 8-row interleaved row words, `per_block` words a
+/// batch.
+fn row_word(rows: &[[u64; 8]], r: usize, w: usize) -> u64 {
+    rows[(r / 8) * (rows.len() / 8) + w][r % 8]
+}
+
 /// Transpose a 64×64 bit matrix: bit `c` of `out[r]` is bit `r` of `m[c]`.
+///
+/// Six rounds, each swapping one bit of the row index with the same bit of
+/// the column index; the rounds commute.
+#[cfg(not(target_arch = "aarch64"))]
 fn transpose64(mut m: [u64; 64]) -> [u64; 64] {
+    let mut width = 32;
+    let mut mask: u64 = 0x0000_0000_FFFF_FFFF;
+    while width > 0 {
+        let mut base = 0;
+        while base < 64 {
+            for r in base..base + width {
+                let t = ((m[r] >> width) ^ m[r + width]) & mask;
+                m[r] ^= t << width;
+                m[r + width] ^= t;
+            }
+            base += 2 * width;
+        }
+        width >>= 1;
+        mask ^= mask << width;
+    }
+    m
+}
+
+/// Transpose a 64×64 bit matrix: bit `c` of `out[r]` is bit `r` of `m[c]`.
+///
+/// Six rounds, each swapping one bit of the row index with the same bit of
+/// the column index; the rounds commute. Register `i` holds rows `i` and
+/// `i + 32`, so the 32-wide round is one byte shuffle per register and
+/// every other round pairs registers: first the 16- and 8-wide rounds over
+/// each set of four registers they mix, then the rest over each run of
+/// eight, so either pass fits in registers.
+#[cfg(target_arch = "aarch64")]
+fn transpose64(m: [u64; 64]) -> [u64; 64] {
+    use std::arch::aarch64::{
+        uint64x2_t, vandq_u64, vcombine_u64, vdupq_n_u64, veorq_u64, vld1_u64, vld1q_u8,
+        vqtbl1q_u8, vreinterpretq_u8_u64, vreinterpretq_u64_u8, vshlq_n_u64, vshrq_n_u64,
+        vst1q_u64, vzip1q_u64, vzip2q_u64,
+    };
+    #[inline(always)]
+    unsafe fn swap<const WIDTH: i32>(a: &mut uint64x2_t, b: &mut uint64x2_t, mask: u64) {
+        unsafe {
+            let t = vandq_u64(veorq_u64(vshrq_n_u64::<WIDTH>(*a), *b), vdupq_n_u64(mask));
+            *a = veorq_u64(*a, vshlq_n_u64::<WIDTH>(t));
+            *b = veorq_u64(*b, t);
+        }
+    }
+    // SAFETY: NEON is baseline on aarch64, and every load and store stays
+    // inside `m`, `v`, `out` or the shuffle table.
+    unsafe {
+        let mut v = [vdupq_n_u64(0); 32];
+        for i in 0..8 {
+            let at = |j: usize| m.as_ptr().add(i + 8 * j);
+            let mut r: [uint64x2_t; 4] =
+                std::array::from_fn(|j| vcombine_u64(vld1_u64(at(j)), vld1_u64(at(j).add(32))));
+            let [r0, r1, r2, r3] = &mut r;
+            swap::<16>(r0, r2, 0x0000_FFFF_0000_FFFF);
+            swap::<16>(r1, r3, 0x0000_FFFF_0000_FFFF);
+            swap::<8>(r0, r1, 0x00FF_00FF_00FF_00FF);
+            swap::<8>(r2, r3, 0x00FF_00FF_00FF_00FF);
+            for (j, r) in r.into_iter().enumerate() {
+                v[i + 8 * j] = r;
+            }
+        }
+        // `[a_lo, a_hi, b_lo, b_hi]` as 32-bit halves becomes
+        // `[a_lo, b_lo, a_hi, b_hi]`.
+        let halves: [u8; 16] = [0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15];
+        let halves = vld1q_u8(halves.as_ptr());
+        let mut out = [0u64; 64];
+        for (b, block) in v.as_chunks::<8>().0.iter().enumerate() {
+            let mut r = *block;
+            for x in r.iter_mut() {
+                *x = vreinterpretq_u64_u8(vqtbl1q_u8(vreinterpretq_u8_u64(*x), halves));
+            }
+            for i in [0, 1, 2, 3] {
+                let (lo, hi) = r.split_at_mut(4);
+                swap::<4>(&mut lo[i], &mut hi[i], 0x0F0F_0F0F_0F0F_0F0F);
+            }
+            for i in [0, 1, 4, 5] {
+                let (lo, hi) = r.split_at_mut(i + 2);
+                swap::<2>(&mut lo[i], &mut hi[0], 0x3333_3333_3333_3333);
+            }
+            for i in [0, 2, 4, 6] {
+                let (lo, hi) = r.split_at_mut(i + 1);
+                swap::<1>(&mut lo[i], &mut hi[0], 0x5555_5555_5555_5555);
+            }
+            let first = 8 * b;
+            for j in 0..4 {
+                let (a, b) = (r[2 * j], r[2 * j + 1]);
+                vst1q_u64(out.as_mut_ptr().add(first + 2 * j), vzip1q_u64(a, b));
+                vst1q_u64(out.as_mut_ptr().add(32 + first + 2 * j), vzip2q_u64(a, b));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+fn transpose64_scalar(mut m: [u64; 64]) -> [u64; 64] {
     let mut width = 32;
     let mut mask: u64 = 0x0000_0000_FFFF_FFFF;
     while width > 0 {
@@ -786,6 +903,26 @@ mod tests {
             for c in 0..64 {
                 assert_eq!((t[r] >> c) & 1, (m[c] >> r) & 1, "({r}, {c})");
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing; run explicitly"]
+    fn transpose64_cost() {
+        let mut state = 7u64;
+        let mut m: [u64; 64] = std::array::from_fn(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        });
+        for (name, f) in [
+            ("fast", super::transpose64 as fn([u64; 64]) -> [u64; 64]),
+            ("scalar", super::transpose64_scalar),
+        ] {
+            let t = std::time::Instant::now();
+            for _ in 0..1_000_000 {
+                m = std::hint::black_box(f(std::hint::black_box(m)));
+            }
+            eprintln!("{name}: {:.1} ns", t.elapsed().as_nanos() as f64 / 1e6);
         }
     }
 }
