@@ -1551,6 +1551,8 @@ pub struct Blake3Setup {
     pub r1cs: BlockR1cs,
     pub registry: Registry,
     pub pcs_params: PcsParams,
+    /// Commit at full height ([`Self::with_full_height_commit`]).
+    full_height: bool,
 }
 
 impl Blake3Setup {
@@ -1587,6 +1589,29 @@ impl Blake3Setup {
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
+    /// Commit every column at full height, the dummy compressions past
+    /// `n_blocks` as zeros, so the opening takes the block-first transport
+    /// whatever `n_blocks` is (as the leanXMSS circuit commits).
+    pub fn with_full_height_commit(mut self) -> Self {
+        self.full_height = true;
+        let union = self.union();
+        let m = union.dense_m();
+        let batch = embedded_initial_k_or_default(m, self.pcs_params.profile);
+        let num_lanes = union.commit_lanes(batch);
+        self.pcs_params.m = m;
+        self.pcs_params.log_batch_size = batch;
+        self.pcs_params.num_lanes = num_lanes;
+        self
+    }
+
+    fn union(&self) -> UnionInstance<'_> {
+        let mut union = UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        if self.full_height {
+            union.set_full_height_commit();
+        }
+        union
+    }
+
     pub fn with_profile(n_blocks: usize, profile: LigeritoProfile) -> Self {
         Self::with_profile_and_rate(n_blocks, profile, profile.log_inv_rate())
     }
@@ -1637,6 +1662,7 @@ impl Blake3Setup {
             r1cs,
             registry,
             pcs_params,
+            full_height: false,
         }
     }
 
@@ -1660,7 +1686,7 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (R1csProofMergedLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let union = UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let union = self.union();
         let slot = UnionSlotProverInput::new(
             generate_witness_batch_major_partial(blocks, self.n_blocks_log()),
             self.r1cs.csc_lincheck_circuit(),
@@ -1674,7 +1700,7 @@ impl Blake3Setup {
         proof: &R1csProofMergedLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, FlockVerifyError> {
-        let union = UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let union = self.union();
         let circuit = self.r1cs.csc_lincheck_circuit();
         let circs: [&dyn LincheckCircuit; 1] = [circuit];
         verify_ligerito_union(
@@ -1698,7 +1724,7 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (R1csProofMergedLigeritoAg, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let union = flock_core::union::UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let union = self.union();
         let nu = self.n_blocks_log();
         // IN-PLACE, not `new`: only this path reaches
         // `UnionInstance::slot_dests`, which is where the union certifies
@@ -1722,7 +1748,7 @@ impl Blake3Setup {
         proof: &R1csProofMergedLigeritoAg,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, FlockVerifyError> {
-        let union = UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let union = self.union();
         let circuit = self.r1cs.csc_lincheck_circuit();
         let circs: [&dyn LincheckCircuit; 1] = [circuit];
         verify_ligerito_union_ag(
