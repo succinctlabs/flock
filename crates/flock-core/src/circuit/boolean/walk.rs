@@ -18,6 +18,7 @@ mod packed;
 mod sliced;
 
 pub use forward::ForwardTrace;
+pub(crate) use sliced::{KernelSite, SlicedProgram};
 
 /// A compiled, layout-specific structural circuit walk.
 ///

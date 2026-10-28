@@ -17,7 +17,7 @@
 //! [`CircuitBuilder`]: super::CircuitBuilder
 //! [`ShapeBuilder`]: crate::circuit::builder::ShapeBuilder
 
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, ops::Range, sync::Arc};
 
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator, ParallelSlice,
@@ -25,10 +25,12 @@ use rayon::prelude::{
 };
 
 use super::{
-    BooleanCircuit, ColumnRole, LayoutError, LoweringMode, R1csBuildError, ValueId, WalkError,
-    WalkPlan,
+    BooleanCircuit, ColumnRole, ExpressionNode, LayoutError, LoweringMode, OperationKernel,
+    R1csBuildError, SchemaOperation, ValueId, WalkError, WalkPlan,
+    walk::{KernelSite, SlicedProgram},
 };
 use crate::{
+    bits::transpose_8_u64s_to_64_bytes,
     circuit::builder::{GateType, SlotWitness},
     field::F128,
     r1cs::BlockR1cs,
@@ -60,6 +62,8 @@ pub enum BooleanGateError {
     Misaligned(String),
     /// Every circuit input must arrive on a wired input word.
     UnwiredInput(String),
+    /// An operation does not fit the kernel attached to its kind.
+    Kernel(String),
 }
 
 impl From<LayoutError> for BooleanGateError {
@@ -96,6 +100,35 @@ pub struct BooleanGate {
     output_cols: Vec<usize>,
     /// A direct evaluation of the outputs, if the gadget has one.
     native: Option<NativeEval>,
+    /// Operations whose rows native kernels write ([`Self::with_kernel`]).
+    kernels: Option<Arc<Kernels>>,
+}
+
+/// The operations left to kernels, and the walk without them.
+struct Kernels {
+    program: SlicedProgram,
+    sites: Vec<Site>,
+    /// Per 64-bit block word: whether a site covers all of it, part of it,
+    /// or none.
+    words: Vec<Cover>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cover {
+    None,
+    Part,
+    Full,
+}
+
+/// One operation call left to a kernel.
+#[derive(Clone)]
+struct Site {
+    kernel: Arc<dyn OperationKernel>,
+    region: Range<usize>,
+    /// Each argument bit: the block positions whose XOR it is.
+    args: Vec<Vec<u32>>,
+    /// The positions of its materialized result.
+    results: Vec<usize>,
 }
 
 /// Computes a gadget's wired outputs from its wired inputs without walking
@@ -188,6 +221,7 @@ impl BooleanGate {
             n_in: inputs.len(),
             output_cols,
             native: None,
+            kernels: None,
         })
     }
 
@@ -202,6 +236,126 @@ impl BooleanGate {
     ) -> Self {
         self.native = Some(Arc::new(native));
         self
+    }
+
+    /// Hand every `kind` operation of `circuit` (as `operations` lists them,
+    /// [`CompiledColumns::operations`](super::CompiledColumns::operations))
+    /// to `kernel` when packing rows: the walk skips its rows and the kernel
+    /// writes them in row form. Each such operation must own `kernel.width()`
+    /// contiguous columns in order, its result materialized among them, and
+    /// take `kernel.arg_bits()` argument bits; the rest of the gadget must
+    /// read nothing of it but that result. `circuit` must be the one this
+    /// gate was built from. A circuit without such operations is unchanged.
+    pub fn with_kernel(
+        mut self,
+        circuit: &BooleanCircuit,
+        operations: &[SchemaOperation],
+        kind: &str,
+        kernel: Arc<dyn OperationKernel>,
+    ) -> Result<Self, BooleanGateError> {
+        let err = |what: &str| BooleanGateError::Kernel(format!("{}: {kind}: {what}", self.name));
+        let lowered = circuit.lower(LoweringMode::RequireIdentityC)?;
+        let layout = lowered.layout();
+        let position = |value: ValueId| {
+            lowered
+                .mapped_value(value)
+                .and_then(|v| layout.value_position(v))
+        };
+        let mut sites = self
+            .kernels
+            .as_ref()
+            .map_or_else(Vec::new, |k| k.sites.clone());
+        let before = sites.len();
+        for op in operations.iter().filter(|op| op.kind == kind) {
+            if op.columns.len() != kernel.width() {
+                return Err(err("operation width differs from the kernel's"));
+            }
+            let base = position(op.columns[0]).ok_or_else(|| err("unplaced column"))?;
+            if op
+                .columns
+                .iter()
+                .enumerate()
+                .any(|(i, &v)| position(v) != Some(base + i))
+            {
+                return Err(err("columns are not contiguous in order"));
+            }
+            let args = op
+                .inputs
+                .iter()
+                .flat_map(|word| &word.expressions)
+                .map(|e| {
+                    circuit.expressions[e.index]
+                        .support
+                        .iter()
+                        .map(|v| {
+                            position(ValueId {
+                                circuit: circuit.id,
+                                index: v.index(),
+                            })
+                            .map(|p| p as u32)
+                        })
+                        .collect::<Option<Vec<u32>>>()
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| err("argument outside the layout"))?;
+            if args.len() != kernel.arg_bits() {
+                return Err(err("argument count differs from the kernel's"));
+            }
+            let results = op
+                .output
+                .expressions
+                .iter()
+                .map(|e| match circuit.expressions[e.index].node {
+                    ExpressionNode::Value(v) if op.columns.contains(&v) => position(v),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| err("result is not materialized among its columns"))?;
+            sites.push(Site {
+                kernel: kernel.clone(),
+                region: base..base + kernel.width(),
+                args,
+                results,
+            });
+        }
+        if sites.len() == before {
+            return Ok(self);
+        }
+        for site in &sites {
+            let inside = |p: u32| sites.iter().any(|s| s.region.contains(&(p as usize)));
+            if site.args.iter().flatten().any(|&p| inside(p)) {
+                return Err(err("an argument reads a kernel's columns"));
+            }
+        }
+        let program = SlicedProgram::with_kernels(
+            &self.plan,
+            &sites
+                .iter()
+                .map(|s| KernelSite {
+                    region: s.region.clone(),
+                    results: s.results.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| err(&e))?;
+        let words = (0..self.r1cs.useful_bits.div_ceil(64))
+            .map(|w| {
+                let covered = (64 * w..64 * w + 64)
+                    .filter(|p| sites.iter().any(|s| s.region.contains(p)))
+                    .count();
+                match covered {
+                    0 => Cover::None,
+                    64 => Cover::Full,
+                    _ => Cover::Part,
+                }
+            })
+            .collect();
+        self.kernels = Some(Arc::new(Kernels {
+            program,
+            sites,
+            words,
+        }));
+        Ok(self)
     }
 
     /// Whether the online phase uses a native evaluation.
@@ -327,6 +481,10 @@ impl BooleanGate {
             .zip(stripe[..live_groups * k].par_chunks_mut(8 * k))
             .zip(rows.par_chunks(64))
             .for_each_init(SlicedScratch::default, |sc, ((runs, stripe), rows)| {
+                if let Some(kernels) = &self.kernels {
+                    self.pack_group_with_kernels(rows, sc, kernels, runs, stripe);
+                    return;
+                }
                 self.walk_sliced(rows, sc);
                 for (planes, runs) in [&sc.z, &sc.a, &sc.b].into_iter().zip(runs.iter_mut()) {
                     for (col, run) in runs.iter_mut().enumerate() {
@@ -350,6 +508,172 @@ impl BooleanGate {
 
     /// Up to 64 rows at once: their `z`, `A·z` and `B·z` as bit planes in `sc`.
     fn walk_sliced(&self, rows: &[Box<[F128]>], sc: &mut SlicedScratch) {
+        let live = self.input_planes(rows, sc);
+        if let Err(e) = self
+            .plan
+            .forward_sliced_compact(&sc.inputs, live, &mut sc.z, &mut sc.a, &mut sc.b)
+        {
+            panic!(
+                "{}: the gadget's constraints reject a row ({e:?})",
+                self.name
+            );
+        }
+    }
+
+    /// Up to 64 rows, with kernels: the walk fills `sc`'s planes but for the
+    /// kernel sites, whose rows the kernels write in row form into `sc.rows`;
+    /// then each column run of `runs` and each 8-row group of `stripe` takes
+    /// the planes' bits, the kernels' bits, or both.
+    fn pack_group_with_kernels(
+        &self,
+        rows: &[Box<[F128]>],
+        sc: &mut SlicedScratch,
+        kernels: &Kernels,
+        runs: &mut [Vec<&mut [F128]>; 3],
+        stripe: &mut [u8],
+    ) {
+        let lanes = rows.len();
+        let live = self.input_planes(rows, sc);
+        let k = 1usize << self.r1cs.k_log;
+        let per_block = k / 64;
+        let batches = lanes.div_ceil(8);
+        let SlicedScratch {
+            inputs,
+            z,
+            a,
+            b,
+            rows: rm,
+            args,
+            arg_rows,
+            ..
+        } = sc;
+        for side in rm.iter_mut() {
+            side.resize(8 * per_block, [0; 8]);
+            for batch in side.chunks_mut(per_block) {
+                for (word, cover) in batch.iter_mut().zip(&kernels.words) {
+                    if *cover != Cover::None {
+                        *word = [0; 8];
+                    }
+                }
+            }
+        }
+        let [rz, ra, rb] = rm;
+        let walked = kernels.program.run(inputs, live, z, a, b, &mut |s, z| {
+            let site = &kernels.sites[s];
+            let arg_words = site.args.len().div_ceil(64);
+            args.clear();
+            args.extend(
+                site.args
+                    .iter()
+                    .map(|support| support.iter().fold(0, |acc, &p| acc ^ z[p as usize])),
+            );
+            args.resize(64 * arg_words, 0);
+            arg_rows.resize(64 * arg_words, 0);
+            for c in 0..arg_words {
+                let t = transpose64(args[64 * c..64 * c + 64].try_into().unwrap());
+                for (r, &word) in t.iter().enumerate() {
+                    arg_rows[r * arg_words + c] = word;
+                }
+            }
+            for batch in 0..batches {
+                let row_args: [&[u64]; 8] =
+                    std::array::from_fn(|j| &arg_rows[(8 * batch + j) * arg_words..][..arg_words]);
+                let window = batch * per_block..(batch + 1) * per_block;
+                site.kernel.fill8(
+                    row_args,
+                    site.region.start,
+                    &mut rz[window.clone()],
+                    &mut ra[window.clone()],
+                    &mut rb[window],
+                );
+            }
+            // Rows past the slot's end stay zero, kernel bits included.
+            if !lanes.is_multiple_of(8) {
+                let batch = lanes / 8;
+                for side in [&mut *rz, &mut *ra, &mut *rb] {
+                    for w in site.region.start / 64..site.region.end.div_ceil(64) {
+                        for lane in side[batch * per_block + w][lanes % 8..].iter_mut() {
+                            *lane = 0;
+                        }
+                    }
+                }
+            }
+            // The result, back into the walk's planes.
+            for &p in &site.results {
+                let (w, bit) = (p / 64, p % 64);
+                let mut plane = 0u64;
+                for r in 0..lanes {
+                    plane |= ((rz[(r / 8) * per_block + w][r % 8] >> bit) & 1) << r;
+                }
+                z[p] = plane;
+            }
+        });
+        if let Err(e) = walked {
+            panic!(
+                "{}: the gadget's constraints reject a row ({e:?})",
+                self.name
+            );
+        }
+        let row_word = |side: &[[u64; 8]], r: usize, w: usize| side[(r / 8) * per_block + w][r % 8];
+        for ((planes, runs), side) in [&*z, &*a, &*b]
+            .into_iter()
+            .zip(runs.iter_mut())
+            .zip([&*rz, &*ra, &*rb])
+        {
+            for (col, run) in runs.iter_mut().enumerate() {
+                let cover = [
+                    kernels.words[2 * col],
+                    *kernels.words.get(2 * col + 1).unwrap_or(&Cover::None),
+                ];
+                if cover == [Cover::Full; 2] {
+                    for (r, o) in run.iter_mut().enumerate() {
+                        *o = F128::new(row_word(side, r, 2 * col), row_word(side, r, 2 * col + 1));
+                    }
+                    continue;
+                }
+                let lo = transpose64(planes[128 * col..128 * col + 64].try_into().unwrap());
+                let hi = transpose64(planes[128 * col + 64..128 * col + 128].try_into().unwrap());
+                if cover == [Cover::None; 2] {
+                    for (r, o) in run.iter_mut().enumerate() {
+                        *o = F128::new(lo[r], hi[r]);
+                    }
+                } else {
+                    for (r, o) in run.iter_mut().enumerate() {
+                        *o = F128::new(
+                            lo[r] | row_word(side, r, 2 * col),
+                            hi[r] | row_word(side, r, 2 * col + 1),
+                        );
+                    }
+                }
+            }
+        }
+        let useful = self.r1cs.useful_bits;
+        for (g, group) in stripe.chunks_mut(k).enumerate() {
+            let mut bytes = [0u8; 64];
+            for (w, cover) in kernels.words.iter().enumerate() {
+                let span = 64 * w..(64 * w + 64).min(useful);
+                if *cover != Cover::Full {
+                    for (byte, &plane) in group[span.clone()].iter_mut().zip(&z[span.clone()]) {
+                        *byte = (plane >> (8 * g)) as u8;
+                    }
+                }
+                if *cover != Cover::None {
+                    transpose_8_u64s_to_64_bytes(&rz[g * per_block + w], &mut bytes);
+                    for (byte, &b) in group[span.clone()].iter_mut().zip(&bytes) {
+                        if *cover == Cover::Full {
+                            *byte = b;
+                        } else {
+                            *byte |= b;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The rows' wired input words as walk input planes in `sc.inputs`;
+    /// returns the live-lane mask.
+    fn input_planes(&self, rows: &[Box<[F128]>], sc: &mut SlicedScratch) -> u64 {
         let lanes = rows.len();
         let live = if lanes == 64 { !0 } else { (1u64 << lanes) - 1 };
         // Input word `w`, bit `j`, across the rows: plane `128w + j`.
@@ -370,15 +694,7 @@ impl BooleanGate {
                 .iter()
                 .map(|&(w, bit)| sc.in_planes[128 * w as usize + bit as usize]),
         );
-        if let Err(e) = self
-            .plan
-            .forward_sliced_compact(&sc.inputs, live, &mut sc.z, &mut sc.a, &mut sc.b)
-        {
-            panic!(
-                "{}: the gadget's constraints reject a row ({e:?})",
-                self.name
-            );
-        }
+        live
     }
 }
 
@@ -391,6 +707,12 @@ struct SlicedScratch {
     a: Vec<u64>,
     b: Vec<u64>,
     temporaries: Vec<u64>,
+    /// Kernel rows in row form, eight rows interleaved per word, eight
+    /// batches: `z`, `A·z`, `B·z`.
+    rows: [Vec<[u64; 8]>; 3],
+    /// A kernel's argument planes, then its arguments row by row.
+    args: Vec<u64>,
+    arg_rows: Vec<u64>,
 }
 
 /// Transpose a 64×64 bit matrix: bit `c` of `out[r]` is bit `r` of `m[c]`.

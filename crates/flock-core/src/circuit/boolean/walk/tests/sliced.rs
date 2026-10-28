@@ -10,7 +10,7 @@ fn compact_walk_matches_the_action_walk() {
         let plan = circuit.walk_plan().unwrap();
         let k_log = capacity_log(plan.useful_bits()).max(7);
         let positions = plan.sliced_positions();
-        assert!(positions >= plan.useful_bits() && positions % 128 == 0);
+        assert!(positions >= plan.useful_bits() && positions.is_multiple_of(128));
         let (mut z, mut a, mut b, mut t) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut cz, mut ca, mut cb) = (Vec::new(), Vec::new(), Vec::new());
         let mut rejected = 0;
