@@ -419,8 +419,14 @@ fn leaf_pipeline_enabled(params: &PcsParams) -> bool {
 /// streams, since the deep pass's sub-groups are whole positions whatever the
 /// stride. `FLOCK_NO_LANE_PIPELINE=1` keeps the staged NTT-then-Merkle path
 /// (the A/B knob; the tree is byte-identical either way).
+///
+/// macOS only: the helpers rely on utility QoS to land on the E-cores
+/// ([`crate::set_utility_qos`] is a no-op elsewhere), so on Linux/x86 they
+/// would oversubscribe the transform's cores. Unmeasured there; lift the
+/// gate once a server A/B shows it pays.
 fn lane_pipeline_enabled(params: &PcsParams) -> bool {
-    params.merkle_hash == crate::merkle::HashKind::Blake3
+    cfg!(target_os = "macos")
+        && params.merkle_hash == crate::merkle::HashKind::Blake3
         && params.n_positions() * params.num_ntts() >= (1 << 22)
         && rayon::current_num_threads() > 1
         && var_os("FLOCK_NO_LANE_PIPELINE").is_none_or(|v| v != *"1")
@@ -552,10 +558,19 @@ fn pipelined_commit(
         // inside the transform: ntt+leaves 135 ms against 130 for the P-core
         // transform alone, and 141 with the all-core deep pass and two
         // helpers. Queue depth 2× helpers bounds the unhashed window.
+        //
+        // The split assumes the caller's pool is the P-core pool and the
+        // spare cores are the E-cores: a narrower caller pool would pin the
+        // deep pass to a few P-cores while helpers took the rest, so E-core
+        // hashing needs a caller pool at least as wide as the P-cluster, and
+        // the helpers never outnumber the E-cores.
         let spare_cores = crate::all_core_pool()
             .current_num_threads()
-            .saturating_sub(current_num_threads());
-        let e_core_hashing = merkle::blake3_sme2_takes_leaves(leaf_size) && spare_cores >= 2;
+            .saturating_sub(current_num_threads())
+            .min(crate::efficiency_core_count());
+        let e_core_hashing = merkle::blake3_sme2_takes_leaves(leaf_size)
+            && current_num_threads() >= crate::perf_core_count_cached()
+            && spare_cores >= 2;
         let n_helpers = if e_core_hashing { spare_cores - 1 } else { 2 };
         // Shallow queue: bounds the unhashed (cache-warm) window; a full
         // queue makes the publisher hash inline on the transform worker.
@@ -1252,13 +1267,20 @@ mod tests {
             let mut codeword = take_f128(params.codeword_len_f128());
             replicate_lane_major_fill(&mut codeword, &q, t, d);
             let (c_ref, pd_ref) = finalize_commit(codeword, t, &params);
-            for threads in [2usize, 8, 32] {
+            // The P-core count is the width that takes the E-core hashing
+            // split (where SME2 and spare E-cores exist); 2 is narrower, 32
+            // wider than any all-core pool.
+            for threads in [2usize, crate::perf_core_count_cached(), 8, 32] {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
                     .build()
                     .unwrap();
                 pool.install(|| {
-                    assert!(lane_pipeline_enabled(&params), "shape must stream");
+                    assert_eq!(
+                        lane_pipeline_enabled(&params),
+                        cfg!(target_os = "macos"),
+                        "shape must stream on macOS"
+                    );
                     let (c_pipe, pd_pipe) = commit_lane_major(&q, &params);
                     assert_eq!(c_pipe.cap, c_ref.cap, "cap (c={c}, threads={threads})");
                     assert!(
