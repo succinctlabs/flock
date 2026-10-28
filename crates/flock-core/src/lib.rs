@@ -354,7 +354,7 @@ fn linux_physical_cores() -> Option<usize> {
 /// the only extra threads the all-core pool could add are SMT siblings,
 /// which were never validated to help (the global pool is deliberately
 /// sized to physical cores — see [`init_perf_thread_pool`]).
-fn efficiency_core_count() -> usize {
+pub(crate) fn efficiency_core_count() -> usize {
     #[cfg(target_vendor = "apple")]
     {
         if let Some(n) = apple_sysctl_usize(c"hw.perflevel1.physicalcpu") {
