@@ -7,7 +7,8 @@ mod addition;
 pub(super) mod tests;
 pub use addition::{Add3, Add4, Add32, AddConst32};
 
-pub(super) type Word = [LinearExpr; 32];
+/// A 32-bit word of expressions, little-endian.
+pub type Word = [LinearExpr; 32];
 
 pub(super) fn physical_witness(
     logical: &[bool],

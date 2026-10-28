@@ -1,11 +1,41 @@
 use super::super::dsl::{Word, constant, materialize};
-use super::columns::FirstC;
+use super::columns::{FirstC, GCols};
 use super::{Blake3Cols, blake3};
 use flock_core::circuit::boolean::{CircuitBuilder, Var};
 
 pub(super) fn eval(builder: &mut CircuitBuilder, cols: &Blake3Cols<Var>) {
     let cv = cols.cv.map(|word| word.map(Into::into));
-    let mut message = cols.message.map(|word| word.map(Into::into));
+    let state = compress(
+        builder,
+        &cols.rounds,
+        cv,
+        cols.message.map(|word| word.map(Into::into)),
+        cols.counter.map(|word| word.map(Into::into)),
+        cols.block_len.map(Into::into),
+        cols.flags.map(Into::into),
+    );
+    let out_lo: [Word; 8] = std::array::from_fn(|i| builder.xor2_words(state[i], state[i + 8]));
+    let out_hi: [Word; 8] = std::array::from_fn(|i| builder.xor2_words(state[i + 8], cv[i]));
+    for (cols, word) in cols.out_lo.iter().zip(out_lo) {
+        materialize(builder, cols, word);
+    }
+    for (cols, word) in cols.out_hi.iter().zip(out_hi) {
+        materialize(builder, cols, word);
+    }
+}
+
+/// One compression's seven rounds over arbitrary input expressions: the
+/// final 16-word state, before the output feed-forward (`out_lo[i]` is
+/// `state[i] ⊕ state[i + 8]`).
+pub fn compress(
+    builder: &mut CircuitBuilder,
+    rounds: &[[GCols<Var>; 8]],
+    cv: [Word; 8],
+    mut message: [Word; 16],
+    counter: [Word; 2],
+    block_len: Word,
+    flags: Word,
+) -> [Word; 16] {
     let mut state = [
         cv[0],
         cv[1],
@@ -19,12 +49,12 @@ pub(super) fn eval(builder: &mut CircuitBuilder, cols: &Blake3Cols<Var>) {
         constant(builder, blake3::BLAKE3_IV[1]),
         constant(builder, blake3::BLAKE3_IV[2]),
         constant(builder, blake3::BLAKE3_IV[3]),
-        cols.counter[0].map(Into::into),
-        cols.counter[1].map(Into::into),
-        cols.block_len.map(Into::into),
-        cols.flags.map(Into::into),
+        counter[0],
+        counter[1],
+        block_len,
+        flags,
     ];
-    for (round, gs) in cols.rounds.iter().enumerate() {
+    for (round, gs) in rounds.iter().enumerate() {
         for (i, g) in gs.iter().enumerate() {
             let [a_lane, b_lane, c_lane, d_lane] = blake3::G_LANES[i];
             let [mx, my] = blake3::G_MSG_IDX[i];
@@ -45,18 +75,11 @@ pub(super) fn eval(builder: &mut CircuitBuilder, cols: &Blake3Cols<Var>) {
             state[c_lane] = c2;
             state[d_lane] = d2;
         }
-        if round + 1 < cols.rounds.len() {
+        if round + 1 < rounds.len() {
             message = std::array::from_fn(|i| message[blake3::MSG_PERMUTATION[i]]);
         }
     }
-    let out_lo: [Word; 8] = std::array::from_fn(|i| builder.xor2_words(state[i], state[i + 8]));
-    let out_hi: [Word; 8] = std::array::from_fn(|i| builder.xor2_words(state[i + 8], cv[i]));
-    for (cols, word) in cols.out_lo.iter().zip(out_lo) {
-        materialize(builder, cols, word);
-    }
-    for (cols, word) in cols.out_hi.iter().zip(out_hi) {
-        materialize(builder, cols, word);
-    }
+    state
 }
 
 fn xor_rotate(builder: &mut CircuitBuilder, x: Word, y: Word, amount: usize) -> Word {
