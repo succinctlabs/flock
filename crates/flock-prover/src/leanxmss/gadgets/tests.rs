@@ -6,7 +6,7 @@ use flock_field::F128;
 
 use super::*;
 use crate::leanxmss::reference::{
-    chain_address, codeword, leaf_address, msg_address, node_address,
+    CHAIN_END, chain_address, codeword, leaf_address, msg_address, node_address,
 };
 
 struct Rng(u64);
@@ -50,16 +50,10 @@ fn bit(v: F128, j: usize) -> bool {
 }
 
 #[test]
-fn select_and_swap_match_their_semantics() {
+fn swap_matches_its_semantics() {
     let mut rng = Rng(1);
-    let gates = [0, 1, 2].map(|step| select_gate(step, 3).unwrap());
     let swap = swap_gate(3).unwrap();
     for _ in 0..64 {
-        let (sel, x, h) = (rng.word(), rng.word(), rng.word());
-        for (step, gate) in gates.iter().enumerate() {
-            let want = if bit(sel, step) { h } else { x };
-            assert_eq!(eval(gate, &[sel, x, h]), [want], "select{step}");
-        }
         let (dir, node, sibling) = (rng.word(), rng.word(), rng.word());
         let want = if bit(dir, 0) {
             [sibling, node]
@@ -96,37 +90,16 @@ fn random_codeword_digits(rng: &mut Rng) -> [u8; V] {
     digits
 }
 
-/// The spread chain over a codeword digest gives each chain's selectors, and
-/// the check accepts exactly the codewords.
+/// The check accepts exactly the codewords.
 #[test]
-fn codeword_check_and_selectors() {
+fn codeword_check() {
     let check = codeword_gate(3).unwrap();
-    let spread = spread_gate(3).unwrap();
     let mut rng = Rng(2);
     for _ in 0..32 {
         let digits = random_codeword_digits(&mut rng);
         let digest = digest_from_digits(&digits);
         assert_eq!(codeword(&digest), Some(digits));
         assert!(eval(&check, &[word_of(&digest)]).is_empty());
-        let mut r = word_of(&digest);
-        let mut sel = Vec::new();
-        for _ in 0..SPREADS {
-            let out = eval(&spread, &[r]);
-            assert_eq!(out.len(), SPREAD_DIGITS + 1);
-            sel.extend_from_slice(&out[..SPREAD_DIGITS]);
-            r = out[SPREAD_DIGITS];
-        }
-        assert_eq!(r, F128::ZERO);
-        for (i, &x) in digits.iter().enumerate() {
-            for step in 0..CHAIN_END {
-                assert_eq!(
-                    bit(sel[i], step),
-                    x as usize <= step,
-                    "chain {i} step {step}"
-                );
-            }
-            assert!((CHAIN_END..128).all(|j| !bit(sel[i], j)));
-        }
     }
     // Wrong digit sum, and a nonzero high digit, are both rejected.
     let mut digits = random_codeword_digits(&mut rng);
@@ -174,7 +147,7 @@ fn addresses_match_the_reference() {
             for level in 1..=HEIGHT {
                 let out = eval(
                     &step,
-                    &[*shifted.last().unwrap(), word_of(&constants[4 + level])],
+                    &[*shifted.last().unwrap(), word_of(&constants[2 + level])],
                 );
                 shifted.push(out[0]);
                 nodes[layer].push(out[1]);
@@ -196,10 +169,14 @@ fn addresses_match_the_reference() {
                 )[0]
             };
             assert_eq!(a(0), word_of(&msg_address(layer, e)));
+            // The machine derives the other steps' addresses from step 0's
+            // by setting bits 61..62.
             for s in 0..CHAIN_END {
-                assert_eq!(a(1 + s), word_of(&chain_address(layer, e, s)));
+                let mut want = a(1);
+                want.lo ^= (s as u64) << 61;
+                assert_eq!(want, word_of(&chain_address(layer, e, s)));
             }
-            assert_eq!(a(4), word_of(&leaf_address(layer, e)));
+            assert_eq!(a(2), word_of(&leaf_address(layer, e)));
             for level in 1..=HEIGHT {
                 assert_eq!(
                     nodes[layer][level - 1],
@@ -215,31 +192,19 @@ fn addresses_match_the_reference() {
 #[test]
 fn gadget_blocks_are_small() {
     let gates = [
-        select_gate(0, 3).unwrap(),
         swap_gate(3).unwrap(),
         codeword_gate(3).unwrap(),
-        spread_gate(3).unwrap(),
         address_gate(3).unwrap(),
         address_step_gate(3).unwrap(),
-        lookup_gate(3).unwrap(),
     ];
-    // The routing blocks carry eight positions each.
-    let routing = [
-        (benes_gate(false, 3).unwrap(), 13),
-        (benes_gate(true, 3).unwrap(), 12),
-    ];
-    for (g, max) in gates
-        .iter()
-        .map(|g| (g, 11))
-        .chain(routing.iter().map(|(g, m)| (g, *m)))
-    {
+    for g in &gates {
         eprintln!(
             "{}: k_log {} ({} useful bits)",
             g.name(),
             g.k_log(),
             g.useful_bits()
         );
-        assert!(g.k_log() <= max, "{} has a 2^{} block", g.name(), g.k_log());
+        assert!(g.k_log() <= 11, "{} has a 2^{} block", g.name(), g.k_log());
     }
 }
 
@@ -249,8 +214,8 @@ fn gadget_blocks_are_small() {
 #[test]
 fn packed_rows_satisfy_the_relation() {
     let nu = 4;
-    let gate = select_gate(1, nu).unwrap();
-    let single = select_gate(1, 0).unwrap();
+    let gate = swap_gate(nu).unwrap();
+    let single = swap_gate(0).unwrap();
     let r1cs = single.r1cs();
     let k_log = gate.k_log();
     let k = 1usize << k_log;
@@ -287,7 +252,11 @@ fn packed_rows_satisfy_the_relation() {
             let mut y = Vec::new();
             gate.eval(&rows[row], &(), &mut y);
             let out_col = gate.table().io_schema.last().unwrap().word_col;
-            assert_eq!(z[(out_col << nu) + row], y[0], "row {row} output word");
+            assert_eq!(
+                z[(out_col << nu) + row],
+                *y.last().unwrap(),
+                "row {row} output word"
+            );
         } else {
             assert!(zr.iter().all(|&x| !x), "dummy row {row} is not zero");
         }
@@ -298,86 +267,12 @@ fn packed_rows_satisfy_the_relation() {
     }
 }
 
-/// The forward block permutes values and index words exactly as the native
-/// network does, and the reverse block with the same control word undoes it.
-#[test]
-fn benes_blocks_match_the_network() {
-    use crate::leanxmss::routing::pair;
-    let forward = benes_gate(false, 3).unwrap();
-    let reverse = benes_gate(true, 3).unwrap();
-    let mut rng = Rng(5);
-    for _ in 0..64 {
-        let ctrl = rng.next() & 0xFFF;
-        let values: Vec<F128> = (0..8).map(|_| rng.word()).collect();
-        let indices: Vec<u64> = (0..8).map(|_| rng.next() % 64).collect();
-        let mut inputs = vec![F128::new(ctrl, 0)];
-        inputs.extend(&values);
-        inputs.extend(indices.iter().map(|&i| F128::new(i, 0)));
-        let out = eval(&forward, &inputs);
-        let mut items: Vec<(F128, u64)> = values
-            .iter()
-            .copied()
-            .zip(indices.iter().copied())
-            .collect();
-        for s in 0..3 {
-            for q in 0..4 {
-                if (ctrl >> (4 * s + q)) & 1 == 1 {
-                    let lo = pair(s, q);
-                    items.swap(lo, lo | 1 << s);
-                }
-            }
-        }
-        for e in 0..8 {
-            assert_eq!(out[e], items[e].0, "value {e}");
-            assert_eq!(out[8 + e], F128::new(items[e].1, 0), "index {e}");
-        }
-        let mut back_in = vec![F128::new(ctrl, 0)];
-        back_in.extend(&out[..8]);
-        assert_eq!(eval(&reverse, &back_in), values, "reverse undoes forward");
-    }
-}
-
-/// The lookup reads each index's digit (dummies as 3) and enforces its class.
-#[test]
-fn lookup_reads_digits_and_enforces_classes() {
-    let gate = lookup_gate(3).unwrap();
-    let mut rng = Rng(6);
-    let digits = random_codeword_digits(&mut rng);
-    let digest = word_of(&digest_from_digits(&digits));
-    for index in 0..64u64 {
-        let digit = digits.get(index as usize).copied().unwrap_or(3);
-        let sel = eval(&gate, &[digest, F128::new(index, 0), F128::ZERO])[0];
-        assert_eq!(
-            sel,
-            F128::new((digit == 0) as u64 | ((digit <= 1) as u64) << 1, 0)
-        );
-        for (class, allowed) in [(1u64, digit >= 1), (2, digit >= 2)] {
-            for run in [eval, eval_native] {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(&gate, &[digest, F128::new(index, 0), F128::new(class, 0)])
-                }));
-                assert_eq!(
-                    r.is_ok(),
-                    allowed,
-                    "index {index} digit {digit} class {class}"
-                );
-            }
-        }
-    }
-}
-
 /// Every gadget's native evaluator agrees with its circuit on random inputs
 /// (valid ones where the circuit constrains them).
 #[test]
 fn native_evaluation_matches_the_circuit() {
     let mut rng = Rng(7);
     let mut gates: Vec<(BooleanGate, Box<dyn Fn(&mut Rng) -> Vec<F128>>)> = Vec::new();
-    for step in 0..CHAIN_END {
-        gates.push((
-            select_gate(step, 3).unwrap(),
-            Box::new(|r| vec![r.word(), r.word(), r.word()]),
-        ));
-    }
     gates.push((
         swap_gate(3).unwrap(),
         Box::new(|r| vec![r.word(), r.word(), r.word()]),
@@ -386,7 +281,6 @@ fn native_evaluation_matches_the_circuit() {
         codeword_gate(3).unwrap(),
         Box::new(|r| vec![word_of(&digest_from_digits(&random_codeword_digits(r)))]),
     ));
-    gates.push((spread_gate(3).unwrap(), Box::new(|r| vec![r.word()])));
     gates.push((
         address_gate(3).unwrap(),
         Box::new(|r| vec![r.word(), r.word()]),
@@ -394,26 +288,6 @@ fn native_evaluation_matches_the_circuit() {
     gates.push((
         address_step_gate(3).unwrap(),
         Box::new(|r| vec![r.word(), r.word()]),
-    ));
-    for reverse in [false, true] {
-        gates.push((
-            benes_gate(reverse, 3).unwrap(),
-            Box::new(move |r| {
-                let mut v = vec![F128::new(r.next() & 0xFFF, 0)];
-                v.extend((0..8).map(|_| r.word()));
-                if !reverse {
-                    v.extend((0..8).map(|_| F128::new(r.next() % 64, 0)));
-                }
-                v
-            }),
-        ));
-    }
-    gates.push((
-        lookup_gate(3).unwrap(),
-        Box::new(|r| {
-            let d = word_of(&digest_from_digits(&random_codeword_digits(r)));
-            vec![d, F128::new(r.next() % 64, 0), F128::ZERO]
-        }),
     ));
     for (gate, inputs) in &gates {
         assert!(gate.has_native(), "{} has no native evaluator", gate.name());

@@ -7,5 +7,5 @@
 
 pub mod circuit;
 pub mod gadgets;
+pub mod machine;
 pub mod reference;
-pub mod routing;
