@@ -41,15 +41,15 @@
 
 use flock_core::circuit::boolean::{
     BooleanCircuit, BooleanGate, BooleanGateError, CircuitBuilder, ColumnRole, ColumnSchema,
-    ColumnVisitor, LinearExpr as Expr, Var,
+    ColumnVisitor, LinearExpr as Expr, SchemaOperation, Var,
 };
 use flock_field::F128;
 
 use super::reference::{CHAIN_END, TARGET_SUM, V, Value, W};
 use crate::r1cs_hashes::{
     blake3::BLAKE3_IV,
-    blake3_dsl::{GCols, compress, round_columns},
-    dsl::Word,
+    blake3_dsl::{GCols, compress_op, round_columns},
+    dsl::{Word, boolean_gate},
 };
 
 /// Chain steps per layer: every codeword takes exactly this many.
@@ -125,6 +125,7 @@ pub struct MachineCols<T> {
     pub keep: [T; 128],
     pub cv: [T; 256],
     pub m: Vec<[T; 128]>,
+    pub out_lo: [T; 256],
     pub h: [T; 256],
     pub reset: Vec<[T; 128]>,
     pub write: Vec<[T; 128]>,
@@ -178,6 +179,7 @@ impl ColumnSchema for MachineSchema {
                 .map(|j| v.word(&format!("m-{j}"), ColumnRole::Witness))
                 .collect(),
             rounds: round_columns(v, "rounds"),
+            out_lo: v.word("out-lo", ColumnRole::Witness),
             h: v.word("h", ColumnRole::Witness),
             reset: (0..3)
                 .map(|j| v.word(&format!("reset-{j}"), ColumnRole::Witness))
@@ -240,8 +242,9 @@ fn mux<const N: usize>(
     })
 }
 
-pub fn machine_circuit() -> BooleanCircuit {
-    CircuitBuilder::compile(MachineSchema, |b, c| {
+/// The row's circuit and its operations.
+pub fn machine_circuit() -> (BooleanCircuit, Vec<SchemaOperation>) {
+    let compiled = CircuitBuilder::compile(MachineSchema, |b, c| {
         let one: Expr = b.one().into();
         let zero = b.zero();
         let word = |w: &[Var; 128]| -> [Expr; 128] { w.map(Into::into) };
@@ -426,17 +429,17 @@ pub fn machine_circuit() -> BooleanCircuit {
             6 => long,
             _ => zero,
         });
-        let state = compress(
+        // One compression, packed by the hand-written BLAKE3 generator.
+        let out_lo = compress_op(
             b,
             &c.rounds,
+            &c.out_lo,
             cv_words,
             msg_words,
             [[zero; 32]; 2],
             block_len,
             flags,
         );
-        let out_lo: [Expr; 256] =
-            std::array::from_fn(|j| b.xor2(state[j / 32][j % 32], state[8 + j / 32][j % 32]));
         let out0: [Expr; 128] = std::array::from_fn(|j| out_lo[j]);
 
         // The next state.
@@ -471,9 +474,8 @@ pub fn machine_circuit() -> BooleanCircuit {
                 b.define_linear(col, e);
             }
         }
-    })
-    .circuit()
-    .clone()
+    });
+    (compiled.circuit().clone(), compiled.operations().to_vec())
 }
 
 fn u(v: F128) -> u128 {
@@ -623,12 +625,14 @@ pub fn plain_ctl(flags: u32, block_len: u32) -> F128 {
 /// The machine row as a gate type: inputs the state words then
 /// `[P, A_chain(step 0), f0, f1, f2, y]`, outputs the next state words.
 pub fn machine_gate(nu: usize) -> Result<BooleanGate, BooleanGateError> {
-    static CIRCUIT: std::sync::OnceLock<BooleanCircuit> = std::sync::OnceLock::new();
-    let circuit = CIRCUIT.get_or_init(machine_circuit);
+    static CIRCUIT: std::sync::OnceLock<(BooleanCircuit, Vec<SchemaOperation>)> =
+        std::sync::OnceLock::new();
+    let (circuit, operations) = CIRCUIT.get_or_init(machine_circuit);
     let ins: Vec<&str> = STATE.iter().chain(&EXTRA).copied().collect();
     let outs: Vec<String> = STATE.iter().map(|s| out_name(s)).collect();
     let outs: Vec<&str> = outs.iter().map(String::as_str).collect();
-    BooleanGate::new("leanxmss.machine", circuit, &ins, &outs, nu).map(|g| g.with_native(native))
+    boolean_gate("leanxmss.machine", circuit, operations, &ins, &outs, nu)
+        .map(|g| g.with_native(native))
 }
 
 /// The prover's values for one layer: the initial slot 2 (chain 0's end if

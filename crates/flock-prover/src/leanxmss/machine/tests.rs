@@ -286,3 +286,55 @@ fn plain_rows_compress() {
         }
     }
 }
+
+/// Packing with the BLAKE3 kernel writes exactly the slot the walk writes:
+/// `z`, `A·z`, `B·z` and the lincheck stripe, dummy rows included.
+#[test]
+fn kernel_packing_matches_the_walk() {
+    use flock_core::union::SlotWitnessDest;
+    let nu = 8;
+    let (circuit, _) = machine_circuit();
+    let ins: Vec<&str> = STATE.iter().chain(&EXTRA).copied().collect();
+    let outs: Vec<String> = STATE.iter().map(|s| out_name(s)).collect();
+    let outs: Vec<&str> = outs.iter().map(String::as_str).collect();
+    let walked = BooleanGate::new("walked", &circuit, &ins, &outs, nu).unwrap();
+    let kernel = machine_gate(nu).unwrap();
+    let mut all: Vec<Box<[F128]>> = Vec::new();
+    for layer in layers(2, 21) {
+        run_layer(&layer, |i| {
+            all.push(i.into());
+            run_native(i)
+        });
+    }
+    let mut rng = Rng(13);
+    for (flags, block_len) in [(1 | 2 | 8, 64), (1, 64), (2 | 8, 16)] {
+        let mut inputs: Vec<F128> = (0..13).map(|_| rng.word()).collect();
+        inputs[6] = plain_ctl(flags, block_len);
+        all.push(inputs.into());
+    }
+    let words = walked.k_log() - 7;
+    for n in [all.len().min(1 << nu), 203, 64, 7] {
+        let rows = &all[..n];
+        let len = 1usize << (nu + words);
+        let pack = |gate: &BooleanGate| {
+            let poison = F128::new(0xDEAD, 0xBEEF);
+            let (mut z, mut a, mut b) = (vec![poison; len], vec![poison; len], vec![poison; len]);
+            let stripe = gate.pack_into(
+                rows,
+                SlotWitnessDest {
+                    z: &mut z,
+                    a: &mut a,
+                    b: &mut b,
+                    elide_padding_writes: false,
+                    dead_padding_unread: false,
+                },
+            );
+            (z, a, b, stripe)
+        };
+        let (want, got) = (pack(&walked), pack(&kernel));
+        assert!(want.0 == got.0, "{n} rows: z differs");
+        assert!(want.1 == got.1, "{n} rows: A·z differs");
+        assert!(want.2 == got.2, "{n} rows: B·z differs");
+        assert!(want.3 == got.3, "{n} rows: stripe differs");
+    }
+}

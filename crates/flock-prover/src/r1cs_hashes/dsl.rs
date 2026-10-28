@@ -1,11 +1,37 @@
 //! Shared authoring operations for the two hash circuits.
 
-use flock_core::circuit::boolean::{CircuitBuilder, ColumnRole, ColumnVisitor, LinearExpr, Var};
+use std::sync::Arc;
+
+use flock_core::circuit::boolean::{
+    BooleanCircuit, BooleanGate, BooleanGateError, CircuitBuilder, ColumnRole, ColumnVisitor,
+    LinearExpr, SchemaOperation, Var,
+};
 
 mod addition;
 #[cfg(test)]
 pub(super) mod tests;
 pub use addition::{Add3, Add4, Add32, AddConst32};
+
+/// A DSL circuit as a gate ([`BooleanGate::new`]) with every hand-written
+/// generator attached: each operation that has one (a BLAKE3 compression
+/// built with [`super::blake3_dsl::compress_op`]) is packed natively rather
+/// than walked. `operations` are the compiled circuit's
+/// ([`flock_core::circuit::boolean::CompiledColumns::operations`]).
+pub fn boolean_gate(
+    name: &str,
+    circuit: &BooleanCircuit,
+    operations: &[SchemaOperation],
+    inputs: &[&str],
+    outputs: &[&str],
+    nu: usize,
+) -> Result<BooleanGate, BooleanGateError> {
+    BooleanGate::new(name, circuit, inputs, outputs, nu)?.with_kernel(
+        circuit,
+        operations,
+        super::blake3_dsl::OPERATION,
+        Arc::new(super::blake3::Blake3Kernel),
+    )
+}
 
 /// A 32-bit word of expressions, little-endian.
 pub type Word = [LinearExpr; 32];

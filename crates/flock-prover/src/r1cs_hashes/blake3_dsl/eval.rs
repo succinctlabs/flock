@@ -1,7 +1,7 @@
 use super::super::dsl::{Word, constant, materialize};
 use super::columns::{FirstC, GCols};
 use super::{Blake3Cols, blake3};
-use flock_core::circuit::boolean::{CircuitBuilder, Var};
+use flock_core::circuit::boolean::{CircuitBuilder, LinearExpr, Var};
 
 pub(super) fn eval(builder: &mut CircuitBuilder, cols: &Blake3Cols<Var>) {
     let cv = cols.cv.map(|word| word.map(Into::into));
@@ -80,6 +80,64 @@ pub fn compress(
         }
     }
     state
+}
+
+/// The kind of [`compress_op`]'s operation.
+pub const OPERATION: &str = "blake3.compress";
+
+/// [`compress`] as one `blake3.compress` operation whose result, `out_lo`
+/// (`state[i] ⊕ state[i + 8]`, 256 bits), is materialized into `out`: the
+/// shape [`super::super::blake3::Blake3Kernel`] generates natively. A gate
+/// built with [`super::super::dsl::boolean_gate`] packs its rows with that
+/// kernel instead of walking them.
+#[allow(clippy::too_many_arguments)]
+pub fn compress_op(
+    builder: &mut CircuitBuilder,
+    rounds: &[[GCols<Var>; 8]],
+    out: &[Var; 256],
+    cv: [Word; 8],
+    message: [Word; 16],
+    counter: [Word; 2],
+    block_len: Word,
+    flags: Word,
+) -> [LinearExpr; 256] {
+    // The operation's columns in definition order, which is their layout.
+    let mut columns: Vec<Var> = Vec::new();
+    for g in rounds.iter().flatten() {
+        columns.extend(g.a_first.majority_product);
+        columns.extend(g.a_first.ripple_product);
+        match &g.c_first {
+            FirstC::Constant(add) => columns.extend(&add.carry_product),
+            FirstC::Variable(add) => columns.extend(add.carry_product),
+        }
+        columns.extend(g.a_second.majority_product);
+        columns.extend(g.a_second.ripple_product);
+        columns.extend(g.c_second.carry_product);
+    }
+    columns.extend(out);
+    let flat = |words: &[Word]| words.iter().flatten().copied().collect::<Vec<_>>();
+    builder.operation(
+        OPERATION,
+        &columns,
+        [
+            ("cv", flat(&cv)),
+            ("message", flat(&message)),
+            ("counter", flat(&counter)),
+            ("block_len", block_len.to_vec()),
+            ("flags", flags.to_vec()),
+        ],
+        |b| {
+            let state = compress(b, rounds, cv, message, counter, block_len, flags);
+            let mut result = [b.zero(); 256];
+            for (j, slot) in result.iter_mut().enumerate() {
+                let (w, bit) = (j / 32, j % 32);
+                let value = b.xor2(state[w][bit], state[w + 8][bit]);
+                b.define_linear(out[j], value);
+                *slot = out[j].into();
+            }
+            result
+        },
+    )
 }
 
 fn xor_rotate(builder: &mut CircuitBuilder, x: Word, y: Word, amount: usize) -> Word {

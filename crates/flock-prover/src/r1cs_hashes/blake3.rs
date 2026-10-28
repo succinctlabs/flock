@@ -1891,6 +1891,96 @@ fn batch_major_const_add_inline(
     sum
 }
 
+/// The seven rounds of eight compressions in lockstep: every G block's
+/// carries and their operands, written with the G region starting at bit
+/// `region` (it is [`GS_BASE`] in this gate's own block); returns the final
+/// state.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn batch_major_rounds(
+    rows: &mut BmRows<'_>,
+    region: usize,
+    cv: &[[u32; BM_V]; 8],
+    m: &[[u32; BM_V]; 16],
+    counter_lo: [u32; BM_V],
+    counter_hi: [u32; BM_V],
+    block_len: [u32; BM_V],
+    flags: [u32; BM_V],
+) -> [[u32; BM_V]; 16] {
+    // `g_bit` positions are in this gate's block, whose G region starts at
+    // GS_BASE.
+    let base = region.wrapping_sub(GS_BASE);
+    let at = |g: usize, off: usize| base.wrapping_add(g_bit(g, off));
+    let mut state: [[u32; BM_V]; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        [BLAKE3_IV[0]; BM_V],
+        [BLAKE3_IV[1]; BM_V],
+        [BLAKE3_IV[2]; BM_V],
+        [BLAKE3_IV[3]; BM_V],
+        counter_lo,
+        counter_hi,
+        block_len,
+        flags,
+    ];
+    let msg_idx = per_round_msg_idx();
+    for r in 0..N_ROUNDS {
+        for g_in_round in 0..N_G_PER_ROUND {
+            let g = r * N_G_PER_ROUND + g_in_round;
+            let [la, lb, lc, ld] = G_LANES[g_in_round];
+            let [mx_i, my_i] = msg_idx[r][g_in_round];
+            let mx = m[mx_i];
+            let my = m[my_i];
+
+            let a_val = state[la];
+            let b_val = state[lb];
+            let c_val = state[lc];
+            let d_val = state[ld];
+
+            let a_1 = batch_major_fused_add_inline(
+                rows,
+                &a_val,
+                &b_val,
+                &mx,
+                at(g, OFF_MAJ1),
+                at(g, OFF_RIP1),
+            );
+            let d_1 = batch_major_xor_rotr(&d_val, &a_1, 16);
+            let c_1 = if g < 4 {
+                batch_major_const_add_inline(rows, BLAKE3_IV[g], &d_1, at(g, OFF_C1), g_c1_rows(g))
+            } else {
+                batch_major_add_inline(rows, &c_val, &d_1, at(g, OFF_C1))
+            };
+            let b_1 = batch_major_xor_rotr(&b_val, &c_1, 12);
+            let a_2 = batch_major_fused_add_inline(
+                rows,
+                &a_1,
+                &b_1,
+                &my,
+                at(g, off_maj2(g)),
+                at(g, off_rip2(g)),
+            );
+            let d_2 = batch_major_xor_rotr(&d_1, &a_2, 8);
+            let c_2 = batch_major_add_inline(rows, &c_1, &d_2, at(g, off_c2(g)));
+            let b_new = batch_major_xor_rotr(&b_1, &c_2, 7);
+            let d_new = d_2;
+
+            state[la] = a_2;
+            state[lb] = b_new;
+            state[lc] = c_2;
+            state[ld] = d_new;
+        }
+    }
+
+    state
+}
+
 /// Build one V = 8 group of compressions into interleaved rows. Mirrors
 /// [`build_block_witness_ab_packed_into`] field-for-field (byte-equality is
 /// pinned by the lockstep test below).
@@ -1931,84 +2021,64 @@ pub(crate) fn build_group_batch_major(
     batch_major_write_lin(&mut rows, BLEN_BASE, &block_len);
     batch_major_write_lin(&mut rows, FLAGS_BASE, &flags);
 
-    let mut state: [[u32; BM_V]; 16] = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
-        [BLAKE3_IV[0]; BM_V],
-        [BLAKE3_IV[1]; BM_V],
-        [BLAKE3_IV[2]; BM_V],
-        [BLAKE3_IV[3]; BM_V],
-        counter_lo,
-        counter_hi,
-        block_len,
-        flags,
-    ];
-    let msg_idx = per_round_msg_idx();
-    for r in 0..N_ROUNDS {
-        for g_in_round in 0..N_G_PER_ROUND {
-            let g = r * N_G_PER_ROUND + g_in_round;
-            let [la, lb, lc, ld] = G_LANES[g_in_round];
-            let [mx_i, my_i] = msg_idx[r][g_in_round];
-            let mx = m[mx_i];
-            let my = m[my_i];
-
-            let a_val = state[la];
-            let b_val = state[lb];
-            let c_val = state[lc];
-            let d_val = state[ld];
-
-            let a_1 = batch_major_fused_add_inline(
-                &mut rows,
-                &a_val,
-                &b_val,
-                &mx,
-                g_bit(g, OFF_MAJ1),
-                g_bit(g, OFF_RIP1),
-            );
-            let d_1 = batch_major_xor_rotr(&d_val, &a_1, 16);
-            let c_1 = if g < 4 {
-                batch_major_const_add_inline(
-                    &mut rows,
-                    BLAKE3_IV[g],
-                    &d_1,
-                    g_bit(g, OFF_C1),
-                    g_c1_rows(g),
-                )
-            } else {
-                batch_major_add_inline(&mut rows, &c_val, &d_1, g_bit(g, OFF_C1))
-            };
-            let b_1 = batch_major_xor_rotr(&b_val, &c_1, 12);
-            let a_2 = batch_major_fused_add_inline(
-                &mut rows,
-                &a_1,
-                &b_1,
-                &my,
-                g_bit(g, off_maj2(g)),
-                g_bit(g, off_rip2(g)),
-            );
-            let d_2 = batch_major_xor_rotr(&d_1, &a_2, 8);
-            let c_2 = batch_major_add_inline(&mut rows, &c_1, &d_2, g_bit(g, off_c2(g)));
-            let b_new = batch_major_xor_rotr(&b_1, &c_2, 7);
-            let d_new = d_2;
-
-            state[la] = a_2;
-            state[lb] = b_new;
-            state[lc] = c_2;
-            state[ld] = d_new;
-        }
-    }
+    let state = batch_major_rounds(
+        &mut rows, GS_BASE, &cv, &m, counter_lo, counter_hi, block_len, flags,
+    );
 
     for w in 0..8 {
         let lo: [u32; BM_V] = from_fn(|j| state[w][j] ^ state[w + 8][j]);
         let hi: [u32; BM_V] = from_fn(|j| state[w + 8][j] ^ cv[w][j]);
         batch_major_write_lin(&mut rows, out_lo_bit(w, 0), &lo);
         batch_major_write_lin(&mut rows, out_hi_bit(w, 0), &hi);
+    }
+}
+
+/// Bits of the G blocks: the region a compression's carries occupy.
+pub const G_REGION_BITS: usize = G_BASE[N_G] - GS_BASE;
+
+/// The hand-written generator as the kernel of the DSL's `blake3.compress`
+/// operation ([`super::blake3_dsl::compress_op`]): its G blocks, laid out as
+/// this gate's own from the operation's first column, then the materialized
+/// `out_lo`. Arguments: `cv`, the block, the counter, the block length and
+/// the flags, 896 bits.
+pub struct Blake3Kernel;
+
+impl flock_core::circuit::boolean::OperationKernel for Blake3Kernel {
+    fn arg_bits(&self) -> usize {
+        28 * WORD_BITS
+    }
+
+    fn width(&self) -> usize {
+        G_REGION_BITS + 8 * WORD_BITS
+    }
+
+    fn fill8(
+        &self,
+        args: [&[u64]; 8],
+        base: usize,
+        z: &mut [[u64; 8]],
+        a: &mut [[u64; 8]],
+        b: &mut [[u64; 8]],
+    ) {
+        let word =
+            |i: usize| -> [u32; BM_V] { from_fn(|j| (args[j][i / 2] >> (32 * (i % 2))) as u32) };
+        let cv: [[u32; BM_V]; 8] = from_fn(word);
+        let m: [[u32; BM_V]; 16] = from_fn(|i| word(8 + i));
+        let mut rows = BmRows { z, a, b };
+        let state = batch_major_rounds(
+            &mut rows,
+            base,
+            &cv,
+            &m,
+            word(24),
+            word(25),
+            word(26),
+            word(27),
+        );
+        for w in 0..8 {
+            let lo: [u32; BM_V] = from_fn(|j| state[w][j] ^ state[w + 8][j]);
+            batch_major_write_lin(&mut rows, base + G_REGION_BITS + w * WORD_BITS, &lo);
+        }
     }
 }
 
