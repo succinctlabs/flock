@@ -60,7 +60,9 @@ records a protocol change rather than a kernel: whole words of degree-one
 constraint rows --- a gate's inputs, its XORed outputs, its constant's word
 --- leave the zerocheck and are checked by the lincheck as one linear
 identity, at no measurable lincheck cost; it includes a soundness gap the
-first version had under the full-height commit, and its fix.
+first version had under the full-height commit, and its fix, and a
+lookahead pass over live spans that lets the sparse tail run two rounds
+per pass on any layout, which more than halves the multi-threaded tail.
 \end{abstract}
 
 \section*{Preliminaries}
@@ -1399,7 +1401,7 @@ rows from the relation removes all three.
 \item[Baseline:] leanXMSS at $1000$ signatures: zerocheck $156$, zerocheck$+$lincheck window $208$, prove $505\,$ms (10 threads, median of three alternating rounds' fastest proves).
 \item[Improvement:] Degree-one words out of the zerocheck in every full slot (\S\ref{sec:degreeone-protocol}).
 \item[Mechanism:] Round~1 and the skip$\to$multilinear fold read $\approx13\%$ fewer blocks; the tail, which overlaps the wiring GKR, moves least; the lincheck pays $+2\,$ms for the partial slots' own combs.
-\item[Result:] zerocheck $156\to140$, window $208\to194$, prove $505\to494\,$ms ($-2.2\%$, $3/3$); lincheck $19\,$ms in every pure-BLAKE3 arm (the linear check is free). Pure BLAKE3 at full utilization \emph{regresses} ($445\to463$), for a reason outside this change.
+\item[Result:] zerocheck $156\to140$, window $208\to194$, prove $505\to494\,$ms ($-2.2\%$, $3/3$); lincheck $19\,$ms in every pure-BLAKE3 arm (the linear check is free). Pure BLAKE3 at full utilization \emph{regresses} ($445\to463$), for a reason outside this change, which \S\ref{sec:livelookahead} removes.
 \end{optsummary}
 
 \begin{table}[h]
@@ -1442,21 +1444,80 @@ full slot's used words --- and dropped words split it. leanXMSS never has
 that layout (many slots, gaps, partial columns), so its tail runs without
 the lookahead in every arm; at $55$--$61\,$ms it is its largest zerocheck
 phase. The remedy belongs to the tail, not to this change
-(\S\ref{sec:degreeone-left}).
+(\S\ref{sec:livelookahead}).
+
+\subsection{The lookahead over live spans}\label{sec:livelookahead}
+
+\begin{optsummary}
+\item[Baseline:] The sparse tail ran the lookahead ladder of \S\ref{sec:foldentry} only on a single live interval starting at~$0$. On any other layout it resolved the fold-level entry's deferred challenge with a \emph{serial} in-place fold over the whole live set, then ran one round per pass. leanXMSS never qualified: at the tail's entry its $34.6$M live positions form $227$ intervals, aligned only to $128$ positions, because a partial slot's columns are live on $2n_t$ of their $2^{\nu+1}$ positions. Pure BLAKE3 with dropped words is a single interval, but it starts at column~$11$.
+\item[Improvement:] A lookahead pass over live-span buffers. Every group of inputs (16 with two pending variables, 8 with one) is weighted by its global index. A run of groups inside one stored interval goes through the dense NEON kernel on the compacted slice; a group straddling a live/dead boundary gathers its inputs with the dead ones at their honest zero. The output layout is the group cover of the live set, merged where groups touch, so its intervals are multiples of $4$ and the ladder continues on any layout.
+\item[Mechanism:] Two effects, separated by a third arm that only parallelizes the resolve: the serial pass leaves the critical path, and the two-rounds-per-pass ladder reads and writes the live set about half as often. Single-threaded neither shows: both routes do about $3L$ multiplications for $L$ live positions.
+\item[Result:] Ten threads: tail $56\to24\,$ms on leanXMSS and $62\to28$ on pure BLAKE3 with dropped words; zerocheck $146\to110$ and $167\to129$; prove faster in $5/5$ rounds on each. One thread: tail unchanged.
+\end{optsummary}
+
+The pass needs nothing from the layout. Its eight sums are sums over
+groups of products of folded values, each group weighted by
+$\eq_{\mathrm{lo}}\cdot\eq_{\mathrm{hi}}$ at its global index; a group
+whose inputs are all dead folds to zero and contributes nothing, and a
+group with some dead inputs is computed exactly as the dense pass computes
+it on the expanded buffer. So the sums, and the stored outputs, are the
+dense pass's, and the transcript is unchanged. The tasks are cut at the
+$\eq_{\mathrm{hi}}$ boundaries, so each carries one high weight; on a
+dense prefix they are the dense pass's chunks. A unit test compares the
+pass with the dense one on expanded buffers for prefixes, an offset
+interval, slot-shaped runs, and intervals that start, end, or meet inside
+a group.
+
+The single-threaded null is the expected one. Per $16$ inputs a fold-2
+pass does $24$ folding multiplications, $4$ eq scalings and $8$ products,
+$2.25$ per input over $L, L/4, L/16,\dots$, so $3L$ in all. The classic
+route does $1$ per input for the resolve and $2$ per input for each
+fold-and-message round over $L/2, L/4,\dots$, again $3L$. What the ladder
+saves is traffic, and the old route's resolve was a single-threaded loop
+over the whole live set; both matter only when the cores compete for
+bandwidth and wait at the pass boundary. The decision was therefore taken
+on the ten-thread measurement (Table~\ref{tab:livelookahead}).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+ten threads & before & resolve parallel only & live-span lookahead\\
+\midrule
+leanXMSS, $1000$ signatures: tail & 56 & 43 & 24\\
+\quad zerocheck & 146 & 136 & 110\\
+\quad zerocheck $+$ lincheck window & 203 & 194 & 184\\
+pure BLAKE3 $2^{18}$, degree-one words dropped: tail & 62 & 50 & 28\\
+\quad zerocheck & 167 & 147 & 129\\
+\quad zerocheck $+$ lincheck window & 205 & 184 & 162\\
+\midrule
+one thread (tail) & before & & live-span lookahead\\
+\midrule
+leanXMSS, $1000$ signatures & 92 & & 91\\
+pure BLAKE3, degree-one words dropped & 112 & & 114\\
+pure BLAKE3, nothing dropped (single prefix) & 126 & & 126\\
+\bottomrule
+\end{tabular}
+\caption{M4, ms. Ten threads: medians over three alternating rounds of each
+round's fastest prove. One thread: medians over three rounds of each
+round's per-phase minimum. ``Before'' is \S\ref{sec:degreeone} as
+measured in Table~\ref{tab:degreeone}. The prove totals were faster in
+every one of five ten-thread rounds on both workloads, by medians of
+$28$ (leanXMSS) and $20\,$ms (pure BLAKE3); the desktop was shared, so the
+window is the steadier figure.}\label{tab:livelookahead}
+\end{table}
+
+With it, dropping words pays at full utilization too. Over the same
+ten-thread rounds pure BLAKE3's zerocheck has a median of $140\,$ms with
+nothing dropped ($136$--$146$, four proves) and $129$ with its degree-one
+words dropped ($121$--$143$, five), against $167$ before ($157$--$181$). leanXMSS's tail, its largest zerocheck phase in every arm of
+Table~\ref{tab:degreeone}, is now its smallest.
 
 \subsection{What is left}\label{sec:degreeone-left}
 
 \begin{itemize}
 \setlength{\itemsep}{1pt}
-\item \emph{The lookahead per live interval.} The lookahead kernel already
-  weights every position by its global index, so given each span's global
-  offset it can run interval by interval; its eight sums are linear, so the
-  per-interval sums add. Pure BLAKE3's dropped words leave column-aligned
-  intervals ($2^{\nu+1}$ positions), which keeps every pass aligned until
-  the sparse loop ends. leanXMSS additionally needs the fold to pad live
-  spans to a power-of-two granularity, because a partial column's live
-  prefix ends on a $128$-position boundary only; that would put its
-  $55$--$61\,$ms tail on the lookahead in every arm.
 \item \emph{Partial slots under full height.} Keeping their savings needs
   the C claim's weight
   $\eq_{\mathrm{row}}\otimes(\eq_{\mathrm{col}}\odot m)
@@ -1538,6 +1599,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \midrule
 \multicolumn{4}{@{}l}{\emph{protocol, leanXMSS at $1000$ signatures, M4, ten threads}}\\
 \S\ref{sec:degreeone} & protocol (work removal) & zerocheck $156\to140$; prove $-2.2\%$ & $3/3$\\
+\S\ref{sec:livelookahead} & pass fusion, scheduling & zc tail: $56\to24\,$ms 10T, $\pm0$ ST & $5/5$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\

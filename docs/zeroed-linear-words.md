@@ -221,17 +221,83 @@ which is unsound under full height.
 
 - **The linear check is free.** The lincheck takes 19 ms in every arm, and
   inputs-only on this binary matches the first version's binary.
-- **At full utilization, dropping words is a net loss today.** Round 1 and
-  the fold shrink as expected, but the multilinear tail doubles.
-  - The sparse tail runs its two-rounds-per-pass lookahead only when the
-    live layout is a single interval starting at 0.
+- **At full utilization, dropping words was a net loss.** Round 1 and the
+  fold shrink as expected, but the multilinear tail doubles.
+  - The sparse tail ran its two-rounds-per-pass lookahead only when the
+    live layout was a single interval starting at 0.
   - A full slot's used words are such an interval, and dropped words split
     it.
   - leanXMSS never has that layout (many slots, gaps, partial columns), so
-    its tail runs without the lookahead in every arm. At 55–61 ms it is
+    its tail ran without the lookahead in every arm. At 55–61 ms it was
     its largest zerocheck phase.
-- **The fix belongs to the tail:** run the lookahead per live interval
-  (see *Next*).
+- **The fix belonged to the tail.** The lookahead now runs on any live
+  layout (next section), which removes the regression.
+
+## The tail's lookahead over live spans
+
+The sparse tail used to run the lookahead ladder only on one live interval
+starting at 0. On any other layout it resolved the fold's deferred
+challenge with a serial in-place fold over the whole live set
+(`fold_in_place_pair`), then ran the classic one-round-per-pass kernel.
+At the tail's entry:
+- **leanXMSS** (1000 signatures) has 34.6M live positions in 227
+  intervals, aligned only to 128 positions. A partial slot's columns are
+  live on `2·n_t` of their `2^(ν+1)` positions.
+- **Pure BLAKE3 with dropped words** is one interval, but it starts at
+  column 11.
+
+`fold_lookahead_sparse_into` (`multilinear.rs`) runs the lookahead pass on
+live-span buffers:
+- Every group of inputs (16 with two pending variables, 8 with one) is
+  weighted by its global index.
+- A run of groups inside one stored interval goes through the dense NEON
+  kernel on the compacted slice.
+- A group straddling a live/dead boundary gathers its inputs with the dead
+  ones at zero.
+- The output layout (`lookahead_layout`) is the group cover of the live
+  set, merged where groups touch. Its intervals are multiples of 4, so the
+  ladder continues on any layout.
+
+The sums and stored outputs equal the dense pass's on the expanded
+buffers, so the transcript is unchanged.
+`sparse_lookahead_matches_the_dense_pass` checks this for prefixes, an
+offset interval, slot-shaped runs, and intervals that start, end or meet
+inside a group, for both pass widths.
+
+The gain is multicore only:
+
+| ms | before | resolve parallel only | live-span lookahead |
+|---|---:|---:|---:|
+| **10 threads**, leanXMSS: tail | 56 | 43 | 24 |
+| leanXMSS: zerocheck | 146 | 136 | 110 |
+| leanXMSS: zerocheck + lincheck window | 203 | 194 | 184 |
+| pure BLAKE3 2^18, linear words dropped: tail | 62 | 50 | 28 |
+| pure BLAKE3: zerocheck | 167 | 147 | 129 |
+| pure BLAKE3: zerocheck + lincheck window | 205 | 184 | 162 |
+| **1 thread**, tail: leanXMSS | 92 | | 91 |
+| pure BLAKE3, linear words dropped | 112 | | 114 |
+| pure BLAKE3, nothing dropped (single prefix) | 126 | | 126 |
+
+- **Ten threads:** medians of three alternating rounds' fastest proves. The
+  prove was faster in 5 of 5 rounds on both workloads (median −28 ms
+  leanXMSS, −20 ms pure BLAKE3). The desktop was shared, so the window is
+  the steadier figure.
+- **One thread:** medians of three rounds' per-phase minimum.
+- **Why one thread shows nothing.** Both routes do about `3L`
+  multiplications for `L` live positions:
+  - fold2 passes: 2.25 per input over `L, L/4, …`;
+  - classic: 1 per input for the resolve, then 2 per input over
+    `L/2, L/4, …`.
+
+  What the ladder saves is memory traffic, and the old route's resolve ran
+  single-threaded over the whole live set. Both only matter when the cores
+  share bandwidth and wait at pass boundaries.
+- **Two effects.** The middle arm parallelizes only the resolve. It gets
+  about a third of the gain, and fewer passes get the rest.
+- **Pure BLAKE3 now gains from dropping words at full utilization.** Over
+  the same ten-thread rounds the zerocheck has a median of 140 ms with
+  nothing dropped and 129 ms with linear words dropped, against 167 ms
+  before.
 
 The first version's pure-BLAKE3 numbers (201,000 compressions,
 `BLAKE3_FULL_HEIGHT=1`, zerocheck 130 → 120) were measured in a
@@ -240,19 +306,13 @@ full height.
 
 ## Next
 
-- **Lookahead per live interval.** The lookahead kernel already weights
-  every position by its global index. Given a span's global offset, it can
-  run interval by interval, since `lookahead_finish` is linear and the sums
-  add.
-  - For pure BLAKE3 the dropped words leave column-aligned intervals, so
-    this recovers the lookahead for all but the last sparse rounds.
-  - For leanXMSS it needs the fold to pad live spans to a power-of-two
-    granularity, because partial columns end on 128-position boundaries
-    only. It would speed up leanXMSS's tail in every arm, not just this
-    change.
 - **Partial slots under full height** (*Not supported yet*).
 - **The two prover-only leftovers:** the C bit-bank fold over masked
   columns, and a/b writes for dropped words.
+- **The RS zerocheck's tail.** Its lookahead cascade still runs only on
+  dense single-run layouts, on aarch64. The live-span pass could serve its
+  sparse route too. The RS zerocheck is not the default on aarch64, so
+  nothing above uses it.
 
 ## Tests
 
@@ -271,6 +331,9 @@ full height.
   inputs only and for linear words, jagged and full height, with a partial
   slot (kept) and a full one (dropped). `zeroed_linear_words_roundtrip_rs`
   runs the RS round trip. The plain registry rejects each proof.
+- `zerocheck::multilinear`: `sparse_lookahead_matches_the_dense_pass`
+  checks the live-span lookahead against the dense pass (see *The tail's
+  lookahead over live spans*).
 - `leanxmss`: `gates_drop_their_degree_one_words` pins the table above.
   `two_signatures_prove_and_verify` asserts its proof drops linear words in
   23 full slots.
