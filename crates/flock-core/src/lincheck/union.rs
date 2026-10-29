@@ -256,16 +256,79 @@ pub fn union_bitbank_fold(
     z_vec
 }
 
-/// Type `ty`'s quirky row-eq table at `(z_skip, x_inner)` with the rows of
-/// its zeroed words ([`TableType::zeroed_word_cols`]) cleared: folding it
-/// through the type's circuit gives the marginals of `A_0`/`B_0` without
-/// those rows, the matrices the zerocheck's `a`/`b` claims are about.
-fn type_eq_inner(ty: &TableType, skip_weights: &[F128], x_inner: &[F128]) -> Vec<F128> {
-    let mut eq = build_quirky_eq_table_from_weights(skip_weights, x_inner);
-    for &w in &ty.zeroed_word_cols {
-        eq[128 * w..128 * (w + 1)].fill(F128::ZERO);
+/// A slot's row weights `u`: the quirky row-eq table at
+/// `(z_skip, x_inner)` with the rows of its dropped words `zeroed`
+/// ([`UnionInstance::zeroed_word_cols`]) scaled by the linear check's `η`,
+/// or cleared when there is none (every dropped row is then `x·1 = x`).
+/// Folding `u` through the type's circuit gives `A_0`'s and `B_0`'s
+/// marginals over the rows the zerocheck kept — the matrices its `a`/`b`
+/// claims are about — plus `η·` those of the dropped rows, which
+/// [`linear_row_fixups`] completes into the dropped rows' identity.
+fn row_weights(
+    zeroed: &[usize],
+    eta: Option<F128>,
+    skip_weights: &[F128],
+    x_inner: &[F128],
+) -> Vec<F128> {
+    let mut u = build_quirky_eq_table_from_weights(skip_weights, x_inner);
+    for &w in zeroed {
+        let rows = &mut u[128 * w..128 * (w + 1)];
+        match eta {
+            Some(eta) => rows.iter_mut().for_each(|v| *v *= eta),
+            None => rows.fill(F128::ZERO),
+        }
     }
-    eq
+    u
+}
+
+/// Turn the dropped rows' share of a comb `α·A_0ᵀu + B_0ᵀu` (`u` from
+/// [`row_weights`], `u_i = η·eq_i` there) into `α·η·Σ_i eq_i·(A_0 + I)_i`,
+/// the weighted residual of their identities `(A_0 z)_i = z_i`: add
+/// `α·u_i` at column `i`, and cancel `B_0`'s `u_i` at the pin (a dropped
+/// row's `B_0` is `{pin}` or empty). An `x·1 = x` row's share cancels to
+/// zero, so with only those rows this is the comb of the cleared table.
+fn linear_row_fixups(ty: &TableType, zeroed: &[usize], alpha: F128, u: &[F128], comb: &mut [F128]) {
+    let pin = ty.const_pin.expect("zeroed words need the const pin");
+    for &w in zeroed {
+        for i in 128 * w..128 * (w + 1) {
+            comb[i] += alpha * u[i];
+            if ty.b_0.rows.get(i).is_some_and(|row| !row.is_empty()) {
+                comb[pin] += u[i];
+            }
+        }
+    }
+}
+
+/// The lincheck's grinding sites sampled like a pin's `β`: one per pinned
+/// circuit, plus the linear check's `η`.
+fn beta_sites<'c>(
+    union: &UnionInstance<'_>,
+    circuits: impl Iterator<Item = &'c dyn LincheckCircuit>,
+) -> usize {
+    circuits.filter(|c| c.const_pin_col().is_some()).count()
+        + usize::from(union.checks_linear_rows())
+}
+
+/// The linear check's `η`, sampled right after `α` when the union drops
+/// linear rows ([`UnionInstance::checks_linear_rows`]): it batches their
+/// identity into the A-claim, one linear identity like a pin's `β`, and
+/// grinds like one.
+fn prove_eta<Ch: Challenger>(
+    union: &UnionInstance<'_>,
+    grinding: LincheckGrinding,
+    nonces: &mut Vec<u64>,
+    challenger: &mut Ch,
+) -> Option<F128> {
+    union
+        .checks_linear_rows()
+        .then(|| match grinding.beta_bits() {
+            Some(bits) => {
+                let (nonce, eta) = challenger.grind_pow_and_sample_f128(bits);
+                nonces.push(nonce);
+                eta
+            }
+            None => challenger.sample_f128(),
+        })
 }
 
 pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
@@ -308,16 +371,11 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
 
     challenger.observe_label(b"flock-lincheck-v0");
     let trace = var("LINCHECK_TRACE").is_ok();
-    let mut grinding_nonces = Vec::with_capacity(
-        grinding.nonce_count(
-            inner_rest_len,
-            slots
-                .iter()
-                .filter(|slot| slot.circuit.const_pin_col().is_some())
-                .count(),
-            k_skip,
-        ),
-    );
+    let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(
+        inner_rest_len,
+        beta_sites(union, slots.iter().map(|slot| slot.circuit)),
+        k_skip,
+    ));
 
     // 1. Sample α (matches verifier's order). ONE α batches the A- and
     //    B-claims for every slot (doc §"The B-claim, and batching the two
@@ -330,6 +388,7 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     } else {
         challenger.sample_f128()
     };
+    let eta = prove_eta(union, grinding, &mut grinding_nonces, challenger);
 
     // 2. Per-type α-batched combs via each type's quirky table — the slot's
     //    column coordinates of r are z_skip, dim6, and the LOW `κ_t − 7`
@@ -359,7 +418,7 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         .map(|(t, slot_in)| {
             let same = |&u: &usize| {
                 std::ptr::addr_eq(slots[u].circuit, slot_in.circuit)
-                    && types[u].zeroed_word_cols == types[t].zeroed_word_cols
+                    && union.zeroed_word_cols(u) == union.zeroed_word_cols(t)
             };
             distinct.iter().position(same).unwrap_or_else(|| {
                 distinct.push(t);
@@ -371,20 +430,25 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         .into_par_iter()
         .map(|t| {
             let inner = types[t].k_log - k_skip;
-            let eq_inner = type_eq_inner(
-                &types[t],
+            let zeroed = union.zeroed_word_cols(t);
+            let u = row_weights(
+                zeroed,
+                eta,
                 &x_ab.z_skip.weights(k_skip),
                 &x_ab.x_inner_rest[..inner],
             );
             // Split, so the per-matrix bilinear values can be reported below.
             // Same nonzeros as the α-batched fold; only the accumulation
             // differs.
-            let (comb_a, comb_b) = slots[t].circuit.fold_split(&eq_inner);
-            let comb_t = comb_a
+            let (comb_a, comb_b) = slots[t].circuit.fold_split(&u);
+            let mut comb_t: Vec<F128> = comb_a
                 .iter()
                 .zip(&comb_b)
                 .map(|(a, b)| alpha * *a + *b)
                 .collect();
+            if eta.is_some() {
+                linear_row_fixups(&types[t], zeroed, alpha, &u, &mut comb_t);
+            }
             ((comb_a, comb_b), comb_t)
         })
         .collect();
@@ -527,6 +591,10 @@ fn col_weight(z_partial: &[F128], rr: &[F128], k_skip: usize) -> Vec<F128> {
 pub struct MatrixAssertion {
     /// The challenge batching the A- and B-matrices.
     pub alpha: F128,
+    /// The linear check's challenge, batching the dropped linear rows'
+    /// identity into the A-claim (`None` when the union drops none —
+    /// [`UnionInstance::checks_linear_rows`]).
+    pub eta: Option<F128>,
     /// Row-side weight: `λ(z_skip) ⊗ eq(x_inner_rest)` — `λ` is the skip
     /// basis's evaluation functional ([`SkipPoint::weights`]), φ₈ Lagrange
     /// on the RS route, the AG base-code functional on the AG route.
@@ -554,6 +622,19 @@ pub struct MatrixAssertion {
     pub evals: Vec<(F128, F128)>,
 }
 
+/// The reported per-matrix values name `A_0` and `B_0` at plain eq row
+/// weights; a type with zeroed words folds masked or `η`-scaled ones and
+/// adds the linear check's terms, which accumulation does not carry.
+fn assert_no_zeroed_words(registry: &Registry) {
+    assert!(
+        registry
+            .boolean_types()
+            .iter()
+            .all(|ty| ty.zeroed_word_cols.is_empty()),
+        "accumulating the lincheck of a type with zeroed words is not supported"
+    );
+}
+
 impl MatrixAssertion {
     /// The per-`(type, matrix)` claims this assertion asserts, in slot order
     /// as `[(A_0 claim, B_0 claim); T]` — ready for
@@ -564,15 +645,7 @@ impl MatrixAssertion {
     /// would name a different polynomial in every proof. These name the
     /// static matrices, and fold forever.
     pub fn claims(&self, registry: &Registry) -> Vec<(MatrixClaim, MatrixClaim)> {
-        // A claim's row weight is a plain eq; a type with zeroed words folds
-        // a masked one ([`type_eq_inner`]), which accumulation cannot carry.
-        assert!(
-            registry
-                .boolean_types()
-                .iter()
-                .all(|ty| ty.zeroed_word_cols.is_empty()),
-            "accumulating the lincheck of a type with zeroed words is not supported"
-        );
+        assert_no_zeroed_words(registry);
         let k_skip = K_SKIP;
         registry
             .boolean_types()
@@ -605,6 +678,7 @@ impl MatrixAssertion {
     /// the only place the base matrices are read) and check the closed-form
     /// Comb-hat collapse against [`Self::target`].
     pub fn check_reported(&self, registry: &Registry) -> Result<(), LincheckError> {
+        assert_no_zeroed_words(registry);
         let k_skip = K_SKIP;
         if self.evals.len() != registry.num_boolean() {
             return Err(LincheckError::BadVectorLength {
@@ -662,14 +736,20 @@ impl MatrixAssertion {
             .iter()
             .zip(registry.slots())
             .zip(circuits)
-            .map(|((ty, slot), circuit)| {
+            .enumerate()
+            .map(|(t, ((ty, slot), circuit))| {
                 let inner = ty.k_log - k_skip;
-                let eq_inner = type_eq_inner(
-                    ty,
+                let zeroed = union.zeroed_word_cols(t);
+                let u = row_weights(
+                    zeroed,
+                    self.eta,
                     &self.z_skip.weights(k_skip),
                     &self.x_inner_rest[..inner],
                 );
-                let mut comb = circuit.fold_alpha_batched(self.alpha, &eq_inner);
+                let mut comb = circuit.fold_alpha_batched(self.alpha, &u);
+                if self.eta.is_some() {
+                    linear_row_fixups(ty, zeroed, self.alpha, &u, &mut comb);
+                }
                 if slot.prefix_bits > 0 {
                     let w_t = eq_prefix_weight(&self.x_inner_rest[inner..], slot.prefix);
                     for v in &mut comb {
@@ -846,10 +926,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     }
     let expected_nonces = grinding.nonce_count(
         inner_rest_len,
-        circuits
-            .iter()
-            .filter(|circuit| circuit.const_pin_col().is_some())
-            .count(),
+        beta_sites(union, circuits.iter().copied()),
         k_skip,
     );
     if proof.grinding_nonces.len() != expected_nonces {
@@ -871,6 +948,20 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
         alpha
     } else {
         challenger.sample_f128()
+    };
+    // 1b. The linear check's η (mirror of prove).
+    let eta = if union.checks_linear_rows() {
+        Some(if let Some(bits) = grinding.beta_bits() {
+            let eta = challenger
+                .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+                .ok_or(LincheckError::InvalidGrindingNonce { which: "eta" })?;
+            nonce_idx += 1;
+            eta
+        } else {
+            challenger.sample_f128()
+        })
+    } else {
+        None
     };
 
     // 2. The per-type α-batched combs are NOT built here — they are the
@@ -955,6 +1046,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     rr.reverse();
     let assertion = MatrixAssertion {
         alpha,
+        eta,
         z_skip: x_ab.z_skip,
         x_inner_rest: x_ab.x_inner_rest.clone(),
         rr: rr.clone(),
@@ -1018,9 +1110,13 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use crate::{
-        lincheck::union::{
-            F128, K_SKIP, Registry, build_eq_table, eq_prefix_sum, eq_prefix_weight,
-            union_comb_partial,
+        lincheck::{
+            LincheckCircuit, SkipPoint, SparseMatrixCircuit,
+            union::{
+                F128, K_SKIP, Registry, build_eq_table, build_quirky_eq_table_from_weights,
+                eq_prefix_sum, eq_prefix_weight, linear_row_fixups, row_weights,
+                union_comb_partial,
+            },
         },
         r1cs::SparseBinaryMatrix,
         schedule::{TableClass, TableType},
@@ -1120,5 +1216,80 @@ mod tests {
         }
 
         assert_eq!(union_comb_partial(&reg, &combs, &rr, k_skip), expected);
+    }
+
+    /// A gate-shaped type, pinned at row 0: word 0 the inputs (`x·1 = x`,
+    /// the pin's own row among them), word 1 products of inputs, word 2
+    /// outputs defined by XORs (`(A z)·1 = x`).
+    fn gate_ty(rng: &mut Rng) -> TableType {
+        let (k, pin) = (512, 0);
+        let mut pick = |lo: usize, hi: usize| -> Vec<usize> {
+            let mut cols: Vec<usize> = (0..3)
+                .map(|_| lo + rng.next_u64() as usize % (hi - lo))
+                .collect();
+            cols.sort_unstable();
+            cols.dedup();
+            cols
+        };
+        let (a, b): (Vec<Vec<usize>>, Vec<Vec<usize>>) = (0..k)
+            .map(|i| match i / 128 {
+                0 => (vec![i], vec![pin]),
+                1 => (pick(1, 128), pick(1, 128)),
+                2 => (pick(1, 256), vec![pin]),
+                _ => (Vec::new(), Vec::new()),
+            })
+            .unzip();
+        TableType {
+            k_log: 9,
+            useful_bits: 384,
+            a_0: SparseBinaryMatrix::new(k, k, a),
+            b_0: SparseBinaryMatrix::new(k, k, b),
+            c_0: SparseBinaryMatrix::new(k, k, (0..k).map(|i| vec![i]).collect()),
+            const_pin: Some(pin),
+            class: TableClass::Boolean,
+            io_schema: Vec::new(),
+            zeroed_word_cols: Vec::new(),
+        }
+    }
+
+    /// The linear check reproduces #67's identity-word elision exactly: with
+    /// only `x·1 = x` words dropped, the `η`-scaled rows plus their fix-ups
+    /// fold to the comb of the cleared table, for any `η`. With an XOR
+    /// word dropped too, the difference is `α·η·Σ_i eq_i·(A_0 + I)_i` over
+    /// its rows.
+    #[test]
+    fn identity_words_are_the_linear_check_with_nothing_to_check() {
+        let mut rng = Rng::new(0x67);
+        let ty = gate_ty(&mut rng);
+        assert_eq!(
+            ty.clone().with_zeroed_linear_words().zeroed_word_cols,
+            [0, 2]
+        );
+        assert_eq!(
+            ty.clone().with_zeroed_identity_words().zeroed_word_cols,
+            [0]
+        );
+        let circuit = SparseMatrixCircuit::new(&ty.a_0, &ty.b_0).with_const_pin(ty.const_pin);
+        let skip = SkipPoint::Phi8(rng.f128()).weights(K_SKIP);
+        let x_inner = rng.f128_vec(ty.k_log - K_SKIP);
+        let (alpha, eta) = (rng.f128(), rng.f128());
+        let comb = |zeroed: &[usize], eta: Option<F128>| {
+            let u = row_weights(zeroed, eta, &skip, &x_inner);
+            let mut comb = circuit.fold_alpha_batched(alpha, &u);
+            if eta.is_some() {
+                linear_row_fixups(&ty, zeroed, alpha, &u, &mut comb);
+            }
+            comb
+        };
+        assert_eq!(comb(&[0], Some(eta)), comb(&[0], None));
+
+        let eq = build_quirky_eq_table_from_weights(&skip, &x_inner);
+        let mut expected = comb(&[0, 2], None);
+        for i in 256..384 {
+            for &c in ty.a_0.rows[i].iter().chain([&i]) {
+                expected[c] += alpha * eta * eq[i];
+            }
+        }
+        assert_eq!(comb(&[0, 2], Some(eta)), expected);
     }
 }

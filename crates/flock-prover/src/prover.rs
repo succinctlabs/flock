@@ -1031,6 +1031,7 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
     // boolean-only registry, so nothing here changes for one.
     let padding = union.padding_spec();
     let bool_padding = union.boolean_padding_spec();
+    let zc_grinding = union.zerocheck_grinding(pcs_params.zerocheck_grinding());
     let m_bool = union.m_bool();
     let bool_words = union.boolean_packed_len();
 
@@ -1104,7 +1105,7 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
                             c_packed,
                             m_bool,
                             &bool_padding,
-                            pcs_params.zerocheck_grinding(),
+                            zc_grinding,
                             challenger,
                         );
                         (
@@ -1128,7 +1129,7 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
                             c_packed,
                             m_bool,
                             &bool_padding,
-                            pcs_params.zerocheck_grinding(),
+                            zc_grinding,
                             challenger,
                         );
                         (

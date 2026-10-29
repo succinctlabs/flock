@@ -1228,3 +1228,162 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
         "an accumulator from a different registry must be rejected"
     );
 }
+
+/// `⊕_{c ∈ cols} z[c]`.
+fn dot(z: &[bool], cols: &[usize]) -> bool {
+    cols.iter().fold(false, |acc, &c| acc ^ z[c])
+}
+
+/// A gate-shaped κ = 9 type pinned at column 0 — word 0 the inputs
+/// (`x·1 = x`, the pin's own row among them), word 1 products of inputs,
+/// word 2 outputs defined as XORs of inputs and products (`(A z)·1 = x`) —
+/// and a satisfying witness on `n` of `2^nu` rows.
+fn gate_slot(nu: usize, n: usize, seed: u64) -> (TableType, Vec<bool>) {
+    let mut rng = Rng::new(seed);
+    let (k, pin) = (512, 0);
+    let mut pick = |lo: usize, hi: usize| -> Vec<usize> {
+        let mut cols: Vec<usize> = (0..3)
+            .map(|_| lo + rng.next_u64() as usize % (hi - lo))
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        cols
+    };
+    let (a, b): (Vec<Vec<usize>>, Vec<Vec<usize>>) = (0..k)
+        .map(|i| match i / 128 {
+            0 => (vec![i], vec![pin]),
+            1 => (pick(1, 128), pick(1, 128)),
+            2 => (pick(1, 256), vec![pin]),
+            _ => (Vec::new(), Vec::new()),
+        })
+        .unzip();
+    let ty = TableType {
+        k_log: 9,
+        useful_bits: 384,
+        a_0: SparseBinaryMatrix::new(k, k, a),
+        b_0: SparseBinaryMatrix::new(k, k, b),
+        c_0: identity(k),
+        const_pin: Some(pin),
+        class: TableClass::Boolean,
+        io_schema: Vec::new(),
+        zeroed_word_cols: Vec::new(),
+    };
+    let mut z = vec![false; k << nu];
+    for z_row in z.chunks_mut(k).take(n) {
+        z_row[pin] = true;
+        for v in 1..128 {
+            z_row[v] = rng.bit();
+        }
+        // Words 1 and 2 read only earlier words.
+        for i in 128..384 {
+            let bit = dot(z_row, &ty.a_0.rows[i]) & dot(z_row, &ty.b_0.rows[i]);
+            z_row[i] = bit;
+        }
+    }
+    (ty, z)
+}
+
+/// The union zerocheck (over the run-list that drops the slot's zeroed
+/// words, `a = A'z`, `b = B'z`, `c = C'z`) and lincheck on one gate slot:
+/// whether the zerocheck verifies, and the lincheck verifier's verdict.
+fn zerocheck_then_lincheck(
+    ty: TableType,
+    z: &[bool],
+    nu: usize,
+    n: usize,
+    grinding: LincheckGrinding,
+) -> (bool, Result<LincheckClaim, LincheckError>) {
+    let registry = Registry::new(vec![ty], nu);
+    let union = UnionInstance::new(&registry, vec![n]);
+    let ty = &registry.types()[0];
+    let (k_log, k) = (ty.k_log, 1usize << ty.k_log);
+    let dropped = |i: usize| union.zeroed_word_cols(0).contains(&(i / 128));
+    let apply = |row_bit: &dyn Fn(&[bool], usize) -> bool| -> Vec<bool> {
+        z.chunks(k)
+            .flat_map(|z_row| (0..k).map(move |i| !dropped(i) && row_bit(z_row, i)))
+            .collect()
+    };
+    let a_sem = apply(&|z_row, i| dot(z_row, &ty.a_0.rows[i]));
+    let b_sem = apply(&|z_row, i| dot(z_row, &ty.b_0.rows[i]));
+    let c_sem = apply(&|z_row, i| z_row[i]);
+    let m = registry.m_total();
+    let offset = registry.slots()[0].offset;
+    let addr = |sem: &[bool]| {
+        let mut out = vec![false; 1 << m];
+        place_addr(&mut out, sem, k_log, nu, offset);
+        pack_bits(&out)
+    };
+    let padding = union.boolean_padding_spec();
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (zc_proof, zc_claim) = prove_packed_padded(
+        &addr(&a_sem),
+        &addr(&b_sem),
+        &addr(&c_sem),
+        m,
+        &padding,
+        &mut ch_p,
+    );
+    let x_ab =
+        union.x_ab_from_multilinear_values(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
+    let stripe = pack_z_lincheck(z, nu + k_log, k_log);
+    let circuit = SparseMatrixCircuit::new(&ty.a_0, &ty.b_0).with_const_pin(ty.const_pin);
+    let slot = UnionLincheckSlot {
+        z_lincheck: &stripe,
+        circuit: &circuit,
+    };
+    let (lc_proof, _, _) =
+        prove_union_capture_z_vec_with_grinding(&union, &[slot], &x_ab, grinding, &mut ch_p);
+
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    let Ok(zc) = verify_zerocheck(m, &zc_proof, &mut ch_v) else {
+        return (
+            false,
+            Err(LincheckError::ConsistencyFailed { which: "zerocheck" }),
+        );
+    };
+    let circuits: [&dyn LincheckCircuit; 1] = [&circuit];
+    let lc = verify_union_with_grinding(
+        &union, &circuits, &x_ab, zc.a_eval, zc.b_eval, &lc_proof, grinding, &mut ch_v,
+    );
+    (true, lc)
+}
+
+/// Dropping a word of XORed outputs moves its check from the zerocheck to
+/// the lincheck. A witness whose output bit disagrees with its XOR passes
+/// the zerocheck once the word is dropped (nothing there reads it) and is
+/// rejected by the lincheck's `η` term; with only the input word dropped,
+/// the zerocheck rejects it itself.
+#[test]
+fn dropped_linear_rows_are_checked_by_the_lincheck() {
+    let (nu, n) = (4, 11);
+    let (ty, z) = gate_slot(nu, n, 0x1D_E7A);
+    let linear = ty.clone().with_zeroed_linear_words();
+    let identity = ty.clone().with_zeroed_identity_words();
+    assert_eq!(linear.zeroed_word_cols, [0, 2]);
+    assert_eq!(identity.zeroed_word_cols, [0]);
+    let checks_linear = |ty: &TableType| {
+        let registry = Registry::new(vec![ty.clone()], nu);
+        UnionInstance::new(&registry, vec![n]).checks_linear_rows()
+    };
+    assert!(checks_linear(&linear) && !checks_linear(&identity));
+
+    let mut bad = z.clone();
+    bad[(n / 2) * 512 + 300] ^= true; // an output bit of a declared row
+    for grinding in [
+        LincheckGrinding::disabled(),
+        LincheckGrinding::per_challenge_128(),
+    ] {
+        for honest_ty in [&ty, &identity, &linear] {
+            let (zc_ok, lc) = zerocheck_then_lincheck(honest_ty.clone(), &z, nu, n, grinding);
+            assert!(zc_ok && lc.is_ok(), "honest witness: {lc:?}");
+        }
+        let (zc_ok, lc) = zerocheck_then_lincheck(linear.clone(), &bad, nu, n, grinding);
+        assert!(zc_ok, "the dropped word is invisible to the zerocheck");
+        assert!(
+            matches!(lc, Err(LincheckError::ConsistencyFailed { .. })),
+            "the lincheck must reject: {lc:?}"
+        );
+        let (zc_ok, _) = zerocheck_then_lincheck(identity.clone(), &bad, nu, n, grinding);
+        assert!(!zc_ok, "a kept output word is the zerocheck's to reject");
+    }
+}

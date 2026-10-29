@@ -103,6 +103,14 @@ fn two_signatures_prove_and_verify() {
         .map(|&(id, _)| witness.rows::<BooleanGate>(id).len())
         .sum();
     assert_eq!(compressions, 2 * COMPRESSIONS_PER_SIGNATURE);
+    // The commit is full height, so only full slots drop their degree-one
+    // words; at this size some do, so the proof exercises the linear check.
+    let union = circuit.union();
+    let full_drops = (0..union.registry().num_boolean())
+        .filter(|&t| !union.zeroed_word_cols(t).is_empty())
+        .count();
+    eprintln!("slots dropping words: {full_drops}");
+    assert!(full_drops > 0 && union.checks_linear_rows());
     let t = Instant::now();
     let proof = circuit.prove(&witness);
     eprintln!("prove: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
@@ -223,4 +231,37 @@ fn the_bus_checks_the_chains() {
         }
     });
     assert!(unbalanced(proves(&witness)), "steps traded between layers");
+}
+
+/// Every gate drops its degree-one words: the pin's word 0, the inputs,
+/// and outputs defined by copies or XORs. Chain, address and address-step
+/// compute nothing else, so the zerocheck reads none of their words.
+#[test]
+fn gates_drop_their_degree_one_words() {
+    use flock_core::circuit::builder::GateType;
+    let dropped: Vec<(String, Vec<usize>, usize)> = gates(3)
+        .iter()
+        .map(|g| {
+            let table = g.table();
+            (
+                g.name().to_owned(),
+                table.zeroed_word_cols,
+                g.useful_bits().div_ceil(128),
+            )
+        })
+        .collect();
+    let all = |n: usize| (0..n).collect::<Vec<_>>();
+    let compress: Vec<usize> = (0..8).chain(89..92).collect();
+    let expected: [(&str, Vec<usize>, usize); 7] = [
+        ("leanxmss.compress", compress.clone(), 92),
+        ("leanxmss.compress", compress, 92),
+        ("leanxmss.chain", all(7), 7),
+        ("leanxmss.swap", vec![0, 1, 2, 3, 5, 6], 8),
+        ("leanxmss.codeword", vec![0, 1], 14),
+        ("leanxmss.address", all(4), 4),
+        ("leanxmss.address-step", all(5), 5),
+    ];
+    for ((name, words, n), (e_name, e_words, e_n)) in dropped.iter().zip(&expected) {
+        assert_eq!((name.as_str(), words, n), (*e_name, e_words, e_n));
+    }
 }

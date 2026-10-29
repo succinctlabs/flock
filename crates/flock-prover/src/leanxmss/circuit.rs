@@ -306,7 +306,9 @@ pub fn plan_nu(kinds: &[(usize, usize)]) -> usize {
 
 /// The gate kinds at `nu`, in [`Slots`] order. The two compression kinds
 /// share one gate: building it is most of the circuit's setup. Every kind
-/// drops its `x·1 = x` input words from the boolean PIOP.
+/// drops its degree-one words (inputs, copied or XORed outputs, the pin's
+/// word) from the zerocheck; chain, address and address-step have no other
+/// word.
 fn gates(nu: usize) -> [BooleanGate; 7] {
     let compress = compress_gate(nu).unwrap();
     [
@@ -318,7 +320,7 @@ fn gates(nu: usize) -> [BooleanGate; 7] {
         address_gate(nu).unwrap(),
         address_step_gate(nu).unwrap(),
     ]
-    .map(BooleanGate::with_zeroed_identity_words)
+    .map(BooleanGate::with_zeroed_linear_words)
 }
 
 /// Declares every gate kind, the counts in [`Slots`] order, each over

@@ -21,7 +21,7 @@ use std::{
     time::Instant,
 };
 
-use ag_skip::R1_POW_BITS;
+use ag_skip::{R1_LINEAR_POW_BITS, R1_POW_BITS};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -90,21 +90,47 @@ pub static RS_TAIL_LOOKAHEAD_DISABLE: std::sync::atomic::AtomicBool =
 /// The policy is intentionally local to zerocheck. Other sumcheck families
 /// have different degrees and proof formats, so they define separate
 /// schedules.
+///
+/// When the boolean PIOP drops degree-one rows other than `x·1 = x`
+/// ([`Self::with_linear_check`]), the lincheck checks their linear identity
+/// `(A_0 + I)·z = 0` at this zerocheck's final point, so each of its
+/// challenges also has to avoid the zeros of that identity's nonzero
+/// residual: one more base-code word at the skip point, one more degree in
+/// each multilinear round.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ZerocheckGrinding {
     enabled: bool,
+    linear_check: bool,
 }
 
 impl ZerocheckGrinding {
     /// Legacy/default behaviour: no PoW operations and no nonce payload in
     /// the transcript.
     pub const fn disabled() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            linear_check: false,
+        }
     }
 
     /// Grind every zerocheck challenge whose soundness is being used.
     pub const fn per_challenge_128() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            linear_check: false,
+        }
+    }
+
+    /// This schedule for a zerocheck whose final point also carries the
+    /// lincheck's identity for dropped linear rows
+    /// ([`crate::union::UnionInstance::checks_linear_rows`]). Changes the
+    /// skip point's bits only: a round's degree goes from 2 to 3, which
+    /// needs the same two bits.
+    pub const fn with_linear_check(self) -> Self {
+        Self {
+            linear_check: true,
+            ..self
+        }
     }
 
     /// Number of leading-zero bits which strictly turns
@@ -131,10 +157,18 @@ impl ZerocheckGrinding {
 
     /// PoW before sampling the univariate-skip point.  The combined round-1
     /// polynomial has degree `< 2^(K_SKIP + 1)`, hence degree at most
-    /// `2^(K_SKIP + 1) - 1`.
+    /// `2^(K_SKIP + 1) - 1`; under a linear check the residual's skip slice
+    /// adds an interpolant of degree at most `2^K_SKIP - 1`.
     pub const fn skip_bits(self) -> Option<u32> {
+        let linear = if self.linear_check {
+            (1usize << K_SKIP) - 1
+        } else {
+            0
+        };
         if self.enabled {
-            Some(Self::bits_for_numerator((1usize << (K_SKIP + 1)) - 1))
+            Some(Self::bits_for_numerator(
+                (1usize << (K_SKIP + 1)) - 1 + linear,
+            ))
         } else {
             None
         }
@@ -149,17 +183,18 @@ impl ZerocheckGrinding {
     /// under a disabled schedule (the direct route's plain single-attempt
     /// nonce, which makes no 128-bit claim).
     pub const fn ag_round_one_bits(self) -> Option<u32> {
-        if self.enabled {
-            Some(R1_POW_BITS)
-        } else {
-            None
+        match (self.enabled, self.linear_check) {
+            (false, _) => None,
+            (true, false) => Some(R1_POW_BITS),
+            (true, true) => Some(R1_LINEAR_POW_BITS),
         }
     }
 
-    /// PoW before a standard degree-two tail-round challenge.
+    /// PoW before a standard degree-two tail-round challenge (degree three
+    /// with a linear check's residual, which needs the same two bits).
     pub const fn multilinear_round_bits(self) -> Option<u32> {
         if self.enabled {
-            Some(Self::bits_for_numerator(2))
+            Some(Self::bits_for_numerator(2 + self.linear_check as usize))
         } else {
             None
         }

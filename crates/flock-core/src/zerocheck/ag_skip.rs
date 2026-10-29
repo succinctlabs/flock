@@ -1015,6 +1015,16 @@ pub const AG_SAMPLING_CREDIT_BITS: u32 = 5;
 /// where the decode is canonical end-to-end (the lincheck fresh skip).
 pub const R1_POW_BITS: u32 = 9;
 
+/// [`R1_ZERO_BOUND`] plus one more BASE-code word: when the boolean PIOP
+/// drops linear rows, the lincheck checks their residual `(A_0 + I)·z` at
+/// this zerocheck's point, and a nonzero residual's skip slice survives r₁
+/// only at a zero of its base-code word (`deg D = 158`).
+/// `474 + 158 = 632` bad points.
+pub const R1_LINEAR_ZERO_BOUND: usize = R1_ZERO_BOUND + 158;
+
+/// [`R1_POW_BITS`] under a linear check: `bits_for(632) = 10`.
+pub const R1_LINEAR_POW_BITS: u32 = 10;
+
 /// Prover-side scan budget for the fused r₁ nonce: success per nonce is
 /// `2^-R1_POW_BITS / 32 = 2^-14`, so exhausting `2^24` nonces has
 /// probability `(1 − 2^-14)^(2^24) ≈ 2^-1477` — a completeness error we
@@ -2237,8 +2247,8 @@ mod tests {
         zerocheck::{
             ZerocheckGrinding,
             ag_skip::{
-                AG_SAMPLING_CREDIT_BITS, F128, N_INNER, R1_POW_BITS, R1_ZERO_BOUND, d_const, d_inv,
-                friendly_challenges, gamma_pow,
+                AG_SAMPLING_CREDIT_BITS, F128, N_INNER, R1_LINEAR_POW_BITS, R1_LINEAR_ZERO_BOUND,
+                R1_POW_BITS, R1_ZERO_BOUND, d_const, d_inv, friendly_challenges, gamma_pow,
             },
         },
     };
@@ -2882,6 +2892,8 @@ mod tests {
         // decode (phase D) hands the fiber's 5 flattening bits back to the
         // prover, so the sampler credit no longer discounts this site.
         assert_eq!(R1_POW_BITS, bits_for(R1_ZERO_BOUND));
+        assert_eq!(R1_LINEAR_ZERO_BOUND, product_deg + 2 * base_deg);
+        assert_eq!(R1_LINEAR_POW_BITS, bits_for(R1_LINEAR_ZERO_BOUND));
         assert_eq!(
             AG_LINCHECK_SKIP_POW_BITS + AG_SAMPLING_CREDIT_BITS,
             bits_for(base_deg)
@@ -2890,6 +2902,17 @@ mod tests {
         let g = ZerocheckGrinding::per_challenge_128();
         assert_eq!(g.ag_round_one_bits(), Some(R1_POW_BITS));
         assert_eq!(ZerocheckGrinding::disabled().ag_round_one_bits(), None);
+        let lin = g.with_linear_check();
+        assert_eq!(lin.ag_round_one_bits(), Some(R1_LINEAR_POW_BITS));
+        // RS skip: 127 + 63 = 190 bad points; the rounds stay at two bits.
+        assert_eq!((g.skip_bits(), lin.skip_bits()), (Some(7), Some(8)));
+        assert_eq!(lin.multilinear_round_bits(), g.multilinear_round_bits());
+        assert_eq!(
+            ZerocheckGrinding::disabled()
+                .with_linear_check()
+                .ag_round_one_bits(),
+            None
+        );
     }
 
     /// The fused predicate really gates on BOTH criteria: a nonce whose

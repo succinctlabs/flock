@@ -872,7 +872,7 @@ fn verify_union_piops<Ch: Challenger>(
                             let zc = verify_zerocheck_with_grinding(
                                 union.m_bool(),
                                 &p.zerocheck,
-                                pcs_params.zerocheck_grinding(),
+                                union.zerocheck_grinding(pcs_params.zerocheck_grinding()),
                                 challenger,
                             )
                             .map_err(FlockVerifyError::Zerocheck)?;
@@ -890,7 +890,7 @@ fn verify_union_piops<Ch: Challenger>(
                             let ag = verify_ag_with_grinding(
                                 union.m_bool(),
                                 &p.ag,
-                                pcs_params.zerocheck_grinding(),
+                                union.zerocheck_grinding(pcs_params.zerocheck_grinding()),
                                 challenger,
                             )
                             .map_err(FlockVerifyError::Ag)?;

@@ -110,9 +110,9 @@ pub struct BooleanGate {
     /// How [`Self::pack_into`] writes a row group eight rows at a time, once
     /// worked out; `None` if a kernel's result feeds the walk.
     batched: Arc<OnceLock<Option<Batched>>>,
-    /// Whether the table drops the words whose rows are all `x·1 = x`
-    /// ([`Self::with_zeroed_identity_words`]).
-    zero_identity_words: bool,
+    /// Whether the table drops the words whose rows all have degree one
+    /// ([`Self::with_zeroed_linear_words`]).
+    zero_linear_words: bool,
 }
 
 /// The operations left to kernels, and the walk without them.
@@ -289,16 +289,17 @@ impl BooleanGate {
             native: None,
             kernels: None,
             batched: Arc::default(),
-            zero_identity_words: false,
+            zero_linear_words: false,
         })
     }
 
-    /// Drop the words whose 128 rows are all `x·1 = x` from the boolean
-    /// PIOP ([`TableType::with_zeroed_identity_words`]): the zerocheck skips
-    /// them and the C claim masks them out. Same relation, a different
-    /// registry digest.
-    pub fn with_zeroed_identity_words(mut self) -> Self {
-        self.zero_identity_words = true;
+    /// Drop the words whose 128 rows all have degree one from the zerocheck
+    /// ([`TableType::with_zeroed_linear_words`]): input words, copied or
+    /// XORed output words, and the const pin's word. The zerocheck skips
+    /// them, the C claim masks them out, and the lincheck checks their
+    /// linear identity. Same relation, a different registry digest.
+    pub fn with_zeroed_linear_words(mut self) -> Self {
+        self.zero_linear_words = true;
         self
     }
 
@@ -1357,8 +1358,8 @@ impl GateType for BooleanGate {
 
     fn table(&self) -> TableType {
         let table = TableType::from_block_r1cs(&self.r1cs).with_io_schema(self.io_schema.clone());
-        if self.zero_identity_words {
-            table.with_zeroed_identity_words()
+        if self.zero_linear_words {
+            table.with_zeroed_linear_words()
         } else {
             table
         }
