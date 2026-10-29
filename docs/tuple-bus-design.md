@@ -332,6 +332,42 @@ cores with the wiring GKR (+23), and the opening (+18), whose block
 statistics (20 against 2) and merged sumcheck (27 against 11) grow with the
 committed columns (703 against 92).
 
+### Where the zerocheck's extra time goes
+
+The zerocheck itself costs the same per block. Run alone on the bus (the
+wiring moved after it, which leaves the transcript unchanged) it takes
+142 ms against pure BLAKE3's 133 ms, in proportion to its live 8 Kbit
+blocks: 308,870 against 288,880. The compression slots match pure BLAKE3
+block for block. The extra 20,015 blocks are the gadget slots: chain
+12,691, swap 4,000, address step 2,500, codeword and address 824.
+
+The other 16 ms come from the wiring, which runs beside it on the same
+cores. Alone, the wiring takes 37 ms on 10 threads and 82 ms on one, about
+12% of the zerocheck and lincheck's single-thread work. Of those 82 ms, 23
+are the GKR fingerprint grind, 36 the GKR layer sumchecks and 12 the tuple
+bus.
+
+**Deferred: test the product at two points instead of grinding.** The
+fingerprint `(α, β)` fails with probability `(L − 1)/2^128` over `L` live
+cells. Today one grind of `bits_for_degree(L − 1)` bits (21 at 1000
+signatures) brings it to 2^-128. Two independent points give
+`((L − 1)/2^128)^2 ≈ 2^-214` with no grind.
+- **Cost:** the batched GKR goes from two product circuits to four, batched
+  by λ. Leaves, layers and sumchecks double, about +42 ms single-thread.
+  Both points reduce to the same `ρ`, so `σ`, `id` and the gather claims
+  are shared and the opening does not grow.
+- **Saving:** the grind costs `2^bits` hashes, 1–2 per live cell at about
+  22 ns each. The second fingerprint costs about 21 ns per cell.
+- **Where it pays:** at 1000 signatures `L` is just under 2^21, so it is
+  a wash on average (grind ~46 ms against ~42 ms). Past 2^21 live cells the
+  grind becomes 22 bits and the second point wins by about 2×. Its cost is
+  also fixed, while a grind's 95th percentile is about 3× its mean.
+- **Recursion:** the tower's node GKRs grind about 18 bits (~6 ms
+  single-thread), and the parent circuit checks each grind with one
+  PowMask row. Two points would add four boundary values per layer there,
+  so the tower has little reason to switch. The bus's 19-bit grind sits at
+  the same break-even as the wiring's.
+
 ## 4. Questions for review
 
 1. Is the transcript position right? The bus samples `β, γ` after the wiring
