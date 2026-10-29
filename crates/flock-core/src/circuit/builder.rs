@@ -47,7 +47,10 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     alloc_zeroed_vec,
-    circuit::{Cell, Circuit, CircuitError},
+    circuit::{
+        Cell, Circuit, CircuitError,
+        bus::{Bus, BusDirection, BusPort, BusTerm},
+    },
     field::F128,
     schedule::{IoDirection, Registry, TableType},
 };
@@ -428,6 +431,9 @@ pub struct ShapeBuilder {
     /// online phase evaluates them in parallel. Declared by the caller via
     /// [`ShapeBuilder::begin_island`]/[`ShapeBuilder::end_island`].
     islands: Vec<(usize, usize)>,
+    /// Tuple-bus ports by DECLARED slot, terms naming io-schema words;
+    /// resolved to cell-slots in [`Self::finish`].
+    bus_ports: Vec<(usize, BusDirection, Vec<BusTerm>)>,
 }
 
 impl ShapeBuilder {
@@ -445,6 +451,7 @@ impl ShapeBuilder {
             rows_per_slot: Vec::new(),
             n_hints: 0,
             islands: Vec::new(),
+            bus_ports: Vec::new(),
         }
     }
 
@@ -628,6 +635,18 @@ impl ShapeBuilder {
         self.parent[rb] = ra;
     }
 
+    /// Make every live row of `slot` a tuple-bus port ([`crate::circuit::bus`]):
+    /// each row sends (or receives) the tuple `terms`, whose words are indices
+    /// into the gate's io schema. Every port of a circuit has the same width.
+    pub fn bus_port(&mut self, slot: SlotId, dir: BusDirection, terms: Vec<BusTerm>) {
+        let n_io = self.slots[slot.0].n_in() + self.slots[slot.0].n_out();
+        assert!(
+            terms.iter().all(|t| t.word.is_none_or(|k| k < n_io)),
+            "a bus term names a word outside the gate's io schema"
+        );
+        self.bus_ports.push((slot.0, dir, terms));
+    }
+
     /// Open an independence island: the steps recorded until the matching
     /// [`Self::end_island`] must read only wires valued BEFORE the first
     /// island (inputs or earlier non-island gate outputs) or produced inside
@@ -756,8 +775,27 @@ impl ShapeBuilder {
         // a pure function of the table types, and `TableType` caches it, so a
         // caller that reuses one `TableType` across circuits pays it once.
         debug_assert_eq!(self.fixed_public.len(), pubs.len());
-        let circuit =
+        let mut circuit =
             Circuit::new_with_fixed_public(&registry, counts.clone(), self.fixed_public, wires)?;
+        if let Some((_, _, first)) = self.bus_ports.first() {
+            let ports = self
+                .bus_ports
+                .iter()
+                .map(|(declared, dir, terms)| BusPort {
+                    ty: registry_slot[*declared],
+                    dir: *dir,
+                    terms: terms
+                        .iter()
+                        .map(|t| BusTerm {
+                            word: t.word.map(|k| iota_base[*declared] + k),
+                            ..*t
+                        })
+                        .collect(),
+                })
+                .collect();
+            let width = first.len();
+            circuit = circuit.with_bus(Bus { width, ports })?;
+        }
         Ok(CircuitShape {
             registry,
             circuit,

@@ -19,17 +19,17 @@ fn signed(n: usize, seed: u64) -> (Vec<Statement>, Vec<Signature>) {
 
 #[test]
 fn compressions_per_signature() {
-    assert_eq!(ROWS, 83);
+    assert_eq!((STEPS, LEAF_BLOCKS), (68, 15));
     assert_eq!(COMPRESSIONS_PER_SIGNATURE, 201);
 }
 
 /// 1000 signatures lay out in a 2^32 Boolean address space.
 #[test]
 fn layout_plan_for_1000_signatures() {
-    let kinds: Vec<(usize, usize)> = gadget_constructors()
+    let kinds: Vec<(usize, usize)> = gates(3)
         .iter()
         .zip(GADGETS_PER_SIGNATURE)
-        .map(|(f, c)| (1000 * c, f(3).k_log()))
+        .map(|(g, c)| (1000 * c, g.k_log()))
         .collect();
     let nu = plan_nu(&kinds);
     let space: u128 = kinds
@@ -62,7 +62,7 @@ fn two_signatures_prove_and_verify() {
     let compressions: usize = circuit
         .gadgets
         .iter()
-        .filter(|(_, g)| g.name() == "leanxmss.machine")
+        .filter(|(_, g)| g.name() == "leanxmss.compress")
         .map(|&(id, _)| witness.rows::<BooleanGate>(id).len())
         .sum();
     assert_eq!(compressions, 2 * COMPRESSIONS_PER_SIGNATURE);
@@ -97,4 +97,93 @@ fn invalid_signature_is_refused() {
         circuit.witness(&statements, &sigs)
     }));
     assert!(refused.is_err());
+}
+
+/// The online phase with the resolved inputs edited by `edit` before the
+/// gates run: a way to feed the step rows a schedule the honest prover
+/// would not.
+fn edited_witness(
+    circuit: &XmssCircuit,
+    statements: &[Statement],
+    sigs: &[Signature],
+    edit: impl FnOnce(&[Source], &mut [F128]),
+) -> CircuitWitness {
+    let plans: Vec<[LayerPlan; 2]> = statements
+        .iter()
+        .zip(sigs)
+        .map(|(st, sig)| signature_plan(st, sig))
+        .collect();
+    let mut values: Vec<F128> = circuit
+        .inputs
+        .iter()
+        .map(|&src| XmssCircuit::resolve(src, statements, Some((sigs, &plans))))
+        .collect();
+    edit(&circuit.inputs, &mut values);
+    circuit
+        .shape
+        .run_filled_deferred(&circuit.plan, &values, &[])
+}
+
+/// Position of a step row's word among the circuit's inputs.
+fn step_input(inputs: &[Source], s: usize, layer: usize, row: usize, w: usize) -> usize {
+    inputs
+        .iter()
+        .position(
+            |src| matches!(*src, Source::Step(a, b, c, d) if (a, b, c, d) == (s, layer, row, w)),
+        )
+        .expect("a step input")
+}
+
+/// The bus's products differ.
+fn unbalanced(r: Result<(), FlockVerifyError>) -> bool {
+    use flock_core::{circuit::WiringError, product_gkr::ProductGkrError};
+    matches!(
+        r,
+        Err(FlockVerifyError::Wiring(WiringError::BusGkr(
+            ProductGkrError::ProductMismatch
+        )))
+    )
+}
+
+/// The bus moves chain values by content: a layer's steps verify in any
+/// order, but not with a wrong value in one step, and not with steps traded
+/// between layers (each layer must spend exactly its own 68).
+#[test]
+fn the_bus_checks_the_chains() {
+    let (statements, sigs) = signed(2, 23);
+    let circuit = XmssCircuit::new(2);
+    let proves = |witness: &CircuitWitness| {
+        let proof = circuit.prove(witness);
+        circuit.verify(&statements, &proof)
+    };
+
+    // Reversed step order within signature 1's bottom layer.
+    let witness = edited_witness(&circuit, &statements, &sigs, |inputs, values| {
+        for row in 0..STEPS / 2 {
+            for w in 0..3 {
+                let a = step_input(inputs, 1, 0, row, w);
+                let b = step_input(inputs, 1, 0, STEPS - 1 - row, w);
+                values.swap(a, b);
+            }
+        }
+    });
+    proves(&witness).expect("steps in any order verify");
+
+    // One step hashes a different value.
+    let witness = edited_witness(&circuit, &statements, &sigs, |inputs, values| {
+        values[step_input(inputs, 0, 1, 17, 1)] += F128::ONE;
+    });
+    assert!(unbalanced(proves(&witness)), "a wrong chain value");
+
+    // Signature 0's two layers trade one step row each: every step is
+    // still computed correctly, but each layer's tuples now carry the other
+    // layer's tag on one row.
+    let witness = edited_witness(&circuit, &statements, &sigs, |inputs, values| {
+        for w in 0..3 {
+            let a = step_input(inputs, 0, 0, 3, w);
+            let b = step_input(inputs, 0, 1, 40, w);
+            values.swap(a, b);
+        }
+    });
+    assert!(unbalanced(proves(&witness)), "steps traded between layers");
 }

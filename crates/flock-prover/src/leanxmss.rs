@@ -6,6 +6,6 @@
 //! native scheme, generic over the hash.
 
 pub mod circuit;
+pub mod compress;
 pub mod gadgets;
-pub mod machine;
 pub mod reference;

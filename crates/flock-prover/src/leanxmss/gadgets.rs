@@ -220,6 +220,95 @@ pub fn codeword_gate(nu: usize) -> Result<BooleanGate, BooleanGateError> {
 }
 
 // ---------------------------------------------------------------------------
+// Chain ends: where each chain starts, for the tuple bus
+// ---------------------------------------------------------------------------
+
+/// One row per chain `c` of a layer: `d` holds the digits from chain `c` on
+/// (the digest shifted down by `2c`), `a` is the layer's chain address at
+/// step 0, `x` the chain's revealed value and `e` its end. Outputs the
+/// digits for chain `c + 1` and the start address `s = A(d_c)`: `a` with
+/// the step field set to the chain's digit.
+///
+/// The row checks nothing about `x` and `e`: the tuple bus sends
+/// `(c, A(d_c), x)` and receives `(c, A(3), e)` for it
+/// ([`super::circuit`]), and `e` is wired into the leaf.
+pub struct ChainCols<T> {
+    pub d: [T; 128],
+    pub a: [T; 128],
+    pub x: [T; 128],
+    pub e: [T; 128],
+    pub d_next: [T; 128],
+    pub s: [T; 128],
+}
+
+struct ChainSchema;
+
+impl ColumnSchema for ChainSchema {
+    type Cols<T> = ChainCols<T>;
+
+    fn columns<V: ColumnVisitor>(&self, v: &mut V) -> ChainCols<V::Value> {
+        ChainCols {
+            d: wired(v, "d", ColumnRole::Input),
+            a: wired(v, "a", ColumnRole::Input),
+            x: wired(v, "x", ColumnRole::Input),
+            e: wired(v, "e", ColumnRole::Input),
+            d_next: wired(v, "d-next", ColumnRole::Output),
+            s: wired(v, "s", ColumnRole::Output),
+        }
+    }
+}
+
+/// The step field's bits in an address word (byte 7 is `tag + 32·step`).
+const STEP_BITS: [usize; 2] = [61, 62];
+
+pub fn chain_circuit() -> BooleanCircuit {
+    CircuitBuilder::compile(ChainSchema, |b, c| {
+        for j in 0..128 {
+            let v = if j + W < 128 {
+                c.d[j + W].into()
+            } else {
+                b.zero()
+            };
+            b.define_linear(c.d_next[j], v);
+        }
+        for j in 0..128 {
+            let v = match STEP_BITS.iter().position(|&k| k == j) {
+                Some(bit) => b.xor2(c.a[j], c.d[bit]),
+                None => c.a[j].into(),
+            };
+            b.define_linear(c.s[j], v);
+        }
+    })
+    .circuit()
+    .clone()
+}
+
+/// io-schema positions of the chain row's words.
+pub mod chain_io {
+    pub const A: usize = 1;
+    pub const X: usize = 2;
+    pub const E: usize = 3;
+    pub const S: usize = 5;
+}
+
+/// Inputs `[d, a, x, e]`, outputs `[d_next, s]`.
+pub fn chain_gate(nu: usize) -> Result<BooleanGate, BooleanGateError> {
+    BooleanGate::new(
+        "leanxmss.chain",
+        &chain_circuit(),
+        &["d", "a", "x", "e"],
+        &["d-next", "s"],
+        nu,
+    )
+    .map(|g| {
+        g.with_native(|i, o| {
+            let d = u(i[0]);
+            o.extend([f(d >> W), f(u(i[1]) ^ (d & 3) << STEP_BITS[0])]);
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Addresses: a shift chain over the leaf index
 // ---------------------------------------------------------------------------
 //

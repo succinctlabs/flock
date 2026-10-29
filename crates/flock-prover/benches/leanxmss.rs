@@ -8,6 +8,8 @@
 //! LEANXMSS_N=1000 cargo bench -p flock-prover --bench leanxmss
 //! ```
 //!
+//! `LEANXMSS_NU` overrides the slot height `2^nu` the layout planner picks.
+//!
 //! Signatures are key-free (each costs two grinds of about 2^20 hashes) and
 //! cached under `target/`.
 
@@ -98,7 +100,9 @@ fn main() {
     let clear = var("LEANXMSS_KEEP_SCRATCH").is_err();
     let (statements, sigs) = cached(n);
     let t = Instant::now();
-    let circuit = XmssCircuit::new(n);
+    // `LEANXMSS_NU`: rows per slot as a power of two (default: `plan_nu`).
+    let nu = var("LEANXMSS_NU").ok().map(|v| v.parse().unwrap());
+    let circuit = XmssCircuit::with_nu(n, nu);
     eprintln!(
         "leanXMSS[BLAKE3] n = {n} (pool {threads:?}): nu = {}, shape {:.0} ms",
         circuit.nu(),

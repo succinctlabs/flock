@@ -1,12 +1,23 @@
 //! The circuit verifying `n` leanXMSS\[BLAKE3\] signatures in one proof.
 //!
-//! Every `Th` call is BLAKE3 compressions, each one row of the chain machine
-//! ([`super::machine`]). A layer's chains and leaf take 83 rows that each
-//! step a chain or absorb a block of the leaf, in an order the digits decide
-//! while the wiring stays fixed. The digests (two blocks at the bottom, one
-//! at the top) and the Merkle nodes are plain rows. That is 2·(83 + 16) + 3 =
-//! 201 rows per signature ([`COMPRESSIONS_PER_SIGNATURE`]), exactly the
-//! compressions native verification spends, all in one slot kind.
+//! Every `Th` call is BLAKE3 compressions, one per row of the compression
+//! gate ([`super::compress`]): 201 per signature
+//! ([`COMPRESSIONS_PER_SIGNATURE`]), exactly what native verification
+//! spends. Most are fixed: the digests, the 15 blocks of each one-time
+//! key's leaf and the Merkle nodes are wired like any circuit. The 68 chain
+//! steps of a layer are not — which chain a step advances depends on the
+//! digits — so they move their values over the tuple bus
+//! ([`flock_core::circuit::bus`], `docs/tuple-bus-design.md`).
+//!
+//! A bus tuple is `(S, c, A, v)`: the layer `S` (a static row tag: signer
+//! and layer), the chain `c`, the chain address `A(µ)` (which carries the
+//! position `µ` in its step field) and the value there. Per chain, a chain
+//! row sends its start `(S, c, A(d_c), x_c)` and receives its end
+//! `(S, c, A(3), e_c)`; the end is wired into the leaf. Each step row
+//! receives `(S, m3, m1, m2)`, hashes `P ‖ m1 ‖ m2 ‖ m3` and sends
+//! `(S, m3, next(m1), H0)`. Every layer has exactly 68 step rows, so with
+//! the digit sum checked, the only way to balance is to walk each chain
+//! from its digit to the end.
 //!
 //! Per signer the statement is public: `P`, the root and the 32-byte message.
 //! The leaf index, randomizers, chain values and Merkle siblings are private.
@@ -16,6 +27,7 @@ use flock_core::{
     circuit::{
         boolean::BooleanGate,
         builder::{CircuitShape, CircuitWitness, FillPlan, ShapeBuilder, SlotId, Wire},
+        bus::{BusDirection, BusTerm, RowTag},
     },
     lincheck::LincheckCircuit,
     merkle::HashKind,
@@ -29,20 +41,29 @@ use flock_core::{
 use flock_field::F128;
 
 use super::{
-    gadgets::{address_gate, address_step_gate, codeword_gate, layer_address_constants, swap_gate},
-    machine::{LayerFresh, ROWS, final_ctl, layer_fresh, machine_gate, plain_ctl},
+    compress::{M, NEXT, O0, compress_gate, ctl},
+    gadgets::{
+        address_gate, address_step_gate, chain_gate, chain_io, codeword_gate,
+        layer_address_constants, swap_gate,
+    },
     reference::{
-        HEIGHT, PublicKey, Signature, Value, XmssHash, codeword, layer_root, msg_address, th,
+        CHAIN_END, HEIGHT, PublicKey, Signature, TARGET_SUM, V, Value, XmssHash, chain_address,
+        codeword, layer_root, le128, msg_address, th,
     },
 };
 use crate::{prover::UnionSlotProverInput, r1cs_hashes::blake3::BLAKE3_IV};
 
-/// Compressions per signature: both layers' machine runs, both paths and the
-/// digests (2 + 1).
-pub const COMPRESSIONS_PER_SIGNATURE: usize = 2 * (ROWS + HEIGHT) + 3;
+/// Chain steps per layer: every codeword takes exactly this many.
+pub const STEPS: usize = V * CHAIN_END - TARGET_SUM;
+/// Leaf blocks: `P ‖ A_leaf` and the 58 ends, four 16-byte words a block.
+pub const LEAF_BLOCKS: usize = (2 + V).div_ceil(4);
+/// Compressions per signature: both layers' chain steps, leaves and paths,
+/// and the digests (2 + 1).
+pub const COMPRESSIONS_PER_SIGNATURE: usize = 2 * (STEPS + LEAF_BLOCKS + HEIGHT) + 3;
 
 const FIAT_SHAMIR_DOMAIN: &[u8] = b"flock-leanxmss-blake3-v1";
 
+/// BLAKE3 flags.
 const CHUNK_START: u32 = 1;
 const CHUNK_END: u32 = 2;
 const ROOT: u32 = 8;
@@ -65,16 +86,23 @@ enum Source {
     Idx(usize),
     Rho(usize, usize),
     Sibling(usize, usize, usize),
-    /// Signer, layer: the machine's initial leaf slot 2.
-    InitialSlot(usize, usize),
-    /// Signer, layer, row, word: a machine row's free value.
-    Fresh(usize, usize, usize, usize),
+    /// Signer, layer, chain: the revealed value and the end.
+    Start(usize, usize, usize),
+    End(usize, usize, usize),
+    /// Signer, layer, step row, word (`[A, v, c]`).
+    Step(usize, usize, usize, usize),
 }
 
-/// Each signature's machine plans, per layer.
-type SignatureFresh = [LayerFresh; 2];
+/// One layer's chain values: the revealed values, the ends, and the step
+/// rows' `[A(µ), v, c]` in chain order.
+struct LayerPlan {
+    starts: [F128; V],
+    ends: [F128; V],
+    steps: Vec<[F128; 3]>,
+}
 
-fn signature_fresh(statement: &Statement, sig: &Signature) -> SignatureFresh {
+/// Walks both layers natively: every chain from its digit to the end.
+fn signature_plan(statement: &Statement, sig: &Signature) -> [LayerPlan; 2] {
     let hash = XmssHash::Blake3;
     let pp = statement.pk.pp;
     let mut msg = statement.msg.to_vec();
@@ -87,13 +115,28 @@ fn signature_fresh(statement: &Statement, sig: &Signature) -> SignatureFresh {
         let ls = &sig.layers[layer];
         let digest = th(hash, &pp, &msg_address(layer, e), &[&msg, &ls.rho]);
         let digits = codeword(&digest).expect("the signature does not verify");
-        let fresh = layer_fresh(&digits, &ls.y);
+        let mut ends = [F128::ZERO; V];
+        let mut steps = Vec::with_capacity(STEPS);
+        for (c, end) in ends.iter_mut().enumerate() {
+            let mut v = ls.y[c];
+            for step in digits[c] as usize..CHAIN_END {
+                let a = chain_address(layer, e, step);
+                steps.push([word(&a), word(&v), word(&le128(c))]);
+                v = th(hash, &pp, &a, &[&v, &le128(c)]);
+            }
+            *end = word(&v);
+        }
+        assert_eq!(steps.len(), STEPS, "the digits are not a codeword");
         if layer == 0 {
             msg = layer_root(hash, &pp, 0, e, &msg, ls, &mut None)
                 .unwrap()
                 .to_vec();
         }
-        fresh
+        LayerPlan {
+            starts: ls.y.each_ref().map(word),
+            ends,
+            steps,
+        }
     })
 }
 
@@ -183,12 +226,14 @@ impl Builder {
 struct Constants {
     iv: [Wire; 2],
     zero: Wire,
-    /// The `ctl` words of plain compressions ([`plain_ctl`]).
+    /// Control words ([`ctl`]): a lone 64-byte block, a first block, a
+    /// middle block, a 64-byte last block, and the 16-byte last block of the
+    /// bottom digest.
     single: Wire,
     first: Wire,
+    middle: Wire,
+    last: Wire,
     last16: Wire,
-    /// The `ctl` word a layer's machine must end on.
-    final_ctl: Wire,
     /// Per layer, the constant parts of its addresses
     /// ([`layer_address_constants`]).
     address: [Vec<Wire>; 2],
@@ -218,9 +263,12 @@ impl Kind {
     }
 }
 
-/// The declared gate kinds.
+/// The declared gate kinds. Chain steps and the other compressions are the
+/// same gate in separate slots: a bus port covers whole slots.
 struct Slots {
-    machine: Kind,
+    step: Kind,
+    hash: Kind,
+    chain: Kind,
     swap: Kind,
     codeword: Kind,
     address: Kind,
@@ -228,8 +276,15 @@ struct Slots {
 }
 
 /// Gates of each kind per signature, in [`Slots`] order.
-const GADGETS_PER_SIGNATURE: [usize; 5] =
-    [COMPRESSIONS_PER_SIGNATURE, 2 * HEIGHT, 2, 2 * 3, 2 * HEIGHT];
+const GADGETS_PER_SIGNATURE: [usize; 7] = [
+    2 * STEPS,
+    COMPRESSIONS_PER_SIGNATURE - 2 * STEPS,
+    2 * V,
+    2 * HEIGHT,
+    2,
+    2 * 3,
+    2 * HEIGHT,
+];
 
 /// The `nu` whose layout has the smallest Boolean address space,
 /// `⌈log2 Σ_kind ⌈count/2^nu⌉·2^(nu + k_log)⌉`, preferring the larger `nu`
@@ -249,31 +304,34 @@ pub fn plan_nu(kinds: &[(usize, usize)]) -> usize {
         .unwrap()
 }
 
-/// The gate kinds' constructors, in [`Slots`] order.
-fn gadget_constructors() -> [fn(usize) -> BooleanGate; 5] {
+/// The gate kinds at `nu`, in [`Slots`] order. The two compression kinds
+/// share one gate: building it is most of the circuit's setup.
+fn gates(nu: usize) -> [BooleanGate; 7] {
+    let compress = compress_gate(nu).unwrap();
     [
-        |nu| machine_gate(nu).unwrap(),
-        |nu| swap_gate(nu).unwrap(),
-        |nu| codeword_gate(nu).unwrap(),
-        |nu| address_gate(nu).unwrap(),
-        |nu| address_step_gate(nu).unwrap(),
+        compress.clone(),
+        compress,
+        chain_gate(nu).unwrap(),
+        swap_gate(nu).unwrap(),
+        codeword_gate(nu).unwrap(),
+        address_gate(nu).unwrap(),
+        address_step_gate(nu).unwrap(),
     ]
 }
 
 /// Declares every gate kind, the counts in [`Slots`] order, each over
-/// `⌈count/2^nu⌉` slots (at least one). Returns the kinds and every slot with
-/// its gate.
+/// `⌈count/2^nu⌉` slots (at least one), and the bus ports of the step and
+/// chain slots. Returns the kinds and every slot with its gate.
 fn declare_slots(
     b: &mut Builder,
     nu: usize,
     counts: &[usize],
 ) -> (Slots, Vec<(SlotId, BooleanGate)>) {
     let mut gadgets = Vec::new();
-    let mut declared: Vec<Kind> = gadget_constructors()
-        .iter()
+    let mut declared: Vec<Kind> = gates(nu)
+        .into_iter()
         .zip(counts)
-        .map(|(f, &count)| {
-            let gate = f(nu);
+        .map(|(gate, &count)| {
             let slots = (0..count.div_ceil(1 << nu).max(1))
                 .map(|_| {
                     let id = b.sb.slot(gate.clone());
@@ -290,12 +348,57 @@ fn declare_slots(
         .collect();
     let mut take = || declared.remove(0);
     let slots = Slots {
-        machine: take(),
+        step: take(),
+        hash: take(),
+        chain: take(),
         swap: take(),
         codeword: take(),
         address: take(),
         address_step: take(),
     };
+    // Rows are emitted layer by layer, so the `k`-th row of a kind (over its
+    // slots) belongs to layer `k / per_layer`: that index is the tuple's `S`.
+    let tag = |slot: usize, div: usize, modulo: usize| {
+        BusTerm::row(RowTag {
+            offset: (slot << nu) as u64,
+            div: div as u64,
+            modulo: modulo as u64,
+        })
+    };
+    for (i, &id) in slots.step.slots.iter().enumerate() {
+        let layer = tag(i, STEPS, 0);
+        let m = |k: usize| BusTerm::word(M + k);
+        b.sb.bus_port(id, BusDirection::Recv, vec![layer, m(3), m(1), m(2)]);
+        b.sb.bus_port(
+            id,
+            BusDirection::Send,
+            vec![layer, m(3), BusTerm::word(NEXT), BusTerm::word(O0)],
+        );
+    }
+    let step3 = F128::new(3 << 61, 0);
+    for (i, &id) in slots.chain.slots.iter().enumerate() {
+        let (layer, chain) = (tag(i, V, 0), tag(i, 1, V));
+        b.sb.bus_port(
+            id,
+            BusDirection::Send,
+            vec![
+                layer,
+                chain,
+                BusTerm::word(chain_io::S),
+                BusTerm::word(chain_io::X),
+            ],
+        );
+        b.sb.bus_port(
+            id,
+            BusDirection::Recv,
+            vec![
+                layer,
+                chain,
+                BusTerm::word(chain_io::A).plus(step3),
+                BusTerm::word(chain_io::E),
+            ],
+        );
+    }
     (slots, gadgets)
 }
 
@@ -303,10 +406,11 @@ fn declare_constants(b: &mut Builder) -> Constants {
     Constants {
         iv: iv_words().map(|w| b.constant(w)),
         zero: b.constant(F128::ZERO),
-        single: b.constant(plain_ctl(CHUNK_START | CHUNK_END | ROOT, 64)),
-        first: b.constant(plain_ctl(CHUNK_START, 64)),
-        last16: b.constant(plain_ctl(CHUNK_END | ROOT, 16)),
-        final_ctl: b.constant(final_ctl()),
+        single: b.constant(ctl(CHUNK_START | CHUNK_END | ROOT, 64)),
+        first: b.constant(ctl(CHUNK_START, 64)),
+        middle: b.constant(ctl(0, 64)),
+        last: b.constant(ctl(CHUNK_END | ROOT, 64)),
+        last16: b.constant(ctl(CHUNK_END | ROOT, 16)),
         address: [0, 1].map(|layer| {
             layer_address_constants(layer)
                 .iter()
@@ -317,15 +421,21 @@ fn declare_constants(b: &mut Builder) -> Constants {
 }
 
 impl XmssCircuit {
-    /// The circuit for `n ≥ 1` signatures.
+    /// The circuit for `n ≥ 1` signatures, its slot height from [`plan_nu`].
     pub fn new(n: usize) -> Self {
+        Self::with_nu(n, None)
+    }
+
+    /// The circuit for `n ≥ 1` signatures with `2^nu` rows per slot, or
+    /// [`plan_nu`]'s choice.
+    pub fn with_nu(n: usize, nu: Option<usize>) -> Self {
         assert!(n >= 1);
-        let kinds: Vec<(usize, usize)> = gadget_constructors()
+        let kinds: Vec<(usize, usize)> = gates(3)
             .iter()
             .zip(GADGETS_PER_SIGNATURE)
-            .map(|(f, per_sig)| (n * per_sig, f(3).k_log()))
+            .map(|(g, per_sig)| (n * per_sig, g.k_log()))
             .collect();
-        let nu = plan_nu(&kinds);
+        let nu = nu.unwrap_or_else(|| plan_nu(&kinds));
         let mut b = Builder {
             sb: ShapeBuilder::new(nu),
             inputs: Vec::new(),
@@ -368,7 +478,7 @@ impl XmssCircuit {
     fn resolve(
         source: Source,
         statements: &[Statement],
-        sigs: Option<(&[Signature], &[SignatureFresh])>,
+        sigs: Option<(&[Signature], &[[LayerPlan; 2]])>,
     ) -> F128 {
         let private = || sigs.expect("private inputs need the signatures");
         let sig = |s: usize| &private().0[s];
@@ -380,8 +490,9 @@ impl XmssCircuit {
             Source::Idx(s) => F128::new(sig(s).idx as u64, 0),
             Source::Rho(s, l) => word(&sig(s).layers[l].rho),
             Source::Sibling(s, l, k) => word(&sig(s).layers[l].path[k]),
-            Source::InitialSlot(s, l) => private().1[s][l].b2,
-            Source::Fresh(s, l, r, j) => private().1[s][l].rows[r][j],
+            Source::Start(s, l, c) => private().1[s][l].starts[c],
+            Source::End(s, l, c) => private().1[s][l].ends[c],
+            Source::Step(s, l, i, k) => private().1[s][l].steps[i][k],
         }
     }
 
@@ -400,14 +511,14 @@ impl XmssCircuit {
     pub fn witness(&self, statements: &[Statement], sigs: &[Signature]) -> CircuitWitness {
         assert_eq!((statements.len(), sigs.len()), (self.n, self.n));
         use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-        let fresh: Vec<SignatureFresh> = (0..self.n)
+        let plans: Vec<[LayerPlan; 2]> = (0..self.n)
             .into_par_iter()
-            .map(|s| signature_fresh(&statements[s], &sigs[s]))
+            .map(|s| signature_plan(&statements[s], &sigs[s]))
             .collect();
         let values: Vec<F128> = self
             .inputs
             .iter()
-            .map(|&src| Self::resolve(src, statements, Some((sigs, &fresh))))
+            .map(|&src| Self::resolve(src, statements, Some((sigs, &plans))))
             .collect();
         self.shape.run_filled_deferred(&self.plan, &values, &[])
     }
@@ -530,29 +641,19 @@ pub struct XmssProof {
     pub commitment: Commitment,
 }
 
-/// One plain compression of `cv` and the block `m`, its kind set by `ctl`
-/// ([`plain_ctl`]): the output chaining value.
-fn compress(
-    b: &mut Builder,
-    slots: &mut Slots,
-    k: &Constants,
-    cv: [Wire; 2],
-    m: [Wire; 4],
-    ctl: Wire,
-) -> [Wire; 2] {
-    let slot = slots.machine.next();
-    let z = k.zero;
-    let out = b.sb.gate(
-        slot,
-        &[m[3], m[0], m[1], m[2], cv[0], cv[1], ctl, z, z, z, z, z, z],
-    );
-    [out[4], out[5]]
+/// One compression of `cv` and the block `m` in `kind`'s next row, its
+/// flags and block length set by `ctl` ([`ctl`]): the output chaining value.
+fn compress(b: &mut Builder, kind: &mut Kind, cv: [Wire; 2], m: [Wire; 4], ctl: Wire) -> [Wire; 2] {
+    let slot = kind.next();
+    let out =
+        b.sb.gate(slot, &[cv[0], cv[1], m[0], m[1], m[2], m[3], ctl]);
+    [out[0], out[1]]
 }
 
 /// `Th` of a 64-byte input: one root compression from the IV; `H0` is the
 /// first output word.
 fn th64(b: &mut Builder, slots: &mut Slots, k: &Constants, m: [Wire; 4]) -> Wire {
-    compress(b, slots, k, k.iv, m, k.single)[0]
+    compress(b, &mut slots.hash, k.iv, m, k.single)[0]
 }
 
 /// Signature `s`: wires its inputs and checks both layers, ending at the
@@ -591,34 +692,53 @@ fn signature(b: &mut Builder, slots: &mut Slots, k: &Constants, s: usize) {
         // 64 at the top (M is the bottom root).
         let digest = match bottom_root {
             None => {
-                let first = compress(b, slots, k, k.iv, [pp, a_msg, msg[0], msg[1]], k.first);
-                compress(b, slots, k, first, [rho, k.zero, k.zero, k.zero], k.last16)[0]
+                let first = compress(
+                    b,
+                    &mut slots.hash,
+                    k.iv,
+                    [pp, a_msg, msg[0], msg[1]],
+                    k.first,
+                );
+                compress(
+                    b,
+                    &mut slots.hash,
+                    first,
+                    [rho, k.zero, k.zero, k.zero],
+                    k.last16,
+                )[0]
             }
             Some(x) => th64(b, slots, k, [pp, a_msg, x, rho]),
         };
         let slot = slots.codeword.next();
         b.sb.gate(slot, &[digest]);
-        // The chains and the leaf: the machine starts with `P ‖ A_leaf` in
-        // the leaf's first two slots, the IV as its chaining value and the
-        // digest as its control word, and must end with every chain consumed.
-        let mut state = vec![
-            k.zero,
-            pp,
-            a_leaf,
-            b.input(Source::InitialSlot(s, layer)),
-            k.iv[0],
-            k.iv[1],
-            digest,
-        ];
-        for row in 0..ROWS {
-            let mut ins = state;
-            ins.extend([pp, a_chain]);
-            ins.extend((0..4).map(|j| b.input(Source::Fresh(s, layer, row, j))));
-            let slot = slots.machine.next();
-            state = b.sb.gate(slot, &ins);
+        // One chain row per chain: its start goes out on the bus, its end
+        // comes back and is wired into the leaf.
+        let mut digits = digest;
+        let mut ends = Vec::with_capacity(V);
+        for c in 0..V {
+            let x = b.input(Source::Start(s, layer, c));
+            let end = b.input(Source::End(s, layer, c));
+            let slot = slots.chain.next();
+            digits = b.sb.gate(slot, &[digits, a_chain, x, end])[0];
+            ends.push(end);
         }
-        b.sb.connect(state[6], k.final_ctl);
-        let mut node = state[4];
+        // The layer's chain steps, in whatever order the digits give.
+        for i in 0..STEPS {
+            let [a, v, c] = std::array::from_fn(|w| b.input(Source::Step(s, layer, i, w)));
+            compress(b, &mut slots.step, k.iv, [pp, a, v, c], k.single);
+        }
+        // The leaf H0(P ‖ A_leaf ‖ end_0 ‖ … ‖ end_57): 15 blocks of one chunk.
+        let words: Vec<Wire> = [pp, a_leaf].into_iter().chain(ends).collect();
+        let mut cv = k.iv;
+        for (i, block) in words.chunks(4).enumerate() {
+            let flags = match i {
+                0 => k.first,
+                i if i + 1 == LEAF_BLOCKS => k.last,
+                _ => k.middle,
+            };
+            cv = compress(b, &mut slots.hash, cv, block.try_into().unwrap(), flags);
+        }
+        let mut node = cv[0];
         for level in 0..HEIGHT {
             let sibling = b.input(Source::Sibling(s, layer, level));
             let dir = shifted[HEIGHT * layer + level];
