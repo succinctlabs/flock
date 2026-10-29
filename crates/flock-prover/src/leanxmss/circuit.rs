@@ -441,6 +441,9 @@ impl XmssCircuit {
             inputs: Vec::new(),
             publics: Vec::new(),
         };
+        // The step rows' bus words and every row's unused outputs need no
+        // copy constraint.
+        b.sb.prune_unwired();
         let counts: Vec<usize> = kinds.iter().map(|&(count, _)| count).collect();
         let (mut slots, gadgets) = declare_slots(&mut b, nu, &counts);
         let constants = declare_constants(&mut b);

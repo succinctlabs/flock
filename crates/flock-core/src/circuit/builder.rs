@@ -434,6 +434,8 @@ pub struct ShapeBuilder {
     /// Tuple-bus ports by DECLARED slot, terms naming io-schema words;
     /// resolved to cell-slots in [`Self::finish`].
     bus_ports: Vec<(usize, BusDirection, Vec<BusTerm>)>,
+    /// See [`Self::prune_unwired`].
+    prune_unwired: bool,
 }
 
 impl ShapeBuilder {
@@ -452,7 +454,14 @@ impl ShapeBuilder {
             n_hints: 0,
             islands: Vec::new(),
             bus_ports: Vec::new(),
+            prune_unwired: false,
         }
+    }
+
+    /// Build the circuit with its unwired gate cell-slots left out of the
+    /// wiring argument ([`Circuit::with_unwired_pruned`]).
+    pub fn prune_unwired(&mut self) {
+        self.prune_unwired = true;
     }
 
     fn find(&mut self, w: Wire) -> usize {
@@ -777,6 +786,9 @@ impl ShapeBuilder {
         debug_assert_eq!(self.fixed_public.len(), pubs.len());
         let mut circuit =
             Circuit::new_with_fixed_public(&registry, counts.clone(), self.fixed_public, wires)?;
+        if self.prune_unwired {
+            circuit = circuit.with_unwired_pruned();
+        }
         if let Some((_, _, first)) = self.bus_ports.first() {
             let ports = self
                 .bus_ports

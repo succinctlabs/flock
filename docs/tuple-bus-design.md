@@ -144,6 +144,23 @@ wiring classes, semantics come from the circuit around it (§2.3).
   ordinary wiring after one receive, which is what leanXMSS does for chain
   ends.
 
+### 1.6 Pruning unwired cells
+
+A bus circuit has whole io words that no wire touches. On leanXMSS these are
+the step rows' `m1, m2, m3, o0, o1, next`, the chain rows' `x` and `s`, and
+`next` on the other compressions. Each of their cells is σ-fixed, so it
+contributes the identical factor `w + α·x + β` to both wiring products.
+`Circuit::with_unwired_pruned` (`ShapeBuilder::prune_unwired`) marks every
+gate cell-slot with no wired cell dead in the wiring's live mask:
+- Its leaves become 1 on both sides.
+- Its gather value and claim disappear.
+- The verifier skips it in the recombination.
+- The digest records the pruned set.
+
+The products are unchanged, so soundness is the wiring's, restricted to the
+cells it still covers. The bus reads its words through its own gathers.
+Pruning is opt-in, so recursion circuits keep their transcripts.
+
 ## 2. leanXMSS on the bus
 
 ### 2.1 Rows
@@ -244,31 +261,43 @@ Two points the static `S` handles:
 ## 3. Results
 
 1000 signatures, M4 (4P + 6E), `cargo bench -p flock-prover --bench leanxmss`.
-These are alternating A/B runs against the machine at `e09103b`, two rounds
-each. Medians are of warm proves; "best" is best online+prove.
+These are alternating A/B runs against the chain machine at `e09103b`, two
+rounds each, with the bus circuit's unwired cells pruned (§1.6). Medians are
+of warm proves; "best" is best online+prove.
 
 | Pool | Machine median | Bus median | Machine best | Bus best |
 |---|---:|---:|---:|---:|
-| rayon, 10 threads | 694 ms | 587 ms | 659 ms | 573 ms (1745 sig/s) |
-| 4 P-cores + hops + SME (`LEANXMSS_POOL=perf`) | 762 ms | 639 ms | 738 ms | 644 ms |
+| rayon, 10 threads | 686 ms | 562 ms | 674 ms | 564 ms (1773 sig/s) |
+| 4 P-cores + hops + SME (`LEANXMSS_POOL=perf`) | 761 ms | 596 ms | 728 ms | 610 ms |
 
-Phase medians, ms, on 10 threads:
+Phase medians, ms. Pure BLAKE3 is `blake3_proof` at 201,000 compressions,
+full height, from the earlier ten-thread comparison.
 
-| Phase | Machine | Bus | Pure BLAKE3, 201k |
-|---|---:|---:|---:|
-| witness | 62 | 47 | 26 |
-| commit | 160 | 132 | 139 |
-| zerocheck (∥ wiring GKR) | 226 | 179 | 134 |
-| wiring GKR (μ = 22) | 166 | 136 | — |
-| bus | — | 8 | — |
-| lincheck | 54 | 56 | 26 |
-| open | 129 | 124 | 102 |
-| total | 694 | 587 | 462 |
+| Phase | Machine, 10T | Bus, 10T | Pure BLAKE3, 10T | Machine, perf | Bus, perf |
+|---|---:|---:|---:|---:|---:|
+| witness | 70 | 48 | 26 | 68 | 47 |
+| commit | 170 | 130 | 139 | 168 | 130 |
+| zerocheck (∥ wiring GKR) | 220 | 161 | 134 | 256 | 156 |
+| wiring GKR | 159 | 111 | — | 206 | 108 |
+| bus | — | 9 | — | — | 10 |
+| lincheck | 55 | 56 | 26 | 73 | 72 |
+| open | 130 | 124 | 102 | 163 | 157 |
+| total | 686 | 562 | 462 | 761 | 596 |
 
-The bus itself costs about 8 ms. Commit is now level with pure hashing. What
-remains of the gap is the wiring GKR running beside the zerocheck, per-slot
-costs (15 slots vs. 1) in lincheck and the opening, and the witness packing.
-Shape setup rises from 4.1 s to 5.0 s.
+On 10 threads, leanXMSS now costs 1.22× pure BLAKE3 at equal compressions,
+down from about 1.45× with the machine. On the P-core pool it costs 1.11×
+(537 ms pure).
+- **Pruning alone** took the wiring GKR from about 136 to 108 ms.
+- **The bus itself** costs 9–10 ms.
+- **Commit** is level with pure hashing.
+
+The rest of the gap:
+- the wiring GKR beside the zerocheck;
+- per-slot costs in lincheck and the opening (15 slots against one);
+- the packing of the non-hash words.
+
+`ν = 16` (10 slots) is a wash: lincheck 54 → 33 ms but commit 128 → 147 ms.
+Shape setup is 4.9 s against 4.1 s.
 
 ## 4. Questions for review
 
