@@ -311,24 +311,26 @@ Two per-slot costs went next (`29b795a`, `9918098`):
   share the compression gate), the slots' stripe folds run together, and
   narrow full slots fold by rows.
 
-Alternating A/B, 10 threads, median of each round's fastest prove (ms):
+Alternating A/B on a quiet machine, 10 threads, three rounds each, median
+of each round's fastest prove (ms):
 
 | Phase | Pure BLAKE3 | Bus |
 |---|---:|---:|
 | witness | 27 | 36 |
-| commit | 149 | 132 |
-| zerocheck (∥ wiring GKR 108, bus 9) | 136 | 158 |
+| compact q | 8 | 9 |
+| commit | 139 | 133 |
+| zerocheck (∥ wiring GKR 110, bus 9) | 135 | 158 |
 | lincheck | 28 | 28 |
-| bit-bank fold | 24 | 25 |
-| open | 116 | 128 |
-| total | 482 | 515 |
+| bit-bank fold | 24 | 24 |
+| open | 103 | 121 |
+| total | 461 | 512 |
 
-Pure BLAKE3 varied more than usual between rounds (475–543 ms); an
-earlier, quieter run gave 462 ms, with commit 139 and open 103. So the bus
-now costs about 1.07–1.11× pure BLAKE3. Best online+prove is 527 ms, about
-1,900 signatures/s. What is left is the zerocheck sharing its cores with
-the wiring GKR, and the opening's block statistics and merged sumcheck,
-which grow with the committed columns (703 against 92).
+The rounds agreed to within 4 ms (pure 459–473, bus 509–512), so the bus
+costs 1.11× pure BLAKE3. Best online+prove is 523 ms, about 1,910
+signatures/s. What is left is the witness (+9), the zerocheck sharing its
+cores with the wiring GKR (+23), and the opening (+18), whose block
+statistics (20 against 2) and merged sumcheck (27 against 11) grow with the
+committed columns (703 against 92).
 
 ## 4. Questions for review
 
