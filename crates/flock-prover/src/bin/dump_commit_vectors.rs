@@ -91,7 +91,7 @@ fn main() -> Result<()> {
     assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
 
     let (commitment, prover_data) = commit(&z_packed, &params);
-    let codeword = &prover_data.codeword;
+    let codeword = &*prover_data.codeword;
     // The commitment now carries a CAP LAYER instead of a single root; the
     // tree root is the depth-0 cap, which is what the CUDA Merkle kernel
     // reproduces.

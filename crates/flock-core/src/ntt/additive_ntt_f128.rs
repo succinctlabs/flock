@@ -154,6 +154,10 @@ pub struct DeepPassHook<'a> {
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
     evals: Vec<Vec<F128>>,
+    /// Per-layer twiddle offsets, empty for an ordinary transform. A
+    /// [`Self::sub_block`] transform adds `offsets[l]` to every twiddle of
+    /// layer `l`.
+    offsets: Vec<F128>,
 }
 
 impl AdditiveNttF128 {
@@ -161,6 +165,7 @@ impl AdditiveNttF128 {
     pub fn new(basis: &[F128]) -> Self {
         Self {
             evals: generate_evals_from_subspace(basis),
+            offsets: Vec::new(),
         }
     }
 
@@ -185,7 +190,36 @@ impl AdditiveNttF128 {
     /// which is "absorbed" into the butterfly and not in the twiddle.)
     pub fn twiddle(&self, layer: usize, block: usize) -> F128 {
         let v = &self.evals[self.log_domain_size() - layer - 1];
-        span_get(&v[1..], block)
+        if self.offsets.is_empty() {
+            span_get(&v[1..], block)
+        } else {
+            span_get(&v[1..], block) + self.offsets[layer]
+        }
+    }
+
+    /// The transform of block `block` at layer `start_layer` of this one, as
+    /// a transform of its own: its layer `l` is layer `start_layer + l` here,
+    /// restricted to the block. Running any forward transform of the result
+    /// on the block's data (after layers `0..start_layer`) leaves exactly
+    /// what the full transform leaves there.
+    ///
+    /// A twiddle is F₂-linear in its block index, and the block's indices at
+    /// layer `start_layer + l` are `(block << l) | c`, so the sub-transform's
+    /// twiddles are this one's at `c`, using the same `evals` rows, plus a
+    /// per-layer constant: `twiddle(start_layer + l, block << l)`.
+    #[cfg_attr(
+        not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn sub_block(&self, start_layer: usize, block: usize) -> Self {
+        let d = self.log_domain_size() - start_layer;
+        assert!(block < 1usize << start_layer);
+        Self {
+            evals: self.evals[..d].to_vec(),
+            offsets: (0..d)
+                .map(|l| self.twiddle(start_layer + l, block << l))
+                .collect(),
+        }
     }
 
     /// Forward additive NTT in place. `data.len()` must be `2^log_d` for some
@@ -619,6 +653,82 @@ impl AdditiveNttF128 {
                 (hook.on_sub)(0, data);
             }
         }
+    }
+
+    /// Layers `0..4` of the rate-1/2 encoding of `[msg, 0]` for the tiles
+    /// `r ∈ [r0, r1)` only. `msg` is the message (`2^(log_d−1)` positions ×
+    /// `num_ntts` lanes); `out` points at the full codeword, of which this
+    /// writes positions `(e << s) + r` for `e ∈ 0..16`, `s = log_d − 4`.
+    /// Layer 0 pairs each message position with the zero half, so it is a
+    /// copy into both halves; layers 1..4 are one fused pass per half.
+    /// `twiddles` is the flat breadth-first table (layer `l`, block `b` at
+    /// `2^l − 1 + b`).
+    ///
+    /// The CPU's share of the hybrid Metal commit's first pass.
+    ///
+    /// # Safety
+    /// `out` must be valid for writes of the whole codeword, and no one else
+    /// may access the positions of tiles `[r0, r1)` during the call.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) unsafe fn first_pass_from_message_tiles(
+        out: *mut F128,
+        msg: &[F128],
+        num_ntts: usize,
+        log_d: usize,
+        r0: usize,
+        r1: usize,
+        twiddles: &[F128],
+    ) {
+        #[derive(Clone, Copy)]
+        struct Out(*mut F128);
+        // SAFETY: each tile writes its own 16 positions.
+        unsafe impl Send for Out {}
+        unsafe impl Sync for Out {}
+        impl Out {
+            // A method, so the closure captures the (Send) wrapper.
+            fn get(self) -> *mut F128 {
+                self.0
+            }
+        }
+        assert!(log_d >= 4 && r1 <= 1usize << (log_d - 4));
+        assert_eq!(msg.len(), num_ntts << (log_d - 1));
+        let s = log_d - 4;
+        let tw = |layer: usize, abs: usize| twiddles[(1usize << layer) - 1 + abs];
+        let half_tw = |b1: usize| {
+            (
+                tw(1, b1),
+                [tw(2, 2 * b1), tw(2, 2 * b1 + 1)],
+                [
+                    tw(3, 4 * b1),
+                    tw(3, 4 * b1 + 1),
+                    tw(3, 4 * b1 + 2),
+                    tw(3, 4 * b1 + 3),
+                ],
+            )
+        };
+        let tws = [half_tw(0), half_tw(1)];
+        let out = Out(out);
+        (r0..r1).into_par_iter().with_min_len(64).for_each(|r| {
+            for (b1, (t0, t1, t2)) in tws.iter().enumerate() {
+                // SAFETY: the 8 rows of this tile and half are disjoint
+                // `num_ntts`-element ranges no other task touches.
+                let mut rows: [&mut [F128]; 8] = core::array::from_fn(|k| unsafe {
+                    core::slice::from_raw_parts_mut(
+                        out.get().add((((b1 * 8 + k) << s) + r) * num_ntts),
+                        num_ntts,
+                    )
+                });
+                for (k, row) in rows.iter_mut().enumerate() {
+                    let at = ((k << s) + r) * num_ntts;
+                    row.copy_from_slice(&msg[at..at + num_ntts]);
+                }
+                butterfly_fused_3layer(rows, *t0, t1, t2);
+            }
+        });
     }
 
     /// Scalar reference for the interleaved forward NTT.
@@ -1756,6 +1866,46 @@ fn ceil_log2(n: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// A layer-4 block transformed by its [`AdditiveNttF128::sub_block`]
+    /// view, with the tuned interleaved path, equals the full transform on
+    /// that block; and the tile-split first pass equals layers 0..4.
+    #[test]
+    fn sub_block_transforms_match_the_full_transform() {
+        let mut rng = crate::test_rng::Rng::new(41);
+        for (log_d, lanes) in [(10usize, 1usize), (12, 5), (12, 64), (13, 46)] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let msg: Vec<F128> = (0..lanes << (log_d - 1)).map(|_| rng.f128()).collect();
+            let mut full = [msg.clone(), msg.clone()].concat();
+            ntt.forward_transform_interleaved_from_layer(&mut full, lanes, 1);
+            let twiddles: Vec<F128> = (0..log_d)
+                .flat_map(|l| (0..1usize << l).map(move |b| (l, b)))
+                .map(|(l, b)| ntt.twiddle(l, b))
+                .collect();
+            let mut split = vec![F128::ZERO; 2 * msg.len()];
+            let tiles = 1usize << (log_d - 4);
+            for (r0, r1) in [(0, tiles / 3), (tiles / 3, tiles)] {
+                // SAFETY: `split` holds the whole codeword; one call at a time.
+                unsafe {
+                    AdditiveNttF128::first_pass_from_message_tiles(
+                        split.as_mut_ptr(),
+                        &msg,
+                        lanes,
+                        log_d,
+                        r0,
+                        r1,
+                        &twiddles,
+                    );
+                }
+            }
+            let block = lanes << (log_d - 4);
+            for (b, chunk) in split.chunks_exact_mut(block).enumerate() {
+                ntt.sub_block(4, b)
+                    .forward_transform_interleaved_live_from_layer(chunk, lanes, lanes, 0);
+            }
+            assert!(split == full, "2^{log_d} x {lanes}");
+        }
+    }
+
     use crate::{
         ntt::additive_ntt_f128::{AdditiveNttF128, F128, log2_pow2, replicate_interleaved},
         test_rng::Rng,

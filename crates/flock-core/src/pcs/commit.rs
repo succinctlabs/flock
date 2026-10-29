@@ -20,7 +20,7 @@ use std::{env::var_os, mem::take, ptr::write_bytes, thread::scope};
 use merkle::{cap_layer, merkle_tree};
 use rayon::{
     current_num_threads,
-    prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut},
+    prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut},
 };
 use serde::{Deserialize, Serialize};
 
@@ -289,15 +289,112 @@ pub struct Commitment {
 /// avoids ~4 GB of duplication at large `m`, dropping peak commit memory by
 /// a factor of ~1.5 (e.g. at m=35: 13 GB → 9 GB).
 pub struct ProverData {
-    pub codeword: Vec<F128>,
-    pub merkle_tree: Vec<Hash>,
+    pub codeword: CodewordBuf,
+    pub merkle_tree: MerkleTreeBuf,
 }
 
 // Recycle the codeword buffer (the prover's largest single allocation —
-// 128 MB at m = 29) through the scratch pool instead of unmapping it.
+// 128 MB at m = 29) through the scratch pool instead of unmapping it. A GPU
+// commit's buffers go back to the GPU when both views drop.
 impl Drop for ProverData {
     fn drop(&mut self) {
-        give_f128(take(&mut self.codeword));
+        // Irrefutable in builds without Metal, where `GpuCodeword` is empty.
+        #[allow(irrefutable_let_patterns)]
+        if let CodewordBuf::Cpu(v) = take(&mut self.codeword) {
+            give_f128(v);
+        }
+    }
+}
+
+/// The level-0 codeword: a vector from the CPU commit, or a view of the
+/// GPU's shared buffer after a Metal commit ([`crate::gpu_commit`]). Derefs
+/// to `[F128]` either way.
+pub enum CodewordBuf {
+    Cpu(Vec<F128>),
+    Gpu(crate::gpu_commit::GpuCodeword),
+}
+
+/// The level-0 Merkle tree, like [`CodewordBuf`].
+pub enum MerkleTreeBuf {
+    Cpu(Vec<Hash>),
+    Gpu(crate::gpu_commit::GpuMerkleTree),
+}
+
+impl Default for CodewordBuf {
+    fn default() -> Self {
+        Self::Cpu(Vec::new())
+    }
+}
+
+impl core::ops::Deref for CodewordBuf {
+    type Target = [F128];
+    fn deref(&self) -> &[F128] {
+        match self {
+            Self::Cpu(v) => v,
+            Self::Gpu(g) => g,
+        }
+    }
+}
+
+impl core::ops::Deref for MerkleTreeBuf {
+    type Target = [Hash];
+    fn deref(&self) -> &[Hash] {
+        match self {
+            Self::Cpu(v) => v,
+            Self::Gpu(g) => g,
+        }
+    }
+}
+
+impl From<Vec<F128>> for CodewordBuf {
+    fn from(v: Vec<F128>) -> Self {
+        Self::Cpu(v)
+    }
+}
+
+impl From<Vec<Hash>> for MerkleTreeBuf {
+    fn from(v: Vec<Hash>) -> Self {
+        Self::Cpu(v)
+    }
+}
+
+impl core::fmt::Debug for CodewordBuf {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CodewordBuf")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for MerkleTreeBuf {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MerkleTreeBuf")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl PartialEq for CodewordBuf {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Vec<F128>> for CodewordBuf {
+    fn eq(&self, other: &Vec<F128>) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq for MerkleTreeBuf {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Vec<Hash>> for MerkleTreeBuf {
+    fn eq(&self, other: &Vec<Hash>) -> bool {
+        **self == **other
     }
 }
 
@@ -334,6 +431,13 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     // `z_packed` into the lower half, and zero-fill JUST the upper half (the
     // RS-encoding zero coefficients that the NTT's first-layer butterfly will
     // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
+    if let Some(done) = crate::gpu_commit::try_commit(
+        params,
+        |msg| copy_message(msg, z_packed),
+        |msg| cpu_commit_from_message(msg, params),
+    ) {
+        return gpu_commit_result(done, params);
+    }
     let codeword = take_f128(codeword_len);
     commit_into(z_packed, params, codeword)
 }
@@ -359,11 +463,72 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
+    if let Some(done) = crate::gpu_commit::try_commit(
+        params,
+        |msg| copy_message(msg, z_packed),
+        |msg| cpu_commit_from_message(msg, params),
+    ) {
+        give_f128(codeword);
+        return gpu_commit_result(done, params);
+    }
     if leaf_pipeline_enabled(params) {
         return commit_into_pipelined(z_packed, params, codeword);
     }
     let codeword = commit_encode_into(z_packed, params, codeword);
     commit_merkle(codeword, params)
+}
+
+/// Parallel copy of the interleaved message into the GPU's message buffer.
+fn copy_message(dst: &mut [F128], src: &[F128]) {
+    const CHUNK: usize = 1 << 16;
+    dst.par_chunks_mut(CHUNK)
+        .zip(src.par_chunks(CHUNK))
+        .for_each(|(d, s)| d.copy_from_slice(s));
+}
+
+/// The CPU commit of an interleaved message (`msg[p·t + l]`, `t =
+/// num_ntts`): the replicate fill, the NTT from layer `log_inv_rate`, and the
+/// tree. The GPU commit's reference on the first commit of a shape, and its
+/// fallback.
+fn cpu_commit_from_message(msg: &[F128], params: &PcsParams) -> (Vec<F128>, Vec<Hash>) {
+    let mut codeword = take_f128(params.n_positions() * params.num_ntts());
+    replicate_message_fill(&mut codeword, msg);
+    let codeword = commit_encode_finish(codeword, params.num_ntts(), params);
+    let bytes: &[u8] = unsafe {
+        from_raw_parts(
+            codeword.as_ptr() as *const u8,
+            codeword.len() * size_of::<F128>(),
+        )
+    };
+    let tree = merkle_tree(bytes, params.n_leaves(), params.merkle_hash);
+    (codeword, tree)
+}
+
+/// Commitment and prover data from a commit the GPU took.
+fn gpu_commit_result(
+    done: crate::gpu_commit::GpuCommit,
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
+    let (codeword, merkle_tree) = match done {
+        crate::gpu_commit::GpuCommit::Gpu(c, t) => (CodewordBuf::Gpu(c), MerkleTreeBuf::Gpu(t)),
+        crate::gpu_commit::GpuCommit::Cpu(c, t) => (c.into(), t.into()),
+    };
+    let cap = cap_layer(
+        &merkle_tree,
+        params.n_leaves(),
+        params.level_zero_cap_depth(),
+    )
+    .to_vec();
+    (
+        Commitment {
+            cap,
+            params: params.clone(),
+        },
+        ProverData {
+            codeword,
+            merkle_tree,
+        },
+    )
 }
 
 /// Stage 1 of the staged commit: replicate-fill + NTT, returning the encoded
@@ -669,8 +834,8 @@ fn pipelined_commit(
             params: params.clone(),
         },
         ProverData {
-            codeword,
-            merkle_tree,
+            codeword: codeword.into(),
+            merkle_tree: merkle_tree.into(),
         },
     )
 }
@@ -763,6 +928,15 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
         "lanes >= num_lanes must be identically zero"
     );
     let _ = lanes;
+    // Metal: the transpose fills the GPU's message buffer, which the GPU
+    // encodes and hashes (all `t` lanes; dead ones are zero either way).
+    if let Some(done) = crate::gpu_commit::try_commit(
+        params,
+        |msg| replicate_lane_major_fill(msg, q, t, d),
+        |msg| cpu_commit_from_message(msg, params),
+    ) {
+        return gpu_commit_result(done, params);
+    }
     // THE DEAD-LANE NTT SKIP: trailing all-zero lanes UNDER the committed
     // count — a pinned lane count (the envelope's `lanes*`) covering members
     // whose content needs fewer — are fixed points of every butterfly, so
@@ -999,8 +1173,8 @@ pub fn commit_merkle(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, Pr
             params: params.clone(),
         },
         ProverData {
-            codeword,
-            merkle_tree,
+            codeword: codeword.into(),
+            merkle_tree: merkle_tree.into(),
         },
     )
 }
@@ -1623,7 +1797,7 @@ mod tests {
         let (_, pd1) = commit(&pack(&z1), &params);
         let (_, pd2) = commit(&pack(&z2), &params);
         let (_, pd_x) = commit(&pack(&z_xor), &params);
-        for (i, (&c1, &c2)) in pd1.codeword.iter().zip(&pd2.codeword).enumerate() {
+        for (i, (&c1, &c2)) in pd1.codeword.iter().zip(pd2.codeword.iter()).enumerate() {
             assert_eq!(c1 + c2, pd_x.codeword[i], "linearity fails at i={i}");
         }
     }

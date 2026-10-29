@@ -26,6 +26,13 @@ mul-count = ["flock-field/mul-count"]
 # flock-prover enables it for development targets. Never use it for real proofs.
 unsound-challenger = ["flock-transcript/unsound-challenger"]
 
+# Run the ranked PCS commit (RS encoding and the BLAKE3 Merkle tree) on the
+# Apple GPU through Metal, ported from the flock-challenge tree. Compiled only
+# on macOS/aarch64; elsewhere the feature builds the CPU path unchanged. No
+# crate dependency: Metal and libobjc are loaded at runtime. With the feature
+# on, `FLOCK_METAL=0` keeps every commit on the CPU (same-binary A/B).
+metal = []
+
 [dependencies]
 flock-field = { workspace = true }
 flock-merkle = { workspace = true }
