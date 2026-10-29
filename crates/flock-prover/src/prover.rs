@@ -1447,12 +1447,19 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
         Some(v) => (v, Some(z_packed)),
         None => (z_packed, None),
     };
+    // The C claim is `z` with the zeroed words masked out (C = diag(mask)).
+    let zeroed = union.zeroed_columns();
+    let zeroed_refs: Vec<&[usize]> = match z_claims.len() {
+        0 => Vec::new(),
+        _ => vec![&[], &zeroed],
+    };
     let pcs_open = open_batch_merged(
         open_witness,
         padded_owner.as_deref(),
         &prover_data,
         &commitment,
         &x_refs,
+        &zeroed_refs,
         &pre,
         &banks,
         &packed_direct,

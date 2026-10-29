@@ -110,6 +110,9 @@ pub struct BooleanGate {
     /// How [`Self::pack_into`] writes a row group eight rows at a time, once
     /// worked out; `None` if a kernel's result feeds the walk.
     batched: Arc<OnceLock<Option<Batched>>>,
+    /// Whether the table drops the words whose rows are all `x·1 = x`
+    /// ([`Self::with_zeroed_identity_words`]).
+    zero_identity_words: bool,
 }
 
 /// The operations left to kernels, and the walk without them.
@@ -286,7 +289,17 @@ impl BooleanGate {
             native: None,
             kernels: None,
             batched: Arc::default(),
+            zero_identity_words: false,
         })
+    }
+
+    /// Drop the words whose 128 rows are all `x·1 = x` from the boolean
+    /// PIOP ([`TableType::with_zeroed_identity_words`]): the zerocheck skips
+    /// them and the C claim masks them out. Same relation, a different
+    /// registry digest.
+    pub fn with_zeroed_identity_words(mut self) -> Self {
+        self.zero_identity_words = true;
+        self
     }
 
     /// Evaluate the outputs with `native` in the online phase instead of the
@@ -1343,7 +1356,12 @@ impl GateType for BooleanGate {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        TableType::from_block_r1cs(&self.r1cs).with_io_schema(self.io_schema.clone())
+        let table = TableType::from_block_r1cs(&self.r1cs).with_io_schema(self.io_schema.clone());
+        if self.zero_identity_words {
+            table.with_zeroed_identity_words()
+        } else {
+            table
+        }
     }
 
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {

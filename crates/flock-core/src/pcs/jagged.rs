@@ -628,6 +628,7 @@ pub fn assist_boundaries(params: &JaggedParams) -> Vec<(u64, u64, u32)> {
 /// sharing the same `(t_{y-1}, t_y)` pair — zero-height columns, including the
 /// zero-padded tail — collapsed into one term of summed weight `Σ eq(z_col, y)`.
 /// Pure regrouping of identical summands: transcript-invariant.
+#[cfg(test)]
 fn assist_columns(params: &JaggedParams, z_col: &[F128]) -> Vec<(F128, u64, u64)> {
     assist_columns_at(&assist_boundaries(params), z_col)
 }
@@ -1537,6 +1538,8 @@ pub(crate) enum MergedWeightClaim<'a> {
         z_row: &'a [F128],
         z_col: &'a [F128],
         table: &'a [F128],
+        /// Columns whose weight is zero ([`FrobeniusClaim::zeroed_cols`]).
+        zeroed_cols: &'a [usize],
     },
     /// A GROUP of γ-scaled (F128-linear) packed-direct claims sharing one
     /// row point: `Σᵢ γᵢ·eq_rowᵢ(row)·eq_colᵢ(col) =
@@ -1600,9 +1603,10 @@ pub(crate) fn build_merged_weight_and_prime(
                 z_row,
                 z_col,
                 table,
+                zeroed_cols,
             } => (
                 build_eq_table(z_row),
-                ColSide::Baked(bake(&build_eq_table(z_col), table)),
+                ColSide::Baked(bake(&masked_eq(z_col, zeroed_cols), table)),
             ),
             MergedWeightClaim::Scalar { z_row, cols } => {
                 (build_eq_table(z_row), ColSide::Combined(cols))
@@ -1738,6 +1742,42 @@ pub struct FrobeniusClaim<'a> {
     pub z_row: &'a [F128],
     pub z_col: &'a [F128],
     pub coeffs: &'a [F128],
+    /// Columns, ascending, where the claim's weight is zero: its column side
+    /// is `eq(z_col, ·)` with these entries cleared ([`masked_eq`]). Empty
+    /// for a plain evaluation claim.
+    pub zeroed_cols: &'a [usize],
+}
+
+impl FrobeniusClaim<'_> {
+    /// The claim's column weights over the `2^k` columns.
+    fn eq_cols(&self) -> Vec<F128> {
+        masked_eq(self.z_col, self.zeroed_cols)
+    }
+}
+
+/// `eq(z_col, ·)` over the `2^|z_col|` columns with the `zeroed` entries
+/// cleared: the column side of a claim on `z` with those columns masked out
+/// (the union's C claim, `C = diag(mask)`). A 0/1 mask commutes with
+/// Frobenius, so the twist `j` of the masked weight is the masked twist.
+pub(crate) fn masked_eq(z_col: &[F128], zeroed: &[usize]) -> Vec<F128> {
+    let mut eq = build_eq_table(z_col);
+    for &y in zeroed {
+        eq[y] = F128::ZERO;
+    }
+    eq
+}
+
+/// [`assist_columns_at`] for a claim whose `zeroed` columns are masked out.
+fn masked_columns_at(
+    bounds: &[(u64, u64, u32)],
+    z_col: &[F128],
+    zeroed: &[usize],
+) -> Vec<(F128, u64, u64)> {
+    if zeroed.is_empty() {
+        assist_columns_at(bounds, z_col)
+    } else {
+        weights_columns_at(bounds, &masked_eq(z_col, zeroed))
+    }
 }
 
 /// A GROUP of γ-scaled (F128-linear) packed-direct claims sharing one row
@@ -1801,7 +1841,7 @@ fn frobenius_statements(
     let m = params.m;
     let sparse = assist_sparse_transitions();
     enum SpecCols<'b> {
-        Point(Vec<F128>),
+        Point(Vec<F128>, &'b [usize]),
         Weights(&'b [F128]),
     }
     let mut specs: Vec<(Vec<F128>, SpecCols<'_>, F128)> = Vec::new();
@@ -1811,7 +1851,11 @@ fn frobenius_statements(
         let mut zc = claim.z_col.to_vec();
         for &c in claim.coeffs.iter() {
             if !c.is_zero() {
-                specs.push((zr.clone(), SpecCols::Point(zc.clone()), c));
+                specs.push((
+                    zr.clone(),
+                    SpecCols::Point(zc.clone(), claim.zeroed_cols),
+                    c,
+                ));
             }
             for x in zr.iter_mut() {
                 *x = *x * *x;
@@ -1851,7 +1895,7 @@ fn frobenius_statements(
             let mut cols: Vec<(F128, u64, u64)> = Vec::new();
             for (i, (zc, c)) in members.iter().enumerate() {
                 let mut cs = match zc {
-                    SpecCols::Point(zc) => assist_columns_at(bounds, zc),
+                    SpecCols::Point(zc, zeroed) => masked_columns_at(bounds, zc, zeroed),
                     SpecCols::Weights(w) => weights_columns_at(bounds, w),
                 };
                 for (w, _, _) in cs.iter_mut() {
@@ -2635,7 +2679,8 @@ fn multipoint_values(
     claims
         .iter()
         .map(|claim| {
-            let cols = assist_columns(params, claim.z_col);
+            let cols =
+                masked_columns_at(&assist_boundaries(params), claim.z_col, claim.zeroed_cols);
             (0..128usize)
                 .into_par_iter()
                 .map(|j| {
@@ -3055,7 +3100,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
                 .iter()
                 .enumerate()
                 .map(|(i, c)| {
-                    let eq_c = build_eq_table(c.z_col);
+                    let eq_c = c.eq_cols();
                     used.iter().map(|&y| gpow[128 * i] * eq_c[y]).collect()
                 })
                 .collect();
@@ -3095,7 +3140,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
             msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
             pairs.push(Pair::LazyRs(lz));
         } else {
-            let eq_cs: Vec<Vec<F128>> = claims.iter().map(|c| build_eq_table(c.z_col)).collect();
+            let eq_cs: Vec<Vec<F128>> = claims.iter().map(FrobeniusClaim::eq_cols).collect();
             let sides: Vec<(F128, Vec<F128>, &[F128])> = claims
                 .iter()
                 .zip(&eq_cs)
@@ -3333,6 +3378,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
             z_row: cl.z_row,
             z_col: cl.z_col,
             coeffs: co,
+            zeroed_cols: cl.zeroed_cols,
         })
         .collect();
     let anchor_groups: Vec<(ScalarGroupClaim<'_>, F128)> = groups
@@ -4199,7 +4245,7 @@ impl LazyRsPair {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let eq_c = build_eq_table(c.z_col);
+                let eq_c = c.eq_cols();
                 // Same grouping as the materialized fill's `w = scale·cols[y]`.
                 let cols = eq_c.iter().map(|&e| gpow[128 * i] * e).collect();
                 (cols, build_eq_table(c.z_row))
@@ -4600,6 +4646,7 @@ fn verify_multipoint_twisted_core<C: Challenger>(
             z_row: cl.z_row,
             z_col: cl.z_col,
             coeffs: co,
+            zeroed_cols: cl.zeroed_cols,
         })
         .collect();
     let anchor_groups: Vec<(ScalarGroupClaim<'_>, F128)> = groups
@@ -4966,6 +5013,7 @@ mod tests {
                     z_row: &c.0,
                     z_col: &c.1,
                     coeffs: &c.3,
+                    zeroed_cols: &[],
                 })
                 .collect();
             let fgroups = [(
@@ -5075,11 +5123,13 @@ mod tests {
                 z_row: &z1r,
                 z_col: &z1c,
                 coeffs: &c1,
+                zeroed_cols: &[],
             },
             FrobeniusClaim {
                 z_row: &z2r,
                 z_col: &z2c,
                 coeffs: &c2,
+                zeroed_cols: &[],
             },
         ];
         let groups = [
@@ -5179,6 +5229,7 @@ mod tests {
             z_row: &z_row,
             z_col: &z_col,
             coeffs: &coeffs,
+            zeroed_cols: &[],
         }];
         let groups = [ScalarGroupClaim {
             z_row: &group_row,
@@ -5324,6 +5375,7 @@ mod tests {
             z_row: &z1r,
             z_col: &z1c,
             coeffs: &c1,
+            zeroed_cols: &[],
         }];
         let groups = [
             ScalarGroupClaim {
@@ -5453,11 +5505,13 @@ mod tests {
                         z_row: &z1r,
                         z_col: &z1c,
                         coeffs: &c1,
+                        zeroed_cols: &[],
                     },
                     FrobeniusClaim {
                         z_row: &z2r,
                         z_col: &z2c,
                         coeffs: &c2,
+                        zeroed_cols: &[],
                     },
                 ];
                 let groups_all = [ScalarGroupClaim {
@@ -5545,11 +5599,13 @@ mod tests {
                 z_row: &z1r,
                 z_col: &z1c,
                 coeffs: &c1,
+                zeroed_cols: &[],
             },
             FrobeniusClaim {
                 z_row: &z2r,
                 z_col: &z2c,
                 coeffs: &c2,
+                zeroed_cols: &[],
             },
         ];
         let groups = [

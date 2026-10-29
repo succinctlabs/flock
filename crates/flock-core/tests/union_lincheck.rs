@@ -146,6 +146,7 @@ fn table_type(slot: &SlotData) -> TableType {
         const_pin: slot.pin,
         class: TableClass::Boolean,
         io_schema: Vec::new(),
+        zeroed_word_cols: Vec::new(),
     }
 }
 

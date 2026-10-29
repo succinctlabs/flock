@@ -72,7 +72,7 @@ use crate::{
         column_sumcheck_prove, inner_product, partial_fold_packed_z_rows_best,
     },
     matrix_fold::{MatrixClaim, Weight},
-    schedule::Registry,
+    schedule::{Registry, TableType},
     union::UnionInstance,
     zerocheck::K_SKIP,
 };
@@ -256,6 +256,18 @@ pub fn union_bitbank_fold(
     z_vec
 }
 
+/// Type `ty`'s quirky row-eq table at `(z_skip, x_inner)` with the rows of
+/// its zeroed words ([`TableType::zeroed_word_cols`]) cleared: folding it
+/// through the type's circuit gives the marginals of `A_0`/`B_0` without
+/// those rows, the matrices the zerocheck's `a`/`b` claims are about.
+fn type_eq_inner(ty: &TableType, skip_weights: &[F128], x_inner: &[F128]) -> Vec<F128> {
+    let mut eq = build_quirky_eq_table_from_weights(skip_weights, x_inner);
+    for &w in &ty.zeroed_word_cols {
+        eq[128 * w..128 * (w + 1)].fill(F128::ZERO);
+    }
+    eq
+}
+
 pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     union: &UnionInstance<'_>,
     slots: &[UnionLincheckSlot<'_>],
@@ -345,7 +357,10 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         .iter()
         .enumerate()
         .map(|(t, slot_in)| {
-            let same = |&u: &usize| std::ptr::addr_eq(slots[u].circuit, slot_in.circuit);
+            let same = |&u: &usize| {
+                std::ptr::addr_eq(slots[u].circuit, slot_in.circuit)
+                    && types[u].zeroed_word_cols == types[t].zeroed_word_cols
+            };
             distinct.iter().position(same).unwrap_or_else(|| {
                 distinct.push(t);
                 distinct.len() - 1
@@ -356,7 +371,8 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         .into_par_iter()
         .map(|t| {
             let inner = types[t].k_log - k_skip;
-            let eq_inner = build_quirky_eq_table_from_weights(
+            let eq_inner = type_eq_inner(
+                &types[t],
                 &x_ab.z_skip.weights(k_skip),
                 &x_ab.x_inner_rest[..inner],
             );
@@ -548,6 +564,15 @@ impl MatrixAssertion {
     /// would name a different polynomial in every proof. These name the
     /// static matrices, and fold forever.
     pub fn claims(&self, registry: &Registry) -> Vec<(MatrixClaim, MatrixClaim)> {
+        // A claim's row weight is a plain eq; a type with zeroed words folds
+        // a masked one ([`type_eq_inner`]), which accumulation cannot carry.
+        assert!(
+            registry
+                .boolean_types()
+                .iter()
+                .all(|ty| ty.zeroed_word_cols.is_empty()),
+            "accumulating the lincheck of a type with zeroed words is not supported"
+        );
         let k_skip = K_SKIP;
         registry
             .boolean_types()
@@ -639,7 +664,8 @@ impl MatrixAssertion {
             .zip(circuits)
             .map(|((ty, slot), circuit)| {
                 let inner = ty.k_log - k_skip;
-                let eq_inner = build_quirky_eq_table_from_weights(
+                let eq_inner = type_eq_inner(
+                    ty,
                     &self.z_skip.weights(k_skip),
                     &self.x_inner_rest[..inner],
                 );
@@ -1015,6 +1041,7 @@ mod tests {
             const_pin: None,
             class: TableClass::Boolean,
             io_schema: Vec::new(),
+            zeroed_word_cols: Vec::new(),
         }
     }
 

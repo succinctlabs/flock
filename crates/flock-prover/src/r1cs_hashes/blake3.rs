@@ -1604,6 +1604,17 @@ impl Blake3Setup {
         self
     }
 
+    /// Drop the input words' `x·1 = x` rows (cv, m and the params word)
+    /// from the boolean PIOP ([`TableType::with_zeroed_identity_words`]):
+    /// the zerocheck skips them and the C claim masks them out.
+    pub fn with_zeroed_identity_words(mut self) -> Self {
+        let table = crate::schedule::TableType::from_block_r1cs(&self.r1cs);
+        self.registry = Registry::new(vec![table.with_zeroed_identity_words()], self.registry.nu());
+        // Warm the digest, as the constructor does.
+        let _ = self.registry.digest();
+        self
+    }
+
     fn union(&self) -> UnionInstance<'_> {
         let mut union = UnionInstance::new(&self.registry, vec![self.n_blocks]);
         if self.full_height {
@@ -2769,6 +2780,57 @@ mod tests {
         let mut ch_p2 = FsChallenger::new(b"flock-union-ag-part");
         let (proof2, _, _) = setup.prove_fast_union_ag(&blocks, &mut ch_p2);
         assert_eq!(proof, proof2, "re-prove over pooled-dirty buffers");
+    }
+
+    /// The input words' `x·1 = x` rows dropped from the boolean PIOP: prove
+    /// → verify through the block-first opening (full height) and the
+    /// materialized weight (jagged), and the proof does not verify for the
+    /// registry that keeps the rows.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn zeroed_identity_words_roundtrip() {
+        let n = 200;
+        let mut rng = Rng::new(0x2E80_1D5);
+        let blocks: Vec<Compression> = (0..n)
+            .map(|_| {
+                let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64u32, 11u32)
+            })
+            .collect();
+        let inputs: Vec<usize> = io_schema()
+            .iter()
+            .filter(|w| w.dir == IoDirection::In)
+            .map(|w| w.word_col)
+            .collect();
+        for full_height in [false, true] {
+            let setup = |zeroed: bool| {
+                let mut s = Blake3Setup::new(n);
+                if zeroed {
+                    s = s.with_zeroed_identity_words();
+                }
+                if full_height {
+                    s = s.with_full_height_commit();
+                }
+                s
+            };
+            let zeroed = setup(true);
+            assert_eq!(zeroed.registry.boolean_types()[0].zeroed_word_cols, inputs);
+            let mut ch = FsChallenger::new(b"flock-zeroed-words");
+            let (proof, commitment, claim_p) = zeroed.prove_fast_union_ag(&blocks, &mut ch);
+            let mut ch = FsChallenger::new(b"flock-zeroed-words");
+            let claim_v = zeroed
+                .verify_union_ag(&commitment, &proof, &mut ch)
+                .unwrap_or_else(|e| panic!("zeroed words rejected (full {full_height}): {e:?}"));
+            assert_eq!(claim_p, claim_v);
+            let mut ch = FsChallenger::new(b"flock-zeroed-words");
+            assert!(
+                setup(false)
+                    .verify_union_ag(&commitment, &proof, &mut ch)
+                    .is_err(),
+                "a zeroed-words proof verified for the plain registry"
+            );
+        }
     }
 
     #[test]

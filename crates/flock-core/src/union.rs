@@ -355,6 +355,26 @@ impl<'r> UnionInstance<'r> {
         heights
     }
 
+    /// The chunk-columns of every boolean type's zeroed words
+    /// ([`TableType::zeroed_word_cols`]), ascending, in the column numbering
+    /// of [`Self::jagged_heights`]: where the C claim's opening weight is
+    /// zero (`C = diag(mask)`). Empty when no type zeroes a word.
+    pub fn zeroed_columns(&self) -> Vec<usize> {
+        let nu = self.n_log();
+        let registry = self.registry();
+        let mut cols: Vec<usize> = registry
+            .boolean_types()
+            .iter()
+            .zip(registry.slots())
+            .flat_map(|(ty, slot)| {
+                let base = slot.offset >> (7 + nu);
+                ty.zeroed_word_cols.iter().map(move |&w| base + w)
+            })
+            .collect();
+        cols.sort_unstable();
+        cols
+    }
+
     /// Used chunk-columns of a type: the leading `ceil(useful_bits/128)`
     /// columns carry data; the rest are dropped from the committed stack.
     fn used_cols(&self, ty: &TableType) -> usize {
@@ -1188,6 +1208,7 @@ mod tests {
             const_pin: None,
             class: TableClass::Boolean,
             io_schema: Vec::new(),
+            zeroed_word_cols: Vec::new(),
         }
     }
 
