@@ -166,7 +166,7 @@ impl fmt::Display for WalkError {
 
 impl std::error::Error for WalkError {}
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
     Zero,
     Value(usize),

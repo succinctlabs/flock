@@ -89,6 +89,15 @@ pub(crate) struct SlicedProgram {
     checked: Vec<RowId>,
     one_position: usize,
     input_positions: Vec<usize>,
+    /// Whether anything kept reads each block position.
+    read: Vec<bool>,
+    /// Whether a walked row sits at each block position (its `A·z`, `B·z`
+    /// are written there).
+    row_at: Vec<bool>,
+    /// Per kernel site: whether anything after its kernel reads its result.
+    results_read: Vec<bool>,
+    /// Positions whose identity rows the program leaves out.
+    identity: Vec<usize>,
 }
 
 impl SlicedProgram {
@@ -101,6 +110,22 @@ impl SlicedProgram {
     /// site position other than its results, or reads a result before the
     /// site's kernel runs.
     pub(crate) fn with_kernels(plan: &WalkPlan, sites: &[KernelSite]) -> Result<Self, String> {
+        Self::compile(plan, sites, false)
+    }
+
+    /// [`Self::with_kernels`] without the identity rows: each input's
+    /// `x · 1 = x` and the constant's `1 · 1 = 1`. They cannot fail, and
+    /// their sides are the position itself (`A·z`) and the constant
+    /// (`B·z`), so the caller writes them ([`Self::identity_rows`]); the
+    /// walk then reads only the inputs it computes with.
+    pub(crate) fn without_identity_rows(
+        plan: &WalkPlan,
+        sites: &[KernelSite],
+    ) -> Result<Self, String> {
+        Self::compile(plan, sites, true)
+    }
+
+    fn compile(plan: &WalkPlan, sites: &[KernelSite], elide: bool) -> Result<Self, String> {
         let positions = plan.useful_bits.div_ceil(128) * 128;
         let temporaries = plan.stats.max_live_temporaries;
         let zero = positions + temporaries;
@@ -115,6 +140,8 @@ impl SlicedProgram {
         let site_of = |position: usize| sites.iter().position(|s| s.region.contains(&position));
         let mut program = Vec::with_capacity(plan.actions.len() + sites.len());
         let mut placed = vec![false; sites.len()];
+        let mut identity = Vec::new();
+        let one = Source::Value(plan.one_position);
         for action in &plan.actions {
             match action {
                 Action::Xor { output, terms } => program.push(Instr::Xor {
@@ -130,6 +157,16 @@ impl SlicedProgram {
                     result,
                     output,
                 } => {
+                    let own = Source::Value(*physical_row);
+                    let identity_row = match kind {
+                        RowKind::Input => *lhs == own && *rhs == one && *result == own,
+                        RowKind::One => *lhs == one && *rhs == one && own == one,
+                        _ => false,
+                    };
+                    if elide && identity_row && site_of(*physical_row).is_none() {
+                        identity.push(*physical_row);
+                        continue;
+                    }
                     let defines = matches!(kind, RowKind::And | RowKind::Materialize);
                     let output = output.filter(|_| defines);
                     let definitional =
@@ -194,12 +231,20 @@ impl SlicedProgram {
             .collect();
         // Nothing kept may read a site's internals, or its results early.
         let mut ran = vec![false; sites.len()];
+        let mut read = vec![false; positions];
+        let mut results_read = vec![false; sites.len()];
         for instr in &program {
             if let Instr::Kernel(site) = instr {
                 ran[*site as usize] = true;
             }
+            for read_at in instr.reads() {
+                if let Some(slot) = read.get_mut(read_at as usize) {
+                    *slot = true;
+                }
+            }
             for read in instr.reads() {
                 if let Some(site) = site_of(read as usize) {
+                    results_read[site] = true;
                     if !sites[site].results.contains(&(read as usize)) {
                         return Err(format!(
                             "position {read} inside kernel site {site} is read outside it"
@@ -211,6 +256,12 @@ impl SlicedProgram {
                         ));
                     }
                 }
+            }
+        }
+        let mut row_at = vec![false; positions];
+        for instr in &program {
+            if let Instr::Define { row, .. } | Instr::Check { row, .. } = instr {
+                row_at[*row as usize] = true;
             }
         }
         let mut code = Vec::new();
@@ -255,7 +306,34 @@ impl SlicedProgram {
             checked,
             one_position: plan.one_position,
             input_positions: plan.input_positions.clone(),
+            read,
+            row_at,
+            results_read,
+            identity,
         })
+    }
+
+    /// The identity rows left out ([`Self::without_identity_rows`]): at each
+    /// position, `A·z` is the position's value and `B·z` the constant.
+    pub(crate) fn identity_rows(&self) -> &[usize] {
+        &self.identity
+    }
+
+    /// Whether a walked row sits at block position `p`.
+    pub(crate) fn has_row_at(&self, p: usize) -> bool {
+        self.row_at.get(p).copied().unwrap_or(false)
+    }
+
+    /// Whether anything the program runs reads block position `p` (inputs
+    /// included; kernels' arguments are the caller's).
+    pub(crate) fn reads_position(&self, p: usize) -> bool {
+        self.read.get(p).copied().unwrap_or(false)
+    }
+
+    /// Whether the walk reads site `site`'s result after its kernel runs. If
+    /// not, the kernel may run after the walk instead of inside it.
+    pub(crate) fn reads_result(&self, site: usize) -> bool {
+        self.results_read[site]
     }
 
     /// Runs the program over 64 lanes. On return `z[..positions()]` holds
@@ -272,17 +350,50 @@ impl SlicedProgram {
         b_z: &mut Vec<u64>,
         kernel: &mut dyn FnMut(usize, &mut [u64]),
     ) -> Result<(), WalkError> {
+        self.run_clearing(inputs, live, z, a_z, b_z, kernel, None)
+    }
+
+    /// [`Self::run`] that zeroes only the `clear` position ranges of `z`,
+    /// `a_z` and `b_z` (buffers this program has sized before; fresh ones are
+    /// zeroed whole). Every other position keeps what the last run left
+    /// there, so the caller must read only `clear`, the inputs and what the
+    /// program writes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_clearing(
+        &self,
+        inputs: &[u64],
+        live: u64,
+        z: &mut Vec<u64>,
+        a_z: &mut Vec<u64>,
+        b_z: &mut Vec<u64>,
+        kernel: &mut dyn FnMut(usize, &mut [u64]),
+        clear: Option<&[Range<usize>]>,
+    ) -> Result<(), WalkError> {
         if inputs.len() != self.input_positions.len() {
             return Err(WalkError::InputCount {
                 expected: self.input_positions.len(),
                 actual: inputs.len(),
             });
         }
-        z.clear();
-        z.resize(self.words, 0);
-        for v in [&mut *a_z, &mut *b_z] {
-            v.clear();
-            v.resize(self.positions, 0);
+        match clear {
+            Some(clear) if z.len() == self.words && a_z.len() == self.positions => {
+                for v in [&mut *z, &mut *a_z, &mut *b_z] {
+                    for range in clear {
+                        v[range.clone()].fill(0);
+                    }
+                }
+                // Temporaries are written before they are read; the zero
+                // word is never written.
+                debug_assert_eq!(z[self.words - 1], 0);
+            }
+            _ => {
+                z.clear();
+                z.resize(self.words, 0);
+                for v in [&mut *a_z, &mut *b_z] {
+                    v.clear();
+                    v.resize(self.positions, 0);
+                }
+            }
         }
         z[self.one_position] = live;
         for (&position, &input) in self.input_positions.iter().zip(inputs) {

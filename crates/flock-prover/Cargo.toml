@@ -120,6 +120,10 @@ name = "genwitness_phase"
 harness = false
 
 [[bench]]
+name = "leanxmss_witgen"
+harness = false
+
+[[bench]]
 name = "profile_prover"
 harness = false
 

@@ -43,6 +43,43 @@ fn layout_plan_for_1000_signatures() {
     assert!(space <= 1 << 32);
 }
 
+/// Every slot of a two-signature witness packs the same, batched or not:
+/// the batched packer keeps the walk's bits on every gadget kind.
+#[test]
+fn every_slot_packs_as_the_walk() {
+    use flock_core::union::SlotWitnessDest;
+    let (statements, sigs) = signed(2, 5);
+    let circuit = XmssCircuit::new(2);
+    let witness = circuit.witness(&statements, &sigs);
+    for (id, gate) in &circuit.gadgets {
+        let rows = witness.rows::<BooleanGate>(*id);
+        let len = 1usize << (circuit.nu() + gate.k_log() - 7);
+        let pack = |batched: bool| {
+            let poison = F128::new(0xDEAD, 0xBEEF);
+            let (mut z, mut a, mut b) = (vec![poison; len], vec![poison; len], vec![poison; len]);
+            let dst = SlotWitnessDest {
+                z: &mut z,
+                a: &mut a,
+                b: &mut b,
+                elide_padding_writes: false,
+                dead_padding_unread: false,
+            };
+            let stripe = if batched {
+                gate.pack_into(rows, dst)
+            } else {
+                gate.pack_into_unbatched(rows, dst)
+            };
+            (z, a, b, stripe)
+        };
+        assert!(
+            pack(true) == pack(false),
+            "{}: {} rows",
+            gate.name(),
+            rows.len()
+        );
+    }
+}
+
 /// Two signatures prove and verify; changing any signer's message, root or
 /// `P` in the statement makes verification fail.
 #[test]

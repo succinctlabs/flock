@@ -103,7 +103,7 @@ fn chain_step_row() {
 }
 
 /// Packing with the BLAKE3 kernel writes exactly the slot the walk writes:
-/// `z`, `A·z`, `B·z` and the lincheck stripe.
+/// `z`, `A·z`, `B·z` and the lincheck stripe, batched or not.
 #[test]
 fn kernel_packing_matches_the_walk() {
     let nu = 7;
@@ -122,26 +122,34 @@ fn kernel_packing_matches_the_walk() {
         })
         .collect();
     let len = 1usize << (nu + walked.k_log() - 7);
-    for n in [1 << nu, 77, 8, 3] {
-        let pack = |gate: &BooleanGate| {
+    for n in [1 << nu, 77, 64, 61, 8, 3] {
+        let pack = |gate: &BooleanGate, batched: bool| {
             let poison = F128::new(0xDEAD, 0xBEEF);
             let (mut z, mut a, mut b) = (vec![poison; len], vec![poison; len], vec![poison; len]);
-            let stripe = gate.pack_into(
-                &all[..n],
-                SlotWitnessDest {
-                    z: &mut z,
-                    a: &mut a,
-                    b: &mut b,
-                    elide_padding_writes: false,
-                    dead_padding_unread: false,
-                },
-            );
+            let dst = SlotWitnessDest {
+                z: &mut z,
+                a: &mut a,
+                b: &mut b,
+                elide_padding_writes: false,
+                dead_padding_unread: false,
+            };
+            let stripe = if batched {
+                gate.pack_into(&all[..n], dst)
+            } else {
+                gate.pack_into_unbatched(&all[..n], dst)
+            };
             (z, a, b, stripe)
         };
-        let (want, got) = (pack(&walked), pack(&kernel));
-        assert!(want.0 == got.0, "{n} rows: z differs");
-        assert!(want.1 == got.1, "{n} rows: A·z differs");
-        assert!(want.2 == got.2, "{n} rows: B·z differs");
-        assert!(want.3 == got.3, "{n} rows: stripe differs");
+        let want = pack(&walked, false);
+        for (what, got) in [
+            ("walk, batched", pack(&walked, true)),
+            ("kernel", pack(&kernel, false)),
+            ("kernel, batched", pack(&kernel, true)),
+        ] {
+            assert!(want.0 == got.0, "{what}, {n} rows: z differs");
+            assert!(want.1 == got.1, "{what}, {n} rows: A·z differs");
+            assert!(want.2 == got.2, "{what}, {n} rows: B·z differs");
+            assert!(want.3 == got.3, "{what}, {n} rows: stripe differs");
+        }
     }
 }

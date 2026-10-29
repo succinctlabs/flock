@@ -21,10 +21,10 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{Arc, OnceLock},
 };
 
-use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use rayon::prelude::{ParallelIterator, ParallelSliceMut};
 
 use super::{
     BooleanCircuit, ColumnRole, ExpressionNode, LayoutError, LoweringMode, OperationKernel,
@@ -99,12 +99,17 @@ pub struct BooleanGate {
     /// input word, bit).
     input_bits: Vec<(u32, u8)>,
     n_in: usize,
+    /// The block word column of each wired input, in order.
+    input_cols: Vec<usize>,
     /// The block word column of each wired output, in order.
     output_cols: Vec<usize>,
     /// A direct evaluation of the outputs, if the gadget has one.
     native: Option<NativeEval>,
     /// Operations whose rows native kernels write ([`Self::with_kernel`]).
     kernels: Option<Arc<Kernels>>,
+    /// How [`Self::pack_into`] writes a row group eight rows at a time, once
+    /// worked out; `None` if a kernel's result feeds the walk.
+    batched: Arc<OnceLock<Option<Batched>>>,
 }
 
 /// The operations left to kernels, and the walk without them.
@@ -121,6 +126,58 @@ enum Cover {
     None,
     Part,
     Full,
+}
+
+/// The packer's plan for writing a 64-row group eight rows at a time: the
+/// walk fills only the words the kernels leave, then each batch of eight
+/// rows is zeroed, filled (wired inputs copied straight from the rows, the
+/// walk's words transposed in, the kernels run) and streamed out on its own,
+/// as the hand-written generators do. Needs every kernel's result to be
+/// unread by the walk, so the kernels can run after it.
+struct Batched {
+    /// The walk without its identity rows
+    /// ([`SlicedProgram::without_identity_rows`]).
+    program: SlicedProgram,
+    /// Block `u64` words holding identity rows, and which bits: there
+    /// `A·z = z` and `B·z = 1`.
+    identity: Vec<(usize, u64)>,
+    /// Per wired input word: whether the walk (or a kernel argument the
+    /// rows cannot supply directly) reads it, so its planes are needed.
+    walked_inputs: Vec<bool>,
+    /// Wired input words copied straight from the rows: (input, first block
+    /// `u64` word of its column).
+    direct: Vec<(usize, usize)>,
+    /// Block `u64` words taken from the walk's planes.
+    walked: Vec<Walked>,
+    /// Block `u64` words a kernel writes, all or part: zeroed per batch.
+    covered: Vec<usize>,
+    /// Plane ranges the walk must zero each run: the words of `walked`.
+    clear: Vec<Range<usize>>,
+    /// Per kernel site, its arguments as runs of input bits, if every
+    /// argument bit is one input bit or zero.
+    args: Vec<Option<Vec<Vec<ArgRun>>>>,
+}
+
+/// A block `u64` word the walk writes.
+#[derive(Clone, Copy)]
+struct Walked {
+    word: usize,
+    /// A kernel writes the rest of the word: the walk's bits are OR-ed in.
+    part: bool,
+    /// `z` comes from the planes too; a wired input word only needs `A·z`
+    /// and `B·z` from them (rows that check inputs sit on the inputs).
+    z: bool,
+}
+
+/// A run of kernel argument bits copied from one half of an input word:
+/// bits `from..` of it, as many as `mask` (the low bits) has, land at `to..`.
+#[derive(Clone, Copy)]
+struct ArgRun {
+    input: usize,
+    hi: bool,
+    from: u32,
+    to: u32,
+    mask: u64,
 }
 
 /// One operation call left to a kernel.
@@ -185,12 +242,14 @@ impl BooleanGate {
         };
         let mut io_schema = Vec::with_capacity(inputs.len() + outputs.len());
         let mut source = HashMap::new();
+        let mut input_cols = Vec::with_capacity(inputs.len());
         for (w, &column) in inputs.iter().enumerate() {
             if circuit.column(column).map(|c| &c.role) != Some(&ColumnRole::Input) {
                 return Err(BooleanGateError::NotAnInput(column.into()));
             }
             let (bits, col) = word(column)?;
             io_schema.push(IoWord::input(col));
+            input_cols.push(col);
             for (bit, value) in bits.into_iter().enumerate() {
                 source.insert(value, (w as u32, bit as u8));
             }
@@ -222,9 +281,11 @@ impl BooleanGate {
             io_schema,
             input_bits,
             n_in: inputs.len(),
+            input_cols,
             output_cols,
             native: None,
             kernels: None,
+            batched: Arc::default(),
         })
     }
 
@@ -358,6 +419,7 @@ impl BooleanGate {
             sites,
             words,
         }));
+        self.batched = Arc::default();
         Ok(self)
     }
 
@@ -432,8 +494,30 @@ impl BooleanGate {
     /// Rows are walked 64 at a time, bit-sliced, and 64×64 bit transposes
     /// turn the walk's planes into row words; the rows then stream out to
     /// the column runs and become the stripe, as the hand-written
-    /// generators' rows do.
+    /// generators' rows do. Unless a kernel's result feeds the walk, the
+    /// walk covers only what the kernels and the wired inputs leave
+    /// ([`Batched`]): input words are copied from the rows, kernel arguments
+    /// that are input bits are read from them, and the kernels run eight
+    /// rows at a time after the walk.
     pub fn pack_into(&self, rows: &[Box<[F128]>], dst: SlotWitnessDest<'_>) -> Vec<u8> {
+        self.pack_into_with(rows, dst, self.batched())
+    }
+
+    /// [`Self::pack_into`] as it packs when a kernel's result feeds the
+    /// walk: every group walked whole, the kernels inside the walk. Writes
+    /// the same slot; kept as the reference the batched packer is tested
+    /// against.
+    #[doc(hidden)]
+    pub fn pack_into_unbatched(&self, rows: &[Box<[F128]>], dst: SlotWitnessDest<'_>) -> Vec<u8> {
+        self.pack_into_with(rows, dst, None)
+    }
+
+    fn pack_into_with(
+        &self,
+        rows: &[Box<[F128]>],
+        dst: SlotWitnessDest<'_>,
+        batched: Option<&Batched>,
+    ) -> Vec<u8> {
         let k_log = self.r1cs.k_log;
         let k = 1usize << k_log;
         let useful = self.r1cs.useful_bits;
@@ -444,7 +528,7 @@ impl BooleanGate {
             a,
             b,
             elide_padding_writes,
-            ..
+            dead_padding_unread,
         } = dst;
         let capacity = z.len() >> (k_log - 7);
         assert!(
@@ -460,45 +544,383 @@ impl BooleanGate {
         }
         let mut stripe = take_u8((capacity / 8) * k);
         let live_groups = n.div_ceil(8);
-        let zeroed = if elide_padding_writes {
-            live_groups
-        } else {
-            capacity / 8
-        };
-        stripe
-            .par_chunks_mut(k)
-            .take(zeroed)
-            .for_each(|g| g.fill(0));
-        // Each 64-row group writes its own run of every column: rows
-        // `64g..64g + 64` of column `col` are `buf[(col << nu) + 64g..]`.
-        let mut runs: Vec<[Vec<&mut [F128]>; 3]> = (0..n.div_ceil(64))
-            .map(|_| std::array::from_fn(|_| Vec::with_capacity(w)))
-            .collect();
-        for (side, buf) in [z, a, b].into_iter().enumerate() {
-            for column in buf.chunks_mut(1 << nu).take(w) {
-                for (g, run) in column[..n].chunks_mut(64).enumerate() {
-                    runs[g][side].push(run);
-                }
-            }
+        // The groups write the live stripe; dummy groups are zero unless
+        // their writes may be elided.
+        if !elide_padding_writes {
+            stripe[live_groups * k..]
+                .par_chunks_mut(1 << 16)
+                .for_each(|c| c.fill(0));
         }
+        // Past each group's useful words the stripe is never read when the
+        // caller certifies it, and zero otherwise.
+        let stripe_tail = (!dead_padding_unread).then_some(64 * useful.div_ceil(64));
         let (program, sites, words) = match &self.kernels {
             Some(k) => (&k.program, &k.sites[..], &k.words[..]),
             None => (self.plan.sliced(), &[][..], &[][..]),
         };
-        let groups: Vec<_> = runs
-            .into_iter()
-            .zip(stripe[..live_groups * k].chunks_mut(8 * k))
-            .map(Mutex::new)
-            .collect();
+        let slot = SlotPtrs {
+            bufs: [z, a, b].map(|buf| SendPtr(buf.as_mut_ptr())),
+            stripe: SendPtr(stripe.as_mut_ptr()),
+        };
         // Groups drain on the P-cores and two E-core helpers, as the
         // hand-written generators' do.
-        run_hetero_chunks_stateful(groups.len(), SlicedScratch::default, |sc, g| {
-            let (runs, stripe) = &mut *groups[g].lock().unwrap();
+        run_hetero_chunks_stateful(n.div_ceil(64), SlicedScratch::default, |sc, g| {
             let rows = &rows[64 * g..n.min(64 * g + 64)];
-            self.pack_group(rows, sc, program, sites, words, runs, stripe);
+            // Rows `64g..` of column `col` are `buf[(col << nu) + 64g..]`;
+            // the group's stripe is its batches' `k` bytes each.
+            // SAFETY: every group takes its own rows of each of the first
+            // `w` columns (`n <= capacity` rows each, asserted above) and
+            // its own stripe bytes, all inside the buffers, once.
+            let (mut runs, stripe) = unsafe {
+                let runs: [Vec<&mut [F128]>; 3] = std::array::from_fn(|side| {
+                    (0..w)
+                        .map(|col| {
+                            std::slice::from_raw_parts_mut(
+                                slot.bufs[side].get().add((col << nu) + 64 * g),
+                                rows.len(),
+                            )
+                        })
+                        .collect()
+                });
+                let stripe = std::slice::from_raw_parts_mut(
+                    slot.stripe.get().add(8 * g * k),
+                    rows.len().div_ceil(8) * k,
+                );
+                (runs, stripe)
+            };
+            match batched {
+                Some(plan) => self.pack_group_batched(rows, sc, plan, sites, &mut runs, stripe),
+                None => self.pack_group(rows, sc, program, sites, words, &mut runs, stripe),
+            }
+            if let Some(tail) = stripe_tail {
+                for batch in stripe.chunks_mut(k) {
+                    batch[tail..].fill(0);
+                }
+            }
         });
-        drop(groups);
         stripe
+    }
+
+    /// The batched packing plan, worked out on first use.
+    fn batched(&self) -> Option<&Batched> {
+        self.batched.get_or_init(|| self.plan_batched()).as_ref()
+    }
+
+    fn plan_batched(&self) -> Option<Batched> {
+        let (sites, covers) = match &self.kernels {
+            Some(k) => (&k.sites[..], &k.words[..]),
+            None => (&[][..], &[][..]),
+        };
+        let program = SlicedProgram::without_identity_rows(
+            &self.plan,
+            &sites
+                .iter()
+                .map(|s| KernelSite {
+                    region: s.region.clone(),
+                    results: s.results.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("the program compiled with its identity rows");
+        if (0..sites.len()).any(|s| program.reads_result(s)) {
+            return None;
+        }
+        let mut identity: Vec<(usize, u64)> = Vec::new();
+        for &p in program.identity_rows() {
+            match identity.iter_mut().find(|(w, _)| *w == p / 64) {
+                Some((_, mask)) => *mask |= 1 << (p % 64),
+                None => identity.push((p / 64, 1 << (p % 64))),
+            }
+        }
+        let words = 2 * self.r1cs.useful_bits.div_ceil(128);
+        let cover = |w: usize| covers.get(w).copied().unwrap_or(Cover::None);
+        let input_at: HashMap<usize, (usize, usize)> = self
+            .input_cols
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &col)| (0..128).map(move |bit| (128 * col + bit, (i, bit))))
+            .collect();
+        let args: Vec<_> = sites
+            .iter()
+            .map(|site| arg_runs(&site.args, &input_at))
+            .collect();
+        let mut walked_inputs: Vec<bool> = self
+            .input_cols
+            .iter()
+            .map(|&col| (128 * col..128 * col + 128).any(|p| program.reads_position(p)))
+            .collect();
+        for (site, args) in sites.iter().zip(&args) {
+            if args.is_none() {
+                for &p in site.args.iter().flatten() {
+                    if let Some(&(i, _)) = input_at.get(&(p as usize)) {
+                        walked_inputs[i] = true;
+                    }
+                }
+            }
+        }
+        let mut input_word = vec![false; words];
+        let direct = self
+            .input_cols
+            .iter()
+            .enumerate()
+            .map(|(i, &col)| {
+                debug_assert!(cover(2 * col) == Cover::None && cover(2 * col + 1) == Cover::None);
+                input_word[2 * col] = true;
+                input_word[2 * col + 1] = true;
+                (i, 2 * col)
+            })
+            .collect();
+        let (mut walked, mut covered, mut clear) =
+            (Vec::new(), Vec::new(), Vec::<Range<usize>>::new());
+        for w in 0..words {
+            let c = cover(w);
+            if c != Cover::None {
+                covered.push(w);
+            }
+            let rows = (64 * w..64 * w + 64).any(|p| program.has_row_at(p));
+            if c == Cover::Full || input_word[w] && !rows {
+                continue;
+            }
+            walked.push(Walked {
+                word: w,
+                part: c == Cover::Part,
+                z: !input_word[w],
+            });
+            match clear.last_mut() {
+                Some(r) if r.end == 64 * w => r.end += 64,
+                _ => clear.push(64 * w..64 * w + 64),
+            }
+        }
+        Some(Batched {
+            program,
+            identity,
+            walked_inputs,
+            direct,
+            walked,
+            covered,
+            clear,
+            args,
+        })
+    }
+
+    /// Up to 64 rows by [`Batched`]: the walk, then eight rows at a time.
+    #[allow(clippy::too_many_arguments)]
+    fn pack_group_batched(
+        &self,
+        rows: &[Box<[F128]>],
+        sc: &mut SlicedScratch,
+        plan: &Batched,
+        sites: &[Site],
+        runs: &mut [Vec<&mut [F128]>; 3],
+        stripe: &mut [u8],
+    ) {
+        let lanes = rows.len();
+        let live = if lanes == 64 { !0 } else { (1u64 << lanes) - 1 };
+        let k = 1usize << self.r1cs.k_log;
+        let per_block = k / 64;
+        // Planes of the inputs the walk reads; the others read as zero.
+        sc.in_planes.resize(128 * self.n_in, 0);
+        for (w, _) in plan
+            .walked_inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, walked)| **walked)
+        {
+            let mut lo = [0u64; 64];
+            let mut hi = [0u64; 64];
+            for (r, row) in rows.iter().enumerate() {
+                lo[r] = row[w].lo;
+                hi[r] = row[w].hi;
+            }
+            sc.in_planes[128 * w..128 * w + 64].copy_from_slice(&transpose64(lo));
+            sc.in_planes[128 * w + 64..128 * w + 128].copy_from_slice(&transpose64(hi));
+        }
+        let SlicedScratch {
+            in_planes,
+            inputs,
+            z,
+            a,
+            b,
+            args,
+            arg_rows,
+            batch_rows,
+            walked_rows,
+            site_args,
+            ..
+        } = sc;
+        inputs.clear();
+        inputs.extend(self.input_bits.iter().map(|&(w, bit)| {
+            if plan.walked_inputs[w as usize] {
+                in_planes[128 * w as usize + bit as usize]
+            } else {
+                0
+            }
+        }));
+        site_args.resize_with(sites.len(), Vec::new);
+        // Kernel arguments the rows cannot supply are read off the planes
+        // when the walk reaches the kernel.
+        let walked = plan.program.run_clearing(
+            inputs,
+            live,
+            z,
+            a,
+            b,
+            &mut |s, z| {
+                if plan.args[s].is_some() {
+                    return;
+                }
+                let site = &sites[s];
+                let arg_words = site.args.len().div_ceil(64);
+                args.clear();
+                args.extend(
+                    site.args
+                        .iter()
+                        .map(|support| support.iter().fold(0, |acc, &p| acc ^ z[p as usize])),
+                );
+                args.resize(64 * arg_words, 0);
+                let out = &mut site_args[s];
+                out.resize(64 * arg_words, 0);
+                for c in 0..arg_words {
+                    let t = transpose64(args[64 * c..64 * c + 64].try_into().unwrap());
+                    for (r, &word) in t.iter().enumerate() {
+                        out[r * arg_words + c] = word;
+                    }
+                }
+            },
+            Some(&plan.clear),
+        );
+        if let Err(e) = walked {
+            panic!(
+                "{}: the gadget's constraints reject a row ({e:?})",
+                self.name
+            );
+        }
+        // The walked words in row form, side by side: `z`, `A·z`, `B·z`.
+        walked_rows.clear();
+        for walked in &plan.walked {
+            let w = walked.word;
+            for (side, planes) in [&*z, &*a, &*b].into_iter().enumerate() {
+                let plane: &[u64; 64] = planes[64 * w..64 * w + 64].try_into().unwrap();
+                walked_rows.push(if (side > 0 || walked.z) && plane.iter().any(|&x| x != 0) {
+                    transpose64(*plane)
+                } else {
+                    [0; 64]
+                });
+            }
+        }
+        let [rz_all, ra_all, rb_all] = batch_rows;
+        for side in [&mut *rz_all, &mut *ra_all, &mut *rb_all] {
+            side.resize(8 * per_block, [0; 8]);
+        }
+        let useful = 64 * self.r1cs.useful_bits.div_ceil(64);
+        for (batch, stripe) in stripe.chunks_mut(k).enumerate() {
+            let at = 8 * batch;
+            let rows = &rows[at..lanes.min(at + 8)];
+            let n = rows.len();
+            let window = batch * per_block..(batch + 1) * per_block;
+            let (rz, ra, rb) = (
+                &mut rz_all[window.clone()],
+                &mut ra_all[window.clone()],
+                &mut rb_all[window],
+            );
+            for side in [&mut *rz, &mut *ra, &mut *rb] {
+                for &w in &plan.covered {
+                    side[w] = [0; 8];
+                }
+            }
+            for &(input, w) in &plan.direct {
+                let half = |hi: bool| -> [u64; 8] {
+                    std::array::from_fn(|j| {
+                        rows.get(j)
+                            .map_or(0, |row| if hi { row[input].hi } else { row[input].lo })
+                    })
+                };
+                rz[w] = half(false);
+                rz[w + 1] = half(true);
+                for side in [&mut *ra, &mut *rb] {
+                    side[w] = [0; 8];
+                    side[w + 1] = [0; 8];
+                }
+            }
+            for (t, walked) in walked_rows.chunks(3).zip(&plan.walked) {
+                let (w, part) = (walked.word, walked.part);
+                let sides = [&mut *rz, &mut *ra, &mut *rb];
+                for (side, t) in sides.into_iter().zip(t).skip(!walked.z as usize) {
+                    let t: &[u64; 8] = t[at..at + 8].try_into().unwrap();
+                    if part {
+                        for (x, &y) in side[w].iter_mut().zip(t) {
+                            *x |= y;
+                        }
+                    } else {
+                        side[w] = *t;
+                    }
+                }
+            }
+            for &(w, mask) in &plan.identity {
+                for j in 0..n {
+                    ra[w][j] |= rz[w][j] & mask;
+                    rb[w][j] |= mask;
+                }
+            }
+            for (s, site) in sites.iter().enumerate() {
+                let arg_words = site.args.len().div_ceil(64);
+                if let Some(runs) = &plan.args[s] {
+                    arg_rows.clear();
+                    arg_rows.resize(8 * arg_words, 0);
+                    for (row, out) in rows.iter().zip(arg_rows.chunks_mut(arg_words)) {
+                        for (out, runs) in out.iter_mut().zip(runs) {
+                            *out = runs.iter().fold(0, |acc, r| {
+                                let src = if r.hi {
+                                    row[r.input].hi
+                                } else {
+                                    row[r.input].lo
+                                };
+                                acc | (src >> r.from & r.mask) << r.to
+                            });
+                        }
+                    }
+                }
+                let source: &[u64] = match plan.args[s] {
+                    Some(_) => arg_rows,
+                    None => &site_args[s][at * arg_words..],
+                };
+                let row_args: [&[u64]; 8] =
+                    std::array::from_fn(|j| &source[j * arg_words..][..arg_words]);
+                site.kernel.fill8(row_args, site.region.start, rz, ra, rb);
+                // Rows past the slot's end stay zero, kernel bits included.
+                if n < 8 {
+                    for side in [&mut *rz, &mut *ra, &mut *rb] {
+                        for w in site.region.start / 64..site.region.end.div_ceil(64) {
+                            side[w][n..].fill(0);
+                        }
+                    }
+                }
+            }
+            for (w, bytes) in stripe[..useful]
+                .as_chunks_mut::<64>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                transpose_8_u64s_to_64_bytes(&rz[w], bytes);
+            }
+        }
+        // Each column's 64 rows go out as one contiguous run: a few long
+        // bursts instead of a short store to every column per batch.
+        for (runs, side) in runs.iter_mut().zip([&*rz_all, &*ra_all, &*rb_all]) {
+            for (col, run) in runs.iter_mut().enumerate() {
+                for (batch, run) in run.chunks_mut(8).enumerate() {
+                    let lo = &side[batch * per_block + 2 * col];
+                    let hi = &side[batch * per_block + 2 * col + 1];
+                    let out: [F128; 8] = std::array::from_fn(|j| F128::new(lo[j], hi[j]));
+                    if let Ok(run) = <&mut [F128; 8]>::try_from(&mut *run) {
+                        store_streaming(run, &out);
+                    } else {
+                        run.copy_from_slice(&out[..run.len()]);
+                    }
+                }
+            }
+        }
     }
 
     /// Up to 64 rows: the walk fills `sc`'s planes but for the kernel
@@ -641,17 +1063,16 @@ impl BooleanGate {
                 }
             }
         }
-        let useful = self.r1cs.useful_bits;
+        let useful = 64 * self.r1cs.useful_bits.div_ceil(64);
         for (g, group) in stripe.chunks_mut(k).enumerate() {
             let rows = &rz[g * per_block..];
-            for (w, bytes) in group[..useful].chunks_mut(64).enumerate() {
-                if bytes.len() == 64 {
-                    transpose_8_u64s_to_64_bytes(&rows[w], bytes);
-                } else {
-                    let mut full = [0u8; 64];
-                    transpose_8_u64s_to_64_bytes(&rows[w], &mut full);
-                    bytes.copy_from_slice(&full[..bytes.len()]);
-                }
+            for (w, bytes) in group[..useful]
+                .as_chunks_mut::<64>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                transpose_8_u64s_to_64_bytes(&rows[w], bytes);
             }
         }
     }
@@ -683,6 +1104,26 @@ impl BooleanGate {
     }
 }
 
+/// A raw pointer the group drivers share; each writes only its own part.
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+// SAFETY: the drivers write disjoint ranges (see `pack_into_with`).
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    fn get(self) -> *mut T {
+        self.0
+    }
+}
+
+/// The slot's buffers (`z`, `A·z`, `B·z`) and its stripe.
+#[derive(Clone, Copy)]
+struct SlotPtrs {
+    bufs: [SendPtr<F128>; 3],
+    stripe: SendPtr<u8>,
+}
+
 /// Per-worker buffers of the bit-sliced packer.
 #[derive(Default)]
 struct SlicedScratch {
@@ -698,6 +1139,50 @@ struct SlicedScratch {
     /// A kernel's argument planes, then its arguments row by row.
     args: Vec<u64>,
     arg_rows: Vec<u64>,
+    /// The batched packer's rows of one batch: `z`, `A·z`, `B·z`.
+    batch_rows: [Vec<[u64; 8]>; 3],
+    /// The batched packer's walked words in row form, three sides each.
+    walked_rows: Vec<[u64; 64]>,
+    /// Per kernel site, the group's arguments read off the planes, row by
+    /// row.
+    site_args: Vec<Vec<u64>>,
+}
+
+/// A kernel site's arguments as runs of input bits per argument word, if
+/// each argument bit is one input bit or zero; `input_at` maps a block
+/// position to its (input, bit).
+fn arg_runs(
+    args: &[Vec<u32>],
+    input_at: &HashMap<usize, (usize, usize)>,
+) -> Option<Vec<Vec<ArgRun>>> {
+    let mut words: Vec<Vec<ArgRun>> = vec![Vec::new(); args.len().div_ceil(64)];
+    for (i, support) in args.iter().enumerate() {
+        let (input, bit) = match support[..] {
+            [] => continue,
+            [p] => *input_at.get(&(p as usize))?,
+            _ => return None,
+        };
+        let (hi, from, to) = (bit >= 64, (bit % 64) as u32, (i % 64) as u32);
+        let runs = &mut words[i / 64];
+        match runs.last_mut() {
+            Some(r)
+                if r.input == input
+                    && r.hi == hi
+                    && r.from + r.mask.count_ones() == from
+                    && r.to + r.mask.count_ones() == to =>
+            {
+                r.mask = r.mask << 1 | 1;
+            }
+            _ => runs.push(ArgRun {
+                input,
+                hi,
+                from,
+                to,
+                mask: 1,
+            }),
+        }
+    }
+    Some(words)
 }
 
 /// `*dst = *src` for a run the caller will not read back soon: on aarch64 a
