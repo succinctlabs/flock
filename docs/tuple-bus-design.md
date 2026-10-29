@@ -299,6 +299,37 @@ The rest of the gap:
 `ν = 16` (10 slots) is a wash: lincheck 54 → 33 ms but commit 128 → 147 ms.
 Shape setup is 4.9 s against 4.1 s.
 
+### After the packer and lincheck fixes
+
+Two per-slot costs went next (`29b795a`, `9918098`):
+- **Witness packing.** The gate packer copies wired input words straight
+  from the rows, builds the BLAKE3 kernel's arguments from them, drops the
+  inputs' identity rows from the walk, and runs the kernel and the stripe
+  eight rows at a time. On one 2^15-row compression slot it is 1.1× the
+  hand-written generator (was 1.57× on 10 threads).
+- **Lincheck.** Each distinct gate's matrices fold once (7 of the 15 slots
+  share the compression gate), the slots' stripe folds run together, and
+  narrow full slots fold by rows.
+
+Alternating A/B, 10 threads, median of each round's fastest prove (ms):
+
+| Phase | Pure BLAKE3 | Bus |
+|---|---:|---:|
+| witness | 27 | 36 |
+| commit | 149 | 132 |
+| zerocheck (∥ wiring GKR 108, bus 9) | 136 | 158 |
+| lincheck | 28 | 28 |
+| bit-bank fold | 24 | 25 |
+| open | 116 | 128 |
+| total | 482 | 515 |
+
+Pure BLAKE3 varied more than usual between rounds (475–543 ms); an
+earlier, quieter run gave 462 ms, with commit 139 and open 103. So the bus
+now costs about 1.07–1.11× pure BLAKE3. Best online+prove is 527 ms, about
+1,900 signatures/s. What is left is the zerocheck sharing its cores with
+the wiring GKR, and the opening's block statistics and merged sumcheck,
+which grow with the committed columns (703 against 92).
+
 ## 4. Questions for review
 
 1. Is the transcript position right? The bus samples `β, γ` after the wiring
