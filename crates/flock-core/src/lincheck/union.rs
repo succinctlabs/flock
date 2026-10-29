@@ -61,6 +61,8 @@
 
 use std::{env::var, time::Instant};
 
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+
 use crate::{
     challenger::Challenger,
     field::F128,
@@ -224,21 +226,26 @@ pub fn union_bitbank_fold(
     } else {
         vec![F128::ZERO; 1usize << col_vars]
     };
-    for (((ty, slot), slot_in), &n_t) in registry
-        .boolean_types()
-        .iter()
-        .zip(registry.slots())
-        .zip(slots)
-        .zip(union.counts())
-    {
-        let y_t = partial_fold_packed_z_rows_best(
-            slot_in.z_lincheck,
-            nu + ty.k_log,
-            ty.k_log,
-            ty.useful_bits,
-            &eq_x_outer,
-            n_t,
-        );
+    // The slots fold concurrently: a registry of many slots has small ones
+    // (and narrow ones, which split over few workers) that would otherwise
+    // leave most cores idle in turn.
+    let types = registry.boolean_types();
+    let counts = union.counts();
+    let folds: Vec<Vec<F128>> = (0..slots.len())
+        .into_par_iter()
+        .map(|t| {
+            let ty = &types[t];
+            partial_fold_packed_z_rows_best(
+                slots[t].z_lincheck,
+                nu + ty.k_log,
+                ty.k_log,
+                ty.useful_bits,
+                &eq_x_outer,
+                counts[t],
+            )
+        })
+        .collect();
+    for ((ty, slot), y_t) in types.iter().zip(registry.slots()).zip(folds) {
         if single {
             z_vec = y_t;
         } else {
@@ -329,33 +336,52 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         vec![F128::ZERO; 1usize << col_vars]
     };
     // Per-type (ξ_A, ξ_B), kept for the matrix-eval report after the sumcheck.
-    let mut split_combs: Vec<(Vec<F128>, Vec<F128>)> = Vec::with_capacity(registry.num_boolean());
-    for ((ty, slot), slot_in) in registry
-        .boolean_types()
+    // Slots of one gate share its circuit (and so its width), and the fold
+    // depends on nothing else: each distinct circuit folds once, the
+    // distinct ones concurrently.
+    let types = registry.boolean_types();
+    let mut distinct: Vec<usize> = Vec::new();
+    let comb_of: Vec<usize> = slots
         .iter()
-        .zip(registry.slots())
-        .zip(slots)
-    {
-        let inner = ty.k_log - k_skip;
-        let eq_inner = build_quirky_eq_table_from_weights(
-            &x_ab.z_skip.weights(k_skip),
-            &x_ab.x_inner_rest[..inner],
-        );
-        // Split, so the per-matrix bilinear values can be reported below.
-        // Same nonzeros as the α-batched fold; only the accumulation differs.
-        let (comb_a, comb_b) = slot_in.circuit.fold_split(&eq_inner);
-        let comb_t: Vec<F128> = comb_a
-            .iter()
-            .zip(&comb_b)
-            .map(|(a, b)| alpha * *a + *b)
-            .collect();
-        split_combs.push((comb_a, comb_b));
+        .enumerate()
+        .map(|(t, slot_in)| {
+            let same = |&u: &usize| std::ptr::addr_eq(slots[u].circuit, slot_in.circuit);
+            distinct.iter().position(same).unwrap_or_else(|| {
+                distinct.push(t);
+                distinct.len() - 1
+            })
+        })
+        .collect();
+    let unique: Vec<((Vec<F128>, Vec<F128>), Vec<F128>)> = distinct
+        .into_par_iter()
+        .map(|t| {
+            let inner = types[t].k_log - k_skip;
+            let eq_inner = build_quirky_eq_table_from_weights(
+                &x_ab.z_skip.weights(k_skip),
+                &x_ab.x_inner_rest[..inner],
+            );
+            // Split, so the per-matrix bilinear values can be reported below.
+            // Same nonzeros as the α-batched fold; only the accumulation
+            // differs.
+            let (comb_a, comb_b) = slots[t].circuit.fold_split(&eq_inner);
+            let comb_t = comb_a
+                .iter()
+                .zip(&comb_b)
+                .map(|(a, b)| alpha * *a + *b)
+                .collect();
+            ((comb_a, comb_b), comb_t)
+        })
+        .collect();
+    let split_combs: Vec<&(Vec<F128>, Vec<F128>)> = comb_of.iter().map(|&u| &unique[u].0).collect();
+    for ((ty, slot), &u) in types.iter().zip(registry.slots()).zip(&comb_of) {
+        let comb_t = &unique[u].1;
         if single {
-            comb_vec = comb_t; // T = 1: w_1 = 1, offset 0 — today's vector.
+            comb_vec = comb_t.clone(); // T = 1: w_1 = 1, offset 0 — today's vector.
         } else {
+            let inner = ty.k_log - k_skip;
             let w_t = eq_prefix_weight(&x_ab.x_inner_rest[inner..], slot.prefix);
             let off = slot.prefix << ty.k_log;
-            for (dst, &src) in comb_vec[off..off + comb_t.len()].iter_mut().zip(&comb_t) {
+            for (dst, &src) in comb_vec[off..off + comb_t.len()].iter_mut().zip(comb_t) {
                 *dst = w_t * src;
             }
         }
