@@ -14,8 +14,10 @@ threads:
 
 | | Metal off | Metal on |
 |---|---:|---:|
-| commit | 152 ms | 131 ms |
-| prove | 486 ms | 464 ms |
+| BLAKE3 2^18: commit | 133 ms | 108 ms |
+| BLAKE3 2^18: prove | 433 ms | 409 ms |
+| leanXMSS 1000 signatures: commit | 127 ms | 104 ms |
+| leanXMSS 1000 signatures: prove | 461 ms | 437 ms (2,112 → 2,222 sig/s) |
 
 The output is byte-identical to the CPU commit. Proofs and the verifier do
 not change.
@@ -28,13 +30,14 @@ not change.
   at runtime through `dlopen` and `objc_msgSend`.
 - **Runtime:** with the feature built in, the GPU takes every eligible
   commit; `FLOCK_METAL=0` keeps them all on the CPU (same-binary A/B).
-- **Split tuning:**
-  - `FLOCK_METAL_GPU_FIRST16` (default 6): sixteenths of the first pass's
-    tiles the GPU takes.
-  - `FLOCK_METAL_GPU_BLOCKS` (default 7): layer-4 position blocks (of 16)
-    the GPU takes. 16 runs the whole graph on the GPU.
-- **Timing:** `FLOCK_COMMIT_TIMING=1` prints the fill, the first pass, the
-  CPU share and the GPU wait.
+- **Split:** tuned per shape, commit by commit (see *Design*). Two env
+  vars pin it instead:
+  - `FLOCK_METAL_GPU_FIRST16`: sixteenths of the first pass's tiles the
+    GPU takes.
+  - `FLOCK_METAL_GPU_BLOCKS`: layer-4 position blocks (of 16) the GPU
+    takes. 16 runs the whole graph on the GPU.
+- **Timing:** `FLOCK_COMMIT_TIMING=1` prints the split, the GPU-share fill,
+  each phase's CPU and GPU time, and the GPU wait.
 
 A commit is eligible when it uses BLAKE3 leaves and rate 1/2, has at most 64
 lanes, and its codeword is at least 2^20 words. The GPU's buffers must also
@@ -93,6 +96,26 @@ same buffers:
    finished sub-groups while they are cache-hot.
 4. **The join.** The CPU hashes the last 7 tree levels after both sides
    finish.
+
+**Balancing the split.** Each commit measures both sides of each phase: the
+GPU's from its command buffer's own timestamps, the CPU's by wall clock
+(contention included). Per shape it keeps an average cost per unit (per
+sixteenth of tiles, per block) and moves the next commit's split to where
+the two sides finish together, `x = 16·c / (g + c)`. The first commit of a
+shape, which runs cold, is not used. At BLAKE3 2^18 it settles within two
+commits at 8–9/16 of the first pass and 8 blocks. The output is identical
+for every split.
+
+**Overlapping the fill.** The CPU transposes only the GPU's message rows
+before starting it (about 8 ms of the 15), then fills its own rows while the
+GPU runs its first pass.
+
+**Packing lanes.** With `t < 64` lanes, a 64-thread group used to leave
+`64 − t` threads computing zeros. The from-message pass and the grouped
+passes now run their 4 tiles × `t` lanes as flat work items, 64 per round:
+3 rounds instead of 4 at 46 lanes. Consecutive items stay consecutive in
+memory. GPU NTT at 2^20 × 46: 168–188 → 143–155 ms. The final pass, one
+tile per group with its own twiddles, is not packed.
 
 **No shared cache lines.** Every boundary between what the CPU and the GPU
 write is a whole 256-byte span:
@@ -163,7 +186,23 @@ At the default split:
   as a simpler fused-pass suffix, which is consistent with bandwidth, not
   kernel scheduling, being the limit.
 
-**Hybrid vs CPU, four alternating rounds, 10 threads:**
+**Tuned and packed hybrid vs CPU, three alternating rounds, 10 threads,
+quiet machine:**
+
+| | Metal off | Metal on |
+|---|---:|---:|
+| BLAKE3 2^18: commit | 133 [133 133 135] | 108 [106 108 109] |
+| BLAKE3 2^18: prove | 433 [431 442 433] | 409 [403 409 418] |
+| leanXMSS 1000: commit | 127 [126 130 127] | 104 [101 104 106] |
+| leanXMSS 1000: prove | 461 [461 467 452] | 437 [431 448 437] |
+
+Faster in 3/3 rounds on both, and every other phase is unchanged. At the
+tuned split for leanXMSS:
+- GPU-share fill: 6.5 ms;
+- first pass: 31 ms (CPU 21, GPU 24);
+- rest: CPU 74 ms, GPU 67 ms.
+
+**The first hybrid (fixed split, no packing), four alternating rounds:**
 
 | | Metal off | Metal on |
 |---|---:|---:|
@@ -193,17 +232,13 @@ the commit.
 
 ## Next
 
-- **Tune the split per shape and machine.** The defaults are this machine's
-  at BLAKE3 2^18. A larger GPU wants more blocks; a one-shot autotune on the
-  first commit (it already runs both paths) could pick them.
-- **Overlap the fill.** The 15 ms lane-major transpose runs before either
-  processor starts. The GPU could start first-pass tiles as their message
-  rows land.
-- **Leave the dead lanes out.** With `t < 64`, a quarter of the GPU's
-  threads run the network on zeros. A kernel that packs two tiles per group
-  at small `t` would recover that.
-- **leanXMSS.** It lives on its own branch; the commit is the same
-  lane-major path, so it should take the hybrid unchanged once merged.
+- **The rest of the fill.** The GPU's share is still transposed before it
+  starts (6–8 ms). Reading the lane-major witness directly would need it
+  in a Metal buffer (a no-copy wrap of the scratch allocation).
+- **The final pass.** It is the one GPU pass left unpacked; packing it
+  means several twiddle sets per group.
+- **GPU zerocheck round 1.** A prototype is next: the multiplications by
+  `eq` dominate it on a GPU without a carryless multiply.
 
 ## Tests
 

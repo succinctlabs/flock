@@ -433,7 +433,7 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
     if let Some(done) = crate::gpu_commit::try_commit(
         params,
-        |msg| copy_message(msg, z_packed),
+        |msg, pos| copy_message(msg, z_packed, params.num_ntts(), pos),
         |msg| cpu_commit_from_message(msg, params),
     ) {
         return gpu_commit_result(done, params);
@@ -465,7 +465,7 @@ pub fn commit_into(
 
     if let Some(done) = crate::gpu_commit::try_commit(
         params,
-        |msg| copy_message(msg, z_packed),
+        |msg, pos| copy_message(msg, z_packed, params.num_ntts(), pos),
         |msg| cpu_commit_from_message(msg, params),
     ) {
         give_f128(codeword);
@@ -478,11 +478,14 @@ pub fn commit_into(
     commit_merkle(codeword, params)
 }
 
-/// Parallel copy of the interleaved message into the GPU's message buffer.
-fn copy_message(dst: &mut [F128], src: &[F128]) {
+/// Parallel copy of message positions `pos` (`t` lanes each) of the
+/// interleaved message into the GPU's message buffer.
+fn copy_message(dst: &mut [F128], src: &[F128], t: usize, pos: core::ops::Range<usize>) {
     const CHUNK: usize = 1 << 16;
-    dst.par_chunks_mut(CHUNK)
-        .zip(src.par_chunks(CHUNK))
+    let r = pos.start * t..pos.end * t;
+    dst[r.clone()]
+        .par_chunks_mut(CHUNK)
+        .zip(src[r].par_chunks(CHUNK))
         .for_each(|(d, s)| d.copy_from_slice(s));
 }
 
@@ -932,7 +935,7 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
     // encodes and hashes (all `t` lanes; dead ones are zero either way).
     if let Some(done) = crate::gpu_commit::try_commit(
         params,
-        |msg| replicate_lane_major_fill(msg, q, t, d),
+        |msg, pos| transpose_lane_major_positions(msg, q, t, d, pos),
         |msg| cpu_commit_from_message(msg, params),
     ) {
         return gpu_commit_result(done, params);
@@ -1023,6 +1026,34 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
         });
     }
     finalize_commit(codeword, live, params)
+}
+
+/// Transpose message positions `pos` of the lane-major stack `q` into the
+/// interleaved message `msg[p·t + l] = q[l·D + p]` (the GPU commit's ranged
+/// fill), cache-blocked over position tiles like
+/// [`replicate_lane_major_fill`].
+fn transpose_lane_major_positions(
+    msg: &mut [F128],
+    q: &[F128],
+    t: usize,
+    d: usize,
+    pos: core::ops::Range<usize>,
+) {
+    let threads = rayon::current_num_threads().max(1);
+    let tile = (pos.len() / (4 * threads)).clamp(64, 1024);
+    msg[pos.start * t..pos.end * t]
+        .par_chunks_mut(tile * t)
+        .enumerate()
+        .for_each(|(i, out)| {
+            let p0 = pos.start + i * tile;
+            let n = out.len() / t;
+            for lane in 0..t {
+                let src = &q[lane * d + p0..lane * d + p0 + n];
+                for (p, &v) in src.iter().enumerate() {
+                    out[p * t + lane] = v;
+                }
+            }
+        });
 }
 
 /// [`replicate_message_fill`] for a lane-major message: fill `codeword` with

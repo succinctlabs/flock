@@ -167,13 +167,15 @@ pub(crate) enum GpuCommit {
 /// unavailable, shape not covered, codeword below [`MIN_CODEWORD_LOG`], or
 /// the buffers still held by an earlier commit's prover data).
 ///
-/// `fill` writes the message: `t·2^(log_d−1)` words, element `(pos, lane)` at
-/// `pos·t + lane`, which is the CPU commit's replicate-fill source. `cpu`
-/// computes the CPU codeword and tree from that message; it runs on the first
-/// commit of each shape, and as the fallback after a GPU error.
+/// `fill(msg, positions)` writes those positions of the message
+/// (`t·2^(log_d−1)` words, element `(pos, lane)` at `pos·t + lane`, the CPU
+/// commit's replicate-fill source); the commit fills the GPU's share first
+/// and the rest while the GPU runs. `cpu` computes the CPU codeword and tree
+/// from the whole message; it runs on the first commit of each shape, and as
+/// the fallback after a GPU error.
 pub(crate) fn try_commit(
     params: &PcsParams,
-    fill: impl FnOnce(&mut [F128]),
+    fill: impl Fn(&mut [F128], core::ops::Range<usize>),
     cpu: impl FnOnce(&[F128]) -> (Vec<F128>, Vec<Hash>),
 ) -> Option<GpuCommit> {
     if !metal_enabled() || !gpu_shape(params) {
@@ -220,7 +222,7 @@ mod imp {
     pub(super) fn try_commit(
         _log_d: usize,
         _t: usize,
-        _fill: impl FnOnce(&mut [F128]),
+        _fill: impl Fn(&mut [F128], core::ops::Range<usize>),
         _cpu: impl FnOnce(&[F128]) -> (Vec<F128>, Vec<Hash>),
     ) -> Option<GpuCommit> {
         None
@@ -787,16 +789,22 @@ kernel void ntt_fused_reg4g4(device uint4* data                [[buffer(0)]],
     threadgroup uint4 tabB[512u];
     threadgroup uint4 pad[124u];
 
-    const uint lane = lid;
-    const bool live = lane < P.lanes;
     const uint B = tgid >> (P.s - LOG_G);
     const uint r_base = (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;
 
-    for (uint rr = 0; rr < (1u << LOG_G); rr++) {
+    // The group's 4 same-B tiles x `lanes` lanes are flat work items, 64 per
+    // round (3 rounds instead of 4 at 46 lanes). The round count is the same
+    // for every thread, since the table rebuilds inside need all 64 at their
+    // barriers; past the last item a thread runs the network on zeros and
+    // skips the loads and stores.
+    const uint items = P.lanes << LOG_G;
+    for (uint it = 0; it < (items + 63u) >> 6; it++) {
+        const uint item = (it << 6) + lid;
+        const bool live = item < items;
+        const uint rr = live ? item / P.lanes : 0u;
+        const uint lane = live ? item - rr * P.lanes : 0u;
         const uint r = r_base + rr;
         const uint pos_base = (B << (P.log_d - P.l)) + r;
-        // Dead lanes still build the shared tables, so they run the network
-        // on zeros and skip only the global loads and stores.
         uint4 elems[NF];
         for (uint e = 0; e < NF; e++) {
             elems[e] = live ? data[AT(pos_base + (e << P.s), lane)] : uint4(0u);
@@ -1014,8 +1022,6 @@ kernel void ntt_fused_reg4_from_zg4(device uint4* data                [[buffer(0
     threadgroup uint4 bases[NTW * 4u];
     threadgroup uint4 tabs[NTW * 64u];
 
-    const uint lane = lid & 63u;
-    const bool live = lane < P.lanes;
     const uint r_base = tgid << LOG_G;
 
     if (lid < NTW * 4u) {
@@ -1041,9 +1047,13 @@ kernel void ntt_fused_reg4_from_zg4(device uint4* data                [[buffer(0
         tabs[ei] = val;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (!live) { return; }
 
-    for (uint rr = 0; rr < (1u << LOG_G); rr++) {
+    // The group's 4 tiles x `lanes` lanes are flat work items, so no thread
+    // idles on a dead lane (with no barrier below, the loop count may differ
+    // per thread). Consecutive items stay consecutive in memory.
+    for (uint item = lid; item < (P.lanes << LOG_G); item += 64u) {
+        const uint rr = item / P.lanes;
+        const uint lane = item - rr * P.lanes;
         const uint r = r_base + rr;
         uint4 elems[NF];
         for (uint e = 0; e < NF / 2u; e++) {
@@ -1827,6 +1837,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         verified: Vec<(usize, usize)>,
         /// A GPU result disagreed with the CPU: no more GPU commits.
         disabled: bool,
+        /// The hybrid split per shape `(log_d, lanes)`, tuned commit by commit.
+        tunes: Vec<((usize, usize), Tune)>,
     }
 
     static STATE: Mutex<State> = Mutex::new(State {
@@ -1834,7 +1846,69 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         in_use: false,
         verified: Vec::new(),
         disabled: false,
+        tunes: Vec::new(),
     });
+
+    /// One shape's hybrid split and the per-unit costs it is balanced on: ms
+    /// per sixteenth of the first pass's tiles (`g1` GPU, `c1` CPU including
+    /// its share of the fill) and per layer-4 block of the rest (`g2`, `c2`).
+    /// Each commit measures both sides and moves the split toward equal
+    /// finish times; output is identical for every split.
+    #[derive(Clone, Copy, Debug)]
+    struct Tune {
+        first16: usize,
+        blocks: usize,
+        g1: f64,
+        c1: f64,
+        g2: f64,
+        c2: f64,
+    }
+
+    impl Tune {
+        fn initial() -> Tune {
+            Tune {
+                first16: hybrid_gpu_first16().unwrap_or(6),
+                blocks: hybrid_gpu_blocks().unwrap_or(7),
+                g1: 0.0,
+                c1: 0.0,
+                g2: 0.0,
+                c2: 0.0,
+            }
+        }
+
+        /// Fold one commit's timings in (exponential average) and re-balance:
+        /// `x` units on the GPU finish together with `16 − x` on the CPU at
+        /// `x = 16·c / (g + c)`. A pinned (env) split stays put.
+        fn update(&mut self, t: &HybridTimes) {
+            let ema = |old: f64, new: f64| if old == 0.0 { new } else { 0.5 * (old + new) };
+            if self.first16 > 0 && self.first16 < 16 {
+                self.g1 = ema(self.g1, t.gpu1 / self.first16 as f64);
+                self.c1 = ema(self.c1, t.cpu1 / (16 - self.first16) as f64);
+            }
+            self.g2 = ema(self.g2, t.gpu2 / self.blocks as f64);
+            self.c2 = ema(self.c2, t.cpu2 / (16 - self.blocks) as f64);
+            let balance = |g: f64, c: f64, lo: usize| -> usize {
+                ((16.0 * c / (g + c)).round() as usize).clamp(lo, 15)
+            };
+            // At least one sixteenth, so the GPU side stays measured.
+            if hybrid_gpu_first16().is_none() && self.g1 > 0.0 {
+                self.first16 = balance(self.g1, self.c1, 1);
+            }
+            if hybrid_gpu_blocks().is_none() {
+                self.blocks = balance(self.g2, self.c2, 1);
+            }
+        }
+    }
+
+    /// One hybrid commit's measured sides, ms: GPU execution time of each
+    /// phase's command buffer (its own timestamps) and the CPU's wall time
+    /// for its share.
+    struct HybridTimes {
+        gpu1: f64,
+        cpu1: f64,
+        gpu2: f64,
+        cpu2: f64,
+    }
 
     /// Held by the codeword and tree views of a GPU commit; the buffers are
     /// free for the next commit once both are dropped.
@@ -1902,31 +1976,61 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
     }
 
-    /// Layer-4 blocks (of 16) the GPU takes in the hybrid commit; the CPU
-    /// takes the rest. `FLOCK_METAL_GPU_BLOCKS=16` runs the whole graph on
-    /// the GPU.
-    fn hybrid_gpu_blocks() -> usize {
-        static K: OnceLock<usize> = OnceLock::new();
+    /// `FLOCK_METAL_GPU_BLOCKS`: pin the layer-4 blocks (of 16) the GPU
+    /// takes in the hybrid commit; 16 runs the whole graph on the GPU. Unset,
+    /// the split is tuned per shape ([`Tune`]).
+    fn hybrid_gpu_blocks() -> Option<usize> {
+        static K: OnceLock<Option<usize>> = OnceLock::new();
         *K.get_or_init(|| {
             std::env::var("FLOCK_METAL_GPU_BLOCKS")
                 .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(7)
-                .clamp(1, 16)
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|k| k.clamp(1, 16))
         })
     }
 
-    /// Sixteenths of the first pass's tiles the GPU takes in the hybrid
-    /// commit; the CPU takes the rest (`FLOCK_METAL_GPU_FIRST16`).
-    fn hybrid_gpu_first16() -> usize {
-        static K: OnceLock<usize> = OnceLock::new();
+    /// `FLOCK_METAL_GPU_FIRST16`: pin the sixteenths of the first pass's
+    /// tiles the GPU takes. Unset, tuned per shape ([`Tune`]).
+    fn hybrid_gpu_first16() -> Option<usize> {
+        static K: OnceLock<Option<usize>> = OnceLock::new();
         *K.get_or_init(|| {
             std::env::var("FLOCK_METAL_GPU_FIRST16")
                 .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(6)
-                .clamp(0, 16)
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|k| k.clamp(0, 16))
         })
+    }
+
+    /// GPU execution time of a completed command buffer, ms.
+    unsafe fn gpu_exec_ms(gpu: &Gpu, cb: Id) -> f64 {
+        unsafe {
+            let t0: f64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> f64,
+                cb,
+                c"GPUStartTime"
+            );
+            let t1: f64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> f64,
+                cb,
+                c"GPUEndTime"
+            );
+            (t1 - t0) * 1e3
+        }
+    }
+
+    /// The message positions of first-pass tiles `[r0, r1)`: the 8 runs
+    /// `(e << s) + [r0, r1)`, `s = log_d − 4`.
+    fn tile_positions(
+        log_d: usize,
+        r0: usize,
+        r1: usize,
+    ) -> impl Iterator<Item = core::ops::Range<usize>> {
+        let s = log_d - 4;
+        (0..8usize)
+            .map(move |e| (e << s) + r0..(e << s) + r1)
+            .filter(|r| !r.is_empty())
     }
 
     /// Levels below the root where both sides of the hybrid stop hashing:
@@ -1963,7 +2067,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         bufs: &Buffers,
         first16: usize,
         k: usize,
-    ) -> Result<(), String> {
+        fill: &dyn Fn(&mut [F128], core::ops::Range<usize>),
+        msg: &mut [F128],
+    ) -> Result<HybridTimes, String> {
         let (log_d, lanes) = (bufs.log_d, bufs.lanes);
         let n = 1usize << log_d;
         let stop = log_d - HYBRID_TOP;
@@ -1973,6 +2079,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             let tiles = 1usize << (log_d - 4);
             let r1 = tiles / 16 * first16;
             let tw = core::slice::from_raw_parts(gpu.contents(bufs.tw_buf).cast::<F128>(), n - 1);
+            // The GPU's message rows first, so it can start; the CPU fills its
+            // own while the GPU runs.
+            for pos in tile_positions(log_d, 0, r1) {
+                fill(msg, pos);
+            }
+            let t_fill_gpu = t0.elapsed();
             let pool = (gpu.api.pool_push)();
             let first = (|| {
                 let cb = gpu.command_buffer()?;
@@ -1984,21 +2096,29 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 gpu.commit_async(cb);
                 Ok::<Id, String>(cb)
             })();
+            let mut cpu1 = 0.0;
+            let mut gpu1 = 0.0;
             let first = match first {
                 Ok(cb) => {
+                    let t_cpu1 = std::time::Instant::now();
+                    for pos in tile_positions(log_d, r1, tiles) {
+                        fill(msg, pos);
+                    }
                     crate::ntt::AdditiveNttF128::first_pass_from_message_tiles(
                         gpu.contents(bufs.code_buf).cast(),
-                        core::slice::from_raw_parts(
-                            gpu.contents(bufs.msg_buf).cast(),
-                            bufs.msg_words(),
-                        ),
+                        msg,
                         lanes,
                         log_d,
                         r1,
                         tiles,
                         tw,
                     );
-                    gpu.wait(cb)
+                    cpu1 = t_cpu1.elapsed().as_secs_f64() * 1e3;
+                    let waited = gpu.wait(cb);
+                    if waited.is_ok() && r1 > 0 {
+                        gpu1 = gpu_exec_ms(gpu, cb);
+                    }
+                    waited
                 }
                 Err(e) => Err(e),
             };
@@ -2111,6 +2231,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             let t_cpu = t_cpu.elapsed();
             let t_wait = std::time::Instant::now();
             let waited = gpu.wait(cb2);
+            let gpu2 = if waited.is_ok() {
+                gpu_exec_ms(gpu, cb2)
+            } else {
+                0.0
+            };
             (gpu.api.pool_pop)(pool);
             waited?;
             let t_wait = t_wait.elapsed();
@@ -2124,20 +2249,26 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             }
             if timing {
                 eprintln!(
-                    "[commit-timing] metal hybrid (gpu first {first16}/16, blocks {k}/16): first pass {:.2} ms | cpu suffix {:.2} ms | gpu wait after {:.2} ms",
+                    "[commit-timing] metal hybrid (gpu first {first16}/16, blocks {k}/16): gpu fill {:.2} | first pass {:.2} (cpu {cpu1:.2}, gpu {gpu1:.2}) | cpu suffix {:.2} (gpu {gpu2:.2}) | gpu wait after {:.2} ms",
+                    t_fill_gpu.as_secs_f64() * 1e3,
                     t_first.as_secs_f64() * 1e3,
                     t_cpu.as_secs_f64() * 1e3,
                     t_wait.as_secs_f64() * 1e3,
                 );
             }
+            Ok(HybridTimes {
+                gpu1,
+                cpu1,
+                gpu2,
+                cpu2: t_cpu.as_secs_f64() * 1e3,
+            })
         }
-        Ok(())
     }
 
     pub(super) fn try_commit(
         log_d: usize,
         lanes: usize,
-        fill: impl FnOnce(&mut [F128]),
+        fill: impl Fn(&mut [F128], core::ops::Range<usize>),
         cpu: impl FnOnce(&[F128]) -> (Vec<F128>, Vec<Hash>),
     ) -> Option<GpuCommit> {
         let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
@@ -2173,6 +2304,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
         state.in_use = true;
         let verify = !state.verified.contains(&(log_d, lanes));
+        let tune = match state
+            .tunes
+            .iter()
+            .find(|(shape, _)| *shape == (log_d, lanes))
+        {
+            Some((_, t)) => *t,
+            None => Tune::initial(),
+        };
         // The graph runs with the lock dropped: `in_use` keeps other commits
         // off the buffers, so they are neither reallocated nor written.
         let bufs = state.bufs.expect("buffers just ensured");
@@ -2187,22 +2326,32 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 bufs.msg_words(),
             )
         };
-        let t_fill = std::time::Instant::now();
-        fill(msg);
-        let t_fill = t_fill.elapsed();
-        let t_gpu = std::time::Instant::now();
-        let k = hybrid_gpu_blocks();
-        let ran = if k < 16 && log_d >= 12 {
-            unsafe { run_hybrid(gpu, &bufs, hybrid_gpu_first16(), k) }
+        let half = 1usize << (log_d - 1);
+        let ran = if tune.blocks < 16 && log_d >= 12 {
+            let ran = unsafe { run_hybrid(gpu, &bufs, tune.first16, tune.blocks, &fill, msg) };
+            // The first commit of a shape runs cold (fresh buffers, pipeline
+            // warm-up) and is not a fair sample.
+            if let (Ok(times), false) = (&ran, verify) {
+                let mut tune = tune;
+                tune.update(times);
+                let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+                match state
+                    .tunes
+                    .iter_mut()
+                    .find(|(shape, _)| *shape == (log_d, lanes))
+                {
+                    Some((_, t)) => *t = tune,
+                    None => state.tunes.push(((log_d, lanes), tune)),
+                }
+            }
+            ran.map(|_| ())
         } else {
+            fill(msg, 0..half);
             unsafe { run_graph(gpu, &bufs, true) }
         };
-        let t_gpu = t_gpu.elapsed();
         if timing {
             eprintln!(
-                "[commit-timing] metal: fill {:.2} ms | gpu graph {:.2} ms | total {:.2} ms (2^{log_d} x {lanes})",
-                t_fill.as_secs_f64() * 1e3,
-                t_gpu.as_secs_f64() * 1e3,
+                "[commit-timing] metal: total {:.2} ms (2^{log_d} x {lanes})",
                 t0.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -2218,6 +2367,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         };
         if let Err(e) = ran {
             eprintln!("[metal] GPU commit failed ({e}); CPU commit");
+            // The hybrid may have stopped before the CPU's rows were filled.
+            fill(msg, 0..half);
             let (cw, tr) = cpu(msg);
             return Some(GpuCommit::Cpu(cw, tr));
         }
@@ -2282,13 +2433,19 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     let bufs = unsafe { Buffers::new(gpu, log_d, lanes) }.unwrap();
                     let msg: Vec<F128> = (0..bufs.msg_words()).map(|_| rng.f128()).collect();
                     let (cw_ref, tree_ref) = cpu_commit(&msg, log_d, lanes);
+                    // The hybrid fills the message by ranges; every position
+                    // must be covered exactly once across the two phases.
+                    let fill = |m: &mut [F128], pos: core::ops::Range<usize>| {
+                        let r = pos.start * lanes..pos.end * lanes;
+                        m[r.clone()].copy_from_slice(&msg[r]);
+                    };
                     for (first16, k) in [(0usize, 1usize), (6, 5), (16, 8), (3, 15)] {
                         unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                msg.as_ptr(),
-                                gpu.contents(bufs.msg_buf).cast(),
-                                msg.len(),
+                            let msg_buf = core::slice::from_raw_parts_mut(
+                                gpu.contents(bufs.msg_buf).cast::<F128>(),
+                                bufs.msg_words(),
                             );
+                            msg_buf.fill(F128::new(0xBAD, 0xBAD));
                             // Stale bytes must not survive.
                             core::ptr::write_bytes(
                                 gpu.contents(bufs.code_buf),
@@ -2300,7 +2457,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                                 0x5A,
                                 bufs.tree_nodes() * 32,
                             );
-                            run_hybrid(gpu, &bufs, first16, k).unwrap();
+                            run_hybrid(gpu, &bufs, first16, k, &fill, msg_buf).unwrap();
                             let cw = core::slice::from_raw_parts(
                                 gpu.contents(bufs.code_buf).cast::<F128>(),
                                 bufs.code_words(),
