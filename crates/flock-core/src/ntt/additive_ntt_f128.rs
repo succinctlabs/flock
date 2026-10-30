@@ -156,7 +156,12 @@ pub struct AdditiveNttF128 {
     evals: Vec<Vec<F128>>,
     /// Per-layer twiddle offsets, empty for an ordinary transform. A
     /// [`Self::sub_block`] transform adds `offsets[l]` to every twiddle of
-    /// layer `l`.
+    /// layer `l`. Only built with the Metal commit (and in tests), so the
+    /// default build's `twiddle` has no branch.
+    #[cfg(any(
+        test,
+        all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+    ))]
     offsets: Vec<F128>,
 }
 
@@ -165,6 +170,10 @@ impl AdditiveNttF128 {
     pub fn new(basis: &[F128]) -> Self {
         Self {
             evals: generate_evals_from_subspace(basis),
+            #[cfg(any(
+                test,
+                all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+            ))]
             offsets: Vec::new(),
         }
     }
@@ -190,11 +199,15 @@ impl AdditiveNttF128 {
     /// which is "absorbed" into the butterfly and not in the twiddle.)
     pub fn twiddle(&self, layer: usize, block: usize) -> F128 {
         let v = &self.evals[self.log_domain_size() - layer - 1];
-        if self.offsets.is_empty() {
-            span_get(&v[1..], block)
-        } else {
-            span_get(&v[1..], block) + self.offsets[layer]
+        let t = span_get(&v[1..], block);
+        #[cfg(any(
+            test,
+            all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+        ))]
+        if !self.offsets.is_empty() {
+            return t + self.offsets[layer];
         }
+        t
     }
 
     /// The transform of block `block` at layer `start_layer` of this one, as
@@ -207,6 +220,10 @@ impl AdditiveNttF128 {
     /// layer `start_layer + l` are `(block << l) | c`, so the sub-transform's
     /// twiddles are this one's at `c`, using the same `evals` rows, plus a
     /// per-layer constant: `twiddle(start_layer + l, block << l)`.
+    #[cfg(any(
+        test,
+        all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+    ))]
     #[cfg_attr(
         not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
         allow(dead_code)
