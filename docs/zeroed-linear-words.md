@@ -149,6 +149,14 @@ Throughout, `D` is the set of dropped rows, the words of
      - **Where it showed:** the leanXMSS tests at two signatures, on
        CI's x86 RS route. The AG zerocheck reads per block, exactly, so
        ARM never showed it.
+     - **The same window read dead padding.** At `ν < 6` it also read a
+       partial slot's dummy rows. The union prover leaves those dirty
+       (`PooledDirty`, and elided dead `a`/`b` writes) on the stated
+       assumption that neither zerocheck reads a dead bit. It was flaky:
+       whatever earlier tests left in the pool. #66's x86 job passed by
+       luck, and forcing RS on ARM failed even there.
+       `UnionInstance::zerocheck_reads_exact` now gates both the dropping
+       and the dirty buffers, so below `ν = 6` the padding is honestly zero.
      - **Cost:** nothing at production sizes (leanXMSS at 1000 signatures
        runs at `ν = 15`).
 

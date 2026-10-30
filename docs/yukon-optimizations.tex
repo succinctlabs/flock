@@ -1377,9 +1377,13 @@ round~1 reads each $8192$-bit window up to its highest useful bit, so it
 skips a dropped column only when the column, $2^{7+\nu}$ bits, covers whole
 windows. At $\nu = 5$ the round-1 message counted a dropped column that
 the fold treated as zero, and the final check failed on x86, where the RS
-route runs; the AG zerocheck reads per block and never showed it.
-Production slots are far above the threshold ($\nu = 15$ for leanXMSS at
-$1000$ signatures).
+route runs; the AG zerocheck reads per block and never showed it. The
+same window read a partial slot's dummy rows, which the union prover
+leaves dirty on the stated assumption that neither zerocheck reads a dead
+bit: a flaky failure that depended on what earlier tests had left in the
+scratch pool. One predicate, $7 + \nu \ge 13$, now gates both the dropped
+words and the dirty buffers. Production slots are far above the threshold
+($\nu = 15$ for leanXMSS at $1000$ signatures).
 
 The first version of this change dropped input words regardless of the
 commit mode. Reading the full-height soundness note against the wiring's

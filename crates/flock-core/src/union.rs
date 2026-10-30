@@ -363,6 +363,17 @@ impl<'r> UnionInstance<'r> {
         heights
     }
 
+    /// Whether both boolean zerochecks read no declared-dead bit. The AG
+    /// zerocheck reads per block, exactly. The RS one's round 1 reads each
+    /// 8192-bit window up to its highest useful bit ([`ROUND1_WINDOW_LOG`]),
+    /// so it is exact only when no window holds a dead bit below a live one:
+    /// when a word column, `2^(7 + nu)` bits, covers whole windows (`nu >=
+    /// 6`). Below that, the witness's dead padding must be honestly zero
+    /// and no word may drop.
+    pub fn zerocheck_reads_exact(&self) -> bool {
+        7 + self.n_log() >= ROUND1_WINDOW_LOG
+    }
+
     /// Slot `t`'s zeroed words ([`TableType::zeroed_word_cols`]) as the
     /// boolean PIOP drops them: its type's list, or none where the slot
     /// commits dummy rows (full height and `0 < n_t < 2^nu`).
@@ -384,7 +395,7 @@ impl<'r> UnionInstance<'r> {
     /// covers whole windows: a word column is `2^(7 + nu)` bits.
     pub fn zeroed_word_cols(&self, t: usize) -> &'r [usize] {
         let n_t = self.counts()[t];
-        if self.committed_rows(n_t) > n_t || 7 + self.n_log() < ROUND1_WINDOW_LOG {
+        if self.committed_rows(n_t) > n_t || !self.zerocheck_reads_exact() {
             &[]
         } else {
             &self.instance.registry().types()[t].zeroed_word_cols

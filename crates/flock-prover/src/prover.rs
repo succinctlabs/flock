@@ -476,8 +476,9 @@ fn build_union_witness(
     // argument that says nothing about `a`/`b`. Element registries are
     // excluded for the same reason they are there: their `a`/`b` are derived
     // by gather rather than run-list gated.
-    let dead_padding_unread =
-        !union.has_element() && union.m_total() - union.n_log() >= pcs::LOG_PACKING;
+    let dead_padding_unread = !union.has_element()
+        && union.m_total() - union.n_log() >= pcs::LOG_PACKING
+        && union.zerocheck_reads_exact();
     let nu = union.n_log();
     // Live-only element `pa`/`pb` derivation: when the region zerocheck will
     // take its sparse arm, dead rows of `a`/`b` are unread everywhere (their
@@ -921,9 +922,12 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
     // Flavor-independent since the AG round 1 + fold went run-list-gated
     // (Dead blocks skipped, Partial blocks cleansed — no declared-dead bit
     // is read on either flavor).
+    // And not below `nu = 6`, where the RS round 1 reads straddled windows
+    // ([`UnionInstance::zerocheck_reads_exact`]).
     let padding_unread = !union.has_element()
         && !union.compaction_is_identity()
-        && union.m_total() - union.n_log() >= LOG_PACKING;
+        && union.m_total() - union.n_log() >= LOG_PACKING
+        && union.zerocheck_reads_exact();
     let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
         build_union_witness(union, sources, padding_unread);
     // Where the witness buffers return: the dirty scratch pool for the pooled
