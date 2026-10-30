@@ -1,0 +1,130 @@
+// ===========================================================================
+// AG zerocheck round 1 on the GPU (prototype).
+//
+// The same sums as the CPU kernel
+// `round1_straight_line_program_packed_banks_fused_padded` over Full blocks:
+// for each 1024-byte block o (128 rows of 64 bits) with weight eq[o],
+//   res[j]   += eq[o] * P_j      (j < 160, the product planes)
+//   bank0[k] += eq[o] * (C_k & even rows),  bank1[k] += eq[o] * (C_k & odd rows)
+// where a plane is the 128-bit value whose bit r is the coordinate's bit in
+// row r, read as an F128.
+//
+// A 32-thread group takes 8 blocks per batch, 4 threads per block (one per
+// 32-row word). Each thread transposes its rows into plane words, runs the
+// encode (ag_encode) on a and b, and forms its word of the 288 output
+// planes. The fold exchanges words through threadgroup memory, 32
+// coordinates at a time: thread t multiplies coordinate t's plane for each
+// of the batch's 8 blocks by that block's eq (nibble tables built per batch)
+// and accumulates in registers across batches. Each group writes 288
+// partial sums; the host XORs them.
+// ===========================================================================
+
+struct AgRound1Params {
+    uint n_blocks;   // a multiple of 8
+};
+
+// In-place transpose of a 32x32 bit matrix: afterwards a[p] bit i is the old
+// a[i] bit p (LSB-first indexing).
+static void transpose32(thread uint* a) {
+    uint m = 0x0000FFFFu;
+    for (uint j = 16u; j != 0u; j >>= 1, m ^= (m << j)) {
+        for (uint k = 0u; k < 32u; k = ((k | j) + 1u) & ~j) {
+            uint t = ((a[k] >> j) ^ a[k | j]) & m;
+            a[k] ^= t << j;
+            a[k | j] ^= t;
+        }
+    }
+}
+
+// The 64 plane words of one 32-row word of a block: rows 32w..32w+31.
+static void plane_words(device const uint2* rows, thread uint* planes) {
+    uint lo[32];
+    uint hi[32];
+    for (uint i = 0u; i < 32u; i++) {
+        uint2 r = rows[i];
+        lo[i] = r.x;
+        hi[i] = r.y;
+    }
+    transpose32(lo);
+    transpose32(hi);
+    for (uint p = 0u; p < 32u; p++) {
+        planes[p] = lo[p];
+        planes[32u + p] = hi[p];
+    }
+}
+
+kernel void ag_round1(device const uint2* a          [[buffer(0)]],
+                      device const uint2* b          [[buffer(1)]],
+                      device const uint2* c          [[buffer(2)]],
+                      device const uint4* eq         [[buffer(3)]],
+                      device uint4* partial          [[buffer(4)]],
+                      constant AgRound1Params& P     [[buffer(5)]],
+                      uint tgid    [[threadgroup_position_in_grid]],
+                      uint ngroups [[threadgroups_per_grid]],
+                      uint lid     [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 tabs[8u * 64u];
+    threadgroup uint xch[32u * 8u * 4u];
+
+    const uint bi = lid >> 2;
+    const uint w = lid & 3u;
+    uint4 acc[9];
+    for (uint q = 0u; q < 9u; q++) { acc[q] = uint4(0u); }
+
+    const uint n_batches = P.n_blocks >> 3;
+    for (uint batch = tgid; batch < n_batches; batch += ngroups) {
+        // The batch's 8 eq weights as four-nibble tables (gf_mul_tab4).
+        for (uint e = lid; e < 512u; e += 32u) {
+            uint bb = e >> 6, ent = e & 63u, k = ent >> 4, n = ent & 15u;
+            uint4 base = eq[(batch << 3) + bb];
+            for (uint m = 0u; m < 4u * k; m++) { base = gf_mulx(base); }
+            uint4 v = uint4(0u);
+            for (uint t = 0u; t < 4u; t++) {
+                if ((n >> t) & 1u) { v ^= base; }
+                base = gf_mulx(base);
+            }
+            tabs[e] = v;
+        }
+
+        const uint blk = (batch << 3) + bi;
+        const uint row0 = blk * 128u + 32u * w;
+        uint pa[64], pb[64], pc[64];
+        plane_words(a + row0, pa);
+        plane_words(b + row0, pb);
+        plane_words(c + row0, pc);
+        uint af[160], bf[160];
+        ag_encode(pa, af);
+        ag_encode(pb, bf);
+
+        uint prod[288];
+        for (uint p = 0u; p < 64u; p++) {
+            prod[p] = (af[p] & pb[p]) ^ (pa[p] & bf[p]);
+            prod[64u + p] = (af[64u + p] & pb[p]) ^ (af[p] & bf[p]) ^ (pa[p] & bf[64u + p]);
+        }
+        for (uint p = 0u; p < 32u; p++) {
+            prod[128u + p] = (af[128u + p] & pb[p]) ^ (af[64u + p] & bf[p])
+                           ^ (af[p] & bf[64u + p]) ^ (pa[p] & bf[128u + p]);
+        }
+        for (uint k = 0u; k < 64u; k++) {
+            prod[160u + k] = pc[k] & 0x55555555u;   // even rows
+            prod[224u + k] = pc[k] & 0xAAAAAAAAu;   // odd rows
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // tables ready
+
+        for (uint ch = 0u; ch < 9u; ch++) {
+            for (uint q = 0u; q < 32u; q++) {
+                xch[((q << 3) + bi) * 4u + w] = prod[(ch << 5) + q];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint bb = 0u; bb < 8u; bb++) {
+                uint base = ((lid << 3) + bb) * 4u;
+                uint4 plane = uint4(xch[base], xch[base + 1u], xch[base + 2u], xch[base + 3u]);
+                acc[ch] ^= gf_mul_tab4(plane, &tabs[bb << 6]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    for (uint ch = 0u; ch < 9u; ch++) {
+        partial[tgid * 288u + (ch << 5) + lid] = acc[ch];
+    }
+}

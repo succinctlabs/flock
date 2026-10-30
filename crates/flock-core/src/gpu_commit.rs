@@ -2391,10 +2391,215 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         Some(GpuCommit::Gpu(codeword, tree))
     }
 
+    // -----------------------------------------------------------------------
+    // AG zerocheck round 1 on the GPU: a prototype, test-only until it is
+    // wired into the prover (see `ag_round1_timing`).
+    // -----------------------------------------------------------------------
+
+    /// The prototype's library source: the commit kernels' field helpers,
+    /// the generated encode, and the kernel.
+    #[cfg(test)]
+    fn ag_round1_source() -> String {
+        let kernel = include_str!("gpu_ag_round1.msl");
+        format!(
+            "{MSL_SOURCE}\n{}\n{kernel}",
+            include_str!("gpu_ag_encode.msl")
+        )
+    }
+
+    /// The `ag_round1` pipeline, compiled on first use (kept as an address:
+    /// the pipeline object is thread-safe).
+    #[cfg(test)]
+    fn ag_round1_pso(gpu: &Gpu) -> Result<Id, String> {
+        static PSO: OnceLock<Result<usize, String>> = OnceLock::new();
+        PSO.get_or_init(|| unsafe {
+            let api = &gpu.api;
+            let pool = (api.pool_push)();
+            let made = (|| {
+                let src = api.nsstring(&ag_round1_source())?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "ag_round1 compile failed: {}",
+                        api.error_string(err)
+                    ));
+                }
+                let name = api.nsstring("ag_round1")?;
+                let f: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    name
+                );
+                if f.is_null() {
+                    return Err("ag_round1 not found".into());
+                }
+                let mut err: Id = NIL;
+                let pso: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut err
+                );
+                if pso.is_null() {
+                    return Err(format!("ag_round1 pipeline: {}", api.error_string(err)));
+                }
+                Ok(pso as usize)
+            })();
+            (api.pool_pop)(pool);
+            made
+        })
+        .clone()
+        .map(|p| p as Id)
+    }
+
+    /// The prototype's sums over `eq.len()` Full blocks (a multiple of 8):
+    /// `(res, bank0, bank1)` as the CPU kernel returns them, plus the GPU
+    /// execution time in ms. Copies its inputs into fresh shared buffers.
+    #[cfg(test)]
+    pub(crate) fn ag_round1_on_gpu(
+        a: &[u8],
+        b: &[u8],
+        c: &[u8],
+        eq: &[F128],
+        groups: usize,
+    ) -> Result<([F128; 160], [F128; 64], [F128; 64], f64), String> {
+        let n = eq.len();
+        assert!(
+            n.is_multiple_of(8) && a.len() == n * 1024 && b.len() == a.len() && c.len() == a.len()
+        );
+        let gpu = gpu()?;
+        let pso = ag_round1_pso(gpu)?;
+        let groups = groups.clamp(1, n / 8);
+        unsafe {
+            let upload = |data: &[u8]| -> Result<Id, String> {
+                let buf = gpu.new_buffer(data.len().max(16))?;
+                core::ptr::copy_nonoverlapping(data.as_ptr(), gpu.contents(buf), data.len());
+                Ok(buf)
+            };
+            let eq_bytes = core::slice::from_raw_parts(eq.as_ptr().cast::<u8>(), n * 16);
+            let bufs = [
+                upload(a)?,
+                upload(b)?,
+                upload(c)?,
+                upload(eq_bytes)?,
+                gpu.new_buffer(groups * 288 * 16)?,
+            ];
+            let pool = (gpu.api.pool_push)();
+            let ran = (|| {
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, pso);
+                for (i, &buf) in bufs.iter().enumerate() {
+                    gpu.set_buffer(enc, buf, 0, i);
+                }
+                gpu.set_bytes(enc, &(n as u32), 5);
+                gpu.dispatch(enc, groups as u64, 32);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb)?;
+                Ok::<f64, String>(gpu_exec_ms(gpu, cb))
+            })();
+            (gpu.api.pool_pop)(pool);
+            let ms = ran;
+            let partial =
+                core::slice::from_raw_parts(gpu.contents(bufs[4]).cast::<F128>(), groups * 288);
+            let mut sums = [F128::ZERO; 288];
+            for g in partial.as_chunks::<288>().0 {
+                for (s, &v) in sums.iter_mut().zip(g) {
+                    *s += v;
+                }
+            }
+            for buf in bufs {
+                gpu.release(buf);
+            }
+            let ms = ms?;
+            let mut res = [F128::ZERO; 160];
+            let mut b0 = [F128::ZERO; 64];
+            let mut b1 = [F128::ZERO; 64];
+            res.copy_from_slice(&sums[..160]);
+            b0.copy_from_slice(&sums[160..224]);
+            b1.copy_from_slice(&sums[224..]);
+            Ok((res, b0, b1, ms))
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use crate::test_rng::Rng;
+
+        /// The GPU AG round-1 prototype equals the CPU kernel on random Full
+        /// blocks: the 160 product sums and both c banks.
+        #[test]
+        fn ag_round1_matches_cpu() {
+            if let Err(e) = gpu() {
+                eprintln!("no Metal device ({e}); skipping");
+                return;
+            }
+            let mut rng = Rng::new(53);
+            let n = 64usize;
+            let bytes =
+                |rng: &mut Rng| -> Vec<u8> { (0..n * 1024).map(|_| rng.f128().lo as u8).collect() };
+            let (a, b, c) = (bytes(&mut rng), bytes(&mut rng), bytes(&mut rng));
+            let eq: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let coverage = vec![crate::zerocheck::BlockCoverage::Full; n];
+            let (res, b0, b1) = crate::genus95_curve_code::round1::round1_straight_line_program_packed_banks_fused_padded(
+                &a, &b, &c, &eq, &coverage,
+            );
+            for groups in [1usize, 3, 8] {
+                let (gres, gb0, gb1, _) = ag_round1_on_gpu(&a, &b, &c, &eq, groups).unwrap();
+                assert!(gb0 == b0, "bank0, {groups} groups");
+                assert!(gb1 == b1, "bank1, {groups} groups");
+                assert!(gres == res, "res, {groups} groups");
+            }
+        }
+
+        /// GPU vs CPU time of round 1 at production-like size: run with
+        /// `--ignored --nocapture` (`AG_BLOCKS` = log2 blocks, default 17).
+        #[test]
+        #[ignore]
+        fn ag_round1_timing() {
+            let lg: usize = std::env::var("AG_BLOCKS").map_or(17, |v| v.parse().unwrap());
+            let n = 1usize << lg;
+            let mut rng = Rng::new(7);
+            let bytes = |rng: &mut Rng| -> Vec<u8> {
+                let words: Vec<F128> = (0..n * 64).map(|_| rng.f128()).collect();
+                unsafe { core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), n * 1024) }
+                    .to_vec()
+            };
+            let (a, b, c) = (bytes(&mut rng), bytes(&mut rng), bytes(&mut rng));
+            let eq: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let coverage = vec![crate::zerocheck::BlockCoverage::Full; n];
+            for rep in 0..3 {
+                let t = std::time::Instant::now();
+                let cpu = crate::genus95_curve_code::round1::round1_straight_line_program_packed_banks_fused_padded(
+                    &a, &b, &c, &eq, &coverage,
+                );
+                let cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+                for groups in [256usize, 1024, 4096] {
+                    let t = std::time::Instant::now();
+                    let (gres, ..) = ag_round1_on_gpu(&a, &b, &c, &eq, groups).unwrap();
+                    let wall = t.elapsed().as_secs_f64() * 1e3;
+                    let (_, _, _, gpu_ms) = ag_round1_on_gpu(&a, &b, &c, &eq, groups).unwrap();
+                    assert!(gres == cpu.0);
+                    eprintln!(
+                        "2^{lg} blocks rep {rep}: cpu {cpu_ms:.1} ms | gpu {groups} groups: {gpu_ms:.1} ms exec ({wall:.1} wall incl. copies)"
+                    );
+                }
+            }
+        }
 
         /// GPU execution time of one command buffer (`GPUEndTime −
         /// GPUStartTime`), in ms.
