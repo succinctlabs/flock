@@ -40,30 +40,35 @@ impl ColumnSchema for Blake3Schema {
             counter: words(v, COUNTER_FIELD, ColumnRole::Input, 32),
             block_len: v.word_aligned(BLOCK_LEN_FIELD, ColumnRole::Input, 32),
             flags: v.word_aligned(FLAGS_FIELD, ColumnRole::Input, 32),
-            rounds: (0..7)
-                .map(|r| {
-                    std::array::from_fn(|i| {
-                        let p = format!("rounds.{r}.g-{i}");
-                        GCols {
-                            a_first: Add3::columns(v, &format!("{p}.a-first")),
-                            // Only these four C lanes still contain a fixed IV word.
-                            c_first: if r == 0 && i < 4 {
-                                FirstC::Constant(AddConst32::columns(
-                                    v,
-                                    &format!("{p}.c-first"),
-                                    blake3::BLAKE3_IV[i],
-                                ))
-                            } else {
-                                FirstC::Variable(Add32::columns(v, &format!("{p}.c-first")))
-                            },
-                            a_second: Add3::columns(v, &format!("{p}.a-second")),
-                            c_second: Add32::columns(v, &format!("{p}.c-second")),
-                        }
-                    })
-                })
-                .collect(),
+            rounds: round_columns(v, "rounds"),
             out_lo: words(v, OUT_LO_FIELD, ColumnRole::Output, blake3::SLOT_BITS),
             out_hi: words(v, OUT_HI_FIELD, ColumnRole::Output, blake3::SLOT_BITS / 2),
         }
     }
+}
+
+/// The seven rounds' G columns, named `{prefix}.{round}.g-{i}.*`.
+pub fn round_columns<V: ColumnVisitor>(v: &mut V, prefix: &str) -> Vec<[GCols<V::Value>; 8]> {
+    (0..7)
+        .map(|r| {
+            std::array::from_fn(|i| {
+                let p = format!("{prefix}.{r}.g-{i}");
+                GCols {
+                    a_first: Add3::columns(v, &format!("{p}.a-first")),
+                    // Only these four C lanes still contain a fixed IV word.
+                    c_first: if r == 0 && i < 4 {
+                        FirstC::Constant(AddConst32::columns(
+                            v,
+                            &format!("{p}.c-first"),
+                            blake3::BLAKE3_IV[i],
+                        ))
+                    } else {
+                        FirstC::Variable(Add32::columns(v, &format!("{p}.c-first")))
+                    },
+                    a_second: Add3::columns(v, &format!("{p}.a-second")),
+                    c_second: Add32::columns(v, &format!("{p}.c-second")),
+                }
+            })
+        })
+        .collect()
 }

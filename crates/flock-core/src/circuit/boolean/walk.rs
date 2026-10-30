@@ -15,8 +15,10 @@ use super::{
 
 mod forward;
 mod packed;
+mod sliced;
 
 pub use forward::ForwardTrace;
+pub(crate) use sliced::{KernelSite, SlicedProgram};
 
 /// A compiled, layout-specific structural circuit walk.
 ///
@@ -35,6 +37,9 @@ pub struct WalkPlan {
     occupied_positions: Vec<usize>,
     expression_fanout: Vec<usize>,
     stats: WalkStats,
+    /// The flat instruction stream of [`Self::forward_sliced_compact`],
+    /// built on first use.
+    sliced: std::sync::OnceLock<sliced::SlicedProgram>,
 }
 
 /// Capacity-bound lincheck view of a structural [`WalkPlan`].
@@ -161,7 +166,7 @@ impl fmt::Display for WalkError {
 
 impl std::error::Error for WalkError {}
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
     Zero,
     Value(usize),
@@ -359,6 +364,7 @@ impl WalkPlan {
                 xor_term_bytes,
                 xor_term_allocations: xor_nodes,
             },
+            sliced: std::sync::OnceLock::new(),
         })
     }
 

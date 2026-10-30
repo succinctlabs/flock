@@ -451,14 +451,28 @@ impl BlockR1cs {
 /// `pub(crate)` so [`crate::schedule::Registry::digest`] absorbs matrices
 /// with the exact same encoding rather than duplicating it.
 pub(crate) fn absorb_matrix(h: &mut Hasher, m: &SparseBinaryMatrix) {
-    h.update(&(m.num_rows as u64).to_le_bytes());
-    h.update(&(m.num_cols as u64).to_le_bytes());
+    // One little-endian u64 per dimension, row length and column index,
+    // staged through a buffer: BLAKE3's output does not depend on how the
+    // input is split across `update` calls, and a call per word dominated
+    // the digest of a large table (BLAKE3's 44M nonzeros).
+    const FLUSH: usize = 1 << 16;
+    let mut buf = Vec::with_capacity(FLUSH + 8);
+    let mut word = |v: usize, buf: &mut Vec<u8>| {
+        buf.extend_from_slice(&(v as u64).to_le_bytes());
+        if buf.len() >= FLUSH {
+            h.update(buf);
+            buf.clear();
+        }
+    };
+    word(m.num_rows, &mut buf);
+    word(m.num_cols, &mut buf);
     for row in m.rows.iter() {
-        h.update(&(row.len() as u64).to_le_bytes());
+        word(row.len(), &mut buf);
         for &col in row {
-            h.update(&(col as u64).to_le_bytes());
+            word(col, &mut buf);
         }
     }
+    h.update(&buf);
 }
 
 /// Block-diagonal `(I_{2^n_log} ⊗ M_0) · z` over GF(2).

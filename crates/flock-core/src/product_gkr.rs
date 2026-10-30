@@ -1141,7 +1141,7 @@ impl BatchedGrinding {
     }
 
     #[inline]
-    fn fingerprint_bits_for(self, live_entries: usize) -> u32 {
+    pub(crate) fn fingerprint_bits_for(self, live_entries: usize) -> u32 {
         if self.fingerprint_bits == 0 {
             0
         } else {
@@ -1354,6 +1354,67 @@ fn prove_batched_grouped<C: Challenger>(
     };
     tp(&mut t, "  leaves(grouped)");
 
+    let GroupedReduction {
+        top_lhs,
+        top_rhs,
+        layers,
+        rho,
+        claim_l,
+        claim_r,
+    } = reduce_grouped(lhs, rhs, mu, grinding, grinding_nonces, ch, &mut t);
+
+    let basis = s_id_basis(mu);
+    let s_sigma_eval = sparse_sigma_eval(sigma, m, &rho);
+    let lv = m.live_eval(&rho);
+    let tail = (beta + F128::ONE) * lv + F128::ONE;
+    let f_eval = claim_l + alpha * m.masked_id_eval(&basis, &rho) + tail;
+    let g_eval = claim_r + alpha * s_sigma_eval + tail;
+    observe_evals(ch, &[f_eval, g_eval, s_sigma_eval]);
+    tp(&mut t, "evals(grouped)");
+
+    let proof = ProductGkrBatchedProof {
+        top_lhs,
+        top_rhs,
+        layers,
+        f_eval,
+        g_eval,
+        s_sigma_eval,
+        grinding_nonces: take(grinding_nonces),
+    };
+    let claim = ProductGkrBatchedClaim {
+        rho,
+        f_eval,
+        g_eval,
+        s_sigma_eval,
+    };
+    (proof, claim)
+}
+
+/// The grouped pipeline's output: both roots, the per-layer reductions, and
+/// the final point with each side's leaf claim there.
+struct GroupedReduction {
+    top_lhs: F128,
+    top_rhs: F128,
+    layers: Vec<BatchedLayerProof>,
+    rho: Vec<F128>,
+    claim_l: F128,
+    claim_r: F128,
+}
+
+/// Build both product circuits over grouped leaves, observe their roots, and
+/// reduce them layer by layer to one point `ρ ∈ F^μ`. The two sides may have
+/// different live prefixes; their grouping (`rows`, group count) must match.
+fn reduce_grouped<C: Challenger>(
+    lhs: GVec,
+    rhs: GVec,
+    mu: usize,
+    grinding: BatchedGrinding,
+    grinding_nonces: &mut Vec<u64>,
+    ch: &mut C,
+    t: &mut Instant,
+) -> GroupedReduction {
+    debug_assert_eq!((lhs.rows, lhs.lens.len()), (rhs.rows, rhs.lens.len()));
+    debug_assert_eq!(lhs.rows * lhs.lens.len(), 1usize << mu);
     // Layer stack, built downward: stack[d] is layer `mu − d`.
     let mut l_layers: Vec<GVec> = Vec::with_capacity(mu + 1);
     let mut r_layers: Vec<GVec> = Vec::with_capacity(mu + 1);
@@ -1367,7 +1428,7 @@ fn prove_batched_grouped<C: Challenger>(
     let top_rhs = r_layers[mu].val(0);
     ch.observe_f128(top_lhs);
     ch.observe_f128(top_rhs);
-    tp(&mut t, "  build-layers(grouped)");
+    tp(t, "  build-layers(grouped)");
 
     let mut r_pt: Vec<F128> = Vec::new();
     let mut layers = Vec::with_capacity(mu);
@@ -1511,34 +1572,15 @@ fn prove_batched_grouped<C: Challenger>(
             (tot.saturating_sub(d_eq + d_msg + d_fold)).as_secs_f64() * 1e3,
         );
     }
-    tp(&mut t, "layer-sumchecks(grouped)");
-
-    let rho = r_pt;
-    let basis = s_id_basis(mu);
-    let s_sigma_eval = sparse_sigma_eval(sigma, m, &rho);
-    let lv = m.live_eval(&rho);
-    let tail = (beta + F128::ONE) * lv + F128::ONE;
-    let f_eval = claim_l + alpha * m.masked_id_eval(&basis, &rho) + tail;
-    let g_eval = claim_r + alpha * s_sigma_eval + tail;
-    observe_evals(ch, &[f_eval, g_eval, s_sigma_eval]);
-    tp(&mut t, "evals(grouped)");
-
-    let proof = ProductGkrBatchedProof {
+    tp(t, "layer-sumchecks(grouped)");
+    GroupedReduction {
         top_lhs,
         top_rhs,
         layers,
-        f_eval,
-        g_eval,
-        s_sigma_eval,
-        grinding_nonces: take(grinding_nonces),
-    };
-    let claim = ProductGkrBatchedClaim {
-        rho,
-        f_eval,
-        g_eval,
-        s_sigma_eval,
-    };
-    (proof, claim)
+        rho: r_pt,
+        claim_l,
+        claim_r,
+    }
 }
 
 fn prove_batched_impl<C: Challenger>(
@@ -1920,65 +1962,20 @@ fn verify_batched_core<C: Challenger>(
     if proof.grinding_nonces.len() != grinding.nonce_count(mu, live_entries) {
         return Err(ProductGkrError::InvalidGrinding);
     }
-    let mut nonce_idx = 0usize;
-    let mut verify_grind_sample = |ch: &mut C, bits: u32| -> Result<F128, ProductGkrError> {
-        if bits != 0 {
-            let nonce = proof.grinding_nonces[nonce_idx];
-            nonce_idx += 1;
-            ch.verify_pow_and_sample_f128(nonce, bits)
-                .ok_or(ProductGkrError::InvalidGrinding)
-        } else {
-            Ok(ch.sample_f128())
-        }
-    };
+    let mut nonces = NonceReader::new(&proof.grinding_nonces);
 
     ch.observe_label(DOMAIN_BATCHED);
-    let alpha = verify_grind_sample(ch, grinding.fingerprint_bits_for(live_entries))?;
+    let alpha = nonces.sample(ch, grinding.fingerprint_bits_for(live_entries))?;
     let beta = ch.sample_f128();
 
-    ch.observe_f128(proof.top_lhs);
-    ch.observe_f128(proof.top_rhs);
-    if proof.top_lhs != proof.top_rhs {
-        return Err(ProductGkrError::ProductMismatch);
-    }
-
-    let mut claim_l = proof.top_lhs;
-    let mut claim_r = proof.top_rhs;
-    let mut r_pt: Vec<F128> = Vec::new();
-    for (k, layer) in proof.layers.iter().enumerate() {
-        if layer.rounds.len() != k {
-            return Err(ProductGkrError::MalformedProof);
-        }
-        let lambda = verify_grind_sample(ch, grinding.lambda_bits)?;
-        let mut c_run = claim_l + lambda * claim_r;
-        let mut r_prime = Vec::with_capacity(k + 1);
-        for i in 0..k {
-            let (g1, g_inf) = layer.rounds[i];
-            let r_eq = r_pt[i];
-            let one_plus_r_eq = F128::ONE + r_eq;
-            let g0 = (c_run + r_eq * g1) * one_plus_r_eq.inv();
-            ch.observe_f128(g1);
-            ch.observe_f128(g_inf);
-            let rho = verify_grind_sample(ch, grinding.round_bits)?;
-            r_prime.push(rho);
-            let one_plus_rho = F128::ONE + rho;
-            c_run = g0 * one_plus_rho + g1 * rho + g_inf * rho * one_plus_rho;
-        }
-        let (vl0, vl1, vr0, vr1) = (layer.vl0, layer.vl1, layer.vr0, layer.vr1);
-        for v in [vl0, vl1, vr0, vr1] {
-            ch.observe_f128(v);
-        }
-        let gate = vl0 * vl1 + lambda * (vr0 * vr1);
-        if c_run != gate {
-            return Err(ProductGkrError::LayerCheckFailed);
-        }
-        let c_k = verify_grind_sample(ch, grinding.close_bits)?;
-        let one_plus_c = F128::ONE + c_k;
-        claim_l = one_plus_c * vl0 + c_k * vl1;
-        claim_r = one_plus_c * vr0 + c_k * vr1;
-        r_prime.push(c_k);
-        r_pt = r_prime;
-    }
+    let (r_pt, claim_l, claim_r) = verify_reduction(
+        proof.top_lhs,
+        proof.top_rhs,
+        &proof.layers,
+        grinding,
+        &mut nonces,
+        ch,
+    )?;
 
     // Input-layer checks at the shared ρ: both reconstructed affinely, sharing
     // the single witness eval (f_eval = g_eval = w(ρ) when f = g = w). With a
@@ -2031,7 +2028,7 @@ fn verify_batched_core<C: Challenger>(
     }
 
     observe_evals(ch, &[proof.f_eval, proof.g_eval, s_sigma]);
-    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
+    debug_assert!(nonces.is_spent());
 
     Ok(ProductGkrBatchedClaim {
         rho: r_pt,
@@ -2039,6 +2036,215 @@ fn verify_batched_core<C: Challenger>(
         g_eval: proof.g_eval,
         s_sigma_eval: s_sigma,
     })
+}
+
+/// The verifier's cursor over a proof's grinding nonces, in transcript order.
+struct NonceReader<'a> {
+    nonces: &'a [u64],
+    next: usize,
+}
+
+impl<'a> NonceReader<'a> {
+    fn new(nonces: &'a [u64]) -> Self {
+        Self { nonces, next: 0 }
+    }
+
+    /// Sample a challenge, checking the next nonce's PoW when `bits ≠ 0`.
+    fn sample<C: Challenger>(&mut self, ch: &mut C, bits: u32) -> Result<F128, ProductGkrError> {
+        if bits == 0 {
+            return Ok(ch.sample_f128());
+        }
+        let nonce = *self
+            .nonces
+            .get(self.next)
+            .ok_or(ProductGkrError::InvalidGrinding)?;
+        self.next += 1;
+        ch.verify_pow_and_sample_f128(nonce, bits)
+            .ok_or(ProductGkrError::InvalidGrinding)
+    }
+
+    fn is_spent(&self) -> bool {
+        self.next == self.nonces.len()
+    }
+}
+
+/// Replay both product circuits' layer reductions from their roots: checks
+/// the roots agree and every layer's sumcheck, and returns the final point
+/// `ρ` with the LHS and RHS leaf claims there. The caller checks those claims
+/// against the leaves it can reconstruct.
+fn verify_reduction<C: Challenger>(
+    top_lhs: F128,
+    top_rhs: F128,
+    layers: &[BatchedLayerProof],
+    grinding: BatchedGrinding,
+    nonces: &mut NonceReader<'_>,
+    ch: &mut C,
+) -> Result<(Vec<F128>, F128, F128), ProductGkrError> {
+    ch.observe_f128(top_lhs);
+    ch.observe_f128(top_rhs);
+    if top_lhs != top_rhs {
+        return Err(ProductGkrError::ProductMismatch);
+    }
+
+    let mut claim_l = top_lhs;
+    let mut claim_r = top_rhs;
+    let mut r_pt: Vec<F128> = Vec::new();
+    for (k, layer) in layers.iter().enumerate() {
+        if layer.rounds.len() != k {
+            return Err(ProductGkrError::MalformedProof);
+        }
+        let lambda = nonces.sample(ch, grinding.lambda_bits)?;
+        let mut c_run = claim_l + lambda * claim_r;
+        let mut r_prime = Vec::with_capacity(k + 1);
+        for i in 0..k {
+            let (g1, g_inf) = layer.rounds[i];
+            let r_eq = r_pt[i];
+            let one_plus_r_eq = F128::ONE + r_eq;
+            let g0 = (c_run + r_eq * g1) * one_plus_r_eq.inv();
+            ch.observe_f128(g1);
+            ch.observe_f128(g_inf);
+            let rho = nonces.sample(ch, grinding.round_bits)?;
+            r_prime.push(rho);
+            let one_plus_rho = F128::ONE + rho;
+            c_run = g0 * one_plus_rho + g1 * rho + g_inf * rho * one_plus_rho;
+        }
+        let (vl0, vl1, vr0, vr1) = (layer.vl0, layer.vl1, layer.vr0, layer.vr1);
+        for v in [vl0, vl1, vr0, vr1] {
+            ch.observe_f128(v);
+        }
+        let gate = vl0 * vl1 + lambda * (vr0 * vr1);
+        if c_run != gate {
+            return Err(ProductGkrError::LayerCheckFailed);
+        }
+        let c_k = nonces.sample(ch, grinding.close_bits)?;
+        let one_plus_c = F128::ONE + c_k;
+        claim_l = one_plus_c * vl0 + c_k * vl1;
+        claim_r = one_plus_c * vr0 + c_k * vr1;
+        r_prime.push(c_k);
+        r_pt = r_prime;
+    }
+    Ok((r_pt, claim_l, claim_r))
+}
+
+// ---------------------------------------------------------------------------
+// Grand products over caller-built leaves
+// ---------------------------------------------------------------------------
+
+const DOMAIN_LEAVES: &[u8] = b"flock-product-gkr-leaves-v0";
+
+/// One side of a [`prove_leaves`] equality: `lens.len()` groups of `rows`
+/// entries (both powers of two), group `g` holding real leaves on its first
+/// `lens[g]` entries and an implicit 1 everywhere after. `buf` has
+/// `lens.len() · rows` entries; those past a group's prefix are never read.
+pub struct ProductLeaves {
+    pub buf: Vec<F128>,
+    pub lens: Vec<usize>,
+    pub rows: usize,
+}
+
+/// A [`prove_leaves`] transcript: both roots and the shared layer
+/// reductions. The final leaf claims are not sent — the verifier derives
+/// them from the last layer and checks them against its own reconstruction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductGkrLeavesProof {
+    pub top_lhs: F128,
+    pub top_rhs: F128,
+    pub layers: Vec<BatchedLayerProof>,
+    /// PoW witnesses in transcript order: per layer its lambda, round and
+    /// closing challenges.
+    pub grinding_nonces: Vec<u64>,
+}
+
+/// Where [`prove_leaves`] / [`verify_leaves`] land: the point `ρ` (row bits
+/// low, group bits high) and each side's leaf MLE there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductLeavesClaim {
+    pub rho: Vec<F128>,
+    pub lhs: F128,
+    pub rhs: F128,
+}
+
+fn layer_nonce_count(grinding: BatchedGrinding, mu: usize) -> usize {
+    mu * usize::from(grinding.lambda_bits != 0)
+        + (mu * mu.saturating_sub(1) / 2) * usize::from(grinding.round_bits != 0)
+        + mu * usize::from(grinding.close_bits != 0)
+}
+
+/// Prove `∏ lhs = ∏ rhs` over leaves the caller built (after sampling the
+/// challenges they depend on), reducing both sides to one point. The two
+/// sides must share their grouping; their live prefixes may differ.
+pub fn prove_leaves<C: Challenger>(
+    lhs: ProductLeaves,
+    rhs: ProductLeaves,
+    grinding: BatchedGrinding,
+    ch: &mut C,
+) -> (ProductGkrLeavesProof, ProductLeavesClaim) {
+    assert_eq!((lhs.rows, lhs.lens.len()), (rhs.rows, rhs.lens.len()));
+    let n = lhs.rows * lhs.lens.len();
+    assert!(n.is_power_of_two() && n >= 2, "need N = 2^μ ≥ 2");
+    assert!(lhs.rows.is_power_of_two());
+    for side in [&lhs, &rhs] {
+        assert!(side.buf.len() >= n && side.lens.iter().all(|&l| l <= side.rows));
+    }
+    let mu = n.trailing_zeros() as usize;
+    let mut t = Instant::now();
+    ch.observe_label(DOMAIN_LEAVES);
+    let mut grinding_nonces = Vec::with_capacity(layer_nonce_count(grinding, mu));
+    let gvec = |s: ProductLeaves| GVec {
+        buf: s.buf,
+        lens: s.lens,
+        rows: s.rows,
+    };
+    let r = reduce_grouped(
+        gvec(lhs),
+        gvec(rhs),
+        mu,
+        grinding,
+        &mut grinding_nonces,
+        ch,
+        &mut t,
+    );
+    (
+        ProductGkrLeavesProof {
+            top_lhs: r.top_lhs,
+            top_rhs: r.top_rhs,
+            layers: r.layers,
+            grinding_nonces,
+        },
+        ProductLeavesClaim {
+            rho: r.rho,
+            lhs: r.claim_l,
+            rhs: r.claim_r,
+        },
+    )
+}
+
+/// Verify a [`prove_leaves`] transcript over `2^mu` leaves per side. Returns
+/// the point and the leaf claims the caller must check.
+pub fn verify_leaves<C: Challenger>(
+    mu: usize,
+    proof: &ProductGkrLeavesProof,
+    grinding: BatchedGrinding,
+    ch: &mut C,
+) -> Result<ProductLeavesClaim, ProductGkrError> {
+    if proof.layers.len() != mu {
+        return Err(ProductGkrError::MalformedProof);
+    }
+    if proof.grinding_nonces.len() != layer_nonce_count(grinding, mu) {
+        return Err(ProductGkrError::InvalidGrinding);
+    }
+    let mut nonces = NonceReader::new(&proof.grinding_nonces);
+    ch.observe_label(DOMAIN_LEAVES);
+    let (rho, lhs, rhs) = verify_reduction(
+        proof.top_lhs,
+        proof.top_rhs,
+        &proof.layers,
+        grinding,
+        &mut nonces,
+        ch,
+    )?;
+    debug_assert!(nonces.is_spent());
+    Ok(ProductLeavesClaim { rho, lhs, rhs })
 }
 
 #[cfg(test)]

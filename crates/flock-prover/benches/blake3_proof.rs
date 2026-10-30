@@ -96,6 +96,21 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         Ok("fast") | Err(_) => Blake3Setup::new(n_blocks),
         Ok(p) => panic!("BLAKE3_PROFILE must be fast, slim, or secure (got {p})"),
     };
+    // BLAKE3_FULL_HEIGHT=1 commits dummy compressions as zeros at full height
+    // (the leanXMSS circuit's commit), so a count that is not a power of two
+    // still opens through the block-first transport.
+    if var("BLAKE3_FULL_HEIGHT").is_ok() {
+        setup = setup.with_full_height_commit();
+    }
+    // BLAKE3_ZERO_INPUTS=1 drops the input words' x·1 = x rows from the
+    // boolean PIOP (the zerocheck skips them; the C claim masks them out);
+    // BLAKE3_ZERO_LINEAR=1 also drops the XORed output words, which the
+    // lincheck then checks.
+    if var("BLAKE3_ZERO_LINEAR").is_ok() {
+        setup = setup.with_zeroed_linear_words();
+    } else if var("BLAKE3_ZERO_INPUTS").is_ok() {
+        setup = setup.with_zeroed_identity_words();
+    }
     // FLOCK_MERKLE_HASH=sha256|blake3 selects the PCS Merkle hash (default
     // sha256). Setting it on `pcs_params` is enough: the Ligerito prover and
     // verifier configs are derived from those params, so the L0 commitment and
@@ -285,6 +300,23 @@ fn main() {
     // to sweep at the same sizes as the competitors; each listed size is benched
     // best-of-3. Default: small-scale context + the SHA-256/Keccak baseline sizes.
     // n_blocks → m: K_LOG=14, so m = 14 + ceil_log2(max(n_blocks, 8)).
+    // BLAKE3_NS takes exact compression counts instead (e.g. "201000", the
+    // compressions of 1000 leanXMSS signatures).
+    let runs = || {
+        var("BLAKE3_RUNS")
+            .ok()
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(3usize)
+    };
+    if let Ok(s) = var("BLAKE3_NS") {
+        for t in s.split([',', ' ']).filter(|t| !t.is_empty()) {
+            let n: usize = t
+                .parse()
+                .expect("BLAKE3_NS: space/comma-separated compression counts");
+            bench_one(n, runs());
+        }
+        return;
+    }
     let specs: Vec<(usize, usize)> = match var("BLAKE3_LOG2S") {
         Ok(s) => s
             .split([',', ' '])
@@ -295,11 +327,7 @@ fn main() {
                     .expect("BLAKE3_LOG2S: space/comma-separated integer log2 values");
                 // `BLAKE3_RUNS` overrides the measured-run count (steady-state
                 // pool behaviour needs more than the default three).
-                let runs = std::env::var("BLAKE3_RUNS")
-                    .ok()
-                    .and_then(|r| r.parse().ok())
-                    .unwrap_or(3usize);
-                (1usize << h, runs)
+                (1usize << h, runs())
             })
             .collect(),
         Err(_) => vec![(1usize, 3), (128, 2), (8192, 2), (32768, 2), (65536, 2)],

@@ -17,17 +17,21 @@
 //! follows evaluation order, adjusted for aligned words and identity-C rows.
 
 mod builder;
+mod gate;
 mod interface;
+mod kernel;
 mod layout;
 mod lowering;
 mod schema;
 mod walk;
 
 pub use builder::CircuitBuilder;
+pub use gate::{BooleanGate, BooleanGateError, NativeEval};
 pub use interface::{
     Interaction, InteractionDirection, InteractionEncoding, InteractionField, InteractionScope,
     Selector,
 };
+pub use kernel::OperationKernel;
 pub use layout::{LayoutError, PhysicalLayout};
 pub use lowering::{AssertionAux, EvaluationError, LoweredCircuit, LoweringMode, R1csBuildError};
 pub use schema::{

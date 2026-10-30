@@ -377,13 +377,13 @@ impl<'p> ChildTape<'p> {
         );
         assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
         let n_log_i = union.n_log();
-        // Block-first transport (`pcs::open_batch_merged`): under a
-        // full-height column prefix the prover bound the k−1 block
-        // coordinates first. `w_rounds` stays in round order for the
-        // running-claim chain; `w_coords` is ρ in coordinate order.
+        // Block-first transport (`pcs::open_batch_merged`): when every used
+        // column is full height the prover bound the dense column
+        // coordinates (all but one) first. `w_rounds` stays in round order
+        // for the running-claim chain; `w_coords` is ρ in coordinate order.
         let w_coords: Vec<RoundRec> = {
             let mut v = w_rounds.clone();
-            if flock_core::pcs::rectangular_prefix_columns(&union.jagged_heights(), n_log_i)
+            if flock_core::pcs::full_height_columns(&union.jagged_heights(), n_log_i, m_mp2)
                 .is_some()
             {
                 v.rotate_left(m_mp2 - n_log_i - 1);

@@ -36,6 +36,10 @@ flock-core = { path = "../flock-core", features = ["unsound-challenger"] }
 flock-transcript = { workspace = true, features = ["unsound-challenger"] }
 
 [[bench]]
+name = "leanxmss"
+harness = false
+
+[[bench]]
 name = "ag_breakdown"
 harness = false
 
@@ -113,6 +117,10 @@ harness = false
 
 [[bench]]
 name = "genwitness_phase"
+harness = false
+
+[[bench]]
+name = "leanxmss_witgen"
 harness = false
 
 [[bench]]

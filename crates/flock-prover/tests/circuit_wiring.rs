@@ -584,7 +584,11 @@ fn g_side_forgery_is_rejected() {
         })
         .collect();
 
-    let proof = WiringProof { gkr, gather };
+    let proof = WiringProof {
+        gkr,
+        gather,
+        bus: None,
+    };
     let mut ch = FsChallenger::new(DOMAIN);
     assert_eq!(
         verify_wiring(&circuit, &public, &proof, &mut ch),
@@ -692,6 +696,7 @@ fn fabricated_witness_fails_recombination() {
     let spliced = WiringProof {
         gkr: fake_proof.gkr.clone(),
         gather: real_gather,
+        bus: None,
     };
     let mut ch = FsChallenger::new(DOMAIN);
     assert_eq!(

@@ -49,8 +49,9 @@ use crate::{
         BlockCoverage, ZerocheckGrinding, cleanse_block,
         multilinear::{
             LiveLayout, expand_to_dense, fold_and_compute_round_pair_into,
-            fold_and_round_pair_sparse_into, fold_in_place_pair, fold1_lookahead_into,
-            fold2_lookahead_into, lookahead_msg_first, lookahead_msg_second, round_pair_naive,
+            fold_and_round_pair_sparse_into, fold_in_place_pair, fold_lookahead_sparse_into,
+            fold1_lookahead_into, fold2_lookahead_into, lookahead_layout, lookahead_msg_first,
+            lookahead_msg_second, round_pair_naive,
         },
         univariate_skip::{SplitEqGhash, build_eq},
     },
@@ -1015,6 +1016,16 @@ pub const AG_SAMPLING_CREDIT_BITS: u32 = 5;
 /// where the decode is canonical end-to-end (the lincheck fresh skip).
 pub const R1_POW_BITS: u32 = 9;
 
+/// [`R1_ZERO_BOUND`] plus one more BASE-code word: when the boolean PIOP
+/// drops linear rows, the lincheck checks their residual `(A_0 + I)·z` at
+/// this zerocheck's point, and a nonzero residual's skip slice survives r₁
+/// only at a zero of its base-code word (`deg D = 158`).
+/// `474 + 158 = 632` bad points.
+pub const R1_LINEAR_ZERO_BOUND: usize = R1_ZERO_BOUND + 158;
+
+/// [`R1_POW_BITS`] under a linear check: `bits_for(632) = 10`.
+pub const R1_LINEAR_POW_BITS: u32 = 10;
+
 /// Prover-side scan budget for the fused r₁ nonce: success per nonce is
 /// `2^-R1_POW_BITS / 32 = 2^-14`, so exhausting `2^24` nonces has
 /// probability `(1 − 2^-14)^(2^24) ≈ 2^-1477` — a completeness error we
@@ -1734,17 +1745,17 @@ pub(super) fn multilinear_values_tail_fiat_shamir_sparse<C: Challenger>(
     let mut domain = 1usize << n_mlv;
     let (mut a_nxt, mut b_nxt) = (Vec::new(), Vec::new());
     let mut i = 1usize;
-    // LOOKAHEAD on the sparse path. When the live layout is a single PREFIX
-    // interval — the shipped shape: the useful chunk-columns are a prefix, so
-    // the compact buffer IS the dense prefix — the dense lookahead ladder
-    // runs on it directly: `fold1/fold2_lookahead_into` size their eq tables
-    // from the challenge suffix and weight every position by its global
-    // index, so a prefix's sums are the full domain's with the dead suffix
-    // at zero, and its outputs are the dense outputs' prefix. Two rounds per
-    // pass with the message in the same sweep; measured on the dense route
-    // at m=32: the steady fold2 passes cost 19–36% less than the two classic
-    // rounds each replaces (the fold1 ENTRY pass is the one that does not
-    // pay, +16% ST). Same `pending2` invariant as `multilinear_values_tail_fiat_shamir_resume`: the
+    // LOOKAHEAD on the sparse path, on any live layout:
+    // `fold_lookahead_sparse_into` weights every group by its global index
+    // and runs the dense kernel on each stored interval's compacted slice, so
+    // dead slots and dropped words between intervals cost nothing. (It used
+    // to need a single interval starting at 0: dropped words split pure
+    // BLAKE3's live set, and leanXMSS's slots never formed one, so both ran
+    // the classic rounds.) Two rounds per pass with the message in the same
+    // sweep; measured on the dense route at m=32: the steady fold2 passes
+    // cost 19–36% less than the two classic rounds each replaces (the fold1
+    // ENTRY pass is the one that does not pay, +16% ST). Same `pending2`
+    // invariant as `multilinear_values_tail_fiat_shamir_resume`: the
     // arrays are folded through every sampled challenge except `rho_prev`
     // (and `pending2` if set); while a challenge is deferred, `domain` is
     // one halving ahead of the round index. Transcript-identical to the
@@ -1756,31 +1767,24 @@ pub(super) fn multilinear_values_tail_fiat_shamir_sparse<C: Challenger>(
     let la_enabled = !LOOKAHEAD_DISABLE.load(Ordering::Relaxed);
     while i < n_mlv && domain >= 1024 && store.len() * SPARSE_TAIL_GATE <= domain {
         let live = store.len();
-        let is_prefix =
-            store.intervals().len() == 1 && store.intervals()[0].0 == 0 && a_mlv.len() == live;
+        // A lookahead pass writes the group cover of the live set
+        // (`lookahead_layout`): a quarter of the input on a fold2 pass, a
+        // half on fold1, plus up to one group per interval end.
         let per_u = if pending2.is_some() { 16 } else { 8 };
         let lookahead =
-            la_enabled && is_prefix && i + 1 < n_mlv && live >= 1024 && live.is_multiple_of(per_u);
+            (la_enabled && i + 1 < n_mlv && live >= 1024).then(|| lookahead_layout(&store, per_u));
         // Output storage is bounded by the input's: shrinking pairs can
         // only round outward by one slot per interval end.
         let cap = store.len() + 2 * store.intervals().len() + 2;
-        let out_len = if pending2.is_some() {
-            live / 4
-        } else {
-            live / 2
-        };
         // Size the output for the pass that actually runs: a lookahead pass
-        // writes `out_len` (a quarter of the input on the fold-level entry),
-        // the deferred-fold resolve below works in place, and only the
-        // classic round needs `cap`. Sizing every pass for `cap` made the
-        // first pass take two input-sized buffers (~3 GB at m=33) and fill a
-        // quarter of them.
-        let need = if lookahead {
-            out_len
-        } else if pending2.is_some() {
-            0
-        } else {
-            cap
+        // writes its layout, the deferred-fold resolve below works in place,
+        // and only the classic round needs `cap`. Sizing every pass for `cap`
+        // made the first pass take two input-sized buffers (~3 GB at m=33)
+        // and fill a quarter of them.
+        let need = match &lookahead {
+            Some(store_out) => store_out.len(),
+            None if pending2.is_some() => 0,
+            None => cap,
         };
         if a_nxt.len() < need {
             give_f128(a_nxt);
@@ -1788,26 +1792,38 @@ pub(super) fn multilinear_values_tail_fiat_shamir_sparse<C: Challenger>(
             a_nxt = take_f128(need);
             b_nxt = take_f128(need);
         }
-        if lookahead {
+        if let Some(store_out) = lookahead {
+            let out_len = store_out.len();
             let (ao, bo) = (&mut a_nxt[..out_len], &mut b_nxt[..out_len]);
+            let (a_in, b_in, st_in, st_out) = (&a_mlv, &b_mlv, &store, &store_out);
+            let rest = &r_rest[i + 2..];
             let q = on_all_cores(32 * a_mlv.len(), || match pending2 {
-                Some(r2) => {
-                    fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r_rest[i + 2..])
-                }
-                None => fold1_lookahead_into(
-                    &a_mlv,
-                    &b_mlv,
+                Some(r2) => fold_lookahead_sparse_into::<16>(
+                    a_in,
+                    b_in,
+                    ao,
+                    bo,
+                    (rho_prev, r2),
+                    rest,
+                    st_in,
+                    st_out,
+                ),
+                None => fold_lookahead_sparse_into::<8>(
+                    a_in,
+                    b_in,
                     ao,
                     bo,
                     (rho_prev, F128::ZERO),
-                    &r_rest[i + 2..],
+                    rest,
+                    st_in,
+                    st_out,
                 ),
             });
             std::mem::swap(&mut a_mlv, &mut a_nxt);
             std::mem::swap(&mut b_mlv, &mut b_nxt);
             a_mlv.truncate(out_len);
             b_mlv.truncate(out_len);
-            store = LiveLayout::new(vec![(0, out_len)]);
+            store = store_out;
             domain = if pending2.is_some() {
                 domain / 4
             } else {
@@ -1831,14 +1847,11 @@ pub(super) fn multilinear_values_tail_fiat_shamir_sparse<C: Challenger>(
             continue;
         }
         // Leaving lookahead mode inside the sparse loop: resolve the deferred
-        // fold on the compact prefix (still one interval), then continue with
-        // the classic rounds.
+        // fold on the compact buffer, then continue with the classic rounds.
         if let Some(r2) = pending2.take() {
-            // The pairwise in-place fold never straddles an interval (intervals
-            // are 128-aligned), so every interval simply halves — this holds
-            // for ANY layout, which matters because the fold-level entry
-            // starts the loop with a deferred challenge before a prefix was
-            // ever established.
+            // The pairwise in-place fold never straddles an interval: the
+            // fold's intervals are 128-aligned and a lookahead pass's are
+            // multiples of 4, so every interval simply halves.
             fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
             store = LiveLayout::new(
                 store
@@ -2237,8 +2250,8 @@ mod tests {
         zerocheck::{
             ZerocheckGrinding,
             ag_skip::{
-                AG_SAMPLING_CREDIT_BITS, F128, N_INNER, R1_POW_BITS, R1_ZERO_BOUND, d_const, d_inv,
-                friendly_challenges, gamma_pow,
+                AG_SAMPLING_CREDIT_BITS, F128, N_INNER, R1_LINEAR_POW_BITS, R1_LINEAR_ZERO_BOUND,
+                R1_POW_BITS, R1_ZERO_BOUND, d_const, d_inv, friendly_challenges, gamma_pow,
             },
         },
     };
@@ -2882,6 +2895,8 @@ mod tests {
         // decode (phase D) hands the fiber's 5 flattening bits back to the
         // prover, so the sampler credit no longer discounts this site.
         assert_eq!(R1_POW_BITS, bits_for(R1_ZERO_BOUND));
+        assert_eq!(R1_LINEAR_ZERO_BOUND, product_deg + 2 * base_deg);
+        assert_eq!(R1_LINEAR_POW_BITS, bits_for(R1_LINEAR_ZERO_BOUND));
         assert_eq!(
             AG_LINCHECK_SKIP_POW_BITS + AG_SAMPLING_CREDIT_BITS,
             bits_for(base_deg)
@@ -2890,6 +2905,17 @@ mod tests {
         let g = ZerocheckGrinding::per_challenge_128();
         assert_eq!(g.ag_round_one_bits(), Some(R1_POW_BITS));
         assert_eq!(ZerocheckGrinding::disabled().ag_round_one_bits(), None);
+        let lin = g.with_linear_check();
+        assert_eq!(lin.ag_round_one_bits(), Some(R1_LINEAR_POW_BITS));
+        // RS skip: 127 + 63 = 190 bad points; the rounds stay at two bits.
+        assert_eq!((g.skip_bits(), lin.skip_bits()), (Some(7), Some(8)));
+        assert_eq!(lin.multilinear_round_bits(), g.multilinear_round_bits());
+        assert_eq!(
+            ZerocheckGrinding::disabled()
+                .with_linear_check()
+                .ag_round_one_bits(),
+            None
+        );
     }
 
     /// The fused predicate really gates on BOTH criteria: a nonce whose

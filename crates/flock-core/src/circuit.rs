@@ -81,6 +81,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     challenger::Challenger,
+    circuit::bus::{Bus, BusProof},
     field::F128,
     matrix_fold::{FoldMatrix, MatrixClaim, Weight, bilinear},
     pcs::{DirectEqInd, PackedDirectClaim},
@@ -92,6 +93,7 @@ use crate::{
 };
 pub mod boolean;
 pub mod builder;
+pub mod bus;
 
 /// Domain label of the circuit digest — versioned, since the digest covers the
 /// whole circuit encoding (cell-slot enumeration, counts, wiring, public
@@ -308,6 +310,8 @@ pub enum CircuitError {
     /// σ is not a permutation. Unreachable given disjointness; checked anyway,
     /// because completeness (and the verifier's `s_σ`) rests on it.
     NotAPermutation,
+    /// The tuple bus does not fit the circuit ([`bus::Bus`]).
+    InvalidBus(&'static str),
 }
 
 /// A circuit over a registry: per-type gate counts, a public segment, and a
@@ -346,6 +350,12 @@ pub struct Circuit {
     fixed_public: Vec<Option<F128>>,
     wires: Vec<Vec<usize>>,
     sigma: Vec<usize>,
+    /// Content-addressed dataflow beside the wiring ([`bus`]).
+    bus: Option<Bus>,
+    /// Per gate cell-slot: no wire touches it, so it is left out of the
+    /// wiring's grand product ([`Self::with_unwired_pruned`]). Empty when
+    /// pruning is off.
+    pruned: Vec<bool>,
     digest_cache: OnceLock<[u8; 32]>,
 }
 
@@ -519,6 +529,8 @@ impl Circuit {
             fixed_public,
             wires: classes,
             sigma,
+            bus: None,
+            pruned: Vec::new(),
             digest_cache: OnceLock::new(),
         };
         // Warm the digest here, at statement-construction time: it is a pure
@@ -544,10 +556,43 @@ impl Circuit {
     /// verifier, the in-circuit transcription's checker, and the sigma
     /// discharge, so the mask cannot drift between them.
     pub fn live_mask(&self) -> LiveMask {
+        let mut counts = self.cells.live_counts(&self.counts, self.num_public);
+        for (count, &pruned) in counts.iter_mut().zip(&self.pruned) {
+            if pruned {
+                *count = 0;
+            }
+        }
         LiveMask {
             nu: self.cells.nu(),
-            counts: self.cells.live_counts(&self.counts, self.num_public),
+            counts,
         }
+    }
+
+    /// Leave every gate cell-slot that no wire touches out of the wiring
+    /// argument. Such a slot's cells are σ-fixed, so each contributes the
+    /// same factor `w + α·x + β` to both grand products: dropping them keeps
+    /// the identity, and they need no gather claim. Worth it when a circuit
+    /// has whole io words that only the bus reads, or none. Digest-bound.
+    pub fn with_unwired_pruned(mut self) -> Self {
+        let nu = self.cells.nu();
+        let mut wired = vec![false; self.cells.num_gate_slots()];
+        for &idx in self.wires.iter().flatten() {
+            if let Some(w) = wired.get_mut(idx >> nu) {
+                *w = true;
+            }
+        }
+        self.pruned = wired.iter().map(|&w| !w).collect();
+        self.digest_cache = OnceLock::new();
+        self.digest();
+        self
+    }
+
+    /// The gate cell-slots the wiring argument gathers, ascending: every one
+    /// unless [`Self::with_unwired_pruned`] dropped it.
+    pub fn gathered_slots(&self) -> Vec<usize> {
+        (0..self.cells.num_gate_slots())
+            .filter(|&iota| !self.pruned.get(iota).copied().unwrap_or(false))
+            .collect()
     }
     /// Number of public words.
     pub fn num_public(&self) -> usize {
@@ -575,6 +620,21 @@ impl Circuit {
     /// from this in v1 ([`product_gkr::verify_batched_with_sigma`]).
     pub fn sigma(&self) -> &[usize] {
         &self.sigma
+    }
+
+    /// Attach a tuple bus ([`bus`]): proven beside the wiring and bound into
+    /// the digest.
+    pub fn with_bus(mut self, bus: Bus) -> Result<Self, CircuitError> {
+        bus.validate(&self)?;
+        self.bus = Some(bus);
+        self.digest_cache = OnceLock::new();
+        self.digest();
+        Ok(self)
+    }
+
+    /// The circuit's tuple bus, if any.
+    pub fn bus(&self) -> Option<&Bus> {
+        self.bus.as_ref()
     }
 
     /// The circuit digest — the statement's circuit half.
@@ -644,6 +704,15 @@ impl Circuit {
                     buf.extend_from_slice(&(idx as u64).to_le_bytes());
                 }
             }
+            // Pruning and a bus are appended after the wiring, so circuits
+            // with neither keep their digests.
+            if !self.pruned.is_empty() {
+                buf.extend_from_slice(b"pruned-unwired");
+                buf.extend(self.pruned.iter().map(|&p| p as u8));
+            }
+            if let Some(bus) = &self.bus {
+                bus.absorb_into(&mut buf);
+            }
             *hash(&buf).as_bytes()
         })
     }
@@ -683,6 +752,8 @@ impl Circuit {
 pub struct WiringProof {
     pub gkr: ProductGkrBatchedProof,
     pub gather: Vec<F128>,
+    /// The tuple bus's argument, when the circuit has a bus.
+    pub bus: Option<BusProof>,
 }
 
 /// Why a wiring proof was rejected.
@@ -699,6 +770,10 @@ pub enum WiringError {
     /// `f_eval ≠ g_eval`: the two grand products ran on different input
     /// vectors. Binding only the `f` side would leave `g` prover-chosen.
     GEvalMismatch,
+    /// The bus's grand product rejected.
+    BusGkr(ProductGkrError),
+    /// The gather values do not rebuild the bus products' leaf claims.
+    BusRecombination,
 }
 
 /// Prove the circuit's wiring equalities against the committed witness.
@@ -790,9 +865,10 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
     // each, producing packed-direct claims.
     let t = Instant::now();
     let eq_row = build_eq(&claim.rho[..nu]);
-    let mut gather = Vec::with_capacity(cells.num_gate_slots());
-    let mut claims = Vec::with_capacity(cells.num_gate_slots());
-    for iota in 0..cells.num_gate_slots() {
+    let gathered = circuit.gathered_slots();
+    let mut gather = Vec::with_capacity(gathered.len());
+    let mut claims = Vec::with_capacity(gathered.len());
+    for iota in gathered {
         let base = cells.gate_word_addr(iota, 0);
         let CellSlot::Gate { ty, .. } = cells.slots()[iota] else {
             unreachable!("the first num_gate_slots cell-slots are gate slots")
@@ -830,7 +906,24 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
         );
     }
 
-    (WiringProof { gkr, gather }, claims)
+    // ---- The tuple bus, on the same transcript after the wiring GKR. Its
+    // gather claims follow the wiring's into the opening.
+    let bus = circuit.bus().map(|bus| {
+        let t = Instant::now();
+        let (proof, bus_claims) = bus::prove_bus(circuit, bus, packed, grinding, ch);
+        if trace {
+            eprintln!(
+                "  [wiring] tuple bus ({} ports, {} claims): {:7.2} ms",
+                bus.ports.len(),
+                bus_claims.len(),
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        claims.extend(bus_claims);
+        proof
+    });
+
+    (WiringProof { gkr, gather, bus }, claims)
 }
 
 /// Replay the wiring argument. Returns the gather claims as `(point, value)`
@@ -1152,7 +1245,8 @@ fn verify_wiring_core<C: Challenger>(
     }
     let cells = circuit.cells();
     let (nu, mu) = (cells.nu(), cells.mu());
-    if proof.gather.len() != cells.num_gate_slots() {
+    let gathered = circuit.gathered_slots();
+    if proof.gather.len() != gathered.len() {
         return Err(WiringError::MalformedProof);
     }
 
@@ -1177,9 +1271,13 @@ fn verify_wiring_core<C: Challenger>(
     let eq_row = build_eq(&claim.rho[..nu]);
     let eq_slot = build_eq(&claim.rho[nu..]);
     let mut acc = F128::ZERO;
+    for (&iota, &v) in gathered.iter().zip(&proof.gather) {
+        acc += eq_slot[iota] * v;
+    }
     for (iota, slot) in cells.slots().iter().enumerate() {
         match *slot {
-            CellSlot::Gate { .. } => acc += eq_slot[iota] * proof.gather[iota],
+            // Gathered above; a pruned slot is dead in the mask.
+            CellSlot::Gate { .. } => {}
             CellSlot::Public { s } => {
                 acc += eq_slot[iota] * circuit.public_slot_eval(s, &eq_row, public)
             }
@@ -1208,17 +1306,19 @@ fn verify_wiring_core<C: Challenger>(
         boolean_pins: Vec::new(),
         element_constants: None,
     };
-    Ok((
-        (0..cells.num_gate_slots())
-            .map(|iota| {
-                (
-                    cells.gate_claim_point(iota, &claim.rho[..nu]),
-                    proof.gather[iota],
-                )
-            })
-            .collect(),
-        assertion,
-    ))
+    let mut gather: Vec<(Vec<F128>, F128)> = gathered
+        .iter()
+        .zip(&proof.gather)
+        .map(|(&iota, &v)| (cells.gate_claim_point(iota, &claim.rho[..nu]), v))
+        .collect();
+    match (circuit.bus(), &proof.bus) {
+        (Some(bus), Some(bus_proof)) => {
+            gather.extend(bus::verify_bus(circuit, bus, bus_proof, grinding, ch)?);
+        }
+        (None, None) => {}
+        _ => return Err(WiringError::MalformedProof),
+    }
+    Ok((gather, assertion))
 }
 
 #[cfg(test)]
@@ -1228,9 +1328,10 @@ mod tests {
     use crate::{
         challenger::FsChallenger,
         circuit::{
-            Cell, CellSlot, CellSpace, Circuit, CircuitError, F128, IoWord, ProductGkrError,
-            Registry, SigmaAssertion, UnionInstance, WiringError, bilinear, prove_wiring,
-            verify_wiring, verify_wiring_deferred,
+            BatchedGrinding, Cell, CellSlot, CellSpace, Circuit, CircuitError, F128, IoWord,
+            ProductGkrError, Registry, SigmaAssertion, UnionInstance, WiringError, bilinear,
+            build_eq, bus, prove_wiring, prove_wiring_with_grinding, verify_wiring,
+            verify_wiring_deferred, verify_wiring_with_grinding,
         },
         element_r1cs::ElementTableBuilder,
         r1cs::SparseBinaryMatrix,
@@ -1254,6 +1355,7 @@ mod tests {
             const_pin: None,
             class: TableClass::Boolean,
             io_schema: schema,
+            zeroed_word_cols: Vec::new(),
         }
     }
 
@@ -1820,5 +1922,199 @@ mod tests {
         .unwrap();
         let mut ch = FsChallenger::new(b"circuit-unit");
         assert!(verify_wiring(&other, &public, &proof, &mut ch).is_err());
+    }
+
+    // ---- the tuple bus ------------------------------------------------------
+
+    /// A width-3 bus over the mixed registry: types 0 and 1 send
+    /// `(value, key, 7)`, type 2 receives its eight rows' `(value, key, 7)`,
+    /// the 7 spelled as a constant on one side and a reduced row tag plus a
+    /// constant on the other.
+    fn bus_circuit(reg: &Registry, recv_constant: F128) -> Circuit {
+        use bus::{Bus, BusDirection, BusPort, BusTerm, RowTag};
+        let seven = F128::new(7, 0);
+        let zero_tag = RowTag {
+            offset: 3,
+            div: 1,
+            modulo: 1,
+        };
+        let port = |ty: usize, dir, words: [usize; 2], last: BusTerm| BusPort {
+            ty,
+            dir,
+            terms: vec![BusTerm::word(words[0]), BusTerm::word(words[1]), last],
+        };
+        let bus = Bus {
+            width: 3,
+            ports: vec![
+                port(
+                    0,
+                    BusDirection::Send,
+                    [0, 1],
+                    BusTerm::row(RowTag {
+                        offset: 0,
+                        div: 100,
+                        modulo: 0,
+                    })
+                    .plus(seven),
+                ),
+                port(
+                    1,
+                    BusDirection::Send,
+                    [3, 4],
+                    BusTerm::row(zero_tag).plus(seven),
+                ),
+                port(
+                    2,
+                    BusDirection::Recv,
+                    [6, 7],
+                    BusTerm::row(zero_tag).plus(recv_constant),
+                ),
+            ],
+        };
+        Circuit::new(&reg.clone(), vec![4, 4, 8], 0, Vec::new())
+            .unwrap()
+            .with_bus(bus)
+            .expect("a valid bus")
+    }
+
+    /// The type-2 rows are the eight sent tuples in a shuffled order.
+    fn bus_buffer(circuit: &Circuit, reg: &Registry, rng: &mut Rng) -> Vec<F128> {
+        let cells = circuit.cells();
+        let mut packed = vec![F128::ZERO; 1usize << (reg.m_total() - 7)];
+        let mut sent = Vec::new();
+        for (ty, words) in [(0usize, [0usize, 1]), (1, [3, 4])] {
+            for row in 0..circuit.counts()[ty] {
+                let t = [rng.f128(), rng.f128()];
+                for (w, v) in words.iter().zip(t) {
+                    packed[cells.gate_word_addr(*w, row)] = v;
+                }
+                sent.push(t);
+            }
+        }
+        for (row, j) in [5usize, 2, 7, 0, 3, 6, 1, 4].into_iter().enumerate() {
+            packed[cells.gate_word_addr(6, row)] = sent[j][0];
+            packed[cells.gate_word_addr(7, row)] = sent[j][1];
+        }
+        packed
+    }
+
+    /// The bus accepts a balanced witness in any order and rejects a changed
+    /// tuple, a different static coordinate, and tampered gather values —
+    /// with and without grinding.
+    #[test]
+    fn bus_roundtrip_balance_and_tamper() {
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let circuit = bus_circuit(&reg, F128::new(7, 0));
+        let mut rng = Rng::new(0xB05_0001);
+        let packed = bus_buffer(&circuit, &reg, &mut rng);
+        roundtrip(&circuit, &packed, &[]).expect("a balanced bus verifies");
+
+        let cells = circuit.cells();
+        let mut bad = packed.clone();
+        bad[cells.gate_word_addr(7, 3)] += F128::ONE;
+        assert_eq!(
+            roundtrip(&circuit, &bad, &[]),
+            Err(WiringError::BusGkr(ProductGkrError::ProductMismatch))
+        );
+        let other = bus_circuit(&reg, F128::new(6, 0));
+        assert_ne!(other.digest(), circuit.digest(), "the bus binds the digest");
+        assert_eq!(
+            roundtrip(&other, &packed, &[]),
+            Err(WiringError::BusGkr(ProductGkrError::ProductMismatch))
+        );
+
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (proof, _) = prove_wiring(&circuit, &packed, &[], &mut ch);
+        let n = proof.bus.as_ref().unwrap().gather.len();
+        assert_eq!(n, 6);
+        for i in 0..n {
+            let mut bad = proof.clone();
+            bad.bus.as_mut().unwrap().gather[i] += F128::ONE;
+            let mut ch = FsChallenger::new(b"circuit-unit");
+            assert_eq!(
+                verify_wiring(&circuit, &[], &bad, &mut ch),
+                Err(WiringError::BusRecombination),
+                "bus gather {i}"
+            );
+        }
+        let mut missing = proof.clone();
+        missing.bus = None;
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        assert_eq!(
+            verify_wiring(&circuit, &[], &missing, &mut ch),
+            Err(WiringError::MalformedProof)
+        );
+
+        let grinding = BatchedGrinding::per_challenge_128();
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (proof, claims) = prove_wiring_with_grinding(&circuit, &packed, &[], grinding, &mut ch);
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let out = verify_wiring_with_grinding(&circuit, &[], &proof, grinding, &mut ch)
+            .expect("a ground bus verifies");
+        assert_eq!(out.len(), claims.len());
+    }
+
+    /// Every bus gather claim is the MLE of its committed word column at the
+    /// claim point.
+    #[test]
+    fn bus_gather_claims_are_column_evaluations() {
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let circuit = bus_circuit(&reg, F128::new(7, 0));
+        let mut rng = Rng::new(0xB05_0002);
+        let packed = bus_buffer(&circuit, &reg, &mut rng);
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (proof, claims) = prove_wiring(&circuit, &packed, &[], &mut ch);
+        let wiring_claims = proof.gather.len();
+        for c in &claims[wiring_claims..] {
+            let eq = build_eq(&c.point);
+            let mle = eq
+                .iter()
+                .zip(&packed)
+                .fold(F128::ZERO, |acc, (&e, &w)| acc + e * w);
+            assert_eq!(mle, c.value);
+        }
+    }
+
+    /// Pruning drops the unwired cell-slots from the wiring argument and its
+    /// gather; the equalities it keeps are still enforced, the digest moves,
+    /// and a bus-only circuit (nothing wired) still proves.
+    #[test]
+    fn pruned_wiring_roundtrip() {
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let full = Circuit::new(
+            &reg,
+            vec![5, 4, 6],
+            9,
+            vec![
+                vec![Cell::new(2, 0), Cell::new(0, 1), Cell::new(3, 2)],
+                vec![Cell::new(5, 1), Cell::new(1, 2)],
+            ],
+        )
+        .unwrap();
+        let pruned = full.clone().with_unwired_pruned();
+        assert_ne!(full.digest(), pruned.digest());
+        assert_eq!(pruned.gathered_slots(), vec![0, 1, 2, 3, 5]);
+        let mut rng = Rng::new(0xC1C0_0004);
+        let (packed, public) = buffer_for(&reg, &pruned, &mut rng);
+        roundtrip(&pruned, &packed, &public).expect("pruned wiring verifies");
+        let mut bad = packed.clone();
+        bad[pruned.cells().gate_word_addr(1, 2)] += F128::ONE;
+        assert_eq!(
+            roundtrip(&pruned, &bad, &public),
+            Err(WiringError::Gkr(ProductGkrError::ProductMismatch))
+        );
+        // A full proof does not verify against the pruned circuit.
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (proof, _) = prove_wiring(&full, &packed, &public, &mut ch);
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        assert!(verify_wiring(&pruned, &public, &proof, &mut ch).is_err());
+
+        let bus_only = bus_circuit(&reg, F128::new(7, 0)).with_unwired_pruned();
+        assert!(bus_only.gathered_slots().is_empty());
+        let packed = bus_buffer(&bus_only, &reg, &mut rng);
+        roundtrip(&bus_only, &packed, &[]).expect("a bus-only circuit verifies");
     }
 }

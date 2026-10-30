@@ -1294,6 +1294,14 @@ fn bundle_digest_merged(
 // Re-pinned 2026-08-31: merged main's profile consolidation (proof-IO v22,
 // Fast = former Fast128 schedule) on top of the BLAKE3 default — both
 // sides' pins were stale. Two deterministic print runs agreed.
+// Re-pinned 2026-10-26 (mix-merged-nu7-128-128 only): the block-first
+// transport now covers every layout whose used columns are all full height,
+// gaps allowed (`pcs::full_height_columns`), not just a full-height prefix.
+// At full counts the BLAKE3 table's 92 used chunk-columns of 128 leave a gap
+// before the element columns, so this fixture's merged sumcheck now binds
+// the dense column coordinates first. The other six fixtures are partial or
+// already a prefix and held byte-identical. Two deterministic print runs
+// agreed.
 #[test]
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
@@ -1317,7 +1325,7 @@ fn mixed_class_merged_proof_bytes_pinned() {
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "a7df4157d729a14cebd2953784a87bb299244bb7204988eb6710d2a21e9447f6",
+            "cdd7c528fcbac61f708ef04d42ede15caf3c2b800b6fdf49682740c597bdeb06",
         ),
         (
             "mix-merged-nu7-100-90",
