@@ -145,11 +145,13 @@ fn assist_shapes_probe() {
                 z_row: &zr_a,
                 z_col: &zc_a,
                 coeffs: &ca,
+                zeroed_cols: &[],
             },
             FrobeniusClaim {
                 z_row: &zr_b,
                 z_col: &zc_b,
                 coeffs: &cb,
+                zeroed_cols: &[],
             },
         ];
         let rho = rng.vec(m);

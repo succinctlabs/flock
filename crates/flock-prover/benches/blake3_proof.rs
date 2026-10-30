@@ -102,6 +102,15 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     if var("BLAKE3_FULL_HEIGHT").is_ok() {
         setup = setup.with_full_height_commit();
     }
+    // BLAKE3_ZERO_INPUTS=1 drops the input words' x·1 = x rows from the
+    // boolean PIOP (the zerocheck skips them; the C claim masks them out);
+    // BLAKE3_ZERO_LINEAR=1 also drops the XORed output words, which the
+    // lincheck then checks.
+    if var("BLAKE3_ZERO_LINEAR").is_ok() {
+        setup = setup.with_zeroed_linear_words();
+    } else if var("BLAKE3_ZERO_INPUTS").is_ok() {
+        setup = setup.with_zeroed_identity_words();
+    }
     // FLOCK_MERKLE_HASH=sha256|blake3 selects the PCS Merkle hash (default
     // sha256). Setting it on `pcs_params` is enough: the Ligerito prover and
     // verifier configs are derived from those params, so the L0 commitment and

@@ -43,7 +43,9 @@ use crate::{
     pcs::{Commitment, dense_lanes},
     schedule::{Instance, Registry, TableType},
     scratch::{give_zeroed_f128, take_f128, take_zeroed_f128},
-    zerocheck::{K_SKIP, PaddingSpec},
+    zerocheck::{
+        K_SKIP, PaddingSpec, ZerocheckGrinding, univariate_skip_optimized::ROUND1_WINDOW_LOG,
+    },
 };
 
 /// Floor of the committed dense-stack size, as a bit-variable count: the
@@ -93,9 +95,14 @@ impl<'r> UnionInstance<'r> {
     /// The PIOP is unchanged: the zerocheck and lincheck still run over the
     /// declared rows, and the dummy rows they treat as zero are committed as
     /// zero. Soundness is unchanged too: the dummy rows enter the committed
-    /// polynomial like any row, so the zerocheck constrains them, the const
-    /// pin's count target holds their pin at `0`, and nothing (wiring,
-    /// publics) references them.
+    /// polynomial like any row, so the zerocheck constrains them and the
+    /// const pin's count target holds their pin at `0`. No wire names a
+    /// dummy cell, but the wiring's and the bus's gathers read each
+    /// committed word's whole column, dummy rows included, and treat it as
+    /// zero there; what makes that true for a cheating prover is that every
+    /// wireable word's rows read `(A z)·pin = x`, so `x = 0` where the pin is
+    /// `0`. Such a slot therefore keeps its zeroed words
+    /// ([`Self::zeroed_word_cols`]).
     ///
     /// STATEMENT data, like the counts and the dense floor: prover and
     /// verifier must construct their instances alike. Boolean-only
@@ -307,7 +314,8 @@ impl<'r> UnionInstance<'r> {
     /// zerocheck consumes over its `M_bool`-variable domain. Identical to
     /// [`Self::padding_spec`] for a boolean-only registry.
     pub fn boolean_padding_spec(&self) -> PaddingSpec {
-        self.instance.boolean_padding_spec()
+        self.instance
+            .boolean_padding_spec_dropping(|t| self.zeroed_word_cols(t))
     }
 
     /// Per-chunk-column heights (in packed words) of the union jagged grid,
@@ -353,6 +361,90 @@ impl<'r> UnionInstance<'r> {
             }
         }
         heights
+    }
+
+    /// Whether both boolean zerochecks read no declared-dead bit. The AG
+    /// zerocheck reads per block, exactly. The RS one's round 1 reads each
+    /// 8192-bit window up to its highest useful bit ([`ROUND1_WINDOW_LOG`]),
+    /// so it is exact only when no window holds a dead bit below a live one:
+    /// when a word column, `2^(7 + nu)` bits, covers whole windows (`nu >=
+    /// 6`). Below that, the witness's dead padding must be honestly zero
+    /// and no word may drop.
+    pub fn zerocheck_reads_exact(&self) -> bool {
+        7 + self.n_log() >= ROUND1_WINDOW_LOG
+    }
+
+    /// Slot `t`'s zeroed words ([`TableType::zeroed_word_cols`]) as the
+    /// boolean PIOP drops them: its type's list, or none where the slot
+    /// commits dummy rows (full height and `0 < n_t < 2^nu`).
+    ///
+    /// A committed dummy row is constrained only by the relation. Its pin is
+    /// `0` (the lincheck's count target), so a degree-one row
+    /// `(A z)·pin = x` forces `x = 0` there, and the wiring and the bus rely
+    /// on that ([`Self::set_full_height_commit`]): a dead wiring leaf is
+    /// `1 + w`, which `w = 1` would make zero, zeroing both grand products.
+    /// The lincheck's linear identity for a dropped row does not involve the
+    /// pin, so it cannot stand in for the row on dummy rows; such a slot
+    /// keeps its rows. Without committed dummy rows (height-`n_t` stacking,
+    /// an empty slot, a full one) they are virtual zeros and the words drop.
+    ///
+    /// Nothing drops below `nu = 6` either. A dropped word still holds its
+    /// witness bits (C aliases z), and the RS zerocheck's round 1 reads each
+    /// 8192-bit window up to its highest useful bit
+    /// ([`ROUND1_WINDOW_LOG`]), so a dropped column is skipped only when it
+    /// covers whole windows: a word column is `2^(7 + nu)` bits.
+    pub fn zeroed_word_cols(&self, t: usize) -> &'r [usize] {
+        let n_t = self.counts()[t];
+        if self.committed_rows(n_t) > n_t || !self.zerocheck_reads_exact() {
+            &[]
+        } else {
+            &self.instance.registry().types()[t].zeroed_word_cols
+        }
+    }
+
+    /// Whether the boolean PIOP drops a row other than `x·1 = x`: then the
+    /// lincheck checks the dropped rows' linear identity (its `η` term) and
+    /// the zerocheck's skip point owes the grinding for one more base-code
+    /// word ([`crate::zerocheck::ZerocheckGrinding::with_linear_check`]).
+    pub fn checks_linear_rows(&self) -> bool {
+        let registry = self.registry();
+        (0..registry.num_boolean()).any(|t| {
+            let ty = &registry.types()[t];
+            self.zeroed_word_cols(t).iter().any(|&w| {
+                let pin = ty.const_pin.expect("zeroed words need the const pin");
+                (128 * w..128 * (w + 1)).any(|i| !ty.is_identity_row(i, pin))
+            })
+        })
+    }
+
+    /// `base`, the profile's boolean zerocheck schedule, with the linear
+    /// check's extra skip-point bits when [`Self::checks_linear_rows`].
+    /// Prover and verifier both take their schedule from here.
+    pub fn zerocheck_grinding(&self, base: ZerocheckGrinding) -> ZerocheckGrinding {
+        if self.checks_linear_rows() {
+            base.with_linear_check()
+        } else {
+            base
+        }
+    }
+
+    /// The chunk-columns of every boolean slot's dropped words
+    /// ([`Self::zeroed_word_cols`]), ascending, in the column numbering of
+    /// [`Self::jagged_heights`]: where the C claim's opening weight is zero
+    /// (`C = diag(mask)`). Empty when no slot drops a word.
+    pub fn zeroed_columns(&self) -> Vec<usize> {
+        let nu = self.n_log();
+        let registry = self.registry();
+        let mut cols: Vec<usize> = registry.slots()[..registry.num_boolean()]
+            .iter()
+            .enumerate()
+            .flat_map(|(t, slot)| {
+                let base = slot.offset >> (7 + nu);
+                self.zeroed_word_cols(t).iter().map(move |&w| base + w)
+            })
+            .collect();
+        cols.sort_unstable();
+        cols
     }
 
     /// Used chunk-columns of a type: the leading `ceil(useful_bits/128)`
@@ -1188,6 +1280,7 @@ mod tests {
             const_pin: None,
             class: TableClass::Boolean,
             io_schema: Vec::new(),
+            zeroed_word_cols: Vec::new(),
         }
     }
 

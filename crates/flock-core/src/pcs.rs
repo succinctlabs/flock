@@ -1530,6 +1530,9 @@ struct BlockFirstClaim<'a> {
     /// Column bit-bank at `z_row`, by column (not dense rank):
     /// `bank[y·128 + b] = Σ_r eq(z_row, r)·bit_b(column y's row r)`.
     bank: &'a [F128],
+    /// Columns whose weight is zero ([`FrobeniusClaim::zeroed_cols`]); their
+    /// bank entries are never read.
+    zeroed_cols: &'a [usize],
 }
 
 /// `x^(2^j)`.
@@ -1707,7 +1710,7 @@ fn block_first_phase<Ch: Challenger>(
                         return Vec::new();
                     }
                     let zj: Vec<F128> = cl.z_col.iter().map(|&z| frob(z, j)).collect();
-                    crate::lincheck::build_eq_table(&zj)
+                    jagged::masked_eq(&zj, cl.zeroed_cols)
                 })
                 .collect()
         })
@@ -1998,6 +2001,9 @@ pub fn open_batch_merged<Ch: Challenger>(
     prover_data: &ProverData,
     commitment: &Commitment,
     x_outers: &[&[F128]],
+    // Per ring-switch claim, the columns its weight zeroes
+    // ([`FrobeniusClaim::zeroed_cols`]); empty, or one entry per claim.
+    zeroed_cols: &[&[usize]],
     precomputed_s_hat_v: &[Option<&[F128]>],
     // Per ring-switch claim, the column bit-bank at its row point (see
     // `lincheck::union_bitbank_fold`); consumed by the block-first transport
@@ -2033,6 +2039,8 @@ pub fn open_batch_merged<Ch: Challenger>(
         "commitment cap is not the prover tree's cap layer"
     );
     challenger.observe_label(b"flock-merged-open-v1");
+    let zeroed = |i: usize| -> &[usize] { zeroed_cols.get(i).copied().unwrap_or(&[]) };
+    assert!(zeroed_cols.is_empty() || zeroed_cols.len() == x_outers.len());
     let t = Instant::now();
     // Element-only registries produce no ring-switched claims; skip the batch
     // entirely (the callee asserts a non-empty batch). This branch DEFINES the
@@ -2125,7 +2133,8 @@ pub fn open_batch_merged<Ch: Challenger>(
     let mut weight_claims: Vec<MergedWeightClaim<'_>> = rs_results
         .iter()
         .zip(x_outers.iter())
-        .map(|((_, o), x)| {
+        .enumerate()
+        .map(|(i, ((_, o), x))| {
             assert_eq!(x.len(), 1 + n_log + k_cols, "point/row/col split mismatch");
             let table = match &o.rs_eq_ind {
                 RsEqInd::DeferredDense { table, .. } => table.as_slice(),
@@ -2135,6 +2144,7 @@ pub fn open_batch_merged<Ch: Challenger>(
                 z_row: &x[1..1 + n_log],
                 z_col: &x[1 + n_log..],
                 table,
+                zeroed_cols: zeroed(i),
             }
         })
         .collect();
@@ -2197,11 +2207,13 @@ pub fn open_batch_merged<Ch: Challenger>(
             .iter()
             .zip(&coeffs)
             .zip(&banks)
-            .map(|((x, c), b)| BlockFirstClaim {
+            .enumerate()
+            .map(|(i, ((x, c), b))| BlockFirstClaim {
                 z_row: &x[1..1 + n_log],
                 z_col: &x[1 + n_log..],
                 coeffs: c,
                 bank: b,
+                zeroed_cols: zeroed(i),
             })
             .collect();
         let (qp, wp) = block_first_phase(
@@ -2281,10 +2293,12 @@ pub fn open_batch_merged<Ch: Challenger>(
     let fclaims: Vec<jagged::FrobeniusClaim<'_>> = x_outers
         .iter()
         .zip(&coeffs)
-        .map(|(x, c)| FrobeniusClaim {
+        .enumerate()
+        .map(|(i, (x, c))| FrobeniusClaim {
             z_row: &x[1..1 + n_log],
             z_col: &x[1 + n_log..],
             coeffs: c,
+            zeroed_cols: zeroed(i),
         })
         .collect();
     // The packed-direct claims enter as the merged-column scalar groups:
@@ -2559,6 +2573,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
     claims: &[F128],
     z_skips: &[SkipPoint],
     x_outers: &[&[F128]],
+    zeroed_cols: &[&[usize]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     heights: &[u64],
     n_log: usize,
@@ -2572,6 +2587,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
         claims,
         z_skips,
         x_outers,
+        zeroed_cols,
         packed_direct,
         heights,
         n_log,
@@ -2595,6 +2611,7 @@ pub fn verify_batch_merged_deferred<Ch: Challenger>(
     claims: &[F128],
     z_skips: &[SkipPoint],
     x_outers: &[&[F128]],
+    zeroed_cols: &[&[usize]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     heights: &[u64],
     n_log: usize,
@@ -2609,6 +2626,7 @@ pub fn verify_batch_merged_deferred<Ch: Challenger>(
         claims,
         z_skips,
         x_outers,
+        zeroed_cols,
         packed_direct,
         heights,
         n_log,
@@ -2627,6 +2645,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
     claims: &[F128],
     z_skips: &[SkipPoint],
     x_outers: &[&[F128]],
+    zeroed_cols: &[&[usize]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     heights: &[u64],
     n_log: usize,
@@ -2640,6 +2659,13 @@ fn verify_batch_merged_core<Ch: Challenger>(
     let n_pd = packed_direct.len();
     assert_eq!(z_skips.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
+    assert!(zeroed_cols.is_empty() || zeroed_cols.len() == n_rs);
+    // The jagged export's RS row weights are plain eqs: a masked claim has
+    // no export form yet. The mask is registry-static, never prover input.
+    assert!(
+        defer.is_none() || zeroed_cols.iter().all(|z| z.is_empty()),
+        "the deferred merged open does not carry zeroed columns"
+    );
     if proof.ring_switches.len() != n_rs {
         return Err(PcsOpenError::Assist);
     }
@@ -2765,12 +2791,14 @@ fn verify_batch_merged_core<Ch: Challenger>(
     let fclaims: Vec<FrobeniusClaim<'_>> = x_outers
         .iter()
         .zip(&coeffs)
-        .map(|(x, c)| {
+        .enumerate()
+        .map(|(i, (x, c))| {
             assert_eq!(x.len(), 1 + n_log + k_cols, "point/row/col split mismatch");
             FrobeniusClaim {
                 z_row: &x[1..1 + n_log],
                 z_col: &x[1 + n_log..],
                 coeffs: c,
+                zeroed_cols: zeroed_cols.get(i).copied().unwrap_or(&[]),
             }
         })
         .collect();

@@ -83,6 +83,13 @@ const ELL: usize = 64;
 const N_CHUNKS: usize = 8;
 /// Total inner-most dims absorbed by the optimization: 3 small + 4 medium.
 const N_INNER: usize = 7;
+
+/// log2 of the round-1 kernel's window, `2^(K_SKIP + N_INNER)` = 8192 bits.
+/// On a multi-run spec it reads each window up to its highest useful bit
+/// ([`build_b_med_counts`]), so a declared-zero run inside the data is read
+/// unless it covers whole windows: it must be honestly zero, or
+/// window-aligned.
+pub const ROUND1_WINDOW_LOG: usize = K_SKIP + N_INNER;
 const N_MEDIUM: usize = 4;
 
 /// The three small-eq challenges (as F_8 values, then embedded via φ_8).

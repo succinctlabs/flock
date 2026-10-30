@@ -1604,6 +1604,31 @@ impl Blake3Setup {
         self
     }
 
+    /// Drop the input words' `x·1 = x` rows (cv, m and the params word)
+    /// from the boolean PIOP ([`TableType::with_zeroed_identity_words`]):
+    /// the zerocheck skips them and the C claim masks them out.
+    pub fn with_zeroed_identity_words(self) -> Self {
+        self.with_table(crate::schedule::TableType::with_zeroed_identity_words)
+    }
+
+    /// [`Self::with_zeroed_identity_words`] plus the four output words,
+    /// whose rows define each bit as an XOR (`(A z)·1 = x`)
+    /// ([`TableType::with_zeroed_linear_words`]): the lincheck checks them.
+    pub fn with_zeroed_linear_words(self) -> Self {
+        self.with_table(crate::schedule::TableType::with_zeroed_linear_words)
+    }
+
+    fn with_table(
+        mut self,
+        f: fn(crate::schedule::TableType) -> crate::schedule::TableType,
+    ) -> Self {
+        let table = crate::schedule::TableType::from_block_r1cs(&self.r1cs);
+        self.registry = Registry::new(vec![f(table)], self.registry.nu());
+        // Warm the digest, as the constructor does.
+        let _ = self.registry.digest();
+        self
+    }
+
     fn union(&self) -> UnionInstance<'_> {
         let mut union = UnionInstance::new(&self.registry, vec![self.n_blocks]);
         if self.full_height {
@@ -2769,6 +2794,107 @@ mod tests {
         let mut ch_p2 = FsChallenger::new(b"flock-union-ag-part");
         let (proof2, _, _) = setup.prove_fast_union_ag(&blocks, &mut ch_p2);
         assert_eq!(proof, proof2, "re-prove over pooled-dirty buffers");
+    }
+
+    fn random_blocks(n: usize, seed: u64) -> Vec<Compression> {
+        let mut rng = Rng::new(seed);
+        (0..n)
+            .map(|_| {
+                let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64u32, 11u32)
+            })
+            .collect()
+    }
+
+    /// The IO words: inputs, or inputs and outputs, ascending.
+    #[cfg(target_arch = "aarch64")]
+    fn io_words(outputs: bool) -> Vec<usize> {
+        let mut words: Vec<usize> = io_schema()
+            .iter()
+            .filter(|w| outputs || w.dir == IoDirection::In)
+            .map(|w| w.word_col)
+            .collect();
+        words.sort_unstable();
+        words
+    }
+
+    /// Degree-one words dropped from the zerocheck — the input words alone
+    /// (`x·1 = x`), or also the XORed output words — prove → verify through
+    /// the materialized weight (jagged) and the block-first opening (full
+    /// height), and the proof does not verify for the registry that keeps
+    /// the rows. At full height a partial slot commits dummy rows, so it
+    /// keeps its words ([`UnionInstance::zeroed_word_cols`]); a full one
+    /// drops them.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn zeroed_words_roundtrip() {
+        for (n, linear, full_height, drops) in [
+            (200, false, false, true),
+            (200, true, false, true),
+            (200, true, true, false),
+            (256, true, true, true),
+        ] {
+            let blocks = random_blocks(n, 0x2E80_1D5);
+            let setup = |zeroed: bool| {
+                let mut s = Blake3Setup::new(n);
+                if zeroed && linear {
+                    s = s.with_zeroed_linear_words();
+                } else if zeroed {
+                    s = s.with_zeroed_identity_words();
+                }
+                if full_height {
+                    s = s.with_full_height_commit();
+                }
+                s
+            };
+            let zeroed = setup(true);
+            let words = io_words(linear);
+            assert_eq!(zeroed.registry.boolean_types()[0].zeroed_word_cols, words);
+            let union = zeroed.union();
+            let dropped: &[usize] = if drops { &words } else { &[] };
+            assert_eq!(union.zeroed_word_cols(0), dropped);
+            assert_eq!(union.checks_linear_rows(), linear && drops);
+            let case = format!("n {n}, linear {linear}, full height {full_height}");
+            let mut ch = FsChallenger::new(b"flock-zeroed-words");
+            let (proof, commitment, claim_p) = zeroed.prove_fast_union_ag(&blocks, &mut ch);
+            let mut ch = FsChallenger::new(b"flock-zeroed-words");
+            let claim_v = zeroed
+                .verify_union_ag(&commitment, &proof, &mut ch)
+                .unwrap_or_else(|e| panic!("zeroed words rejected ({case}): {e:?}"));
+            assert_eq!(claim_p, claim_v);
+            let mut ch = FsChallenger::new(b"flock-zeroed-words");
+            assert!(
+                setup(false)
+                    .verify_union_ag(&commitment, &proof, &mut ch)
+                    .is_err(),
+                "a zeroed-words proof verified for the plain registry ({case})"
+            );
+        }
+    }
+
+    /// The RS zerocheck (the x86 default) with the input and output words
+    /// dropped: prove → verify, and the plain registry rejects the proof.
+    #[test]
+    fn zeroed_linear_words_roundtrip_rs() {
+        let n = 200;
+        let blocks = random_blocks(n, 0x2E80_1D6);
+        let zeroed = Blake3Setup::new(n).with_zeroed_linear_words();
+        assert!(zeroed.union().checks_linear_rows());
+        let mut ch = FsChallenger::new(b"flock-zeroed-words-rs");
+        let (proof, commitment, claim_p) = zeroed.prove_fast(&blocks, &mut ch);
+        let mut ch = FsChallenger::new(b"flock-zeroed-words-rs");
+        let claim_v = zeroed
+            .verify(&commitment, &proof, &mut ch)
+            .unwrap_or_else(|e| panic!("zeroed words rejected (RS): {e:?}"));
+        assert_eq!(claim_p, claim_v);
+        let mut ch = FsChallenger::new(b"flock-zeroed-words-rs");
+        assert!(
+            Blake3Setup::new(n)
+                .verify(&commitment, &proof, &mut ch)
+                .is_err(),
+            "a zeroed-words proof verified for the plain registry"
+        );
     }
 
     #[test]
