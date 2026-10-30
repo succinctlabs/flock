@@ -39,6 +39,7 @@ pub mod circuit;
 pub mod element_r1cs;
 pub mod field;
 pub mod genus95_curve_code;
+pub mod gpu_commit;
 pub mod lincheck;
 pub mod matrix_fold;
 pub mod merkle;
