@@ -138,6 +138,19 @@ Throughout, `D` is the set of dropped rows, the words of
      `0 < n_t < 2^ν`) keeps all its rows. `UnionInstance::zeroed_word_cols`
      returns nothing for it, and every consumer reads the list through
      that method.
+   - **Small slots (`ν < 6`) keep their rows too.** A dropped word still
+     holds its witness bits, since C aliases z. The RS zerocheck's round
+     1 reads each 8192-bit window up to its highest useful bit
+     (`build_b_med_counts`), so it skips a dropped column only when the
+     column covers whole windows. A word column is `2^(7 + ν)` bits.
+     - **The failure:** at `ν = 5` a window straddles a dropped and a live
+       column. Round 1 read the dropped one while the fold treated it as
+       zero, and the zerocheck's final check failed.
+     - **Where it showed:** the leanXMSS tests at two signatures, on
+       CI's x86 RS route. The AG zerocheck reads per block, exactly, so
+       ARM never showed it.
+     - **Cost:** nothing at production sizes (leanXMSS at 1000 signatures
+       runs at `ν = 15`).
 
    The first version of this PR dropped the input words regardless of
    commit mode. Under full height that removed this guarantee for partial

@@ -1371,6 +1371,16 @@ commits dummy rows ($0 < n_t < 2^\nu$ under full height) keeps all of its
 rows, and the dropped set is read per slot from the instance, never from
 the type alone.
 
+\paragraph{Small slots.} Below $\nu = 6$ nothing drops either. A dropped
+word still holds its witness bits ($C$ aliases $z$). The RS zerocheck's
+round~1 reads each $8192$-bit window up to its highest useful bit, so it
+skips a dropped column only when the column, $2^{7+\nu}$ bits, covers whole
+windows. At $\nu = 5$ the round-1 message counted a dropped column that
+the fold treated as zero, and the final check failed on x86, where the RS
+route runs; the AG zerocheck reads per block and never showed it.
+Production slots are far above the threshold ($\nu = 15$ for leanXMSS at
+$1000$ signatures).
+
 The first version of this change dropped input words regardless of the
 commit mode. Reading the full-height soundness note against the wiring's
 dead-leaf formula found the gap; the version recorded here closes it.

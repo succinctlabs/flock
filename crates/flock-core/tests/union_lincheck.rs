@@ -1355,7 +1355,8 @@ fn zerocheck_then_lincheck(
 /// the zerocheck rejects it itself.
 #[test]
 fn dropped_linear_rows_are_checked_by_the_lincheck() {
-    let (nu, n) = (4, 11);
+    // nu >= 6: below it no word drops (`UnionInstance::zeroed_word_cols`).
+    let (nu, n) = (6, 43);
     let (ty, z) = gate_slot(nu, n, 0x1D_E7A);
     let linear = ty.clone().with_zeroed_linear_words();
     let identity = ty.clone().with_zeroed_identity_words();

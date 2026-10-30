@@ -43,7 +43,9 @@ use crate::{
     pcs::{Commitment, dense_lanes},
     schedule::{Instance, Registry, TableType},
     scratch::{give_zeroed_f128, take_f128, take_zeroed_f128},
-    zerocheck::{K_SKIP, PaddingSpec, ZerocheckGrinding},
+    zerocheck::{
+        K_SKIP, PaddingSpec, ZerocheckGrinding, univariate_skip_optimized::ROUND1_WINDOW_LOG,
+    },
 };
 
 /// Floor of the committed dense-stack size, as a bit-variable count: the
@@ -374,9 +376,15 @@ impl<'r> UnionInstance<'r> {
     /// pin, so it cannot stand in for the row on dummy rows; such a slot
     /// keeps its rows. Without committed dummy rows (height-`n_t` stacking,
     /// an empty slot, a full one) they are virtual zeros and the words drop.
+    ///
+    /// Nothing drops below `nu = 6` either. A dropped word still holds its
+    /// witness bits (C aliases z), and the RS zerocheck's round 1 reads each
+    /// 8192-bit window up to its highest useful bit
+    /// ([`ROUND1_WINDOW_LOG`]), so a dropped column is skipped only when it
+    /// covers whole windows: a word column is `2^(7 + nu)` bits.
     pub fn zeroed_word_cols(&self, t: usize) -> &'r [usize] {
         let n_t = self.counts()[t];
-        if self.committed_rows(n_t) > n_t {
+        if self.committed_rows(n_t) > n_t || 7 + self.n_log() < ROUND1_WINDOW_LOG {
             &[]
         } else {
             &self.instance.registry().types()[t].zeroed_word_cols

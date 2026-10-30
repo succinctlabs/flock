@@ -2808,6 +2808,7 @@ mod tests {
     }
 
     /// The IO words: inputs, or inputs and outputs, ascending.
+    #[cfg(target_arch = "aarch64")]
     fn io_words(outputs: bool) -> Vec<usize> {
         let mut words: Vec<usize> = io_schema()
             .iter()

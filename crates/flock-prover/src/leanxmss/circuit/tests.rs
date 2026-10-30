@@ -103,14 +103,13 @@ fn two_signatures_prove_and_verify() {
         .map(|&(id, _)| witness.rows::<BooleanGate>(id).len())
         .sum();
     assert_eq!(compressions, 2 * COMPRESSIONS_PER_SIGNATURE);
-    // The commit is full height, so only full slots drop their degree-one
-    // words; at this size some do, so the proof exercises the linear check.
+    // At nu = 5 a word column is 4096 bits, less than the RS zerocheck's
+    // round-1 window, so no slot drops its degree-one words
+    // (`UnionInstance::zeroed_word_cols`); `four_signatures_drop_words`
+    // covers them.
+    assert_eq!(circuit.nu(), 5);
     let union = circuit.union();
-    let full_drops = (0..union.registry().num_boolean())
-        .filter(|&t| !union.zeroed_word_cols(t).is_empty())
-        .count();
-    eprintln!("slots dropping words: {full_drops}");
-    assert!(full_drops > 0 && union.checks_linear_rows());
+    assert!((0..union.registry().num_boolean()).all(|t| union.zeroed_word_cols(t).is_empty()));
     let t = Instant::now();
     let proof = circuit.prove(&witness);
     eprintln!("prove: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
@@ -129,6 +128,34 @@ fn two_signatures_prove_and_verify() {
     assert!(circuit.verify(&tampered, &proof).is_err(), "P");
     let swapped = vec![statements[1], statements[0]];
     assert!(circuit.verify(&swapped, &proof).is_err(), "signer order");
+}
+
+/// Four signatures plan `nu = 6`, the smallest slot height at which words
+/// drop: the commit is full height, so the full slots drop their degree-one
+/// words and the lincheck checks the linear ones. The proof verifies, and
+/// fails for a changed message. On x86 this is the RS zerocheck's test of
+/// dropped words inside a multi-slot layout.
+#[test]
+fn four_signatures_drop_words() {
+    let (statements, sigs) = signed(4, 13);
+    let circuit = XmssCircuit::new(4);
+    assert_eq!(circuit.nu(), 6);
+    let union = circuit.union();
+    let full_drops = (0..union.registry().num_boolean())
+        .filter(|&t| !union.zeroed_word_cols(t).is_empty())
+        .count();
+    assert!(
+        full_drops > 0 && union.checks_linear_rows(),
+        "{full_drops} slots drop"
+    );
+    let witness = circuit.witness(&statements, &sigs);
+    let proof = circuit.prove(&witness);
+    circuit
+        .verify(&statements, &proof)
+        .expect("honest proof verifies");
+    let mut tampered = statements.clone();
+    tampered[2].msg[5] ^= 1;
+    assert!(circuit.verify(&tampered, &proof).is_err(), "message");
 }
 
 /// The online phase refuses a signature that does not verify: the bottom
