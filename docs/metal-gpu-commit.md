@@ -230,6 +230,47 @@ the commit.
   - the embedded metallib, which only shortens init;
   - the cross-process warmup cache and the autotuner.
 
+## Ligerito's recursive commits
+
+They stay on the CPU. Each recursive level commits through `ligero_commit`
+(`pcs/ligerito.rs`), which has its own NTT call and Merkle tree, not the
+level-0 path above. At BLAKE3 2^18 (10 threads, `FLOCK_LIG_TIMING=1`) they
+are 16 lanes at rates 1/8 to 1/2048:
+
+| level | shape | encode + Merkle |
+|---|---|---:|
+| 1 | 2^16 columns, rate 1/8 | ~25 ms |
+| 2 | 2^13, rate 1/32 | ~11 ms |
+| 3 | 2^10, rate 1/128 | ~6 ms |
+| 4–5 | rates 1/512, 1/2048 | ~3.5 ms |
+
+About 45 ms per prove. Only level 1 is large enough for a split to matter.
+At the level-0 split's ~18% gain that is about 4–6 ms, and the levels run
+one at a time between sumcheck rounds, so the GPU work overlaps nothing. The
+challenge's recursive-Merkle GPU switch measured as noise in yukon's A/B.
+
+## GPU zerocheck round 1 (prototype, not wired)
+
+A Metal kernel for the AG round-1 sums over Full blocks: the 160 product
+coordinates and both `c` banks. It is test-only and equal to
+`round1_straight_line_program_packed_banks_fused_padded`
+(`ag_round1_matches_cpu`).
+- **v1:** each thread transposes its 32 rows into plane words and runs the
+  Paar encode. At 2^17 blocks it took 68–92 ms against the CPU's ~20 ms
+  (10 threads). It was spill-bound: about 800 live words per thread.
+- **v2:** only `a`'s and `b`'s 64 plane words stay in registers. Each
+  encoded word is an unrolled XOR chain straight from the 160×64 matrix
+  (`scripts/gen_gpu_ag_round1.py` → `gpu_ag_round1_gen.msl`). Products go
+  through threadgroup memory in three coordinate sets, each folded at once.
+  50–64 ms; 28–35 ms without the `eq` multiplications.
+
+The remaining costs are the 128 live plane words and ~4,600 table lookups
+per block for the `eq` multiplications, which the M4's GPU has no carryless
+multiply for. A GPU prefix of ~25% of the blocks would save about 10 ms at
+best, so it is not wired in. The challenge's experience agrees: only its
+multiplication-free GPU arms paid off. The GKR wiring check's folds have the
+same multiplications.
+
 ## Next
 
 - **The rest of the fill.** The GPU's share is still transposed before it
@@ -237,8 +278,6 @@ the commit.
   in a Metal buffer (a no-copy wrap of the scratch allocation).
 - **The final pass.** It is the one GPU pass left unpacked; packing it
   means several twiddle sets per group.
-- **GPU zerocheck round 1.** A prototype is next: the multiplications by
-  `eq` dominate it on a GPU without a carryless multiply.
 
 ## Tests
 
@@ -256,6 +295,11 @@ the commit.
   transform.
 - **`gpu_graph_timing`** (ignored): per-stage GPU timestamps at production
   size.
+- **`ag_round1_matches_cpu`:** the round-1 prototype against the CPU
+  kernel; **`ag_round1_timing`** (ignored) times it at 2^17 blocks.
 - **Without the feature:** the workspace tests, clippy and fmt pass
-  unchanged. With `--features flock-prover/metal` the workspace tests pass
+  unchanged. The sub-block twiddle offsets are compiled only with the
+  feature (and in tests), so the default build's NTT is main's: single
+  core, BLAKE3 2^18, its ranked NTT measured 449.1 vs 449.2 ms (median of
+  3 alternating rounds) and prove 1.95–1.98 s on both. With `--features flock-prover/metal` the workspace tests pass
   too; large commits then take the GPU path, first-commit check included.
