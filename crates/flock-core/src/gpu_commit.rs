@@ -2400,10 +2400,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     /// the generated encode, and the kernel.
     #[cfg(test)]
     fn ag_round1_source() -> String {
-        let kernel = include_str!("gpu_ag_round1.msl");
         format!(
-            "{MSL_SOURCE}\n{}\n{kernel}",
-            include_str!("gpu_ag_encode.msl")
+            "{MSL_SOURCE}\n{}\n{}",
+            include_str!("gpu_ag_round1_gen.msl"),
+            include_str!("gpu_ag_round1.msl")
         )
     }
 
