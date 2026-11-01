@@ -1623,6 +1623,15 @@ does (the Metal track).
 \item[Result:] Default pool $455.6\to410.3\,$ms ($-10\%$, $4/4$); the open alone $121.6\to92.0$.
 \end{optsummary}
 
+\subsection{The lincheck's circuit fold, in two chains}\label{sec:cscgather}
+
+\begin{optsummary}
+\item[Baseline:] Single-threaded the lincheck took $84.7\,$ms against the frontier's $77.8$, which read as a slower z-fold kernel: per useful bit ($11{,}707$ here, $15{,}409$ in the frontier's circuit) $43\%$ behind its hand-written EOR3 \code{process\_block16\_neon\_single\_sha3}. It is not: on the production shape ($m{=}32$, $k{=}2^{14}$, one thread) our eight-row kernel, a typed-table variant that compiles to the frontier's \code{ubfx} plus scaled-load sequence, a sixteen-row intrinsics variant and the frontier's assembly all fold in $53$--$55\,$ms. The z fold is load-bound and at parity per lookup. The difference is the lincheck's other term, the circuit fold \code{CscCircuit::fold\_split} ($A_0^{\top}u$ and $B_0^{\top}u$): $19.8\,$ms single-threaded over BLAKE3's $44.4$M nonzeros (linear substitution leaves rows of up to $5{,}320$ entries), where the frontier walks its circuit in $0.05\,$ms.
+\item[Improvement:] Each column's gather runs in two interleaved accumulators, indices masked by the power-of-two width (asserted at construction) so the bounds checks drop out. \code{fold\_split} (prover) and \code{fold\_alpha\_batched} (verifier) share it, so every \code{CscCircuit} gains: the BLAKE3 and SHA-2 encoders and every leanXMSS gate.
+\item[Mechanism:] One accumulator serializes on the XOR, about two cycles a nonzero; two leave the loop bound by its two loads. Four or eight chains and an L1-blocked two-pass row split measured no better. The same sums in another order: byte-identical.
+\item[Result:] The fold alone $19.8\to9.3\,$ms ST. BLAKE3 prove, lincheck ST $84.3\to73.6\,$ms, 10T $17.5\to16.7$ (both $4/4$), proof digest unchanged in all $16$; its verifier ST $20.7\to11.6\,$ms, 10T $4.8\to4.1$. leanXMSS[BLAKE3] at $1000$ signatures ($4$ pairs): lincheck ST $114.2\to90.8\,$ms, prove $1982\to1958$, verify $136.5\to69.3$ (all $4/4$); 10T lincheck $-2.0\,$ms and verify $26.6\to20.3$ ($4/4$), prove unchanged.
+\end{optsummary}
+
 \paragraph{Rejected, and what is left.} The induce truncation of
 \S\ref{sec:inducetrunc} generalizes to every rate --- the low
 $2^{\mathrm{msg}}$ outputs of the last $\log(1/\rho)$ transpose steps are
@@ -1636,9 +1645,13 @@ $-4\,$ms ST. Three larger items remain, each above the bloat bar without
 an explicit call: the frontier's depth-three delayed sparse-dual
 induction (C2, $\approx500$ lines there), which would take most of the
 remaining induce ($7.0\,$ms ST at the L0 boundary, $2.7$ at L1); the
-SIMD witness builder, null at eight threads (\S\ref{sec:zpool}) but
-single-threaded the frontier's witness generation is $144\,$ms against
-our $201$; and the strict ladder itself, whose recursive commits are
+witness builder, where single-threaded the frontier takes $139\,$ms
+against our $189$ plus a $24\,$ms message transpose --- its scalar
+full-word stream builder (the SIMD quad path is off on its codeword arm)
+writes whole u64s with no zeroing or read-modify-write and fills the
+codeword's message half while the data is hot, against our batch-major
+builder's $77\%$ bit compute, $17\%$ row flush and $6\%$ memset; and the
+strict ladder itself, whose recursive commits are
 $+120\,$ms ST over Fast100 by construction --- a parameter decision, not
 an implementation one.
 
@@ -1711,6 +1724,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:lazyood2} & work removal (algebra) & level OODs: $-5.6\,$ms ST, $-3.4$ 10T & $4/4$\\
 \S\ref{sec:inducecost} & dispatch & induce: $-3.1\,$ms ST, $-1.3$ 10T & $4/4$\\
 \S\ref{sec:erichpool} & scheduling & default-pool prove: $455.6\to410.3\,$ms & $4/4$\\
+\S\ref{sec:cscgather} & ILP & lincheck: $-10.6\,$ms ST; verify $20.7\to11.6$; leanXMSS verify $-49\%$ & $4/4$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
