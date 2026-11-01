@@ -127,9 +127,7 @@ use {
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
-use crate::r1cs_hashes::common::{
-    BM_V, BmRow, add_carry_parts_v, fused_add3_parts_v, or_bit_row, or_u32_row,
-};
+use crate::r1cs_hashes::common::{BM_V, BmRow, or_u32_row};
 use crate::{
     prover::{UnionSlotProverInput, prove_fast_ligerito_union},
     r1cs_hashes::common::{
@@ -364,22 +362,30 @@ fn out_hi_bit(w: usize, b: usize) -> usize {
 
 /// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
 /// — i.e., `PERM^r [G_MSG_IDX[g]]`.
-fn per_round_msg_idx() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
+const fn per_round_msg_idx() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
     let mut perm = [0usize; 16];
-    for i in 0..16 {
+    let mut i = 0;
+    while i < 16 {
         perm[i] = i;
+        i += 1;
     }
     let mut out = [[[0usize; 2]; N_G_PER_ROUND]; N_ROUNDS];
-    for r in 0..N_ROUNDS {
-        for g in 0..N_G_PER_ROUND {
+    let mut r = 0;
+    while r < N_ROUNDS {
+        let mut g = 0;
+        while g < N_G_PER_ROUND {
             out[r][g][0] = perm[G_MSG_IDX[g][0]];
             out[r][g][1] = perm[G_MSG_IDX[g][1]];
+            g += 1;
         }
         let mut next = [0usize; 16];
-        for i in 0..16 {
+        let mut i = 0;
+        while i < 16 {
             next[i] = perm[MSG_PERMUTATION[i]];
+            i += 1;
         }
         perm = next;
+        r += 1;
     }
     out
 }
@@ -1864,11 +1870,6 @@ impl Blake3Setup {
 // `common::drive_witness_batch_major`.
 // ---------------------------------------------------------------------------
 
-#[inline(always)]
-fn batch_major_xor_rotr(x: &[u32; BM_V], y: &[u32; BM_V], r: u32) -> [u32; BM_V] {
-    from_fn(|j| (x[j] ^ y[j]).rotate_right(r))
-}
-
 struct BmRows<'a> {
     z: &'a mut [BmRow],
     a: &'a mut [BmRow],
@@ -1882,70 +1883,165 @@ fn batch_major_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) 
     or_u32_row(rows.b, bit, &[0xFFFF_FFFF; BM_V]);
 }
 
-#[inline(always)]
-fn batch_major_add_inline(
-    rows: &mut BmRows<'_>,
-    x: &[u32; BM_V],
-    y: &[u32; BM_V],
-    carry_bit: usize,
-) -> [u32; BM_V] {
-    let (sum, left, right, carry) = add_carry_parts_v(x, y);
-    or_u32_row(rows.z, carry_bit, &carry);
-    or_u32_row(rows.a, carry_bit, &left);
-    or_u32_row(rows.b, carry_bit, &right);
-    sum
+/// One lane's run of consecutive bit fields, written to `rows[w][lane]` as
+/// whole words: a word is stored once it is complete and never read back.
+/// The bits below the run's start in its first word are kept, and the last
+/// partial word is OR'd in, so a run that starts or ends mid-word (the DSL
+/// kernel's) leaves its neighbours intact.
+struct LaneWords<'r> {
+    rows: &'r mut [BmRow],
+    lane: usize,
+    word: usize,
+    pending: u64,
+    used: usize,
 }
 
-#[inline(always)]
-fn batch_major_fused_add_inline(
-    rows: &mut BmRows<'_>,
-    x: &[u32; BM_V],
-    y: &[u32; BM_V],
-    m: &[u32; BM_V],
-    maj_bit: usize,
-    rip_bit: usize,
-) -> [u32; BM_V] {
-    let (sum, maj, rip) = fused_add3_parts_v(x, y, m);
-    or_u32_row(rows.z, maj_bit, &maj[2]);
-    or_u32_row(rows.a, maj_bit, &maj[0]);
-    or_u32_row(rows.b, maj_bit, &maj[1]);
-    or_u32_row(rows.z, rip_bit, &rip[2]);
-    or_u32_row(rows.a, rip_bit, &rip[0]);
-    or_u32_row(rows.b, rip_bit, &rip[1]);
-    sum
-}
-
-#[inline(always)]
-fn batch_major_const_add_inline(
-    rows: &mut BmRows<'_>,
-    k: u32,
-    y: &[u32; BM_V],
-    bit: usize,
-    n_rows: usize,
-) -> [u32; BM_V] {
-    let t = CARRY_BITS_PER_ADD - n_rows;
-    let mask = (1u32 << n_rows) - 1;
-    let mut sum = [0u32; BM_V];
-    let mut zc = [0u32; BM_V];
-    let mut ac = [0u32; BM_V];
-    let mut bc = [0u32; BM_V];
-    for j in 0..BM_V {
-        let (s, left, right, carry) = add_carry_parts(k, y[j]);
-        sum[j] = s;
-        zc[j] = (carry >> t) & mask;
-        ac[j] = (left >> t) & mask;
-        bc[j] = (right >> t) & mask;
+impl<'r> LaneWords<'r> {
+    #[inline(always)]
+    fn at(rows: &'r mut [BmRow], lane: usize, bit: usize) -> Self {
+        let (word, used) = (bit >> 6, bit & 63);
+        let pending = if used == 0 {
+            0
+        } else {
+            rows[word][lane] & ((1 << used) - 1)
+        };
+        Self {
+            rows,
+            lane,
+            word,
+            pending,
+            used,
+        }
     }
-    or_u32_row(rows.z, bit, &zc);
-    or_u32_row(rows.a, bit, &ac);
-    or_u32_row(rows.b, bit, &bc);
-    sum
+
+    /// Append a `width`-bit field (`width ≤ 32`, value pre-masked).
+    #[inline(always)]
+    fn push(&mut self, value: u32, width: usize) {
+        let v = value as u64;
+        self.pending |= v << self.used;
+        self.used += width;
+        if self.used >= 64 {
+            self.rows[self.word][self.lane] = self.pending;
+            self.word += 1;
+            self.used -= 64;
+            self.pending = v >> (width - self.used);
+        }
+    }
+
+    #[inline(always)]
+    fn finish(self) {
+        if self.used > 0 {
+            self.rows[self.word][self.lane] |= self.pending;
+        }
+    }
 }
 
-/// The seven rounds of eight compressions in lockstep: every G block's
-/// carries and their operands, written with the G region starting at bit
-/// `region` (it is [`GS_BASE`] in this gate's own block); returns the final
-/// state.
+/// `per_round_msg_idx`, as a constant the unrolled rounds index literally.
+const MSG_IDX: [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] = per_round_msg_idx();
+
+/// One compression's G blocks, lane `lane` of the rows, starting at bit
+/// `region` ([`GS_BASE`] in this gate's own block); returns the final state.
+/// All 56 G's are expanded, so every state and message index is a literal
+/// and the state lives in registers, and the fields stream out in bit order
+/// (the block layout is their emission order).
+#[inline(always)]
+fn lane_rounds(
+    rows: &mut BmRows<'_>,
+    lane: usize,
+    region: usize,
+    cv: [u32; 8],
+    m: [u32; 16],
+    params: [u32; 4],
+) -> [u32; 16] {
+    let mut wz = LaneWords::at(rows.z, lane, region);
+    let mut wa = LaneWords::at(rows.a, lane, region);
+    let mut wb = LaneWords::at(rows.b, lane, region);
+    let mut s = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        params[0],
+        params[1],
+        params[2],
+        params[3],
+    ];
+    macro_rules! push3 {
+        ($width:expr, $z:expr, $a:expr, $b:expr) => {{
+            wz.push($z, $width);
+            wa.push($a, $width);
+            wb.push($b, $width);
+        }};
+    }
+    macro_rules! g {
+        ($r:literal, $gi:literal) => {{
+            const G: usize = $r * N_G_PER_ROUND + $gi;
+            const L: [usize; 4] = G_LANES[$gi];
+            const M: [usize; 2] = MSG_IDX[$r][$gi];
+            // Round 1's column G's add the constant IV word (it is still
+            // `s[L[2]]`) and drop the carries below its lowest set bit.
+            const C1_SHIFT: usize = CARRY_BITS_PER_ADD - g_c1_rows(G);
+            let (a, b, c, d) = (s[L[0]], s[L[1]], s[L[2]], s[L[3]]);
+            let (a_1, maj, rip) = fused_add3_parts(a, b, m[M[0]]);
+            push3!(CARRY_BITS_PER_ADD, maj[2], maj[0], maj[1]);
+            push3!(RIPPLE_BITS_PER_FADD, rip[2], rip[0], rip[1]);
+            let d_1 = (d ^ a_1).rotate_right(16);
+            let (c_1, left, right, carry) = add_carry_parts(c, d_1);
+            push3!(
+                g_c1_rows(G),
+                carry >> C1_SHIFT,
+                left >> C1_SHIFT,
+                right >> C1_SHIFT
+            );
+            let b_1 = (b ^ c_1).rotate_right(12);
+            let (a_2, maj, rip) = fused_add3_parts(a_1, b_1, m[M[1]]);
+            push3!(CARRY_BITS_PER_ADD, maj[2], maj[0], maj[1]);
+            push3!(RIPPLE_BITS_PER_FADD, rip[2], rip[0], rip[1]);
+            let d_2 = (d_1 ^ a_2).rotate_right(8);
+            let (c_2, left, right, carry) = add_carry_parts(c_1, d_2);
+            push3!(CARRY_BITS_PER_ADD, carry, left, right);
+            s[L[0]] = a_2;
+            s[L[1]] = (b_1 ^ c_2).rotate_right(7);
+            s[L[2]] = c_2;
+            s[L[3]] = d_2;
+        }};
+    }
+    macro_rules! round {
+        ($r:literal) => {{
+            g!($r, 0);
+            g!($r, 1);
+            g!($r, 2);
+            g!($r, 3);
+            g!($r, 4);
+            g!($r, 5);
+            g!($r, 6);
+            g!($r, 7);
+        }};
+    }
+    round!(0);
+    round!(1);
+    round!(2);
+    round!(3);
+    round!(4);
+    round!(5);
+    round!(6);
+    debug_assert_eq!((wz.word << 6) + wz.used, region + G_REGION_BITS);
+    wz.finish();
+    wa.finish();
+    wb.finish();
+    s
+}
+
+/// The seven rounds of eight compressions, lane by lane ([`lane_rounds`]),
+/// with the G region starting at bit `region`; returns the final state.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn batch_major_rounds(
@@ -1958,77 +2054,21 @@ fn batch_major_rounds(
     block_len: [u32; BM_V],
     flags: [u32; BM_V],
 ) -> [[u32; BM_V]; 16] {
-    // `g_bit` positions are in this gate's block, whose G region starts at
-    // GS_BASE.
-    let base = region.wrapping_sub(GS_BASE);
-    let at = |g: usize, off: usize| base.wrapping_add(g_bit(g, off));
-    let mut state: [[u32; BM_V]; 16] = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
-        [BLAKE3_IV[0]; BM_V],
-        [BLAKE3_IV[1]; BM_V],
-        [BLAKE3_IV[2]; BM_V],
-        [BLAKE3_IV[3]; BM_V],
-        counter_lo,
-        counter_hi,
-        block_len,
-        flags,
-    ];
-    let msg_idx = per_round_msg_idx();
-    for r in 0..N_ROUNDS {
-        for g_in_round in 0..N_G_PER_ROUND {
-            let g = r * N_G_PER_ROUND + g_in_round;
-            let [la, lb, lc, ld] = G_LANES[g_in_round];
-            let [mx_i, my_i] = msg_idx[r][g_in_round];
-            let mx = m[mx_i];
-            let my = m[my_i];
-
-            let a_val = state[la];
-            let b_val = state[lb];
-            let c_val = state[lc];
-            let d_val = state[ld];
-
-            let a_1 = batch_major_fused_add_inline(
-                rows,
-                &a_val,
-                &b_val,
-                &mx,
-                at(g, OFF_MAJ1),
-                at(g, OFF_RIP1),
-            );
-            let d_1 = batch_major_xor_rotr(&d_val, &a_1, 16);
-            let c_1 = if g < 4 {
-                batch_major_const_add_inline(rows, BLAKE3_IV[g], &d_1, at(g, OFF_C1), g_c1_rows(g))
-            } else {
-                batch_major_add_inline(rows, &c_val, &d_1, at(g, OFF_C1))
-            };
-            let b_1 = batch_major_xor_rotr(&b_val, &c_1, 12);
-            let a_2 = batch_major_fused_add_inline(
-                rows,
-                &a_1,
-                &b_1,
-                &my,
-                at(g, off_maj2(g)),
-                at(g, off_rip2(g)),
-            );
-            let d_2 = batch_major_xor_rotr(&d_1, &a_2, 8);
-            let c_2 = batch_major_add_inline(rows, &c_1, &d_2, at(g, off_c2(g)));
-            let b_new = batch_major_xor_rotr(&b_1, &c_2, 7);
-            let d_new = d_2;
-
-            state[la] = a_2;
-            state[lb] = b_new;
-            state[lc] = c_2;
-            state[ld] = d_new;
+    let mut state = [[0u32; BM_V]; 16];
+    for j in 0..BM_V {
+        let params = [counter_lo[j], counter_hi[j], block_len[j], flags[j]];
+        let s = lane_rounds(
+            rows,
+            j,
+            region,
+            from_fn(|w| cv[w][j]),
+            from_fn(|i| m[i][j]),
+            params,
+        );
+        for (word, v) in state.iter_mut().zip(s) {
+            word[j] = v;
         }
     }
-
     state
 }
 
@@ -2057,30 +2097,42 @@ pub(crate) fn build_group_batch_major(
     let block_len: [u32; BM_V] = from_fn(|j| inputs[j].3);
     let flags: [u32; BM_V] = from_fn(|j| inputs[j].4);
 
-    or_bit_row(rows.z, Z_CONST_POS);
-    or_bit_row(rows.a, Z_CONST_POS);
-    or_bit_row(rows.b, Z_CONST_POS);
-
-    for w in 0..8 {
-        batch_major_write_lin(&mut rows, chaining_value_bit(w, 0), &cv[w]);
+    // Every row in `[0, USEFUL_BITS / 64]` is stored whole, so the driver
+    // need not clear them: the I/O words here, the G region streamed, and
+    // the pin's word (the G region's last) stored before the stream ORs its
+    // tail in.
+    let pin_word = Z_CONST_POS / 64;
+    debug_assert_eq!(pin_word, (G_BASE[N_G] - 1) / 64);
+    for r in [&mut *rows.z, &mut *rows.a, &mut *rows.b] {
+        r[pin_word] = [1 << (Z_CONST_POS % 64); BM_V];
     }
-    for i in 0..16 {
-        batch_major_write_lin(&mut rows, m_bit(i, 0), &m[i]);
-    }
-    batch_major_write_lin(&mut rows, T_LO_BASE, &counter_lo);
-    batch_major_write_lin(&mut rows, T_HI_BASE, &counter_hi);
-    batch_major_write_lin(&mut rows, BLEN_BASE, &block_len);
-    batch_major_write_lin(&mut rows, FLAGS_BASE, &flags);
+    store_lin_words(&mut rows, CV_BASE, &cv);
+    store_lin_words(&mut rows, M_BASE, &m);
+    store_lin_words(
+        &mut rows,
+        T_LO_BASE,
+        &[counter_lo, counter_hi, block_len, flags],
+    );
 
     let state = batch_major_rounds(
         &mut rows, GS_BASE, &cv, &m, counter_lo, counter_hi, block_len, flags,
     );
 
-    for w in 0..8 {
-        let lo: [u32; BM_V] = from_fn(|j| state[w][j] ^ state[w + 8][j]);
-        let hi: [u32; BM_V] = from_fn(|j| state[w + 8][j] ^ cv[w][j]);
-        batch_major_write_lin(&mut rows, out_lo_bit(w, 0), &lo);
-        batch_major_write_lin(&mut rows, out_hi_bit(w, 0), &hi);
+    let lo: [[u32; BM_V]; 8] = from_fn(|w| from_fn(|j| state[w][j] ^ state[w + 8][j]));
+    let hi: [[u32; BM_V]; 8] = from_fn(|w| from_fn(|j| state[w + 8][j] ^ cv[w][j]));
+    store_lin_words(&mut rows, OUT_LO_BASE, &lo);
+    store_lin_words(&mut rows, OUT_HI_BASE, &hi);
+}
+
+/// Store consecutive 32-bit I/O words from the word-aligned bit `bit` as
+/// whole rows: `z = a =` the values, `b` all ones (`x·1 = x`).
+fn store_lin_words<const N: usize>(rows: &mut BmRows<'_>, bit: usize, vals: &[[u32; BM_V]; N]) {
+    debug_assert_eq!(bit % 64, 0);
+    for (k, [lo, hi]) in vals.as_chunks::<2>().0.iter().enumerate() {
+        let word: BmRow = from_fn(|j| lo[j] as u64 | (hi[j] as u64) << 32);
+        rows.z[bit / 64 + k] = word;
+        rows.a[bit / 64 + k] = word;
+        rows.b[bit / 64 + k] = [u64::MAX; BM_V];
     }
 }
 
