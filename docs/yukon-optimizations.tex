@@ -1641,6 +1641,45 @@ does (the Metal track).
 \item[Result:] BLAKE3 prove ($4$ pairs): witgen ST $196.9\to130.8\,$ms, 10T $35.5\to26.1$; prove ST $1858\to1789\,$ms ($-3.6\%$), 10T $417.5\to410.4$ (all $4/4$), proof digest unchanged in all $16$ --- single-threaded witness generation now under the frontier's $139$. leanXMSS[BLAKE3] at $1000$ signatures: witgen ST $183.0\to177.3\,$ms, 10T $34.5\to33.3$ (both $4/4$), every proof verified; its witness is mostly the DSL gate packing (\code{BooleanGate::pack\_into\_with}), which this does not touch.
 \end{optsummary}
 
+\subsection{The message transpose: measured, fusion held back}\label{sec:fusedmsg}
+
+The lane-major commit transposes the witness into the ranked top's
+position-major message, $\mathrm{msg}[p\cdot t+l]=q[l\cdot D+p]$
+($t=46$ lanes, $D=2^{19}$: $368\,$MB each way at $m{=}32$), in
+$24\,$ms ST and $13.6\,$ms at 10T --- it barely scales, being pure DRAM
+traffic. The frontier avoids it by writing its codeword's message half
+during witness generation. Three attempts:
+
+\begin{itemize}
+\item \emph{A faster transpose.} Every loop order measured the same in a
+standalone kernel on the production shape --- lane-major reads with
+scattered stores $22.3\,$ms, lane pairs $23.0$, lane quads $22.4$,
+position-major gathers $38.4$ --- and staging each tile in L2 and
+streaming it out non-temporally (skipping the destination's
+read-for-ownership) measured $25.7$--$27.5$ against $23.4$--$25.6$
+in-prove. It is bandwidth-bound; rejected.
+\item \emph{Fusing it into the first NTT pass} (gathering the radix-8
+inputs from $q$ directly): $8\times46$ concurrent read streams per tile
+row and a $1\,$MB staging tile per pass. Not attempted.
+\item \emph{Writing the message from the witness driver}, as the frontier
+does: when $q$ is the single slot's $z$ (identity compaction) and the
+ranked top applies, the union prover lends the driver a
+\code{MessageDest}; the BLAKE3 driver writes each position's lane record
+from its staged rows with non-temporal stores, and
+\code{commit\_lane\_major\_with\_message} skips the transpose.
+Byte-identical (digest unchanged, $16/16$). Four pairs against
+\S\ref{sec:lanebuilder}: ST witgen $+16.6\,$ms, transpose $-24.2$, prove
+$-3.9$ ($3/4$); 10T witgen $+2.9$, transpose $-13.6$, prove
+$-8.5\,$ms ($4/4$, $-2\%$). The single-thread cost is the $368\,$MB of
+extra stores ($+11.5\,$ms at $\approx32\,$GB/s in a witgen-only probe, the
+single-core write floor), so the single-thread gain cannot exceed
+$\approx-8\,$ms. At $+184$ lines across $14$ files --- a new
+\code{SlotWitnessDest} field every driver and test site carries --- for a
+single-thread wash it is held back (branch \code{yukon-128-fused-msg});
+it is worth taking only for the 10T result. It cannot help leanXMSS,
+whose compacted $q$ is not its $z$.
+\end{itemize}
+
 \paragraph{Rejected, and what is left.} The induce truncation of
 \S\ref{sec:inducetrunc} generalizes to every rate --- the low
 $2^{\mathrm{msg}}$ outputs of the last $\log(1/\rho)$ transpose steps are
@@ -1650,16 +1689,13 @@ at L1, but the segment XOR costs most of what it saves: $2.87\to2.49\,$ms
 ST at L1, $0.4\,$ms a prove, not worth its lines. Routing the query PoW
 through the eight-way or SME2 BLAKE3 kernel (grinding is $8\,$ms ST) needs
 the transcript crate to depend on the Merkle crate's kernels; estimated
-$-4\,$ms ST. Three larger items remain, each above the bloat bar without
+$-4\,$ms ST. Larger items remain, each above the bloat bar without
 an explicit call: the frontier's depth-three delayed sparse-dual
 induction (C2, $\approx500$ lines there), which would take most of the
 remaining induce ($7.0\,$ms ST at the L0 boundary, $2.7$ at L1); the
-witness builder, where single-threaded the frontier takes $139\,$ms
-against our $189$ plus a $24\,$ms message transpose --- its scalar
-full-word stream builder (the SIMD quad path is off on its codeword arm)
-writes whole u64s with no zeroing or read-modify-write and fills the
-codeword's message half while the data is hot, against our batch-major
-builder's $77\%$ bit compute, $17\%$ row flush and $6\%$ memset; and the
+leanXMSS DSL gate packing (\code{BooleanGate::pack\_into\_with}, about
+half its $177\,$ms single-threaded witness generation); the fused
+message write of \S\ref{sec:fusedmsg} for its 10T gain; and the
 strict ladder itself, whose recursive commits are
 $+120\,$ms ST over Fast100 by construction --- a parameter decision, not
 an implementation one.
@@ -1734,6 +1770,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:inducecost} & dispatch & induce: $-3.1\,$ms ST, $-1.3$ 10T & $4/4$\\
 \S\ref{sec:erichpool} & scheduling & default-pool prove: $455.6\to410.3\,$ms & $4/4$\\
 \S\ref{sec:cscgather} & ILP & lincheck: $-10.6\,$ms ST; verify $20.7\to11.6$; leanXMSS verify $-49\%$ & $4/4$\\
+\S\ref{sec:lanebuilder} & representation, store pattern & witgen: $196.9\to130.8\,$ms ST, $-9.4$ 10T; prove $-3.6\%$ ST & $4/4$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
