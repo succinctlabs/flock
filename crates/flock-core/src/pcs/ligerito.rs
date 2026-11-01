@@ -2846,18 +2846,18 @@ pub fn induce_sumcheck_poly_via_ntt(
 /// Cost-based dispatch between the dense [`induce_sumcheck_poly`] and the
 /// sparse-NTT [`induce_sumcheck_poly_via_ntt`].
 ///
-/// The dense path costs `O(n_queries · 2^log_msg_cols)`; the NTT path costs one
-/// pass over the `2^(log_msg_cols+log_inv_rate)` codeword domain, `O(2^log_block
-/// · log_block)`. The `2^log_msg_cols` factor cancels, so the NTT wins exactly
-/// when there are enough queries to amortize the codeword pass against the rate
-/// blow-up and depth:
-///   `n_queries  >  C · 2^log_inv_rate · log_block`   (C≈4: the NTT is ~2×
-/// costlier per op — memory-bound, multi-pass — plus margin so we only switch
-/// when clearly ahead). In the recursive PCS this fires only at the top level
-/// (large message domain, many queries); deeper levels stay dense.
+/// The dense path costs `n_queries · 2^log_msg_cols` products; the NTT path
+/// costs the transpose layers past [`transpose_forward_ntt_sparse`]'s
+/// windowed prefix, `(log_block − 8) · 2^(log_block − 1)` butterflies of one
+/// product each. Measured on M4 at the strict-128 ladder's levels (rates
+/// 1/2 .. 1/2048), both cost ~1 ns per product at 1 and 10 threads, so the
+/// dispatch compares the two counts directly. The earlier `n_queries > 4 ·
+/// 2^log_inv_rate · log_block` rule (tuned at blake m=30, rate 1/2) kept the
+/// strict-128 L1 induce (2^16 columns, rate 1/8, 79 queries) dense at
+/// 5.45 ms ST where the NTT takes 2.74 ms.
 ///
 /// Both paths are byte-identical (see `induce_sumcheck_poly_via_ntt_matches_dense`),
-/// so a mis-dispatch only costs time. Tuned/validated at blake m=30.
+/// so a mis-dispatch only costs time.
 pub(crate) fn induce_sumcheck_poly_auto(
     log_msg_cols: usize,
     log_inv_rate: usize,
@@ -2869,7 +2869,7 @@ pub(crate) fn induce_sumcheck_poly_auto(
 ) -> (Vec<F128>, F128) {
     let log_block = log_msg_cols + log_inv_rate;
     let use_ntt =
-        log_msg_cols >= 12 && queries.len() > 4 * (1usize << log_inv_rate) * log_block.max(1);
+        log_msg_cols >= 12 && queries.len() << log_msg_cols > (log_block - 8) << (log_block - 1);
     if use_ntt {
         induce_sumcheck_poly_via_ntt(
             log_msg_cols,
@@ -6789,6 +6789,10 @@ mod tests {
             (8, 3, 3, 71),
             (5, 5, 3, 43),
             (0, 2, 1, 3),
+            // log_block ≥ 12: the windowed sparse prefix.
+            (12, 1, 2, 100),
+            (9, 3, 1, 60),
+            (8, 5, 0, 40),
         ];
         for (si, &(log_msg, log_inv_rate, log_int, n_queries)) in shapes.iter().enumerate() {
             let block_len = 1usize << (log_msg + log_inv_rate);

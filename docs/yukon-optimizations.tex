@@ -1550,6 +1550,98 @@ Table~\ref{tab:degreeone}, is now its smallest.
   linear check's terms in the tower's fold region.
 \end{itemize}
 
+\section{The strict-128 audit against the current frontier}\label{sec:strict128}
+
+On 2026-10-30 the campaign was re-run against the challenge tree's
+newest frontier (\code{flock-challenge} \code{8d4b435}, sixteen
+submissions past the \code{c35c1c4} the earlier sections audited,
+$7$--$11\%$ faster than it on every arm) and for the \emph{strict-128}
+(\code{Fast}) profile only. Host: Apple M4 (4P$+$6E). Shape: the $m{=}32$
+BLAKE3 prove ($2^{18}$ compressions), grinding on. Protocol: alternating
+processes, each the minimum over its proves, then the median over four
+processes; the single-thread A/B decides compute changes, ten threads
+and the default pool decide parallelism. Every change here is
+proof-byte-identical (one digest across all $24$ A/B processes).
+
+\paragraph{Where strict-128 differs from Fast100.} Phase by phase at ten
+threads, the two profiles cost the same except in the Ligerito recursion:
+its five recursive commits ($44$ against $18\,$ms; $191$ against
+$69\,$ms single-threaded) and its query grinding ($2.4$--$3.7$ against
+$0.2\,$ms). Both follow from the strict ladder itself --- rates
+$1/8\,..\,1/2048$, climbing $+2$ per level, and $16$-bit query PoW --- not
+from an implementation gap: the recursive encodes already start past the
+$\log(1/\rho)$ copy-only layers, and their per-element cost matches the
+frontier's ($\approx2\,$ms per $2^{20}$ elements at ten threads on both).
+
+\paragraph{The audit.} Of the frontier's thirty switches that measured
+significant on their own (the 2026-10-29 switch campaign), the CPU-side
+ones map as follows. \emph{Live}: the streaming commit and its from-message
+top (NTT\_TOP\_EPOOL, NTT\_MERKLE\_PIPELINE, NTT\_FROM\_MSG;
+\S\ref{sec:streamcommit}, \S\ref{sec:rankedtop}), the zerocheck lookahead
+(\S\ref{sec:cascade}, \S\ref{sec:foldentry}), round-1 AB prep under the
+commit (\S\ref{sec:abhoist}), recursive commits from the message
+(\S\ref{sec:recursivefill}; the low-rate levels keep the replicate fill,
+which measured faster there), and the lincheck stripe kernels
+(\S\ref{sec:lcfold}). \emph{Re-derived for the union}: the direct-open
+family (LIG\_FOLD2, OPEN\_DIRECT\_AB/FOLD4/FOLD8, ZC\_LINCHECK\_C\_REUSE)
+lives on as the statistics ladder and the block-first merged sumcheck
+(\S\ref{sec:statsladder}, \S\ref{sec:blockfirst}). \emph{Measured null
+earlier}: the SIMD witness builder (\S\ref{sec:zpool}) and non-temporal
+witness stores (\S\ref{sec:mt}). \emph{Lost in the union's F256 rewrite
+of the recursion and restored below}: the lazy level OOD
+(\S\ref{sec:lazyood}); the induce truncation (\S\ref{sec:inducetrunc})
+was also lost and re-measured, see the rejections. Against the frontier
+at ten threads the prover now leads on witness generation and on commit
+plus zerocheck; it trails on the open (the union's two ring-switched
+claims and the F256 recursion --- protocol) and on everything the GPU
+does (the Metal track).
+
+\subsection{Lazy level OODs, again}\label{sec:lazyood2}
+
+\begin{optsummary}
+\item[Baseline:] Each recursive level's OOD sample built the dense $\eq(z,\cdot)$ table ($2^{20}$ entries at L1, two samples per level), swept it against the split table for the answer and the round message, then swept it again into the combined basis; both intakes also re-read the whole table for a base-valued \code{assert}.
+\item[Improvement:] Keep the sample as the exact factors $\eq = \mathrm{lo}\otimes\mathrm{hi}$ (\code{build\_eq\_split}): each $\mathrm{hi}$ block's pair sums run against the L1-resident $\mathrm{lo}$ and are scaled by $\mathrm{hi}[e]$ once, and the glue adds $\mathrm{lo}[h]\cdot(\beta\,\mathrm{hi}[e])$. The invariant check moves into the sweep. Tasks over a level's table take at least $2^{14}$ elements, so the deep levels ($2^8$--$2^{14}$) no longer split into dispatch-bound rayon tasks.
+\item[Mechanism:] The challenge tree's lazy OOD (LIG\_LAZY\_OOD and its per-level twins), re-derived on the F256 split table. Three F128 products per pair as before; the $2^{\mathrm{dim}}$ table build and its two re-reads are gone. The same field elements by distributivity, sums order-free.
+\item[Result:] Level OODs ST $10.7\to5.1\,$ms, 10T $5.9\to2.5\,$ms (both $4/4$).
+\end{optsummary}
+
+\subsection{The induce dispatch, by product count}\label{sec:inducecost}
+
+\begin{optsummary}
+\item[Baseline:] The induced query basis takes the dense path ($q\cdot2^{\mathrm{msg}}$ products) unless $q > 4\cdot2^{\log(1/\rho)}\cdot\log_2(\mathrm{block})$ --- a margin tuned at $m{=}30$, rate $1/2$. At strict-128's rate-$1/8$ L1 (msg $2^{16}$, $79$ queries) it chose dense: $5.45\,$ms ST.
+\item[Improvement:] Compare the two counts directly: dense $q\cdot2^{\mathrm{msg}}$ against the sparse transpose's $(\log\mathrm{block}-8)\cdot2^{\log\mathrm{block}-1}$ butterflies past its windowed prefix.
+\item[Mechanism:] Measured on the strict ladder's levels, both paths cost $\approx1\,$ns per product at one and at ten threads, so no margin is needed. L1 now takes the NTT ($2.74\,$ms ST); L2 and deeper stay dense, where the count says so (L2: $0.41$ dense against $1.33$). The equivalence test gains three shapes with $\log\mathrm{block}\ge12$, the first to exercise the windowed prefix.
+\item[Result:] Induce ST $15.2\to12.2\,$ms, 10T $7.1\to5.8\,$ms (both $4/4$, jointly with the task-size floor). Open bucket, all three changes: ST $382.9\to372.5$, 10T $97.1\to91.8\,$ms ($4/4$).
+\end{optsummary}
+
+\subsection{The default pool on an E-rich chip}\label{sec:erichpool}
+
+\begin{optsummary}
+\item[Baseline:] \code{init\_perf\_thread\_pool} sizes the pool to the P-cores --- right on 8P$+$2E (M1~Max) and 10P$+$4E, where the E-cores straggle --- so on the M4's 4P$+$6E the default prove ran four threads plus the all-core hops: $455.6\,$ms, against $416.5$ with \code{RAYON\_NUM\_THREADS=10}.
+\item[Improvement:] When the E-cluster is at least as large as the P-cluster, the pool takes every core.
+\item[Mechanism:] The challenge tree reaches the same E-cluster through its helper pool (\code{epool}, a $1.3$k-line module plus per-site queues); on this topology the plain all-core pool captures it with two lines. P-rich chips are unchanged.
+\item[Result:] Default pool $455.6\to410.3\,$ms ($-10\%$, $4/4$); the open alone $121.6\to92.0$.
+\end{optsummary}
+
+\paragraph{Rejected, and what is left.} The induce truncation of
+\S\ref{sec:inducetrunc} generalizes to every rate --- the low
+$2^{\mathrm{msg}}$ outputs of the last $\log(1/\rho)$ transpose steps are
+the XOR of the $2^{\log(1/\rho)}$ segments, since every entry they feed is
+a butterfly's top output $a+b$ --- and removes three of eleven dense layers
+at L1, but the segment XOR costs most of what it saves: $2.87\to2.49\,$ms
+ST at L1, $0.4\,$ms a prove, not worth its lines. Routing the query PoW
+through the eight-way or SME2 BLAKE3 kernel (grinding is $8\,$ms ST) needs
+the transcript crate to depend on the Merkle crate's kernels; estimated
+$-4\,$ms ST. Three larger items remain, each above the bloat bar without
+an explicit call: the frontier's depth-three delayed sparse-dual
+induction (C2, $\approx500$ lines there), which would take most of the
+remaining induce ($7.0\,$ms ST at the L0 boundary, $2.7$ at L1); the
+SIMD witness builder, null at eight threads (\S\ref{sec:zpool}) but
+single-threaded the frontier's witness generation is $144\,$ms against
+our $201$; and the strict ladder itself, whose recursive commits are
+$+120\,$ms ST over Fast100 by construction --- a parameter decision, not
+an implementation one.
+
 \section*{Summary}
 
 \paragraph{Measurement protocol.} Results before 2026-08-27 include
@@ -1614,6 +1706,11 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \multicolumn{4}{@{}l}{\emph{protocol, leanXMSS at $1000$ signatures, M4, ten threads}}\\
 \S\ref{sec:degreeone} & protocol (work removal) & zerocheck $156\to140$; prove $-2.2\%$ & $3/3$\\
 \S\ref{sec:livelookahead} & pass fusion, scheduling & zc tail: $56\to24\,$ms 10T, $\pm0$ ST & $5/5$\\
+\midrule
+\multicolumn{4}{@{}l}{\emph{strict-128 (Fast), $m{=}32$ BLAKE3, M4, grinding on}}\\
+\S\ref{sec:lazyood2} & work removal (algebra) & level OODs: $-5.6\,$ms ST, $-3.4$ 10T & $4/4$\\
+\S\ref{sec:inducecost} & dispatch & induce: $-3.1\,$ms ST, $-1.3$ 10T & $4/4$\\
+\S\ref{sec:erichpool} & scheduling & default-pool prove: $455.6\to410.3\,$ms & $4/4$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
