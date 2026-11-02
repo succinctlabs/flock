@@ -746,6 +746,10 @@ impl Circuit {
     pub fn num_public(&self) -> usize {
         self.num_public
     }
+    /// Public word `i`'s digest-bound value, when the circuit fixes it.
+    pub fn fixed_public(&self, i: usize) -> Option<F128> {
+        self.fixed_public.get(i).copied().flatten()
+    }
     /// The digest-bound gate/type schedule.
     pub fn registry(&self) -> &Registry {
         &self.registry
@@ -889,7 +893,7 @@ impl Circuit {
     /// `Σ_j eq(ρ_row, j) · public[(s << ν) + j]` — the MLE of public slot `s`'s
     /// word vector, zero on its unused rows. `O(2^ν)` per slot, so
     /// `O(#public)` over the segment.
-    fn public_slot_eval(&self, s: usize, eq_row: &[F128], public: &[F128]) -> F128 {
+    pub fn public_slot_eval(&self, s: usize, eq_row: &[F128], public: &[F128]) -> F128 {
         let nu = self.cells.nu();
         let base = s << nu;
         let hi = ((base + (1usize << nu)).min(public.len())).saturating_sub(base);
@@ -1133,6 +1137,12 @@ pub struct SigmaAssertion {
     /// The tuple bus's static columns at its row point
     /// ([`bus::Bus::structure_columns`]), when the circuit has a bus.
     pub bus: Option<BusStructure>,
+    /// The public columns' values at the grand product's row point
+    /// ([`Circuit::public_columns`], in that order), when the circuit opens
+    /// any: each a function of fixed public words only, so a static column
+    /// of the table (plane 7).
+    #[serde(default)]
+    pub public_columns: Option<BusStructure>,
 }
 
 impl SigmaAssertion {
@@ -1143,6 +1153,7 @@ impl SigmaAssertion {
     const ELEMENT_B_PLANE: usize = 4;
     const BOOLEAN_PIN_PLANE: usize = 5;
     const BUS_PLANE: usize = 6;
+    const PUBLIC_COLUMN_PLANE: usize = 7;
 
     fn plane_claim(&self, plane: usize, value: F128) -> MatrixClaim {
         let selector = [
@@ -1171,7 +1182,7 @@ impl SigmaAssertion {
     /// All digest-keyed circuit-structure evaluations, in canonical order:
     /// Product-GKR's `(live*s_id, live, live*s_sigma)`, then Boolean
     /// constant-pin prefixes, then the element affine `A`/`B` constants,
-    /// then the bus's static columns.
+    /// then the bus's static columns, then the public columns.
     pub fn claims(&self) -> Vec<MatrixClaim> {
         let mut claims = vec![
             self.plane_claim(Self::MASKED_ID_PLANE, self.masked_id_value),
@@ -1220,7 +1231,51 @@ impl SigmaAssertion {
                 });
             }
         }
+        if let Some(pc) = &self.public_columns {
+            let base_bits = self.matrix_base_bits();
+            for (c, &value) in pc.values.iter().enumerate() {
+                let mut col: Vec<F128> = (0..base_bits)
+                    .map(|j| F128::new(((c >> j) & 1) as u64, 0))
+                    .collect();
+                col.extend(
+                    (0..3).map(|j| F128::new(((Self::PUBLIC_COLUMN_PLANE >> j) & 1) as u64, 0)),
+                );
+                claims.push(MatrixClaim {
+                    row: Weight::eq(pc.rho_row.clone()),
+                    col: Weight::eq(col),
+                    value,
+                });
+            }
+        }
         claims
+    }
+
+    /// The words that determine every claim of [`Self::claims`] beyond the
+    /// circuit's static facts (`nu`, `base_bits`, the pinned types, the
+    /// column counts): `rho`, the pins' shared point, the element point, the
+    /// bus's and the public columns' row points (each when present), then
+    /// every claim's value in claims order. Shared binding absorbs these
+    /// once instead of the claims ([`crate::aggregate`]).
+    pub fn shared_surface(&self) -> Vec<F128> {
+        let mut out = self.rho.clone();
+        if let Some((_, point, _)) = self.boolean_pins.first() {
+            assert!(
+                self.boolean_pins.iter().all(|(_, p, _)| p == point),
+                "the boolean pins share one point"
+            );
+            out.extend_from_slice(point);
+        }
+        if let Some((point, _, _)) = &self.element_constants {
+            out.extend_from_slice(point);
+        }
+        if let Some(bus) = &self.bus {
+            out.extend_from_slice(&bus.rho_row);
+        }
+        if let Some(pc) = &self.public_columns {
+            out.extend_from_slice(&pc.rho_row);
+        }
+        out.extend(self.claims().iter().map(|c| c.value));
+        out
     }
 
     fn matrix_base_bits(&self) -> usize {
@@ -1259,6 +1314,8 @@ pub struct CircuitStructureMatrix<'a> {
     mask: LiveMask,
     base_cols: usize,
     bus_cols: Vec<BusColumn>,
+    /// Per public column, the public word of each live row.
+    public_cols: Vec<&'a [u32]>,
 }
 
 impl<'a> CircuitStructureMatrix<'a> {
@@ -1276,11 +1333,14 @@ impl<'a> CircuitStructureMatrix<'a> {
             .max(element_cols)
             .max(circuit.registry().num_boolean().next_power_of_two())
             .max(bus_cols.len().next_power_of_two());
+        let public_cols: Vec<&[u32]> = circuit.public_columns().map(|(_, w)| w).collect();
+        let base_cols = base_cols.max(public_cols.len().next_power_of_two());
         Self {
             circuit,
             mask: circuit.live_mask(),
             base_cols,
             bus_cols,
+            public_cols,
         }
     }
 
@@ -1347,6 +1407,15 @@ impl<'a> CircuitStructureMatrix<'a> {
                 .bus_cols
                 .get(slot)
                 .map_or(F128::ZERO, |c| c.entry(self.circuit, row)),
+            SigmaAssertion::PUBLIC_COLUMN_PLANE => self
+                .public_cols
+                .get(slot)
+                .and_then(|words| words.get(row))
+                .map_or(F128::ZERO, |&p| {
+                    self.circuit
+                        .fixed_public(p as usize)
+                        .expect("a deferred public column reads fixed words")
+                }),
             _ => F128::ZERO,
         }
     }
@@ -1452,15 +1521,14 @@ fn verify_wiring_core<C: Challenger>(
     if proof.gather.len() != gathered.len() {
         return Err(WiringError::MalformedProof);
     }
-    // The recursion's in-circuit verifier does not compute public columns'
-    // values, and its recombination is in enumeration order.
+    // A deferred verify hands the public columns' values to the structure
+    // table, which knows only FIXED public words.
     assert!(
-        !defer_sigma || circuit.public_columns().next().is_none(),
-        "deferred-sigma wiring does not support public columns"
-    );
-    assert!(
-        !defer_sigma || !circuit.live_slots_packed(),
-        "deferred-sigma wiring does not support packed slots"
+        !defer_sigma
+            || circuit.public_columns().all(|(_, words)| words
+                .iter()
+                .all(|&p| circuit.fixed_public(p as usize).is_some())),
+        "a deferred public column reads fixed public words"
     );
 
     let mask = circuit.live_mask();
@@ -1520,6 +1588,7 @@ fn verify_wiring_core<C: Challenger>(
         boolean_pins: Vec::new(),
         element_constants: None,
         bus: None,
+        public_columns: None,
     };
     let mut gather: Vec<(Vec<F128>, F128)> = gathered
         .iter()
@@ -1528,14 +1597,23 @@ fn verify_wiring_core<C: Challenger>(
         .collect();
     // The public columns' claims, in the prover's order, valued from the
     // public words: the opening then checks each column against them.
-    gather.extend(circuit.public_columns().map(|(iota, words)| {
-        let v = words
-            .iter()
-            .zip(&eq_row)
-            .fold(F128::ZERO, |acc, (&p, &e)| acc + e * public[p as usize]);
-        (cells.gate_claim_point(iota, &claim.rho[..nu]), v)
-    }));
+    let public_claims: Vec<(Vec<F128>, F128)> = circuit
+        .public_columns()
+        .map(|(iota, words)| {
+            let v = words
+                .iter()
+                .zip(&eq_row)
+                .fold(F128::ZERO, |acc, (&p, &e)| acc + e * public[p as usize]);
+            (cells.gate_claim_point(iota, &claim.rho[..nu]), v)
+        })
+        .collect();
+    let public_columns = (!public_claims.is_empty()).then(|| BusStructure {
+        rho_row: claim.rho[..nu].to_vec(),
+        values: public_claims.iter().map(|&(_, v)| v).collect(),
+    });
+    gather.extend(public_claims);
     let mut assertion = assertion;
+    assertion.public_columns = public_columns;
     match (circuit.bus(), &proof.bus) {
         (Some(bus), Some(bus_proof)) => {
             let (claims, structure) = bus::verify_bus(circuit, bus, bus_proof, grinding, ch)?;
@@ -2568,25 +2646,33 @@ mod tests {
         assert!(verify_wiring(&packed, &public, &proof, &mut ch).is_err());
     }
 
-    /// The recursion's deferred-σ verifier does not compute public columns.
+    /// The deferred verify hands the public columns' values to the sigma
+    /// assertion (plane 7, over the circuit's FIXED public words) and takes
+    /// packed slots: the assertion discharges, and a moved public-column
+    /// value does not.
     #[test]
-    #[should_panic(expected = "deferred-sigma wiring does not support public columns")]
-    fn deferred_wiring_refuses_public_columns() {
+    fn deferred_wiring_defers_public_columns() {
         let nu = 3;
         let reg = mixed_registry(nu);
-        let circuit = Circuit::new(
-            &reg,
-            vec![1, 4, 6],
-            1,
-            vec![vec![Cell::new(8, 0), Cell::new(0, 0)]],
-        )
-        .unwrap()
-        .with_public_columns_opened();
+        let wires = vec![vec![Cell::new(8, 0), Cell::new(0, 0)]];
+        let plain = Circuit::new(&reg, vec![1, 4, 6], 1, wires.clone()).unwrap();
         let mut rng = Rng::new(0xC1C0_0006);
-        let (packed, public) = buffer_for(&reg, &circuit, &mut rng);
+        let (packed, public) = buffer_for(&reg, &plain, &mut rng);
+        let fixed = public.iter().map(|&p| Some(p)).collect();
+        let circuit = Circuit::new_with_fixed_public(&reg, vec![1, 4, 6], fixed, wires)
+            .unwrap()
+            .with_public_columns_opened()
+            .with_live_slots_packed();
+        assert!(circuit.public_columns().next().is_some());
         let mut ch = FsChallenger::new(b"circuit-unit");
         let (proof, _) = prove_wiring(&circuit, &packed, &public, &mut ch);
         let mut ch = FsChallenger::new(b"circuit-unit");
-        let _ = verify_wiring_deferred(&circuit, &public, &proof, &mut ch);
+        let (_, assertion) =
+            verify_wiring_deferred(&circuit, &public, &proof, &mut ch).expect("deferred verify");
+        assert!(assertion.public_columns.is_some(), "the columns travel");
+        assert!(assertion.check(&circuit), "the deferred claims discharge");
+        let mut bad = assertion.clone();
+        bad.public_columns.as_mut().unwrap().values[0] += F128::ONE;
+        assert!(!bad.check(&circuit), "a moved public-column value");
     }
 }

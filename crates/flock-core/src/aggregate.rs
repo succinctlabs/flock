@@ -564,8 +564,14 @@ const DOMAIN_SHARED: &[u8] = b"flock-aggregate-shared-v1";
 
 /// The shared binding: per fresh boolean assertion, the row low (the skip
 /// point's weights), `x_inner_rest`, the column low (`z_partial`), `rr`,
-/// each type's `(A, B)` values, then its linear-identity values.
-fn bind_shared<Ch: Challenger>(assertions: &[MatrixAssertion], ch: &mut Ch) {
+/// each type's `(A, B)` values, then its linear-identity values; then per
+/// sigma key, per fresh sigma assertion, its
+/// [`SigmaAssertion::shared_surface`].
+fn bind_shared<Ch: Challenger>(
+    assertions: &[MatrixAssertion],
+    sigma: &[SigmaKey<'_>],
+    ch: &mut Ch,
+) {
     ch.observe_label(DOMAIN_SHARED);
     for a in assertions {
         ch.observe_f128_slice(&a.z_skip.weights(K_SKIP));
@@ -578,6 +584,11 @@ fn bind_shared<Ch: Challenger>(assertions: &[MatrixAssertion], ch: &mut Ch) {
         }
         for v in a.linear_evals.iter().flatten() {
             ch.observe_f128(*v);
+        }
+    }
+    for (_, asserts) in sigma {
+        for a in asserts {
+            ch.observe_f128_slice(&a.shared_surface());
         }
     }
 }
@@ -613,7 +624,7 @@ fn prove_aggregate_impl<Ch: Challenger>(
 
     bind(registry, priors, ch);
     if shared.is_some() {
-        bind_shared(assertions, ch);
+        bind_shared(assertions, sigma, ch);
     }
     let mut folds = Vec::with_capacity(groups.len());
     let mut per_type = Vec::with_capacity(groups.len());
@@ -703,7 +714,7 @@ fn prove_aggregate_impl<Ch: Challenger>(
         per_element.push((out_a, out_b));
     }
 
-    let (sigma_folds, sigma_out) = fold_sigma_prove(sigma, priors, grinding, ch)?;
+    let (sigma_folds, sigma_out) = fold_sigma_prove(sigma, priors, shared.is_some(), grinding, ch)?;
     let (jagged_folds, jagged_out) = fold_jagged_prove(jagged, priors, grinding, ch)?;
 
     Ok((
@@ -786,6 +797,7 @@ fn gather_sigma(
 fn fold_sigma_prove<Ch: Challenger>(
     sigma: &[SigmaKey<'_>],
     priors: &[&Accumulator],
+    shared: bool,
     grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<(Vec<FoldProof>, Vec<([u8; 32], MatrixClaim)>), AggregateError> {
@@ -818,7 +830,15 @@ fn fold_sigma_prove<Ch: Challenger>(
                 combs.push(FoldMatrix::col_marginal(&m, &q.row.materialize(), n_cols));
             }
         }
-        let (pf, folded) = prove_fold_with_grinding(&m, &combs, &claims, grinding, ch);
+        // Under shared binding the fresh claims were bound with their
+        // assertions' surfaces ([`bind_shared`]).
+        let n_bound = if shared {
+            asserts.iter().map(|a| a.claims().len()).sum()
+        } else {
+            0
+        };
+        let (pf, folded) =
+            prove_fold_bound_with_grinding(&m, &combs, &claims, n_bound, grinding, ch);
         folds.push(pf);
         out.push((digest, folded));
     }
@@ -830,6 +850,7 @@ fn fold_sigma_verify<Ch: Challenger>(
     sigma: &[SigmaKey<'_>],
     priors: &[&Accumulator],
     proofs: &[FoldProof],
+    shared: bool,
     grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<Vec<([u8; 32], MatrixClaim)>, AggregateError> {
@@ -852,8 +873,13 @@ fn fold_sigma_verify<Ch: Challenger>(
         let claims = gather_sigma(circuit, asserts, priors)?;
         ch.observe_label(DOMAIN_SIGMA_GROUP);
         ch.observe_bytes(&digest);
-        let folded =
-            verify_fold_with_grinding(&claims, pf, grinding, ch).map_err(AggregateError::Fold)?;
+        let n_bound = if shared {
+            asserts.iter().map(|a| a.claims().len()).sum()
+        } else {
+            0
+        };
+        let folded = verify_fold_bound_with_grinding(&claims, n_bound, pf, grinding, ch)
+            .map_err(AggregateError::Fold)?;
         out.push((digest, folded));
     }
     Ok(out)
@@ -1153,7 +1179,7 @@ fn verify_aggregate_impl<Ch: Challenger>(
 
     bind(registry, priors, ch);
     if shared.is_some() {
-        bind_shared(assertions, ch);
+        bind_shared(assertions, sigma, ch);
     }
     let mut per_type = Vec::with_capacity(groups.len());
     for ((g, members), (pa, pb)) in groups.iter().enumerate().zip(&proof.folds) {
@@ -1201,7 +1227,14 @@ fn verify_aggregate_impl<Ch: Challenger>(
     // The sigma group, replayed the same way — the verifier reads no
     // sigma table here; the fold verifies against the CLAIMS alone, and
     // the table is only touched at the root discharge.
-    let sigma_out = fold_sigma_verify(sigma, priors, &proof.sigma_folds, grinding, ch)?;
+    let sigma_out = fold_sigma_verify(
+        sigma,
+        priors,
+        &proof.sigma_folds,
+        shared.is_some(),
+        grinding,
+        ch,
+    )?;
 
     let jagged_out = fold_jagged_verify(jagged, priors, &proof.jagged_folds, grinding, ch)?;
 

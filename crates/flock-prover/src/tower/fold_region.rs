@@ -1,7 +1,7 @@
 use std::iter::repeat_n;
 
 use flock_core::{
-    circuit::builder::SlotId,
+    circuit::{SigmaAssertion, builder::SlotId},
     genus95_curve_code::{EvaluationPoint, SAMPLE_ATTEMPT_BUDGET, base_evaluation_functional},
     lincheck::MatrixAssertion,
     matrix_fold::{FoldProof, JaggedClaim, JaggedRowWeight, MatrixClaim, Weight},
@@ -29,6 +29,39 @@ pub(super) struct ClaimLoc {
     pub(super) col_pt_v: usize,
     pub(super) col_pt_n: usize,
     pub(super) value_v: usize,
+    /// A structure claim bound by its assertion's shared surface
+    /// ([`locate_shared_sigma`]): both lows are the constant 1 (the
+    /// `low_v`/`low_n` fields are unused) and the column point continues
+    /// past its `col_pt_n` stream words with these constant bits (padding,
+    /// index and plane selector).
+    pub(super) consts: Option<Vec<F128>>,
+}
+
+impl ClaimLoc {
+    /// The claim's row and column weights, rebuilt from located words.
+    fn weights(&self, vals_rec: &[F128]) -> (Weight, Weight) {
+        let row_pt = vals_rec[self.row_pt_v..self.row_pt_v + self.row_pt_n].to_vec();
+        let mut col_pt = vals_rec[self.col_pt_v..self.col_pt_v + self.col_pt_n].to_vec();
+        match &self.consts {
+            Some(tail) => {
+                col_pt.extend_from_slice(tail);
+                (
+                    Weight::low_eq(vec![F128::ONE], row_pt),
+                    Weight::low_eq(vec![F128::ONE], col_pt),
+                )
+            }
+            None => (
+                Weight::low_eq(
+                    vals_rec[self.row_low_v..self.row_low_v + self.row_low_n].to_vec(),
+                    row_pt,
+                ),
+                Weight::low_eq(
+                    vals_rec[self.col_low_v..self.col_low_v + self.col_low_n].to_vec(),
+                    col_pt,
+                ),
+            ),
+        }
+    }
 }
 
 /// One fold group's ordinals: its claims, then the lambdas, col rounds,
@@ -134,10 +167,14 @@ pub(super) fn fold_region_ops_bound(
     want
 }
 
-/// The aggregate's shared binding (`aggregate::Binding::Shared`): its
-/// label, then per assertion the row low, `x_inner_rest`, the column low,
-/// `rr`, and each type's `(A, B)` values.
-pub(super) fn shared_binding_ops(asserts: &[MatrixAssertion]) -> Vec<TranscriptOp> {
+/// The aggregate's shared binding: its label, then per boolean assertion
+/// the row low, `x_inner_rest`, the column low, `rr`, each type's `(A, B)`
+/// values and the linear values, then per sigma assertion its shared
+/// surface.
+pub(super) fn shared_binding_ops(
+    asserts: &[MatrixAssertion],
+    sigmas: &[&SigmaAssertion],
+) -> Vec<TranscriptOp> {
     let mut want = vec![Op::Label(b"flock-aggregate-shared-v1".to_vec())];
     for a in asserts {
         want.extend([
@@ -152,7 +189,101 @@ pub(super) fn shared_binding_ops(asserts: &[MatrixAssertion]) -> Vec<TranscriptO
             a.linear_evals.iter().flatten().count(),
         ));
     }
+    for sa in sigmas {
+        want.push(Op::ObserveSlice(sa.shared_surface().len()));
+    }
     want
+}
+
+/// Locate each sigma assertion's shared surface from value ordinal `v0`
+/// (after the boolean blocks), pin it, and hand back per assertion its
+/// claims' locations in [`SigmaAssertion::claims`] order: row points and
+/// the GKR planes' column heads as stream words, everything else constant.
+/// Returns the locations and the value cursor past the surfaces.
+pub(super) fn locate_shared_sigma(
+    sigmas: &[&SigmaAssertion],
+    vals_rec: &[F128],
+    v0: usize,
+) -> (Vec<Vec<ClaimLoc>>, usize) {
+    let bits = |x: usize, n: usize| -> Vec<F128> {
+        (0..n)
+            .map(|j| F128::new(((x >> j) & 1) as u64, 0))
+            .collect()
+    };
+    let mut v = v0;
+    let out = sigmas
+        .iter()
+        .map(|sa| {
+            let surface = sa.shared_surface();
+            assert_eq!(
+                &vals_rec[v..v + surface.len()],
+                &surface[..],
+                "the sigma surface on the stream"
+            );
+            assert!(sa.element_constants.is_none(), "no element side here");
+            let (nu, mu, base) = (sa.nu, sa.rho.len(), sa.base_bits);
+            let rho_v = v;
+            let mut at = v + mu;
+            let pin_v = (!sa.boolean_pins.is_empty()).then(|| {
+                at += nu;
+                at - nu
+            });
+            let bus_v = sa.bus.as_ref().map(|_| {
+                at += nu;
+                at - nu
+            });
+            let pc_v = sa.public_columns.as_ref().map(|_| {
+                at += nu;
+                at - nu
+            });
+            let mut value_v = at;
+            v = at + sa.claims().len();
+            let mut claim = |row_pt_v: usize, col_pt_v: usize, col_pt_n: usize, tail: Vec<F128>| {
+                let cl = ClaimLoc {
+                    row_low_v: 0,
+                    row_low_n: 1,
+                    row_pt_v,
+                    row_pt_n: nu,
+                    col_low_v: 0,
+                    col_low_n: 1,
+                    col_pt_v,
+                    col_pt_n,
+                    value_v,
+                    consts: Some(tail),
+                };
+                value_v += 1;
+                cl
+            };
+            let mut locs = Vec::new();
+            for plane in 0..3usize {
+                let mut tail = vec![F128::ZERO; base - (mu - nu)];
+                tail.extend(bits(plane, 3));
+                locs.push(claim(rho_v, rho_v + nu, mu - nu, tail));
+            }
+            for &(t, _, _) in &sa.boolean_pins {
+                let mut tail = bits(t, base);
+                tail.extend(bits(5, 3));
+                locs.push(claim(pin_v.expect("pins"), 0, 0, tail));
+            }
+            for (c, _) in sa.bus.iter().flat_map(|b| b.values.iter().enumerate()) {
+                let mut tail = bits(c, base);
+                tail.extend(bits(6, 3));
+                locs.push(claim(bus_v.expect("bus"), 0, 0, tail));
+            }
+            for (c, _) in sa
+                .public_columns
+                .iter()
+                .flat_map(|p| p.values.iter().enumerate())
+            {
+                let mut tail = bits(c, base);
+                tail.extend(bits(7, 3));
+                locs.push(claim(pc_v.expect("public columns"), 0, 0, tail));
+            }
+            assert_eq!(locs.len(), sa.claims().len(), "one location per claim");
+            locs
+        })
+        .collect();
+    (out, v)
 }
 
 /// One type's claim locations in the shared block, per assertion: its
@@ -205,6 +336,7 @@ pub(super) fn locate_shared_binding(
                 col_pt_v: rr_v,
                 col_pt_n: inner,
                 value_v,
+                consts: None,
             };
             assert_eq!(vals_rec[ev_v + 2 * t], a.evals[t].0, "shared A value");
             assert_eq!(vals_rec[ev_v + 2 * t + 1], a.evals[t].1, "shared B value");
@@ -271,6 +403,7 @@ pub(super) fn locate_and_pin_folds_from(
                             + c.row.point.len()
                             + c.col.low.len()
                             + c.col.point.len(),
+                        consts: None,
                     };
                     vcur = l.value_v + 1;
                     l
@@ -311,26 +444,9 @@ pub(super) fn locate_and_pin_folds_from(
         .collect();
     for ((loc, cs), fp) in locs.iter().zip(fold_claims).zip(fold_proofs) {
         for (cl, c) in loc.claims.iter().zip(cs) {
-            assert_eq!(
-                &vals_rec[cl.row_low_v..cl.row_low_v + cl.row_low_n],
-                &c.row.low[..],
-                "row low on the stream"
-            );
-            assert_eq!(
-                &vals_rec[cl.row_pt_v..cl.row_pt_v + cl.row_pt_n],
-                &c.row.point[..],
-                "row point on the stream"
-            );
-            assert_eq!(
-                &vals_rec[cl.col_low_v..cl.col_low_v + cl.col_low_n],
-                &c.col.low[..],
-                "col low on the stream"
-            );
-            assert_eq!(
-                &vals_rec[cl.col_pt_v..cl.col_pt_v + cl.col_pt_n],
-                &c.col.point[..],
-                "col point on the stream"
-            );
+            let (row, col) = cl.weights(vals_rec);
+            assert_eq!(row, c.row, "row weight on the stream");
+            assert_eq!(col, c.col, "col weight on the stream");
             assert_eq!(vals_rec[cl.value_v], c.value, "claim value on the stream");
         }
         for (j, &(q1, qinf)) in fp.col_rounds.iter().enumerate() {
@@ -401,19 +517,13 @@ pub(super) fn replay_fold_endpoints(
                 .zip(&lam)
                 .fold(F128::ZERO, |acc, (cl, &l)| acc + l * vals_rec[cl.value_v]);
             let (run_c, rho_col) = replay_rounds(target_c, loc.col_v, loc.col_ch0, loc.k_col);
-            let located = |low_v: usize, low_n: usize, pt_v: usize, pt_n: usize| -> Weight {
-                Weight::low_eq(
-                    vals_rec[low_v..low_v + low_n].to_vec(),
-                    vals_rec[pt_v..pt_v + pt_n].to_vec(),
-                )
-            };
             let expect_c =
                 loc.claims
                     .iter()
                     .zip(&lam)
                     .enumerate()
                     .fold(F128::ZERO, |acc, (i, (cl, &l))| {
-                        let w = located(cl.col_low_v, cl.col_low_n, cl.col_pt_v, cl.col_pt_n);
+                        let w = cl.weights(vals_rec).1;
                         acc + l * w.eval(&rho_col) * vals_rec[loc.bridge_v + i]
                     });
             assert_eq!(run_c, expect_c, "col endpoint closes from located words");
@@ -428,7 +538,7 @@ pub(super) fn replay_fold_endpoints(
                 .iter()
                 .zip(&mus)
                 .fold(F128::ZERO, |acc, (cl, &m)| {
-                    let w = located(cl.row_low_v, cl.row_low_n, cl.row_pt_v, cl.row_pt_n);
+                    let w = cl.weights(vals_rec).0;
                     acc + m * w.eval(&rho_row)
                 });
             assert_eq!(
@@ -508,15 +618,25 @@ pub(super) fn emit_fold_region(
                        recs: &mut Vec<AlphaRec>,
                        fi: usize,
                        row_side: bool,
-                       low_v: usize,
-                       low_n: usize,
-                       pt_v: usize,
-                       pt_n: usize,
+                       cl: &ClaimLoc,
                        rho_w: &[Wire],
                        rho_vals: &[F128]|
      -> Wire {
+        let (low_v, low_n, pt_v, pt_n) = if row_side {
+            (cl.row_low_v, cl.row_low_n, cl.row_pt_v, cl.row_pt_n)
+        } else {
+            (cl.col_low_v, cl.col_low_n, cl.col_pt_v, cl.col_pt_n)
+        };
+        // A shared-bound structure claim: low 1, and the column point's
+        // constant tail bakes as zw/ow.
+        let (low_n, tail): (usize, &[F128]) = match &cl.consts {
+            Some(tail) => (1, if row_side { &[] } else { &tail[..] }),
+            None => (low_n, &[]),
+        };
         let s = low_n.trailing_zeros() as usize;
-        let seed = if low_n == 1 {
+        let seed = if cl.consts.is_some() {
+            ow
+        } else if low_n == 1 {
             wv(low_v)
         } else {
             assert_eq!(low_n, 64, "the lincheck low width");
@@ -541,7 +661,22 @@ pub(super) fn emit_fold_region(
             }
             acc
         };
-        let fs: Vec<(Wire, Wire)> = (0..pt_n).map(|j| (wv(pt_v + j), rho_w[s + j])).collect();
+        let bit = |c: F128| {
+            if c == F128::ZERO {
+                zw
+            } else {
+                assert_eq!(c, F128::ONE, "a constant coordinate is a bit");
+                ow
+            }
+        };
+        let fs: Vec<(Wire, Wire)> = (0..pt_n)
+            .map(|j| (wv(pt_v + j), rho_w[s + j]))
+            .chain(
+                tail.iter()
+                    .enumerate()
+                    .map(|(j, &c)| (bit(c), rho_w[s + pt_n + j])),
+            )
+            .collect();
         prefix(sb, seed, &fs)
     };
 
@@ -571,10 +706,7 @@ pub(super) fn emit_fold_region(
                 &mut alpha_recs,
                 fi,
                 false,
-                cl.col_low_v,
-                cl.col_low_n,
-                cl.col_pt_v,
-                cl.col_pt_n,
+                cl,
                 &rho_col_w,
                 &rho_col_vals,
             );
@@ -612,10 +744,7 @@ pub(super) fn emit_fold_region(
                 &mut alpha_recs,
                 fi,
                 true,
-                cl.row_low_v,
-                cl.row_low_n,
-                cl.row_pt_v,
-                cl.row_pt_n,
+                cl,
                 &rho_row_w,
                 &rho_row_vals,
             );

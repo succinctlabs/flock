@@ -15,6 +15,7 @@ use flock_core::{
     aggregate::{
         Accumulator, Dropped, ElementMatrices, SharedTables, TypeMatrices, matrix_classes,
     },
+    circuit::SigmaAssertion,
     element_r1cs::union::ElementAssertion,
     lincheck::{LincheckCircuit, SkipPoint},
     matrix_fold::{FoldProof, JaggedClaim, MatrixClaim},
@@ -29,8 +30,9 @@ use crate::tower::node::digest_f128;
 use crate::{
     schedule::Registry,
     tower::{
-        fold_region::ClaimLoc, fold_region_ops_bound, locate_and_pin_folds_from,
-        locate_shared_binding, shared_binding_ops,
+        fold_region::{ClaimLoc, locate_shared_sigma},
+        fold_region_ops_bound, locate_and_pin_folds_from, locate_shared_binding,
+        shared_binding_ops,
     },
 };
 use flock_field::PHI_8_TABLE;
@@ -66,7 +68,7 @@ use crate::{
         check_jagged_fold_publics, cw, emit_ag_point_binding, emit_child_region,
         emit_fiat_shamir_chain_partitioned, emit_fold_region, emit_jagged_fold_region,
         emit_lagrange_lows, emit_recorded_pow_checks, env_acc_chain_base, env_app_base,
-        envelope_shape_with_lane, expected_child_tail_schedule, flatten_ops, fold_region_ops,
+        envelope_shape_with_lane, expected_child_tail_schedule, flatten_ops,
         jagged_fold_region_ops, labeled_bytes_payloads, lane_block_words,
         live_element_input_from_rows, locate_and_pin_folds, locate_and_pin_jagged_folds,
         merge_chain, native_chain, outer_lanes, outer_union, outer_zerocheck_ag, pack_params,
@@ -621,8 +623,9 @@ pub(super) fn build_first_level_core(
         Op::ObserveBytes(1),
     ];
     let n_uni = fold_claims.len() - 1;
+    let sigma_refs: Vec<&SigmaAssertion> = sigmas.iter().collect();
     let n_bound: Vec<usize> = if family.shared.is_some() {
-        want.extend(shared_binding_ops(&bool_asserts));
+        want.extend(shared_binding_ops(&bool_asserts, &sigma_refs));
         (0..n_uni)
             .map(|fi| k_ary * fold_members(fi).len())
             .collect()
@@ -634,7 +637,18 @@ pub(super) fn build_first_level_core(
     // precede the fold, exactly as the jagged groups bind.
     want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
     want.push(Op::ObserveBytes(32));
-    want.extend(fold_region_ops(cfg, &fold_claims[n_uni..]));
+    // Under shared binding the fresh sigma claims were bound by their
+    // assertions' surfaces.
+    let n_sigma_bound = if family.shared.is_some() {
+        fold_claims[n_uni].len()
+    } else {
+        0
+    };
+    want.extend(fold_region_ops_bound(
+        cfg,
+        &fold_claims[n_uni..],
+        &[n_sigma_bound],
+    ));
     // The jagged group rides the SAME tape after the uniform folds.
     let jagged_keys: Vec<([u8; 32], Vec<JaggedClaim>)> = vec![(
         leaf_digest,
@@ -651,7 +665,8 @@ pub(super) fn build_first_level_core(
     );
     assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
     let (locs, vcur, ccur) = if family.shared.is_some() {
-        let (per_type, v0) = locate_shared_binding(&bool_asserts, registry, vals_rec, 0);
+        let (per_type, v_sigma) = locate_shared_binding(&bool_asserts, registry, vals_rec, 0);
+        let (sigma_locs, v0) = locate_shared_sigma(&sigma_refs, vals_rec, v_sigma);
         let mut prebound: Vec<Vec<ClaimLoc>> = Vec::with_capacity(sig_g);
         for fi in 0..n_uni {
             let members = fold_members(fi);
@@ -669,6 +684,7 @@ pub(super) fn build_first_level_core(
                     .collect(),
             );
         }
+        prebound.push(sigma_locs.into_iter().flatten().collect());
         locate_and_pin_folds_from(&fold_claims, &fold_proofs, vals_rec, chals, v0, &prebound)
     } else {
         locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals)
@@ -1188,14 +1204,21 @@ pub(super) fn build_first_level_core(
             // Circuit structure: every native claim is fully wire-bound.
             for (j, (row_w, col_w, value_w)) in rk.structure_claim_w.iter().enumerate() {
                 let cl = &locs[sig_g].claims[n_priors + rk.structure_claim_w.len() * k + j];
-                sb.connect(wv(cl.row_low_v), ow);
-                sb.connect(wv(cl.col_low_v), ow);
                 assert_eq!(cl.row_pt_n, row_w.len());
-                assert_eq!(cl.col_pt_n, col_w.len());
+                // A shared-bound claim's lows and constant column tail are
+                // baked; its stream words connect like any claim's.
+                match &cl.consts {
+                    Some(tail) => assert_eq!(cl.col_pt_n + tail.len(), col_w.len()),
+                    None => {
+                        sb.connect(wv(cl.row_low_v), ow);
+                        sb.connect(wv(cl.col_low_v), ow);
+                        assert_eq!(cl.col_pt_n, col_w.len());
+                    }
+                }
                 for (j, &w) in row_w.iter().enumerate() {
                     sb.connect(wv(cl.row_pt_v + j), w);
                 }
-                for (j, &w) in col_w.iter().enumerate() {
+                for (j, &w) in col_w.iter().take(cl.col_pt_n).enumerate() {
                     sb.connect(wv(cl.col_pt_v + j), w);
                 }
                 sb.connect(wv(cl.value_v), *value_w);

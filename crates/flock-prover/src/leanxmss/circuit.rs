@@ -67,10 +67,8 @@ pub(crate) const FIAT_SHAMIR_DOMAIN: &[u8] = b"flock-leanxmss-blake3-v1";
 ///
 /// [`Self::DEFAULT`] is the shipped proof. [`Self::RECURSION_LEAF`] is what
 /// the recursion tower's walkers replay in-circuit
-/// (`docs/leanxmss-recursion-plan.md`): the chained BLAKE3 transcript, a
-/// hashed statement, and the optimisations the walkers support so far —
-/// the dropped degree-one words; the wiring's pruning, public columns and
-/// packing stay off.
+/// (`docs/leanxmss-recursion-plan.md`): every optimisation of the default,
+/// plus the chained BLAKE3 transcript and a hashed statement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XmssOptions {
     /// The chained BLAKE3 transcript ([`FsChallenger::with_chained_blake3`])
@@ -108,9 +106,9 @@ impl XmssOptions {
     pub const RECURSION_LEAF: Self = Self {
         chained_transcript: true,
         zero_linear_words: true,
-        prune_unwired: false,
-        public_columns: false,
-        pack_live_slots: false,
+        prune_unwired: true,
+        public_columns: true,
+        pack_live_slots: true,
         hashed_statement: true,
     };
 }

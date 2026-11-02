@@ -36,8 +36,8 @@ use crate::{
         emit_mac256, emit_pow_checks, emit_publics_hash, emit_query_phase, emit_recombination,
         emit_residual_region, emit_spine256, flatten_ops, leaf_boolean_lcs, level_geometry,
         level_sources, observed_f256, outer_union, pack8, parse_open_levels, payload_words,
-        pin_recombination, query_phase_blake3_rows, replay_ligerito_spine256, squeeze_word_wire,
-        strat_scheds, walker_common,
+        pin_recombination, query_phase_blake3_rows, recombination_positions,
+        replay_ligerito_spine256, squeeze_word_wire, strat_scheds, walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -889,7 +889,7 @@ fn parse_anchor_boolean_replica(
     let k_cols_i = params_i.k;
     // Recompute the recombination and f == g from located words.
     let n_pub_slots_c = pin_recombination(
-        lo.shape.circuit.cells(),
+        &lo.shape.circuit,
         n_log_i,
         &lo.public,
         &lo.proof.wiring().gather,
@@ -2010,6 +2010,7 @@ pub(super) fn emit_real_child_region(
         Some(&el_zc_rho_w[n_log_i..]),
         Some((asum_w, bsum_w)),
         None,
+        None,
         zw,
         ow,
     );
@@ -2370,9 +2371,17 @@ fn emit_recombination_f_eq_g(
         le8,
         pub_w,
         &gather_w,
+        &{
+            let positions = recombination_positions(&rt.lo.shape.circuit);
+            assert_eq!(
+                positions.1.len(),
+                rt.n_pub_slots_c,
+                "one position per public slot"
+            );
+            positions
+        },
         pt_w,
         n_log_i,
-        rt.n_pub_slots_c,
         f_w,
         g_w,
         zw,
@@ -3051,6 +3060,7 @@ pub(super) fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &Re
         boolean_pins: rt.sigma_native.boolean_pins.clone(),
         element_constants: rt.sigma_native.element_constants.clone(),
         bus: rt.sigma_native.bus.clone(),
+        public_columns: rt.sigma_native.public_columns.clone(),
     };
     assert_eq!(sa.rho, rt.sigma_native.rho, "the emitted sigma point");
     assert_eq!(sa.value, rt.sigma_native.value, "the emitted sigma value");

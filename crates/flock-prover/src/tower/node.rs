@@ -782,7 +782,7 @@ pub fn build_node_outer_app(
         ];
         if shared.is_some() {
             // No fresh assertions: the shared block is its label alone.
-            want.extend(shared_binding_ops(&[]));
+            want.extend(shared_binding_ops(&[], &[]));
         }
         let n_uni_l = lclaims.len() - 1;
         want.extend(fold_region_ops(cfg, &lclaims[..n_uni_l]));

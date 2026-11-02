@@ -1,6 +1,6 @@
 # leanXMSS recursion: plan
 
-Status: phases 1–4 working, 2026-11-02, branch `leanxmss-recursion`.
+Status: phases 1–5 working, 2026-11-02, branch `leanxmss-recursion`.
 
 ## Goal
 
@@ -79,27 +79,41 @@ Phase 5's order: the dropped words first (half the cost, all in the zerocheck), 
 - **Lane width.** `EnvShape::acc_chain_words` is per tower (`envelope_shape_with_lane`); the body and registry are the chain tower's.
 - **Fit.** Two 1000-signature leaves first needed 35 lanes against the pin of 31. Three changes fit two 992-signature leaves in 30.56 lanes:
   - the hashed statement above;
-  - **shared binding** (`aggregate::Binding::Shared`): the fold binds each child's boolean assertion once (skip point, `x_inner_rest`, `z_partial`, `rr`, per-type values) instead of 30 claims of ~145 words each — the fold tape's absorbed words drop ~60%;
+  - **shared binding** (`aggregate::prove_aggregate_classes_shared_with_grinding`): the fold binds each child's boolean assertion once (skip point, `x_inner_rest`, `z_partial`, `rr`, per-type values) instead of 30 claims of ~145 words each — the fold tape's absorbed words drop ~60%;
   - **folding per matrix class** (`matrix_classes`): the 15 slot types use 6 distinct gates, so 12 fold groups instead of 30; the lane drops from 863 to 371 words.
 - **Leaf size.** 992 signatures (31·32): the statement hash's 1,054 compressions keep the compression kind in two 2^15-row slots and the leaf at 2^32 bits. 1000 signatures would push the layout planner to ν = 14 (twice the slots and gathers).
 - **Measured** (M4, 10 threads, an unquiet machine): FL over 2 × 992 signatures proves in 559 ms, verifies in 8.5 ms, 254 KiB. Slot headroom is thin: BLAKE3 14,551 and MAC 15,835 of 16,384.
 
-**4. Internal and spine nodes.** Done, without the standalone verifier yet.
+**4. Internal and spine nodes, and the root verifier.** Done.
 - `ChainLane::family` (`LaneFamily::Batches`): the lane folds per matrix class under shared binding, at its block width, and the node statement is `hash_pair(D_left, D_right)` with the counter multiplied.
 - `XmssTower::prove` runs the chain tower's spine over leanXMSS first-level nodes: the base over the last two, then each level prepends the next-earlier one. `xmss_statement` recomputes the root digest from the batches: `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))`.
 - `XmssTower::discharge_root`: the statement, the lane against the leaf tables per class, and the main fold and passenger (`discharge_outer`, shared with the chain tower).
 - **Tests.** `xmss_internal_node_over_two_first_level_nodes`, `xmss_tower_e2e` (8 batches, a steady root; refuses a wrong digest, a wrong count, a moved lane claim).
-- **Open.** A standalone `verify_root` from a VK, and the full-size run (8 × 992 signatures).
+- **Root verifier.** `XmssTowerVk::generate` builds the VK from a reference tower over six batches. `verify_xmss_root(vk, statement, bundle)` checks the root proof against the VK alone. It then reassembles the accumulator from the root's publics, checks the statement, and runs the discharge. `xmss_tower_e2e` also refuses swapped batches, an edited message and a forged public.
+- **Full size.** 8 × 992 = 7,936 signatures, with the final leaf posture (phase 5): the tower proves in 52.7 s. That includes the eight leaves, the circuit builds and seven outers, at 10 threads on an unquiet machine. The root proof is 254 KiB.
 
-**5. Put the leaf optimisations back (required).** Add in-circuit support, in the order of the leaf time each saves (phase 1), for:
-- the dropped words;
-- pruning;
-- public columns;
-- packed slots.
+**5. Put the leaf optimisations back.** Done: `RECURSION_LEAF` now has every optimisation of the default proof, plus the chained transcript and the hashed statement.
+- **Dropped degree-one words.**
+  - **Lincheck report.** A dropping type reports its `(A, B)` values over its kept rows. When η checks the dropped rows, the type also reports their identity value `⟨W, D(A_0 + I)⟩` as an extra `matrix_evals` pair after the `T` pairs. A union that drops nothing keeps its proof bytes, so the m6 and element byte pins hold.
+  - **Folding.** `MatrixAssertion::linear_claims`; a linear-identity fold group per dropping class (`Accumulator::per_linear`); `aggregate::Dropped` and `SharedTables`. Matrix classes key on each type's dropped words.
+  - **In-circuit.** The tape locates η, and the reported check adds `α·η·v_L`. The union's raised AG round-one grinding applies.
+  - **The C claim** (`C = diag(mask)`) exports as `JaggedRowWeight::Masked` on the same layout table. It costs one prefix chain per masked column in the jagged fold: 76 columns in 13 runs at 992 signatures.
+- **The wiring package (pruning, public columns, packing).**
+  - **Recombination.** It reads each gathered slot and public slot at its grand-product position (`recombination_positions`). The circuit-structure table already indexes σ and the live mask in packed order.
+  - **Public columns.** Under the hashed statement they read only fixed public words. So their values are static functions of the row point, and defer to plane 7 of the circuit-structure table (`SigmaAssertion::public_columns`).
+- **σ binding.** The public columns added 19 structure claims per child, which pushed the first-level node to 31.11 lanes. Shared binding now absorbs each σ assertion's surface once (`SigmaAssertion::shared_surface`). The claims' constant coordinates bake into the in-circuit fold (`ClaimLoc::consts`), and the fold tape's absorbed words drop from 5,781 to 2,729.
+- **Fit at 992 signatures per leaf** (first-level node):
+
+  | Leaf posture | Lanes (pin 31) | MAC slot (of 16,384) |
+  |---|---:|---:|
+  | Dropped words, no wiring package | 30.97 | 16,073 |
+  | Full posture | 30.47 | 16,099 |
+
+  The first-level node proves in 372 ms and verifies in 8.9 ms (10 threads, unquiet machine). The MAC slot is the binding constraint now.
 
 ## Open questions
 
-1. **Tree shape.** Is it a fixed balanced tree over fixed-size batches, which the final verifier rebuilds from the list? Or may a node merge children of different sizes, which puts the shape in the statement?
-2. **Leaf batch size, and whether the envelope must grow.** A leanXMSS child adds the bus GKR, 15 lincheck pins and the public words to each region.
-3. **Statement digest format.** A hash tree over batch digests is the starting proposal; the alternative is a hash chain over the concatenated list.
-4. **Phase 5's scope.** The whole package is worth about 5% at one thread and 7% at ten (phase 1). Are the dropped words cheap enough in-circuit to fold into phase 2 directly?
+1. **Tree shape.** The driver is the chain tower's spine: a base over the last two first-level nodes, then each level prepends the next-earlier one. The statement is `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))` over fixed 992-signature batches, and the verifier rebuilds it from the batches (`xmss_statement`). A balanced tree would need a second internal shape.
+2. **Leaf batch size.** It is 992. One more signature tips the statement hash's compressions into a third slot, and the layout planner to ν = 14.
+3. **Margin.** The first-level node runs at 30.47 of 31 lanes, and its MAC slot at 98%. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
+4. **The leaf's cost.** It needs an A/B of `RECURSION_LEAF` against `DEFAULT` on a quiet machine. What remains is the chained transcript (+19 ms in phase 1) and the statement hash (~1,054 compressions).

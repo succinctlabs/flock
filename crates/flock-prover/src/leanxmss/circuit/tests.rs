@@ -167,7 +167,7 @@ fn recursion_leaf_proves_and_verifies() {
     let (statements, sigs) = signed(4, 17);
     let leaf = XmssCircuit::with_options(4, None, XmssOptions::RECURSION_LEAF);
     let circuit = &leaf.shape.circuit;
-    assert!(circuit.public_columns().next().is_none() && !circuit.live_slots_packed());
+    assert!(circuit.public_columns().next().is_some() && circuit.live_slots_packed());
     let public = leaf.public(&statements);
     let digest = leaf.statement_digest(&statements);
     assert_eq!(

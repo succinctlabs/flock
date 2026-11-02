@@ -2,7 +2,7 @@ use std::{array::from_fn, iter::repeat_n};
 
 use flock_core::{
     circuit::{
-        CellSlot, CellSpace, Circuit, SigmaAssertion,
+        CellSlot, Circuit, SigmaAssertion,
         builder::SlotId,
         bus::{Bus, BusColumn, BusDirection, BusStructure},
     },
@@ -68,7 +68,7 @@ pub(super) struct BusRec {
 /// Returns `num_public_slots` (the emitters derive everything else from the
 /// gather count and `n_log_i`; `cells.nu()` is asserted against it here).
 pub(super) fn pin_recombination(
-    cells: &CellSpace,
+    circuit: &Circuit,
     n_log_i: usize,
     public: &[F128],
     gather: &[F128],
@@ -78,14 +78,12 @@ pub(super) fn pin_recombination(
     r_pt: &[F128],
     fgs_v: usize,
 ) -> usize {
+    let cells = circuit.cells();
     let (nu_c, c_bits) = (cells.nu(), cells.c_bits());
     assert_eq!(nu_c, n_log_i, "the cell space's row vars are the union's");
     assert_eq!(r_pt.len(), nu_c + c_bits, "ρ spans the cell space");
-    assert_eq!(
-        gather.len(),
-        cells.num_gate_slots(),
-        "one gather per gate slot"
-    );
+    let gathered = circuit.gathered_slots();
+    assert_eq!(gather.len(), gathered.len(), "one gather per gathered slot");
     assert_eq!(
         gammas.len(),
         n_el_pd + gather.len(),
@@ -99,22 +97,17 @@ pub(super) fn pin_recombination(
             n_el_pd + i
         );
     }
+    // Every slot sits at its grand-product position (packing moves them;
+    // pruned and public columns are dead there).
     let eq_row = build_eq(&r_pt[..nu_c]);
     let eq_slot = build_eq(&r_pt[nu_c..]);
     let mut acc = F128::ZERO;
+    for (&iota, &g) in gathered.iter().zip(gather) {
+        acc += eq_slot[circuit.gkr_slot(iota)] * g;
+    }
     for (iota, slot) in cells.slots().iter().enumerate() {
-        match *slot {
-            CellSlot::Gate { .. } => acc += eq_slot[iota] * gather[iota],
-            CellSlot::Public { s } => {
-                let base = s << nu_c;
-                let hi = ((base + (1usize << nu_c)).min(public.len())).saturating_sub(base);
-                let mut v = F128::ZERO;
-                for j in 0..hi {
-                    v += eq_row[j] * public[base + j];
-                }
-                acc += eq_slot[iota] * v;
-            }
-            CellSlot::Pad => {}
+        if let CellSlot::Public { s } = *slot {
+            acc += eq_slot[circuit.gkr_slot(iota)] * circuit.public_slot_eval(s, &eq_row, public);
         }
     }
     assert_eq!(
@@ -127,6 +120,28 @@ pub(super) fn pin_recombination(
         "f_eval == g_eval on the stream"
     );
     cells.num_public_slots()
+}
+
+/// The recombination's slot positions in the grand product: each gathered
+/// slot's, then each public slot's in segment order.
+pub(super) fn recombination_positions(circuit: &Circuit) -> (Vec<usize>, Vec<usize>) {
+    let gathered = circuit
+        .gathered_slots()
+        .into_iter()
+        .map(|iota| circuit.gkr_slot(iota))
+        .collect();
+    let mut public: Vec<(usize, usize)> = circuit
+        .cells()
+        .slots()
+        .iter()
+        .enumerate()
+        .filter_map(|(iota, slot)| match *slot {
+            CellSlot::Public { s } => Some((s, circuit.gkr_slot(iota))),
+            _ => None,
+        })
+        .collect();
+    public.sort_unstable();
+    (gathered, public.into_iter().map(|(_, q)| q).collect())
 }
 
 /// The product-GKR layer recursion in-circuit, from the agreed top pair
@@ -379,6 +394,7 @@ pub(super) fn circuit_structure_claim_wires(
     element_point: Option<&[Wire]>,
     element_values: Option<(Wire, Wire)>,
     bus: Option<(&[Wire], &[Wire])>,
+    public_columns: Option<(&[Wire], &[Wire])>,
     zw: Wire,
     ow: Wire,
 ) -> Vec<(Vec<Wire>, Vec<Wire>, Wire)> {
@@ -435,6 +451,26 @@ pub(super) fn circuit_structure_claim_wires(
         }
     } else {
         assert!(bus.is_none(), "bus wires without a bus structure");
+    }
+    // The public columns' values at the wiring's row point: plane 7.
+    if let Some(structure) = &sigma.public_columns {
+        let (row_w, value_w) = public_columns.expect("public column wires");
+        assert_eq!(
+            row_w.len(),
+            structure.rho_row.len(),
+            "public column row point"
+        );
+        assert_eq!(value_w.len(), structure.values.len(), "public column wires");
+        for (c, &vw) in value_w.iter().enumerate() {
+            let mut col: Vec<Wire> = (0..sigma.base_bits).map(|j| bit((c >> j) & 1)).collect();
+            col.extend_from_slice(&selector(7));
+            out.push((row_w.to_vec(), col, vw));
+        }
+    } else {
+        assert!(
+            public_columns.is_none(),
+            "public column wires without the structure"
+        );
     }
     assert_eq!(
         out.len(),
@@ -953,9 +989,9 @@ pub(super) fn emit_recombination(
     le8: SlotId,
     pub_w: &[Wire],
     gather_w: &[Wire],
+    positions: &(Vec<usize>, Vec<usize>),
     pt_w: &[Wire],
     nu_c: usize,
-    n_pub_slots: usize,
     f_w: Wire,
     g_w: Wire,
     zw: Wire,
@@ -963,19 +999,19 @@ pub(super) fn emit_recombination(
 ) {
     sb.connect(f_w, g_w);
     let rows = 1usize << nu_c;
+    let (gather_pos, public_pos) = positions;
+    assert_eq!(gather_pos.len(), gather_w.len(), "one position per gather");
     assert_eq!(
         pub_w.chunks(rows).count(),
-        n_pub_slots,
+        public_pos.len(),
         "public slots tile the child's segment"
     );
-    let eq_slot_w = emit_eq_prefix(
-        sb,
-        macs,
-        &pt_w[nu_c..],
-        gather_w.len() + n_pub_slots,
-        zw,
-        ow,
-    );
+    let live = gather_pos
+        .iter()
+        .chain(public_pos)
+        .max()
+        .map_or(1, |&q| q + 1);
+    let eq_slot_w = emit_eq_prefix(sb, macs, &pt_w[nu_c..], live, zw, ow);
     let max_chunks = pub_w
         .chunks(rows)
         .map(|s| s.len().div_ceil(8))
@@ -983,10 +1019,10 @@ pub(super) fn emit_recombination(
         .expect("a circuit child has publics");
     let eq_hi_w = emit_eq_prefix(sb, macs, &pt_w[3..nu_c], max_chunks, zw, ow);
     let mut acc = zw;
-    for (i, &gw2) in gather_w.iter().enumerate() {
-        acc = sb.gate(macs, &[acc, eq_slot_w[i], gw2])[0];
+    for (&q, &gw2) in gather_pos.iter().zip(gather_w) {
+        acc = sb.gate(macs, &[acc, eq_slot_w[q], gw2])[0];
     }
-    for (s, spub) in pub_w.chunks(rows).enumerate() {
+    for (spub, &q) in pub_w.chunks(rows).zip(public_pos) {
         let mut v = zw;
         for (h, chunk) in spub.chunks(8).enumerate() {
             let mut a_in: Vec<Wire> = chunk.to_vec();
@@ -996,7 +1032,7 @@ pub(super) fn emit_recombination(
             a_in.push(v);
             v = sb.gate(le8, &a_in)[0];
         }
-        acc = sb.gate(macs, &[acc, eq_slot_w[gather_w.len() + s], v])[0];
+        acc = sb.gate(macs, &[acc, eq_slot_w[q], v])[0];
     }
     sb.connect(acc, f_w);
 }

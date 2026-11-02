@@ -45,8 +45,8 @@ use crate::{
         emit_fiat_shamir_chain, emit_gkr_layers, emit_publics_hash, emit_query_phase,
         emit_recombination, emit_residual_region, flatten_ops, level_geometry, level_sources,
         observed_f256, pack8, parse_open_levels, payload_words, pin_bus_sides, pin_recombination,
-        query_phase_blake3_rows, replay_ligerito_spine256, squeeze_word_wire, strat_scheds,
-        walker_common,
+        query_phase_blake3_rows, recombination_positions, replay_ligerito_spine256,
+        squeeze_word_wire, strat_scheds, walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_BUS, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -87,6 +87,10 @@ pub(super) struct ChildTape<'p> {
     /// Packed-direct claims by source: the wiring's gathers, then the bus's
     /// (after the element pair, when there is one).
     pub(super) n_wire: usize,
+    /// Public columns ([`Circuit::public_columns`]): pd claims after the
+    /// wiring gathers whose values are fixed-public functions, bound by the
+    /// circuit-structure claims (plane 7).
+    pub(super) n_pubcol: usize,
     pub(super) n_bus: usize,
     pub(super) el: Option<ElPiopRec>,
     pub(super) start_v: usize,
@@ -321,18 +325,36 @@ impl<'p> ChildTape<'p> {
         let (pd_recs, mp_val_v, rs_recs, rs_gam_ch, rs_gam_fins) =
             Self::parse_merged_open(&ops, &vals_rec, proof, &mo_l);
         // The pd claims are the element class's two (c, lc) — when the
-        // class exists — plus one per wiring GATHER, then one per bus
-        // gather; every gather value is absorbed, in proof order.
+        // class exists — plus one per wiring GATHER, one per public column,
+        // then one per bus gather; every value is absorbed, in proof order.
         let n_el_pd = if has_el { 2 } else { 0 };
         let n_wire = proof.wiring().gather.len();
+        let pubcol: &[F128] = inner
+            .sigma
+            .public_columns
+            .as_ref()
+            .map_or(&[], |p| &p.values);
+        let n_pubcol = pubcol.len();
+        assert_eq!(
+            n_pubcol,
+            built.shape.circuit.public_columns().count(),
+            "one value per public column"
+        );
         let bus_gather: &[F128] = proof.wiring().bus.as_ref().map_or(&[], |b| &b.gather);
         let n_bus = bus_gather.len();
         assert_eq!(
             pd_recs.len(),
-            n_el_pd + n_wire + n_bus,
-            "pd claims = element (c, lc) + the wiring gathers + the bus gathers"
+            n_el_pd + n_wire + n_pubcol + n_bus,
+            "pd claims = element (c, lc) + the wiring gathers + public columns + the bus gathers"
         );
-        for (k, g) in proof.wiring().gather.iter().chain(bus_gather).enumerate() {
+        for (k, g) in proof
+            .wiring()
+            .gather
+            .iter()
+            .chain(pubcol)
+            .chain(bus_gather)
+            .enumerate()
+        {
             assert_eq!(
                 vals_rec[pd_recs[n_el_pd + k]],
                 *g,
@@ -419,7 +441,7 @@ impl<'p> ChildTape<'p> {
         };
         // Recompute the recombination and f == g from located words.
         let n_pub_slots_c = pin_recombination(
-            inner.built.shape.circuit.cells(),
+            &inner.built.shape.circuit,
             n_log_i,
             &inner.built.witness.public,
             &inner.proof.wiring().gather,
@@ -435,7 +457,7 @@ impl<'p> ChildTape<'p> {
                 bus,
                 br,
                 &chals,
-                &gammas_o[n_el_pd + n_wire..]
+                &gammas_o[n_el_pd + n_wire + n_pubcol..]
                     .iter()
                     .map(|pd| vals_rec[pd.val_v])
                     .collect::<Vec<_>>(),
@@ -766,8 +788,12 @@ impl<'p> ChildTape<'p> {
             } else {
                 Vec::new()
             };
-            for i2 in 0..n_wire {
-                v.push(cells.gate_claim_point(i2, &gkr_rec.r_pt[..cells.nu()]));
+            let circuit = &built.shape.circuit;
+            for iota in circuit.gathered_slots() {
+                v.push(cells.gate_claim_point(iota, &gkr_rec.r_pt[..cells.nu()]));
+            }
+            for (iota, _) in circuit.public_columns() {
+                v.push(cells.gate_claim_point(iota, &gkr_rec.r_pt[..cells.nu()]));
             }
             if let (Some(bus), Some(br)) = (built.shape.circuit.bus(), &bus_rec) {
                 for iota in bus.words() {
@@ -1025,6 +1051,7 @@ impl<'p> ChildTape<'p> {
             gkr: gkr_rec,
             bus: bus_rec,
             n_wire,
+            n_pubcol,
             n_bus,
             el: el_rec,
             start_v,
@@ -2156,7 +2183,7 @@ pub(super) fn emit_child_region(
     // claims after the wiring's.
     let bus_w: Option<(Vec<Wire>, Vec<Wire>)> = ct.bus.as_ref().map(|br| {
         let gather_w: Vec<Wire> = (0..ct.n_bus)
-            .map(|k| wv(ct.gammas_o[n_el_pd + ct.n_wire + k].val_v))
+            .map(|k| wv(ct.gammas_o[n_el_pd + ct.n_wire + ct.n_pubcol + k].val_v))
             .collect();
         emit_bus(
             sb,
@@ -2376,6 +2403,13 @@ pub(super) fn emit_child_region(
         bus_w
             .as_ref()
             .map(|(p, c)| (&p[..ct.inner.built.shape.circuit.cells().nu()], &c[..])),
+        // The public columns' pd values, at the wiring's row point.
+        (ct.n_pubcol > 0).then_some((
+            &pt_w[..ct.inner.built.shape.circuit.cells().nu()],
+            &(0..ct.n_pubcol)
+                .map(|c| wv(ct.gammas_o[n_el_pd + ct.n_wire + c].val_v))
+                .collect::<Vec<_>>()[..],
+        )),
         zw,
         ow,
     );
@@ -2554,9 +2588,17 @@ fn emit_wiring_gkr_and_recombination(
         le8,
         pub_w,
         &gather_w,
+        &{
+            let positions = recombination_positions(&ct.inner.built.shape.circuit);
+            assert_eq!(
+                positions.1.len(),
+                ct.n_pub_slots_c,
+                "one position per public slot"
+            );
+            positions
+        },
         &pt_w,
         n_log_i,
-        ct.n_pub_slots_c,
         f_w,
         g_w,
         zw,
@@ -2983,7 +3025,7 @@ fn emit_anchor_expect(
         let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
         for layer in (0..=m_mp2).rev() {
             let za = if layer < n_log_i {
-                if members[0] >= n_el_pd + ct.n_wire {
+                if members[0] >= n_el_pd + ct.n_wire + ct.n_pubcol {
                     bus_pt_w.expect("a bus gather group")[layer]
                 } else if members[0] >= n_el_pd {
                     pt_w[layer]
@@ -3132,6 +3174,7 @@ pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildR
             boolean_pins: ct.sigma_native.boolean_pins.clone(),
             element_constants: ct.sigma_native.element_constants.clone(),
             bus: ct.sigma_native.bus.clone(),
+            public_columns: ct.sigma_native.public_columns.clone(),
         };
         assert_eq!(sa.rho, ct.sigma_native.rho, "the emitted sigma point");
         assert_eq!(sa.value, ct.sigma_native.value, "the emitted sigma value");

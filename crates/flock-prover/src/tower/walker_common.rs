@@ -331,10 +331,6 @@ pub(super) fn parse_gkr_input_check_advice(
     circuit: &Circuit,
     r_pt: &[F128],
 ) -> (usize, F128, F128) {
-    assert!(
-        circuit.public_columns().next().is_none() && !circuit.live_slots_packed(),
-        "the walkers do not transcribe public columns or packed slots"
-    );
     let mu_i = circuit.cells().mu();
     let (mid_n, live_n) = {
         let basis_i = s_id_basis(mu_i);

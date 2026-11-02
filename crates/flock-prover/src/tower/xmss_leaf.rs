@@ -508,8 +508,14 @@ fn xmss_internal_node_over_two_first_level_nodes() {
 #[ignore]
 fn xmss_dropped_words_tape_probe() {
     let n = 4;
+    // `XMSS_WIRING=1` adds the wiring package (pruning, public columns,
+    // packing).
+    let wiring = std::env::var("XMSS_WIRING").is_ok();
     let options = XmssOptions {
         zero_linear_words: true,
+        prune_unwired: wiring,
+        public_columns: wiring,
+        pack_live_slots: wiring,
         ..XmssOptions::RECURSION_LEAF
     };
     // 2^8-row slots: the big kinds fill whole slots, and only a full slot
