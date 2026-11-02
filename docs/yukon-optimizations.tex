@@ -1658,9 +1658,20 @@ position-major gathers $38.4$ --- and staging each tile in L2 and
 streaming it out non-temporally (skipping the destination's
 read-for-ownership) measured $25.7$--$27.5$ against $23.4$--$25.6$
 in-prove. It is bandwidth-bound; rejected.
-\item \emph{Fusing it into the first NTT pass} (gathering the radix-8
-inputs from $q$ directly): $8\times46$ concurrent read streams per tile
-row and a $1\,$MB staging tile per pass. Not attempted.
+\item \emph{Fusing it into the first NTT pass}: the dual from-source
+radix-8 kernel takes $(\text{row},\text{lane})$ source strides, so the
+ranked top reads $q$ in place with strides $(1, D)$ instead of the
+message's $(t, 1)$ --- a ten-line change that would serve every
+application, BLAKE3 and leanXMSS alike, without touching a witness
+driver. Byte-identical (digest unchanged), but the first pass now pulls
+$8\times46=368$ concurrent streams $1\,$MB and $8\,$MB apart, which
+alias into the same cache sets: the ranked NTT went $436\to480\,$ms ST
+against the $24\,$ms transpose it saved ($+20\,$ms net), and the 10T
+commit $136\to132\,$ms. Consuming each stream line by line (lane-outer
+over an $8$-row tile) would end the aliasing but reads $368$ one-line
+bursts per tile, the pattern the transpose's own tiling measured at
+$\approx9\,$GB/s; long bursts need a multi-MB staging tile per worker,
+which does not fit L2 at 10T. Rejected.
 \item \emph{Writing the message from the witness driver}, as the frontier
 does: when $q$ is the single slot's $z$ (identity compaction) and the
 ranked top applies, the union prover lends the driver a
@@ -1676,8 +1687,14 @@ single-core write floor), so the single-thread gain cannot exceed
 $\approx-8\,$ms. At $+184$ lines across $14$ files --- a new
 \code{SlotWitnessDest} field every driver and test site carries --- for a
 single-thread wash it is held back (branch \code{yukon-128-fused-msg});
-it is worth taking only for the 10T result. It cannot help leanXMSS,
-whose compacted $q$ is not its $z$.
+it is worth taking only for the 10T result. For leanXMSS the same
+write is possible --- under its full-height commit compaction is a
+per-slot contiguous copy, so a witness position's place in $q$, and
+hence in the message, is a per-slot offset --- but it buys the same
+trade from the generic DSL packer: its transpose is $30\,$ms ST against
+$\approx17\,$ms of extra message stores, and its compaction, which the
+open still needs, stays ($9\,$ms ST and 10T once the pool is warm;
+the $25\,$ms first-run figure is page faults). Not taken.
 \end{itemize}
 
 \paragraph{Rejected, and what is left.} The induce truncation of
@@ -1694,8 +1711,7 @@ an explicit call: the frontier's depth-three delayed sparse-dual
 induction (C2, $\approx500$ lines there), which would take most of the
 remaining induce ($7.0\,$ms ST at the L0 boundary, $2.7$ at L1); the
 leanXMSS DSL gate packing (\code{BooleanGate::pack\_into\_with}, about
-half its $177\,$ms single-threaded witness generation); the fused
-message write of \S\ref{sec:fusedmsg} for its 10T gain; and the
+half its $177\,$ms single-threaded witness generation); and the
 strict ladder itself, whose recursive commits are
 $+120\,$ms ST over Fast100 by construction --- a parameter decision, not
 an implementation one.
