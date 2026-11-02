@@ -170,6 +170,14 @@ fn recursion_leaf_proves_and_verifies() {
     assert!((0..union.registry().num_boolean()).all(|t| union.zeroed_word_cols(t).is_empty()));
     let circuit = &leaf.shape.circuit;
     assert!(circuit.public_columns().next().is_none() && !circuit.live_slots_packed());
+    let public = leaf.public(&statements);
+    let digest = leaf.statement_digest(&statements);
+    assert_eq!(
+        public[public.len() - 2..],
+        digest_words(&digest),
+        "the statement digest is the last public pair"
+    );
+    assert!(public.len() < 64, "no signer word is public");
     let witness = leaf.witness(&statements, &sigs);
     let proof = leaf.prove(&witness);
     leaf.verify(&statements, &proof)

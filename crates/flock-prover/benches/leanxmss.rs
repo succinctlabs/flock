@@ -14,7 +14,8 @@
 //! `recursion` for the recursion leaf, or a comma-separated list of changes
 //! to the default: `chained` (the chained transcript), `no-zero` (keep the
 //! degree-one words), `no-prune`, `no-public` (no public columns),
-//! `no-pack`.
+//! `no-pack`, `hashed` (hash the signers' words in-circuit, publish the
+//! digest).
 //!
 //! Signatures are key-free (each costs two grinds of about 2^20 hashes) and
 //! cached under `target/`.
@@ -107,6 +108,7 @@ fn options(spec: &str) -> XmssOptions {
             "no-prune" => options.prune_unwired = false,
             "no-public" => options.public_columns = false,
             "no-pack" => options.pack_live_slots = false,
+            "hashed" => options.hashed_statement = true,
             _ => panic!("LEANXMSS_OPTIONS: unknown change {change:?}"),
         }
     }
