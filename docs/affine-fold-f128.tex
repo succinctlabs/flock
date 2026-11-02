@@ -126,11 +126,22 @@ gives
   \What_i^{\,2} = a_i\, \What_{i+1} + \What_i, \qquad a_i =
   W_{i+1}(v_{i+1}) / W_i(v_i)^2,
 \]
-and $X = v_0 \What_0$. So $X \cdot X_j$ is $v_0 X_{j+1}$ when bit $0$
-of $j$ is clear. Otherwise it carries through the trailing ones of $j$
-and yields one term per carry. The map $T: \coef(G) \mapsto
-\coef(XG)$ has about two nonzeros per column on average, and the
-prover applies it in $O(n)$ with constant multiplications. The prover
+and $X = v_0 \What_0$. With the standard basis $v_i = x^i$ we have
+$v_0 = 1$ and $X = \What_0$. Write $P_i = a_0 \cdots a_{i-1}$, and let
+$t(j)$ and $z(j)$ be the numbers of trailing ones and trailing zeros of
+$j$. Expanding $\What_0 X_j$ through the carries gives
+$X \cdot X_j = \sum_{i < t(j)} P_i\, X_{j - 2^i + 1} + P_{t(j)}\,
+X_{j+1}$. In gather form, each output coefficient has exactly two
+terms:
+\[
+  (T g)_m = P_{t(m-1)}\, g_{m-1} + P_{z(m)}\, g_{m + 2^{z(m)} - 1}
+  \qquad (m \ge 1;\ (Tg)_0 = 0),
+\]
+where the second term is present when its index is in range. The
+prover applies $T$ in $O(n)$ with two multiplications by constants per
+coefficient. \texttt{benches/affine\_fold\_probe.rs} checks this
+formula against the NTT: $\mathrm{Enc}(Tg)(x) = x\,\mathrm{Enc}(g)(x)$
+at every domain point. The prover
 needs $Xf_1$ for $f'$ and for the two grid entries $\langle Xf_1,
 W_b\rangle$.
 
@@ -317,6 +328,37 @@ total & 55.0 & estimate $-15$ to $-20$ ms of a $248$ ms prove \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+\paragraph{Probe measurement.} \texttt{benches/affine\_fold\_probe.rs}
+times the real \texttt{ligero\_commit} at today's split shapes and at
+the half-size native shapes, keeping the same rates and four lanes. Run
+on the same machine (median of 7, ms):
+
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Level & split table & ms & native table & ms \\
+\midrule
+L1 & $2^{20}$ & 15.47 & $2^{19}$ & 8.58 \\
+L2 & $2^{17}$ & 7.43 & $2^{15}$ & 2.08 \\
+L3 & $2^{14}$ & 3.72 & $2^{11}$ & 0.80 \\
+L4 & $2^{11}$ & 2.01 & $2^{7}$ & 0.32 \\
+L5 & $2^{8}$ & 1.06 & --- & --- \\
+\midrule
+total & & 29.70 & & 11.78 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The commits alone save about $18$ ms, close to the trace's
+$28.5$ ms total for today's recursive commits. The probe also runs
+simple fold kernels with a dense basis, written the same naive way for
+both paths. At L0 ($2^{25}$, $k = 6$) the F256 fold takes $89.6$ ms and
+the affine fold $85.0$ ms. At L1 the F256 fold on $2^{20}$ takes
+$3.9$ ms and the affine fold on $2^{19}$ takes $2.2$ ms. Production's
+fused F256 kernels run the L0 folds in $12.7$ ms, so the affine path
+needs the same fusion work (step~3 of \S\ref{sec:plan}) to keep that
+part flat.
 
 The largest item is the split. Today a folded $\F_{2^{256}}$ table of
 length $N$ is committed as a $\F_{2^{128}}$ table of length $2N$, and
