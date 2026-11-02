@@ -538,3 +538,191 @@ fn xmss_tower_e2e() {
         "a lane claim moved off its value"
     );
 }
+
+/// The leanXMSS tower's ONLINE cost per stage, under `tower_online_bench`'s
+/// discipline: one setup per stage, then `BENCH_RUNS` steady online
+/// iterations after a warmup (the warmup reports on the setup tier). Each
+/// stage runs with only its own inputs resident. `XMSS_N` signatures per
+/// leaf (default 992, the production batch).
+#[test]
+#[ignore] // Benchmark — run explicitly with --nocapture.
+fn xmss_tower_online_bench() {
+    use std::{sync::atomic::Ordering, time::Instant};
+
+    use crate::{
+        leanxmss::circuit::{XmssOptions, keyless_batch},
+        tower::{
+            envelope::STEADY_OVERRIDE,
+            online::{Online, median_total, report_stage},
+            test_config,
+        },
+    };
+    let cfg = test_config();
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    let runs = env("BENCH_RUNS").unwrap_or(3);
+    let n = env("XMSS_N").unwrap_or(992);
+    let circuit = XmssCircuit::with_options(n, env("XMSS_NU"), XmssOptions::RECURSION_LEAF);
+    // Signing grinds each signature's digest onto a codeword (~30 s per
+    // 1000 signatures on every core), so the batches are signed once on a
+    // full-width pool, whatever RAYON_NUM_THREADS says, and cached on disk.
+    let cached = |seed: u64| -> (Vec<Statement>, Vec<Signature>) {
+        use crate::leanxmss::reference::{PK_LEN, PublicKey, SIG_LEN};
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("leanxmss-blake3-keyless-v2-{n}-seed{seed}.bin"));
+        let record = PK_LEN + 32 + SIG_LEN;
+        if let Ok(bytes) = std::fs::read(&path)
+            && bytes.len() == n * record
+        {
+            return bytes
+                .chunks_exact(record)
+                .map(|r| {
+                    let pk = PublicKey::from_bytes(r[..PK_LEN].try_into().unwrap());
+                    let msg = r[PK_LEN..PK_LEN + 32].try_into().unwrap();
+                    let sig = Signature::from_bytes(&r[PK_LEN + 32..]).unwrap();
+                    (Statement { pk, msg }, sig)
+                })
+                .unzip();
+        }
+        let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
+        let (statements, sigs) = rayon::ThreadPoolBuilder::new()
+            .num_threads(cores)
+            .build()
+            .unwrap()
+            .install(|| keyless_batch(n, seed));
+        let mut bytes = Vec::with_capacity(n * record);
+        for (st, sig) in statements.iter().zip(&sigs) {
+            bytes.extend_from_slice(&st.pk.to_bytes());
+            bytes.extend_from_slice(&st.msg);
+            bytes.extend_from_slice(&sig.to_bytes());
+        }
+        let _ = std::fs::write(&path, bytes);
+        (statements, sigs)
+    };
+    let batches: Vec<(Vec<Statement>, Vec<Signature>)> =
+        (0..6u64).map(|i| cached(101 + i)).collect();
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+
+    // ---- LEAF: witness + prove over one batch, nothing else alive ----
+    let leaf: Vec<Online> = (0..=runs)
+        .map(|_| {
+            let t = Instant::now();
+            let witness = circuit.witness(&batches[0].0, &batches[0].1);
+            let witgen_ms = ms(t);
+            let t = Instant::now();
+            let proof = circuit.prove(&witness);
+            let prove_ms = ms(t);
+            drop((witness, proof));
+            Online {
+                witgen_ms,
+                prove_ms,
+                ..Online::default()
+            }
+        })
+        .collect();
+
+    // ---- FL: the spine's fresh child, over batches 0 and 1 ----
+    let (fresh, jp) = {
+        let l0 = build_xmss_leaf(&circuit, &batches[0].0, &batches[0].1);
+        let l1 = build_xmss_leaf(&circuit, &batches[1].0, &batches[1].1);
+        STEADY_OVERRIDE.store(runs, Ordering::Relaxed);
+        let fl = build_xmss_first_level_node(cfg, &circuit, [&l0, &l1]);
+        STEADY_OVERRIDE.store(0, Ordering::Relaxed);
+        (fl, xmss_jagged_params(&l0))
+    };
+    let fl = fresh.onlines.clone();
+
+    // ---- BASE over two more first-level nodes, then the steady SPINE
+    // node: the fresh FL plus the base as its node child ----
+    let pair = |i: usize| {
+        let l0 = build_xmss_leaf(&circuit, &batches[i].0, &batches[i].1);
+        let l1 = build_xmss_leaf(&circuit, &batches[i + 1].0, &batches[i + 1].1);
+        build_xmss_first_level_node(cfg, &circuit, [&l0, &l1])
+    };
+    let (fl1, fl2) = (pair(2), pair(4));
+    let family = xmss_family(&circuit);
+    let dropped = family
+        .shared
+        .clone()
+        .expect("the leanXMSS lane binds shared");
+    let shape = circuit.shape();
+    let parts = LaneParts {
+        registry: &shape.registry,
+        family: &family,
+        dropped: &dropped,
+        circuit: &shape.circuit,
+        params: &jp,
+        claims_base: fresh.fold_pub_base,
+        block_words: lane_block_words(&fresh.acc),
+    };
+    STEADY_OVERRIDE.store(runs, Ordering::Relaxed);
+    let base = build_node_outer_app(
+        cfg,
+        &[&fl1.lo, &fl2.lo],
+        Some(fresh.stmt_base),
+        Some(parts.lane(&[&fl1.acc, &fl2.acc])),
+        None,
+    );
+    drop((fl1, fl2));
+    let lane = base.lane_acc.clone().expect("the base's lane");
+    let spine = build_node_outer_app(
+        cfg,
+        &[&fresh.lo, &base.lo],
+        Some(fresh.stmt_base),
+        Some(parts.lane(&[&fresh.acc, &lane])),
+        Some(SpineIn {
+            node_child: 1,
+            prior: &base.block,
+            forge: false,
+        }),
+    )
+    .onlines;
+    STEADY_OVERRIDE.store(usize::MAX, Ordering::Relaxed);
+    let internal = base.onlines.clone();
+
+    let steady = |r: &[Online]| -> Vec<Online> {
+        if r.len() > 1 {
+            r[1..].to_vec()
+        } else {
+            r.to_vec()
+        }
+    };
+    println!(
+        "\nXMSS TOWER ONLINE: {n} signatures per leaf (leaf nu {}), {runs} steady runs, {} threads",
+        circuit.nu(),
+        rayon::current_num_threads(),
+    );
+    println!(
+        "  warmup (setup tier): leaf {:.0} | FL {:.0} | base {:.0} | spine {:.0} ms",
+        leaf[0].total(),
+        fl[0].total(),
+        internal[0].total(),
+        spine[0].total(),
+    );
+    let (leaf, fl, internal, spine) = (
+        steady(&leaf),
+        steady(&fl),
+        steady(&internal),
+        steady(&spine),
+    );
+    report_stage("leaf", &leaf);
+    report_stage("FL", &fl);
+    report_stage("base", &internal);
+    report_stage("spine", &spine);
+    let (leaf_on, fl_on, node_on) = (median_total(&leaf), median_total(&fl), median_total(&spine));
+    // A binary tree over L leaves carries L/2 first-level nodes and
+    // L/2 − 1 nodes above them, so a leaf's amortised share tends to
+    // leaf + FL/2 + node/2.
+    let per_leaf = leaf_on + fl_on / 2.0 + node_on / 2.0;
+    println!(
+        "  per leaf (leaf + FL/2 + node/2): {per_leaf:.0} ms = {:.3} ms per signature, \
+         {:+.1}% over the leaf alone",
+        per_leaf / n as f64,
+        100.0 * (per_leaf / leaf_on - 1.0),
+    );
+    println!(
+        "  an 8-leaf tower ({} signatures) on one prover, in sequence: {:.1} s online",
+        8 * n,
+        (8.0 * leaf_on + 4.0 * fl_on + 3.0 * node_on) / 1e3,
+    );
+}

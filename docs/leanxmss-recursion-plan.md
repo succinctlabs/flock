@@ -90,7 +90,7 @@ Phase 5's order: the dropped words first (half the cost, all in the zerocheck), 
 - `XmssTower::discharge_root`: the statement, the lane against the leaf tables per class, and the main fold and passenger (`discharge_outer`, shared with the chain tower).
 - **Tests.** `xmss_internal_node_over_two_first_level_nodes`, `xmss_tower_e2e` (8 batches, a steady root; refuses a wrong digest, a wrong count, a moved lane claim).
 - **Root verifier.** `XmssTowerVk::generate` builds the VK from a reference tower over six batches. `verify_xmss_root(vk, statement, bundle)` checks the root proof against the VK alone. It then reassembles the accumulator from the root's publics, checks the statement, and runs the discharge. `xmss_tower_e2e` also refuses swapped batches, an edited message and a forged public.
-- **Full size.** 8 × 992 = 7,936 signatures, with the final leaf posture (phase 5): the tower proves in 52.7 s. That includes the eight leaves, the circuit builds and seven outers, at 10 threads on an unquiet machine. The root proof is 254 KiB.
+- **Full size.** 8 × 992 = 7,936 signatures, with the final leaf posture (phase 5): the end-to-end test passes, including the standalone verify. The root proof is 254 KiB. Per-stage timings are in the measured section below.
 
 **5. Put the leaf optimisations back.** Done: `RECURSION_LEAF` now has every optimisation of the default proof, plus the chained transcript and the hashed statement.
 - **Dropped degree-one words.**
@@ -109,11 +109,48 @@ Phase 5's order: the dropped words first (half the cost, all in the zerocheck), 
   | Dropped words, no wiring package | 30.97 | 16,073 |
   | Full posture | 30.47 | 16,099 |
 
-  The first-level node proves in 372 ms and verifies in 8.9 ms (10 threads, unquiet machine). The MAC slot is the binding constraint now.
+  The MAC slot is the binding constraint now.
+
+## Measured (2026-11-02, quiet M4, bench profile)
+
+**The leaf.** 992 signatures; the median of each process's fastest prove, 4 alternating processes per arm, in ms. The recursion leaf costs nothing measurable. Phase 1's binary gives the same default, so the dropped-words lincheck report left the shipped proof's time alone.
+
+| Arm | 1 thread | 10 threads |
+|---|---:|---:|
+| `DEFAULT` | 1,870 | 431 |
+| `RECURSION_LEAF` | 1,853 | 430 |
+| default + chained transcript | 1,900 | 434 |
+| default + hashed statement | 1,888 | 437 |
+| phase 1's binary, default | 1,871 | 434 |
+
+**The tower** (`xmss_tower_online_bench`). Online ms per proof: the median of 3 steady iterations after a warmup. The leaf here is witness + prove inside the test binary.
+
+| Stage | 1 thread | 4 threads | 10 threads |
+|---|---:|---:|---:|
+| Leaf (992 signatures) | 2,054 | 604 | 471 |
+| First-level node | 780 | 295 | 270 |
+| Base | 693 | 250 | 208 |
+| Spine node | 712 | 250 | 216 |
+| Per leaf: leaf + FL/2 + node/2 | 2,801 (+36%) | 877 (+45%) | 714 (+52%) |
+| Per signature | 2.82 | 0.88 | 0.72 |
+
+The nodes scale worse with threads than the leaf (3.3× from 1 to 10 threads, against the leaf's 4.4×), so the overhead grows with the thread count.
+
+**Where a node's time goes** (spine node, 1 thread, ~700 ms; `PCS_TRACE`):
+
+| Phase | Node ms | Notes |
+|---|---:|---|
+| Witness generation | 62 | Fills a zeroed 2^25-word padded buffer for a 2^22-word commit. |
+| Commit | 192 | A plain F128 NTT (126) and Merkle (51). |
+| Zerocheck + lincheck + wiring | ~150 | |
+| Element PIOP | 13 | |
+| Open | ~270 | Ligerito 112; W build + merged sumcheck 103; multipoint 97. |
+
+Per committed word, a node costs 2.8× a leaf. The leaf's bit-structured witness takes the fast paths: the ranked NTT, block statistics, and closed-form multipoint weights over 703 full columns (3 ms). The node's ragged layout (730 columns, 11 full) takes the dense virtual weight: 74 ms of weight passes and two-product sumcheck. That, and the padded witness buffer, are the first places to look.
 
 ## Open questions
 
 1. **Tree shape.** The driver is the chain tower's spine: a base over the last two first-level nodes, then each level prepends the next-earlier one. The statement is `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))` over fixed 992-signature batches, and the verifier rebuilds it from the batches (`xmss_statement`). A balanced tree would need a second internal shape.
 2. **Leaf batch size.** It is 992. One more signature tips the statement hash's compressions into a third slot, and the layout planner to ν = 14.
 3. **Margin.** The first-level node runs at 30.47 of 31 lanes, and its MAC slot at 98%. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
-4. **The leaf's cost.** It needs an A/B of `RECURSION_LEAF` against `DEFAULT` on a quiet machine. What remains is the chained transcript (+19 ms in phase 1) and the statement hash (~1,054 compressions).
+4. **Node cost.** A node is 35–46% of a leaf's time for an eighth of its words (above). Aligned envelope columns, or a closed-form ragged weight, and a witness buffer sized to the commit are the first candidates.

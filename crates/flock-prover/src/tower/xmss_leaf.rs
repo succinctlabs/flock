@@ -149,6 +149,8 @@ pub struct XmssFlNode {
     /// Signatures under the node.
     pub(super) n: usize,
     pub(super) t: Online,
+    /// One record per online iteration (1 + steady_reps of them).
+    pub(super) onlines: Vec<Online>,
 }
 
 /// The leanXMSS leaf family under `circuit`: the leaf domain, and per
@@ -192,6 +194,7 @@ pub fn build_xmss_first_level_node(
         ),
         n: 2 * per_leaf,
         t: core.t,
+        onlines: core.onlines,
     }
 }
 
