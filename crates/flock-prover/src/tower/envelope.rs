@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use flock_core::circuit::builder::SlotId;
+use flock_core::{aggregate::Accumulator, circuit::builder::SlotId, matrix_fold::MatrixClaim};
 
 use crate::tower::{
     AssistLayerGate, BitSpreadGate, BitSpreadTable, Blake3Gate, CollapsedSlots, F128,
@@ -54,6 +54,10 @@ pub(super) struct EnvShape {
     /// one aggregate of a child's layout that stays circuit structure
     /// under FREE COUNTS.
     pub(super) lanes: usize,
+    /// The ACC_CHAIN block's width: the leaf registry's lane. A tower fixes
+    /// it once for every level ([`ENV_ACC_CHAIN_WORDS`] for the chain
+    /// tower; [`lane_block_words`] of its lane for the others).
+    pub(super) acc_chain_words: usize,
 }
 
 /// The APPLICATION STATEMENT's width in the envelope's public segment:
@@ -162,6 +166,21 @@ pub(super) fn steady_reps() -> usize {
 /// shorter shape — a dev-size chain, a fold with fewer groups — rides the
 /// same layout and a reader simply stops at its own group widths.
 pub(super) const ENV_ACC_CHAIN_WORDS: usize = 160;
+
+/// The public segment's BODY: everything before the tail blocks. Fixed for
+/// every envelope, so a tower whose lane needs a wider ACC_CHAIN block
+/// grows `publics*` by exactly the difference.
+const ENV_BODY_WORDS: usize = 4266;
+
+/// The ACC_CHAIN width a lane accumulator needs: per folded group its
+/// published `[live | rho_col | rho_row | value]`, boolean A and B per type,
+/// then sigma, then jagged.
+pub(super) fn lane_block_words(acc: &Accumulator) -> usize {
+    let w = |c: &MatrixClaim| 2 + c.col.point.len() + c.row.point.len();
+    acc.per_type.iter().map(|(a, b)| w(a) + w(b)).sum::<usize>()
+        + acc.sigma.iter().map(|(_, c)| w(c)).sum::<usize>()
+        + acc.jagged.iter().map(|(_, c)| w(c)).sum::<usize>()
+}
 // F256 verification adds extension-field table claims to the shared
 // registry. A live node uses 1,028 words; keep a fixed-shape margin so the
 // same block carries the accumulator at every recursive level.
@@ -209,7 +228,7 @@ pub(super) fn env_acc_main_base(env: &EnvShape) -> usize {
 }
 
 pub(super) fn env_acc_chain_base(env: &EnvShape) -> usize {
-    env_acc_main_base(env) - ENV_ACC_CHAIN_WORDS
+    env_acc_main_base(env) - env.acc_chain_words
 }
 
 /// The reserved tail blocks an envelope outer hands to
@@ -231,6 +250,12 @@ pub(super) struct EnvTail<'w> {
 /// The fixed envelope shape — always on, no override: the registry
 /// convergence below is pinned to m* = 29's measured geometry.
 pub(super) fn envelope_shape() -> EnvShape {
+    envelope_shape_with_lane(ENV_ACC_CHAIN_WORDS)
+}
+
+/// [`envelope_shape`] with an ACC_CHAIN block of `acc_chain_words`: the
+/// same registry and body, the public segment longer by the difference.
+pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
     EnvShape {
         // The two-child envelope fits at 14 after consolidating the F256
         // residual tables and assigning each independent child verifier to
@@ -282,8 +307,13 @@ pub(super) fn envelope_shape() -> EnvShape {
             (882, 4150),   // eight-way residual accumulation
             (1008, 15000), // extension prefix w 8
         ],
-        // Preserve the existing public body while enlarging ACC_MAIN.
-        publics: 5684,
+        // Preserve the existing public body while enlarging ACC_MAIN:
+        // 5684 at the chain tower's lane width.
+        publics: ENV_BODY_WORDS
+            + acc_chain_words
+            + ENV_ACC_MAIN_WORDS
+            + ENV_PASS_WORDS
+            + ENV_APP_WORDS,
         // The committed lane count — the ONE piece of a child's layout that
         // stays circuit structure (the parent hashes `num_lanes`-word
         // leaves), so it is pinned while everything count-shaped rides the
@@ -292,6 +322,7 @@ pub(super) fn envelope_shape() -> EnvShape {
         // lanes; 31 stays below `2^initial_k = 32`, so children remain
         // lane-major.
         lanes: 31,
+        acc_chain_words,
     }
 }
 
@@ -513,7 +544,8 @@ pub(super) fn pad_envelope_counts(
     // this outer has no content for is zeros, built exactly as the padding
     // is.
     let body =
-        env.publics - ENV_ACC_CHAIN_WORDS - ENV_ACC_MAIN_WORDS - ENV_PASS_WORDS - ENV_APP_WORDS;
+        env.publics - env.acc_chain_words - ENV_ACC_MAIN_WORDS - ENV_PASS_WORDS - ENV_APP_WORDS;
+    debug_assert_eq!(body, ENV_BODY_WORDS);
     let live_pub = sb.public_len();
     report.push(format!("publics {live_pub}/{body}"));
     if live_pub > body {
@@ -524,7 +556,7 @@ pub(super) fn pad_envelope_counts(
             sb.public_input();
         }
         for (name, w, width) in [
-            ("acc_chain", tail.acc_chain, ENV_ACC_CHAIN_WORDS),
+            ("acc_chain", tail.acc_chain, env.acc_chain_words),
             ("acc_main", tail.acc_main, ENV_ACC_MAIN_WORDS),
             ("pass", tail.pass, ENV_PASS_WORDS),
             ("app", tail.app, ENV_APP_WORDS),

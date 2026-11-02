@@ -34,26 +34,24 @@ use {
 };
 
 use crate::{
-    r1cs_hashes::{
-        blake3::build_block_r1cs,
-        fs_chain::{FsChainTrace, IV},
-    },
+    r1cs_hashes::fs_chain::{FsChainTrace, IV},
     tower::{
-        CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind, InnerPd,
-        LeafEvalGate, LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner, MixedProof, MpRec,
-        OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ag_seed_bytes,
-        assertion_mac, bytes_payload_mask, cap_payloads, cap_wires, check_residual_publics,
-        circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
-        emit_boolean_reported_check, emit_element_reported_check, emit_fiat_shamir_chain,
-        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region, flatten_ops,
-        level_geometry, level_sources, observed_f256, pack8, parse_open_levels, payload_words,
-        pin_recombination, query_phase_blake3_rows, replay_ligerito_spine256, squeeze_word_wire,
-        strat_scheds, walker_common,
+        BusRec, CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind,
+        InnerPd, LeafEvalGate, LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner, MixedProof,
+        MpRec, OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire,
+        ag_seed_bytes, assertion_mac, bytes_payload_mask, cap_payloads, cap_wires,
+        check_residual_publics, circuit_structure_claim_wires, cw, declare_envelope_slots,
+        decode_ag_point, emit_boolean_reported_check, emit_bus, emit_element_reported_check,
+        emit_fiat_shamir_chain, emit_gkr_layers, emit_publics_hash, emit_query_phase,
+        emit_recombination, emit_residual_region, flatten_ops, level_geometry, level_sources,
+        observed_f256, pack8, parse_open_levels, payload_words, pin_bus_sides, pin_recombination,
+        query_phase_blake3_rows, replay_ligerito_spine256, squeeze_word_wire, strat_scheds,
+        walker_common,
         walker_common::{
-            LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
+            LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_BUS, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
-            LBL_RING_SWITCH, LBL_ZEROCHECK, RS_SHAT_WORDS, TailEntry, Z_PARTIAL_WORDS,
-            publish_tail, zskip_wires,
+            LBL_PRODUCT_LEAVES, LBL_RING_SWITCH, LBL_ZEROCHECK, RS_SHAT_WORDS, TailEntry,
+            Z_PARTIAL_WORDS, publish_tail, zskip_wires,
         },
     },
     verifier::{verify_ligerito_union_circuit, verify_ligerito_union_circuit_ag},
@@ -84,6 +82,12 @@ pub(super) struct ChildTape<'p> {
     // its tape, and the `el_*`/`a_sum_n`/`b_sum_n` natives below are
     // meaningful iff `el.is_some()`.
     pub(super) gkr: GkrRec,
+    /// The tuple bus's region, when the child's circuit has a bus.
+    pub(super) bus: Option<BusRec>,
+    /// Packed-direct claims by source: the wiring's gathers, then the bus's
+    /// (after the element pair, when there is one).
+    pub(super) n_wire: usize,
+    pub(super) n_bus: usize,
     pub(super) el: Option<ElPiopRec>,
     pub(super) start_v: usize,
     gammas_o: Vec<PdRec>,
@@ -98,6 +102,7 @@ pub(super) struct ChildTape<'p> {
     pub(super) lvl_src: Vec<(&'p [[u8; 32]], &'p Vec<Vec<F128>>, &'p Vec<[u8; 32]>)>,
     pub(super) geo: Vec<Lvl>,
     pub(super) native_sums: Vec<F256>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) n_pd: usize,
     /// Packed-direct claim carrying the element lincheck's `z_eval`.
     pub(super) z_ix: Option<usize>,
@@ -194,6 +199,7 @@ struct LabelMap {
     elzc_l: Vec<usize>,
     el_l: Vec<usize>,
     gkr_l: Vec<usize>,
+    bus_l: Vec<usize>,
     mo_l: Vec<usize>,
     mp_l: Vec<usize>,
 }
@@ -222,20 +228,22 @@ struct ChainOpenParse<'p> {
 }
 
 impl<'p> ChildTape<'p> {
-    pub(super) fn new(inner: &'p MixedInner, domain: &'static [u8]) -> Self {
+    /// `lcs` are the child's lincheck circuits in registry order.
+    pub(super) fn new(
+        inner: &'p MixedInner,
+        domain: &'static [u8],
+        lcs: &[&dyn LincheckCircuit],
+    ) -> Self {
         let built = &inner.built;
         let proof = &inner.proof;
-        let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
-        let blake_r1cs = build_block_r1cs(inner.nu);
-        let blake_lc = blake_r1cs.csc_lincheck_circuit();
-        let lcs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
+        let union = inner.union();
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
         let all_claims = match proof {
             MixedProof::Rs(p) => verify_ligerito_union_circuit(
                 &union,
                 &built.shape.circuit,
                 &built.witness.public,
-                &lcs,
+                lcs,
                 &inner.commitment,
                 p,
                 &inner.pcs,
@@ -245,7 +253,7 @@ impl<'p> ChildTape<'p> {
                 &union,
                 &built.shape.circuit,
                 &built.witness.public,
-                &lcs,
+                lcs,
                 &inner.commitment,
                 p,
                 &inner.pcs,
@@ -275,15 +283,17 @@ impl<'p> ChildTape<'p> {
         let ops: Vec<Op> = flatten_ops(t_shape.ops()).to_vec();
         let mut pub_payloads = bytes_payload_mask(&ops);
 
+        let has_bus = built.shape.circuit.bus().is_some();
         let LabelMap {
             zc_l,
             lc_l,
             elzc_l,
             el_l,
             gkr_l,
+            bus_l,
             mo_l,
             mp_l,
-        } = Self::parse_label_map(&ops, proof, has_el);
+        } = Self::parse_label_map(&ops, proof, has_el, has_bus);
 
         let vc_at = |end: usize| vc_at(&ops, end);
         let fin_at = |end: usize| fin_at(&ops, end);
@@ -291,25 +301,40 @@ impl<'p> ChildTape<'p> {
         Self::check_boolean_zerocheck_slices(&ops, &vals_rec, proof, has_el, &zc_l);
 
         let gkr_rec = Self::parse_wiring_gkr_region(&ops, &vals_rec, &chals, proof, built, &gkr_l);
+        let bus_rec = built.shape.circuit.bus().map(|bus| {
+            walker_common::walk_bus_gkr(
+                &ops,
+                &vals_rec,
+                &chals,
+                proof.wiring().bus.as_ref().expect("a bus proof"),
+                bus_l[0],
+                bus.width,
+                &vc_at,
+                &fin_at,
+            )
+        });
 
         let el_rec = Self::parse_element_piop_region(&ops, has_el, &elzc_l, &el_l);
 
         let (pd_recs, mp_val_v, rs_recs, rs_gam_ch, rs_gam_fins) =
             Self::parse_merged_open(&ops, &vals_rec, proof, &mo_l);
         // The pd claims are the element class's two (c, lc) — when the
-        // class exists — plus one per wiring GATHER; every gather value is
-        // absorbed, in proof order.
+        // class exists — plus one per wiring GATHER, then one per bus
+        // gather; every gather value is absorbed, in proof order.
         let n_el_pd = if has_el { 2 } else { 0 };
+        let n_wire = proof.wiring().gather.len();
+        let bus_gather: &[F128] = proof.wiring().bus.as_ref().map_or(&[], |b| &b.gather);
+        let n_bus = bus_gather.len();
         assert_eq!(
             pd_recs.len(),
-            n_el_pd + proof.wiring().gather.len(),
-            "pd claims = element (c, lc) + the wiring gathers"
+            n_el_pd + n_wire + n_bus,
+            "pd claims = element (c, lc) + the wiring gathers + the bus gathers"
         );
-        let pd_vals: Vec<F128> = pd_recs.iter().map(|&pv| vals_rec[pv]).collect();
-        for (k, g) in proof.wiring().gather.iter().enumerate() {
-            assert!(
-                pd_vals.contains(g),
-                "gather value {k} rides a packed-direct claim"
+        for (k, g) in proof.wiring().gather.iter().chain(bus_gather).enumerate() {
+            assert_eq!(
+                vals_rec[pd_recs[n_el_pd + k]],
+                *g,
+                "gather value {k} is its packed-direct claim"
             );
         }
 
@@ -396,12 +421,25 @@ impl<'p> ChildTape<'p> {
             n_log_i,
             &inner.built.witness.public,
             &inner.proof.wiring().gather,
-            &gammas_o,
+            &gammas_o[..n_el_pd + n_wire],
             n_el_pd,
             &vals_rec,
             &gkr_rec.r_pt,
             gkr_rec.fgs_v,
         );
+        if let (Some(bus), Some(br)) = (built.shape.circuit.bus(), &bus_rec) {
+            pin_bus_sides(
+                &built.shape.circuit,
+                bus,
+                br,
+                &chals,
+                &gammas_o[n_el_pd + n_wire..]
+                    .iter()
+                    .map(|pd| vals_rec[pd.val_v])
+                    .collect::<Vec<_>>(),
+                sigma_native.bus.as_ref().expect("the bus columns travel"),
+            );
+        }
         let params_i = JaggedParams::from_heights(&union.jagged_heights(), n_log_i, m_mp2);
         let k_cols_i = params_i.k;
         let bounds_i = assist_boundaries(&params_i);
@@ -707,8 +745,13 @@ impl<'p> ChildTape<'p> {
             } else {
                 Vec::new()
             };
-            for i2 in 0..gammas_o.len() - n_el_pd {
+            for i2 in 0..n_wire {
                 v.push(cells.gate_claim_point(i2, &gkr_rec.r_pt[..cells.nu()]));
+            }
+            if let (Some(bus), Some(br)) = (built.shape.circuit.bus(), &bus_rec) {
+                for iota in bus.words() {
+                    v.push(cells.gate_claim_point(iota, &br.r_pt[..cells.nu()]));
+                }
             }
             v
         };
@@ -942,6 +985,9 @@ impl<'p> ChildTape<'p> {
             b3_rows,
             spread_w,
             gkr: gkr_rec,
+            bus: bus_rec,
+            n_wire,
+            n_bus,
             el: el_rec,
             start_v,
             gammas_o,
@@ -1003,7 +1049,7 @@ impl<'p> ChildTape<'p> {
     }
 
     /// ---- the label map: the region order the assembly builds against ----
-    fn parse_label_map(ops: &[Op], proof: &MixedProof, has_el: bool) -> LabelMap {
+    fn parse_label_map(ops: &[Op], proof: &MixedProof, has_el: bool, has_bus: bool) -> LabelMap {
         let find = |label: &[u8]| -> Vec<usize> {
             ops.iter()
                 .enumerate()
@@ -1035,6 +1081,7 @@ impl<'p> ChildTape<'p> {
         let elzc_l = find(LBL_ELEMENT_ZC);
         let el_l = find(LBL_ELEMENT_LC);
         let gkr_l = find(LBL_PRODUCT_GKR);
+        let bus_l = find(LBL_BUS);
         let mo_l = find(LBL_MERGED_OPEN);
         let rs_l = find(LBL_RING_SWITCH);
         let mp_l = find(LBL_MULTIPOINT);
@@ -1059,6 +1106,18 @@ impl<'p> ChildTape<'p> {
             "the wiring fork precedes the boolean PIOP"
         );
         assert_eq!(gkr_l.len(), 1, "one batched wiring GKR");
+        assert_eq!(bus_l.len(), usize::from(has_bus), "a bus region iff a bus");
+        assert_eq!(
+            find(LBL_PRODUCT_LEAVES).len(),
+            bus_l.len(),
+            "the only leaves product is the bus's"
+        );
+        if has_bus {
+            assert!(
+                gkr_l[0] < bus_l[0] && bus_l[0] < zc_l[0],
+                "the bus follows the wiring GKR on its fork"
+            );
+        }
         assert_eq!(mo_l.len(), 1, "one merged open");
         assert_eq!(
             rs_l.len(),
@@ -1076,6 +1135,7 @@ impl<'p> ChildTape<'p> {
             elzc_l,
             el_l,
             gkr_l,
+            bus_l,
             mo_l,
             mp_l,
         }
@@ -1936,6 +1996,9 @@ pub(super) struct ChildRegion {
     /// inputs, in the child's declaration order). Application-statement
     /// plumbing — the hash-chain adjacency connect — reads through these.
     pub(super) child_pub_w: Vec<Wire>,
+    /// The segment's digest as the child's transcript absorbed it — the
+    /// H(publics) region's root, connected to those absorbed words.
+    pub(super) pub_digest_w: [Wire; 2],
 }
 
 /// Emit ONE child's complete deferred-verifier region — chain, query phase,
@@ -1999,7 +2062,8 @@ pub(super) fn emit_child_region(
         &ct.pub_payloads,
         &ct.cross,
     );
-    let pub_w = emit_h_publics_region(sb, child_q, iv2, ct, stream, &ww, vals, consts);
+    let (pub_w, pub_digest_w) =
+        emit_h_publics_region(sb, child_q, iv2, ct, stream, &ww, vals, consts);
     let cap_w = cap_wires(stream, &ww, &ct.cap_pays);
     let (to_publish, level_accs, query_positions) = emit_query_phase(
         sb,
@@ -2046,6 +2110,33 @@ pub(super) fn emit_child_region(
     let (pt_w, mid_w, live_w, sig_w) = emit_wiring_gkr_and_recombination(
         sb, cs, ct, trace, &outs, &wv, &pub_w, n_el_pd, vals, zw, ow, zassert,
     );
+    // The tuple bus, after the wiring on its fork: its gathers are the pd
+    // claims after the wiring's.
+    let bus_w: Option<(Vec<Wire>, Vec<Wire>)> = ct.bus.as_ref().map(|br| {
+        let gather_w: Vec<Wire> = (0..ct.n_bus)
+            .map(|k| wv(ct.gammas_o[n_el_pd + ct.n_wire + k].val_v))
+            .collect();
+        emit_bus(
+            sb,
+            cs.macs,
+            cs.zcr,
+            &ct.inner.built.shape.circuit,
+            br,
+            ct.sigma_native
+                .bus
+                .as_ref()
+                .expect("the bus columns travel"),
+            &gather_w,
+            trace,
+            &outs,
+            &wv,
+            vals,
+            consts,
+            zw,
+            ow,
+            zassert,
+        )
+    });
 
     assert_eq!(
         ct.mp_o.val_vs.len(),
@@ -2089,6 +2180,7 @@ pub(super) fn emit_child_region(
         &mp_sig_w,
         anc_w,
         &pt_w,
+        bus_w.as_ref().map(|(p, _)| &p[..]),
         (pfslot, pf_w),
         n_el_pd,
         vals,
@@ -2187,10 +2279,7 @@ pub(super) fn emit_child_region(
                 (aw, bw)
             })
             .collect();
-        let inner_union = UnionInstance::new(
-            &ct.inner.built.shape.registry,
-            ct.inner.built.shape.counts.clone(),
-        );
+        let inner_union = ct.inner.union();
         let el_r_col_w: Vec<Wire> = el_rec
             .expect("element transcript")
             .lc_rounds
@@ -2227,6 +2316,9 @@ pub(super) fn emit_child_region(
         &pin_wires,
         element_point,
         element_values,
+        bus_w
+            .as_ref()
+            .map(|(p, c)| (&p[..ct.inner.built.shape.circuit.cells().nu()], &c[..])),
         zw,
         ow,
     );
@@ -2297,12 +2389,13 @@ pub(super) fn emit_child_region(
         zskip: zskip_wires(&ct.zskip, &outs, trace, stream, &ww),
         pf: (pfslot, pf_w),
         child_pub_w: pub_w,
+        pub_digest_w,
     }
 }
 
 /// ---- ROUND 2: the H(publics) region (v2 statement binding) ----
 /// The returned wires ARE the child's public segment — the recombination
-/// folds them.
+/// folds them — and its digest as the transcript absorbed it.
 #[allow(clippy::too_many_arguments)]
 fn emit_h_publics_region(
     sb: &mut ShapeBuilder,
@@ -2313,14 +2406,14 @@ fn emit_h_publics_region(
     ww: &[Option<Wire>],
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
-) -> Vec<Wire> {
+) -> (Vec<Wire>, [Wire; 2]) {
     let pays = payload_words(stream);
     assert_eq!(pays[4].len(), 2, "the publics digest payload is 32 bytes");
     let dw = [
         ww[pays[4][0]].expect("digest word wired"),
         ww[pays[4][1]].expect("digest word wired"),
     ];
-    emit_publics_hash(
+    let pub_w = emit_publics_hash(
         sb,
         child_q,
         iv2,
@@ -2328,7 +2421,8 @@ fn emit_h_publics_region(
         dw,
         vals,
         consts,
-    )
+    );
+    (pub_w, dw)
 }
 
 /// ---- the WIRING GKR in-circuit ----
@@ -2357,38 +2451,9 @@ fn emit_wiring_gkr_and_recombination(
     // The grand products agree: a COPY CONSTRAINT on the tops (every
     // former published-zero delta in this region is now a connect — the
     // proof itself fails on a broken identity; no public, no checker item).
-    let (mut cl_w, mut cr_w) = (wv(g.top_v), wv(g.top_v + 1));
-    sb.connect(cl_w, cr_w);
-    let mut pt_w: Vec<Wire> = Vec::new();
-    for lr in &g.layers {
-        let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
-        let mut run_w = sb.gate(macs, &[cl_w, lam_w, cr_w])[0];
-        let mut pt_next: Vec<Wire> = Vec::with_capacity(lr.rounds.len() + 1);
-        for (t2, &(gv, rfin)) in lr.rounds.iter().enumerate() {
-            let rho_w = outs[trace.squeezes[rfin][0]][0];
-            vals.push(lr.g0s[t2]);
-            let g0w = sb.input();
-            let o = sb.gate(zcr, &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow]);
-            sb.connect(o[0], zassert);
-            run_w = o[1];
-            pt_next.push(rho_w);
-        }
-        // The layer close: run == vl0·vl1 + lambda·(vr0·vr1).
-        let (vl0, vl1) = (wv(lr.v_v), wv(lr.v_v + 1));
-        let (vr0, vr1) = (wv(lr.v_v + 2), wv(lr.v_v + 3));
-        let pl = sb.gate(macs, &[zw, vl0, vl1])[0];
-        let pr = sb.gate(macs, &[zw, vr0, vr1])[0];
-        let gate_w = sb.gate(macs, &[pl, lam_w, pr])[0];
-        sb.connect(gate_w, run_w);
-        // The claim fold: claim' = v0 + c·(v0 + v1).
-        let ck_w = outs[trace.squeezes[lr.ck_fin][0]][0];
-        let sl = sb.gate(macs, &[vl0, vl1, ow])[0];
-        let sr = sb.gate(macs, &[vr0, vr1, ow])[0];
-        cl_w = sb.gate(macs, &[vl0, ck_w, sl])[0];
-        cr_w = sb.gate(macs, &[vr0, ck_w, sr])[0];
-        pt_next.push(ck_w);
-        pt_w = pt_next;
-    }
+    let (cl_w, cr_w, pt_w) = emit_gkr_layers(
+        sb, macs, zcr, &g.layers, g.top_v, trace, outs, wv, vals, zw, ow, zassert,
+    );
     assert_eq!(
         pt_w.len(),
         ct.mu_i,
@@ -2422,7 +2487,7 @@ fn emit_wiring_gkr_and_recombination(
             s
         }
     };
-    let gather_w: Vec<Wire> = (0..ct.n_pd - n_el_pd)
+    let gather_w: Vec<Wire> = (0..ct.n_wire)
         .map(|i| wv(ct.gammas_o[n_el_pd + i].val_v))
         .collect();
     emit_recombination(
@@ -2628,6 +2693,7 @@ fn emit_anchor_expect(
     mp_sig_w: &[Wire],
     anc_w: Wire,
     pt_w: &[Wire],
+    bus_pt_w: Option<&[Wire]>,
     pf: (SlotId, usize),
     n_el_pd: usize,
     vals: &mut Vec<F128>,
@@ -2859,7 +2925,9 @@ fn emit_anchor_expect(
         let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
         for layer in (0..=m_mp2).rev() {
             let za = if layer < n_log_i {
-                if members[0] >= n_el_pd {
+                if members[0] >= n_el_pd + ct.n_wire {
+                    bus_pt_w.expect("a bus gather group")[layer]
+                } else if members[0] >= n_el_pd {
                     pt_w[layer]
                 } else {
                     let el_rec = el_rec.expect("element pd claim");
@@ -3005,6 +3073,7 @@ pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildR
             value: public[sig_base],
             boolean_pins: ct.sigma_native.boolean_pins.clone(),
             element_constants: ct.sigma_native.element_constants.clone(),
+            bus: ct.sigma_native.bus.clone(),
         };
         assert_eq!(sa.rho, ct.sigma_native.rho, "the emitted sigma point");
         assert_eq!(sa.value, ct.sigma_native.value, "the emitted sigma value");

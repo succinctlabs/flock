@@ -15,7 +15,10 @@
 
 use std::collections::BTreeSet;
 
-use aggregate::{Accumulator, prove_aggregate, verify_aggregate};
+use aggregate::{
+    Accumulator, AggregateProof, prove_aggregate, prove_aggregate_classes_shared_with_grinding,
+    verify_aggregate, verify_aggregate_classes_shared_with_grinding,
+};
 use bincode::serialize;
 use flock_core::{
     aggregate::{self, AggregateError},
@@ -38,7 +41,7 @@ use lincheck::{
     prove_union_capture_z_vec_with_grinding, union_comb_partial, verify as verify_lincheck,
     verify_union, verify_union_deferred, verify_union_with_grinding,
 };
-use matrix_fold::{col_marginal, prove_fold, verify_fold};
+use matrix_fold::{FoldGrinding, col_marginal, prove_fold, verify_fold};
 use zerocheck::{prove_packed_padded, verify as verify_zerocheck};
 const DOMAIN: &[u8] = b"flock-union-lincheck-test-v0";
 
@@ -1201,6 +1204,67 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
         ),
     }
 
+    // SHARED BINDING: each assertion bound once, its claims folded without
+    // being observed again — same accumulators' validity, a different
+    // transcript, and the binding still covers every claim: a proof made
+    // for one assertion set does not verify for another.
+    let run_shared = |asserts: &[MatrixAssertion],
+                      priors: &[&Accumulator]|
+     -> Result<(AggregateProof, Accumulator), AggregateError> {
+        let mut chp = FsChallenger::new(b"agg");
+        let circs: Vec<&dyn LincheckCircuit> = vec![&agg_circ];
+        let (proof, acc_p) = prove_aggregate_classes_shared_with_grinding(
+            &registry,
+            &mats,
+            &circs,
+            asserts,
+            &[],
+            &[],
+            &[],
+            &[],
+            priors,
+            FoldGrinding::disabled(),
+            &mut chp,
+        )?;
+        let mut chv = FsChallenger::new(b"agg");
+        let acc_v = verify_aggregate_classes_shared_with_grinding(
+            &registry,
+            asserts,
+            &[],
+            &[],
+            &[],
+            priors,
+            &proof,
+            FoldGrinding::disabled(),
+            &mut chv,
+        )?;
+        assert_eq!(acc_p, acc_v, "shared: prover and verifier agree");
+        Ok((proof, acc_v))
+    };
+    let fresh_s = [assert_of(&slots[1], false), assert_of(&slots[2], false)];
+    let (proof_s, acc_s) = run_shared(&fresh_s, &[&acc_l, &acc_r]).expect("shared merge verifies");
+    assert!(acc_s.discharge(&mats), "the shared accumulator discharges");
+    assert_ne!(acc_s, acc_m, "shared binding is a different transcript");
+    let swapped = [assert_of(&slots[1], false), assert_of(&slots[3], false)];
+    let mut chv = FsChallenger::new(b"agg");
+    match verify_aggregate_classes_shared_with_grinding(
+        &registry,
+        &swapped,
+        &[],
+        &[],
+        &[],
+        &[&acc_l, &acc_r],
+        &proof_s,
+        FoldGrinding::disabled(),
+        &mut chv,
+    ) {
+        Err(_) => {}
+        Ok(a) => assert!(
+            !a.discharge(&mats),
+            "a shared proof verified for another assertion set"
+        ),
+    }
+
     // A tampered report is caught by the equation check inside
     // `verify_aggregate` — a caller cannot forget it.
     let bad = assert_of(&slots[1], true);
@@ -1387,4 +1451,20 @@ fn dropped_linear_rows_are_checked_by_the_lincheck() {
         let (zc_ok, _) = zerocheck_then_lincheck(identity.clone(), &bad, nu, n, grinding);
         assert!(!zc_ok, "a kept output word is the zerocheck's to reject");
     }
+}
+
+/// Types with the same base block share a matrix class, in first-occurrence
+/// order; a different block is its own class.
+#[test]
+fn matrix_classes_group_identical_blocks() {
+    let nu = 4usize;
+    let a = build_slot(9, 300, nu, 11, Some(0), 0xC1A5_5001);
+    let b = build_slot(9, 300, nu, 7, Some(0), 0xC1A5_5002);
+    let registry = Registry::new(vec![table_type(&a), table_type(&b), table_type(&a)], nu);
+    assert_eq!(aggregate::matrix_classes(&registry), vec![0, 1, 0]);
+    let mats: Vec<(&SparseBinaryMatrix, &SparseBinaryMatrix)> =
+        vec![(&a.a0, &a.b0), (&b.a0, &b.b0), (&a.a0, &a.b0)];
+    let class = aggregate::class_mats(&registry, &mats);
+    assert_eq!(class.len(), 2);
+    assert!(std::ptr::eq(class[1].0, &b.a0));
 }

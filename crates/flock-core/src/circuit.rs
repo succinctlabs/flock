@@ -81,7 +81,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     challenger::Challenger,
-    circuit::bus::{Bus, BusProof},
+    circuit::bus::{Bus, BusColumn, BusProof, BusStructure},
     field::F128,
     matrix_fold::{FoldMatrix, MatrixClaim, Weight, bilinear},
     pcs::{DirectEqInd, PackedDirectClaim},
@@ -1130,6 +1130,9 @@ pub struct SigmaAssertion {
     /// Element affine-constant evaluations at the element constraint point:
     /// `(point, a_const_eval, b_const_eval)`.
     pub element_constants: Option<(Vec<F128>, F128, F128)>,
+    /// The tuple bus's static columns at its row point
+    /// ([`bus::Bus::structure_columns`]), when the circuit has a bus.
+    pub bus: Option<BusStructure>,
 }
 
 impl SigmaAssertion {
@@ -1139,6 +1142,7 @@ impl SigmaAssertion {
     const ELEMENT_A_PLANE: usize = 3;
     const ELEMENT_B_PLANE: usize = 4;
     const BOOLEAN_PIN_PLANE: usize = 5;
+    const BUS_PLANE: usize = 6;
 
     fn plane_claim(&self, plane: usize, value: F128) -> MatrixClaim {
         let selector = [
@@ -1166,7 +1170,8 @@ impl SigmaAssertion {
 
     /// All digest-keyed circuit-structure evaluations, in canonical order:
     /// Product-GKR's `(live*s_id, live, live*s_sigma)`, then Boolean
-    /// constant-pin prefixes, then the element affine `A`/`B` constants.
+    /// constant-pin prefixes, then the element affine `A`/`B` constants,
+    /// then the bus's static columns.
     pub fn claims(&self) -> Vec<MatrixClaim> {
         let mut claims = vec![
             self.plane_claim(Self::MASKED_ID_PLANE, self.masked_id_value),
@@ -1196,6 +1201,20 @@ impl SigmaAssertion {
                     // The affine vectors are row-independent, so a fixed
                     // zero row point gives a canonical claim identity.
                     row: Weight::eq(vec![F128::ZERO; self.nu]),
+                    col: Weight::eq(col),
+                    value,
+                });
+            }
+        }
+        if let Some(bus) = &self.bus {
+            let base_bits = self.matrix_base_bits();
+            for (c, &value) in bus.values.iter().enumerate() {
+                let mut col: Vec<F128> = (0..base_bits)
+                    .map(|j| F128::new(((c >> j) & 1) as u64, 0))
+                    .collect();
+                col.extend((0..3).map(|j| F128::new(((Self::BUS_PLANE >> j) & 1) as u64, 0)));
+                claims.push(MatrixClaim {
+                    row: Weight::eq(bus.rho_row.clone()),
                     col: Weight::eq(col),
                     value,
                 });
@@ -1239,6 +1258,7 @@ pub struct CircuitStructureMatrix<'a> {
     circuit: &'a Circuit,
     mask: LiveMask,
     base_cols: usize,
+    bus_cols: Vec<BusColumn>,
 }
 
 impl<'a> CircuitStructureMatrix<'a> {
@@ -1249,13 +1269,18 @@ impl<'a> CircuitStructureMatrix<'a> {
         } else {
             1usize << (circuit.registry().m_elem() - circuit.registry().nu() - 7)
         };
+        let bus_cols = circuit
+            .bus()
+            .map_or_else(Vec::new, |bus| bus.structure_columns());
         let base_cols = cell_cols
             .max(element_cols)
-            .max(circuit.registry().num_boolean().next_power_of_two());
+            .max(circuit.registry().num_boolean().next_power_of_two())
+            .max(bus_cols.len().next_power_of_two());
         Self {
             circuit,
             mask: circuit.live_mask(),
             base_cols,
+            bus_cols,
         }
     }
 
@@ -1318,6 +1343,10 @@ impl<'a> CircuitStructureMatrix<'a> {
                     F128::ZERO
                 }
             }
+            SigmaAssertion::BUS_PLANE => self
+                .bus_cols
+                .get(slot)
+                .map_or(F128::ZERO, |c| c.entry(self.circuit, row)),
             _ => F128::ZERO,
         }
     }
@@ -1490,6 +1519,7 @@ fn verify_wiring_core<C: Challenger>(
         value: claim.s_sigma_eval,
         boolean_pins: Vec::new(),
         element_constants: None,
+        bus: None,
     };
     let mut gather: Vec<(Vec<F128>, F128)> = gathered
         .iter()
@@ -1505,9 +1535,12 @@ fn verify_wiring_core<C: Challenger>(
             .fold(F128::ZERO, |acc, (&p, &e)| acc + e * public[p as usize]);
         (cells.gate_claim_point(iota, &claim.rho[..nu]), v)
     }));
+    let mut assertion = assertion;
     match (circuit.bus(), &proof.bus) {
         (Some(bus), Some(bus_proof)) => {
-            gather.extend(bus::verify_bus(circuit, bus, bus_proof, grinding, ch)?);
+            let (claims, structure) = bus::verify_bus(circuit, bus, bus_proof, grinding, ch)?;
+            gather.extend(claims);
+            assertion.bus = Some(structure);
         }
         (None, None) => {}
         _ => return Err(WiringError::MalformedProof),
@@ -2247,6 +2280,33 @@ mod tests {
         let out = verify_wiring_with_grinding(&circuit, &[], &proof, grinding, &mut ch)
             .expect("a ground bus verifies");
         assert_eq!(out.len(), claims.len());
+    }
+
+    /// The deferred verify hands the bus's static columns to the sigma
+    /// assertion: they discharge against the circuit-structure table, and a
+    /// wrong column value does not.
+    #[test]
+    fn bus_structure_defers_to_the_sigma_assertion() {
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let circuit = bus_circuit(&reg, F128::new(7, 0));
+        let mut rng = Rng::new(0xB05_0003);
+        let packed = bus_buffer(&circuit, &reg, &mut rng);
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (proof, _) = prove_wiring(&circuit, &packed, &[], &mut ch);
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (_, assertion) =
+            verify_wiring_deferred(&circuit, &[], &proof, &mut ch).expect("deferred verify");
+        let bus = assertion.bus.as_ref().expect("the bus columns travel");
+        let cols = circuit.bus().unwrap().structure_columns();
+        assert_eq!(bus.values.len(), cols.len());
+        assert!(cols.iter().any(|c| matches!(c, bus::BusColumn::Tag { .. })));
+        assert!(assertion.check(&circuit), "the bus columns discharge");
+        for i in 0..cols.len() {
+            let mut bad = assertion.clone();
+            bad.bus.as_mut().unwrap().values[i] += F128::ONE;
+            assert!(!bad.check(&circuit), "bus column {i}");
+        }
     }
 
     /// Every bus gather claim is the MLE of its committed word column at the

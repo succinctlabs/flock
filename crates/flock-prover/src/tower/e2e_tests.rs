@@ -13,8 +13,8 @@ use flock_core::{
 use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
-        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, RootBundle,
-        RootDischargeFailure, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
+        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LaneFamily, LeafOuter, Online,
+        RootBundle, RootDischargeFailure, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
         UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
         chain_blake_r1cs, chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base,
         env_pass_base,
@@ -120,6 +120,7 @@ pub(super) fn chain_spine_converges() {
             params: &chain_jp,
             priors: &[&fls[2].acc, &fls[3].acc],
             claims_base: acc_base,
+            family: LaneFamily::Chain,
         }),
         None,
     );
@@ -155,6 +156,7 @@ pub(super) fn chain_spine_converges() {
             params: &chain_jp,
             priors: &[&fls[1].acc, &base_lane],
             claims_base: acc_base,
+            family: LaneFamily::Chain,
         }),
         Some(SpineIn {
             node_child: 1,
@@ -195,6 +197,7 @@ pub(super) fn chain_spine_converges() {
             params: &chain_jp,
             priors: &[&fls[0].acc, &n2_lane],
             claims_base: acc_base,
+            family: LaneFamily::Chain,
         }),
         Some(SpineIn {
             node_child: 1,
@@ -345,6 +348,7 @@ pub(super) fn chain_spine_converges() {
             params: &chain_jp,
             priors: &[&fls[0].acc, &n2_lane],
             claims_base: acc_base,
+            family: LaneFamily::Chain,
         }),
         Some(SpineIn {
             node_child: 1,
@@ -454,6 +458,7 @@ pub(super) fn chain_tower_e2e_with_lane() {
         params: &chain_jp,
         priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
+        family: LaneFamily::Chain,
     };
     let out = build_node_outer_app(
         cfg,
@@ -680,6 +685,7 @@ pub(super) fn chain_tower_m32_headline() {
         params: &chain_jp,
         priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
+        family: LaneFamily::Chain,
     };
     let t_in = Instant::now();
     let out = build_node_outer_app(
@@ -872,6 +878,7 @@ pub(super) fn tower_online_bench() {
             params: &chain_jp,
             priors: &[&fl0.acc, &fl1.acc],
             claims_base: fresh.fold_pub_base,
+            family: LaneFamily::Chain,
         }),
         None,
     );
@@ -893,6 +900,7 @@ pub(super) fn tower_online_bench() {
                 params: &chain_jp,
                 priors: &[&fresh.acc, &lane],
                 claims_base: fresh.fold_pub_base,
+                family: LaneFamily::Chain,
             }),
             Some(SpineIn {
                 node_child: 1,

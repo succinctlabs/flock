@@ -1,7 +1,11 @@
 use std::{array::from_fn, iter::repeat_n};
 
 use flock_core::{
-    circuit::{CellSlot, CellSpace, SigmaAssertion, builder::SlotId},
+    circuit::{
+        CellSlot, CellSpace, Circuit, SigmaAssertion,
+        builder::SlotId,
+        bus::{Bus, BusColumn, BusDirection, BusStructure},
+    },
     genus95_curve_code::EvaluationPoint,
     zerocheck::{K_SKIP, univariate_skip::build_eq},
 };
@@ -10,6 +14,7 @@ use flock_hash::blake3_compress;
 use flock_transcript::challenger::has_leading_zero_bits;
 
 use crate::{
+    r1cs_hashes::fs_chain::FsChainTrace,
     schedule::Registry,
     tower::{
         CHUNK_END, CHUNK_START, F128, IV, PdRec, ROOT, ShapeBuilder, UnionInstance, Wire,
@@ -32,6 +37,21 @@ pub(super) struct GkrRec {
     pub(super) layers: Vec<GkrLayerRec>,
     pub(super) fgs_v: usize, // f_eval, g_eval, s_sigma consecutive
     pub(super) r_pt: Vec<F128>,
+}
+
+/// The tuple bus's region, located on the tape: β and the γs, the top
+/// pair, the layers (the wiring's shape), and where the walk lands — the
+/// point `(ρ_row, ρ_port)` and both leaf claims, which the side
+/// reconstruction must reproduce.
+pub(super) struct BusRec {
+    pub(super) beta_fin: usize,
+    pub(super) beta_ch: usize,
+    pub(super) gamma_fins: Vec<usize>,
+    pub(super) top_v: usize,
+    pub(super) layers: Vec<GkrLayerRec>,
+    pub(super) r_pt: Vec<F128>,
+    pub(super) claim_l: F128,
+    pub(super) claim_r: F128,
 }
 
 /// **THE RECOMBINATION (round 4), pinned natively.** The wiring verifier's
@@ -109,6 +129,209 @@ pub(super) fn pin_recombination(
     cells.num_public_slots()
 }
 
+/// The product-GKR layer recursion in-circuit, from the agreed top pair
+/// (a copy constraint): per layer the λ-combined running claim through
+/// `ZcRoundGate` rounds (`g0` advice, zero deltas), the close
+/// `run == vl0·vl1 + λ·(vr0·vr1)`, and the `c_k` fold of both claims.
+/// Returns the final left and right leaf-claim wires and the point wires.
+/// Both grand products — the wiring's and the bus's — run this shape.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_gkr_layers(
+    sb: &mut ShapeBuilder,
+    macs: SlotId,
+    zcr: SlotId,
+    layers: &[GkrLayerRec],
+    top_v: usize,
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    vals: &mut Vec<F128>,
+    zw: Wire,
+    ow: Wire,
+    zassert: Wire,
+) -> (Wire, Wire, Vec<Wire>) {
+    let (mut cl_w, mut cr_w) = (wv(top_v), wv(top_v + 1));
+    sb.connect(cl_w, cr_w);
+    let mut pt_w: Vec<Wire> = Vec::new();
+    for lr in layers {
+        let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
+        let mut run_w = sb.gate(macs, &[cl_w, lam_w, cr_w])[0];
+        let mut pt_next: Vec<Wire> = Vec::with_capacity(lr.rounds.len() + 1);
+        for (t2, &(gv, rfin)) in lr.rounds.iter().enumerate() {
+            let rho_w = outs[trace.squeezes[rfin][0]][0];
+            vals.push(lr.g0s[t2]);
+            let g0w = sb.input();
+            let o = sb.gate(zcr, &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow]);
+            sb.connect(o[0], zassert);
+            run_w = o[1];
+            pt_next.push(rho_w);
+        }
+        // The layer close: run == vl0·vl1 + lambda·(vr0·vr1).
+        let (vl0, vl1) = (wv(lr.v_v), wv(lr.v_v + 1));
+        let (vr0, vr1) = (wv(lr.v_v + 2), wv(lr.v_v + 3));
+        let pl = sb.gate(macs, &[zw, vl0, vl1])[0];
+        let pr = sb.gate(macs, &[zw, vr0, vr1])[0];
+        let gate_w = sb.gate(macs, &[pl, lam_w, pr])[0];
+        sb.connect(gate_w, run_w);
+        // The claim fold: claim' = v0 + c·(v0 + v1).
+        let ck_w = outs[trace.squeezes[lr.ck_fin][0]][0];
+        let sl = sb.gate(macs, &[vl0, vl1, ow])[0];
+        let sr = sb.gate(macs, &[vr0, vr1, ow])[0];
+        cl_w = sb.gate(macs, &[vl0, ck_w, sl])[0];
+        cr_w = sb.gate(macs, &[vr0, ck_w, sr])[0];
+        pt_next.push(ck_w);
+        pt_w = pt_next;
+    }
+    (cl_w, cr_w, pt_w)
+}
+
+/// The tuple bus in-circuit: its grand product's layers
+/// ([`emit_gkr_layers`]), then each side rebuilt from wires —
+/// `1 + Σ_p eq(ρ_port, p)·[(β + 1)·E_p + Σ_k γ_k·(c_k·E_p + ŵ_k + T_k)]` —
+/// and connected to the walk's leaf claims. β and the γs are squeeze
+/// wires, `ŵ_k` the bus gathers' pd value wires, `eq(ρ_port, ·)` MAC rows
+/// over the port bits, and the static columns `E_p`, `T_k` advice wires
+/// that the parent binds through the circuit-structure claims
+/// ([`circuit_structure_claim_wires`]). Returns the point wires and the
+/// column value wires.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_bus(
+    sb: &mut ShapeBuilder,
+    macs: SlotId,
+    zcr: SlotId,
+    circuit: &Circuit,
+    br: &BusRec,
+    structure: &BusStructure,
+    gather_w: &[Wire],
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+    zw: Wire,
+    ow: Wire,
+    zassert: Wire,
+) -> (Vec<Wire>, Vec<Wire>) {
+    let bus = circuit.bus().expect("a bus region needs a bus");
+    let nu = circuit.cells().nu();
+    let (cl_w, cr_w, pt_w) = emit_gkr_layers(
+        sb, macs, zcr, &br.layers, br.top_v, trace, outs, wv, vals, zw, ow, zassert,
+    );
+    assert_eq!(
+        pt_w.len(),
+        nu + bus.c_bits(),
+        "the bus point spans rows and ports"
+    );
+    let beta_w = outs[trace.squeezes[br.beta_fin][0]][0];
+    let gamma_w: Vec<Wire> = br
+        .gamma_fins
+        .iter()
+        .map(|&f| outs[trace.squeezes[f][0]][0])
+        .collect();
+    let cols = bus.structure_columns();
+    let col_w: Vec<Wire> = structure
+        .values
+        .iter()
+        .map(|&v| {
+            vals.push(v);
+            sb.input()
+        })
+        .collect();
+    let words = bus.words();
+    assert_eq!(gather_w.len(), words.len(), "one gather wire per bus word");
+    let n_ports = bus
+        .side(BusDirection::Send)
+        .len()
+        .max(bus.side(BusDirection::Recv).len());
+    let eq_port_w = emit_eq_prefix(sb, macs, &pt_w[nu..], n_ports, zw, ow);
+    for (dir, claim_w) in [(BusDirection::Send, cl_w), (BusDirection::Recv, cr_w)] {
+        let mut acc = ow;
+        for (g, port) in bus.side(dir).into_iter().enumerate() {
+            let mass = col_w[Bus::column_index(&cols, BusColumn::Live { ty: port.ty })];
+            // (β + 1)·E_p
+            let mut inner = sb.gate(macs, &[mass, beta_w, mass])[0];
+            for (term, &gk) in port.terms.iter().zip(&gamma_w) {
+                let mut value = zw;
+                if !term.constant.is_zero() {
+                    let c = cw(sb, vals, consts, term.constant);
+                    value = sb.gate(macs, &[value, c, mass])[0];
+                }
+                if let Some(iota) = term.word {
+                    let gw = gather_w[words.binary_search(&iota).expect("a bus word")];
+                    value = sb.gate(macs, &[value, gw, ow])[0];
+                }
+                if let Some(tag) = term.row {
+                    let tw = col_w[Bus::column_index(&cols, BusColumn::Tag { ty: port.ty, tag })];
+                    value = sb.gate(macs, &[value, tw, ow])[0];
+                }
+                inner = sb.gate(macs, &[inner, gk, value])[0];
+            }
+            acc = sb.gate(macs, &[acc, eq_port_w[g], inner])[0];
+        }
+        sb.connect(acc, claim_w);
+    }
+    (pt_w, col_w)
+}
+
+/// **The bus's side reconstruction, pinned natively** — the twin of
+/// [`pin_recombination`] for the tuple bus (`bus::verify_bus`): each side
+/// is `1 + Σ_p eq(ρ_port, p)·[(β + 1)·E_p + Σ_k γ_k·(c_k·E_p + ŵ_k + T_k)]`
+/// from located words — β and the γs, the bus gathers' pd values — and the
+/// deferred static columns (`E_p`, `T_k`) the sigma assertion carries. It
+/// must land on the walk's leaf claims; the emitter wires the same sum.
+pub(super) fn pin_bus_sides(
+    circuit: &Circuit,
+    bus: &Bus,
+    br: &BusRec,
+    chals: &[F128],
+    gather: &[F128],
+    structure: &BusStructure,
+) {
+    let nu = circuit.cells().nu();
+    assert_eq!(
+        structure.rho_row,
+        br.r_pt[..nu],
+        "the bus columns sit at the walk's row point"
+    );
+    let cols = bus.structure_columns();
+    assert_eq!(structure.values.len(), cols.len(), "one value per column");
+    let words = bus.words();
+    assert_eq!(gather.len(), words.len(), "one gather per bus word");
+    let beta = chals[br.beta_ch];
+    let gamma: Vec<F128> = (0..bus.width).map(|k| chals[br.beta_ch + 1 + k]).collect();
+    let eq_port = build_eq(&br.r_pt[nu..]);
+    let column = |col: BusColumn| structure.values[Bus::column_index(&cols, col)];
+    let side = |dir: BusDirection| -> F128 {
+        let mut acc = F128::ONE;
+        for (g, port) in bus.side(dir).into_iter().enumerate() {
+            let mass = column(BusColumn::Live { ty: port.ty });
+            let mut inner = (beta + F128::ONE) * mass;
+            for (term, &gk) in port.terms.iter().zip(&gamma) {
+                let mut value = term.constant * mass;
+                if let Some(iota) = term.word {
+                    value += gather[words.binary_search(&iota).expect("a bus word")];
+                }
+                if let Some(tag) = term.row {
+                    value += column(BusColumn::Tag { ty: port.ty, tag });
+                }
+                inner += gk * value;
+            }
+            acc += eq_port[g] * inner;
+        }
+        acc
+    };
+    assert_eq!(
+        side(BusDirection::Send),
+        br.claim_l,
+        "the send side rebuilds"
+    );
+    assert_eq!(
+        side(BusDirection::Recv),
+        br.claim_r,
+        "the receive side rebuilds"
+    );
+}
+
 /// The eq table's `live` prefix over `point_w` wires (LSB-first —
 /// `build_eq`'s convention), as MacGate rows: the DOUBLING build, one row
 /// per node — `e·ρ` is `0 + e·ρ` and `e·(1+ρ)` is `e + e·ρ`, so both
@@ -155,6 +378,7 @@ pub(super) fn circuit_structure_claim_wires(
     boolean_values: &[(usize, Wire)],
     element_point: Option<&[Wire]>,
     element_values: Option<(Wire, Wire)>,
+    bus: Option<(&[Wire], &[Wire])>,
     zw: Wire,
     ow: Wire,
 ) -> Vec<(Vec<Wire>, Vec<Wire>, Wire)> {
@@ -198,6 +422,19 @@ pub(super) fn circuit_structure_claim_wires(
             col.extend_from_slice(&selector(plane));
             out.push((vec![zw; sigma.nu], col, value_w));
         }
+    }
+    // The bus's static columns at its row point: plane 6, one column each.
+    if let Some(structure) = &sigma.bus {
+        let (row_w, value_w) = bus.expect("bus structure wires");
+        assert_eq!(row_w.len(), structure.rho_row.len(), "bus row point width");
+        assert_eq!(value_w.len(), structure.values.len(), "bus column wires");
+        for (c, &vw) in value_w.iter().enumerate() {
+            let mut col: Vec<Wire> = (0..sigma.base_bits).map(|j| bit((c >> j) & 1)).collect();
+            col.extend_from_slice(&selector(6));
+            out.push((row_w.to_vec(), col, vw));
+        }
+    } else {
+        assert!(bus.is_none(), "bus wires without a bus structure");
     }
     assert_eq!(
         out.len(),

@@ -365,10 +365,12 @@ fn verify_grind_sample_vec_n<Ch: Challenger>(
 
 /// Bind the claims into the transcript — weights included, not just values.
 /// λ and μ must depend on everything being folded: two claim sets that agreed
-/// only on their values would otherwise draw the same challenges.
-fn observe_claims<Ch: Challenger>(claims: &[MatrixClaim], ch: &mut Ch) {
+/// only on their values would otherwise draw the same challenges. The last
+/// `n_bound` claims are already bound by the caller (the aggregate's shared
+/// binding: words that determine them sit earlier in this transcript).
+fn observe_claims<Ch: Challenger>(claims: &[MatrixClaim], n_bound: usize, ch: &mut Ch) {
     ch.observe_label(DOMAIN);
-    for c in claims {
+    for c in &claims[..claims.len() - n_bound] {
         for w in [&c.row, &c.col] {
             ch.observe_f128_slice(&w.low);
             ch.observe_f128_slice(&w.point);
@@ -399,7 +401,21 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
     grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> (FoldProof, MatrixClaim) {
+    prove_fold_bound_with_grinding(m, combs, claims, 0, grinding, ch)
+}
+
+/// [`prove_fold_with_grinding`] whose last `n_bound` claims the caller has
+/// already bound into `ch`: the fold observes only the others.
+pub fn prove_fold_bound_with_grinding<Ch: Challenger>(
+    m: &dyn FoldMatrix,
+    combs: &[Vec<F128>],
+    claims: &[MatrixClaim],
+    n_bound: usize,
+    grinding: FoldGrinding,
+    ch: &mut Ch,
+) -> (FoldProof, MatrixClaim) {
     assert!(!claims.is_empty(), "nothing to fold");
+    assert!(n_bound <= claims.len(), "bound claims are claims");
     assert_eq!(combs.len(), claims.len(), "one column marginal per claim");
     let k_row = claims[0].row.n_vars();
     let k_col = claims[0].col.n_vars();
@@ -409,7 +425,7 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
     }
 
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(k_row, k_col));
-    observe_claims(claims, ch);
+    observe_claims(claims, n_bound, ch);
     let lambdas = grind_sample_vec(
         ch,
         &mut grinding_nonces,
@@ -696,7 +712,19 @@ pub fn verify_fold_with_grinding<Ch: Challenger>(
     grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<MatrixClaim, FoldError> {
-    if claims.is_empty() || proof.bridge.len() != claims.len() {
+    verify_fold_bound_with_grinding(claims, 0, proof, grinding, ch)
+}
+
+/// [`verify_fold_with_grinding`] whose last `n_bound` claims the caller has
+/// already bound into `ch`.
+pub fn verify_fold_bound_with_grinding<Ch: Challenger>(
+    claims: &[MatrixClaim],
+    n_bound: usize,
+    proof: &FoldProof,
+    grinding: FoldGrinding,
+    ch: &mut Ch,
+) -> Result<MatrixClaim, FoldError> {
+    if claims.is_empty() || proof.bridge.len() != claims.len() || n_bound > claims.len() {
         return Err(FoldError::Malformed);
     }
     let k_row = claims[0].row.n_vars();
@@ -715,7 +743,7 @@ pub fn verify_fold_with_grinding<Ch: Challenger>(
     }
     let mut nonce_idx = 0usize;
 
-    observe_claims(claims, ch);
+    observe_claims(claims, n_bound, ch);
     let lambdas = verify_grind_sample_vec_n(
         ch,
         &proof.grinding_nonces,

@@ -8,8 +8,8 @@
 use std::{array::from_fn, iter::repeat_n};
 
 use flock_core::{
-    circuit::{Circuit, builder::SlotId},
-    product_gkr::{LiveMask, ProductGkrBatchedProof, s_id_basis},
+    circuit::{Circuit, builder::SlotId, bus::BusProof},
+    product_gkr::{BatchedLayerProof, LiveMask, ProductGkrBatchedProof, s_id_basis},
     zerocheck::{
         ag_skip::friendly_challenges,
         univariate_skip_optimized::{medium_challenges_ghash, small_challenges_ghash},
@@ -22,8 +22,8 @@ use flock_transcript::transcript_record::{
 use crate::{
     r1cs_hashes::fs_chain::FsChainTrace,
     tower::{
-        ChildSlots, F128, GkrLayerRec, GkrRec, InnerPd, Lvl, MergedChain, MixedProof, MpRec,
-        OpenLevel, PdRec, RoundRec, ShapeBuilder, Wire, ZskipTapeRec, ZskipWires,
+        BusRec, ChildSlots, F128, GkrLayerRec, GkrRec, InnerPd, Lvl, MergedChain, MixedProof,
+        MpRec, OpenLevel, PdRec, RoundRec, ShapeBuilder, Wire, ZskipTapeRec, ZskipWires,
         assert_chain_replays, duplex_row_count_model, emit_family_h, emit_spine256,
         level_query_phase_blake3_rows, merge_chain, squeeze_word_wire,
     },
@@ -65,10 +65,72 @@ pub(super) fn walk_wiring_gkr_core(
     assert_eq!(gkr.top_lhs, gkr.top_rhs, "the grand products agree");
     i += 2;
     // The layer walk + native replay in lockstep.
-    let (mut claim_l, mut claim_r) = (gkr.top_lhs, gkr.top_rhs);
+    let (i2, lrecs, r_pt, claim_l, claim_r) = walk_gkr_layers(
+        ops,
+        vals_rec,
+        chals,
+        i,
+        gkr.top_lhs,
+        &gkr.layers,
+        vc_at,
+        fin_at,
+    );
+    let i = i2;
+    // The input checks: s_id(rho) closed-form NATIVE, s_sigma from the
+    // PROOF — the deferred value the assertion carries. Masked input
+    // checks under the live-identity padding: leaves are w +
+    // α·(live⊙s_id) + (β+1)·live + 1 (dead cells = 1).
+    assert_eq!(r_pt.len(), mu, "the GKR point spans the inner cell space");
+    let alpha2 = chals[c_alpha];
+    let beta2 = chals[c_alpha + 1];
+    let basis = s_id_basis(mu);
+    let tail_w2 = (beta2 + F128::ONE) * mask_w.live_eval(&r_pt) + F128::ONE;
+    assert_eq!(
+        claim_l,
+        gkr.f_eval + alpha2 * mask_w.masked_id_eval(&basis, &r_pt) + tail_w2,
+        "lhs input check replays (masked)"
+    );
+    assert_eq!(
+        claim_r,
+        gkr.g_eval + alpha2 * gkr.s_sigma_eval + tail_w2,
+        "rhs input check replays with the DEFERRED (masked) sigma value"
+    );
+    // The triple observed last — the assertion's value wire.
+    let (fv, _) = vc_at(i);
+    assert!(matches!(ops[i], Op::ObserveScalar), "f_eval obs");
+    assert_eq!(vals_rec[fv], gkr.f_eval, "f_eval on the stream");
+    assert_eq!(vals_rec[fv + 1], gkr.g_eval, "g_eval on the stream");
+    assert_eq!(vals_rec[fv + 2], gkr.s_sigma_eval, "s_sigma on the stream");
+    GkrRec {
+        alpha_fin,
+        beta_fin,
+        top_v: tv,
+        layers: lrecs,
+        fgs_v: fv,
+        r_pt,
+    }
+}
+
+/// The product-GKR layer walk both grand products share: per layer `k`,
+/// the λ squeeze, `k` rounds (two observes + a squeeze), the four layer
+/// values and the `c_k` squeeze, replayed natively in lockstep from the
+/// agreed top. Returns the next op index, the layer records, the final
+/// point and both leaf claims there.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(super) fn walk_gkr_layers(
+    ops: &[Op],
+    vals_rec: &[F128],
+    chals: &[F128],
+    mut i: usize,
+    top: F128,
+    layers: &[BatchedLayerProof],
+    vc_at: &impl Fn(usize) -> (usize, usize),
+    fin_at: &impl Fn(usize) -> usize,
+) -> (usize, Vec<GkrLayerRec>, Vec<F128>, F128, F128) {
+    let (mut claim_l, mut claim_r) = (top, top);
     let mut r_pt: Vec<F128> = Vec::new();
     let mut lrecs: Vec<GkrLayerRec> = Vec::new();
-    for (k, layer) in gkr.layers.iter().enumerate() {
+    for (k, layer) in layers.iter().enumerate() {
         assert_eq!(layer.rounds.len(), k, "layer {k} has k rounds");
         while matches!(ops[i], Op::Pow { .. }) {
             i += 1;
@@ -136,38 +198,71 @@ pub(super) fn walk_wiring_gkr_core(
             ck_fin,
         });
     }
-    // The input checks: s_id(rho) closed-form NATIVE, s_sigma from the
-    // PROOF — the deferred value the assertion carries. Masked input
-    // checks under the live-identity padding: leaves are w +
-    // α·(live⊙s_id) + (β+1)·live + 1 (dead cells = 1).
-    assert_eq!(r_pt.len(), mu, "the GKR point spans the inner cell space");
-    let alpha2 = chals[c_alpha];
-    let beta2 = chals[c_alpha + 1];
-    let basis = s_id_basis(mu);
-    let tail_w2 = (beta2 + F128::ONE) * mask_w.live_eval(&r_pt) + F128::ONE;
-    assert_eq!(
-        claim_l,
-        gkr.f_eval + alpha2 * mask_w.masked_id_eval(&basis, &r_pt) + tail_w2,
-        "lhs input check replays (masked)"
+    (i, lrecs, r_pt, claim_l, claim_r)
+}
+
+/// The tuple bus's transcript walk ([`flock_core::circuit::bus`]): its
+/// label, β (behind its fingerprint grind), one γ per coordinate, the
+/// leaves label, the top pair and the layer recursion. The leaf claims are
+/// returned for the side reconstruction; the bus's gather values ride the
+/// merged open as packed-direct claims after the wiring's.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn walk_bus_gkr(
+    ops: &[Op],
+    vals_rec: &[F128],
+    chals: &[F128],
+    bus_proof: &BusProof,
+    bus_l0: usize,
+    width: usize,
+    vc_at: &impl Fn(usize) -> (usize, usize),
+    fin_at: &impl Fn(usize) -> usize,
+) -> BusRec {
+    let gkr = &bus_proof.gkr;
+    let mut i = bus_l0 + 1;
+    while matches!(ops[i], Op::Pow { .. }) {
+        i += 1;
+    }
+    assert!(matches!(ops[i], Op::SqueezeScalar), "bus beta");
+    let beta_fin = fin_at(i);
+    let (_, beta_ch) = vc_at(i);
+    i += 1;
+    let mut gamma_fins = Vec::with_capacity(width);
+    for k in 0..width {
+        assert!(matches!(ops[i], Op::SqueezeScalar), "bus gamma {k}");
+        assert_eq!(vc_at(i).1, beta_ch + 1 + k, "bus challenges are adjacent");
+        gamma_fins.push(fin_at(i));
+        i += 1;
+    }
+    assert!(
+        matches!(&ops[i], Op::Label(l) if l.as_slice() == LBL_PRODUCT_LEAVES),
+        "the bus's leaves label"
     );
-    assert_eq!(
-        claim_r,
-        gkr.g_eval + alpha2 * gkr.s_sigma_eval + tail_w2,
-        "rhs input check replays with the DEFERRED (masked) sigma value"
+    i += 1;
+    assert!(matches!(ops[i], Op::ObserveScalar), "bus top lhs");
+    let (tv, _) = vc_at(i);
+    assert_eq!(vals_rec[tv], gkr.top_lhs, "bus top_lhs on the stream");
+    assert_eq!(vals_rec[tv + 1], gkr.top_rhs, "bus top_rhs on the stream");
+    assert_eq!(gkr.top_lhs, gkr.top_rhs, "the bus products agree");
+    i += 2;
+    let (_, layers, r_pt, claim_l, claim_r) = walk_gkr_layers(
+        ops,
+        vals_rec,
+        chals,
+        i,
+        gkr.top_lhs,
+        &gkr.layers,
+        vc_at,
+        fin_at,
     );
-    // The triple observed last — the assertion's value wire.
-    let (fv, _) = vc_at(i);
-    assert!(matches!(ops[i], Op::ObserveScalar), "f_eval obs");
-    assert_eq!(vals_rec[fv], gkr.f_eval, "f_eval on the stream");
-    assert_eq!(vals_rec[fv + 1], gkr.g_eval, "g_eval on the stream");
-    assert_eq!(vals_rec[fv + 2], gkr.s_sigma_eval, "s_sigma on the stream");
-    GkrRec {
-        alpha_fin,
+    BusRec {
         beta_fin,
+        beta_ch,
+        gamma_fins,
         top_v: tv,
-        layers: lrecs,
-        fgs_v: fv,
+        layers,
         r_pt,
+        claim_l,
+        claim_r,
     }
 }
 
@@ -625,6 +720,8 @@ pub(super) const LBL_LINCHECK: &[u8] = b"flock-lincheck-v0";
 pub(super) const LBL_ELEMENT_ZC: &[u8] = b"flock-element-union-zc-v0";
 pub(super) const LBL_ELEMENT_LC: &[u8] = b"flock-element-union-lc-v0";
 pub(super) const LBL_PRODUCT_GKR: &[u8] = b"flock-product-gkr-batched-v0";
+pub(super) const LBL_BUS: &[u8] = b"flock-tuple-bus-v1";
+pub(super) const LBL_PRODUCT_LEAVES: &[u8] = b"flock-product-gkr-leaves-v0";
 pub(super) const LBL_MERGED_OPEN: &[u8] = b"flock-merged-open-v1";
 pub(super) const LBL_RING_SWITCH: &[u8] = b"flock-ring-switch-v0";
 pub(super) const LBL_MULTIPOINT: &[u8] = b"flock-multipoint-twisted-v1";

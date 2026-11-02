@@ -3,18 +3,22 @@ use std::iter::repeat_n;
 use flock_core::{
     circuit::builder::SlotId,
     genus95_curve_code::{EvaluationPoint, SAMPLE_ATTEMPT_BUDGET, base_evaluation_functional},
+    lincheck::MatrixAssertion,
     matrix_fold::{FoldProof, JaggedClaim, JaggedRowWeight, MatrixClaim, Weight},
-    zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET,
+    zerocheck::{K_SKIP, ag_skip::R1_FUSED_ATTEMPT_BUDGET},
 };
 use flock_transcript::transcript_record::{TranscriptOp, TranscriptOp as Op};
 
 use crate::{
     r1cs_hashes::fs_chain::FsChainTrace,
+    schedule::Registry,
     tower::{F128, ShapeBuilder, TowerConfig, Wire, squeeze_word_wire, tower_fold_grinding},
 };
 
 /// One absorbed claim's stream ordinals on a fold tape: the four weight
-/// slices and the value, in absorb order.
+/// slices and the value, in absorb order — or, for a claim the aggregate's
+/// shared binding bound, where those words sit in the shared block.
+#[derive(Clone)]
 pub(super) struct ClaimLoc {
     pub(super) row_low_v: usize,
     pub(super) row_low_n: usize,
@@ -69,11 +73,21 @@ pub(super) fn fold_region_ops(
     cfg: TowerConfig,
     fold_claims: &[Vec<MatrixClaim>],
 ) -> Vec<TranscriptOp> {
+    fold_region_ops_bound(cfg, fold_claims, &vec![0; fold_claims.len()])
+}
+
+/// [`fold_region_ops`] where group `g`'s last `n_bound[g]` claims were bound
+/// by the shared block ([`shared_binding_ops`]) and are not observed again.
+pub(super) fn fold_region_ops_bound(
+    cfg: TowerConfig,
+    fold_claims: &[Vec<MatrixClaim>],
+    n_bound: &[usize],
+) -> Vec<TranscriptOp> {
     let mut want: Vec<Op> = Vec::new();
     let grinding = tower_fold_grinding(cfg);
-    for cs in fold_claims {
+    for (cs, &nb) in fold_claims.iter().zip(n_bound) {
         want.push(Op::Label(b"flock-matrix-fold-v0".to_vec()));
-        for c in cs {
+        for c in &cs[..cs.len() - nb] {
             want.extend([
                 Op::ObserveSlice(c.row.low.len()),
                 Op::ObserveSlice(c.row.point.len()),
@@ -120,6 +134,77 @@ pub(super) fn fold_region_ops(
     want
 }
 
+/// The aggregate's shared binding (`aggregate::Binding::Shared`): its
+/// label, then per assertion the row low, `x_inner_rest`, the column low,
+/// `rr`, and each type's `(A, B)` values.
+pub(super) fn shared_binding_ops(asserts: &[MatrixAssertion]) -> Vec<TranscriptOp> {
+    let mut want = vec![Op::Label(b"flock-aggregate-shared-v1".to_vec())];
+    for a in asserts {
+        want.extend([
+            Op::ObserveSlice(1 << K_SKIP),
+            Op::ObserveSlice(a.x_inner_rest.len()),
+            Op::ObserveSlice(a.z_partial.len()),
+            Op::ObserveSlice(a.rr.len()),
+        ]);
+        want.extend(repeat_n(Op::ObserveScalar, 2 * a.evals.len()));
+    }
+    want
+}
+
+/// Locate the shared block from value ordinal `v0`, pin it against the
+/// assertions, and hand back, per boolean type, each assertion's `(A, B)`
+/// claim locations inside it — the claims' slices are the block's (each
+/// type reads a prefix of the points), so several claims share ordinals.
+/// Returns the per-type locations and the value cursor past the block.
+pub(super) fn locate_shared_binding(
+    asserts: &[MatrixAssertion],
+    registry: &Registry,
+    vals_rec: &[F128],
+    v0: usize,
+) -> (Vec<Vec<(ClaimLoc, ClaimLoc)>>, usize) {
+    let n_types = registry.num_boolean();
+    let mut per_type: Vec<Vec<(ClaimLoc, ClaimLoc)>> = vec![Vec::new(); n_types];
+    let mut v = v0;
+    for a in asserts {
+        let low_v = v;
+        let x_v = low_v + (1 << K_SKIP);
+        let zp_v = x_v + a.x_inner_rest.len();
+        let rr_v = zp_v + a.z_partial.len();
+        let ev_v = rr_v + a.rr.len();
+        v = ev_v + 2 * a.evals.len();
+        assert_eq!(
+            &vals_rec[low_v..x_v],
+            &a.z_skip.weights(K_SKIP)[..],
+            "shared row low"
+        );
+        assert_eq!(
+            &vals_rec[x_v..zp_v],
+            &a.x_inner_rest[..],
+            "shared x_inner_rest"
+        );
+        assert_eq!(&vals_rec[zp_v..rr_v], &a.z_partial[..], "shared z_partial");
+        assert_eq!(&vals_rec[rr_v..ev_v], &a.rr[..], "shared rr");
+        for (t, ty) in registry.boolean_types().iter().enumerate() {
+            let inner = ty.k_log - K_SKIP;
+            let loc = |value_v: usize| ClaimLoc {
+                row_low_v: low_v,
+                row_low_n: 1 << K_SKIP,
+                row_pt_v: x_v,
+                row_pt_n: inner,
+                col_low_v: zp_v,
+                col_low_n: a.z_partial.len(),
+                col_pt_v: rr_v,
+                col_pt_n: inner,
+                value_v,
+            };
+            assert_eq!(vals_rec[ev_v + 2 * t], a.evals[t].0, "shared A value");
+            assert_eq!(vals_rec[ev_v + 2 * t + 1], a.evals[t].1, "shared B value");
+            per_type[t].push((loc(ev_v + 2 * t), loc(ev_v + 2 * t + 1)));
+        }
+    }
+    (per_type, v)
+}
+
 /// Locate every fold's surfaces on the value/challenge streams (counters
 /// start at 0 — the bind prefix carries only byte payloads) and pin them
 /// field-for-field against the gathered claims and the `FoldProof`s.
@@ -131,13 +216,30 @@ pub(super) fn locate_and_pin_folds(
     fold_claims: &[Vec<MatrixClaim>],
     fold_proofs: &[&FoldProof],
     vals_rec: &[F128],
-    _chals: &[F128],
+    chals: &[F128],
 ) -> (Vec<FoldLoc>, usize, usize) {
-    let (mut vcur, mut ccur) = (0usize, 0usize);
+    locate_and_pin_folds_from(fold_claims, fold_proofs, vals_rec, chals, 0, &[])
+}
+
+/// [`locate_and_pin_folds`] from value ordinal `v0`, where group `g`'s last
+/// `prebound[g].len()` claims are already located (in the shared block,
+/// [`locate_shared_binding`]) and absent from the group's own words.
+pub(super) fn locate_and_pin_folds_from(
+    fold_claims: &[Vec<MatrixClaim>],
+    fold_proofs: &[&FoldProof],
+    vals_rec: &[F128],
+    _chals: &[F128],
+    v0: usize,
+    prebound: &[Vec<ClaimLoc>],
+) -> (Vec<FoldLoc>, usize, usize) {
+    let (mut vcur, mut ccur) = (v0, 0usize);
     let locs: Vec<FoldLoc> = fold_claims
         .iter()
-        .map(|cs| {
-            let claims = cs
+        .enumerate()
+        .map(|(g, cs)| {
+            let pre: &[ClaimLoc] = prebound.get(g).map_or(&[], |p| &p[..]);
+            let n_own = cs.len() - pre.len();
+            let claims = cs[..n_own]
                 .iter()
                 .map(|c| {
                     let l = ClaimLoc {
@@ -158,6 +260,7 @@ pub(super) fn locate_and_pin_folds(
                     vcur = l.value_v + 1;
                     l
                 })
+                .chain(pre.iter().cloned())
                 .collect::<Vec<_>>();
             let (k_col, k_row) = (cs[0].col.n_vars(), cs[0].row.n_vars());
             let lam_ch0 = ccur;
