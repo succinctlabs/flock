@@ -97,6 +97,12 @@ pub struct Accumulator {
     /// about different polynomials, which is meaningless — so the groups
     /// never mix, exactly as `A₀` and `B₀` never mix within a group.
     pub per_element: Vec<(MatrixClaim, MatrixClaim)>,
+    /// The linear-identity groups (shared binding, [`Dropped`]): per matrix
+    /// class that drops words under `η`, one folded claim about its
+    /// `D·(A_0 + I)` ([`crate::schedule::TableType::linear_identity_matrix`]). Empty
+    /// elsewhere.
+    #[serde(default)]
+    pub per_linear: Vec<MatrixClaim>,
     /// The wiring-sigma group (sigma v2 route B, wiring doc §sigma):
     /// per circuit SHAPE, one folded claim on that circuit's sigma table,
     /// keyed by the circuit digest. PER-DIGEST entries (wall 3): a tree
@@ -126,6 +132,17 @@ impl Accumulator {
                 .iter()
                 .zip(mats)
                 .all(|((ca, cb), (a, b))| ca.check_direct(*a) && cb.check_direct(*b))
+    }
+
+    /// Discharge the linear-identity groups against their matrices
+    /// ([`SharedTables::linear`]).
+    pub fn discharge_linear(&self, mats: &[&SparseBinaryMatrix]) -> bool {
+        self.per_linear.len() == mats.len()
+            && self
+                .per_linear
+                .iter()
+                .zip(mats)
+                .all(|(c, m)| c.check_direct(*m))
     }
 
     /// Discharge the element group against its `F128`-coefficient matrices.
@@ -172,6 +189,9 @@ pub struct AggregateProof {
     pub folds: Vec<(FoldProof, FoldProof)>,
     /// Per element type, likewise.
     pub el_folds: Vec<(FoldProof, FoldProof)>,
+    /// Per linear-identity group ([`Accumulator::per_linear`]), its fold.
+    #[serde(default)]
+    pub linear_folds: Vec<FoldProof>,
     /// The sigma group's folds, one per digest key, in the caller's key
     /// order.
     pub sigma_folds: Vec<FoldProof>,
@@ -230,13 +250,67 @@ fn gather(
     (a, b)
 }
 
+/// The linear-identity claims to fold for one group: the priors' entry
+/// `lg` first, then per assertion one per member type — [`gather`]'s order.
+fn gather_linear(
+    registry: &Registry,
+    assertions: &[MatrixAssertion],
+    priors: &[&Accumulator],
+    lg: usize,
+    members: &[usize],
+) -> Vec<MatrixClaim> {
+    let mut out: Vec<MatrixClaim> = priors.iter().map(|p| p.per_linear[lg].clone()).collect();
+    for assertion in assertions {
+        let claims = assertion.linear_claims(registry);
+        for &t in members {
+            out.push(
+                claims[t]
+                    .clone()
+                    .expect("a linear group's member reports one"),
+            );
+        }
+    }
+    out
+}
+
+/// The union-level facts shared binding folds by, beyond the registry:
+/// each boolean type's dropped words ([`UnionInstance::zeroed_word_cols`])
+/// and whether the lincheck checks them (`η`,
+/// [`UnionInstance::checks_linear_rows`]). Constants of the circuit — every
+/// proof over it and every accumulator of it shares them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dropped {
+    pub zeroed: Vec<Vec<usize>>,
+    pub checked: bool,
+}
+
+impl Dropped {
+    /// The facts of `union`.
+    pub fn of(union: &UnionInstance<'_>) -> Self {
+        Self {
+            zeroed: (0..union.registry().num_boolean())
+                .map(|t| union.zeroed_word_cols(t).to_vec())
+                .collect(),
+            checked: union.checks_linear_rows(),
+        }
+    }
+
+    /// No type drops a word.
+    pub fn none(registry: &Registry) -> Self {
+        Self {
+            zeroed: vec![Vec::new(); registry.num_boolean()],
+            checked: false,
+        }
+    }
+}
+
 /// The boolean types' MATRIX CLASSES: type `t` maps to the class of the
-/// first type with the same base block (`k_log`, `A₀`, `B₀`), classes
-/// numbered in first-occurrence order. A circuit that declares one gate in
-/// several slots (leanXMSS's compressions) has one class for all of them:
-/// their claims are about the same polynomials, so [`Binding::Shared`]
-/// folds them as one group.
-pub fn matrix_classes(registry: &Registry) -> Vec<usize> {
+/// first type with the same base block (`k_log`, `A₀`, `B₀`) and the same
+/// dropped words, classes numbered in first-occurrence order. A circuit
+/// that declares one gate in several slots (leanXMSS's compressions) has
+/// one class for all of them that drop alike: their claims are about the
+/// same polynomials, so shared binding folds them as one group.
+pub fn matrix_classes(registry: &Registry, zeroed: &[Vec<usize>]) -> Vec<usize> {
     let same = |x: &SparseBinaryMatrix, y: &SparseBinaryMatrix| {
         x.num_rows == y.num_rows
             && x.num_cols == y.num_cols
@@ -250,6 +324,7 @@ pub fn matrix_classes(registry: &Registry) -> Vec<usize> {
         .map(|(t, ty)| {
             let class = reps.iter().position(|&r| {
                 types[r].k_log == ty.k_log
+                    && zeroed[r] == zeroed[t]
                     && same(&types[r].a_0, &ty.a_0)
                     && same(&types[r].b_0, &ty.b_0)
             });
@@ -261,14 +336,14 @@ pub fn matrix_classes(registry: &Registry) -> Vec<usize> {
         .collect()
 }
 
-/// Each fold group's member types under `binding`: one group per type, or
-/// one per matrix class.
-fn groups(registry: &Registry, binding: Binding) -> Vec<Vec<usize>> {
+/// Each fold group's member types: one group per type, or under shared
+/// binding one per matrix class.
+fn groups(registry: &Registry, shared: Option<&Dropped>) -> Vec<Vec<usize>> {
     let n = registry.num_boolean();
-    match binding {
-        Binding::PerClaim => (0..n).map(|t| vec![t]).collect(),
-        Binding::Shared => {
-            let classes = matrix_classes(registry);
+    match shared {
+        None => (0..n).map(|t| vec![t]).collect(),
+        Some(d) => {
+            let classes = matrix_classes(registry, &d.zeroed);
             let n_classes = classes.iter().max().map_or(0, |&c| c + 1);
             (0..n_classes)
                 .map(|c| (0..n).filter(|&t| classes[t] == c).collect())
@@ -277,13 +352,52 @@ fn groups(registry: &Registry, binding: Binding) -> Vec<Vec<usize>> {
     }
 }
 
-/// The matrices of each [`Binding::Shared`] group — its class's first
-/// type's — for discharging a shared accumulator.
-pub fn class_mats<'a>(registry: &Registry, mats: &[TypeMatrices<'a>]) -> Vec<TypeMatrices<'a>> {
-    groups(registry, Binding::Shared)
-        .iter()
-        .map(|members| mats[members[0]])
-        .collect()
+/// The groups that fold a linear-identity claim: those that drop words,
+/// when `η` checks them.
+fn linear_groups(groups: &[Vec<usize>], shared: Option<&Dropped>) -> Vec<usize> {
+    match shared {
+        Some(d) if d.checked => (0..groups.len())
+            .filter(|&g| !d.zeroed[groups[g][0]].is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A shared accumulator's tables: per group its kept `A_0`/`B_0`
+/// ([`crate::schedule::TableType::kept_matrices`]), and per linear group its
+/// `D·(A_0 + I)` — what [`Accumulator::discharge`] and
+/// [`Accumulator::discharge_linear`] read.
+pub struct SharedTables {
+    pub kept: Vec<(SparseBinaryMatrix, SparseBinaryMatrix)>,
+    pub linear: Vec<SparseBinaryMatrix>,
+}
+
+impl SharedTables {
+    pub fn new(registry: &Registry, dropped: &Dropped) -> Self {
+        let groups = groups(registry, Some(dropped));
+        let types = registry.boolean_types();
+        let kept = groups
+            .iter()
+            .map(|m| types[m[0]].kept_matrices(&dropped.zeroed[m[0]]))
+            .collect();
+        let linear = linear_groups(&groups, Some(dropped))
+            .into_iter()
+            .map(|g| {
+                let t = groups[g][0];
+                types[t].linear_identity_matrix(&dropped.zeroed[t])
+            })
+            .collect();
+        Self { kept, linear }
+    }
+
+    /// The kept pairs as [`TypeMatrices`].
+    pub fn kept_refs(&self) -> Vec<TypeMatrices<'_>> {
+        self.kept.iter().map(|(a, b)| (a, b)).collect()
+    }
+
+    pub fn linear_refs(&self) -> Vec<&SparseBinaryMatrix> {
+        self.linear.iter().collect()
+    }
 }
 
 /// The prior COUNT is one transcript byte — `0`/`1` coincide with the old
@@ -301,11 +415,13 @@ fn check_priors(
     registry: &Registry,
     priors: &[&Accumulator],
     n_groups: usize,
+    n_linear: usize,
     n_element: usize,
 ) -> Result<(), AggregateError> {
     for p in priors {
         if p.registry_digest != registry.digest()
             || p.per_type.len() != n_groups
+            || p.per_linear.len() != n_linear
             || p.per_element.len() != n_element
         {
             return Err(AggregateError::RegistryMismatch);
@@ -397,18 +513,26 @@ pub fn prove_aggregate_classes_with_grinding<Ch: Challenger>(
         sigma,
         jagged,
         priors,
-        Binding::PerClaim,
+        None,
         grinding,
         ch,
     )
 }
 
-/// [`prove_aggregate_classes_with_grinding`] under [`Binding::Shared`]:
-/// each boolean assertion is bound once, and its per-type claims fold
-/// without being observed again.
+/// [`prove_aggregate_classes_with_grinding`] under SHARED BINDING: each
+/// fresh boolean assertion is bound once ([`bind_shared`]) — its claims
+/// are all built from the same skip point, `x_inner_rest`, `z_partial` and
+/// `rr` (each type reads a prefix of the points), so binding those and the
+/// reported values binds every claim: `~2T + 160` words per assertion
+/// instead of `~290·T` for `T` boolean types. The folds then run per
+/// MATRIX CLASS ([`matrix_classes`], keyed by `dropped`'s words too):
+/// `per_type` holds one entry per class, about its KEPT `A_0`/`B_0`, and
+/// `per_linear` one per class whose dropped rows `η` checks
+/// ([`SharedTables`]). `mats` are the registry's base blocks, per type.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_aggregate_classes_shared_with_grinding<Ch: Challenger>(
     registry: &Registry,
+    dropped: &Dropped,
     mats: &[TypeMatrices<'_>],
     circuits: &[&dyn LincheckCircuit],
     assertions: &[MatrixAssertion],
@@ -430,33 +554,17 @@ pub fn prove_aggregate_classes_shared_with_grinding<Ch: Challenger>(
         sigma,
         jagged,
         priors,
-        Binding::Shared,
+        Some(dropped),
         grinding,
         ch,
     )
 }
 
-/// How the fresh boolean claims enter the transcript.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Binding {
-    /// Every claim's weights and value, inside its type's fold.
-    PerClaim,
-    /// Each assertion once, before the folds ([`bind_shared`]): its claims
-    /// are all built from the same skip point, `x_inner_rest`, `z_partial`
-    /// and `rr` (each type reads a prefix of the points), so binding those
-    /// and the per-type values binds every claim. With `T` boolean types
-    /// that is `~2T + 160` words per assertion instead of `~290·T`. The
-    /// folds then run per MATRIX CLASS ([`matrix_classes`]): the
-    /// accumulator's `per_type` holds one entry per class, discharged
-    /// against [`class_mats`].
-    Shared,
-}
-
 const DOMAIN_SHARED: &[u8] = b"flock-aggregate-shared-v1";
 
-/// [`Binding::Shared`]'s binding: per fresh boolean assertion, the row low
-/// (the skip point's weights), `x_inner_rest`, the column low
-/// (`z_partial`), `rr`, then each type's `(A, B)` values.
+/// The shared binding: per fresh boolean assertion, the row low (the skip
+/// point's weights), `x_inner_rest`, the column low (`z_partial`), `rr`,
+/// each type's `(A, B)` values, then its linear-identity values.
 fn bind_shared<Ch: Challenger>(assertions: &[MatrixAssertion], ch: &mut Ch) {
     ch.observe_label(DOMAIN_SHARED);
     for a in assertions {
@@ -467,6 +575,9 @@ fn bind_shared<Ch: Challenger>(assertions: &[MatrixAssertion], ch: &mut Ch) {
         for &(va, vb) in &a.evals {
             ch.observe_f128(va);
             ch.observe_f128(vb);
+        }
+        for v in a.linear_evals.iter().flatten() {
+            ch.observe_f128(*v);
         }
     }
 }
@@ -482,7 +593,7 @@ fn prove_aggregate_impl<Ch: Challenger>(
     sigma: &[SigmaKey<'_>],
     jagged: &[JaggedKeyProve<'_>],
     priors: &[&Accumulator],
-    binding: Binding,
+    shared: Option<&Dropped>,
     grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
@@ -495,22 +606,30 @@ fn prove_aggregate_impl<Ch: Challenger>(
     if mats.len() != registry.num_boolean() {
         return Err(AggregateError::Malformed);
     }
-    let groups = groups(registry, binding);
-    check_priors(registry, priors, groups.len(), el_mats.len())?;
+    let groups = groups(registry, shared);
+    let linear = linear_groups(&groups, shared);
+    check_priors(registry, priors, groups.len(), linear.len(), el_mats.len())?;
+    let tables = shared.map(|d| SharedTables::new(registry, d));
 
     bind(registry, priors, ch);
-    if binding == Binding::Shared {
+    if shared.is_some() {
         bind_shared(assertions, ch);
     }
     let mut folds = Vec::with_capacity(groups.len());
     let mut per_type = Vec::with_capacity(groups.len());
     for (g, members) in groups.iter().enumerate() {
         let t = members[0];
-        let (ma, mb) = mats[t];
+        // Under shared binding a group's claims are about its KEPT rows.
+        let (ma, mb) = match &tables {
+            Some(tables) => (&tables.kept[g].0, &tables.kept[g].1),
+            None => mats[t],
+        };
+        let dropped_rows = shared.map_or(&[][..], |d| &d.zeroed[t][..]);
         let (ca, cb) = gather(registry, assertions, priors, g, members);
-        let n_bound = match binding {
-            Binding::PerClaim => 0,
-            Binding::Shared => assertions.len() * members.len(),
+        let n_bound = if shared.is_some() {
+            assertions.len() * members.len()
+        } else {
+            0
         };
         // The k·nnz work. ONE `fold_split` per claim yields the column
         // marginals for BOTH matrices, so the A- and B-folds share it — and
@@ -522,7 +641,13 @@ fn prove_aggregate_impl<Ch: Challenger>(
         let mut combs_b = Vec::with_capacity(cb.len());
         for (qa, qb) in ca.iter().zip(&cb) {
             let (xa, xb) = if qa.row == qb.row {
-                circuits[t].fold_split(&qa.row.materialize())
+                // The tuned kernel folds the whole block: clearing the
+                // dropped rows' weights gives the kept block's marginals.
+                let mut row = qa.row.materialize();
+                for &w in dropped_rows {
+                    row[128 * w..128 * (w + 1)].fill(F128::ZERO);
+                }
+                circuits[t].fold_split(&row)
             } else {
                 (
                     col_marginal(ma, &qa.row.materialize(), n_cols),
@@ -536,6 +661,24 @@ fn prove_aggregate_impl<Ch: Challenger>(
         let (pb, out_b) = prove_fold_bound_with_grinding(mb, &combs_b, &cb, n_bound, grinding, ch);
         folds.push((pa, pb));
         per_type.push((out_a, out_b));
+    }
+
+    // The linear-identity groups, after the boolean folds.
+    let mut linear_folds = Vec::with_capacity(linear.len());
+    let mut per_linear = Vec::with_capacity(linear.len());
+    for (lg, &g) in linear.iter().enumerate() {
+        let members = &groups[g];
+        let m = &tables.as_ref().expect("linear groups are shared").linear[lg];
+        let claims = gather_linear(registry, assertions, priors, lg, members);
+        let n_cols = 1usize << registry.boolean_types()[members[0]].k_log;
+        let combs: Vec<Vec<F128>> = claims
+            .iter()
+            .map(|q| col_marginal(m, &q.row.materialize(), n_cols))
+            .collect();
+        let n_bound = assertions.len() * members.len();
+        let (pf, out) = prove_fold_bound_with_grinding(m, &combs, &claims, n_bound, grinding, ch);
+        linear_folds.push(pf);
+        per_linear.push(out);
     }
 
     // The element group: same fold, different matrices. Its claims are plain
@@ -567,6 +710,7 @@ fn prove_aggregate_impl<Ch: Challenger>(
         AggregateProof {
             folds,
             el_folds,
+            linear_folds,
             sigma_folds,
             jagged_folds,
         },
@@ -574,6 +718,7 @@ fn prove_aggregate_impl<Ch: Challenger>(
             registry_digest: registry.digest(),
             per_type,
             per_element,
+            per_linear,
             sigma: sigma_out,
             jagged: jagged_out,
         },
@@ -928,16 +1073,18 @@ pub fn verify_aggregate_classes_with_grinding<Ch: Challenger>(
         jagged,
         priors,
         proof,
-        Binding::PerClaim,
+        None,
         grinding,
         ch,
     )
 }
 
-/// [`verify_aggregate_classes_with_grinding`] under [`Binding::Shared`].
+/// [`verify_aggregate_classes_with_grinding`] under shared binding
+/// ([`prove_aggregate_classes_shared_with_grinding`]).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_aggregate_classes_shared_with_grinding<Ch: Challenger>(
     registry: &Registry,
+    dropped: &Dropped,
     assertions: &[MatrixAssertion],
     el_assertions: &[(&UnionInstance<'_>, ElementAssertion)],
     sigma: &[SigmaKey<'_>],
@@ -955,7 +1102,7 @@ pub fn verify_aggregate_classes_shared_with_grinding<Ch: Challenger>(
         jagged,
         priors,
         proof,
-        Binding::Shared,
+        Some(dropped),
         grinding,
         ch,
     )
@@ -970,7 +1117,7 @@ fn verify_aggregate_impl<Ch: Challenger>(
     jagged: &[JaggedKeyVerify<'_>],
     priors: &[&Accumulator],
     proof: &AggregateProof,
-    binding: Binding,
+    shared: Option<&Dropped>,
     grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<Accumulator, AggregateError> {
@@ -980,33 +1127,57 @@ fn verify_aggregate_impl<Ch: Challenger>(
     if assertions.is_empty() && priors.is_empty() {
         return Err(AggregateError::Empty);
     }
-    let groups = groups(registry, binding);
-    if proof.folds.len() != groups.len() {
+    let groups = groups(registry, shared);
+    let linear = linear_groups(&groups, shared);
+    if proof.folds.len() != groups.len() || proof.linear_folds.len() != linear.len() {
         return Err(AggregateError::Malformed);
     }
-    check_priors(registry, priors, groups.len(), proof.el_folds.len())?;
+    check_priors(
+        registry,
+        priors,
+        groups.len(),
+        linear.len(),
+        proof.el_folds.len(),
+    )?;
     for assertion in assertions {
         assertion
             .check_reported(registry)
             .map_err(AggregateError::Reported)?;
+        // The assertion's dropped words are the circuit's.
+        if let Some(d) = shared
+            && assertion.zeroed != d.zeroed
+        {
+            return Err(AggregateError::Malformed);
+        }
     }
 
     bind(registry, priors, ch);
-    if binding == Binding::Shared {
+    if shared.is_some() {
         bind_shared(assertions, ch);
     }
     let mut per_type = Vec::with_capacity(groups.len());
     for ((g, members), (pa, pb)) in groups.iter().enumerate().zip(&proof.folds) {
         let (ca, cb) = gather(registry, assertions, priors, g, members);
-        let n_bound = match binding {
-            Binding::PerClaim => 0,
-            Binding::Shared => assertions.len() * members.len(),
+        let n_bound = if shared.is_some() {
+            assertions.len() * members.len()
+        } else {
+            0
         };
         let out_a = verify_fold_bound_with_grinding(&ca, n_bound, pa, grinding, ch)
             .map_err(AggregateError::Fold)?;
         let out_b = verify_fold_bound_with_grinding(&cb, n_bound, pb, grinding, ch)
             .map_err(AggregateError::Fold)?;
         per_type.push((out_a, out_b));
+    }
+    let mut per_linear = Vec::with_capacity(linear.len());
+    for ((lg, &g), pf) in linear.iter().enumerate().zip(&proof.linear_folds) {
+        let members = &groups[g];
+        let claims = gather_linear(registry, assertions, priors, lg, members);
+        let n_bound = assertions.len() * members.len();
+        per_linear.push(
+            verify_fold_bound_with_grinding(&claims, n_bound, pf, grinding, ch)
+                .map_err(AggregateError::Fold)?,
+        );
     }
 
     // The element group, replayed the same way. Its fold count is the
@@ -1038,6 +1209,7 @@ fn verify_aggregate_impl<Ch: Challenger>(
         registry_digest: registry.digest(),
         per_type,
         per_element,
+        per_linear,
         sigma: sigma_out,
         jagged: jagged_out,
     })

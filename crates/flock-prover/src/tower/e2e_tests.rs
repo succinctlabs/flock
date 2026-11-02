@@ -281,6 +281,7 @@ pub(super) fn chain_spine_converges() {
         registry_digest: n3.acc.registry_digest,
         per_type: Vec::new(),
         per_element: Vec::new(),
+        per_linear: Vec::new(),
         sigma: vec![(base_d, pass[0].1.clone())],
         jagged: vec![(base_d, pass[1].1.clone())],
     };

@@ -15,7 +15,7 @@
 //! verifier recomputes from the batches.
 
 use flock_core::{
-    aggregate::{Accumulator, class_mats},
+    aggregate::{Accumulator, Dropped, SharedTables},
     circuit::Circuit,
     matrix_fold::MatrixClaim,
     pcs::jagged::JaggedParams,
@@ -85,6 +85,7 @@ pub fn xmss_statement(circuit: &XmssCircuit, batches: &[Vec<Statement>]) -> Xmss
 struct LaneParts<'a> {
     registry: &'a Registry,
     family: &'a FlFamily<'a>,
+    dropped: &'a Dropped,
     circuit: &'a Circuit,
     params: &'a JaggedParams,
     claims_base: usize,
@@ -103,6 +104,7 @@ impl LaneParts<'_> {
             claims_base: self.claims_base,
             family: LaneFamily::Batches {
                 block_words: self.block_words,
+                dropped: self.dropped,
             },
         }
     }
@@ -157,9 +159,14 @@ impl XmssTower {
         let claims_base = fls[0].fold_pub_base;
         let family = xmss_family(circuit);
         let jp = xmss_jagged_params(&leaf);
+        let dropped = family
+            .shared
+            .clone()
+            .expect("the leanXMSS lane binds shared");
         let parts = LaneParts {
             registry: &leaf.inner.built.shape.registry,
             family: &family,
+            dropped: &dropped,
             circuit: &leaf.inner.built.shape.circuit,
             params: &jp,
             claims_base,
@@ -273,12 +280,8 @@ impl XmssTower {
         // (2) the leanXMSS lane vs the leaf tables (leaf 0's shape).
         let registry = &self.leaf.inner.built.shape.registry;
         let leaf_circuit = &self.leaf.inner.built.shape.circuit;
-        let mats: Vec<_> = registry
-            .boolean_types()
-            .iter()
-            .map(|ty| (&ty.a_0, &ty.b_0))
-            .collect();
-        if !lane.discharge(&class_mats(registry, &mats)) {
+        let tables = SharedTables::new(registry, &Dropped::of(&self.leaf.inner.union()));
+        if !lane.discharge(&tables.kept_refs()) || !lane.discharge_linear(&tables.linear_refs()) {
             return Err(ChainLaneBoolean);
         }
         if !lane.per_element.is_empty() {
@@ -423,7 +426,7 @@ fn xmss_tower_e2e() {
     let nu = std::env::var("XMSS_NU")
         .ok()
         .and_then(|v| v.parse().ok())
-        .or((n < 64).then_some(10));
+        .or((n < 64).then_some(9));
     let circuit =
         XmssCircuit::with_options(n, nu, crate::leanxmss::circuit::XmssOptions::RECURSION_LEAF);
     let batch = |seed: u64| {

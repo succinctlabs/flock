@@ -150,6 +150,15 @@ pub(super) struct MixedInner {
 }
 
 impl MixedInner {
+    /// The boolean zerocheck's AG round-one grinding bits — the union's
+    /// schedule, which owes the linear check's extra bits when it drops
+    /// linear rows ([`UnionInstance::zerocheck_grinding`]).
+    pub(super) fn ag_round_one_bits(&self) -> Option<u32> {
+        self.union()
+            .zerocheck_grinding(self.pcs.zerocheck_grinding())
+            .ag_round_one_bits()
+    }
+
     /// The union instance the proof was made over.
     pub(super) fn union(&self) -> UnionInstance<'_> {
         let mut union =

@@ -173,11 +173,12 @@ pub(super) const ENV_ACC_CHAIN_WORDS: usize = 160;
 const ENV_BODY_WORDS: usize = 4266;
 
 /// The ACC_CHAIN width a lane accumulator needs: per folded group its
-/// published `[live | rho_col | rho_row | value]`, boolean A and B per type,
-/// then sigma, then jagged.
+/// published `[live | rho_col | rho_row | value]`, boolean A and B per group,
+/// the linear-identity groups, then sigma, then jagged.
 pub(super) fn lane_block_words(acc: &Accumulator) -> usize {
     let w = |c: &MatrixClaim| 2 + c.col.point.len() + c.row.point.len();
     acc.per_type.iter().map(|(a, b)| w(a) + w(b)).sum::<usize>()
+        + acc.per_linear.iter().map(w).sum::<usize>()
         + acc.sigma.iter().map(|(_, c)| w(c)).sum::<usize>()
         + acc.jagged.iter().map(|(_, c)| w(c)).sum::<usize>()
 }

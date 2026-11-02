@@ -7,7 +7,10 @@
 #[cfg(test)]
 use {
     crate::{
-        leanxmss::reference::{Value, XmssHash, sign_keyless},
+        leanxmss::{
+            circuit::XmssOptions,
+            reference::{Value, XmssHash, sign_keyless},
+        },
         tower::{
             ChildSlots, ChildTape, SLOT_WORDS, ShapeBuilder, Wire, check_child_region,
             emit_child_region, expected_child_tail_schedule,
@@ -17,7 +20,7 @@ use {
 };
 
 use flock_core::{
-    aggregate::Accumulator,
+    aggregate::{Accumulator, Dropped},
     circuit::builder::BuiltCircuit,
     pcs::{LOG_PACKING, jagged::JaggedParams},
     union::publics_digest,
@@ -30,7 +33,7 @@ use crate::verifier::verify_ligerito_union_circuit_ag_deferred;
 use crate::verifier::verify_ligerito_union_circuit_deferred;
 use crate::{
     leanxmss::{
-        circuit::{FIAT_SHAMIR_DOMAIN, Statement, XmssCircuit, XmssOptions},
+        circuit::{FIAT_SHAMIR_DOMAIN, Statement, XmssCircuit},
         reference::Signature,
     },
     tower::{
@@ -56,10 +59,10 @@ pub fn build_xmss_leaf(
     statements: &[Statement],
     sigs: &[Signature],
 ) -> XmssLeaf {
-    assert_eq!(
-        circuit.options(),
-        XmssOptions::RECURSION_LEAF,
-        "a tower leaf proves in the recursion posture"
+    let options = circuit.options();
+    assert!(
+        options.chained_transcript && options.hashed_statement,
+        "a tower leaf proves under the chained transcript with a hashed statement"
     );
     let witness = circuit.witness(statements, sigs);
     let proof = circuit.prove(&witness);
@@ -161,7 +164,7 @@ pub(super) fn xmss_family(circuit: &XmssCircuit) -> FlFamily<'_> {
             .collect(),
         circs: circuit.lincheck_circuits(),
         lane_words: None,
-        shared_binding: true,
+        shared: Some(Dropped::of(&circuit.union())),
     }
 }
 
@@ -366,13 +369,14 @@ fn xmss_first_level_node_over_two_leaves() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
-    // A tall slot keeps a small batch to one slot per gate kind, the shape
-    // a production leaf has (plan_nu would spread 4 signatures over 2^6-row
-    // slots: twice the gather claims of a 1000-signature leaf).
+    // A tall slot keeps a small batch to a few slots per gate kind, the
+    // shape a production leaf has (plan_nu would spread 4 signatures over
+    // 2^6-row slots: twice the gather claims of a 1000-signature leaf);
+    // 2^9 still fills the step kind's first slot, so words drop.
     let nu = std::env::var("XMSS_NU")
         .ok()
         .and_then(|v| v.parse().ok())
-        .or((n < 64).then_some(10));
+        .or((n < 64).then_some(9));
     let circuit = XmssCircuit::with_options(n, nu, XmssOptions::RECURSION_LEAF);
     let batch = |seed: u64| {
         if n < 64 {
@@ -422,15 +426,13 @@ pub(super) fn xmss_jagged_params(leaf: &XmssLeaf) -> JaggedParams {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn xmss_internal_node_over_two_first_level_nodes() {
-    use flock_core::aggregate::class_mats;
-
     use crate::tower::{
         ChainLane, LaneFamily, build_node_outer_app, lane_block_words, node::digest_f128,
         span_count_word, test_config,
     };
     let cfg = test_config();
     let n = 4;
-    let circuit = XmssCircuit::with_options(n, Some(10), XmssOptions::RECURSION_LEAF);
+    let circuit = XmssCircuit::with_options(n, Some(9), XmssOptions::RECURSION_LEAF);
     let leaves: Vec<XmssLeaf> = (0..4u64)
         .map(|i| {
             let (st, sg) = signed(n, 17 + i);
@@ -457,6 +459,7 @@ fn xmss_internal_node_over_two_first_level_nodes() {
             claims_base: fl0.fold_pub_base,
             family: LaneFamily::Batches {
                 block_words: lane_words,
+                dropped: family.shared.as_ref().expect("shared"),
             },
         }),
         None,
@@ -483,8 +486,10 @@ fn xmss_internal_node_over_two_first_level_nodes() {
     );
     let lane = out.lane_acc.as_ref().expect("the lane rides the node");
     let registry = &leaves[0].inner.built.shape.registry;
+    let tables =
+        flock_core::aggregate::SharedTables::new(registry, family.shared.as_ref().unwrap());
     assert!(
-        lane.discharge(&class_mats(registry, &family.mats)),
+        lane.discharge(&tables.kept_refs()) && lane.discharge_linear(&tables.linear_refs()),
         "lane boolean"
     );
     assert!(
@@ -495,4 +500,89 @@ fn xmss_internal_node_over_two_first_level_nodes() {
         lane.discharge_jagged(&[(leaves[0].inner.built.shape.circuit.digest(), &jp)]),
         "lane jagged"
     );
+}
+
+/// Phase 5 probe: a leaf with its degree-one words dropped, through the
+/// child tape.
+#[test]
+#[ignore]
+fn xmss_dropped_words_tape_probe() {
+    let n = 4;
+    let options = XmssOptions {
+        zero_linear_words: true,
+        ..XmssOptions::RECURSION_LEAF
+    };
+    // 2^8-row slots: the big kinds fill whole slots, and only a full slot
+    // drops its words under the full-height commit.
+    let circuit = XmssCircuit::with_options(n, Some(8), options);
+    let (statements, sigs) = signed(n, 17);
+    let leaf = build_xmss_leaf(&circuit, &statements, &sigs);
+    let union = leaf.inner.union();
+    let dropping = (0..union.registry().num_boolean())
+        .filter(|&t| !union.zeroed_word_cols(t).is_empty())
+        .count();
+    println!(
+        "dropping types {dropping} of {} | checks linear rows {}",
+        union.registry().num_boolean(),
+        union.checks_linear_rows()
+    );
+    assert!(dropping > 0, "the probe drops words");
+    drop(union);
+    let lcs = circuit.lincheck_circuits();
+    let ct = ChildTape::new(&leaf.inner, XMSS_DOMAIN, &lcs);
+    let nu2 = 16;
+    let mut sb = ShapeBuilder::new(nu2);
+    let mut cs = ChildSlots::new(&mut sb, nu2, ct.spread_w);
+    let (mut vals, mut hints, mut consts) = (Vec::new(), Vec::new(), Vec::new());
+    let b3_slot = cs.q.b3;
+    let region = emit_child_region(
+        &mut sb,
+        &mut cs,
+        b3_slot,
+        &ct,
+        &mut vals,
+        &mut hints,
+        &mut consts,
+    );
+    let shape2 = sb.finish().expect("the region builds");
+    let hint_refs: Vec<&(dyn Any + Sync)> = hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
+    let built2 = shape2.run(&vals, &hint_refs);
+    check_child_region(&built2.public, &ct, &region);
+}
+
+/// How many layout columns the C claim masks, and in how many runs.
+#[test]
+#[ignore]
+fn xmss_masked_columns_census() {
+    use flock_core::matrix_fold::JaggedRowWeight;
+    for (n, nu) in [(4usize, 8usize), (4, 10), (992, 15)] {
+        let options = XmssOptions {
+            zero_linear_words: true,
+            ..XmssOptions::RECURSION_LEAF
+        };
+        let circuit = XmssCircuit::with_options(n, Some(nu), options);
+        let (st, sg) = if n < 64 {
+            signed(n, 5)
+        } else {
+            crate::leanxmss::circuit::keyless_batch(n, 5)
+        };
+        let leaf = build_xmss_leaf(&circuit, &st, &sg);
+        let union = leaf.inner.union();
+        let dropping = (0..union.registry().num_boolean())
+            .filter(|&t| !union.zeroed_word_cols(t).is_empty())
+            .count();
+        for c in &leaf.inner.work.jagged.rs {
+            if let JaggedRowWeight::Masked(p, z) = &c.row {
+                let runs = 1 + z.windows(2).filter(|w| w[1] != w[0] + 1).count();
+                println!(
+                    "n {n} nu {nu}: {} of {} types drop | layout bits {} | masked columns {} in {} runs",
+                    dropping,
+                    union.registry().num_boolean(),
+                    p.len(),
+                    z.len(),
+                    runs
+                );
+            }
+        }
+    }
 }

@@ -511,11 +511,14 @@ pub(super) fn emit_boolean_reported_check(
     z_partial_w: &[Wire],
     beta_w: &[Option<Wire>],
     eval_w: &[(Wire, Wire)],
+    linear: Option<(Wire, &[Option<Wire>])>,
     target_w: Wire,
     zw: Wire,
     ow: Wire,
 ) {
     assert_eq!(eval_w.len(), registry.num_boolean(), "Boolean eval count");
+    // The linear check: `α·η·⟨W_t, D(A_0 + I)⟩` joins type t's term.
+    let alpha_eta = linear.map(|(eta_w, _)| assertion_mac(sb, spine, zw, alpha_w, eta_w, zw));
     assert_eq!(beta_w.len(), registry.num_boolean(), "Boolean beta count");
     assert_eq!(z_partial_w.len(), 1usize << K_SKIP, "Boolean low weight");
     let mut acc = zw;
@@ -541,7 +544,12 @@ pub(super) fn emit_boolean_reported_check(
             ow,
         );
         let p_t = emit_eq_product(sb, pfslot, pf_w, ow, &rr_w[inner..], &col_prefix, zw, ow);
-        let ab = assertion_mac(sb, spine, vb_w, alpha_w, va_w, zw);
+        let mut ab = assertion_mac(sb, spine, vb_w, alpha_w, va_w, zw);
+        if let (Some(ae), Some((_, lin))) = (alpha_eta, linear)
+            && let Some(vl_w) = lin[t]
+        {
+            ab = assertion_mac(sb, spine, ab, ae, vl_w, zw);
+        }
         let wp = assertion_mac(sb, spine, zw, w_t, p_t, zw);
         let term = assertion_mac(sb, spine, zw, wp, ab, zw);
         acc = assertion_mac(sb, spine, acc, term, ow, zw);

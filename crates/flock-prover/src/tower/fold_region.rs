@@ -147,23 +147,31 @@ pub(super) fn shared_binding_ops(asserts: &[MatrixAssertion]) -> Vec<TranscriptO
             Op::ObserveSlice(a.rr.len()),
         ]);
         want.extend(repeat_n(Op::ObserveScalar, 2 * a.evals.len()));
+        want.extend(repeat_n(
+            Op::ObserveScalar,
+            a.linear_evals.iter().flatten().count(),
+        ));
     }
     want
 }
 
+/// One type's claim locations in the shared block, per assertion: its
+/// `(A, B)` pair and, when it reports one, its linear-identity claim.
+pub(super) type SharedLocs = Vec<Vec<(ClaimLoc, ClaimLoc, Option<ClaimLoc>)>>;
+
 /// Locate the shared block from value ordinal `v0`, pin it against the
-/// assertions, and hand back, per boolean type, each assertion's `(A, B)`
-/// claim locations inside it — the claims' slices are the block's (each
-/// type reads a prefix of the points), so several claims share ordinals.
+/// assertions, and hand back, per boolean type, each assertion's claim
+/// locations inside it — the claims' slices are the block's (each type
+/// reads a prefix of the points), so several claims share ordinals.
 /// Returns the per-type locations and the value cursor past the block.
 pub(super) fn locate_shared_binding(
     asserts: &[MatrixAssertion],
     registry: &Registry,
     vals_rec: &[F128],
     v0: usize,
-) -> (Vec<Vec<(ClaimLoc, ClaimLoc)>>, usize) {
+) -> (SharedLocs, usize) {
     let n_types = registry.num_boolean();
-    let mut per_type: Vec<Vec<(ClaimLoc, ClaimLoc)>> = vec![Vec::new(); n_types];
+    let mut per_type: SharedLocs = vec![Vec::new(); n_types];
     let mut v = v0;
     for a in asserts {
         let low_v = v;
@@ -171,7 +179,8 @@ pub(super) fn locate_shared_binding(
         let zp_v = x_v + a.x_inner_rest.len();
         let rr_v = zp_v + a.z_partial.len();
         let ev_v = rr_v + a.rr.len();
-        v = ev_v + 2 * a.evals.len();
+        let lin_v = ev_v + 2 * a.evals.len();
+        v = lin_v + a.linear_evals.iter().flatten().count();
         assert_eq!(
             &vals_rec[low_v..x_v],
             &a.z_skip.weights(K_SKIP)[..],
@@ -199,7 +208,13 @@ pub(super) fn locate_shared_binding(
             };
             assert_eq!(vals_rec[ev_v + 2 * t], a.evals[t].0, "shared A value");
             assert_eq!(vals_rec[ev_v + 2 * t + 1], a.evals[t].1, "shared B value");
-            per_type[t].push((loc(ev_v + 2 * t), loc(ev_v + 2 * t + 1)));
+            // The linear values follow the pairs, in type order.
+            let lin = a.linear_evals[t].map(|value| {
+                let at = lin_v + a.linear_evals[..t].iter().flatten().count();
+                assert_eq!(vals_rec[at], value, "shared linear value");
+                loc(at)
+            });
+            per_type[t].push((loc(ev_v + 2 * t), loc(ev_v + 2 * t + 1), lin));
         }
     }
     (per_type, v)
@@ -780,8 +795,29 @@ pub(super) struct JClaimLoc {
     /// Combo rows: (coeff ordinal, address) per term — the address WORD
     /// sits at coeff ordinal + 1, pinned to its REGISTRY constant.
     pub(super) terms: Vec<(usize, u32)>,
+    /// Masked rows: the zeroed layout columns (a constant of the child
+    /// circuit); `row_pt` is the point and `row_scale_v` the size word.
+    pub(super) masked: Option<Vec<u32>>,
     pub(super) col_v: usize,
     pub(super) val_v: usize,
+}
+
+/// A masked row's weight at `rho` from its located point:
+/// `eq(point, ρ) + Σ_{y ∈ zeroed} eq(point, y)·eq(y, ρ)` (char 2).
+fn masked_row_eval(point: &[F128], zeroed: &[u32], rho: &[F128]) -> F128 {
+    let bit = |b: bool| if b { F128::ONE } else { F128::ZERO };
+    let eq_y = |y: u32, x: &[F128]| {
+        x.iter().enumerate().fold(F128::ONE, |e, (l, &v)| {
+            e * (F128::ONE + bit((y >> l) & 1 == 1) + v)
+        })
+    };
+    let full = point
+        .iter()
+        .zip(rho)
+        .fold(F128::ONE, |e, (&p, &r)| e * (F128::ONE + p + r));
+    zeroed
+        .iter()
+        .fold(full, |acc, &y| acc + eq_y(y, point) * eq_y(y, rho))
 }
 
 /// One jagged fold group's located surfaces — [`FoldLoc`]'s sibling.
@@ -815,7 +851,7 @@ pub(super) fn jagged_fold_region_ops(
         let k_row = cs
             .iter()
             .find_map(|c| match &c.row {
-                JaggedRowWeight::Eq(_, p) => Some(p.len()),
+                JaggedRowWeight::Eq(_, p) | JaggedRowWeight::Masked(p, _) => Some(p.len()),
                 JaggedRowWeight::Combo(_) => None,
             })
             .expect("every jagged key carries at least one Eq claim");
@@ -836,6 +872,12 @@ pub(super) fn jagged_fold_region_ops(
                     for _ in t {
                         want.extend([Op::ObserveScalar, Op::ObserveScalar]);
                     }
+                }
+                JaggedRowWeight::Masked(p, _) => {
+                    // tag, then the mask's SIZE, then the point.
+                    want.push(Op::ObserveScalar);
+                    want.push(Op::ObserveScalar);
+                    want.push(Op::ObserveSlice(p.len()));
                 }
             }
             want.push(Op::ObserveSlice(n_col));
@@ -934,7 +976,7 @@ pub(super) fn locate_and_pin_jagged_folds(
             let k_row = cs
                 .iter()
                 .find_map(|c| match &c.row {
-                    JaggedRowWeight::Eq(_, p) => Some(p.len()),
+                    JaggedRowWeight::Eq(_, p) | JaggedRowWeight::Masked(p, _) => Some(p.len()),
                     JaggedRowWeight::Combo(_) => None,
                 })
                 .expect("every jagged key carries at least one Eq claim");
@@ -949,6 +991,7 @@ pub(super) fn locate_and_pin_jagged_folds(
                 .iter()
                 .map(|c| {
                     let tag_v = vcur;
+                    let mut masked = None;
                     let (row_pt, terms) = match &c.row {
                         JaggedRowWeight::Eq(scale, p) => {
                             assert_eq!(vals_rec[tag_v], F128::new(0, p.len() as u64), "eq row tag");
@@ -981,6 +1024,26 @@ pub(super) fn locate_and_pin_jagged_folds(
                             vcur = tag_v + 1 + 2 * t.len();
                             ((0, 0), terms)
                         }
+                        JaggedRowWeight::Masked(p, zeroed) => {
+                            assert_eq!(
+                                vals_rec[tag_v],
+                                F128::new(2, p.len() as u64),
+                                "masked row tag"
+                            );
+                            assert_eq!(
+                                vals_rec[tag_v + 1],
+                                F128::new(zeroed.len() as u64, 0),
+                                "masked row SIZE on the stream"
+                            );
+                            assert_eq!(
+                                &vals_rec[tag_v + 2..tag_v + 2 + p.len()],
+                                &p[..],
+                                "masked row point on the stream"
+                            );
+                            masked = Some(zeroed.clone());
+                            vcur = tag_v + 2 + p.len();
+                            ((tag_v + 2, p.len()), Vec::new())
+                        }
                     };
                     let col_v = vcur;
                     assert_eq!(
@@ -995,6 +1058,7 @@ pub(super) fn locate_and_pin_jagged_folds(
                         row_scale_v: tag_v + 1,
                         row_pt,
                         terms,
+                        masked,
                         col_v,
                         val_v,
                     }
@@ -1110,7 +1174,10 @@ pub(super) fn replay_jagged_fold_endpoints(
                 .iter()
                 .zip(&mus)
                 .fold(F128::ZERO, |acc, (cl, &m)| {
-                    let rw = if cl.terms.is_empty() {
+                    let rw = if let Some(zeroed) = &cl.masked {
+                        let point = &vals_rec[cl.row_pt.0..cl.row_pt.0 + cl.row_pt.1];
+                        masked_row_eval(point, zeroed, &rho_row)
+                    } else if cl.terms.is_empty() {
                         // The eq product SEEDED by the zero-claim scale.
                         (0..cl.row_pt.1).fold(vals_rec[cl.row_scale_v], |w, j| {
                             w * (F128::ONE + vals_rec[cl.row_pt.0 + j] + rho_row[j])
@@ -1236,7 +1303,27 @@ pub(super) fn emit_jagged_fold_region(
         }
         let mut wmu_w = zw;
         for (i, cl) in loc.claims.iter().enumerate() {
-            let rw = if cl.terms.is_empty() {
+            let rw = if let Some(zeroed) = &cl.masked {
+                // eq(point, ρ), then each zeroed column's share
+                // eq(point, y)·eq(y, ρ) as ONE prefix chain with y's bits
+                // baked as ow/zw.
+                let pt: Vec<Wire> = (0..cl.row_pt.1).map(|j| wv(cl.row_pt.0 + j)).collect();
+                let fs: Vec<(Wire, Wire)> =
+                    pt.iter().zip(&rho_row_w).map(|(&p, &r)| (p, r)).collect();
+                let mut acc = prefix(sb, ow, &fs);
+                for &y in zeroed {
+                    let bit = |l: usize| if (y >> l) & 1 == 1 { ow } else { zw };
+                    let fs: Vec<(Wire, Wire)> = pt
+                        .iter()
+                        .enumerate()
+                        .map(|(l, &p)| (p, bit(l)))
+                        .chain(rho_row_w.iter().enumerate().map(|(l, &r)| (r, bit(l))))
+                        .collect();
+                    let share = prefix(sb, ow, &fs);
+                    acc = sb.gate(macs, &[acc, share, ow])[0];
+                }
+                acc
+            } else if cl.terms.is_empty() {
                 let fs: Vec<(Wire, Wire)> = (0..cl.row_pt.1)
                     .map(|j| (wv(cl.row_pt.0 + j), rho_row_w[j]))
                     .collect();

@@ -938,6 +938,12 @@ pub enum JaggedRowWeight {
     /// count-derived). Fresh only, so no scale: a Combo never rides in as
     /// an inherited claim.
     Combo(Vec<(F128, u32)>),
+    /// `eq(point, ·)` with the `zeroed` layout columns cleared — a fresh
+    /// statement whose claim masks those columns out (the union's C claim
+    /// when slots drop words: `C = diag(mask)`). The mask is a constant of
+    /// the child circuit, bound by the group's key, so the transcript
+    /// carries only its size.
+    Masked(Vec<F128>, Vec<u32>),
 }
 
 impl JaggedRowWeight {
@@ -956,15 +962,17 @@ impl JaggedRowWeight {
                 })
             }
             Self::Combo(terms) => terms.iter().fold(F128::ZERO, |acc, &(c, addr)| {
-                let e = rho.iter().enumerate().fold(F128::ONE, |e, (l, &r)| {
-                    e * if (addr >> l) & 1 == 1 {
-                        r
-                    } else {
-                        F128::ONE + r
-                    }
-                });
-                acc + c * e
+                acc + c * eq_at_index(rho, addr)
             }),
+            // eq(point, ρ) minus each zeroed column's share (char 2: plus).
+            Self::Masked(point, zeroed) => {
+                assert_eq!(point.len(), rho.len(), "point/arity mismatch");
+                zeroed
+                    .iter()
+                    .fold(Self::Eq(F128::ONE, point.clone()).eval(rho), |acc, &y| {
+                        acc + eq_at_index(point, y) * eq_at_index(rho, y)
+                    })
+            }
         }
     }
 
@@ -988,6 +996,14 @@ impl JaggedRowWeight {
                 }
                 out
             }
+            Self::Masked(point, zeroed) => {
+                assert_eq!(point.len(), k, "point/arity mismatch");
+                let mut out = Weight::eq(point.clone()).materialize();
+                for &y in zeroed {
+                    out[y as usize] = F128::ZERO;
+                }
+                out
+            }
         }
     }
 
@@ -1006,6 +1022,11 @@ impl JaggedRowWeight {
                     ch.observe_f128(F128::new(addr as u64, 0));
                 }
             }
+            Self::Masked(point, zeroed) => {
+                ch.observe_f128(F128::new(2, point.len() as u64));
+                ch.observe_f128(F128::new(zeroed.len() as u64, 0));
+                ch.observe_f128_slice(point);
+            }
         }
     }
 
@@ -1015,8 +1036,22 @@ impl JaggedRowWeight {
         match self {
             Self::Eq(_, point) => point.len() == k,
             Self::Combo(terms) => terms.iter().all(|&(_, addr)| (addr as usize) < (1 << k)),
+            Self::Masked(point, zeroed) => {
+                point.len() == k && zeroed.iter().all(|&y| (y as usize) < (1 << k))
+            }
         }
     }
+}
+
+/// `eq(point, index)` for an integer index read LSB-first.
+fn eq_at_index(point: &[F128], index: u32) -> F128 {
+    point.iter().enumerate().fold(F128::ONE, |e, (l, &p)| {
+        e * if (index >> l) & 1 == 1 {
+            p
+        } else {
+            F128::ONE + p
+        }
+    })
 }
 
 /// `Σ_y row(y) · Ĵ(y, col) = value` — one assist statement's `W`-value as a

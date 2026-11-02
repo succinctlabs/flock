@@ -91,6 +91,9 @@ pub(super) struct AccLayout {
     /// one implied key — the chain circuit): per-type flat, then sigma,
     /// then jagged.
     lane_unkeyed: Vec<(usize, usize)>,
+    /// The lane's linear-identity entries (shared-binding lanes), after the
+    /// pairs.
+    lane_linear: Vec<(usize, usize)>,
     lane_sigma_w: (usize, usize),
     lane_jagged_w: (usize, usize),
 }
@@ -116,6 +119,7 @@ impl AccLayout {
             lane_unkeyed.push(w(a));
             lane_unkeyed.push(w(b));
         }
+        let lane_linear: Vec<(usize, usize)> = lane.per_linear.iter().map(w).collect();
         AccLayout {
             main_base: env_acc_main_base(env),
             lane_base,
@@ -126,6 +130,7 @@ impl AccLayout {
             jagged_w: w(&root.block.jagged[0].1),
             pass_w: [w(&root.block.passenger[0].1), w(&root.block.passenger[1].1)],
             lane_unkeyed,
+            lane_linear,
             lane_sigma_w: w(&lane.sigma[0].1),
             lane_jagged_w: w(&lane.jagged[0].1),
         }
@@ -239,6 +244,7 @@ pub(super) fn reassemble_parts(
         registry_digest: steady_lo.shape.registry.digest(),
         per_type,
         per_element,
+        per_linear: Vec::new(),
         sigma,
         jagged,
     };
@@ -266,12 +272,18 @@ pub(super) fn reassemble_parts(
         .iter()
         .map(|[a, b]| (a.clone(), b.clone()))
         .collect();
+    let lane_linear: Vec<MatrixClaim> = l
+        .lane_linear
+        .iter()
+        .map(|&(kc, kr)| read_acc_entry(public, &mut p, false, kc, kr).1)
+        .collect();
     let (_, lsig) = read_acc_entry(public, &mut p, false, l.lane_sigma_w.0, l.lane_sigma_w.1);
     let (_, ljag) = read_acc_entry(public, &mut p, false, l.lane_jagged_w.0, l.lane_jagged_w.1);
     let lane = Accumulator {
         registry_digest: leaf.registry.digest(),
         per_type: lane_per_type,
         per_element: Vec::new(),
+        per_linear: lane_linear,
         sigma: vec![(chain_d, lsig)],
         jagged: vec![(chain_d, ljag)],
     };

@@ -2842,6 +2842,7 @@ fn emit_assertion_families(
         &zpartial_ws,
         &beta_wires,
         &mat_eval_w,
+        None,
         lcb_w,
         zw,
         ow,

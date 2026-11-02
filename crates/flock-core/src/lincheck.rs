@@ -573,6 +573,13 @@ pub struct LincheckProof {
     /// catches.
     ///
     /// Empty on the single-table path, which does not accumulate.
+    ///
+    /// When the union checks linear rows (`η` sampled), each type that
+    /// drops words reports its pair over its KEPT rows, and one more pair
+    /// `(⟨W_t, D_t·(A_0 + I)⟩, 0)` per such type follows the `T` pairs, in
+    /// type order: the dropped rows' identity value, so every reported
+    /// value names a static matrix. A union that drops nothing keeps
+    /// exactly `T` pairs.
     pub matrix_evals: Vec<(F128, F128)>,
     /// PoW nonces in Fiat--Shamir order: the α batching challenge, one β
     /// constant-wire challenge per pinned circuit, one nonce per multilinear

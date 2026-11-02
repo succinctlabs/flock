@@ -113,6 +113,8 @@ pub(super) struct ChildTape<'p> {
     pub(super) zc_rounds_b: Vec<(usize, usize)>,
     pub(super) outer_b: (usize, usize),
     pub(super) bl_alpha: (usize, usize),
+    /// The linear check's η `(ch, fin)`, when the union drops linear rows.
+    pub(super) eta_b: Option<(usize, usize)>,
     pub(super) betas_b: Vec<(usize, usize)>,
     pub(super) zc_finals_v: usize,
     lc_msg_vs: Vec<usize>,
@@ -472,6 +474,7 @@ impl<'p> ChildTape<'p> {
             zskip,
             (outer_ch_b, outer_fin_b),
             bl_alpha,
+            eta_b,
             betas_b,
             zc_finals_v,
             lc_msg_vs,
@@ -570,6 +573,17 @@ impl<'p> ChildTape<'p> {
             assert!(matches!(ops[i2], Op::SqueezeScalar), "lc alpha");
             let lc_alpha = (vc_at(i2).1, fin_at(i2));
             i2 += 1;
+            // The linear check's η, right after α when the union drops a
+            // row other than `x·1 = x`.
+            let eta = union.checks_linear_rows().then(|| {
+                while matches!(ops[i2], Op::Pow { .. }) {
+                    i2 += 1;
+                }
+                assert!(matches!(ops[i2], Op::SqueezeScalar), "lc eta");
+                let eta = (vc_at(i2).1, fin_at(i2));
+                i2 += 1;
+                eta
+            });
             let mut betas = Vec::new();
             loop {
                 while matches!(ops[i2], Op::Pow { .. }) {
@@ -600,8 +614,15 @@ impl<'p> ChildTape<'p> {
                 "z_partial slice"
             );
             let (zp, _) = vc_at(i2);
-            (zc_r, zskip, outer, lc_alpha, betas, zcf, lc_msgs, lc_r, zp)
+            (
+                zc_r, zskip, outer, lc_alpha, eta, betas, zcf, lc_msgs, lc_r, zp,
+            )
         };
+        assert_eq!(
+            eta_b.map(|(ch, _)| chals[ch]),
+            bool_assert.eta,
+            "the located linear-check eta"
+        );
         assert!(
             lc_rounds_b.len() <= 1 + k_cols_i,
             "lc rounds fit the col bits"
@@ -655,7 +676,7 @@ impl<'p> ChildTape<'p> {
                     let pt = decode_ag_point(
                         &ag_seed_bytes(chals[*seed_ch], chals[*seed_ch + 1]),
                         nonce,
-                        inner.pcs.zerocheck_grinding().ag_round_one_bits(),
+                        inner.ag_round_one_bits(),
                     );
                     assert_eq!(
                         bool_assert.z_skip,
@@ -895,11 +916,28 @@ impl<'p> ChildTape<'p> {
                 let mut acc = F128::ZERO;
                 for (si, xs) in [&x_ab_n, &x_c_n].iter().enumerate() {
                     let z_row = &xs[1..1 + n_log_i];
-                    let run_n = run_weights_n(&xs[1 + n_log_i..]);
-                    let w_n = run_n
+                    let z_col = &xs[1 + n_log_i..];
+                    let run_n = run_weights_n(z_col);
+                    let mut w_n = run_n
                         .iter()
                         .zip(&eqc_n)
                         .fold(F128::ZERO, |a, (&x, &e)| a + x * e);
+                    // A masked statement (the C claim when slots drop
+                    // words) takes each zeroed column's share back out.
+                    if let JaggedRowWeight::Masked(_, zeroed) = &inner.work.jagged.rs[si].row {
+                        for &y in zeroed {
+                            let y = y as usize;
+                            let r = (0..n_runs)
+                                .find(|&r| {
+                                    (run_y0[r]..run_y0[r] + bounds_i[r].2 as usize).contains(&y)
+                                })
+                                .expect("a zeroed column lies in a run");
+                            let e = z_col.iter().enumerate().fold(F128::ONE, |e, (jj, &zc)| {
+                                e * (F128::ONE + zc + bit((y >> jj) & 1 == 1))
+                            });
+                            w_n += e * eqc_n[r];
+                        }
+                    }
                     // The count win's tie: the RAW per-statement W the
                     // region now PUBLISHES equals the deferred export's
                     // claim value — the verifier-exported reference, not a
@@ -1009,6 +1047,7 @@ impl<'p> ChildTape<'p> {
             zc_rounds_b,
             outer_b: (outer_ch_b, outer_fin_b),
             bl_alpha,
+            eta_b,
             betas_b,
             zc_finals_v,
             lc_msg_vs,
@@ -1987,6 +2026,9 @@ pub(super) struct ChildRegion {
     /// Reported matrix evaluations, constrained by the in-circuit scalar
     /// closure and connected to the aggregate fold's fresh claim values.
     pub(super) mat_eval_w: Vec<(Wire, Wire)>,
+    /// Per type, the dropped rows' identity value when `η` checks them —
+    /// likewise constrained and connected to the linear fold claims.
+    pub(super) lin_eval_w: Vec<Option<Wire>>,
     /// The z_skip surface, by flavor — see [`ZskipWires`].
     pub(super) zskip: ZskipWires,
     /// The residual close-out's prefix slot (and width) — reusable by a
@@ -2206,6 +2248,20 @@ pub(super) fn emit_child_region(
             (aw, bw)
         })
         .collect();
+    // The dropped rows' identity values, advice bound by the reported check
+    // below and, as fold claims, at the root.
+    let lin_eval_w: Vec<Option<Wire>> = ct
+        .bool_assert
+        .linear_evals
+        .iter()
+        .map(|v| {
+            v.map(|v| {
+                vals.push(v);
+                sb.input()
+            })
+        })
+        .collect();
+    let eta_w = ct.eta_b.map(|(_, fin)| outs[trace.squeezes[fin][0]][0]);
     let mat_alpha_w = outs[trace.squeezes[ct.bl_alpha.1][0]][0];
     let mat_x_inner_w: Vec<Wire> = (0..ct.bool_assert.x_inner_rest.len())
         .map(|j| {
@@ -2253,6 +2309,7 @@ pub(super) fn emit_child_region(
         &zpartial_ws,
         &beta_wires,
         &mat_eval_w,
+        eta_w.map(|e| (e, &lin_eval_w[..])),
         lcb_w,
         zw,
         ow,
@@ -2386,6 +2443,7 @@ pub(super) fn emit_child_region(
             .collect(),
         b_zpartial_w: (0..Z_PARTIAL_WORDS).map(|i| wv(ct.zp_v + i)).collect(),
         mat_eval_w,
+        lin_eval_w,
         zskip: zskip_wires(&ct.zskip, &outs, trace, stream, &ww),
         pf: (pfslot, pf_w),
         child_pub_w: pub_w,

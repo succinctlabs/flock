@@ -451,6 +451,7 @@ pub(super) fn discharge_outer(
             registry_digest: main.registry_digest,
             per_type: Vec::new(),
             per_element: Vec::new(),
+            per_linear: Vec::new(),
             sigma: vec![(base_d, passenger[0].1.clone())],
             jagged: vec![(base_d, passenger[1].1.clone())],
         };

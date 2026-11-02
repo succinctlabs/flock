@@ -6,16 +6,18 @@ use std::{
 };
 
 use aggregate::{
-    AggregateError, AggregateProof, JaggedKeyProve, JaggedKeyVerify, SigmaKey,
-    prove_aggregate_classes_shared_with_grinding, prove_aggregate_classes_with_grinding,
-    verify_aggregate_classes_shared_with_grinding, verify_aggregate_classes_with_grinding,
+    JaggedKeyProve, JaggedKeyVerify, prove_aggregate_classes_shared_with_grinding,
+    prove_aggregate_classes_with_grinding, verify_aggregate_classes_shared_with_grinding,
+    verify_aggregate_classes_with_grinding,
 };
 use flock_core::{
     aggregate,
-    aggregate::{Accumulator, ElementMatrices, TypeMatrices, matrix_classes},
+    aggregate::{
+        Accumulator, Dropped, ElementMatrices, SharedTables, TypeMatrices, matrix_classes,
+    },
     element_r1cs::union::ElementAssertion,
-    lincheck::{LincheckCircuit, MatrixAssertion, SkipPoint},
-    matrix_fold::{FoldGrinding, FoldProof, JaggedClaim, MatrixClaim},
+    lincheck::{LincheckCircuit, SkipPoint},
+    matrix_fold::{FoldProof, JaggedClaim, MatrixClaim},
     pcs::{LOG_PACKING, jagged::JaggedParams},
     r1cs::BlockR1cs,
     union::publics_digest,
@@ -180,34 +182,6 @@ pub(super) fn record_child_inner_verify(
     .expect("the child verifies (recorded)");
 }
 
-/// The aggregate fold's prover, either binding.
-type ProveAggregate<'a, Ch> = fn(
-    &Registry,
-    &[TypeMatrices<'a>],
-    &[&dyn LincheckCircuit],
-    &[MatrixAssertion],
-    &[ElementMatrices<'a>],
-    &[(&UnionInstance<'a>, ElementAssertion)],
-    &[SigmaKey<'a>],
-    &[JaggedKeyProve<'a>],
-    &[&Accumulator],
-    FoldGrinding,
-    &mut Ch,
-) -> Result<(AggregateProof, Accumulator), AggregateError>;
-
-/// The aggregate fold's verifier, either binding.
-type VerifyAggregate<'a, Ch> = fn(
-    &Registry,
-    &[MatrixAssertion],
-    &[(&UnionInstance<'a>, ElementAssertion)],
-    &[SigmaKey<'a>],
-    &[JaggedKeyVerify<'a>],
-    &[&Accumulator],
-    &AggregateProof,
-    FoldGrinding,
-    &mut Ch,
-) -> Result<Accumulator, AggregateError>;
-
 /// A first-level node's leaf family: beyond the leaves' proofs, what the
 /// fold and the child tapes need — the leaves' transcript domain and, per
 /// boolean registry type in registry order, the base matrices and the
@@ -219,10 +193,12 @@ pub(super) struct FlFamily<'a> {
     /// The tower's ACC_CHAIN width ([`EnvShape::acc_chain_words`]): fixed,
     /// or `None` to fit the lane this node folds ([`lane_block_words`]).
     pub(super) lane_words: Option<usize>,
-    /// The fold binds each child's boolean assertion once
-    /// (`aggregate::Binding::Shared`) rather than every per-type claim — the
-    /// win grows with the type count.
-    pub(super) shared_binding: bool,
+    /// Shared binding (`prove_aggregate_classes_shared_with_grinding`): the
+    /// fold binds each child's boolean assertion once rather than every
+    /// per-type claim — the win grows with the type count — and folds per
+    /// matrix class under the leaf union's dropped words. `None`: per-claim
+    /// binding, per type.
+    pub(super) shared: Option<Dropped>,
 }
 
 /// A first-level node's application statement, published in the envelope's
@@ -288,7 +264,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
         mats: vec![(&blake_r1cs.a_0, &blake_r1cs.b_0)],
         circs: vec![blake_r1cs.csc_lincheck_circuit()],
         lane_words: Some(ENV_ACC_CHAIN_WORDS),
-        shared_binding: false,
+        shared: None,
     };
     let inners: Vec<&MixedInner> = cps.iter().map(|cp| &cp.inner).collect();
     let core = build_first_level_core(
@@ -445,64 +421,100 @@ pub(super) fn build_first_level_core(
     let jagged_p: Vec<JaggedKeyProve<'_>> = vec![(leaf_digest, &leaf_params_j, jags.to_vec())];
     let jagged_v: Vec<JaggedKeyVerify<'_>> = vec![(leaf_digest, jags.to_vec())];
     let mut chp = FsChallenger::with_chained_blake3(fl_domain);
-    let (prove_agg, verify_agg) = if family.shared_binding {
-        (
-            prove_aggregate_classes_shared_with_grinding::<FsChallenger>
-                as ProveAggregate<'_, FsChallenger>,
-            verify_aggregate_classes_shared_with_grinding::<RecordingChallenger<FsChallenger>>
-                as VerifyAggregate<'_, RecordingChallenger<FsChallenger>>,
-        )
-    } else {
-        (
-            prove_aggregate_classes_with_grinding::<FsChallenger>
-                as ProveAggregate<'_, FsChallenger>,
-            verify_aggregate_classes_with_grinding::<RecordingChallenger<FsChallenger>>
-                as VerifyAggregate<'_, RecordingChallenger<FsChallenger>>,
-        )
-    };
-    let (agg, acc_p) = prove_agg(
-        registry,
-        mats,
-        circs,
-        &bool_asserts,
-        &el_mats,
-        &el_asserts,
-        &[(leaf_circuit, sigmas.iter().collect())],
-        &jagged_p,
-        &[],
-        tower_fold_grinding(cfg),
-        &mut chp,
-    )
+    let sigma_key = [(leaf_circuit, sigmas.iter().collect())];
+    let grinding = tower_fold_grinding(cfg);
+    let (agg, acc_p) = match &family.shared {
+        Some(dropped) => prove_aggregate_classes_shared_with_grinding(
+            registry,
+            dropped,
+            mats,
+            circs,
+            &bool_asserts,
+            &el_mats,
+            &el_asserts,
+            &sigma_key,
+            &jagged_p,
+            &[],
+            grinding,
+            &mut chp,
+        ),
+        None => prove_aggregate_classes_with_grinding(
+            registry,
+            mats,
+            circs,
+            &bool_asserts,
+            &el_mats,
+            &el_asserts,
+            &sigma_key,
+            &jagged_p,
+            &[],
+            grinding,
+            &mut chp,
+        ),
+    }
     .expect("the first-level fold proves");
     let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(fl_domain));
-    let acc_v = verify_agg(
-        registry,
-        &bool_asserts,
-        &el_asserts,
-        &[(leaf_circuit, sigmas.iter().collect())],
-        &jagged_v,
-        &[],
-        &agg,
-        tower_fold_grinding(cfg),
-        &mut rec,
-    )
+    let acc_v = match &family.shared {
+        Some(dropped) => verify_aggregate_classes_shared_with_grinding(
+            registry,
+            dropped,
+            &bool_asserts,
+            &el_asserts,
+            &sigma_key,
+            &jagged_v,
+            &[],
+            &agg,
+            grinding,
+            &mut rec,
+        ),
+        None => verify_aggregate_classes_with_grinding(
+            registry,
+            &bool_asserts,
+            &el_asserts,
+            &sigma_key,
+            &jagged_v,
+            &[],
+            &agg,
+            grinding,
+            &mut rec,
+        ),
+    }
     .expect("the first-level fold verifies");
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
     assert!(acc_v.per_element.is_empty(), "no element group accumulated");
     // The boolean fold groups: one per type, or one per matrix class under
-    // shared binding (`aggregate::Binding::Shared`) — each group's claims
-    // are child-major, then type-ascending within the group.
-    let groups: Vec<Vec<usize>> = if family.shared_binding {
-        let classes = matrix_classes(registry);
-        let n_classes = classes.iter().max().map_or(0, |&c| c + 1);
-        (0..n_classes)
-            .map(|c| (0..n_types).filter(|&t| classes[t] == c).collect())
-            .collect()
-    } else {
-        (0..n_types).map(|t| vec![t]).collect()
+    // shared binding — each group's claims are child-major, then
+    // type-ascending within the group. Under shared binding the classes
+    // that drop words under η add a linear-identity group each.
+    let groups: Vec<Vec<usize>> = match &family.shared {
+        Some(dropped) => {
+            let classes = matrix_classes(registry, &dropped.zeroed);
+            let n_classes = classes.iter().max().map_or(0, |&c| c + 1);
+            (0..n_classes)
+                .map(|c| (0..n_types).filter(|&t| classes[t] == c).collect())
+                .collect()
+        }
+        None => (0..n_types).map(|t| vec![t]).collect(),
     };
-    let group_mats: Vec<TypeMatrices<'_>> = groups.iter().map(|m| mats[m[0]]).collect();
-    assert!(acc_v.discharge(&group_mats), "the boolean group discharges");
+    let linear: Vec<usize> = match &family.shared {
+        Some(d) if d.checked => (0..groups.len())
+            .filter(|&g| !d.zeroed[groups[g][0]].is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    // The boolean groups' discharge: the kept blocks and the linear
+    // identities under shared binding, the base blocks otherwise.
+    let shared_tables = family
+        .shared
+        .as_ref()
+        .map(|d| SharedTables::new(registry, d));
+    let discharges_boolean = |acc: &Accumulator| -> bool {
+        match &shared_tables {
+            Some(t) => acc.discharge(&t.kept_refs()) && acc.discharge_linear(&t.linear_refs()),
+            None => acc.discharge(mats),
+        }
+    };
+    assert!(discharges_boolean(&acc_v), "the boolean groups discharge");
     assert!(
         acc_v.discharge_sigma(&[leaf_circuit]),
         "the sigma group discharges against the ONE leaf circuit"
@@ -531,13 +543,39 @@ pub(super) fn build_first_level_core(
         fold_proofs.push(&agg.folds[g].0);
         fold_proofs.push(&agg.folds[g].1);
     }
-    let sig_g = 2 * groups.len();
+    // The linear-identity groups follow, same claim order.
+    let lc: Vec<_> = bool_asserts
+        .iter()
+        .map(|a| a.linear_claims(registry))
+        .collect();
+    for (lg, &g) in linear.iter().enumerate() {
+        fold_claims.push(
+            lc.iter()
+                .flat_map(|c| {
+                    groups[g]
+                        .iter()
+                        .map(move |&t| c[t].clone().expect("a linear member"))
+                })
+                .collect(),
+        );
+        fold_proofs.push(&agg.linear_folds[lg]);
+    }
+    let n_ab = 2 * groups.len();
+    let sig_g = n_ab + linear.len();
     fold_claims.push(sigmas.iter().flat_map(|s| s.claims()).collect());
     fold_proofs.push(&agg.sigma_folds[0]);
     for claims in &fold_claims[..sig_g] {
         assert_eq!(claims[0].row.low.len(), 64, "fresh lagrange low");
         assert_eq!(claims[0].col.low.len(), 64, "fresh z_partial low");
     }
+    // Fold `fi`'s member types: an A/B fold's group, or a linear group's.
+    let fold_members = |fi: usize| -> &[usize] {
+        if fi < n_ab {
+            &groups[fi / 2]
+        } else {
+            &groups[linear[fi - n_ab]]
+        }
+    };
     assert_eq!(
         fold_claims[sig_g][0].row.low.len(),
         1,
@@ -583,9 +621,11 @@ pub(super) fn build_first_level_core(
         Op::ObserveBytes(1),
     ];
     let n_uni = fold_claims.len() - 1;
-    let n_bound: Vec<usize> = if family.shared_binding {
+    let n_bound: Vec<usize> = if family.shared.is_some() {
         want.extend(shared_binding_ops(&bool_asserts));
-        groups.iter().flat_map(|m| [k_ary * m.len(); 2]).collect()
+        (0..n_uni)
+            .map(|fi| k_ary * fold_members(fi).len())
+            .collect()
     } else {
         vec![0; n_uni]
     };
@@ -610,16 +650,24 @@ pub(super) fn build_first_level_core(
         "bind: registry digest"
     );
     assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
-    let (locs, vcur, ccur) = if family.shared_binding {
+    let (locs, vcur, ccur) = if family.shared.is_some() {
         let (per_type, v0) = locate_shared_binding(&bool_asserts, registry, vals_rec, 0);
         let mut prebound: Vec<Vec<ClaimLoc>> = Vec::with_capacity(sig_g);
-        for members in &groups {
-            let (a, b): (Vec<ClaimLoc>, Vec<ClaimLoc>) = (0..k_ary)
-                .flat_map(|k| members.iter().map(move |&t| (t, k)))
-                .map(|(t, k)| per_type[t][k].clone())
-                .unzip();
-            prebound.push(a);
-            prebound.push(b);
+        for fi in 0..n_uni {
+            let members = fold_members(fi);
+            prebound.push(
+                (0..k_ary)
+                    .flat_map(|k| members.iter().map(move |&t| (t, k)))
+                    .map(|(t, k)| {
+                        let (a, b, l) = &per_type[t][k];
+                        match (fi < n_ab, fi % 2) {
+                            (true, 0) => a.clone(),
+                            (true, _) => b.clone(),
+                            (false, _) => l.clone().expect("a linear member"),
+                        }
+                    })
+                    .collect(),
+            );
         }
         locate_and_pin_folds_from(&fold_claims, &fold_proofs, vals_rec, chals, v0, &prebound)
     } else {
@@ -643,6 +691,13 @@ pub(super) fn build_first_level_core(
             outs[2 * g + 1],
             acc_v.per_type[g].1,
             "boolean B accumulator"
+        );
+    }
+    for lg in 0..linear.len() {
+        assert_eq!(
+            outs[n_ab + lg],
+            acc_v.per_linear[lg],
+            "linear-identity accumulator"
         );
     }
     let (sig_digest, sig_claim) = acc_v.sigma.first().expect("sigma accumulated");
@@ -908,7 +963,27 @@ pub(super) fn build_first_level_core(
                     for j in 0..loc.n_col {
                         sb.connect(wv(cl.col_v + j), rk.jag_sig_w[j]);
                     }
-                    if cl.terms.is_empty() {
+                    if let Some(zeroed) = &cl.masked {
+                        // A masked claim: its tag and mask size pin to
+                        // constants (the mask itself is the circuit's).
+                        let tag = cw_j(
+                            &mut sb,
+                            &mut vals,
+                            &mut jag_const_rec,
+                            F128::new(2, cl.row_pt.1 as u64),
+                        );
+                        sb.connect(wv(cl.row_scale_v - 1), tag);
+                        let size = cw_j(
+                            &mut sb,
+                            &mut vals,
+                            &mut jag_const_rec,
+                            F128::new(zeroed.len() as u64, 0),
+                        );
+                        sb.connect(wv(cl.row_scale_v), size);
+                        for j in 0..cl.row_pt.1 {
+                            sb.connect(wv(cl.row_pt.0 + j), rk.jag_row_w[li][j]);
+                        }
+                    } else if cl.terms.is_empty() {
                         let tag = cw_j(
                             &mut sb,
                             &mut vals,
@@ -1065,7 +1140,7 @@ pub(super) fn build_first_level_core(
                         [tk.chals[*seed_ch], tk.chals[*seed_ch + 1]],
                         nonce,
                         &pt,
-                        inners[k].pcs.zerocheck_grinding().ag_round_one_bits(),
+                        inners[k].ag_round_one_bits(),
                         &mut vals,
                         &mut consts,
                         zw,
@@ -1132,7 +1207,7 @@ pub(super) fn build_first_level_core(
             assert_eq!(rk.mat_eval_w.len(), n_types, "child Boolean type count");
             let child_claims: Vec<(usize, usize, usize)> = (0..sig_g)
                 .flat_map(|fi| {
-                    let members = &groups[fi / 2];
+                    let members = fold_members(fi);
                     let base = n_priors + k * members.len();
                     members
                         .iter()
@@ -1158,10 +1233,14 @@ pub(super) fn build_first_level_core(
             }
             for &(fi, ci, t) in &child_claims {
                 let cl = &locs[fi].claims[ci];
-                {
-                    let (a_w, b_w) = rk.mat_eval_w[t];
-                    sb.connect(wv(cl.value_v), if fi % 2 == 0 { a_w } else { b_w });
-                }
+                let value_w = if fi >= n_ab {
+                    rk.lin_eval_w[t].expect("the region's linear value")
+                } else if fi % 2 == 0 {
+                    rk.mat_eval_w[t].0
+                } else {
+                    rk.mat_eval_w[t].1
+                };
+                sb.connect(wv(cl.value_v), value_w);
             }
             // Every claim's lagrange lows are the first's — one published
             // copy binds them all (one stream copy, under shared binding).
@@ -1244,6 +1323,12 @@ pub(super) fn build_first_level_core(
                     let ci = n_priors + k * members.len() + j;
                     sb.publish(wv(locs[2 * g].claims[ci].value_v));
                     sb.publish(wv(locs[2 * g + 1].claims[ci].value_v));
+                }
+            }
+            for (lg, &g) in linear.iter().enumerate() {
+                for j in 0..groups[g].len() {
+                    let ci = n_priors + k * groups[g].len() + j;
+                    sb.publish(wv(locs[n_ab + lg].claims[ci].value_v));
                 }
             }
         }
@@ -1415,6 +1500,7 @@ pub(super) fn build_first_level_core(
                     .map(|t| (rebuilt[2 * t].clone(), rebuilt[2 * t + 1].clone()))
                     .collect(),
                 per_element: Vec::new(),
+                per_linear: rebuilt[n_ab..sig_g].to_vec(),
                 sigma: vec![(leaf_digest, rebuilt[sig_g].clone())],
                 jagged: vec![(leaf_digest, jrebuilt[0].clone())],
             };
@@ -1423,7 +1509,7 @@ pub(super) fn build_first_level_core(
                 "the Accumulator, reassembled from the public segment alone"
             );
             assert!(
-                acc_pub.discharge(&group_mats)
+                discharges_boolean(&acc_pub)
                     && acc_pub.discharge_sigma(&[leaf_circuit])
                     && acc_pub.discharge_jagged(&[(leaf_digest, &leaf_params_j)]),
                 "the public-segment accumulator discharges all three groups"
@@ -1437,11 +1523,7 @@ pub(super) fn build_first_level_core(
             // the checker holds the nonce range and the row lows.
             for (inner, base) in inners.iter().zip(&ag_pub_bases) {
                 if let Some(base) = base {
-                    check_ag_skip_publics(
-                        &built2.public,
-                        *base,
-                        inner.pcs.zerocheck_grinding().ag_round_one_bits(),
-                    );
+                    check_ag_skip_publics(&built2.public, *base, inner.ag_round_one_bits());
                 }
             }
             for &(v, idx) in &jag_const_rec {
