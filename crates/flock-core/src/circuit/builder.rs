@@ -436,6 +436,10 @@ pub struct ShapeBuilder {
     bus_ports: Vec<(usize, BusDirection, Vec<BusTerm>)>,
     /// See [`Self::prune_unwired`].
     prune_unwired: bool,
+    /// See [`Self::open_public_columns`].
+    open_public_columns: bool,
+    /// See [`Self::pack_live_slots`].
+    pack_live_slots: bool,
 }
 
 impl ShapeBuilder {
@@ -455,6 +459,8 @@ impl ShapeBuilder {
             islands: Vec::new(),
             bus_ports: Vec::new(),
             prune_unwired: false,
+            open_public_columns: false,
+            pack_live_slots: false,
         }
     }
 
@@ -462,6 +468,20 @@ impl ShapeBuilder {
     /// wiring argument ([`Circuit::with_unwired_pruned`]).
     pub fn prune_unwired(&mut self) {
         self.prune_unwired = true;
+    }
+
+    /// Build the circuit with its public columns (gate cell-slots whose live
+    /// cells are all wired to public words) checked by the opening instead of
+    /// the wiring argument ([`Circuit::with_public_columns_opened`]).
+    pub fn open_public_columns(&mut self) {
+        self.open_public_columns = true;
+    }
+
+    /// Build the circuit with the wiring's grand product laid out so its live
+    /// cell-slots merge first ([`Circuit::with_live_slots_packed`]), after
+    /// pruning and opening public columns.
+    pub fn pack_live_slots(&mut self) {
+        self.pack_live_slots = true;
     }
 
     fn find(&mut self, w: Wire) -> usize {
@@ -788,6 +808,12 @@ impl ShapeBuilder {
             Circuit::new_with_fixed_public(&registry, counts.clone(), self.fixed_public, wires)?;
         if self.prune_unwired {
             circuit = circuit.with_unwired_pruned();
+        }
+        if self.open_public_columns {
+            circuit = circuit.with_public_columns_opened();
+        }
+        if self.pack_live_slots {
+            circuit = circuit.with_live_slots_packed();
         }
         if let Some((_, _, first)) = self.bus_ports.first() {
             let ports = self

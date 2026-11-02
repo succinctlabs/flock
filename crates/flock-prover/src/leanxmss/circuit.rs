@@ -446,8 +446,13 @@ impl XmssCircuit {
             publics: Vec::new(),
         };
         // The step rows' bus words and every row's unused outputs need no
-        // copy constraint.
+        // copy constraint, and the columns that only take constants or the
+        // signer's public words (IV, control words, address constants, P) are
+        // checked by the opening. That leaves dead cell-slots among live
+        // ones, so the grand product packs the live ones together.
         b.sb.prune_unwired();
+        b.sb.open_public_columns();
+        b.sb.pack_live_slots();
         let counts: Vec<usize> = kinds.iter().map(|&(count, _)| count).collect();
         let (mut slots, gadgets) = declare_slots(&mut b, nu, &counts);
         let constants = declare_constants(&mut b);
