@@ -2163,6 +2163,30 @@ impl flock_core::circuit::boolean::OperationKernel for Blake3Kernel {
         a: &mut [[u64; 8]],
         b: &mut [[u64; 8]],
     ) {
+        self.fill8_inline(args, base, z, a, b);
+    }
+}
+
+impl Blake3Kernel {
+    /// [`OperationKernel::fill8`], inlined into its caller: one whose `base`
+    /// is a constant mod 64 (`64·w + c`) gets every field's shift and every
+    /// word boundary resolved at compile time, as the hand-written layout
+    /// does — through the trait, `base` is a runtime value.
+    ///
+    /// When the G blocks end on a word boundary, every word of the run is
+    /// stored whole, the bits below `base` in its first word kept: such a
+    /// caller need not clear the run first.
+    ///
+    /// [`OperationKernel::fill8`]: flock_core::circuit::boolean::OperationKernel::fill8
+    #[inline(always)]
+    pub fn fill8_inline(
+        &self,
+        args: [&[u64]; 8],
+        base: usize,
+        z: &mut [[u64; 8]],
+        a: &mut [[u64; 8]],
+        b: &mut [[u64; 8]],
+    ) {
         let word =
             |i: usize| -> [u32; BM_V] { from_fn(|j| (args[j][i / 2] >> (32 * (i % 2))) as u32) };
         let cv: [[u32; BM_V]; 8] = from_fn(word);
@@ -2178,9 +2202,14 @@ impl flock_core::circuit::boolean::OperationKernel for Blake3Kernel {
             word(26),
             word(27),
         );
-        for w in 0..8 {
-            let lo: [u32; BM_V] = from_fn(|j| state[w][j] ^ state[w + 8][j]);
-            batch_major_write_lin(&mut rows, base + G_REGION_BITS + w * WORD_BITS, &lo);
+        let lo: [[u32; BM_V]; 8] = from_fn(|w| from_fn(|j| state[w][j] ^ state[w + 8][j]));
+        let out = base + G_REGION_BITS;
+        if out.is_multiple_of(64) {
+            store_lin_words(&mut rows, out, &lo);
+        } else {
+            for (w, lo) in lo.iter().enumerate() {
+                batch_major_write_lin(&mut rows, out + w * WORD_BITS, lo);
+            }
         }
     }
 }

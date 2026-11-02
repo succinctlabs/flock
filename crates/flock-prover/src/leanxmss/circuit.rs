@@ -41,7 +41,7 @@ use flock_core::{
 use flock_field::F128;
 
 use super::{
-    compress::{M, NEXT, O0, compress_gate, ctl},
+    compress::{self, CompressPacker, M, NEXT, O0, compress_gate, ctl},
     gadgets::{
         address_gate, address_step_gate, chain_gate, chain_io, codeword_gate,
         layer_address_constants, swap_gate,
@@ -192,6 +192,8 @@ pub struct XmssCircuit {
     shape: CircuitShape,
     plan: FillPlan,
     gadgets: Vec<(SlotId, BooleanGate)>,
+    /// The compression slots' driver, in place of the gate's packer.
+    compress: CompressPacker,
     inputs: Vec<Source>,
     publics: Vec<Source>,
 }
@@ -458,12 +460,18 @@ impl XmssCircuit {
         }
         let shape = b.sb.finish().expect("the leanXMSS circuit is well formed");
         let plan = shape.fill_plan();
+        let compress = gadgets
+            .iter()
+            .find(|(_, gate)| gate.name() == compress::NAME)
+            .map(|(_, gate)| CompressPacker::new(gate))
+            .unwrap();
         XmssCircuit {
             n,
             nu,
             shape,
             plan,
             gadgets,
+            compress,
             inputs: b.inputs,
             publics: b.publics,
         }
@@ -574,10 +582,14 @@ impl XmssCircuit {
             .iter()
             .map(|(id, gate)| {
                 let rows = witness.rows::<BooleanGate>(*id);
+                let compress = (gate.name() == compress::NAME).then_some(&self.compress);
                 (
                     self.shape.registry_slot(*id),
                     UnionSlotProverInput::in_place(
-                        move |dst| gate.pack_into(rows, dst),
+                        move |dst| match compress {
+                            Some(packer) => packer.pack_into(rows, dst),
+                            None => gate.pack_into(rows, dst),
+                        },
                         gate.r1cs().csc_lincheck_circuit(),
                     ),
                 )
