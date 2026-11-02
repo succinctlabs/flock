@@ -267,14 +267,14 @@ pub(crate) fn prove_bus<C: Challenger>(
     let nu = cells.nu();
     let rows = 1usize << nu;
     ch.observe_label(DOMAIN_BUS);
-    let bits = grinding.fingerprint_bits_for(live_entries(bus, circuit));
     let mut fingerprint_nonce = Vec::new();
-    let beta = if bits != 0 {
-        let (nonce, beta) = ch.grind_pow_and_sample_f128(bits);
-        fingerprint_nonce.push(nonce);
-        beta
-    } else {
-        ch.sample_f128()
+    let beta = match grinding.fingerprint_target_for(live_entries(bus, circuit)) {
+        Some(target) => {
+            let (nonce, beta) = ch.grind_pow_below_and_sample_f128(target);
+            fingerprint_nonce.push(nonce);
+            beta
+        }
+        None => ch.sample_f128(),
     };
     let gamma: Vec<F128> = (0..bus.width).map(|_| ch.sample_f128()).collect();
     let challenges = Challenges { beta, gamma };
@@ -366,14 +366,13 @@ pub(crate) fn verify_bus<C: Challenger>(
         return Err(WiringError::MalformedProof);
     }
     ch.observe_label(DOMAIN_BUS);
-    let bits = grinding.fingerprint_bits_for(live_entries(bus, circuit));
-    let beta = if bits != 0 {
+    let beta = if let Some(target) = grinding.fingerprint_target_for(live_entries(bus, circuit)) {
         let [nonce] = proof.fingerprint_nonce[..] else {
             return Err(WiringError::BusGkr(
                 crate::product_gkr::ProductGkrError::InvalidGrinding,
             ));
         };
-        ch.verify_pow_and_sample_f128(nonce, bits)
+        ch.verify_pow_below_and_sample_f128(nonce, target)
             .ok_or(WiringError::BusGkr(
                 crate::product_gkr::ProductGkrError::InvalidGrinding,
             ))?

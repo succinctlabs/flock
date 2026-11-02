@@ -161,6 +161,87 @@ The products are unchanged, so soundness is the wiring's, restricted to the
 cells it still covers. The bus reads its words through its own gathers.
 Pruning is opt-in, so recursion circuits keep their transcripts.
 
+### 1.7 Public columns
+
+Many io words take nothing but public words: the chain steps' IV, control
+word and `P`, the other compressions' control words, the address
+gadgets' constants. Wiring them cost a cell per row and gained nothing,
+because the verifier already knows every value they must hold.
+
+`Circuit::with_public_columns_opened` (`ShapeBuilder::open_public_columns`)
+finds every gate cell-slot whose live cells are all wired to public words
+and takes it out of the wiring's grand product:
+- Its cells leave their wire classes, so σ rotates what is left of each
+  class and the slot is dead in the live mask.
+- It keeps its gather claim at the GKR's row point `ρ_row`, but the proof
+  does not carry the value. The verifier computes it from the public words,
+  `Σ_row eq(ρ_row, row) · public[p(row)]`, and the opening checks the
+  committed column against it.
+- The digest records which slots are public columns. Each row's public word
+  follows from the (digest-bound) wiring.
+
+**Soundness.** The claim's row point comes from the grand product, after the
+commitment, so one evaluation pins the whole committed column, the public
+words on live rows and zero on dummy rows, up to `ν/2^128`. That is what the
+copy constraints to the public cells said. Whatever else a class holds stays
+in the grand product, still tied to its public word. A column with an
+unwired live cell, or one wired to a gate, stays in the wiring.
+
+At 1000 signatures this takes 24 of the 66 gathered cell-slots out:
+1.87M live cells become 1.22M. The 117k public cells left are in mixed
+columns (the hashes' IV and `P` words, public on some rows and wired to a
+gate on others); taking those out would need a claim over only the public
+rows.
+
+The test `public_column_is_checked_by_the_opening` runs the product chain
+on multipliers other than its public ones. Every gate and every remaining
+wire holds, and the opening rejects.
+
+### 1.8 Packing live slots
+
+The product tree merges cell-slot `q` with `q + 2^(c−1)` first, then with
+`q + 2^(c−2)`, and so on, and a merged layer is as long as its longer
+input. After pruning and opening public columns, every one of leanXMSS's
+64 first merges paired a live slot with a dead one. So the bottom seven
+layers were each about as long as the leaves, and each layer's sumcheck
+walked every live cell.
+
+`Circuit::with_live_slots_packed` (`ShapeBuilder::pack_live_slots`) lays the
+grand product's slots out by live count, at bit-reversed positions, so
+slots of similar size merge first. Only the grand product moves: σ and the
+live mask are in its positions, and the recombination maps each cell-slot
+to its position. The gather and the public columns are per cell-slot and do
+not change. The digest records the order.
+
+Same leaves, same live counts: the GKR's work goes from 38 ms to 21 ms on
+one thread, measured on the product alone.
+
+### 1.9 Grinding to the degree, not a power of two
+
+The fingerprint `(α, β)` fails with probability `(L − 1)/2^128` over `L`
+live leaves. Grinding `bits_for_degree(L − 1)` bits brings that to
+`2^-128`, but it rounds `L − 1` up to a power of two: up to twice the
+needed work. At 1.22M live cells it grinds 21 bits, `2^21 = 2.10M` hashes,
+for a degree of 1.23M.
+
+A PoW can take any target. A nonce passes when its hash's first eight
+bytes, read big-endian, are below `T`. `T = 2^(64 − b)` is exactly `b`
+leading zero bits, so the bit grind is a special case.
+`T = ⌊(2^64 − 1)/(L − 1)⌋` passes with probability below `1/(L − 1)`, so the
+event stays strictly below `2^-128`, and the expected work is `L − 1`
+hashes. The wiring's and the bus's fingerprints grind to that target
+(`BatchedGrinding::fingerprint_target_for`).
+
+The target grind is `Challenger::grind_pow_below_and_sample_f128`. The plain
+BLAKE3 and SHA-256 transcripts implement it. The chained transcript, which
+the recursion replays in-circuit with leading-zero rows, falls back to the
+fewest bits that cover the target. That is exactly the old bit count, so
+recursion transcripts do not change.
+
+Over 40 transcripts on one thread, at `L − 1 = 1,226,045`: 21 bits averaged
+60 ms (2.50M hashes), the target 28 ms (1.19M hashes). The bus's 504k live
+leaves sit just under `2^19`, so its grind barely changes.
+
 ## 2. leanXMSS on the bus
 
 ### 2.1 Rows
@@ -347,6 +428,10 @@ cores. Alone, the wiring takes 37 ms on 10 threads and 82 ms on one, about
 are the GKR fingerprint grind, 36 the GKR layer sumchecks and 12 the tuple
 bus.
 
+**Update (§1.7–1.9).** With public columns, packing and the target grind,
+the wiring's live cells are 1.22M, its GKR work is about 22 ms on one
+thread instead of 47, and its grind about 29 ms instead of 50 on average.
+
 **Deferred: test the product at two points instead of grinding.** The
 fingerprint `(α, β)` fails with probability `(L − 1)/2^128` over `L` live
 cells. Today one grind of `bits_for_degree(L − 1)` bits (21 at 1000
@@ -362,6 +447,10 @@ signatures) brings it to 2^-128. Two independent points give
   a wash on average (grind ~46 ms against ~42 ms). Past 2^21 live cells the
   grind becomes 22 bits and the second point wins by about 2×. Its cost is
   also fixed, while a grind's 95th percentile is about 3× its mean.
+- **Since the target grind (§1.9)** the grind costs `L − 1` hashes, not the
+  next power of two, so the second point no longer wins by 2× past a power
+  of two. It is a wash at any size; its remaining advantage is the fixed
+  cost.
 - **Recursion:** the tower's node GKRs grind about 18 bits (~6 ms
   single-thread), and the parent circuit checks each grind with one
   PowMask row. Two points would add four boundary values per layer there,
