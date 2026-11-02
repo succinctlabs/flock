@@ -527,7 +527,7 @@ fn in_place_drivers_zero_trailing_group_in_dirty_destination() {
         assert_in_place_matches_canonical_on_dirty_destination(
             count,
             nu,
-            None,
+            Some(spread.useful_bits()),
             spread.generate_witness_batch_major(&spread_rows, nu),
             |dst| spread.generate_witness_batch_major_into(&spread_rows, dst),
         );
@@ -542,7 +542,7 @@ fn in_place_drivers_zero_trailing_group_in_dirty_destination() {
         assert_in_place_matches_canonical_on_dirty_destination(
             count,
             nu,
-            None,
+            Some(pow_mask.useful_bits()),
             pow_mask.generate_witness_batch_major(&pow_mask_rows, nu),
             |dst| pow_mask.generate_witness_batch_major_into(&pow_mask_rows, dst),
         );
@@ -559,7 +559,7 @@ fn in_place_drivers_zero_trailing_group_in_dirty_destination() {
         assert_in_place_matches_canonical_on_dirty_destination(
             count,
             nu,
-            None,
+            Some(FamilyTransposeTileTable::USEFUL_BITS),
             FamilyTransposeTileTable::generate_witness_batch_major(&tile_rows, nu),
             |dst| FamilyTransposeTileTable::generate_witness_batch_major_into(&tile_rows, dst),
         );

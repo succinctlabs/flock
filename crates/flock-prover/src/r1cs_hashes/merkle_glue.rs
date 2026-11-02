@@ -46,7 +46,6 @@ use std::sync::OnceLock;
 use flock_core::{
     r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout},
     schedule::IoWord,
-    scratch::take_u8,
     union::SlotWitnessDest,
     zerocheck::K_SKIP,
 };
@@ -56,7 +55,7 @@ use rayon::prelude::{
 };
 
 use crate::r1cs_hashes::{
-    common::{drive_witness_batch_major_partial_into, identity},
+    common::{BM_V, BmRow, drive_witness_batch_major_partial_into, identity},
     merkle_r1cs::SLOT_WORDS,
 };
 
@@ -132,91 +131,97 @@ fn scatter_zab(
     (z, a, b, stripe)
 }
 
-/// [`scatter_zab`] writing into a union slot's destination block — the
-/// copy-free assembly path ([`flock_core::union::SlotWitnessDest`]'s
-/// contract, mirroring `common::drive_witness_batch_major_partial_into`):
-/// live rows' words are written at their BatchMajor addresses; under
-/// `elide_padding_writes` the all-dummy groups are skipped (already zero, or
-/// dirty-but-unread per the mode) while the trailing partial group still
-/// zero-flushes its dead lanes, otherwise the whole block is zero-filled
-/// first. The stripe is pooled; only the groups the count-proportional
-/// lincheck reads are cleared under elide.
-pub(crate) fn scatter_zab_into(
-    per_row: &[[Vec<bool>; 3]],
-    k: usize,
+// ---------------------------------------------------------------------------
+// The packed glue path
+// ---------------------------------------------------------------------------
+
+/// One lane of a batch-major group's staging rows (`rz[u][lane]`, …): a
+/// packed glue builder writes its row's `(z, a, b)` here as block-`u64`s —
+/// bit `j` of the row at bit `j % 64` of `u64` `j / 64` — instead of three
+/// `Vec<bool>`s. The rows start zero, so fields are OR-ed in.
+struct LaneRows<'r> {
+    rz: &'r mut [BmRow],
+    ra: &'r mut [BmRow],
+    rb: &'r mut [BmRow],
+    lane: usize,
+}
+
+impl LaneRows<'_> {
+    /// Bits `[at, at + width)` of `z`, `a`, `b` (`width <= 64`; the field
+    /// may straddle two `u64`s).
+    #[inline]
+    fn put(&mut self, at: usize, width: usize, z: u64, a: u64, b: u64) {
+        debug_assert!((1..=64).contains(&width));
+        let mask = u64::MAX >> (64 - width);
+        let (z, a, b) = (z & mask, a & mask, b & mask);
+        let (u, s, l) = (at / 64, at % 64, self.lane);
+        self.rz[u][l] |= z << s;
+        self.ra[u][l] |= a << s;
+        self.rb[u][l] |= b << s;
+        if s + width > 64 {
+            self.rz[u + 1][l] |= z >> (64 - s);
+            self.ra[u + 1][l] |= a >> (64 - s);
+            self.rb[u + 1][l] |= b >> (64 - s);
+        }
+    }
+
+    /// The whole 128-bit word `w`.
+    #[inline]
+    fn word(&mut self, w: usize, z: u128, a: u128, b: u128) {
+        self.put(128 * w, 64, z as u64, a as u64, b as u64);
+        self.put(
+            128 * w + 64,
+            64,
+            (z >> 64) as u64,
+            (a >> 64) as u64,
+            (b >> 64) as u64,
+        );
+    }
+}
+
+/// A glue table's in-place witness through the shared partial batch-major
+/// driver (non-temporal flush, 8×8 stripe transpose), its rows built packed
+/// by `build`. Same words as the `Vec<bool>` path; the padding contract is
+/// the driver's (the BLAKE3 and SHA-2 tables').
+fn generate_packed_into<S: Sync>(
+    rows: &[S],
+    k_log: usize,
     useful_bits: usize,
     dst: SlotWitnessDest<'_>,
+    build: impl Fn(&S, &mut LaneRows<'_>) + Sync + Send,
 ) -> Vec<u8> {
-    let words_per_block = k / 128;
-    let SlotWitnessDest {
-        z,
-        a,
-        b,
-        elide_padding_writes,
-        dead_padding_unread: _,
-    } = dst;
-    assert_eq!(z.len() % words_per_block, 0, "aligned slot block");
-    let n_total = z.len() / words_per_block;
-    assert!(per_row.len() <= n_total, "live rows fit the capacity");
-    assert!(
-        n_total.is_multiple_of(8),
-        "the lincheck stripe needs nu >= 3"
-    );
-    let nu = n_total.trailing_zeros() as usize;
-    if !elide_padding_writes {
-        for buf in [&mut *z, &mut *a, &mut *b] {
-            buf.par_chunks_mut(1 << 16).for_each(|c| c.fill(F128::ZERO));
-        }
-    } else {
-        // Elision covers the all-dummy groups only. The trailing partial
-        // group's dead lanes are READ even on a dirty pooled destination: the
-        // RS zerocheck's round 1 takes whole 512-bit sub-windows (4 rows of a
-        // chunk-column) up to the last live row, so stale words there break
-        // the proof.
-        let live_rows = per_row.len().next_multiple_of(8);
-        for w in 0..words_per_block {
-            let column = w << nu;
-            for buf in [&mut *z, &mut *a, &mut *b] {
-                buf[column + per_row.len()..column + live_rows].fill(F128::ZERO);
+    let words_per_block = (1usize << k_log) / 128;
+    let n_blocks_log = (dst.z.len() / words_per_block).trailing_zeros() as usize;
+    let row_u64 = 2 * useful_bits.div_ceil(128);
+    drive_witness_batch_major_partial_into(
+        rows,
+        n_blocks_log,
+        k_log,
+        useful_bits,
+        dst,
+        |group, rz, ra, rb| {
+            for r in [&mut *rz, &mut *ra, &mut *rb] {
+                r[..row_u64].fill([0; BM_V]);
             }
-        }
-    }
-    for (i, [pz, pa, pb]) in per_row.iter().enumerate() {
-        for w in 0..words_per_block {
-            let addr = (w << nu) + i;
-            z[addr] = pack_word(pz, w * 128);
-            a[addr] = pack_word(pa, w * 128);
-            b[addr] = pack_word(pb, w * 128);
-        }
-    }
-    let mut stripe = take_u8((n_total / 8) * k);
-    let live_groups = per_row.len().div_ceil(8);
-    let zero_groups = if elide_padding_writes {
-        live_groups
-    } else {
-        n_total / 8
-    };
-    stripe
-        .par_chunks_mut(k)
-        .take(zero_groups)
-        .for_each(|g| g.fill(0));
-    stripe[..live_groups * k]
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(g, chunk)| {
-            for r in 0..8 {
-                let row = 8 * g + r;
-                if row >= per_row.len() {
-                    continue;
-                }
-                for c in 0..useful_bits {
-                    if per_row[row][0][c] {
-                        chunk[c] |= 1u8 << r;
-                    }
-                }
+            for (lane, input) in group.iter().enumerate() {
+                build(
+                    input,
+                    &mut LaneRows {
+                        rz: &mut *rz,
+                        ra: &mut *ra,
+                        rb: &mut *rb,
+                        lane,
+                    },
+                );
             }
-        });
-    stripe
+        },
+    )
+}
+
+/// Bits `0, 8, …, 56` of `v` as an 8-bit value.
+#[inline]
+fn byte_low_bits(v: u64) -> u64 {
+    (v & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56
 }
 
 // ---------------------------------------------------------------------------
@@ -414,80 +419,32 @@ impl SwapTable {
 
     /// [`Self::generate_witness_batch_major`] writing into a union slot's
     /// destination block — the copy-free union assembly path. Every column
-    /// group is word-aligned, so the rows are built as packed `u64` lanes
-    /// ([`Self::packed_row`]) through the partial batch-major driver, never
-    /// as per-bit bools: 7,294 rows went 28.5 → ~1 ms at one thread.
+    /// group is word-aligned, so a row is a dozen word operations
+    /// ([`generate_packed_into`]), never per-bit bools: 7,294 rows went
+    /// 28.5 → 0.35 ms at one thread.
     pub fn generate_witness_batch_major_into(
         rows: &[SwapInput],
         dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
-        let words_per_block = Self::k() / 128;
-        let n_blocks_log = (dst.z.len() / words_per_block).trailing_zeros() as usize;
-        drive_witness_batch_major_partial_into(
-            rows,
-            n_blocks_log,
-            Self::K_LOG,
-            Self::USEFUL_BITS,
-            dst,
-            |group, rz, ra, rb| {
-                for (lane, input) in group.iter().enumerate() {
-                    let [z, a, b] = Self::packed_row(input);
-                    for u in 0..Self::ROW_U64 {
-                        rz[u][lane] = z[u];
-                        ra[u][lane] = a[u];
-                        rb[u][lane] = b[u];
-                    }
-                }
-            },
-        )
-    }
-
-    /// The `u64`s of a row's useful chunk-columns: 12 words.
-    const ROW_U64: usize = 2 * Self::USEFUL_BITS.div_ceil(128);
-
-    /// [`Self::build_witness`] as block-`u64`s: `(z, a, b)` over the useful
-    /// chunk-columns, bit `j` of the block at bit `j % 64` of `u64` `j / 64`.
-    fn packed_row(input: &SwapInput) -> [[u64; Self::ROW_U64]; 3] {
-        const ONES: u64 = !0;
-        let lanes = |d: &[u32; SLOT_WORDS]| -> [u64; SLOT_BITS / 64] {
-            std::array::from_fn(|i| d[2 * i] as u64 | (d[2 * i + 1] as u64) << 32)
-        };
-        let (prev, sib) = (lanes(&input.prev), lanes(&input.sib));
-        let not_bit = if input.bit_word & 1 == 1 { 0 } else { ONES };
-        let (mut z, mut a, mut b) = (
-            [0u64; Self::ROW_U64],
-            [0u64; Self::ROW_U64],
-            [0u64; Self::ROW_U64],
-        );
-        // A free column: `z·1 = z`.
-        let mut free = |at: usize, v: u64| {
-            z[at] = v;
-            a[at] = v;
-            b[at] = ONES;
-        };
-        free(Self::BIT / 64, input.bit_word as u64);
-        free(Self::BIT / 64 + 1, (input.bit_word >> 64) as u64);
-        for (i, (&p, &s)) in prev.iter().zip(&sib).enumerate() {
-            free(Self::PREV / 64 + i, p);
-            free(Self::SIB / 64 + i, s);
-        }
-        for (i, (&p, &s)) in prev.iter().zip(&sib).enumerate() {
-            let t = not_bit & (p ^ s);
-            z[Self::T / 64 + i] = t;
-            a[Self::T / 64 + i] = not_bit;
-            b[Self::T / 64 + i] = p ^ s;
-            for (at, v) in [(Self::LEFT / 64 + i, s ^ t), (Self::RIGHT / 64 + i, p ^ t)] {
-                z[at] = v;
-                a[at] = v;
-                b[at] = ONES;
+        const ONES: u64 = u64::MAX;
+        generate_packed_into(rows, Self::K_LOG, Self::USEFUL_BITS, dst, |input, r| {
+            let lanes = |d: &[u32; SLOT_WORDS]| -> [u64; SLOT_BITS / 64] {
+                std::array::from_fn(|i| d[2 * i] as u64 | (d[2 * i + 1] as u64) << 32)
+            };
+            let (prev, sib) = (lanes(&input.prev), lanes(&input.sib));
+            let not_bit = if input.bit_word & 1 == 1 { 0 } else { ONES };
+            let bw = input.bit_word;
+            r.word(Self::BIT / 128, bw, bw, u128::MAX);
+            for (i, (&p, &sb)) in prev.iter().zip(&sib).enumerate() {
+                let t = not_bit & (p ^ sb);
+                r.put(Self::PREV + 64 * i, 64, p, p, ONES);
+                r.put(Self::SIB + 64 * i, 64, sb, sb, ONES);
+                r.put(Self::T + 64 * i, 64, t, not_bit, p ^ sb);
+                r.put(Self::LEFT + 64 * i, 64, sb ^ t, sb ^ t, ONES);
+                r.put(Self::RIGHT + 64 * i, 64, p ^ t, p ^ t, ONES);
             }
-        }
-        let c = Self::CONST / 64;
-        let one = 1u64 << (Self::CONST % 64);
-        z[c] = one;
-        a[c] = one;
-        b[c] = one;
-        [z, a, b]
+            r.put(Self::CONST, 1, 1, 1, 1);
+        })
     }
 }
 
@@ -771,11 +728,25 @@ impl BitSpreadTable {
         rows: &[BitSpreadInput],
         dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
-        let per: Vec<[Vec<bool>; 3]> = rows
-            .par_iter()
-            .map(|&i| self.build_masked_witness(i))
-            .collect();
-        scatter_zab_into(&per, self.k(), self.useful_bits(), dst)
+        const ONES: u128 = u128::MAX;
+        generate_packed_into(rows, self.k_log(), self.useful_bits(), dst, |i, r| {
+            let w = i.word;
+            r.word(0, w, w, ONES);
+            for l in 0..self.depth {
+                let v = (w >> l) & 1;
+                r.word(self.out(l) / 128, v, v, ONES);
+            }
+            r.word(self.mask_pos() / 128, i.zero_mask, i.zero_mask, ONES);
+            // z/check stays zero; A/B carry the product inputs.
+            r.word(self.check_pos() / 128, 0, w, i.zero_mask);
+            let (pm, pp) = (i.position_mask, i.position_prefix);
+            r.word(self.position_mask_pos() / 128, pm, pm, ONES);
+            r.word(self.position_prefix_pos() / 128, pp, pp, ONES);
+            let masked = w & pm;
+            r.word(self.masked_position_pos() / 128, masked, w, pm);
+            r.word(self.position_pos() / 128, masked ^ pp, masked ^ pp, ONES);
+            r.put(self.const_pos(), 1, 1, 1, 1);
+        })
     }
 }
 
@@ -866,7 +837,7 @@ impl FamilyTransposeTileTable {
     const SELECTED_PRODUCTS: usize = Self::DST_ONE_HOT + 16 * 3;
     const CONST: usize = Self::SELECTED_PRODUCTS + 8 * 8 * 16;
     const OUTPUT: usize = 18 * 128;
-    const USEFUL_BITS: usize = Self::OUTPUT + 8 * 128;
+    pub const USEFUL_BITS: usize = Self::OUTPUT + 8 * 128;
 
     fn k() -> usize {
         1usize << Self::K_LOG
@@ -1100,8 +1071,50 @@ impl FamilyTransposeTileTable {
         rows: &[FamilyTransposeTileInput],
         dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
-        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
-        scatter_zab_into(&per, Self::k(), Self::USEFUL_BITS, dst)
+        const ONES: u128 = u128::MAX;
+        generate_packed_into(rows, Self::K_LOG, Self::USEFUL_BITS, dst, |input, r| {
+            let word = |x: F128| x.lo as u128 | (x.hi as u128) << 64;
+            for (w, &row) in input.rows.iter().enumerate() {
+                r.word(Self::INPUT / 128 + w, word(row), word(row), ONES);
+            }
+            let sel = input.selector;
+            r.word(Self::SELECTOR / 128, sel as u128, sel as u128, ONES);
+            r.put(Self::NOT_SELECTOR, 8, !sel as u64, !sel as u64, 0xff);
+            for source in [true, false] {
+                let nibble = if source { sel & 0x0f } else { sel >> 4 } as usize;
+                for value in 0..16 {
+                    let lit = |q: usize| (nibble >> q) & 1 == (value >> q) & 1;
+                    let (z0, z1) = (lit(0) && lit(1), lit(2) && lit(3));
+                    let bits = |x: [bool; 3]| x[0] as u64 | (x[1] as u64) << 1 | (x[2] as u64) << 2;
+                    r.put(
+                        Self::hot_base(source, value),
+                        3,
+                        bits([z0, z1, z0 && z1]),
+                        bits([lit(0), lit(2), z0]),
+                        bits([lit(1), lit(3), z1]),
+                    );
+                }
+            }
+            // Products `x_{r,c,s} · [s = source]` over the 16 source bytes;
+            // the selected bit lands at row `r` of every destination byte.
+            let (source, destination) = ((sel & 0x0f) as usize, (sel >> 4) as usize);
+            let hot = 1u64 << source;
+            let mut out_a = [0u128; 8];
+            for (row_i, &row) in input.rows.iter().enumerate() {
+                for (c, out) in out_a.iter_mut().enumerate() {
+                    let x = byte_low_bits(row.lo >> c) | byte_low_bits(row.hi >> c) << 8;
+                    r.put(Self::product(row_i, c, 0), 16, x & hot, x, hot);
+                    if x & hot != 0 {
+                        *out |= 0x0101_0101_0101_0101_0101_0101_0101_0101u128 << row_i;
+                    }
+                }
+            }
+            let out_b = 0xffu128 << (8 * destination);
+            for (c, &a) in out_a.iter().enumerate() {
+                r.word(Self::OUTPUT / 128 + c, a & out_b, a, out_b);
+            }
+            r.put(Self::CONST, 1, 1, 1, 1);
+        })
     }
 }
 
@@ -1243,8 +1256,19 @@ impl PowMaskTable {
         rows: &[PowMaskInput],
         dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
-        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
-        scatter_zab_into(&per, self.k(), self.useful_bits(), dst)
+        const ONES: u64 = u64::MAX;
+        generate_packed_into(rows, self.k_log(), self.useful_bits(), dst, |i, r| {
+            r.word(0, i.pred, i.pred, u128::MAX);
+            r.word(1, i.nonce, i.nonce, u128::MAX);
+            let (mask, nonce_hi) = (i.mask as u64, (i.nonce >> 64) as u64);
+            r.put(256, 64, mask, mask, ONES);
+            r.put(320, 64, nonce_hi, nonce_hi, ONES);
+            // z/check stays zero; A/B carry the product inputs
+            // `pred_j · z[256 + j]`, j < 127.
+            r.put(384, 64, 0, i.pred as u64, mask);
+            r.put(448, 63, 0, (i.pred >> 64) as u64, nonce_hi);
+            r.put(self.const_pos(), 1, 1, 1, 1);
+        })
     }
 }
 
@@ -1299,61 +1323,108 @@ mod family_h_tests {
 }
 
 #[cfg(test)]
-mod swap_tests {
+mod packed_glue_tests {
     use flock_core::union::SlotWitnessDest;
     use flock_field::F128;
 
-    use crate::r1cs_hashes::merkle_glue::{SwapInput, SwapTable, scatter_zab_into};
+    use crate::r1cs_hashes::merkle_glue::{
+        BitSpreadInput, BitSpreadTable, FamilyTransposeTileInput, FamilyTransposeTileTable,
+        PowMaskInput, PowMaskTable, SwapInput, SwapTable,
+    };
 
-    fn input(i: u64) -> SwapInput {
-        let w = |s: u64| -> [u32; 8] {
-            std::array::from_fn(|j| (s.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (j * 4)) as u32)
-        };
-        SwapInput {
-            bit_word: (i as u128).wrapping_mul(0x0123_4567_89ab_cdef_fedc_ba98_7654_3211),
-            prev: w(2 * i + 1),
-            sib: w(2 * i + 2),
-        }
+    fn mix(i: u64, salt: u64) -> u128 {
+        let x = (i ^ salt).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (x as u128) << 64 | x.rotate_left(29) as u128
     }
 
-    /// The packed generator writes exactly the bool path's `z`, `a`, `b` and
-    /// lincheck stripe, at full, partial and empty counts, with padding
-    /// writes elided over a zero buffer and not.
+    /// The packed in-place generator writes exactly the canonical
+    /// `Vec<bool>` path's `z`, `a`, `b` and lincheck stripe into a zero,
+    /// non-eliding destination, at full, partial and empty counts.
+    fn check(
+        what: &str,
+        nu: usize,
+        canonical: (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>),
+        generate: impl Fn(SlotWitnessDest<'_>) -> Vec<u8>,
+    ) {
+        let n = canonical.0.len();
+        let (mut z, mut a, mut b) = (
+            vec![F128::ZERO; n],
+            vec![F128::ZERO; n],
+            vec![F128::ZERO; n],
+        );
+        let stripe = generate(SlotWitnessDest {
+            z: &mut z,
+            a: &mut a,
+            b: &mut b,
+            elide_padding_writes: false,
+            dead_padding_unread: false,
+        });
+        assert!(z == canonical.0, "{what}: z (nu {nu})");
+        assert!(a == canonical.1, "{what}: a (nu {nu})");
+        assert!(b == canonical.2, "{what}: b (nu {nu})");
+        assert!(stripe == canonical.3, "{what}: stripe (nu {nu})");
+    }
+
     #[test]
-    fn packed_swap_witness_matches_the_bool_path() {
+    fn packed_glue_witnesses_match_the_bool_path() {
         let nu = 6;
-        let words = (1 << nu) * (SwapTable::k() / 128);
-        for count in [0usize, 1, 7, 8, 9, 37, 64] {
-            for elide in [false, true] {
-                let rows: Vec<SwapInput> = (0..count as u64).map(input).collect();
-                let run = |packed: bool| {
-                    let (mut z, mut a, mut b) = (
-                        vec![F128::ZERO; words],
-                        vec![F128::ZERO; words],
-                        vec![F128::ZERO; words],
-                    );
-                    let dst = SlotWitnessDest {
-                        z: &mut z,
-                        a: &mut a,
-                        b: &mut b,
-                        elide_padding_writes: elide,
-                        dead_padding_unread: false,
-                    };
-                    let stripe = if packed {
-                        SwapTable::generate_witness_batch_major_into(&rows, dst)
-                    } else {
-                        let per: Vec<_> = rows.iter().map(SwapTable::build_witness).collect();
-                        scatter_zab_into(&per, SwapTable::k(), SwapTable::USEFUL_BITS, dst)
-                    };
-                    (z, a, b, stripe)
-                };
-                let (want, got) = (run(false), run(true));
-                assert!(want.0 == got.0, "z, count {count}, elide {elide}");
-                assert!(want.1 == got.1, "a, count {count}, elide {elide}");
-                assert!(want.2 == got.2, "b, count {count}, elide {elide}");
-                let live = count.div_ceil(8) * SwapTable::k();
-                assert_eq!(want.3[..live], got.3[..live], "stripe, count {count}");
-            }
+        let spread = BitSpreadTable::new(24);
+        for count in [0u64, 1, 7, 8, 9, 37, 64] {
+            let swap: Vec<SwapInput> = (0..count)
+                .map(|i| SwapInput {
+                    bit_word: mix(i, 1),
+                    prev: std::array::from_fn(|j| mix(i, 2 + j as u64) as u32),
+                    sib: std::array::from_fn(|j| mix(i, 20 + j as u64) as u32),
+                })
+                .collect();
+            check(
+                "swap",
+                nu,
+                SwapTable::generate_witness_batch_major(&swap, nu),
+                |dst| SwapTable::generate_witness_batch_major_into(&swap, dst),
+            );
+            let spread_rows: Vec<BitSpreadInput> = (0..count)
+                .map(|i| BitSpreadInput {
+                    word: mix(i, 3),
+                    zero_mask: mix(i, 4) & mix(i, 5),
+                    position_mask: mix(i, 6),
+                    position_prefix: mix(i, 7),
+                })
+                .collect();
+            check(
+                "spread",
+                nu,
+                spread.generate_witness_batch_major(&spread_rows, nu),
+                |dst| spread.generate_witness_batch_major_into(&spread_rows, dst),
+            );
+            let pow: Vec<PowMaskInput> = (0..count)
+                .map(|i| PowMaskInput {
+                    pred: mix(i, 8),
+                    nonce: mix(i, 9),
+                    mask: mix(i, 10),
+                })
+                .collect();
+            check(
+                "pow mask",
+                nu,
+                PowMaskTable.generate_witness_batch_major(&pow, nu),
+                |dst| PowMaskTable.generate_witness_batch_major_into(&pow, dst),
+            );
+            let tiles: Vec<FamilyTransposeTileInput> = (0..count)
+                .map(|i| FamilyTransposeTileInput {
+                    rows: std::array::from_fn(|r| {
+                        let x = mix(i, 11 + r as u64);
+                        F128::new(x as u64, (x >> 64) as u64)
+                    }),
+                    selector: mix(i, 30) as u8,
+                })
+                .collect();
+            check(
+                "family tile",
+                nu,
+                FamilyTransposeTileTable::generate_witness_batch_major(&tiles, nu),
+                |dst| FamilyTransposeTileTable::generate_witness_batch_major_into(&tiles, dst),
+            );
         }
     }
 }
