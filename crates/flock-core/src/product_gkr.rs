@@ -85,7 +85,7 @@ use rayon::prelude::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    challenger::{Challenger, grinding_bits_for_degree},
+    challenger::{Challenger, grinding_target_for_degree, pow_target_for_bits},
     field::F128,
     fold_min_len,
     scratch::{give_f128, take_f128},
@@ -1111,7 +1111,8 @@ pub struct ProductGkrBatchedProof {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchedGrinding {
     /// Nonzero enables the initial `(alpha, beta)` product fingerprint grind.
-    /// Its actual bit count is raised to cover the live product degree.
+    /// Its actual target is lowered to cover the live product degree
+    /// ([`Self::fingerprint_target_for`]).
     pub fingerprint_bits: u32,
     /// Linear batching challenge combining the two product circuits.
     pub lambda_bits: u32,
@@ -1140,19 +1141,24 @@ impl BatchedGrinding {
         }
     }
 
+    /// The fingerprint grind's PoW target
+    /// ([`Challenger::grind_pow_below_and_sample_f128`]), `None` without one:
+    /// the policy's `2^-fingerprint_bits`, lowered to cover the fingerprint's
+    /// degree `L − 1` for `L` live leaves. The expected work is then linear in
+    /// `L` rather than the next power of two; a transcript without targets
+    /// grinds the covering bit count, which is the old
+    /// `max(fingerprint_bits, grinding_bits_for_degree(L − 1))`.
     #[inline]
-    pub(crate) fn fingerprint_bits_for(self, live_entries: usize) -> u32 {
-        if self.fingerprint_bits == 0 {
-            0
-        } else {
-            self.fingerprint_bits
-                .max(grinding_bits_for_degree(live_entries.saturating_sub(1)))
-        }
+    pub(crate) fn fingerprint_target_for(self, live_entries: usize) -> Option<u64> {
+        (self.fingerprint_bits != 0).then(|| {
+            pow_target_for_bits(self.fingerprint_bits)
+                .min(grinding_target_for_degree(live_entries.saturating_sub(1)))
+        })
     }
 
     #[inline]
     fn nonce_count(self, mu: usize, live_entries: usize) -> usize {
-        usize::from(self.fingerprint_bits_for(live_entries) != 0)
+        usize::from(self.fingerprint_target_for(live_entries).is_some())
             + mu * usize::from(self.lambda_bits != 0)
             + (mu * mu.saturating_sub(1) / 2) * usize::from(self.round_bits != 0)
             + mu * usize::from(self.close_bits != 0)
@@ -1611,11 +1617,15 @@ fn prove_batched_impl<C: Challenger>(
     ch.observe_label(DOMAIN_BATCHED);
     let live_entries = live.map_or(n, |m| m.counts.iter().sum());
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(mu, live_entries));
-    let alpha = grind_sample(
-        ch,
-        &mut grinding_nonces,
-        grinding.fingerprint_bits_for(live_entries),
-    );
+    let alpha = match grinding.fingerprint_target_for(live_entries) {
+        Some(target) => {
+            let (nonce, alpha) = ch.grind_pow_below_and_sample_f128(target);
+            grinding_nonces.push(nonce);
+            alpha
+        }
+        None => ch.sample_f128(),
+    };
+    tp(&mut t, "fingerprint grind");
     let beta = ch.sample_f128();
 
     if !force_dense && let Some(m) = live {
@@ -1965,7 +1975,7 @@ fn verify_batched_core<C: Challenger>(
     let mut nonces = NonceReader::new(&proof.grinding_nonces);
 
     ch.observe_label(DOMAIN_BATCHED);
-    let alpha = nonces.sample(ch, grinding.fingerprint_bits_for(live_entries))?;
+    let alpha = nonces.sample_below(ch, grinding.fingerprint_target_for(live_entries))?;
     let beta = ch.sample_f128();
 
     let (r_pt, claim_l, claim_r) = verify_reduction(
@@ -2047,6 +2057,25 @@ struct NonceReader<'a> {
 impl<'a> NonceReader<'a> {
     fn new(nonces: &'a [u64]) -> Self {
         Self { nonces, next: 0 }
+    }
+
+    /// Sample a challenge, checking the next nonce's PoW against `target`
+    /// when there is one.
+    fn sample_below<C: Challenger>(
+        &mut self,
+        ch: &mut C,
+        target: Option<u64>,
+    ) -> Result<F128, ProductGkrError> {
+        let Some(target) = target else {
+            return Ok(ch.sample_f128());
+        };
+        let nonce = *self
+            .nonces
+            .get(self.next)
+            .ok_or(ProductGkrError::InvalidGrinding)?;
+        self.next += 1;
+        ch.verify_pow_below_and_sample_f128(nonce, target)
+            .ok_or(ProductGkrError::InvalidGrinding)
     }
 
     /// Sample a challenge, checking the next nonce's PoW when `bits ≠ 0`.
