@@ -51,7 +51,7 @@ pub use crate::tower::{
         RootBundle, TowerVerifyError, TowerVk, TowerVkFingerprint, verify_root, verify_root_bytes,
     },
     xmss_leaf::{XmssFlNode, XmssLeaf, build_xmss_first_level_node, build_xmss_leaf},
-    xmss_tower::{XmssStatement, XmssTower, xmss_statement},
+    xmss_tower::{XmssStatement, XmssTower, XmssTowerVk, verify_xmss_root, xmss_statement},
 };
 // The wire format (`proof_io`'s tower-root bundle) carries a `MixedProof`.
 pub(crate) use crate::tower::chain::MixedProof;

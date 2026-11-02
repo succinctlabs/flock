@@ -30,12 +30,16 @@ use crate::{
     },
     schedule::Registry,
     tower::{
-        ChainLane, F128, FlFamily, HashKind, LaneFamily, NodeOut, SpineIn, TowerConfig, XmssFlNode,
-        XmssLeaf, build_node_outer_app, build_xmss_first_level_node, build_xmss_leaf,
+        ChainLane, DOMAIN, F128, FlFamily, FsChallenger, HashKind, LaneFamily, LeafOuter, NodeOut,
+        RootBundle, SpineIn, TowerConfig, TowerVerifyError, XmssFlNode, XmssLeaf,
+        build_node_outer_app, build_xmss_first_level_node, build_xmss_leaf,
         driver::{RootDischargeFailure, discharge_outer},
-        lane_block_words,
+        envelope_shape_with_lane, lane_block_words,
         node::digest_f128,
+        outer_union,
+        query::leaf_boolean_lcs,
         span_count_word,
+        verify::{AccLayout, reassemble_parts},
         xmss_leaf::{xmss_family, xmss_jagged_params},
     },
 };
@@ -299,6 +303,105 @@ impl XmssTower {
     }
 }
 
+/// The leanXMSS tower's VERIFICATION KEY for one leaf circuit: a reference
+/// tower over six batches (the smallest run with all four shapes — leaf,
+/// FL, base, steady) and the published blocks' decode plan. Shapes are
+/// statement-independent, so any six valid batches give the same key.
+pub struct XmssTowerVk {
+    pub(super) tower: XmssTower,
+    pub(super) layout: AccLayout,
+}
+
+impl XmssTowerVk {
+    /// Prove the reference tower over `batches` (six, under `circuit`).
+    pub fn generate(
+        cfg: TowerConfig,
+        circuit: &XmssCircuit,
+        batches: &[(Vec<Statement>, Vec<Signature>)],
+    ) -> XmssTowerVk {
+        assert_eq!(batches.len(), 6, "the reference tower has six leaves");
+        let tower = XmssTower::prove(cfg, circuit, batches);
+        let env = envelope_shape_with_lane(lane_block_words(&tower.fl.acc));
+        let layout = AccLayout::from_parts(&env, tower.fl.fold_pub_base, &tower.root);
+        XmssTowerVk { tower, layout }
+    }
+}
+
+/// **VERIFY A leanXMSS TOWER ROOT, STANDALONE**: the VK, the claimed
+/// statement (recomputed by the consumer with [`xmss_statement`] from the
+/// batches it holds), and the root bundle. The root proof verifies against
+/// VK materials, the accumulators are reassembled from the bundle's
+/// publics alone, and the discharge legs run against the VK's tables.
+pub fn verify_xmss_root(
+    vk: &XmssTowerVk,
+    statement: &XmssStatement,
+    bundle: &RootBundle<'_>,
+) -> Result<(), TowerVerifyError> {
+    // (1) geometry: the depth this statement claims, and which node shape
+    // roots it (two first-level nodes: the base; more: the steady node).
+    let per_pair = 2 * vk.tower.per_leaf;
+    if statement.n_signatures == 0 || !statement.n_signatures.is_multiple_of(per_pair) {
+        return Err(TowerVerifyError::Geometry);
+    }
+    let k = statement.n_signatures / per_pair;
+    if k < 2 {
+        return Err(TowerVerifyError::Geometry);
+    }
+    let base_lo = &vk
+        .tower
+        .base
+        .as_ref()
+        .expect("the VK tower keeps its base")
+        .lo;
+    let root_lo: &LeafOuter = if k == 2 { base_lo } else { &vk.tower.root.lo };
+    if bundle.public.len() != root_lo.public.len() {
+        return Err(TowerVerifyError::PublicsLength);
+    }
+
+    // (2) the root proof, against VK materials only.
+    let u = outer_union(&root_lo.shape.registry, root_lo.shape.counts.clone());
+    let lcs = leaf_boolean_lcs(root_lo);
+    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+    bundle
+        .proof
+        .verify_circuit(
+            &u,
+            &root_lo.shape.circuit,
+            bundle.public,
+            &lcs,
+            bundle.commitment,
+            &root_lo.pcs,
+            &mut ch,
+        )
+        .map_err(TowerVerifyError::Proof)?;
+
+    // (3) the published accumulators, from the publics alone.
+    let (main, passenger, lane) = reassemble_parts(
+        bundle.public,
+        &vk.layout,
+        &vk.tower.fl.lo,
+        &vk.tower.root.lo,
+        base_lo,
+        &vk.tower.leaf.inner.built.shape,
+    )?;
+
+    // (4) the discharge legs + the statement binding.
+    vk.tower
+        .discharge_with(bundle.public, &lane, &main, &passenger, statement, k >= 4)
+        .map_err(TowerVerifyError::Discharge)
+}
+
+impl XmssTower {
+    /// The root's transportable part: publics, proof, commitment.
+    pub fn root_bundle(&self) -> RootBundle<'_> {
+        RootBundle {
+            public: &self.root.lo.public,
+            proof: &self.root.lo.proof,
+            commitment: &self.root.lo.commitment,
+        }
+    }
+}
+
 /// Phase 4: the leanXMSS tower end to end — eight batches (`XMSS_N`
 /// signatures each, default 4 at a tall slot), four first-level nodes, the
 /// base and two spine levels to a steady root; the root-side discharge
@@ -315,16 +418,32 @@ fn xmss_tower_e2e() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
-    let nu = (n < 64).then_some(10);
+    // A small batch takes a tall slot (one slot per gate kind, the
+    // production shape); `XMSS_NU` overrides.
+    let nu = std::env::var("XMSS_NU")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or((n < 64).then_some(10));
     let circuit =
         XmssCircuit::with_options(n, nu, crate::leanxmss::circuit::XmssOptions::RECURSION_LEAF);
+    let batch = |seed: u64| {
+        if n < 64 {
+            signed(n, seed)
+        } else {
+            crate::leanxmss::circuit::keyless_batch(n, seed)
+        }
+    };
     let batches: Vec<(Vec<Statement>, Vec<Signature>)> =
-        (0..8u64).map(|i| signed(n, 101 + i)).collect();
+        (0..8u64).map(|i| batch(101 + i)).collect();
     let t = Instant::now();
     let tower = XmssTower::prove(cfg, &circuit, &batches);
     println!(
-        "xmss tower: 8 x {n} signatures in {:?} | root prove {:.0} ms | root proof {:.1} KiB",
+        "xmss tower: 8 x {n} signatures (leaf nu {}) in {:?} | prove: FL {:.0} ms, base {:.0} ms, \
+         root {:.0} ms | root proof {:.1} KiB",
+        circuit.nu(),
         t.elapsed(),
+        tower.fl.t.prove_ms,
+        tower.base.as_ref().map_or(0.0, |b| b.online.prove_ms),
         tower.root.online.prove_ms,
         bincode::serialize(&tower.root.lo.proof).unwrap().len() as f64 / 1024.0,
     );
@@ -332,6 +451,56 @@ fn xmss_tower_e2e() {
     tower
         .discharge_root()
         .expect("the root-side residue discharges");
+
+    // The standalone verifier: a VK from six other batches, the statement
+    // recomputed from the batches alone.
+    let vk_batches: Vec<(Vec<Statement>, Vec<Signature>)> =
+        (0..6u64).map(|i| batch(901 + i)).collect();
+    let vk = XmssTowerVk::generate(cfg, &circuit, &vk_batches);
+    let statements: Vec<Vec<Statement>> = batches.iter().map(|b| b.0.clone()).collect();
+    let st = xmss_statement(&circuit, &statements);
+    assert_eq!(&st, tower.statement());
+    verify_xmss_root(&vk, &st, &tower.root_bundle()).expect("the root verifies standalone");
+    let mut swapped = statements.clone();
+    swapped.swap(0, 1);
+    assert!(
+        matches!(
+            verify_xmss_root(
+                &vk,
+                &xmss_statement(&circuit, &swapped),
+                &tower.root_bundle()
+            ),
+            Err(TowerVerifyError::Discharge(RootDischargeFailure::Statement))
+        ),
+        "the batches in another order"
+    );
+    let mut edited = statements.clone();
+    edited[5][0].msg[3] ^= 1;
+    assert!(
+        matches!(
+            verify_xmss_root(
+                &vk,
+                &xmss_statement(&circuit, &edited),
+                &tower.root_bundle()
+            ),
+            Err(TowerVerifyError::Discharge(RootDischargeFailure::Statement))
+        ),
+        "an edited message"
+    );
+    let mut public = tower.root.lo.public.clone();
+    public[tower.app_base] += F128::ONE;
+    let forged = RootBundle {
+        public: &public,
+        proof: &tower.root.lo.proof,
+        commitment: &tower.root.lo.commitment,
+    };
+    assert!(
+        matches!(
+            verify_xmss_root(&vk, &st, &forged),
+            Err(TowerVerifyError::Proof(_))
+        ),
+        "a public word the proof does not attest"
+    );
 
     let lane = tower.root.lane_acc.as_ref().unwrap();
     let check = |public: &[F128], lane: &Accumulator, st: &XmssStatement| {
