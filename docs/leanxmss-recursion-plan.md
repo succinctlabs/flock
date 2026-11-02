@@ -140,17 +140,20 @@ The nodes scale worse with threads than the leaf (3.3× from 1 to 10 threads, ag
 
 | Phase | Node ms | Notes |
 |---|---:|---|
-| Witness generation | 62 | Fills a zeroed 2^25-word padded buffer for a 2^22-word commit. |
-| Commit | 192 | A plain F128 NTT (126) and Merkle (51). |
+| Witness generation | 62 | Slot generation; the buffers come pre-zeroed from the zero pool. The swap gate's per-bit bool path took 28.5 ms, and its packed rewrite (a59e952) brought witgen to 32 ms. |
+| Commit | 192 | A plain F128 NTT (126) and Merkle (51). The nodes commit at rate 1/4 (Slim, half the queries for the parent) and the leaf at 1/2 (Fast), so per input word they encode and hash twice as much; per codeword word the NTT costs the same. |
 | Zerocheck + lincheck + wiring | ~150 | |
 | Element PIOP | 13 | |
 | Open | ~270 | Ligerito 112; W build + merged sumcheck 103; multipoint 97. |
 
-Per committed word, a node costs 2.8× a leaf. The leaf's bit-structured witness takes the fast paths: the ranked NTT, block statistics, and closed-form multipoint weights over 703 full columns (3 ms). The node's ragged layout (730 columns, 11 full) takes the dense virtual weight: 74 ms of weight passes and two-product sumcheck. That, and the padded witness buffer, are the first places to look.
+Per committed word, a node costs 2.8× a leaf. The leaf's bit-structured witness takes the fast paths: the ranked NTT, block statistics, and closed-form multipoint weights over 703 full columns (3 ms). The node's ragged layout (730 columns, 11 full) takes the dense virtual weight: 74 ms of weight passes and two-product sumcheck. That is the next place to look. After the swap fix, witgen's remaining 32 ms is BLAKE3 rows (12), the family-transpose tiles (7, still on the bool path), the element slots (7) and the bit spread (3).
 
 ## Open questions
 
 1. **Tree shape.** The driver is the chain tower's spine: a base over the last two first-level nodes, then each level prepends the next-earlier one. The statement is `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))` over fixed 992-signature batches, and the verifier rebuilds it from the batches (`xmss_statement`). A balanced tree would need a second internal shape.
 2. **Leaf batch size.** It is 992. One more signature tips the statement hash's compressions into a third slot, and the layout planner to ν = 14.
 3. **Margin.** The first-level node runs at 30.47 of 31 lanes, and its MAC slot at 98%. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
-4. **Node cost.** A node is 35–46% of a leaf's time for an eighth of its words (above). Aligned envelope columns, or a closed-form ragged weight, and a witness buffer sized to the commit are the first candidates.
+4. **Node cost.** A node is 35–46% of a leaf's time for an eighth of its words (above). The candidates:
+   - the ragged multipoint weight: aligned envelope columns, or a closed-form ragged weight;
+   - the family tiles' bool-path witness;
+   - the Slim-vs-Fast trade for the node commit, which is in-circuit query cost against prover time.

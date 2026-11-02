@@ -55,7 +55,10 @@ use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
 
-use crate::r1cs_hashes::{common::identity, merkle_r1cs::SLOT_WORDS};
+use crate::r1cs_hashes::{
+    common::{drive_witness_batch_major_partial_into, identity},
+    merkle_r1cs::SLOT_WORDS,
+};
 
 /// Bits in a digest.
 const SLOT_BITS: usize = 32 * SLOT_WORDS;
@@ -410,13 +413,81 @@ impl SwapTable {
     }
 
     /// [`Self::generate_witness_batch_major`] writing into a union slot's
-    /// destination block — the copy-free union assembly path.
+    /// destination block — the copy-free union assembly path. Every column
+    /// group is word-aligned, so the rows are built as packed `u64` lanes
+    /// ([`Self::packed_row`]) through the partial batch-major driver, never
+    /// as per-bit bools: 7,294 rows went 28.5 → ~1 ms at one thread.
     pub fn generate_witness_batch_major_into(
         rows: &[SwapInput],
         dst: SlotWitnessDest<'_>,
     ) -> Vec<u8> {
-        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
-        scatter_zab_into(&per, Self::k(), Self::USEFUL_BITS, dst)
+        let words_per_block = Self::k() / 128;
+        let n_blocks_log = (dst.z.len() / words_per_block).trailing_zeros() as usize;
+        drive_witness_batch_major_partial_into(
+            rows,
+            n_blocks_log,
+            Self::K_LOG,
+            Self::USEFUL_BITS,
+            dst,
+            |group, rz, ra, rb| {
+                for (lane, input) in group.iter().enumerate() {
+                    let [z, a, b] = Self::packed_row(input);
+                    for u in 0..Self::ROW_U64 {
+                        rz[u][lane] = z[u];
+                        ra[u][lane] = a[u];
+                        rb[u][lane] = b[u];
+                    }
+                }
+            },
+        )
+    }
+
+    /// The `u64`s of a row's useful chunk-columns: 12 words.
+    const ROW_U64: usize = 2 * Self::USEFUL_BITS.div_ceil(128);
+
+    /// [`Self::build_witness`] as block-`u64`s: `(z, a, b)` over the useful
+    /// chunk-columns, bit `j` of the block at bit `j % 64` of `u64` `j / 64`.
+    fn packed_row(input: &SwapInput) -> [[u64; Self::ROW_U64]; 3] {
+        const ONES: u64 = !0;
+        let lanes = |d: &[u32; SLOT_WORDS]| -> [u64; SLOT_BITS / 64] {
+            std::array::from_fn(|i| d[2 * i] as u64 | (d[2 * i + 1] as u64) << 32)
+        };
+        let (prev, sib) = (lanes(&input.prev), lanes(&input.sib));
+        let not_bit = if input.bit_word & 1 == 1 { 0 } else { ONES };
+        let (mut z, mut a, mut b) = (
+            [0u64; Self::ROW_U64],
+            [0u64; Self::ROW_U64],
+            [0u64; Self::ROW_U64],
+        );
+        // A free column: `z·1 = z`.
+        let mut free = |at: usize, v: u64| {
+            z[at] = v;
+            a[at] = v;
+            b[at] = ONES;
+        };
+        free(Self::BIT / 64, input.bit_word as u64);
+        free(Self::BIT / 64 + 1, (input.bit_word >> 64) as u64);
+        for (i, (&p, &s)) in prev.iter().zip(&sib).enumerate() {
+            free(Self::PREV / 64 + i, p);
+            free(Self::SIB / 64 + i, s);
+        }
+        for (i, (&p, &s)) in prev.iter().zip(&sib).enumerate() {
+            let t = not_bit & (p ^ s);
+            z[Self::T / 64 + i] = t;
+            a[Self::T / 64 + i] = not_bit;
+            b[Self::T / 64 + i] = p ^ s;
+            for (at, v) in [(Self::LEFT / 64 + i, s ^ t), (Self::RIGHT / 64 + i, p ^ t)] {
+                z[at] = v;
+                a[at] = v;
+                b[at] = ONES;
+            }
+        }
+        let c = Self::CONST / 64;
+        let one = 1u64 << (Self::CONST % 64);
+        z[c] = one;
+        a[c] = one;
+        b[c] = one;
+        [z, a, b]
     }
 }
 
@@ -1224,5 +1295,65 @@ mod family_h_tests {
             }
         }
         assert_eq!(assembled.to_vec(), tensor_algebra_transpose(&rows),);
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use flock_core::union::SlotWitnessDest;
+    use flock_field::F128;
+
+    use crate::r1cs_hashes::merkle_glue::{SwapInput, SwapTable, scatter_zab_into};
+
+    fn input(i: u64) -> SwapInput {
+        let w = |s: u64| -> [u32; 8] {
+            std::array::from_fn(|j| (s.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (j * 4)) as u32)
+        };
+        SwapInput {
+            bit_word: (i as u128).wrapping_mul(0x0123_4567_89ab_cdef_fedc_ba98_7654_3211),
+            prev: w(2 * i + 1),
+            sib: w(2 * i + 2),
+        }
+    }
+
+    /// The packed generator writes exactly the bool path's `z`, `a`, `b` and
+    /// lincheck stripe, at full, partial and empty counts, with padding
+    /// writes elided over a zero buffer and not.
+    #[test]
+    fn packed_swap_witness_matches_the_bool_path() {
+        let nu = 6;
+        let words = (1 << nu) * (SwapTable::k() / 128);
+        for count in [0usize, 1, 7, 8, 9, 37, 64] {
+            for elide in [false, true] {
+                let rows: Vec<SwapInput> = (0..count as u64).map(input).collect();
+                let run = |packed: bool| {
+                    let (mut z, mut a, mut b) = (
+                        vec![F128::ZERO; words],
+                        vec![F128::ZERO; words],
+                        vec![F128::ZERO; words],
+                    );
+                    let dst = SlotWitnessDest {
+                        z: &mut z,
+                        a: &mut a,
+                        b: &mut b,
+                        elide_padding_writes: elide,
+                        dead_padding_unread: false,
+                    };
+                    let stripe = if packed {
+                        SwapTable::generate_witness_batch_major_into(&rows, dst)
+                    } else {
+                        let per: Vec<_> = rows.iter().map(SwapTable::build_witness).collect();
+                        scatter_zab_into(&per, SwapTable::k(), SwapTable::USEFUL_BITS, dst)
+                    };
+                    (z, a, b, stripe)
+                };
+                let (want, got) = (run(false), run(true));
+                assert!(want.0 == got.0, "z, count {count}, elide {elide}");
+                assert!(want.1 == got.1, "a, count {count}, elide {elide}");
+                assert!(want.2 == got.2, "b, count {count}, elide {elide}");
+                let live = count.div_ceil(8) * SwapTable::k();
+                assert_eq!(want.3[..live], got.3[..live], "stripe, count {count}");
+            }
+        }
     }
 }
