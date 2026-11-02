@@ -1697,6 +1697,15 @@ open still needs, stays ($9\,$ms ST and 10T once the pool is warm;
 the $25\,$ms first-run figure is page faults). Not taken.
 \end{itemize}
 
+\subsection{The leanXMSS compression slots, without the walk}\label{sec:compresspacker}
+
+\begin{optsummary}
+\item[Baseline:] leanXMSS[BLAKE3] spends $201$ compressions a signature --- $201$k rows at $1000$ signatures, over seven $2^{15}$-row slots --- and the DSL gate's generic packer (\code{BooleanGate::pack\_into}) wrote them: of $176\,$ms single-threaded witness generation about $155$ are these slots, $0.78\,\mu$s a row against $0.48$ for the standalone BLAKE3 driver on the same compressions. The BLAKE3 kernel already wrote the rounds (\S\ref{sec:lanebuilder}); the profile was kernel $41\%$, the packer's own plumbing $51\%$ (staging clears, per-batch input and argument gathers, plane transposes for the six words the walk still owns, the column-run stores), the walk $2\%$.
+\item[Improvement:] A dedicated slot driver, \code{CompressPacker}, on the standalone generator's driver (\code{drive\_witness\_batch\_major\_partial\_into}: burst flush, stripe from the staged rows). Per eight rows the wired inputs and \code{next} go in as whole words (identity and linear rows, $z=Az$, $Bz=1$), the compression by the kernel, and the rest of the row --- the pin and the padding's $Bz$, the same in every row --- from a template the gate's own packer writes once on zero rows. The kernel body is now \code{\#[inline(always)]} (\code{Blake3Kernel::fill8\_inline}) and the driver calls it at bit $64w+6$ with the $6$ a constant, asserted against the layout, so every field's shift and word boundary resolve at compile time as in the standalone layout; and since the row's padding ends the rounds on a word boundary, the kernel stores its output words whole too, so no staging row needs clearing. The other five leanXMSS gates keep the generic packer.
+\item[Mechanism:] One slot ($28{,}715$ rows, one thread): generic $0.78\,\mu$s a row; dedicated driver through the trait $0.65$; constant bit offset $0.56$; no clearing $0.52$ (standalone generator: $0.48$). Byte-identical: \code{kernel\_packing\_matches\_the\_walk} now also checks the driver's $z$, $Az$, $Bz$ and stripe against the walk's, on poisoned buffers, at full, partial and sub-eight row counts.
+\item[Result:] leanXMSS[BLAKE3] at $1000$ signatures ($4$ pairs): witgen ST $176.1\to120.0\,$ms, 10T $32.8\to25.2$; prove ST $1943\to1883\,$ms ($-2.8\%$), 10T $454.5\to449.0$ (all $4/4$); proof digest unchanged in all $16$. $+184$ lines, test included.
+\end{optsummary}
+
 \paragraph{Rejected, and what is left.} The induce truncation of
 \S\ref{sec:inducetrunc} generalizes to every rate --- the low
 $2^{\mathrm{msg}}$ outputs of the last $\log(1/\rho)$ transpose steps are
@@ -1710,8 +1719,9 @@ $-4\,$ms ST. Larger items remain, each above the bloat bar without
 an explicit call: the frontier's depth-three delayed sparse-dual
 induction (C2, $\approx500$ lines there), which would take most of the
 remaining induce ($7.0\,$ms ST at the L0 boundary, $2.7$ at L1); the
-leanXMSS DSL gate packing (\code{BooleanGate::pack\_into\_with}, about
-half its $177\,$ms single-threaded witness generation); and the
+rest of leanXMSS's witness generation --- its compression slots now run
+$0.04\,\mu$s a row off the standalone generator, and the five small gates
+left on the generic packer are $\approx15\,$ms ST; and the
 strict ladder itself, whose recursive commits are
 $+120\,$ms ST over Fast100 by construction --- a parameter decision, not
 an implementation one.
@@ -1787,6 +1797,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:erichpool} & scheduling & default-pool prove: $455.6\to410.3\,$ms & $4/4$\\
 \S\ref{sec:cscgather} & ILP & lincheck: $-10.6\,$ms ST; verify $20.7\to11.6$; leanXMSS verify $-49\%$ & $4/4$\\
 \S\ref{sec:lanebuilder} & representation, store pattern & witgen: $196.9\to130.8\,$ms ST, $-9.4$ 10T; prove $-3.6\%$ ST & $4/4$\\
+\S\ref{sec:compresspacker} & specialization & leanXMSS witgen: $176.1\to120.0\,$ms ST, $-7.5$ 10T; prove $-2.8\%$ ST & $4/4$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
