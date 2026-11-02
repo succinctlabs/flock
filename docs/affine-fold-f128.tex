@@ -1,0 +1,371 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.2in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\eq}{\mathsf{eq}}
+\newcommand{\RS}{\mathsf{RS}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\coef}{\mathrm{coef}}
+\newcommand{\What}{\widehat W}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{remark}[theorem]{Remark}
+
+\title{Affine Folding over $\F_{2^{128}}$ for Ligerito:\\
+Dropping the $\F_{2^{256}}$ Fold Challenges}
+\author{DRAFT --- design note}
+\date{November 2, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Flock reaches 128-bit security in Ligerito's proximity term by sampling
+every fold challenge from the quadratic extension $\F_{2^{256}}$ and
+splitting each folded extension table into two base-field coordinate
+tables at the code switch (\texttt{pcs/ligerito/extension.rs}). The
+draft by Chiesa, Yogev, Weissenberg and Zheng, \emph{Reed--Solomon
+Proximity Gaps with Small Error via Affine Mixing}, proves mutual
+correlated agreement (MCA) for the combination $f + (\alpha + \beta
+x)\,g$ with error about $\ell/q$ (the Johnson list size over the field
+size). No factor of $n$ appears. This note specifies a Ligerito fold
+round that uses affine mixing with all challenges in $\F_{2^{128}}$. It
+gives the soundness argument for the three steps the paper leaves
+open: claim transport, degree growth and interleaving. It also gives
+per-level parameters for the $m = 32$ Fast profile and an
+implementation plan. The expected gain is about half of the recursive
+commit cost, plus smaller proofs.
+\end{abstract}
+
+\section{Setting}\label{sec:setting}
+
+$\F = \F_q$ with $q = 2^{128}$. $D \subseteq \F$ is an
+$\F_2$-subspace of size $n$, and $\RS[D, d]$ is the evaluation code of
+polynomials of degree at most $d$ on $D$. Messages are coefficient
+vectors in the LCH novel basis $(X_j)_{j \ge 0}$, where $\deg X_j = j$.
+A vector of length $L$ therefore stores a polynomial of degree less
+than $L$, and the code does not depend on the basis.
+
+A Ligerito level commits $2^k$ rows $f(i, \cdot) \in \F^{2^c}$, $i \in
+\{0,1\}^k$, as one interleaved codeword. Each Merkle leaf holds the
+$2^k$ symbols at one $x \in D$. The level enters with a linear claim
+\begin{equation}\label{eq:claim}
+  \textstyle\sum_{i, c} f(i, c)\, W(i, c) = v,
+\end{equation}
+where the weight $W$ is a sum of eq-tensors (the batched opening,
+OOD and consistency claims). The level runs $k$ sumcheck rounds over
+the row bits. Today every round folds $f' = f_0 + r(f_0 + f_1)$ with
+$r \in \F_{2^{256}}$. Here $f_b := f(b, \cdot)$ splits on the bit
+bound in that round.
+
+\paragraph{Why $\F_{2^{256}}$ today.} Over $\F_{2^{128}}$, the scalar
+line MCA bounds near the Johnson radius carry a factor of at least $n$
+(already $n/q$ in the unique-decoding regime). At $n = 2^{20}$ that
+leaves about $108$ bits per fold challenge, too many to grind away.
+The extension makes the proximity term about $2^{-209}$. The cost is
+$\F_{2^{256}}$ arithmetic in every fold and a coordinate split that
+doubles every committed recursive table
+(\S\ref{sec:cost}).
+
+\section{The affine fold round}\label{sec:round}
+
+Write $Xf_1$ for the table whose rows are the rows of $f_1$ multiplied
+by $X$ as polynomials. Each row gains one coefficient. Extend $W_b :=
+W(b, \cdot)$ by zero on the new coordinate. One round:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Prover} sends the grid $G[u][b] = \langle u, W_b\rangle$
+  for $u \in \{f_0, f_1, Xf_1\}$ and $b \in \{0,1\}$. The claim fixes
+  $G[f_1][1] = v - G[f_0][0]$, so the prover sends five
+  $\F_{2^{128}}$ elements. Today's round message is two
+  $\F_{2^{256}}$ elements, which is four $\F_{2^{128}}$ elements.
+\item \textbf{Verifier} samples $(\alpha, \beta, r) \in \F^3$ from one
+  fused squeeze, with the fold grinding of \S\ref{sec:params}.
+\item \textbf{Both} move to
+  \[
+    f' = f_0 + \alpha f_1 + \beta\, Xf_1, \qquad
+    W' = W_0 + r(W_0 + W_1),
+  \]
+  \[
+    v' = \textstyle\sum_{u, b} a_u(\alpha, \beta)\, e_b(r)\, G[u][b],
+    \qquad (a_{f_0}, a_{f_1}, a_{Xf_1}) = (1, \alpha, \beta), \quad
+    (e_0, e_1) = (1 + r, r).
+  \]
+\end{enumerate}
+By bilinearity, $\langle f', W'\rangle = v'$ when the grid is honest.
+The weight update is today's binding at $r$, so $W'$ keeps its
+eq-structure and the verifier evaluates it as it does now. The
+verifier never evaluates an $X$-shifted weight.
+
+\paragraph{Codeword view.} For every $x \in D$,
+\[
+  \mathrm{Enc}(f')(x) = \mathrm{Enc}(f_0)(x) + (\alpha + \beta x)\,
+  \mathrm{Enc}(f_1)(x),
+\]
+which is the paper's affine combination applied row by row. After the
+$k$ rounds of a level, a query at $x$ combines the opened leaf with the
+weights $\omega_i(x) = \prod_{j=1}^{k} (\alpha_j + \beta_j x)^{i_j}$.
+These weights depend on $x$, so the verifier computes $2^k$ products
+per query plus the $2^k$-term inner product. Today that inner product
+is $\F_{2^{128}} \times \F_{2^{256}}$, which costs two base
+multiplications per term. The count of base multiplications is
+therefore unchanged.
+
+\paragraph{The multiply-by-$X$ map.} Let $W_i$ be the subspace
+vanishing polynomials of the domain basis $(v_i)$ and $\What_i = W_i /
+W_i(v_i)$. The identity $W_{i+1}(X) = W_i(X)\,(W_i(X) + W_i(v_i))$
+gives
+\[
+  \What_i^{\,2} = a_i\, \What_{i+1} + \What_i, \qquad a_i =
+  W_{i+1}(v_{i+1}) / W_i(v_i)^2,
+\]
+and $X = v_0 \What_0$. So $X \cdot X_j$ is $v_0 X_{j+1}$ when bit $0$
+of $j$ is clear. Otherwise it carries through the trailing ones of $j$
+and yields one term per carry. The map $T: \coef(G) \mapsto
+\coef(XG)$ has about two nonzeros per column on average, and the
+prover applies it in $O(n)$ with constant multiplications. The prover
+needs $Xf_1$ for $f'$ and for the two grid entries $\langle Xf_1,
+W_b\rangle$.
+
+\section{Soundness}\label{sec:soundness}
+
+Each fold round contributes two errors to the round-by-round
+analysis: the MCA error of the affine combination
+(\S\ref{sec:mca}) and the claim-transport error of the grid
+(\S\ref{sec:transport}).
+
+\subsection{Claim transport}\label{sec:transport}
+
+\begin{lemma}[Grid transport]\label{lem:transport}
+Fix tables $f_0, f_1$ and weights $W_0, W_1$. Suppose the incoming
+claim is false: $v \ne \langle f_0, W_0\rangle + \langle f_1,
+W_1\rangle$. Then for any grid the prover sends,
+$\Pr_{\alpha, \beta, r}[\, v' = \langle f', W'\rangle \,] \le 2/q$.
+\end{lemma}
+
+\begin{proof}
+Let $\Delta[u][b]$ be the sent grid minus the true inner products. The
+claim relation forces $\Delta[f_0][0] + \Delta[f_1][1] \ne 0$, so
+$\Delta \ne 0$. The difference $v' - \langle f', W'\rangle =
+\sum_{u, b} a_u e_b \Delta[u][b]$ is a polynomial in $(\alpha, \beta,
+r)$ of total degree at most $2$. Its six products $\{1, \alpha,
+\beta\} \times \{1 + r, r\}$ are linearly independent, so a nonzero
+$\Delta$ gives a nonzero polynomial. Schwartz--Zippel gives at most
+$2/q$.
+\end{proof}
+
+When the analysis carries $L$ candidate codewords through the round,
+the transport error is $2L/q$. Under the Johnson+OOD regime that Flock
+uses, OOD reduces the list to one candidate, so $L = 1$. This term
+replaces today's sumcheck term (about $250$ bits over
+$\F_{2^{256}}$). It is about $127$ bits here and is absorbed into the
+fold grinding.
+
+\subsection{MCA for one round}\label{sec:mca}
+
+\paragraph{Degree growth.} Round $j$ of a level combines words of
+$\RS[D, d + j - 1]$ into $\RS[D, d + j]$ on the same domain, with
+$d = 2^c - 1$. Both halves have degree at most $d + j - 1$, so the
+paper's condition $\deg G \le \deg_{\mathrm{out}} - 1$ holds with no
+change. The intermediate codes appear only in the analysis. Nothing is
+committed at those degrees, and the rate grows by $k/n$, which is
+negligible. The next level re-encodes the folded message at its own
+rate (\S\ref{sec:overflow}), so the degree does not accumulate across
+levels.
+
+\paragraph{Interleaving (Habo\v{c}k's observation).} Round $j$
+combines $t = 2^{k-j}$ row pairs with one shared $(\alpha, \beta)$,
+and the rows must share an agreement set. Because $D \subseteq \F_q$,
+an interleaved word of $t$ rows of $\RS_q[D, d]$ is exactly one word of
+$\RS_{q^t}[D, d]$: fix an $\F_q$-basis of $\F_{q^t}$. The rate and
+distance are the same, and agreement of the $\F_{q^t}$-word is
+simultaneous agreement of all rows. Since $x \in D \subseteq \F_q$ and
+$(\alpha, \beta) \in \F_q^2$, the affine combination of
+$\F_{q^t}$-words is the row-wise combination.
+
+\begin{lemma}[Subfield challenges]\label{lem:subfield}
+Let $\F_q \subseteq \F_Q$, $D \subseteq \F_q$ and $f, g: D \to \F_Q$.
+The bound of the paper's Lemma~3.1 on the number of exceptional
+$(\alpha, \beta)$ holds for $(\alpha, \beta) \in \F_q^2$, with $q$
+replaced by $Q$ only inside the $\max\{q, \binom n2\}$ factor, where it
+stays $q$. Hence
+\[
+  \Pr_{(\alpha, \beta) \leftarrow \F_q^2}[\text{exceptional}] \le
+  \frac{(4d^2M^2 + 1)D^3 v^2 + \ell \max\{q, \binom n2\}}{q^2}.
+\]
+\end{lemma}
+
+\begin{proof}[Proof sketch]
+The paper's proof counts bad pairs and divides by $q^2$ at the end.
+We check each count with words over $\F_Q$ and pairs from $\F_q^2$.
+\begin{itemize}[leftmargin=1.5em]
+\item \emph{Lemma 2.3, rational case.} The good pairs form a proper
+  affine subspace of $\F_Q^2$. It meets $\F_q^2$ in at most $q$
+  points. In the polynomial case, two coordinates still fix at most
+  one pair.
+\item \emph{Lemma 3.3.} The excluded pairs give distinct linear factors
+  $Y - \alpha' - \beta' X$ of a fixed polynomial, with $\alpha',
+  \beta' \in \F_q \subseteq \F_Q$. The Frobenius root map is a
+  bijection on $\F_q$. The count $D^2$ is unchanged.
+\item \emph{Lemma 3.4.} The list size $\ell = L_{d+1}(B-1)$ is a
+  set-system (Johnson) bound and does not depend on the field.
+  Directions $(\sigma, \omega, H)$ range over $\F_Q$, which only
+  enlarges the persistent case that the lemma already covers.
+\item \emph{Claims 3.6 and 3.7.} Take $K$ to be the algebraic closure
+  of $\F_Q(T_0)$. The incidence and degree bounds are geometric and do
+  not depend on the field. Hensel lifting needs $R_Z(X, \alpha' +
+  \beta' X, P(X^e)) \ne 0$ over $\F_Q$, and $T_0$ is transcendental
+  over $\F_Q$.
+\end{itemize}
+\end{proof}
+
+\begin{remark}
+Lemma~\ref{lem:subfield} needs to be checked by the authors. Ulrich
+Habo\v{c}k has offered a write-up of the interleaved argument for
+lines. Applying the lemma round by round to $t = 2^{k-1}, \dots, 1$
+pairs gives the multilinear fold with error $\eps_{\mathrm{aff}}$ per
+round and \emph{no} union over rows. Today's analysis pays $2^{k-1}$
+there (the row union in the mca-commutes lemma).
+\end{remark}
+
+\paragraph{Agreement loss.} The theorem allows agreement loss $s = 1$
+per round, so up to $k$ coordinates per level. The query bound
+$a^t$ becomes $(a + k/n)^t$, a factor of at most $\exp(tk/(an))$. At
+L0 ($t = 244$, $k = 6$, $n = 2^{20}$, $a \approx 0.727$) this is
+$0.003$ bits. At L5 ($t = 25$, $k = 4$, $n = 2^{15}$, $a \approx
+0.042$) it is $0.10$ bits. The query budget must include it.
+
+\subsection{Overflow coefficients}\label{sec:overflow}
+
+After $k$ rounds the folded message has degree at most $d + k$. Its
+coefficients on $X_{2^c}, \dots, X_{2^c + k - 1}$ are $\tau_1, \dots,
+\tau_k$. At the code switch the prover sends the $\tau_s$ in the clear,
+and the next level commits only the low $2^c$ coefficients. The claim
+weight is zero on the overflow coordinates, so the claim
+$\langle f', W'\rangle$ does not change. Each consistency claim at a
+query $x$ becomes
+\[
+  \textstyle\langle f'_{\mathrm{lo}}, (X_c(x))_c\rangle =
+  \sum_i \omega_i(x)\, \mathrm{leaf}_i(x) - \sum_s \tau_s\,
+  X_{2^c + s - 1}(x).
+\]
+The verifier evaluates $X_{2^c + s - 1}(x)$ from products of
+$\What_i(x)$, which are $\F_2$-linear in $x$.
+
+\section{Parameters}\label{sec:params}
+
+Per fold round, $\eps_{\mathrm{round}} \le \eps_{\mathrm{aff}} + 2/q$,
+and the fold grinding is $\lceil 128 - \log_2
+(1/\eps_{\mathrm{round}}) \rceil$ bits. The script
+\texttt{scripts/affine\_fold\_params.py} evaluates the general form of
+the paper's Lemma~3.1 for every round of every level of a config. It
+uses degree $d_j = d + j$ in round $j$, the integer Johnson bound for
+$\ell$, and a search over $m$, $D$ and $B$ subject to the paper's
+inequality (3.4). Any $(m, D, B)$ it reports is a valid certificate,
+so each bound is proven. By Lemma~\ref{lem:subfield} the bound does not
+depend on the number of interleaved rows. The closed form of the
+paper's Theorem~1.1 does not apply at levels L2--L5, because
+$n\eta^2 < 4/\rho$ there. Lemma~3.1 still does.
+
+The table shows the output for \texttt{configs/ligerito/m32\_fast.toml}
+($\eta = 0.02$), taking the worst round of each level:
+
+\begin{center}
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Level & rate $\rho$ & $n$ & $\ell$ & $\log_2 \eps_{\mathrm{aff}}$ &
+fold grind (bits) & agreement loss (bits) \\
+\midrule
+L0 & $2^{-1}$  & $2^{20}$ & 7     & $-125.2$ & 4 & 0.003 \\
+L1 & $2^{-3}$  & $2^{19}$ & 16    & $-124.0$ & 5 & 0.002 \\
+L2 & $2^{-5}$  & $2^{18}$ & 21    & $-123.6$ & 5 & 0.005 \\
+L3 & $2^{-7}$  & $2^{17}$ & 22    & $-123.5$ & 5 & 0.014 \\
+L4 & $2^{-9}$  & $2^{16}$ & 24    & $-123.4$ & 5 & 0.040 \\
+L5 & $2^{-11}$ & $2^{15}$ & 28--30 & $-123.1$ & 5 & 0.104 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Grinding is fused into the challenge squeeze, so $4$--$5$ bits per fold
+challenge cost little. A production analysis should emit a new
+\texttt{analysis\_version} from these numbers.
+
+\section{Expected cost}\label{sec:cost}
+
+Ligerito prover sub-phases at $m = 32$ (Fast profile, main
+\texttt{2c735c3}, Apple M4 Max under background load, one warm run):
+
+\begin{center}
+\begin{tabular}{@{}lrl@{}}
+\toprule
+Sub-phase & ms & Effect of the affine fold \\
+\midrule
+recursive commits (NTT + Merkle) & 28.5 & about half: no coordinate split \\
+\texttt{initial\_k} folds + code switch & 12.7 & about flat; the split pass goes away \\
+recursive folds + code switches & 4.2 & smaller ($\F_{2^{128}}$ vs $\F_{2^{256}}$) \\
+induce (basis + sum) & 4.7 & smaller ($\F_{2^{128}}$ basis) \\
+OODs, grinding, opens & 5.9 & flat \\
+\midrule
+total & 55.0 & estimate $-15$ to $-20$ ms of a $248$ ms prove \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The largest item is the split. Today a folded $\F_{2^{256}}$ table of
+length $N$ is committed as a $\F_{2^{128}}$ table of length $2N$, and
+each level removes only $k - 1$ variables. With the affine fold, a
+table of length $N$ is committed as length $N$ (plus $k$ overflow
+values), and each level removes $k$ variables. The ladder should be
+retuned. Proofs also shrink: round messages, OOD answers and the final
+message become $\F_{2^{128}}$, and the recursive Merkle leaves halve.
+The 100-bit profiles benefit as well, since they pay for
+$\F_{2^{256}}$ today with no security gain.
+
+\section{Implementation plan}\label{sec:plan}
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Analysis.} Commit the parameter script and the analysis
+  identity. Get Lemma~\ref{lem:subfield} checked by the paper's
+  authors and by Habo\v{c}k.
+\item \textbf{Prototype.} Add \texttt{pcs/ligerito/affine.rs} next to
+  \texttt{extension.rs}, behind a new profile field value, for the
+  native opening only. Start with simple kernels: the grid message,
+  the $T$ map, the affine fold, overflow handling and per-query
+  weights. Measure open time and proof size at $m = 32$ against
+  \texttt{extension.rs} with interleaved runs.
+\item \textbf{Kernels.} If the gain holds, port the fast paths. The L0
+  lookahead and skip kernels and the fused fold+message passes assume
+  multilinear folding, so they need affine versions. This step is
+  where most of the engineering time goes.
+\item \textbf{Recursion and GPU.} Port the in-circuit verifier
+  (\texttt{tower/query.rs}, \texttt{gates\_spine.rs}, the walkers):
+  remove the $\F_{2^{256}}$ gadgets and add the grid check, per-query
+  weights and overflow terms. Port the CUDA twin, re-pin fixtures,
+  bump the proof-IO version and retire \texttt{extension.rs}.
+\end{enumerate}
+
+\paragraph{Open items.}
+(i) Lemma~\ref{lem:subfield} as a checked statement.
+(ii) Round-by-round accounting of the agreement loss together with the
+OOD list reduction.
+(iii) The overflow handling at L0, where the leaf is lane-major and has
+46 lanes.
+(iv) Whether the per-query weights $\omega_i(x)$ change the
+recursion circuit's row count enough to cross a power of two.
+
+\paragraph{References.}
+A.~Chiesa, E.~Yogev, G.~Weissenberg, K.~Z.~Zheng, \emph{Reed--Solomon
+Proximity Gaps with Small Error via Affine Mixing}, draft, 2026.
+B.~B\"unz, R.~Rothblum, W.~Wang, \emph{Flock}, ePrint 2026/1329,
+Appendix~C (Ligerito; mca-commutes lemma).
+U.~Habo\v{c}k, private communication on interleaved correlated
+agreement, 2026.
+
+\end{document}
