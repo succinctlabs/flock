@@ -63,6 +63,55 @@ pub const COMPRESSIONS_PER_SIGNATURE: usize = 2 * (STEPS + LEAF_BLOCKS + HEIGHT)
 
 const FIAT_SHAMIR_DOMAIN: &[u8] = b"flock-leanxmss-blake3-v1";
 
+/// The proof's transcript and its optional optimisations.
+///
+/// [`Self::DEFAULT`] is the shipped proof. [`Self::RECURSION_LEAF`] is what
+/// the chain tower's walkers can replay in-circuit today
+/// (`docs/leanxmss-recursion-plan.md`): the chained BLAKE3 transcript and
+/// none of the optimisations, each of which the walkers refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XmssOptions {
+    /// The chained BLAKE3 transcript ([`FsChallenger::with_chained_blake3`])
+    /// instead of the tree transcript.
+    pub chained_transcript: bool,
+    /// Each gate's degree-one words leave the zerocheck
+    /// ([`BooleanGate::with_zeroed_linear_words`]).
+    pub zero_linear_words: bool,
+    /// Cell-slots nobody wires leave the wiring
+    /// ([`ShapeBuilder::prune_unwired`]).
+    pub prune_unwired: bool,
+    /// Columns that take only public words leave the grand product
+    /// ([`ShapeBuilder::open_public_columns`]).
+    pub public_columns: bool,
+    /// The grand product's slots in order of live count
+    /// ([`ShapeBuilder::pack_live_slots`]).
+    pub pack_live_slots: bool,
+}
+
+impl XmssOptions {
+    pub const DEFAULT: Self = Self {
+        chained_transcript: false,
+        zero_linear_words: true,
+        prune_unwired: true,
+        public_columns: true,
+        pack_live_slots: true,
+    };
+
+    pub const RECURSION_LEAF: Self = Self {
+        chained_transcript: true,
+        zero_linear_words: false,
+        prune_unwired: false,
+        public_columns: false,
+        pack_live_slots: false,
+    };
+}
+
+impl Default for XmssOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// BLAKE3 flags.
 const CHUNK_START: u32 = 1;
 const CHUNK_END: u32 = 2;
@@ -196,6 +245,7 @@ pub struct XmssCircuit {
     compress: CompressPacker,
     inputs: Vec<Source>,
     publics: Vec<Source>,
+    options: XmssOptions,
 }
 
 /// Records each declared input's source alongside the shape.
@@ -312,6 +362,11 @@ pub fn plan_nu(kinds: &[(usize, usize)]) -> usize {
 /// word) from the zerocheck; chain, address and address-step have no other
 /// word.
 fn gates(nu: usize) -> [BooleanGate; 7] {
+    gates_keeping_every_word(nu).map(BooleanGate::with_zeroed_linear_words)
+}
+
+/// [`gates`] without dropping degree-one words from the zerocheck.
+fn gates_keeping_every_word(nu: usize) -> [BooleanGate; 7] {
     let compress = compress_gate(nu).unwrap();
     [
         compress.clone(),
@@ -322,7 +377,6 @@ fn gates(nu: usize) -> [BooleanGate; 7] {
         address_gate(nu).unwrap(),
         address_step_gate(nu).unwrap(),
     ]
-    .map(BooleanGate::with_zeroed_linear_words)
 }
 
 /// Declares every gate kind, the counts in [`Slots`] order, each over
@@ -332,9 +386,15 @@ fn declare_slots(
     b: &mut Builder,
     nu: usize,
     counts: &[usize],
+    zero_linear_words: bool,
 ) -> (Slots, Vec<(SlotId, BooleanGate)>) {
     let mut gadgets = Vec::new();
-    let mut declared: Vec<Kind> = gates(nu)
+    let kinds = if zero_linear_words {
+        gates(nu)
+    } else {
+        gates_keeping_every_word(nu)
+    };
+    let mut declared: Vec<Kind> = kinds
         .into_iter()
         .zip(counts)
         .map(|(gate, &count)| {
@@ -435,6 +495,11 @@ impl XmssCircuit {
     /// The circuit for `n ≥ 1` signatures with `2^nu` rows per slot, or
     /// [`plan_nu`]'s choice.
     pub fn with_nu(n: usize, nu: Option<usize>) -> Self {
+        Self::with_options(n, nu, XmssOptions::DEFAULT)
+    }
+
+    /// [`Self::with_nu`], proving with `options`.
+    pub fn with_options(n: usize, nu: Option<usize>, options: XmssOptions) -> Self {
         assert!(n >= 1);
         let kinds: Vec<(usize, usize)> = gates(3)
             .iter()
@@ -449,14 +514,21 @@ impl XmssCircuit {
         };
         // The step rows' bus words and every row's unused outputs need no
         // copy constraint, and the columns that only take constants or the
-        // signer's public words (IV, control words, address constants, P) are
-        // checked by the opening. That leaves dead cell-slots among live
-        // ones, so the grand product packs the live ones together.
-        b.sb.prune_unwired();
-        b.sb.open_public_columns();
-        b.sb.pack_live_slots();
+        // signer's public words (IV, control words, address constants, P) can
+        // be checked by the opening. That leaves dead cell-slots among live
+        // ones, so the grand product packs the live ones together. The
+        // recursion leaf keeps all of them in the wiring.
+        if options.prune_unwired {
+            b.sb.prune_unwired();
+        }
+        if options.public_columns {
+            b.sb.open_public_columns();
+        }
+        if options.pack_live_slots {
+            b.sb.pack_live_slots();
+        }
         let counts: Vec<usize> = kinds.iter().map(|&(count, _)| count).collect();
-        let (mut slots, gadgets) = declare_slots(&mut b, nu, &counts);
+        let (mut slots, gadgets) = declare_slots(&mut b, nu, &counts, options.zero_linear_words);
         let constants = declare_constants(&mut b);
         for s in 0..n {
             let island = b.sb.begin_island();
@@ -479,11 +551,24 @@ impl XmssCircuit {
             compress,
             inputs: b.inputs,
             publics: b.publics,
+            options,
         }
     }
 
     pub fn signatures(&self) -> usize {
         self.n
+    }
+
+    pub fn options(&self) -> XmssOptions {
+        self.options
+    }
+
+    fn challenger(&self) -> FsChallenger {
+        if self.options.chained_transcript {
+            FsChallenger::with_chained_blake3(FIAT_SHAMIR_DOMAIN)
+        } else {
+            FsChallenger::new(FIAT_SHAMIR_DOMAIN)
+        }
     }
 
     /// Each slot has `2^nu` rows.
@@ -607,7 +692,7 @@ impl XmssCircuit {
     pub fn prove(&self, witness: &CircuitWitness) -> XmssProof {
         let union = self.union();
         let pcs = Self::pcs_params(&union);
-        let mut challenger = FsChallenger::new(FIAT_SHAMIR_DOMAIN);
+        let mut challenger = self.challenger();
         let (proof, commitment, _claims) = prove_circuit(
             &union,
             &self.shape.circuit,
@@ -627,7 +712,7 @@ impl XmssCircuit {
     ) -> Result<(), FlockVerifyError> {
         let union = self.union();
         let pcs = Self::pcs_params(&union);
-        let mut challenger = FsChallenger::new(FIAT_SHAMIR_DOMAIN);
+        let mut challenger = self.challenger();
         verify_circuit(
             &union,
             &self.shape.circuit,

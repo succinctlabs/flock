@@ -11,6 +11,8 @@ An aggregation tree:
 
 The first milestone is a first-level node over two leanXMSS proofs, with a round-trip and tamper tests.
 
+The leaf will be most of the prover time, so the leaf keeps its optimisations (user, 2026-11-02). The recursion-leaf posture below is scaffolding to get a first node working. The in-circuit support for each optimisation is part of the main line, done in the order of what it saves at the leaf.
+
 ## Starting point
 
 The chain tower (`crates/flock-prover/src/tower/`) already verifies circuit-union proofs in-circuit. A leanXMSS proof is the same proof type, `R1csProofCircuitMerged[Ag]`. It has the AG zerocheck, the union lincheck, the wiring product-GKR and the merged Ligerito opening at the 128-bit profile.
@@ -41,7 +43,28 @@ The chain tower (`crates/flock-prover/src/tower/`) already verifies circuit-unio
 - the chained BLAKE3 transcript;
 - no dropped words, no pruning, no public columns, no packed slots.
 
-Measure what each switch costs the leaf prover against the default leanXMSS proof. The default proof stays as it is.
+Measure what each switch costs the leaf prover against the default leanXMSS proof. The default proof stays as it is. The measurement sets the order of phase 5.
+
+Done: `XmssOptions` (`DEFAULT`, `RECURSION_LEAF`, one switch per optimisation), and the bench knob `LEANXMSS_OPTIONS`.
+
+Measured on 2026-11-02: M4, 1000 signatures, quiet machine, 3 alternating processes per arm, median of each process's fastest prove. Each row turns one option off, or all of them for the recursion leaf.
+
+| Prove (ms) | 1 thread | Δ | 10 threads | Δ |
+|---|---:|---:|---:|---:|
+| Shipped proof (`DEFAULT`) | 1804 | | 426 | |
+| Recursion leaf (all off) | 1904 | +100 | 459 | +33 |
+| Chained transcript | 1823 | +19 | 429 | +3 |
+| Keep degree-one words | 1880 | +76 | 444 | +18 |
+| No pruning | 1886 | +82 | 453 | +27 |
+| No public columns | 1842 | +38 | 439 | +13 |
+| No packing | 1869 | +65 | 438 | +12 |
+
+- **Where the recursion leaf's +100 ms goes (one thread).** The zerocheck takes +53, from the kept degree-one words. The wiring takes the other +53: 44 → 98 ms, from the three wiring options and the bit grind.
+- **The wiring options overlap.** Each costs 38–82 ms alone, but only 53 together. Packing only pays once pruning and public columns leave dead slots, so they are one package.
+- **The chained transcript costs almost nothing.** The +19 is the grind falling back to whole bits. Recursion leaves can keep it permanently, so the tree transcript never needs an in-circuit emitter.
+- **Ranges.** Every arm's processes were within 15–40 ms of each other at one thread and 2–20 ms at ten. A grind's luck (±20 ms) is the main noise.
+
+Phase 5's order: the dropped words first (half the cost, all in the zerocheck), then the wiring package.
 
 **2. Child tape over a leanXMSS proof.**
 - Take the lincheck set from the circuit's gate kinds.
@@ -57,7 +80,7 @@ Measure what each switch costs the leaf prover against the default leanXMSS proo
 
 **4. Internal and spine nodes.** Replace the chain statement and lane with the signature-set statement, then build an aggregation driver and `verify_root`.
 
-**5. Put the leaf optimisations back.** If their prover savings matter, add in-circuit support for:
+**5. Put the leaf optimisations back (required).** Add in-circuit support, in the order of the leaf time each saves (phase 1), for:
 - the dropped words;
 - pruning;
 - public columns;
@@ -68,4 +91,4 @@ Measure what each switch costs the leaf prover against the default leanXMSS proo
 1. **Tree shape.** Is it a fixed balanced tree over fixed-size batches, which the final verifier rebuilds from the list? Or may a node merge children of different sizes, which puts the shape in the statement?
 2. **Leaf batch size, and whether the envelope must grow.** A leanXMSS child adds the bus GKR, 15 lincheck pins and the public words to each region.
 3. **Statement digest format.** A hash tree over batch digests is the starting proposal; the alternative is a hash chain over the concatenated list.
-4. **Leaf posture.** How much the tower-posture leaf costs, and so how much phase 5 is worth.
+4. **Phase 5's scope.** The whole package is worth about 5% at one thread and 7% at ten (phase 1). Are the dropped words cheap enough in-circuit to fold into phase 2 directly?

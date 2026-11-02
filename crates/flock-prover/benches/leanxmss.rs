@@ -10,6 +10,12 @@
 //!
 //! `LEANXMSS_NU` overrides the slot height `2^nu` the layout planner picks.
 //!
+//! `LEANXMSS_OPTIONS` changes the proof's options ([`XmssOptions`]):
+//! `recursion` for the recursion leaf, or a comma-separated list of changes
+//! to the default: `chained` (the chained transcript), `no-zero` (keep the
+//! degree-one words), `no-prune`, `no-public` (no public columns),
+//! `no-pack`.
+//!
 //! Signatures are key-free (each costs two grinds of about 2^20 hashes) and
 //! cached under `target/`.
 
@@ -22,7 +28,7 @@ use std::{
 };
 
 use flock_prover::leanxmss::{
-    circuit::{Statement, XmssCircuit, keyless_batch},
+    circuit::{Statement, XmssCircuit, XmssOptions, keyless_batch},
     reference::{PK_LEN, PublicKey, SIG_LEN, Signature},
 };
 
@@ -89,6 +95,24 @@ fn cached(n: usize) -> (Vec<Statement>, Vec<Signature>) {
     (statements, sigs)
 }
 
+fn options(spec: &str) -> XmssOptions {
+    if spec == "recursion" {
+        return XmssOptions::RECURSION_LEAF;
+    }
+    let mut options = XmssOptions::DEFAULT;
+    for change in spec.split(',').filter(|c| !c.is_empty()) {
+        match change {
+            "chained" => options.chained_transcript = true,
+            "no-zero" => options.zero_linear_words = false,
+            "no-prune" => options.prune_unwired = false,
+            "no-public" => options.public_columns = false,
+            "no-pack" => options.pack_live_slots = false,
+            _ => panic!("LEANXMSS_OPTIONS: unknown change {change:?}"),
+        }
+    }
+    options
+}
+
 fn main() {
     // `LEANXMSS_POOL=perf`: P-core pool plus all-core hops (blake3_proof's
     // setup); default: rayon's pool over every core.
@@ -102,9 +126,10 @@ fn main() {
     let t = Instant::now();
     // `LEANXMSS_NU`: rows per slot as a power of two (default: `plan_nu`).
     let nu = var("LEANXMSS_NU").ok().map(|v| v.parse().unwrap());
-    let circuit = XmssCircuit::with_nu(n, nu);
+    let options = var("LEANXMSS_OPTIONS").map_or(XmssOptions::DEFAULT, |v| options(&v));
+    let circuit = XmssCircuit::with_options(n, nu, options);
     eprintln!(
-        "leanXMSS[BLAKE3] n = {n} (pool {threads:?}): nu = {}, shape {:.0} ms",
+        "leanXMSS[BLAKE3] n = {n} (pool {threads:?}): nu = {}, shape {:.0} ms, {options:?}",
         circuit.nu(),
         t.elapsed().as_secs_f64() * 1e3
     );

@@ -158,6 +158,38 @@ fn four_signatures_drop_words() {
     assert!(circuit.verify(&tampered, &proof).is_err(), "message");
 }
 
+/// The recursion leaf at four signatures: the chained transcript, no
+/// dropped words, every cell-slot in the wiring. It proves and verifies,
+/// fails for a changed message, and its proofs and the default ones are not
+/// interchangeable.
+#[test]
+fn recursion_leaf_proves_and_verifies() {
+    let (statements, sigs) = signed(4, 17);
+    let leaf = XmssCircuit::with_options(4, None, XmssOptions::RECURSION_LEAF);
+    let union = leaf.union();
+    assert!((0..union.registry().num_boolean()).all(|t| union.zeroed_word_cols(t).is_empty()));
+    let circuit = &leaf.shape.circuit;
+    assert!(circuit.public_columns().next().is_none() && !circuit.live_slots_packed());
+    let witness = leaf.witness(&statements, &sigs);
+    let proof = leaf.prove(&witness);
+    leaf.verify(&statements, &proof)
+        .expect("honest proof verifies");
+    let mut tampered = statements.clone();
+    tampered[3].msg[9] ^= 1;
+    assert!(leaf.verify(&tampered, &proof).is_err(), "message");
+
+    let default = XmssCircuit::new(4);
+    assert!(
+        default.verify(&statements, &proof).is_err(),
+        "leaf proof, default verifier"
+    );
+    let proof = default.prove(&default.witness(&statements, &sigs));
+    assert!(
+        leaf.verify(&statements, &proof).is_err(),
+        "default proof, leaf verifier"
+    );
+}
+
 /// The online phase refuses a signature that does not verify: the bottom
 /// root changes, so the top layer's digest is not a codeword.
 #[test]
