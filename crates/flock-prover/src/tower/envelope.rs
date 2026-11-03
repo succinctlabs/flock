@@ -328,11 +328,14 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
         // The committed lane count — the ONE piece of a child's layout that
         // stays circuit structure (the parent hashes `num_lanes`-word
         // leaves), so it is pinned while everything count-shaped rides the
-        // jagged claims. 24 covers every envelope member's content-derived
-        // count at min-one-row. F256 raises the largest live content to 25
-        // lanes; 31 stays below `2^initial_k = 32`, so children remain
-        // lane-major.
-        lanes: 31,
+        // jagged claims. The largest member is the leanXMSS first-level
+        // node: 28.44 lanes of 2^17 words after family H by Horner (30.96
+        // before, which forced 31), so 29 covers every member; the outer
+        // asserts content ≤ pin. Lanes past the content are zero and the
+        // commit's NTT skips them, but the Merkle leaves and the parent's
+        // opened rows still carry them. 29 < `2^initial_k = 32`, so
+        // children remain lane-major.
+        lanes: 29,
         acc_chain_words,
     }
 }
@@ -417,7 +420,8 @@ pub(super) fn declare_envelope_slots(
 /// Every envelope slot's count rounds up to a multiple of `2^8` rows
 /// ([`pad_envelope_counts`]): the alignment the opening's multipoint assist
 /// needs for its closed form, at a few percent of area (the first-level
-/// node over two 992-signature leaves: 30.47 → 30.96 lanes, inside the pin).
+/// node over two 992-signature leaves: 30.47 → 30.96 lanes, measured before
+/// family H by Horner).
 pub(super) const ENV_ROW_ALIGN_LOG: usize = 8;
 
 /// Pad every envelope slot's declared count up to counts* (the counts pin:

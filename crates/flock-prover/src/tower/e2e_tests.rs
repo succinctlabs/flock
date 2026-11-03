@@ -1341,10 +1341,14 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 // (`SquareChainGate`, `HornerStepGate`), so the three outer circuits and
 // the outer registry move; chain circuit, chain registry and publics
 // UNCHANGED. Two identical prints.
+// Re-blessed 2026-11-03: the lane pin drops 31 → 29, so a parent opens
+// 29-word rows of its node children; the base and steady circuits move.
+// The FL circuit (leaf children), chain circuit, both registries and
+// publics UNCHANGED. Two identical prints.
 const PIN_CHAIN_CIRCUIT: &str = "b8f442da32b9961612ccaf9acb39cadcd4592e913b2b208a1b9740d01c10e9c9";
 const PIN_FL_CIRCUIT: &str = "44cf22f1e1763b11cd26919c4411ce8e32dc86c98717a65010f6abb531b02eac";
-const PIN_BASE_CIRCUIT: &str = "c26dc7d6e4cfb546bdfb24b967afe51efac9cec0fce368d9d7f7de4ffa26d92f";
-const PIN_STEADY_CIRCUIT: &str = "42fa2dd98b87d5aaa79b8c0829d3eac7b84cf92daef56be4e1af10ba68bf1866";
+const PIN_BASE_CIRCUIT: &str = "c6156f1a09d331807d6777a70d28b83cf206b28814a8e24c166160807bc4294f";
+const PIN_STEADY_CIRCUIT: &str = "0e5a956f323a07e8d7f7292fa51f1c8c86ee0aa62626cb3285d7466d770f0c7f";
 const PIN_CHAIN_REGISTRY: &str = "3126c5ce825e8fc3942843c0548ba43964b1daa5751a834fcbbc1c3ab58e40fe";
 const PIN_OUTER_REGISTRY: &str = "46ff22cef00ffef70a39f7c3c0c10972445ac329ff8d2cadf1f865e1842c0053";
 const PIN_PUBLICS_LEN: usize = 5684;

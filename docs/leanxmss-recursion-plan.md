@@ -218,13 +218,30 @@ A census of the spine's full-field gates (rows per gate type per verifier step) 
 **Not done:**
 - The ĝ anchor's 2,794 square-root checks per child still run on 21-column spine-gate rows (a narrow-gate fix, not an algorithmic one).
 - The family-H transpose dot is 2,048 MACs per claim where summing the 16 tile partials first gives 128.
-- The first-level node is now at about 28.4 lanes, so the 31-lane pin could drop to 29.
+- The first-level node is now at about 28.4 lanes, so the 31-lane pin could drop to 29 (done below).
+
+## Lane pin 31 → 29 (2026-11-03)
+
+The first-level node, the largest envelope member, is 28.44 lanes of 2^17 words after Horner, so the pin drops to 29. The base and steady circuits move (a parent opens 29-word rows of its node children); the FL circuit, chain circuit, registries and publics do not.
+
+Time is unchanged. A quiet M4, 1 thread, two alternating runs per binary, median of 6 steady proves, fingerprint PoW excluded (ms):
+
+| | FL | base | spine |
+|---|---:|---:|---:|
+| pin 31 | 569.7 | 530.4 | 536.4 |
+| pin 29 | 570.5 | 534.5 | 536.7 |
+
+The differences are inside the Ligerito grinding draw (about ±7 ms). This is expected from the code:
+- The commit's NTT already skipped the dead lanes (`commit_lane_major`), so Horner's lane drop had already taken the NTT gain (~9 ms).
+- A 31-word Merkle leaf (496 B) and a 29-word one (464 B) are both 8 BLAKE3 blocks, so neither the commit's Merkle nor the parent's opening rows shrink (node BLAKE rows 23,808 / 24,320 in both).
+
+What it does buy: the node proof drops from 255.1 to 251.3 KiB. The pin that would matter is **28**: a 448 B leaf is exactly 7 blocks. That needs the FL under 28 lanes; the ĝ narrow-chain change is the likely way there.
 
 ## Open questions
 
 1. **Tree shape.** The driver is the chain tower's spine: a base over the last two first-level nodes, then each level prepends the next-earlier one. The statement is `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))` over fixed 992-signature batches, and the verifier rebuilds it from the batches (`xmss_statement`). A balanced tree would need a second internal shape.
 2. **Leaf batch size.** It is 992. One more signature tips the statement hash's compressions into a third slot, and the layout planner to ν = 14.
-3. **Margin.** The first-level node runs at 30.47 of 31 lanes, and its MAC slot at 98%. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
+3. **Margin.** The first-level node runs at 28.44 of 29 lanes, and its MAC slot at 98%. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
 4. **Node cost.** A node is 35–46% of a leaf's time for an eighth of its words (above). The candidates:
    - the ragged multipoint weight: aligned envelope columns, or a closed-form ragged weight;
    - the family tiles' bool-path witness;
