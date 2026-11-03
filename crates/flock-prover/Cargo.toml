@@ -40,6 +40,10 @@ name = "affine_fold_probe"
 harness = false
 
 [[bench]]
+name = "affine_vs_f256"
+harness = false
+
+[[bench]]
 name = "ag_breakdown"
 harness = false
 

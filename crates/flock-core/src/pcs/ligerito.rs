@@ -62,6 +62,7 @@ use crate::{
     scratch::{give_f128, take_f128},
 };
 
+pub mod affine;
 pub(crate) mod extension;
 
 // ===================================================================
