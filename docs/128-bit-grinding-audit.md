@@ -84,6 +84,13 @@ recorded child-proof and accumulator-fold `Pow` with native BLAKE3 arithmetic,
 64-bit nonce constraints, and the requested leading-zero predicate. The check
 word is circuit IO bound to its fixed value; it is not a private witness cell.
 
+Correction (2026-11-03): until the `fix-leaf-pow-checks` change, this held for
+node children and the fold tapes but not for a first-level node's leaf
+children. `emit_child_region` bound each leaf nonce in the fused chain rows but
+emitted no predicate rows, so every leaf grind except the AG round-one point
+was unchecked in-circuit. It now emits one PowMask row per recorded leaf `Pow`,
+and `chain_child_region_emits_alone` asserts the count.
+
 The current permutation/copy-constraint argument is the active batched
 Product-GKR path. It is included in this conclusion. The older standalone
 `permutation.rs` API is inactive and outside the requested review boundary.
