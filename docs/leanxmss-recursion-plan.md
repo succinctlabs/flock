@@ -148,6 +148,36 @@ The nodes scale worse with threads than the leaf (3.3× from 1 to 10 threads, ag
 
 Per committed word, a node costs 2.8× a leaf. The leaf's bit-structured witness takes the fast paths: the ranked NTT, block statistics, and closed-form multipoint weights over 703 full columns (3 ms). The node's ragged layout (730 columns, 11 full) takes the dense virtual weight: 74 ms of weight passes and two-product sumcheck. That is the next place to look. After the swap fix, witgen's remaining 32 ms is BLAKE3 rows (12), the family-transpose tiles (7, still on the bool path), the element slots (7) and the bit spread (3).
 
+## Node optimization pass (2026-11-02)
+
+Goal: every per-byte difference between a node and the leaf is either removed or explained. Measured at 1 thread on a quiet M4 with the bench profile (`xmss_tower_online_bench`). The fingerprint PoW enters at its expectation (live leaves × 22.4 ns/hash), since its sampled time is a random draw, fixed per transcript (8–91 ms observed).
+
+**Removed:**
+- **Glue witness** (aa13455, cfadf18). The swap, bit-spread, PoW-mask and family-tile tables write packed words through the shared batch-major driver instead of `Vec<bool>` rows. Node witgen went 60 → 21 ms.
+- **Lane fill** (2ce1fd4). The rate-1/4 lane-major fill transposes once and copies the replicas: 14 → 7.7 ms, the leaf's rate per encoded byte. Fusing the fill into the first NTT pass lost: 32–38 ms against 24 ms for the memcpy replicate plus the in-place pass.
+- **Uneven-column multipoint** (dea13dd). Envelope counts are aligned to 2^8 with real padding gates, and the closed form now runs over 2^g-row sub-columns, prover-only.
+  - Multipoint weights went 37 → 5 ms and its sumcheck 37 → 0.7 ms.
+  - The first-level node grows 30.47 → 30.96 lanes.
+
+| Per-proof ms | 1 thread | 4 threads | 10 threads |
+|---|---:|---:|---:|
+| Spine node before → after | 712 → 580 (expected PoW) | 250 → 222 | 216 → 184 |
+| First-level node before → after | 780 → 629 | 295 → 226 | 270 → 193 |
+| Per-leaf overhead before → after | +36% → ~+31% | +45% → +38% | +52% → +41% |
+
+**Explained (spine ÷ leaf, ns per live byte):**
+- **Commit 2.0×.** The rate is 1/4 (Slim) against 1/2. Per encoded byte: NTT 0.8×, fill 1.0×, Merkle 1.1×. The Merkle excess is 31-lane rows of 496 B rounding up to 64-byte blocks, and a pinned lane count that is 15% zero.
+- **Ligerito 2.2×.** The rate again: 0.94× per encoded byte.
+- **Zerocheck 0.9×.**
+- **Lincheck 1.8×.** A fixed comb build per distinct gate (10 ms node, 19 ms leaf) plus count-proportional folds at 1.4×.
+- **Wiring 6.5× and fingerprint PoW 5.5×.** Cell density: the node has 2^23 cells for 57 MB, because nearly every node word is a gate input or output; the leaf has 2^22 cells for 369 MB. Per cell the node is cheaper. Pruning and packing do not shrink the node's μ.
+- **Element PIOP (13 ms).** Node-only full-field gates.
+- **Multipoint values (22 ms).** A fixed cost in both leaf and node: 2 claims × 128 conjugates × columns × layers.
+- **Merged path 3.0×.**
+  - The leaf takes the block-first transport. It needs per-column bit-banks, which the leaf gets from its boolean zerocheck (the 71 ms C-claim fold); counted together with that fold, the leaf is 0.53 ns/B and the node is 1.8×.
+  - For the node's full-field words a bit-bank costs about what the W build does.
+  - Open: a node block-first path at g = 8 with byte-table banks could save ~25 ms, but it changes the transcript order. That means a verifier rotation and the parent's in-circuit RealTape.
+
 ## Open questions
 
 1. **Tree shape.** The driver is the chain tower's spine: a base over the last two first-level nodes, then each level prepends the next-earlier one. The statement is `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))` over fixed 992-signature batches, and the verifier rebuilds it from the batches (`xmss_statement`). A balanced tree would need a second internal shape.
