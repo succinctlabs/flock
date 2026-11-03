@@ -434,18 +434,30 @@ background load:
 \toprule
 & F256 ladder & affine & change \\
 \midrule
-prove, run 1 (ms, median) & 58.7 & 46.4 & $-21.0\%$ \\
-prove, run 2 (ms, median) & 57.9 & 46.1 & $-20.4\%$ \\
+prove, run 1 (ms, median) & 58.2 & 40.5 & $-30.4\%$ \\
+prove, run 2 (ms, median) & 60.5 & 39.3 & $-35.0\%$ \\
+prove, best of 9 & 56.3 & 38.3 & $-32.1\%$ \\
 proof size (KiB) & 425.2 & 396.6 & $-6.7\%$ \\
+verify (ms) & & 1.4 & \\
 \bottomrule
 \end{tabular}
 \end{center}
-In a warm trace the affine L0 takes $18.1$ ms ($5.7$ statistics,
-$12.3$ materialize) against $11.5$ ms for the F256 ladder. The
-recursive commits take $11.8$ ms against $35.1$ ms. The materialize
-pass does $\sum_i (\mathrm{popcount}(i) + 1) \approx 168$
-multiplications per column against $92$ for the F256 fold, so it
-stays the largest L0 cost.
+In a warm trace the affine L0 takes $16.6$ ms ($5.5$ statistics,
+$11.1$ materialize) against $10.9$ ms for the F256 ladder. The
+recursive commits take $11.9$ ms against $29.5$ ms, and the
+consistency step $3.9$ ms against $5.7$ ms. That step had cost
+$10.3$ ms before the subspace constants $s_k(v_k)^{-1}$ were cached
+(each query inverted about $20$ of them) and the queries ran in
+parallel. The same fix took the verifier from $13.5$ to $1.4$ ms.
+
+The materialize pass does $\sum_i (\mathrm{popcount}(i) + 1) = 165$
+multiplications per column against $92$ for the F256 fold, at about
+the same rate per product, so it stays the largest L0 cost. Two
+attempts did not help. Folding the low lane bits pairwise inside the
+column chunks cuts the count to about $150$, because $T$ reads outside
+an aligned chunk only at its first column, but it ran no faster. A
+register-resident Karatsuba accumulator with pre-split coefficients ran
+slower than the plain loop.
 
 The largest item is the split. Today a folded $\F_{2^{256}}$ table of
 length $N$ is committed as a $\F_{2^{128}}$ table of length $2N$, and

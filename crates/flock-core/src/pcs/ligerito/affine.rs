@@ -24,7 +24,8 @@ use std::{
 };
 
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    ParallelSliceMut,
 };
 
 use crate::{
@@ -402,19 +403,31 @@ fn lane_statistics_fused(
         .collect()
 }
 
+/// Largest subspace-polynomial index the cached tables cover.
+const SUBSPACE_TABLE: usize = 48;
+
+/// `(s_k(v_k), 1 / s_k(v_k))` for `k < SUBSPACE_TABLE`. The values do not
+/// depend on the domain size, so one table serves every level.
+fn subspace_constants() -> &'static (Vec<F128>, Vec<F128>) {
+    static TABLE: std::sync::OnceLock<(Vec<F128>, Vec<F128>)> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let v = eval_sk_at_vks(SUBSPACE_TABLE);
+        let inv = v.iter().map(|x| x.inv()).collect();
+        (v, inv)
+    })
+}
+
 /// Normalized subspace polynomials `Ŵ_0(x), …, Ŵ_{count-1}(x)`.
 fn subspace_evals(x: F128, count: usize) -> Vec<F128> {
-    let sks_vks = eval_sk_at_vks(count);
+    assert!(count <= SUBSPACE_TABLE);
+    let (sks_vks, inv) = subspace_constants();
     let mut w = Vec::with_capacity(count);
     let mut s = x;
     for k in 0..count {
         if k > 0 {
             s = next_s(s, sks_vks[k - 1]);
         }
-        w.push(s);
-    }
-    for (wk, &v) in w.iter_mut().zip(&sks_vks) {
-        *wk *= v.inv();
+        w.push(s * inv[k]);
     }
     w
 }
@@ -896,7 +909,9 @@ pub fn prove_affine_l0<Ch: Challenger>(
         t_opens += t.elapsed();
         let t = Instant::now();
         let rows = &proof.openings.last().expect("just pushed").opened_rows;
+        let ti = Instant::now();
         let enforced = batched_consistency(rows, &queries, &gammas, &overflow, c, &alpha);
+        let t_enf = ti.elapsed();
         let basis = induce_sumcheck_poly_auto(
             c,
             config.log_inv_rates[li],
@@ -911,6 +926,13 @@ pub fn prove_affine_l0<Ch: Challenger>(
         let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(li + 1));
         proof.claim_batch_grinding_nonces.push(nonce);
         level.add_weight(&basis, beta, enforced);
+        if trace {
+            eprintln!(
+                "  induce L{li}: enforced {:.2} ms, basis+glue {:.2} ms",
+                t_enf.as_secs_f64() * 1e3,
+                (ti.elapsed() - t_enf).as_secs_f64() * 1e3
+            );
+        }
         t_induce += t.elapsed();
         proof.overflows.push(overflow);
         committed.push(next);
@@ -949,14 +971,41 @@ struct LaneTerm {
 /// per lane and term stay in L1/L2).
 const LANE_LOW_BITS: usize = 12;
 
-/// `Σ_i ω_i(X) lane_i` for lane-major lanes and per-lane polynomials `ω_i`
-/// (monomial coefficients in `X`): `h_s = Σ_i [X^s]ω_i · lane_i` in one
-/// column-chunked pass (stored `[col][s]`), then Horner
-/// `f = h_0 + X(h_1 + X(h_2 + …))` with the gather map `T`.
-fn materialize_lanes(witness: &[F128], d: usize, omega: &[Vec<F128>], p: &[F128]) -> Vec<F128> {
+/// `ω_m = Π_{j: m_j = 1} (α_j + β_j X)` in monomial coefficients.
+fn row_polynomial(m: usize, gammas: &[(F128, F128)]) -> Vec<F128> {
+    let mut poly = vec![F128::ONE];
+    for (j, &(alpha, beta)) in gammas.iter().enumerate() {
+        if (m >> j) & 1 == 1 {
+            let mut next = vec![F128::ZERO; poly.len() + 1];
+            for (s, &a) in poly.iter().enumerate() {
+                next[s] += alpha * a;
+                next[s + 1] += beta * a;
+            }
+            poly = next;
+        }
+    }
+    poly
+}
+
+/// The folded L0 message `Σ_i ω_i(X) lane_i` for lane-major lanes:
+/// `h_s = Σ_i [X^s]ω_i · lane_i` in one column-chunked pass (stored
+/// `[col][s]`, chunks of `COLS` columns), then Horner
+/// `f = h_0 + X(h_1 + X(h_2 + …))` with the gather map `T`. The cost is
+/// `Σ_i (popcount(i) + 1)` multiplications per column, 165 over 46 lanes.
+/// Folding the low lane bits pairwise first saves multiplications but not
+/// time (measured), and a register-resident Karatsuba accumulator was
+/// slower than this loop.
+#[doc(hidden)]
+pub fn materialize_lanes<const COLS: usize>(
+    witness: &[F128],
+    d: usize,
+    num_lanes: usize,
+    gammas: &[(F128, F128)],
+    p: &[F128],
+) -> Vec<F128> {
+    let omega: Vec<Vec<F128>> = (0..num_lanes).map(|i| row_polynomial(i, gammas)).collect();
     let deg = omega.iter().map(|w| w.len() - 1).max().unwrap_or(0);
     let width = deg + 1;
-    const COLS: usize = 1 << 10;
     let mut h = vec![F128::ZERO; d * width];
     h.par_chunks_mut(COLS * width)
         .enumerate()
@@ -992,6 +1041,9 @@ fn materialize_lanes(witness: &[F128], d: usize, omega: &[Vec<F128>], p: &[F128]
     }
     f
 }
+
+/// Column chunk of the L0 materialize pass.
+const MATERIALIZE_COLS: usize = 1 << 10;
 
 /// The L0 rounds on the lane-major path, from per-lane statistics only:
 /// the grid of round j is a combination of `stats` and the row weights, and
@@ -1132,26 +1184,9 @@ fn lane_rounds<Ch: Challenger>(
         gammas.push((alpha, beta));
     }
 
-    // The folded message Σ_i ω_i(X) lane_i, ω_i = Π_{j: i_j} (α_j + β_j X):
-    // h_s = Σ_i [X^s]ω_i · lane_i, then Horner f = h_0 + X(h_1 + X(h_2 + …)).
+    // The folded message Σ_i ω_i(X) lane_i, ω_i = Π_{j: i_j} (α_j + β_j X).
     let t1 = Instant::now();
-    let omega: Vec<Vec<F128>> = (0..num_lanes)
-        .map(|i| {
-            let mut poly = vec![F128::ONE];
-            for (j, &(alpha, beta)) in gammas.iter().enumerate() {
-                if (i >> j) & 1 == 1 {
-                    let mut next = vec![F128::ZERO; poly.len() + 1];
-                    for (s, &a) in poly.iter().enumerate() {
-                        next[s] += alpha * a;
-                        next[s + 1] += beta * a;
-                    }
-                    poly = next;
-                }
-            }
-            poly
-        })
-        .collect();
-    let mut f = materialize_lanes(witness, d, &omega, p);
+    let mut f = materialize_lanes::<MATERIALIZE_COLS>(witness, d, num_lanes, &gammas, p);
     f.resize(d + k, F128::ZERO);
     let mut w = vec![F128::ZERO; d];
     for term in &terms {
@@ -1189,12 +1224,11 @@ fn batched_consistency(
     alpha: &[F128],
 ) -> F128 {
     let weights = build_eq_table(alpha);
-    rows.iter()
-        .zip(queries)
-        .zip(&weights)
-        .fold(F128::ZERO, |acc, ((row, &q), &wt)| {
-            acc + wt * consistency_value(row, q, gammas, overflow, log_cols)
-        })
+    rows.par_iter()
+        .zip(queries.par_iter())
+        .zip(weights.par_iter())
+        .map(|((row, &q), &wt)| wt * consistency_value(row, q, gammas, overflow, log_cols))
+        .reduce(|| F128::ZERO, |a, b| a + b)
 }
 
 // ---------------------------------------------------------------------------
@@ -1646,6 +1680,57 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The L0 materialize equals the sequential affine folds of the lanes,
+    /// for chunk sizes below and above the lane length.
+    #[test]
+    fn materialize_lanes_matches_sequential_folds() {
+        let mut rng = RandomChallenger::new(0xAFF1_0006);
+        let (c, k, live) = (9usize, 6usize, 46usize);
+        let d = 1usize << c;
+        let w = random_vec(&mut rng, live * d);
+        let gammas: Vec<(F128, F128)> = (0..k)
+            .map(|_| (rng.sample_f128(), rng.sample_f128()))
+            .collect();
+        let p = carry_products(c + 4);
+        // Reference: fold row pairs round by round, f0 + α f1 + β T f1.
+        let mut rows: Vec<Vec<F128>> = (0..1 << k)
+            .map(|i| {
+                if i < live {
+                    w[i * d..(i + 1) * d].to_vec()
+                } else {
+                    vec![F128::ZERO; d]
+                }
+            })
+            .collect();
+        for &(alpha, beta) in &gammas {
+            rows = rows
+                .chunks(2)
+                .map(|pair| {
+                    let (a, b) = (&pair[0], &pair[1]);
+                    let len = a.len();
+                    (0..=len)
+                        .map(|m| {
+                            let base = if m < len {
+                                a[m] + alpha * b[m]
+                            } else {
+                                F128::ZERO
+                            };
+                            base + beta * t_at(|j| b[j], len, m, &p)
+                        })
+                        .collect()
+                })
+                .collect();
+        }
+        for got in [
+            super::materialize_lanes::<64>(&w, d, live, &gammas, &p),
+            super::materialize_lanes::<1024>(&w, d, live, &gammas, &p),
+        ] {
+            let mut got = got;
+            got.resize(d + k, F128::ZERO);
+            assert_eq!(got, rows[0]);
         }
     }
 

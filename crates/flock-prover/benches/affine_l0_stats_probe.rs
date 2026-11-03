@@ -14,7 +14,7 @@ use std::time::Instant;
 use flock_prover::{
     field::{F128, F256Unreduced},
     init_perf_thread_pool,
-    pcs::ligerito::affine::{carry_products, shifted_eq_functionals},
+    pcs::ligerito::affine::{carry_products, materialize_lanes, shifted_eq_functionals},
 };
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
@@ -167,6 +167,10 @@ fn time<R>(f: impl FnOnce() -> R) -> f64 {
 
 fn main() {
     init_perf_thread_pool();
+    if std::env::args().any(|a| a == "materialize") {
+        materialize_mode();
+        return;
+    }
     let d = 1usize << LOG_COLS;
     let f = rand_vec(LANES * d, 1);
     let withins: Vec<Vec<F128>> = (0..13).map(|t| rand_vec(d, 100 + t)).collect();
@@ -262,5 +266,35 @@ fn main() {
     for (name, v) in rows {
         let min = v.iter().copied().fold(f64::INFINITY, f64::min);
         println!("  {name}  median {:7.2}  min {:7.2}", median(v), min);
+    }
+}
+
+/// The L0 folded-message pass alone, chunk sizes interleaved.
+fn materialize_mode() {
+    let d = 1usize << LOG_COLS;
+    let f = rand_vec(LANES * d, 1);
+    let p = carry_products(LOG_COLS + 4);
+    let raw = rand_vec(12, 9);
+    let gammas: Vec<(F128, F128)> = raw.chunks(2).map(|c| (c[0], c[1])).collect();
+    type Kernel = fn(&[F128], usize, usize, &[(F128, F128)], &[F128]) -> Vec<F128>;
+    let kernels: [(&str, Kernel); 3] = [
+        ("cols 2^8 ", materialize_lanes::<256>),
+        ("cols 2^10", materialize_lanes::<1024>),
+        ("cols 2^12", materialize_lanes::<4096>),
+    ];
+    let mut ts = vec![Vec::new(); kernels.len()];
+    for rep in 0..16 {
+        for (i, (_, k)) in kernels.iter().enumerate() {
+            let start = Instant::now();
+            std::hint::black_box(k(&f, d, LANES, &gammas, &p));
+            if rep > 0 {
+                ts[i].push(start.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+    }
+    println!("L0 materialize, {LANES} lanes x 2^{LOG_COLS}, 6 rounds (15 reps, ms):");
+    for ((name, _), v) in kernels.iter().zip(ts) {
+        let min = v.iter().copied().fold(f64::INFINITY, f64::min);
+        println!("  {name}: median {:6.2}  min {:6.2}", median(v), min);
     }
 }
