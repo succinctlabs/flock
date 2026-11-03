@@ -4120,12 +4120,12 @@ impl VirtualEqTerm {
 /// A factored sum of scaled equality tensors. It starts with the opening's
 /// basis and can absorb L0's additional OOD term without materializing a
 /// `2^log_n` vector.
-pub(crate) struct VirtualEqBasis {
+pub struct VirtualEqBasis {
     terms: Vec<VirtualEqTerm>,
 }
 
 impl VirtualEqBasis {
-    pub(crate) fn new(point: Vec<F128>, gamma: F128) -> Self {
+    pub fn new(point: Vec<F128>, gamma: F128) -> Self {
         Self {
             terms: vec![VirtualEqTerm::new(point, gamma)],
         }
@@ -4813,7 +4813,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
 /// zero regardless, since q's dead lanes are zero). No trailing verifier
 /// mirror: the transcript ends at the opening on this path.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenger>(
+pub fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     b_initial: Vec<F128>,

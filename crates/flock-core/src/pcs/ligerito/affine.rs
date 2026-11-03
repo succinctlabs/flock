@@ -23,7 +23,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
 
 use crate::{
     merkle::cap_layer,
@@ -189,7 +191,7 @@ pub fn affine_configs(
 /// Prefix products `P_i = a_0 ⋯ a_{i-1}` of the novel-basis squaring
 /// constants `a_i = W_{i+1}(v_{i+1}) / W_i(v_i)^2` for the standard basis
 /// `v_i = x^i`. `P` has `dim + 1` entries.
-fn carry_products(dim: usize) -> Vec<F128> {
+pub fn carry_products(dim: usize) -> Vec<F128> {
     let mut w: Vec<F128> = (0..=dim).map(|i| F128::new(1u64 << i, 0)).collect();
     let mut c = Vec::with_capacity(dim + 1);
     for i in 0..=dim {
@@ -223,6 +225,181 @@ fn t_at(g: impl Fn(usize) -> F128, len: usize, m: usize, p: &[F128]) -> F128 {
         out += p[tz] * g(j);
     }
     out
+}
+
+/// `F_s(g) = <(X^s g)_{<2^c}, eq(z)>` for `s = 0..=max_s`, where `g` has
+/// `2^c` coefficients and `z ∈ F^c` (LSB first). This is what the L0 grid
+/// needs from each lane: the weight's column factor against `X^s` times the
+/// row.
+///
+/// One top-down fold of `g` gives all of them. Split `g = g_L + Ŵ_{c-1} g_H`.
+/// `X` raises a coefficient index by at most one, and coefficients at
+/// `2^c` and above never flow back down, so
+/// `F_s(g) = F'_s(g_L + z_{c-1}(g_L + g_H)) + z_{c-1} <B_s(g_L + g_H), eq(z')>`,
+/// where `B_s(h)` is the overflow of `X^s h` past `2^{c-1}`. It depends only
+/// on the top `s` coefficients of `h`. The cost is the fold (`2^c`
+/// multiplications) plus `O(c · max_s^2)`, the same as computing `F_0` alone.
+pub fn shifted_eq_functionals(g: &[F128], z: &[F128], max_s: usize, p: &[F128]) -> Vec<F128> {
+    let c = z.len();
+    assert_eq!(g.len(), 1usize << c);
+    let mut cur = g.to_vec();
+    let mut out = vec![F128::ZERO; max_s + 1];
+    // The split identity needs `s <= 2^b`; the last few levels (at most
+    // `2 max_s` coefficients) are finished by brute force.
+    let mut b = c;
+    while b > 0 && (1usize << (b - 1)) >= max_s.max(1) {
+        b -= 1;
+        let half = 1usize << b;
+        let zb = z[b];
+        let lo = half - max_s;
+        let win: Vec<F128> = (lo..half).map(|j| cur[j] + cur[j + half]).collect();
+        split_correction(win, b, z, p, &mut out);
+        let (l, h) = cur.split_at(half);
+        cur = l.iter().zip(h).map(|(&a, &hh)| a + zb * (a + hh)).collect();
+    }
+    let eq = build_eq_table(&z[..b]);
+    let mut xs = cur;
+    for o in out.iter_mut() {
+        *o += xs
+            .iter()
+            .zip(&eq)
+            .fold(F128::ZERO, |acc, (&a, &e)| acc + a * e);
+        let len = xs.len();
+        xs = (0..=len).map(|m| t_at(|j| xs[j], len, m, p)).collect();
+    }
+    out
+}
+
+/// The level-`b` term of [`shifted_eq_functionals`]: `win` holds the top
+/// `max_s = out.len() - 1` coefficients of `g_L + g_H` (indices
+/// `[2^b - max_s, 2^b)`; inputs below cannot reach `2^b` in `max_s` steps).
+/// Adds `z_b <B_s, eq(z_0..z_{b-1})>` to `out[s]` for `s >= 1`.
+fn split_correction(mut win: Vec<F128>, b: usize, z: &[F128], p: &[F128], out: &mut [F128]) {
+    let max_s = out.len() - 1;
+    let half = 1usize << b;
+    debug_assert!(half >= max_s && win.len() == max_s);
+    let lo = half - max_s;
+    let low_eq: Vec<F128> = (0..max_s)
+        .map(|j| {
+            (0..b).fold(F128::ONE, |e, i| {
+                e * if (j >> i) & 1 == 1 {
+                    z[i]
+                } else {
+                    F128::ONE + z[i]
+                }
+            })
+        })
+        .collect();
+    for s in 1..=max_s {
+        let len = lo + win.len();
+        let cur = &win;
+        win = (lo..=len)
+            .map(|m| {
+                t_at(
+                    |j| if j >= lo { cur[j - lo] } else { F128::ZERO },
+                    len,
+                    m,
+                    p,
+                )
+            })
+            .collect();
+        // Overflow coefficient half + j (j < s) carries eq(z_0..z_{b-1}; j).
+        let overflow =
+            (half..lo + win.len()).fold(F128::ZERO, |acc, j| acc + win[j - lo] * low_eq[j - half]);
+        out[s] += z[b] * overflow;
+    }
+}
+
+/// [`shifted_eq_functionals`] for every live lane of a lane-major witness
+/// (`witness[lane · d + col]`) and several column points, in one sweep.
+/// The top `c - low_bits` column bits are folded in a single pass against
+/// their eq table; the split corrections of those levels need only the
+/// `max_s` coefficients below each block boundary, which are gathered
+/// directly. The remaining `2^low_bits` vector goes through the recursion.
+/// Returns `[term][lane][s]`; lanes `num_lanes..lanes` are zero.
+#[allow(clippy::too_many_arguments)]
+fn lane_statistics_fused(
+    witness: &[F128],
+    d: usize,
+    lanes: usize,
+    num_lanes: usize,
+    points: &[&[F128]],
+    max_s: usize,
+    p: &[F128],
+    low_bits: usize,
+) -> Vec<Vec<Vec<F128>>> {
+    let c = d.trailing_zeros() as usize;
+    let low = c.min(low_bits.max(ceil_log2(max_s.max(1)) + 1));
+    let blk = 1usize << low;
+    let eq_tops: Vec<Vec<F128>> = points.iter().map(|z| build_eq_table(&z[low..])).collect();
+    let n_h = 1usize << (c - low);
+    const H_CHUNK: usize = 8;
+    let terms = points.len();
+    let zero = || vec![F128::ZERO; terms * blk];
+    let per_lane: Vec<Vec<Vec<F128>>> = (0..num_lanes)
+        .into_par_iter()
+        .map(|lane| {
+            let row = &witness[lane * d..(lane + 1) * d];
+            let v = (0..n_h.div_ceil(H_CHUNK))
+                .into_par_iter()
+                .fold(zero, |mut acc, hc| {
+                    for h in hc * H_CHUNK..((hc + 1) * H_CHUNK).min(n_h) {
+                        let src = &row[h * blk..(h + 1) * blk];
+                        for (t, eq_top) in eq_tops.iter().enumerate() {
+                            let w = eq_top[h];
+                            for (a, &x) in acc[t * blk..(t + 1) * blk].iter_mut().zip(src) {
+                                *a += w * x;
+                            }
+                        }
+                    }
+                    acc
+                })
+                .reduce(zero, |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(b) {
+                        *x += y;
+                    }
+                    a
+                });
+            points
+                .iter()
+                .enumerate()
+                .map(|(t, z)| {
+                    let mut out = vec![F128::ZERO; max_s + 1];
+                    if max_s > 0 {
+                        for b in (low..c).rev() {
+                            let half = 1usize << b;
+                            let eq_above = build_eq_table(&z[b + 1..c]);
+                            let win = (half - max_s..half)
+                                .map(|j| {
+                                    eq_above
+                                        .iter()
+                                        .enumerate()
+                                        .fold(F128::ZERO, |acc, (h, &e)| {
+                                            let base = h << (b + 1);
+                                            acc + e * (row[base + j] + row[base + half + j])
+                                        })
+                                })
+                                .collect();
+                            split_correction(win, b, z, p, &mut out);
+                        }
+                    }
+                    let tail =
+                        shifted_eq_functionals(&v[t * blk..(t + 1) * blk], &z[..low], max_s, p);
+                    for (o, x) in out.iter_mut().zip(tail) {
+                        *o += x;
+                    }
+                    out
+                })
+                .collect()
+        })
+        .collect();
+    (0..terms)
+        .map(|t| {
+            let mut stats: Vec<Vec<F128>> = per_lane.iter().map(|l| l[t].clone()).collect();
+            stats.resize(lanes, vec![F128::ZERO; max_s + 1]);
+            stats
+        })
+        .collect()
 }
 
 /// Normalized subspace polynomials `Ŵ_0(x), …, Ŵ_{count-1}(x)`.
@@ -283,7 +460,7 @@ fn consistency_value(
 ) -> F128 {
     let x = query_point(q);
     let omega = row_weights(gammas, x);
-    debug_assert_eq!(omega.len(), row.len());
+    debug_assert!(row.len() <= omega.len(), "dead lanes are zero and omitted");
     let folded = row
         .iter()
         .zip(&omega)
@@ -463,6 +640,27 @@ fn view(w: &LigeroWitness) -> Commitment<'_> {
 // Prover
 // ---------------------------------------------------------------------------
 
+/// The L0 input of the affine ladder.
+pub enum AffineL0 {
+    /// LSB-lane layout (`ligero_commit`): `witness[col · 2^k0 + lane]`, with a
+    /// dense basis in the same layout.
+    Dense {
+        witness: Vec<F128>,
+        basis: Vec<F128>,
+    },
+    /// Lane-major integer-lane commit (`commit_lane_major`):
+    /// `witness[lane · 2^c0 + col]`, lanes `>= num_lanes` zero. The basis is
+    /// `gamma · eq(point, ·)` in the same index order, never materialized.
+    /// `seeded_stats`, when given, are the per-lane `<lane, eq(point_lo)>`.
+    Lanes {
+        witness: Vec<F128>,
+        point: Vec<F128>,
+        gamma: F128,
+        seeded_stats: Option<Vec<F128>>,
+        num_lanes: usize,
+    },
+}
+
 /// Prove `Σ_x witness[x] · basis[x] = target` against an L0 commitment of
 /// `witness` built by `ligero_commit(witness, log_n - initial_k, initial_k,
 /// log_inv_rates[0], …)`. `config` must be an affine ladder
@@ -476,7 +674,29 @@ pub fn prove_affine<Ch: Challenger>(
     l0_tree: &[Hash],
     challenger: &mut Ch,
 ) -> AffineProof {
-    let log_n = witness.len().trailing_zeros() as usize;
+    prove_affine_l0(
+        config,
+        AffineL0::Dense { witness, basis },
+        target,
+        l0_codeword,
+        l0_tree,
+        challenger,
+    )
+}
+
+/// [`prove_affine`] for either L0 layout ([`AffineL0`]).
+pub fn prove_affine_l0<Ch: Challenger>(
+    config: &ProverConfig,
+    l0: AffineL0,
+    target: F128,
+    l0_codeword: &[F128],
+    l0_tree: &[Hash],
+    challenger: &mut Ch,
+) -> AffineProof {
+    let witness_len = match &l0 {
+        AffineL0::Dense { witness, .. } | AffineL0::Lanes { witness, .. } => witness.len(),
+    };
+    let log_n = witness_len.trailing_zeros() as usize;
     let r = config.recursive_steps;
     let shapes = level_shapes(log_n, config.initial_k, &config.recursive_ks);
     assert_eq!(
@@ -504,13 +724,15 @@ pub fn prove_affine<Ch: Challenger>(
     challenger.observe_label(LABEL);
     challenger.observe_f128(target);
     let block_len_0 = 1usize << (shapes[0].1 + config.log_inv_rates[0]);
-    let lanes_0 = 1usize << shapes[0].0;
+    let lanes_0 = match &l0 {
+        AffineL0::Dense { .. } => 1usize << shapes[0].0,
+        AffineL0::Lanes { num_lanes, .. } => *num_lanes,
+    };
     assert_eq!(l0_codeword.len(), block_len_0 * lanes_0);
     let initial_cap = cap_layer(l0_tree, block_len_0, strat(0).cap_depth()).to_vec();
     challenger.observe_bytes(initial_cap.as_flattened());
 
     let p = carry_products(log_n + 1);
-    let mut level = Level::new(witness, basis, shapes[0].0, target);
     let mut proof = AffineProof {
         initial_cap,
         recursive_caps: Vec::new(),
@@ -526,26 +748,56 @@ pub fn prove_affine<Ch: Challenger>(
     };
 
     let t = Instant::now();
-    for _ in 0..config.ood_samples[0] {
-        let z = challenger.sample_f128_vec(log_n);
-        let eq_z = build_eq_scaled_parallel(&z, F128::ONE);
-        let y = level.dot(&eq_z);
-        challenger.observe_f128(y);
-        proof.ood_values.push(y);
-        let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(0));
-        proof.claim_batch_grinding_nonces.push(nonce);
-        level.add_weight(&eq_z, beta, y);
-    }
-    t_ood += t.elapsed();
+    let (mut level, mut l0_gammas) = match l0 {
+        AffineL0::Dense { witness, basis } => {
+            let mut level = Level::new(witness, basis, shapes[0].0, target);
+            for _ in 0..config.ood_samples[0] {
+                let z = challenger.sample_f128_vec(log_n);
+                let eq_z = build_eq_scaled_parallel(&z, F128::ONE);
+                let y = level.dot(&eq_z);
+                challenger.observe_f128(y);
+                proof.ood_values.push(y);
+                let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(0));
+                proof.claim_batch_grinding_nonces.push(nonce);
+                level.add_weight(&eq_z, beta, y);
+            }
+            t_ood += t.elapsed();
+            (level, None)
+        }
+        AffineL0::Lanes {
+            witness,
+            point,
+            gamma,
+            seeded_stats,
+            num_lanes,
+        } => {
+            let (level, gammas) = lane_rounds(
+                config,
+                &witness,
+                shapes[0],
+                num_lanes,
+                (point, gamma, seeded_stats),
+                target,
+                &p,
+                &mut proof,
+                challenger,
+                trace,
+            );
+            t_folds += t.elapsed();
+            (level, Some(gammas))
+        }
+    };
 
     let mut committed: Vec<LigeroWitness> = Vec::with_capacity(r);
     for li in 0..=r {
         let (k, c) = shapes[li];
-        assert_eq!(level.rows, 1usize << k);
-        assert_eq!(level.width, 1usize << c);
         let t = Instant::now();
-        let mut gammas = Vec::with_capacity(k);
-        for _ in 0..k {
+        let mut gammas = l0_gammas.take().unwrap_or_default();
+        if gammas.is_empty() {
+            assert_eq!(level.rows, 1usize << k);
+            assert_eq!(level.width, 1usize << c);
+        }
+        while gammas.len() < k {
             let xf1 = level.shifted_odd_rows(&p);
             let g = level.grid(&xf1);
             debug_assert_eq!(g[0] + g[3], level.claim, "grid must split the claim");
@@ -683,6 +935,250 @@ pub fn prove_affine<Ch: Challenger>(
     proof
 }
 
+/// One eq term of the L0 weight on the lane-major path:
+/// `scale · eq(point_hi, row) · eq(point_lo, col)`, with the per-row
+/// statistics `stats[row][s] = <(X^s f[row])_{<2^c}, eq(point_lo)>`.
+struct LaneTerm {
+    scale: F128,
+    col_point: Vec<F128>,
+    rows: Vec<F128>,
+    stats: Vec<Vec<F128>>,
+}
+
+/// Column bits the lane statistics leave to the recursion (`2^12` words
+/// per lane and term stay in L1/L2).
+const LANE_LOW_BITS: usize = 12;
+
+/// `Σ_i ω_i(X) lane_i` for lane-major lanes and per-lane polynomials `ω_i`
+/// (monomial coefficients in `X`): `h_s = Σ_i [X^s]ω_i · lane_i` in one
+/// column-chunked pass (stored `[col][s]`), then Horner
+/// `f = h_0 + X(h_1 + X(h_2 + …))` with the gather map `T`.
+fn materialize_lanes(witness: &[F128], d: usize, omega: &[Vec<F128>], p: &[F128]) -> Vec<F128> {
+    let deg = omega.iter().map(|w| w.len() - 1).max().unwrap_or(0);
+    let width = deg + 1;
+    const COLS: usize = 1 << 10;
+    let mut h = vec![F128::ZERO; d * width];
+    h.par_chunks_mut(COLS * width)
+        .enumerate()
+        .for_each(|(chunk, out)| {
+            let col0 = chunk * COLS;
+            let cols = out.len() / width;
+            for (i, w) in omega.iter().enumerate() {
+                let src = &witness[i * d + col0..i * d + col0 + cols];
+                for (j, &x) in src.iter().enumerate() {
+                    let dst = &mut out[j * width..j * width + w.len()];
+                    for (o, &cs) in dst.iter_mut().zip(w) {
+                        *o += cs * x;
+                    }
+                }
+            }
+        });
+    let mut f: Vec<F128> = (0..d)
+        .into_par_iter()
+        .map(|col| h[col * width + deg])
+        .collect();
+    for s in (0..deg).rev() {
+        let len = f.len();
+        let cur = &f;
+        let hs = &h;
+        f = (0..len + 1)
+            .into_par_iter()
+            .with_min_len(PAR_MIN)
+            .map(|m| {
+                let low = if m < d { hs[m * width + s] } else { F128::ZERO };
+                t_at(|j| cur[j], len, m, p) + low
+            })
+            .collect();
+    }
+    f
+}
+
+/// The L0 rounds on the lane-major path, from per-lane statistics only:
+/// the grid of round j is a combination of `stats` and the row weights, and
+/// the fold maps `S'[m][s] = S[2m][s] + α S[2m+1][s] + β S[2m+1][s+1]`.
+/// The witness is read once per term (the statistics) and once more to
+/// materialize the folded message `Σ_i ω_i(X) lane_i` for the L1 commit.
+#[allow(clippy::too_many_arguments)]
+fn lane_rounds<Ch: Challenger>(
+    config: &ProverConfig,
+    witness: &[F128],
+    (k, c): (usize, usize),
+    num_lanes: usize,
+    (point, gamma, seeded_stats): (Vec<F128>, F128, Option<Vec<F128>>),
+    target: F128,
+    p: &[F128],
+    proof: &mut AffineProof,
+    challenger: &mut Ch,
+    trace: bool,
+) -> (Level, Vec<(F128, F128)>) {
+    let (lanes, d) = (1usize << k, 1usize << c);
+    assert_eq!(witness.len(), lanes * d);
+    assert_eq!(point.len(), k + c);
+    let claim_bits = config.claim_batch_grinding_bits[0] as u32;
+    let t0 = Instant::now();
+    // The first OOD point is fixed before any answer is sent, so its
+    // statistics share the seeded term's sweep. Later points (no shipped
+    // config takes them at L0) depend on the previous answer.
+    let first_z = (config.ood_samples[0] > 0).then(|| challenger.sample_f128_vec(k + c));
+    let mut sweep_points: Vec<&[F128]> = vec![&point[..c]];
+    if let Some(z) = &first_z {
+        sweep_points.push(&z[..c]);
+    }
+    let mut swept = lane_statistics_fused(
+        witness,
+        d,
+        lanes,
+        num_lanes,
+        &sweep_points,
+        k,
+        p,
+        LANE_LOW_BITS,
+    )
+    .into_iter();
+    let seed_stats = swept.next().expect("seeded term");
+    if let Some(given) = &seeded_stats {
+        debug_assert!(
+            given.iter().zip(&seed_stats).all(|(&a, s)| a == s[0]),
+            "seeded statistics disagree with the witness"
+        );
+    }
+    let mut terms = vec![LaneTerm {
+        scale: gamma,
+        col_point: point[..c].to_vec(),
+        rows: build_eq_table(&point[c..]),
+        stats: seed_stats,
+    }];
+    let mut claim = target;
+    let mut first = first_z.map(|z| (z, swept.next().expect("first OOD term")));
+    for _ in 0..config.ood_samples[0] {
+        let (z, stats) = first.take().unwrap_or_else(|| {
+            let z = challenger.sample_f128_vec(k + c);
+            let stats = lane_statistics_fused(
+                witness,
+                d,
+                lanes,
+                num_lanes,
+                &[&z[..c]],
+                k,
+                p,
+                LANE_LOW_BITS,
+            )
+            .remove(0);
+            (z, stats)
+        });
+        let rows = build_eq_table(&z[c..]);
+        let y = rows
+            .iter()
+            .zip(&stats)
+            .fold(F128::ZERO, |acc, (&w, s)| acc + w * s[0]);
+        challenger.observe_f128(y);
+        proof.ood_values.push(y);
+        let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits);
+        proof.claim_batch_grinding_nonces.push(nonce);
+        claim += beta * y;
+        terms.push(LaneTerm {
+            scale: beta,
+            col_point: z[..c].to_vec(),
+            rows,
+            stats,
+        });
+    }
+    let t_stats = t0.elapsed();
+
+    let mut gammas = Vec::with_capacity(k);
+    for _ in 0..k {
+        let mut g = [F128::ZERO; 6];
+        for term in &terms {
+            let mut tg = [F128::ZERO; 6];
+            for m in 0..term.rows.len() / 2 {
+                let (w0, w1) = (term.rows[2 * m], term.rows[2 * m + 1]);
+                let (s0, s1) = (&term.stats[2 * m], &term.stats[2 * m + 1]);
+                let us = [s0[0], s1[0], s1[1]];
+                for (u, &v) in us.iter().enumerate() {
+                    tg[2 * u] += w0 * v;
+                    tg[2 * u + 1] += w1 * v;
+                }
+            }
+            for (a, b) in g.iter_mut().zip(tg) {
+                *a += term.scale * b;
+            }
+        }
+        debug_assert_eq!(g[0] + g[3], claim, "grid must split the claim");
+        let sent = [g[0], g[1], g[2], g[4], g[5]];
+        challenger.observe_f128_slice(&sent);
+        proof.grids.push(sent);
+        let (nonce, ch) =
+            challenger.grind_pow_and_sample_f128_vec(config.fold_grinding_bits[0] as u32, 3);
+        proof.fold_grinding_nonces.push(nonce);
+        let (alpha, beta, r) = (ch[0], ch[1], ch[2]);
+        for term in &mut terms {
+            let half = term.rows.len() / 2;
+            term.stats = (0..half)
+                .map(|m| {
+                    let (s0, s1) = (&term.stats[2 * m], &term.stats[2 * m + 1]);
+                    (0..s0.len() - 1)
+                        .map(|s| s0[s] + alpha * s1[s] + beta * s1[s + 1])
+                        .collect()
+                })
+                .collect();
+            term.rows = (0..half)
+                .map(|m| {
+                    let (w0, w1) = (term.rows[2 * m], term.rows[2 * m + 1]);
+                    w0 + r * (w0 + w1)
+                })
+                .collect();
+        }
+        claim = fold_claim(&g, alpha, beta, r);
+        gammas.push((alpha, beta));
+    }
+
+    // The folded message Σ_i ω_i(X) lane_i, ω_i = Π_{j: i_j} (α_j + β_j X):
+    // h_s = Σ_i [X^s]ω_i · lane_i, then Horner f = h_0 + X(h_1 + X(h_2 + …)).
+    let t1 = Instant::now();
+    let omega: Vec<Vec<F128>> = (0..num_lanes)
+        .map(|i| {
+            let mut poly = vec![F128::ONE];
+            for (j, &(alpha, beta)) in gammas.iter().enumerate() {
+                if (i >> j) & 1 == 1 {
+                    let mut next = vec![F128::ZERO; poly.len() + 1];
+                    for (s, &a) in poly.iter().enumerate() {
+                        next[s] += alpha * a;
+                        next[s + 1] += beta * a;
+                    }
+                    poly = next;
+                }
+            }
+            poly
+        })
+        .collect();
+    let mut f = materialize_lanes(witness, d, &omega, p);
+    f.resize(d + k, F128::ZERO);
+    let mut w = vec![F128::ZERO; d];
+    for term in &terms {
+        let eq = build_eq_scaled_parallel(&term.col_point, term.scale * term.rows[0]);
+        w.as_mut_slice()
+            .into_par_iter()
+            .zip(eq.into_par_iter())
+            .with_min_len(PAR_MIN)
+            .for_each(|(dst, e)| *dst += e);
+    }
+    if trace {
+        eprintln!(
+            "  L0 lanes: statistics {:.2} ms, materialize {:.2} ms",
+            t_stats.as_secs_f64() * 1e3,
+            t1.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let level = Level {
+        f,
+        rows: 1,
+        width: d + k,
+        w,
+        claim,
+    };
+    (level, gammas)
+}
+
 /// `Σ_q eq(α)_q · (Enc(f')(x_q) − overflow(x_q))`.
 fn batched_consistency(
     rows: &[Vec<F128>],
@@ -759,16 +1255,49 @@ fn induced_at_residual(
     out
 }
 
-/// Verify an [`AffineProof`]. `eval_b_residual(rs, residual_log)` returns the
-/// caller's basis bound at the fold challenges `rs` (LSB first), as a table
-/// over the `residual_log` remaining variables.
-#[allow(clippy::too_many_arguments)]
+/// Verify an [`AffineProof`] for the LSB-lane L0 ([`AffineL0::Dense`]).
+/// `eval_b_residual(rs, residual_log)` returns the caller's basis bound at the
+/// fold challenges `rs` (in binding order), as a table over the
+/// `residual_log` remaining variables.
 pub fn verify_affine<Ch, F>(
     config: &VerifierConfig,
     proof: &AffineProof,
     log_n: usize,
     target: F128,
     expected_initial_cap: &[Hash],
+    eval_b_residual: F,
+    challenger: &mut Ch,
+) -> bool
+where
+    Ch: Challenger,
+    F: Fn(&[F128], usize) -> Vec<F128>,
+{
+    let lanes = 1usize << config.initial_k;
+    verify_affine_l0(
+        config,
+        proof,
+        log_n,
+        target,
+        expected_initial_cap,
+        (lanes, false),
+        eval_b_residual,
+        challenger,
+    )
+}
+
+/// [`verify_affine`] for either L0 layout: `(l0_num_lanes, lane_major)`.
+/// On the lane-major path the L0 rounds bind the lane (high) variables
+/// first, so the binding order of a lane-major index is its coordinates
+/// rotated left by `log_n - initial_k`; `eval_b_residual` receives the
+/// challenges in that order.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_affine_l0<Ch, F>(
+    config: &VerifierConfig,
+    proof: &AffineProof,
+    log_n: usize,
+    target: F128,
+    expected_initial_cap: &[Hash],
+    (l0_num_lanes, lane_major): (usize, bool),
     eval_b_residual: F,
     challenger: &mut Ch,
 ) -> bool
@@ -811,8 +1340,14 @@ where
         }};
     }
 
+    if l0_num_lanes == 0 || l0_num_lanes > 1usize << config.initial_k {
+        return false;
+    }
     for _ in 0..config.ood_samples[0] {
-        let point = challenger.sample_f128_vec(log_n);
+        let mut point = challenger.sample_f128_vec(log_n);
+        if lane_major {
+            point.rotate_left(log_n - config.initial_k);
+        }
         let y = *next!(proof.ood_values, ood_i);
         challenger.observe_f128(y);
         let nonce = *next!(proof.claim_batch_grinding_nonces, claim_i);
@@ -873,7 +1408,7 @@ where
                 block_len,
                 &queries,
                 &opening.opened_rows,
-                1usize << k,
+                if li == 0 { l0_num_lanes } else { 1usize << k },
                 &opening.merkle_proof,
                 config.merkle_hash,
                 strat(li),
@@ -984,7 +1519,7 @@ where
             block_len,
             &queries,
             &opening.opened_rows,
-            1usize << k,
+            if li == 0 { l0_num_lanes } else { 1usize << k },
             &opening.merkle_proof,
             config.merkle_hash,
             strat(li),
@@ -1015,8 +1550,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        AffineProof, F128, affine_configs, carry_products, novel_basis_evals, prove_affine, t_at,
-        verify_affine,
+        AffineL0, AffineProof, F128, affine_configs, carry_products, novel_basis_evals,
+        prove_affine, prove_affine_l0, t_at, verify_affine, verify_affine_l0,
     };
     use crate::{
         challenger::{Challenger, FsChallenger, RandomChallenger},
@@ -1057,6 +1592,59 @@ mod tests {
                     .zip(novel_basis_evals(x, tg.len()))
                     .fold(F128::ZERO, |acc, (&a, b)| acc + a * b);
                 assert_eq!(direct, etg[i], "novel basis eval, c = {c}, point {i}");
+            }
+        }
+    }
+
+    /// The one-fold recursion for `<(X^s g)_{<2^c}, eq(z)>` matches applying
+    /// `T` s times and taking the eq inner product.
+    #[test]
+    fn shifted_eq_functionals_match_brute_force() {
+        let mut rng = RandomChallenger::new(0xAFF1_0003);
+        let max_s = 7;
+        for c in 0..10 {
+            let len = 1usize << c;
+            let p = carry_products(c + 4);
+            let g = random_vec(&mut rng, len);
+            let z = random_vec(&mut rng, c);
+            let eq = build_eq_table(&z);
+            let got = super::shifted_eq_functionals(&g, &z, max_s, &p);
+            let mut xs = g.clone();
+            for s in 0..=max_s {
+                let want = xs
+                    .iter()
+                    .zip(&eq)
+                    .fold(F128::ZERO, |acc, (&a, &b)| acc + a * b);
+                assert_eq!(got[s], want, "c = {c}, s = {s}");
+                let l = xs.len();
+                xs = (0..=l).map(|m| t_at(|j| xs[j], l, m, &p)).collect();
+            }
+        }
+    }
+
+    /// The fused lane sweep matches per-lane [`super::shifted_eq_functionals`].
+    #[test]
+    fn fused_lane_statistics_match_per_lane() {
+        let mut rng = RandomChallenger::new(0xAFF1_0005);
+        for (c, low_bits) in [(8usize, 3usize), (9, 4), (6, 12), (13, 12)] {
+            let d = 1usize << c;
+            let (lanes, live) = (8usize, 5usize);
+            let mut w = random_vec(&mut rng, live * d);
+            w.resize(lanes * d, F128::ZERO);
+            let z1 = random_vec(&mut rng, c);
+            let z2 = random_vec(&mut rng, c);
+            let p = carry_products(c + 4);
+            let got =
+                super::lane_statistics_fused(&w, d, lanes, live, &[&z1, &z2], 6, &p, low_bits);
+            for (t, z) in [&z1, &z2].iter().enumerate() {
+                for lane in 0..lanes {
+                    let want =
+                        super::shifted_eq_functionals(&w[lane * d..(lane + 1) * d], z, 6, &p);
+                    assert_eq!(
+                        got[t][lane], want,
+                        "c {c}, low {low_bits}, term {t}, lane {lane}"
+                    );
+                }
             }
         }
     }
@@ -1158,6 +1746,133 @@ mod tests {
             },
             &mut ch,
         )
+    }
+
+    /// The lane-major L0 (integer lanes, factored eq basis, statistics-only
+    /// rounds) against a real `commit_lane_major` commitment.
+    #[test]
+    fn lane_major_roundtrip_and_tamper() {
+        use crate::{
+            merkle::cap_layer,
+            pcs::{
+                commit::{PcsParams, commit_lane_major},
+                ligerito::LigeritoProfile,
+            },
+        };
+        let (log_n, initial_k, live) = (14usize, 3usize, 5usize);
+        let c0 = log_n - initial_k;
+        let d = 1usize << c0;
+        for ood in [0, 1, 2] {
+            let levels = 4;
+            let split = ProverConfig {
+                log_inv_rates: vec![1, 2, 2, 3],
+                recursive_steps: 3,
+                initial_log_msg_cols: c0,
+                initial_log_num_interleaved: initial_k,
+                initial_k,
+                recursive_log_msg_cols: vec![0; 3],
+                recursive_ks: vec![2, 2, 2],
+                queries: vec![23, 17, 13, 11],
+                grinding_bits: vec![2; levels],
+                fold_grinding_bits: vec![0; levels],
+                claim_batch_grinding_bits: vec![1; levels],
+                consistency_batch_grinding_bits: vec![1; levels],
+                ood_samples: vec![ood; levels],
+                merkle_hash: HashKind::Blake3,
+                stratified: vec![],
+            };
+            let (prover, verifier) = affine_configs(&split, log_n, &[2, 3, 3, 3]);
+            let mut rng = RandomChallenger::new(0xAFF1_0004 + ood as u64);
+            let mut q = random_vec(&mut rng, live * d);
+            q.resize(1 << log_n, F128::ZERO);
+            let point = random_vec(&mut rng, log_n);
+            let gamma = rng.sample_f128();
+            let eq = build_eq_table(&point);
+            let target = q
+                .iter()
+                .zip(&eq)
+                .fold(F128::ZERO, |acc, (&a, &b)| acc + a * b)
+                * gamma;
+            let low = build_eq_table(&point[..c0]);
+            let seeded: Vec<F128> = (0..live)
+                .map(|l| {
+                    q[l * d..(l + 1) * d]
+                        .iter()
+                        .zip(&low)
+                        .fold(F128::ZERO, |acc, (&a, &b)| acc + a * b)
+                })
+                .collect();
+            let params = PcsParams {
+                m: log_n + 7,
+                log_inv_rate: 1,
+                log_batch_size: initial_k,
+                profile: LigeritoProfile::Fast,
+                num_lanes: Some(live),
+                merkle_hash: HashKind::Blake3,
+            };
+            let (_, pd) = commit_lane_major(&q, &params);
+            let cap = cap_layer(
+                &pd.merkle_tree,
+                params.n_leaves(),
+                prover.level_zero_cap_depth(),
+            )
+            .to_vec();
+            let mut ch = FsChallenger::new(b"affine-lanes");
+            let proof = prove_affine_l0(
+                &prover,
+                AffineL0::Lanes {
+                    witness: q.clone(),
+                    point: point.clone(),
+                    gamma,
+                    seeded_stats: Some(seeded),
+                    num_lanes: live,
+                },
+                target,
+                &pd.codeword,
+                &pd.merkle_tree,
+                &mut ch,
+            );
+            assert_eq!(proof.openings[0].opened_rows[0].len(), live);
+            let mut rotated = point.clone();
+            rotated.rotate_left(c0);
+            let check = |proof: &AffineProof, target: F128| {
+                let mut ch = FsChallenger::new(b"affine-lanes");
+                verify_affine_l0(
+                    &verifier,
+                    proof,
+                    log_n,
+                    target,
+                    &cap,
+                    (live, true),
+                    |rs, residual_log| {
+                        let prefix = rotated
+                            .iter()
+                            .zip(rs)
+                            .fold(gamma, |acc, (&z, &r)| acc * (F128::ONE + z + r));
+                        let out: Vec<F128> = build_eq_table(&rotated[rs.len()..])
+                            .into_iter()
+                            .map(|v| v * prefix)
+                            .collect();
+                        assert_eq!(out.len(), 1usize << residual_log);
+                        out
+                    },
+                    &mut ch,
+                )
+            };
+            assert!(check(&proof, target), "lane-major roundtrip, ood = {ood}");
+            assert!(!check(&proof, target + F128::ONE), "wrong target");
+            for e in 0..5 {
+                let mut bad = proof.clone();
+                bad.grids[1][e] += F128::ONE;
+                assert!(!check(&bad, target), "L0 grid entry {e}");
+            }
+            let mut bad = proof.clone();
+            bad.openings[0].opened_rows[3][live - 1] += F128::ONE;
+            assert!(!check(&bad, target), "L0 opened row");
+            let mut bad = proof.clone();
+            bad.overflows[0][2] += F128::ONE;
+            assert!(!check(&bad, target), "L0 overflow");
+        }
     }
 
     #[test]

@@ -44,6 +44,10 @@ name = "affine_vs_f256"
 harness = false
 
 [[bench]]
+name = "affine_l0_stats_probe"
+harness = false
+
+[[bench]]
 name = "ag_breakdown"
 harness = false
 
