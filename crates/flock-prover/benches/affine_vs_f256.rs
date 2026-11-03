@@ -46,13 +46,14 @@ use flock_prover::{
 
 const LOG_N: usize = 25;
 const INITIAL_K: usize = 6;
-/// The default affine ladder: L0 and three recursive levels, L1 at rate
-/// 1/4. The split ladder's native twin has a fourth level of 8 columns,
-/// where `scripts/affine_fold_params.py` finds no fold bound for two of
-/// its rounds.
-const RATES: [usize; 4] = [1, 2, 5, 7];
+/// The default affine ladder: L0 and three recursive levels at the split
+/// ladder's rates. The split ladder's native twin has a fourth level of 8
+/// columns, where `scripts/affine_fold_params.py` finds no fold bound for
+/// two of its rounds. `rates=1,2,5,7 fold=4,4,5,5` is about 3 ms faster
+/// for about 21 KiB more proof.
+const RATES: [usize; 4] = [1, 3, 5, 7];
 /// Per-level fold grinding from `scripts/affine_fold_params.py` on `RATES`.
-const FOLD_BITS: [usize; 4] = [4, 4, 5, 5];
+const FOLD_BITS: [usize; 4] = [4, 5, 5, 5];
 
 fn rand_vec(len: usize, seed: u64) -> Vec<F128> {
     let mut s = seed | 1;

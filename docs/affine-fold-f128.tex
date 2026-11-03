@@ -493,14 +493,16 @@ with the new kernels, medians of nine:
 affine ladder & prove (ms) & proof (KiB) \\
 \midrule
 rates $[1,3,5,7,9]$, $4$ recursive levels & $\approx 33$--$39$ & 396.6 \\
-rates $[1,3,5,7]$, $3$ recursive levels & $\approx 32$ & 383.0 \\
+rates $[1,3,5,7]$, $3$ recursive levels (default) & $33.0$ / $32.9$ & 383.0 \\
 rates $[1,2,5,7]$, $3$ recursive levels & $28.6$ / $29.1$ & 404.3 \\
-F256 ladder & $60.0$ / $60.0$ & 425.2 \\
+F256 ladder & $60.0$--$63.9$ & 425.2 \\
 \bottomrule
 \end{tabular}
 \end{center}
-With rates $[1,2,5,7]$ the opening is $-52\%$ against the F256 ladder,
-and the proof is still $5\%$ smaller. Lower rates at L2 and L3 gain
+The default is rates $[1,3,5,7]$ (fold bits $[4,5,5,5]$, every round
+certified): $21$ KiB of proof is worth more than $3$ ms. Against the
+F256 ladder that is $-46\%$ to $-48\%$ prove time and $-10\%$ proof. Rates
+$[1,2,5,7]$ give $-52\%$ with a proof still $5\%$ smaller. Lower rates at L2 and L3 gain
 less than the noise. A rate-$1/2$ L1 would save about $2.5$ ms more
 for about $100$ KiB of proof. The remaining costs are the statistics
 sweep ($5.5$ ms, two terms), materialize ($5$ ms), recursive commits
@@ -540,7 +542,7 @@ $\F_{2^{256}}$ today with no security gain.
   where most of the engineering time goes. \emph{Status:} the
   lane-major L0 with the factored basis is done (statistics-only
   rounds, \S\ref{sec:cost}), with a chunked L0 materialize and a
-  retuned ladder (rates $[1,2,5,7]$). Open: the merged-transport wiring
+  three-level ladder (rates $[1,3,5,7]$). Open: the merged-transport wiring
   (\texttt{pcs::open\_batch\_merged}), the recursive-level kernels, and
   a profile TOML for the affine ladder.
 \item \textbf{Recursion and GPU.} Port the in-circuit verifier
