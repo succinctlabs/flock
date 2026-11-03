@@ -15,7 +15,11 @@
 //! (`recursive_prover_with_basis_precomputed_round0_lanes`) and the affine
 //! lane path (`AffineL0::Lanes`).
 //!
-//! Run: `cargo bench --bench affine_vs_f256 [-- lanes]`
+//! `rates=1,3,5,7,9 fold=4,5,5,5,5` picks another affine ladder
+//! ([`affine_ladder`]: that many levels, Johnson queries recomputed); the
+//! fold grinding comes from `scripts/affine_fold_params.py` on that ladder.
+//!
+//! Run: `cargo bench --bench affine_vs_f256 [-- lanes] [rates=.. fold=..]`
 //! Phase breakdown of one run each: `LIG_PROVE_TRACE=1 cargo bench --bench affine_vs_f256 -- trace`
 
 use std::time::Instant;
@@ -31,8 +35,8 @@ use flock_prover::{
         ligerito::{
             LigeritoProfile, ProverConfig, VerifierConfig, VirtualEqBasis,
             affine::{
-                AffineL0, affine_configs, prove_affine, prove_affine_l0, verify_affine,
-                verify_affine_l0,
+                AffineL0, affine_ladder, prove_affine, prove_affine_l0,
+                verify_affine, verify_affine_l0,
             },
             ligero_commit, prover_config_for, recursive_prover_with_basis,
             recursive_prover_with_basis_precomputed_round0_lanes,
@@ -42,8 +46,13 @@ use flock_prover::{
 
 const LOG_N: usize = 25;
 const INITIAL_K: usize = 6;
-/// Per-level fold grinding from `scripts/affine_fold_params.py` on m32_fast.
-const FOLD_BITS: [usize; 6] = [4, 5, 5, 5, 5, 5];
+/// The default affine ladder: L0 and three recursive levels, L1 at rate
+/// 1/4. The split ladder's native twin has a fourth level of 8 columns,
+/// where `scripts/affine_fold_params.py` finds no fold bound for two of
+/// its rounds.
+const RATES: [usize; 4] = [1, 2, 5, 7];
+/// Per-level fold grinding from `scripts/affine_fold_params.py` on `RATES`.
+const FOLD_BITS: [usize; 4] = [4, 4, 5, 5];
 
 fn rand_vec(len: usize, seed: u64) -> Vec<F128> {
     let mut s = seed | 1;
@@ -228,7 +237,23 @@ fn main() {
     init_perf_thread_pool();
     let trace_only = std::env::args().any(|a| a == "trace");
     let split = prover_config_for(LOG_N, INITIAL_K, LigeritoProfile::Fast).expect("m32 fast");
-    let (affine, affine_v) = affine_configs(&split, LOG_N, &FOLD_BITS);
+    let list = |key: &str| {
+        std::env::args()
+            .find_map(|a| a.strip_prefix(key).map(str::to_owned))
+            .map(|v| {
+                v.split(',')
+                    .map(|x| x.parse::<usize>().unwrap())
+                    .collect::<Vec<_>>()
+            })
+    };
+    let (affine, affine_v) = match list("rates=") {
+        Some(rates) => affine_ladder(&split, LOG_N, &rates, &list("fold=").expect("fold=..")),
+        None => affine_ladder(&split, LOG_N, &RATES, &FOLD_BITS),
+    };
+    println!(
+        "affine ladder: ks {:?}, rates {:?}, queries {:?}, fold bits {:?}",
+        affine.recursive_ks, affine.log_inv_rates, affine.queries, affine.fold_grinding_bits
+    );
     if std::env::args().any(|a| a == "lanes") {
         lanes_mode(&split, &affine, &affine_v, trace_only);
         return;

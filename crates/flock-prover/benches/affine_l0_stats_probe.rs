@@ -277,7 +277,9 @@ fn materialize_mode() {
     let raw = rand_vec(12, 9);
     let gammas: Vec<(F128, F128)> = raw.chunks(2).map(|c| (c[0], c[1])).collect();
     type Kernel = fn(&[F128], usize, usize, &[(F128, F128)], &[F128]) -> Vec<F128>;
-    let kernels: [(&str, Kernel); 3] = [
+    let kernels: [(&str, Kernel); 5] = [
+        ("cols 2^13", materialize_lanes::<8192>),
+        ("cols 2^14", materialize_lanes::<16384>),
         ("cols 2^8 ", materialize_lanes::<256>),
         ("cols 2^10", materialize_lanes::<1024>),
         ("cols 2^12", materialize_lanes::<4096>),

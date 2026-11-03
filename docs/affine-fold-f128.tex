@@ -450,14 +450,67 @@ $10.3$ ms before the subspace constants $s_k(v_k)^{-1}$ were cached
 (each query inverted about $20$ of them) and the queries ran in
 parallel. The same fix took the verifier from $13.5$ to $1.4$ ms.
 
-The materialize pass does $\sum_i (\mathrm{popcount}(i) + 1) = 165$
-multiplications per column against $92$ for the F256 fold, at about
-the same rate per product, so it stays the largest L0 cost. Two
-attempts did not help. Folding the low lane bits pairwise inside the
-column chunks cuts the count to about $150$, because $T$ reads outside
-an aligned chunk only at its first column, but it ran no faster. A
-register-resident Karatsuba accumulator with pre-split coefficients ran
-slower than the plain loop.
+The first materialize pass computed the coefficients $h_s = \sum_i
+[X^s]\omega_i\,\mathrm{lane}_i$ and then ran Horner over $T$, for $165$
+multiplications per column. It is now a round-by-round fold of lane
+pairs, $f_0 + \alpha f_1 + \beta T f_1$, and $T$ is cheap: since $P_0 =
+1$ and $t(m-1) = z(m)$ for even $m$,
+\[
+  (Tg)_m = \begin{cases} g_{m-1} + g_m & m \text{ odd},\\
+  P_{z(m)}\,(g_{m-1} + g_{m+2^{z(m)}-1}) & m \text{ even}. \end{cases}
+\]
+So a pair costs two multiplications per column, $f_0 + (\alpha+\beta)
+f_1[m] + \beta f_1[m-1]$ at odd $m$ and $f_0 + \alpha f_1[m] + \beta
+P_z(\dots)$ at even $m$: $2 \cdot 45 = 90$ per column for $46$ lanes,
+against $92$ for the F256 fold. The fold runs in chunks of $2^{12}$
+columns, so the intermediate lanes stay in cache. $T$ reads outside an
+aligned chunk only at its first column, and only at the last column of
+two other chunks. An error at a window's first column moves right one
+column per round, so a first pass folds the last $8$ columns of each
+chunk through all rounds to get those values. The pass went from $11$
+to $5$ ms. A test checks it against the sequential fold for chunk sizes
+$8$ to $4096$. Two smaller changes: the L1 weight and the recursive OOD
+terms use the two halves of the eq tensor, not the full table (weight
+$2.4 \to 1.3$ ms, OODs $2.3 \to 1.2$ ms).
+
+\paragraph{The ladder.} The native twin of the split ladder has a fourth
+recursive level of $2^3$ columns at rate $2^{-9}$.
+\texttt{scripts/affine\_fold\_params.py} finds no Lemma~3.1 certificate
+for rounds $3$ and $4$ of that level, and rounds $1$ and $2$ need $6$
+fold bits, not $5$. The prototype ladder is therefore not sound as
+configured at that level. Dropping the level fixes this and makes the
+proof smaller: the prover sends the $2^7 + 4$ final coefficients in
+place of a fourth commitment and its $29$ openings. The affine commits
+are also cheap enough that L1 can run at rate $1/4$: $119$ queries in
+place of $79$, the Johnson count for that rate (\texttt{affine\_ladder}
+recomputes the counts, and a test checks that it gives the shipped
+counts at the split rates). The script gives fold bits $[4, 4, 5, 5]$
+for rates $[1, 2, 5, 7]$, with every round certified. Same bench, all
+with the new kernels, medians of nine:
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+affine ladder & prove (ms) & proof (KiB) \\
+\midrule
+rates $[1,3,5,7,9]$, $4$ recursive levels & $\approx 33$--$39$ & 396.6 \\
+rates $[1,3,5,7]$, $3$ recursive levels & $\approx 32$ & 383.0 \\
+rates $[1,2,5,7]$, $3$ recursive levels & $28.6$ / $29.1$ & 404.3 \\
+F256 ladder & $60.0$ / $60.0$ & 425.2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+With rates $[1,2,5,7]$ the opening is $-52\%$ against the F256 ladder,
+and the proof is still $5\%$ smaller. Lower rates at L2 and L3 gain
+less than the noise. A rate-$1/2$ L1 would save about $2.5$ ms more
+for about $100$ KiB of proof. The remaining costs are the statistics
+sweep ($5.5$ ms, two terms), materialize ($5$ ms), recursive commits
+($7.7$ ms) and the L0 consistency basis ($2.4$ ms, a sparse transposed
+NTT). The first two are bound by multiplications. If the L0 OOD point
+reused the seeded point's column coordinates and drew only fresh row
+coordinates, both terms would share one statistics vector and the
+sweep would halve. The list is fixed when the commitment is, and both
+points come later, so the OOD bound should still hold. This is a
+protocol change and is not done.
 
 The largest item is the split. Today a folded $\F_{2^{256}}$ table of
 length $N$ is committed as a $\F_{2^{128}}$ table of length $2N$, and
@@ -486,9 +539,10 @@ $\F_{2^{256}}$ today with no security gain.
   multilinear folding, so they need affine versions. This step is
   where most of the engineering time goes. \emph{Status:} the
   lane-major L0 with the factored basis is done (statistics-only
-  rounds, \S\ref{sec:cost}). Open: the merged-transport wiring
-  (\texttt{pcs::open\_batch\_merged}), and the recursive-level
-  kernels.
+  rounds, \S\ref{sec:cost}), with a chunked L0 materialize and a
+  retuned ladder (rates $[1,2,5,7]$). Open: the merged-transport wiring
+  (\texttt{pcs::open\_batch\_merged}), the recursive-level kernels, and
+  a profile TOML for the affine ladder.
 \item \textbf{Recursion and GPU.} Port the in-circuit verifier
   (\texttt{tower/query.rs}, \texttt{gates\_spine.rs}, the walkers):
   remove the $\F_{2^{256}}$ gadgets and add the grid check, per-query

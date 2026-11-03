@@ -25,7 +25,7 @@ use std::{
 
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
-    ParallelSliceMut,
+    ParallelSlice, ParallelSliceMut,
 };
 
 use crate::{
@@ -37,7 +37,7 @@ use crate::{
             induce_sumcheck_poly_auto, ligero_commit, merkle_paths_for, next_s,
             verify_and_sample_queries, verify_level_opens,
         },
-        ring_switch::build_eq_scaled_parallel,
+        ring_switch::{build_eq_scaled_parallel, build_eq_split},
     },
 };
 
@@ -124,38 +124,106 @@ fn level_shapes(log_n: usize, initial_k: usize, recursive_ks: &[usize]) -> Vec<(
 /// (`c < 1` or `k > 2^c`) are dropped from the tail, since each native level
 /// is one variable smaller than its split twin. `fold_grinding_bits` gives
 /// the per-level fold grinding (docs/affine-fold-f128.tex, §Parameters).
+/// At m32_fast the last native level has 8 columns, and
+/// `scripts/affine_fold_params.py` finds no fold bound for two of its
+/// rounds; use [`affine_ladder`] with three recursive levels there.
 pub fn affine_configs(
     split: &ProverConfig,
     log_n: usize,
     fold_grinding_bits: &[usize],
 ) -> (ProverConfig, VerifierConfig) {
+    let ks = native_ks(split, log_n, usize::MAX);
+    let levels = ks.len() + 1;
+    build_ladder(
+        split,
+        log_n,
+        &ks,
+        &split.log_inv_rates[..levels],
+        &split.queries[..levels],
+        fold_grinding_bits,
+    )
+}
+
+/// Johnson radius slack of the Fast profile (`η` in the level TOMLs).
+const LADDER_ETA: f64 = 0.02;
+
+/// An affine ladder with its own rate schedule: `rates.len()` levels (L0
+/// and `rates.len() - 1` recursive levels, the native ks of `split`), the
+/// split config's grinding and OOD schedules, and Johnson query counts
+/// recomputed for the new rates. Level ℓ takes the fewest queries `t` with
+/// `t · log2(1/(√ρ + η)) + grinding_bits ≥ 128` after paying the fold's
+/// agreement loss `t · log2(1 + k/(a n))`, `a = √ρ + η`.
+pub fn affine_ladder(
+    split: &ProverConfig,
+    log_n: usize,
+    rates: &[usize],
+    fold_grinding_bits: &[usize],
+) -> (ProverConfig, VerifierConfig) {
+    let ks = native_ks(split, log_n, rates.len() - 1);
+    assert_eq!(
+        ks.len() + 1,
+        rates.len(),
+        "ladder deeper than the native shapes"
+    );
+    let shapes = level_shapes(log_n, split.initial_k, &ks);
+    let queries: Vec<usize> = shapes
+        .iter()
+        .zip(rates)
+        .enumerate()
+        .map(|(li, (&(k, c), &rate))| {
+            let a = (-(rate as f64)).exp2().sqrt() + LADDER_ETA;
+            let per_query = -a.log2();
+            let n = ((c + rate) as f64).exp2();
+            let loss = (1.0 + k as f64 / (a * n)).log2();
+            let need = 128.0 - split.grinding_bits[li] as f64;
+            (need / (per_query - loss) - 1e-9).ceil() as usize
+        })
+        .collect();
+    build_ladder(split, log_n, &ks, rates, &queries, fold_grinding_bits)
+}
+
+/// The native recursive ks of `split`, at most `max_levels` of them.
+fn native_ks(split: &ProverConfig, log_n: usize, max_levels: usize) -> Vec<usize> {
     let mut c = log_n - split.initial_k;
     let mut ks = Vec::new();
-    let mut cols = Vec::new();
-    for &k in &split.recursive_ks {
+    for &k in split.recursive_ks.iter().take(max_levels) {
         if c <= k || k > 1usize << (c - k) {
             break;
         }
         c -= k;
         ks.push(k);
-        cols.push(c);
     }
+    ks
+}
+
+fn build_ladder(
+    split: &ProverConfig,
+    log_n: usize,
+    ks: &[usize],
+    rates: &[usize],
+    queries: &[usize],
+    fold_grinding_bits: &[usize],
+) -> (ProverConfig, VerifierConfig) {
     let levels = ks.len() + 1;
     assert!(
         levels >= 2,
         "affine ladder needs at least one recursive level"
     );
     assert!(fold_grinding_bits.len() >= levels);
+    let cols = level_shapes(log_n, split.initial_k, ks)[1..]
+        .iter()
+        .map(|s| s.1)
+        .collect();
     let cut = |v: &[usize]| v[..levels].to_vec();
     let prover = ProverConfig {
-        log_inv_rates: cut(&split.log_inv_rates),
+        log_inv_rates: cut(rates),
         recursive_steps: ks.len(),
         initial_log_msg_cols: log_n - split.initial_k,
         initial_log_num_interleaved: split.initial_k,
         initial_k: split.initial_k,
         recursive_log_msg_cols: cols,
-        recursive_ks: ks,
-        queries: cut(&split.queries),
+        recursive_ks: ks.to_vec(),
+        queries: cut(queries),
         grinding_bits: cut(&split.grinding_bits),
         fold_grinding_bits: cut(fold_grinding_bits),
         claim_batch_grinding_bits: cut(&split.claim_batch_grinding_bits),
@@ -202,6 +270,7 @@ pub fn carry_products(dim: usize) -> Vec<F128> {
             *wj = *wj * (*wj + ci);
         }
     }
+    // `t_at` relies on `P_0 = 1`.
     let mut p = vec![F128::ONE];
     for i in 0..dim {
         let a = c[i + 1] * (c[i] * c[i]).inv();
@@ -214,18 +283,18 @@ pub fn carry_products(dim: usize) -> Vec<F128> {
 /// coefficients): `P_{t(m-1)} g_{m-1} + P_{z(m)} g_{m + 2^{z(m)} - 1}`, with
 /// `t` the trailing ones and `z` the trailing zeros. The second term is
 /// present when its index is in range. `g(j)` reads coefficient `j`.
+/// Since `P_0 = 1` and `t(m-1) = z(m)` for even `m`, this is `g_{m-1} +
+/// g_m` for odd `m` and `P_{z(m)} (g_{m-1} + g_{m+2^{z(m)}-1})` for even
+/// `m`: one multiplication per two coefficients.
 #[inline(always)]
 fn t_at(g: impl Fn(usize) -> F128, len: usize, m: usize, p: &[F128]) -> F128 {
     if m == 0 {
         return F128::ZERO;
     }
-    let mut out = p[(m - 1).trailing_ones() as usize] * g(m - 1);
     let tz = m.trailing_zeros() as usize;
     let j = m + (1usize << tz) - 1;
-    if j < len {
-        out += p[tz] * g(j);
-    }
-    out
+    let sum = if j < len { g(m - 1) + g(j) } else { g(m - 1) };
+    if tz == 0 { sum } else { p[tz] * sum }
 }
 
 /// `F_s(g) = <(X^s g)_{<2^c}, eq(z)>` for `s = 0..=max_s`, where `g` has
@@ -542,6 +611,36 @@ impl Level {
             .reduce(|| F128::ZERO, |a, b| a + b)
     }
 
+    /// `<f, eq(z)>` from the eq tensor's factors, without the full table.
+    fn dot_eq(&self, eq: &EqFactors) -> F128 {
+        assert_eq!(eq.len(), self.w.len());
+        self.f[..eq.len()]
+            .par_chunks(eq.lo.len())
+            .zip(eq.hi.par_iter())
+            .map(|(block, &h)| {
+                h * block
+                    .iter()
+                    .zip(&eq.lo)
+                    .fold(F128::ZERO, |acc, (&a, &l)| acc + a * l)
+            })
+            .reduce(|| F128::ZERO, |a, b| a + b)
+    }
+
+    /// [`Self::add_weight`] for `basis = eq(z)`, from its factors.
+    fn add_eq_weight(&mut self, eq: &EqFactors, beta: F128, value: F128) {
+        assert_eq!(eq.len(), self.w.len());
+        self.w
+            .par_chunks_mut(eq.lo.len())
+            .zip(eq.hi.par_iter())
+            .for_each(|(block, &h)| {
+                let bh = beta * h;
+                for (dst, &l) in block.iter_mut().zip(&eq.lo) {
+                    *dst += bh * l;
+                }
+            });
+        self.claim += beta * value;
+    }
+
     /// `X f_1` for every row pair: `half * (width + 1)` coefficients.
     fn shifted_odd_rows(&self, p: &[F128]) -> Vec<F128> {
         let half = self.rows / 2;
@@ -617,6 +716,24 @@ impl Level {
         self.w = next_w;
         self.rows = half;
         self.width += 1;
+    }
+}
+
+/// `eq(z)` as its low and high tensor factors: `eq(z)[i] = lo[i mod
+/// 2^{n_lo}] · hi[i >> n_lo]`, with `n_lo` about half of `z`.
+struct EqFactors {
+    lo: Vec<F128>,
+    hi: Vec<F128>,
+}
+
+impl EqFactors {
+    fn new(z: &[F128]) -> Self {
+        let (lo, hi) = build_eq_split(z, z.len().div_ceil(2));
+        Self { lo, hi }
+    }
+
+    fn len(&self) -> usize {
+        self.lo.len() * self.hi.len()
     }
 }
 
@@ -766,13 +883,13 @@ pub fn prove_affine_l0<Ch: Challenger>(
             let mut level = Level::new(witness, basis, shapes[0].0, target);
             for _ in 0..config.ood_samples[0] {
                 let z = challenger.sample_f128_vec(log_n);
-                let eq_z = build_eq_scaled_parallel(&z, F128::ONE);
-                let y = level.dot(&eq_z);
+                let eq_z = EqFactors::new(&z);
+                let y = level.dot_eq(&eq_z);
                 challenger.observe_f128(y);
                 proof.ood_values.push(y);
                 let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(0));
                 proof.claim_batch_grinding_nonces.push(nonce);
-                level.add_weight(&eq_z, beta, y);
+                level.add_eq_weight(&eq_z, beta, y);
             }
             t_ood += t.elapsed();
             (level, None)
@@ -877,13 +994,13 @@ pub fn prove_affine_l0<Ch: Challenger>(
         let t = Instant::now();
         for _ in 0..config.ood_samples[li + 1] {
             let z = challenger.sample_f128_vec(c);
-            let eq_z = build_eq_scaled_parallel(&z, F128::ONE);
-            let y = level.dot(&eq_z);
+            let eq_z = EqFactors::new(&z);
+            let y = level.dot_eq(&eq_z);
             challenger.observe_f128(y);
             proof.ood_values.push(y);
             let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(li + 1));
             proof.claim_batch_grinding_nonces.push(nonce);
-            level.add_weight(&eq_z, beta, y);
+            level.add_eq_weight(&eq_z, beta, y);
         }
         t_ood += t.elapsed();
 
@@ -971,30 +1088,90 @@ struct LaneTerm {
 /// per lane and term stay in L1/L2).
 const LANE_LOW_BITS: usize = 12;
 
-/// `ω_m = Π_{j: m_j = 1} (α_j + β_j X)` in monomial coefficients.
-fn row_polynomial(m: usize, gammas: &[(F128, F128)]) -> Vec<F128> {
-    let mut poly = vec![F128::ONE];
-    for (j, &(alpha, beta)) in gammas.iter().enumerate() {
-        if (m >> j) & 1 == 1 {
-            let mut next = vec![F128::ZERO; poly.len() + 1];
-            for (s, &a) in poly.iter().enumerate() {
-                next[s] += alpha * a;
-                next[s + 1] += beta * a;
-            }
-            poly = next;
-        }
-    }
-    poly
+/// One L0 round's constants for [`fold_lane_pair`]: `f_0 + α f_1 + β T f_1`
+/// is `f_0 + (α + β) f_1[m] + β f_1[m-1]` at odd `m` and `f_0 + α f_1[m] +
+/// β P_z (f_1[m-1] + f_1[m+2^z-1])` at even `m`, two multiplications per
+/// coefficient either way.
+struct RoundCoefs {
+    alpha: F128,
+    beta: F128,
+    alpha_beta: F128,
+    beta_p: Vec<F128>,
 }
 
-/// The folded L0 message `Σ_i ω_i(X) lane_i` for lane-major lanes:
-/// `h_s = Σ_i [X^s]ω_i · lane_i` in one column-chunked pass (stored
-/// `[col][s]`, chunks of `COLS` columns), then Horner
-/// `f = h_0 + X(h_1 + X(h_2 + …))` with the gather map `T`. The cost is
-/// `Σ_i (popcount(i) + 1)` multiplications per column, 165 over 46 lanes.
-/// Folding the low lane bits pairwise first saves multiplications but not
-/// time (measured), and a register-resident Karatsuba accumulator was
-/// slower than this loop.
+/// Fold one lane pair over the columns `col0..col0 + out.len()`, where
+/// `col0` is a multiple of `out.len()` (a power of two). Inside the block
+/// `T` reads only the block, except at its first column, which reads
+/// `f_1[col0 - 1]` (`left`) and `f_1[col0 + 2^z - 1]` (`far`, when outside).
+#[inline(always)]
+fn fold_lane_pair(
+    x0: &[F128],
+    x1: &[F128],
+    out: &mut [F128],
+    col0: usize,
+    rc: &RoundCoefs,
+    left: F128,
+    far: impl FnOnce(usize) -> F128,
+) {
+    let n = out.len();
+    debug_assert!(n.is_power_of_two() && col0.is_multiple_of(n));
+    let t0 = if col0 == 0 {
+        F128::ZERO
+    } else {
+        let tz = col0.trailing_zeros() as usize;
+        let fi = (1usize << tz) - 1;
+        let fv = if fi < n { x1[fi] } else { far(col0 + fi) };
+        rc.beta_p[tz] * (left + fv)
+    };
+    out[0] = x0[0] + rc.alpha * x1[0] + t0;
+    let mut j = 1;
+    while j + 1 < n {
+        out[j] = x0[j] + rc.alpha_beta * x1[j] + rc.beta * x1[j - 1];
+        let e = j + 1;
+        let tz = e.trailing_zeros() as usize;
+        out[e] = x0[e] + rc.alpha * x1[e] + rc.beta_p[tz] * (x1[j] + x1[e + (1usize << tz) - 1]);
+        j += 2;
+    }
+    if j < n {
+        out[j] = x0[j] + rc.alpha_beta * x1[j] + rc.beta * x1[j - 1];
+    }
+}
+
+/// One round over a block of `n` columns at `col0`: `src(i)` is input lane
+/// `i` of `lanes_in`, output lane `m` goes to `dst[m n..(m + 1) n]`, and
+/// `edge(i, col0)` gives lane `i`'s `left` and `far` edge values.
+fn fold_round<'s>(
+    src: impl Fn(usize) -> &'s [F128],
+    dst: &mut [F128],
+    n: usize,
+    col0: usize,
+    lanes_in: usize,
+    rc: &RoundCoefs,
+    edge: impl Fn(usize, usize) -> (F128, F128),
+) {
+    for (m, out) in dst.chunks_mut(n).take(lanes_in.div_ceil(2)).enumerate() {
+        if 2 * m + 1 < lanes_in {
+            let (left, far) = edge(2 * m + 1, col0);
+            fold_lane_pair(src(2 * m), src(2 * m + 1), out, col0, rc, left, |_| far);
+        } else {
+            out.copy_from_slice(src(2 * m));
+        }
+    }
+}
+
+/// Columns of the window that computes a chunk's last column through all
+/// rounds: an error at the window's first column moves right one column
+/// per round, so 8 columns cover up to 7 rounds.
+const TAIL_COLS: usize = 8;
+
+/// The folded L0 message `Σ_i ω_i(X) lane_i` for lane-major lanes, folded
+/// round by round (`f_0 + α f_1 + β T f_1` on lane pairs) in column chunks
+/// of `COLS`, so the intermediate lanes stay in cache. A chunk's first
+/// column needs the round inputs at the last column of two other chunks;
+/// a first pass computes those from an 8-column window per chunk. The
+/// `rounds` overflow coefficients past `d` are folded last, on their own.
+/// This is `2 (num_lanes - 1)` multiplications per column (90 over 46
+/// lanes).
 #[doc(hidden)]
 pub fn materialize_lanes<const COLS: usize>(
     witness: &[F128],
@@ -1003,47 +1180,126 @@ pub fn materialize_lanes<const COLS: usize>(
     gammas: &[(F128, F128)],
     p: &[F128],
 ) -> Vec<F128> {
-    let omega: Vec<Vec<F128>> = (0..num_lanes).map(|i| row_polynomial(i, gammas)).collect();
-    let deg = omega.iter().map(|w| w.len() - 1).max().unwrap_or(0);
-    let width = deg + 1;
-    let mut h = vec![F128::ZERO; d * width];
-    h.par_chunks_mut(COLS * width)
-        .enumerate()
-        .for_each(|(chunk, out)| {
-            let col0 = chunk * COLS;
-            let cols = out.len() / width;
-            for (i, w) in omega.iter().enumerate() {
-                let src = &witness[i * d + col0..i * d + col0 + cols];
-                for (j, &x) in src.iter().enumerate() {
-                    let dst = &mut out[j * width..j * width + w.len()];
-                    for (o, &cs) in dst.iter_mut().zip(w) {
-                        *o += cs * x;
-                    }
-                }
-            }
-        });
-    let mut f: Vec<F128> = (0..d)
-        .into_par_iter()
-        .map(|col| h[col * width + deg])
+    let rounds = gammas.len();
+    // Chunks of COLS columns, or one chunk when the lanes are shorter.
+    let cols = COLS.min(d);
+    assert!(cols.is_power_of_two() && cols >= TAIL_COLS && d.is_multiple_of(cols));
+    assert!(rounds < TAIL_COLS && num_lanes <= 1usize << rounds);
+    assert_eq!(witness.len() % d, 0);
+    let coefs: Vec<RoundCoefs> = gammas
+        .iter()
+        .map(|&(alpha, beta)| RoundCoefs {
+            alpha,
+            beta,
+            alpha_beta: alpha + beta,
+            beta_p: p.iter().map(|&pz| beta * pz).collect(),
+        })
         .collect();
-    for s in (0..deg).rev() {
-        let len = f.len();
-        let cur = &f;
-        let hs = &h;
-        f = (0..len + 1)
-            .into_par_iter()
-            .with_min_len(PAR_MIN)
+    let lane = |i: usize, lo: usize, len: usize| &witness[i * d + lo..i * d + lo + len];
+    // Lane counts entering each round.
+    let counts: Vec<usize> = (0..=rounds)
+        .scan(num_lanes, |n, _| {
+            let cur = *n;
+            *n = n.div_ceil(2);
+            Some(cur)
+        })
+        .collect();
+    let half = num_lanes.div_ceil(2);
+
+    // Pass 1: tails[c][j][i] = round-j input lane i at chunk c's last column.
+    let chunks = d / cols;
+    let tails: Vec<Vec<Vec<F128>>> = (0..chunks)
+        .into_par_iter()
+        .map(|c| {
+            let w0 = (c + 1) * cols - TAIL_COLS;
+            let mut cur: Vec<F128> = (0..num_lanes)
+                .flat_map(|i| lane(i, w0, TAIL_COLS).iter().copied())
+                .collect();
+            let mut next = vec![F128::ZERO; half * TAIL_COLS];
+            let mut out = Vec::with_capacity(rounds);
+            for (j, rc) in coefs.iter().enumerate() {
+                out.push(
+                    (0..counts[j])
+                        .map(|i| cur[i * TAIL_COLS + TAIL_COLS - 1])
+                        .collect::<Vec<_>>(),
+                );
+                let src = |i: usize| &cur[i * TAIL_COLS..(i + 1) * TAIL_COLS];
+                fold_round(src, &mut next, TAIL_COLS, w0, counts[j], rc, |_, _| {
+                    (F128::ZERO, F128::ZERO)
+                });
+                std::mem::swap(&mut cur, &mut next);
+            }
+            out
+        })
+        .collect();
+    let tail_at = |j: usize, i: usize, col: usize| {
+        debug_assert_eq!(col % cols, cols - 1);
+        tails[col / cols][j][i]
+    };
+
+    // Pass 2: every chunk through all rounds, edges from the tails.
+    let mut f = vec![F128::ZERO; d];
+    f.par_chunks_mut(cols).enumerate().for_each(|(c, f_chunk)| {
+        let col0 = c * cols;
+        let mut a = vec![F128::ZERO; half * cols];
+        let mut b = vec![F128::ZERO; half.div_ceil(2).max(1) * cols];
+        for (j, rc) in coefs.iter().enumerate() {
+            let edge = |i: usize, col0: usize| {
+                if col0 == 0 {
+                    return (F128::ZERO, F128::ZERO);
+                }
+                let tz = col0.trailing_zeros() as usize;
+                (
+                    tail_at(j, i, col0 - 1),
+                    tail_at(j, i, col0 + (1usize << tz) - 1),
+                )
+            };
+            if j == 0 {
+                let src = |i: usize| lane(i, col0, cols);
+                fold_round(src, &mut a, cols, col0, counts[0], rc, edge);
+            } else {
+                let src = |i: usize| &a[i * cols..(i + 1) * cols];
+                fold_round(src, &mut b, cols, col0, counts[j], rc, edge);
+                std::mem::swap(&mut a, &mut b);
+            }
+        }
+        f_chunk.copy_from_slice(&a[..cols]);
+    });
+
+    // The overflow coefficients past d: round j's inputs have j of them.
+    let last = chunks - 1;
+    let mut ov: Vec<Vec<F128>> = vec![Vec::new(); num_lanes];
+    for (j, rc) in coefs.iter().enumerate() {
+        let len = d + j;
+        ov = (0..counts[j].div_ceil(2))
             .map(|m| {
-                let low = if m < d { hs[m * width + s] } else { F128::ZERO };
-                t_at(|j| cur[j], len, m, p) + low
+                let (x0, x1) = (2 * m, 2 * m + 1);
+                (d..=len)
+                    .map(|pos| {
+                        let at = |i: usize, q: usize| {
+                            if q == d - 1 {
+                                tails[last][j][i]
+                            } else {
+                                ov[i].get(q - d).copied().unwrap_or(F128::ZERO)
+                            }
+                        };
+                        let v0 = if pos < len { at(x0, pos) } else { F128::ZERO };
+                        if x1 >= counts[j] {
+                            return v0;
+                        }
+                        let v1 = if pos < len { at(x1, pos) } else { F128::ZERO };
+                        v0 + rc.alpha * v1 + rc.beta * t_at(|q| at(x1, q), len, pos, p)
+                    })
+                    .collect()
             })
             .collect();
     }
+    f.extend_from_slice(&ov[0]);
     f
 }
 
 /// Column chunk of the L0 materialize pass.
-const MATERIALIZE_COLS: usize = 1 << 10;
+const MATERIALIZE_COLS: usize = 1 << 12;
 
 /// The L0 rounds on the lane-major path, from per-lane statistics only:
 /// the grid of round j is a combination of `stats` and the row weights, and
@@ -1188,20 +1444,36 @@ fn lane_rounds<Ch: Challenger>(
     let t1 = Instant::now();
     let mut f = materialize_lanes::<MATERIALIZE_COLS>(witness, d, num_lanes, &gammas, p);
     f.resize(d + k, F128::ZERO);
+    let t_mat = t1.elapsed();
+    // W = Σ_terms scale · row weight · eq(col_point), from the eq tensor's
+    // low and high factors in one pass.
+    let lo_bits = c / 2;
+    let factors: Vec<(Vec<F128>, Vec<F128>)> = terms
+        .iter()
+        .map(|term| {
+            let (lo, mut hi) = build_eq_split(&term.col_point, lo_bits);
+            let scale = term.scale * term.rows[0];
+            hi.iter_mut().for_each(|h| *h *= scale);
+            (lo, hi)
+        })
+        .collect();
     let mut w = vec![F128::ZERO; d];
-    for term in &terms {
-        let eq = build_eq_scaled_parallel(&term.col_point, term.scale * term.rows[0]);
-        w.as_mut_slice()
-            .into_par_iter()
-            .zip(eq.into_par_iter())
-            .with_min_len(PAR_MIN)
-            .for_each(|(dst, e)| *dst += e);
-    }
+    w.par_chunks_mut(1 << lo_bits)
+        .enumerate()
+        .for_each(|(h, block)| {
+            for (lo, hi) in &factors {
+                let hv = hi[h];
+                for (dst, &l) in block.iter_mut().zip(lo) {
+                    *dst += hv * l;
+                }
+            }
+        });
     if trace {
         eprintln!(
-            "  L0 lanes: statistics {:.2} ms, materialize {:.2} ms",
+            "  L0 lanes: statistics {:.2} ms, materialize {:.2} ms, weight {:.2} ms",
             t_stats.as_secs_f64() * 1e3,
-            t1.elapsed().as_secs_f64() * 1e3
+            t_mat.as_secs_f64() * 1e3,
+            (t1.elapsed() - t_mat).as_secs_f64() * 1e3
         );
     }
     let level = Level {
@@ -1584,8 +1856,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        AffineL0, AffineProof, F128, affine_configs, carry_products, novel_basis_evals,
-        prove_affine, prove_affine_l0, t_at, verify_affine, verify_affine_l0,
+        AffineL0, AffineProof, F128, affine_configs, affine_ladder, carry_products,
+        novel_basis_evals, prove_affine, prove_affine_l0, t_at, verify_affine, verify_affine_l0,
     };
     use crate::{
         challenger::{Challenger, FsChallenger, RandomChallenger},
@@ -1725,8 +1997,10 @@ mod tests {
                 .collect();
         }
         for got in [
+            super::materialize_lanes::<8>(&w, d, live, &gammas, &p),
             super::materialize_lanes::<64>(&w, d, live, &gammas, &p),
-            super::materialize_lanes::<1024>(&w, d, live, &gammas, &p),
+            super::materialize_lanes::<512>(&w, d, live, &gammas, &p),
+            super::materialize_lanes::<4096>(&w, d, live, &gammas, &p),
         ] {
             let mut got = got;
             got.resize(d + k, F128::ZERO);
@@ -1969,6 +2243,24 @@ mod tests {
             assert_eq!(fx.proof.yr.len(), (1 << 5) + 2);
             assert!(verifies(&fx, &fx.proof, fx.target), "ood = {ood}");
         }
+    }
+
+    /// At the split ladder's rates, the recomputed Johnson queries are the
+    /// shipped m32_fast counts; at L1 rate 1/4 they rise to 119.
+    #[test]
+    fn ladder_queries_match_the_shipped_analysis() {
+        let split = crate::pcs::ligerito::prover_config_for(
+            25,
+            6,
+            crate::pcs::ligerito::LigeritoProfile::Fast,
+        )
+        .expect("m32 fast");
+        let (same, _) = affine_ladder(&split, 25, &split.log_inv_rates[..5], &[0; 5]);
+        assert_eq!(same.queries, split.queries[..5]);
+        assert_eq!(same.recursive_ks, [4, 4, 4, 4]);
+        let (fast, _) = affine_ladder(&split, 25, &[1, 2, 5, 7], &[4, 4, 5, 5]);
+        assert_eq!(fast.queries, [244, 119, 48, 35]);
+        assert_eq!(fast.recursive_log_msg_cols, [15, 11, 7]);
     }
 
     #[test]
