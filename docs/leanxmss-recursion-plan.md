@@ -178,6 +178,48 @@ Goal: every per-byte difference between a node and the leaf is either removed or
   - For the node's full-field words a bit-bank costs about what the W build does.
   - Open: a node block-first path at g = 8 with byte-table banks could save ~25 ms, but it changes the transcript order. That means a verifier rotation and the parent's in-circuit RealTape.
 
+## Family H by Horner (2026-11-03)
+
+A census of the spine's full-field gates (rows per gate type per verifier step) found that the ring switch's 128 Frobenius twists were half of them. That is family H plus the ĝ anchor: 47% of the field words and 51% of their wiring cells.
+
+**The waste was in family H's twisted sum.**
+- Family H computes `Σ_j c_j·v_j^(2^j)` with `c_j = γ·MLE_j(r″)`, where row j of the inverse Moore matrix is row j of the trace-dual table.
+- It raised each `v_j` by repeated squaring: Σ j = 8128 F256 squarings per child, which filled the 2^14-row F256 MAC slot and spilled onto the 50-column F256 spine gate.
+- The per-row constants were computed by 1,016 squarings of constants and 1,792 scaling MACs, all on the 21-column F128 spine gate.
+
+**The rewrite.**
+- Row j is row 0 Frobenius-shifted, and Frobenius commutes with `eq` at Boolean points. So `c_j = φ^j(e_j)` with `e_j = φ^-j(γ)·MLE_0(φ^-j(r″))`.
+- The sum is then `Σ_j φ^j(e_j·v_j)`, a Horner chain `h ← e_j·v_j + h²` from j = 127 down.
+- `φ^-j = φ^(128-j)` on F_{2^128}, so the shifted inputs are forward squaring chains of r″'s seven coordinates and γ, with no advice.
+- Two new element types:
+  - `SquareChainGate`: 31 squarings per row.
+  - `HornerStepGate`: 28 columns, with row 0's constants (`g0`, the geometric ratio and the seven low-index corrections) written into its A/B rows.
+- Circuit building asserts that every Moore row is row 0 shifted.
+
+**Result.**
+- Spine full-field gates: 1.22M → 0.87M words and 776k → 536k cells. Live witness: 57.0 → 52.1 MB. The first-level node's full-field words: 1.38M → 1.05M.
+- The two new types cost about 300 extra BLAKE3 rows per node in the transcript chains.
+
+| 1 thread, expected fingerprint PoW | before | after |
+|---|---:|---:|
+| Spine node | 578 ms | 554 ms |
+| Base node | 571 ms | 551 ms |
+| First-level node | 641 ms | 616 ms |
+| Spine node, 10 threads | 190 ms | 178 ms |
+
+- **Where the spine's 24 ms came from:**
+  - commit NTT −9 ms (the encode does scale with live words under the 31-lane pin);
+  - wiring −8 ms and fingerprint PoW −5 ms;
+  - element PIOP −2 ms and witgen −2 ms;
+  - zerocheck +3.5 ms (the extra BLAKE3 rows).
+- The W build and merged sumcheck did not move.
+- Ligerito's grinding is also a per-transcript draw, about ±7 ms per node type. Ignore it in A/Bs.
+
+**Not done:**
+- The ĝ anchor's 2,794 square-root checks per child still run on 21-column spine-gate rows (a narrow-gate fix, not an algorithmic one).
+- The family-H transpose dot is 2,048 MACs per claim where summing the 16 tile partials first gives 128.
+- The first-level node is now at about 28.4 lanes, so the 31-lane pin could drop to 29.
+
 ## Open questions
 
 1. **Tree shape.** The driver is the chain tower's spine: a base over the last two first-level nodes, then each level prepends the next-earlier one. The statement is `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))` over fixed 992-signature batches, and the verifier rebuilds it from the batches (`xmss_statement`). A balanced tree would need a second internal shape.

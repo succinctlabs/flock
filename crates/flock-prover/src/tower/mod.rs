@@ -71,9 +71,10 @@ use crate::{
         },
         envelope::{
             ENV_ACC_CHAIN_WORDS, ENV_ACC_MAIN_WORDS, ENV_APP_WORDS, EnvShape, EnvTail,
-            declare_envelope_slots, env_acc_chain_base, env_acc_main_base, env_app_base,
-            env_pass_base, envelope_shape, envelope_shape_with_lane, lane_block_words, outer_lanes,
-            pad_envelope_counts, slot_cached, span_count_word, steady_reps,
+            KEY_HORNER_STEP, KEY_SQUARE_CHAIN, declare_envelope_slots, env_acc_chain_base,
+            env_acc_main_base, env_app_base, env_pass_base, envelope_shape,
+            envelope_shape_with_lane, lane_block_words, outer_lanes, pad_envelope_counts,
+            slot_cached, span_count_word, steady_reps,
         },
         fl_node::{FlApp, FlFamily, build_first_level_core, chain_blake_r1cs},
         fold_region::{
@@ -99,9 +100,10 @@ use crate::{
         },
         gates_leaf::{LeafEvalGate, LeafEvalGate256, build_mac256},
         gates_spine::{
-            AssistLayerGate, MacGate, MacGate256, MergedRoundGate, PrefixGate, PrefixGate256,
-            ResidualAccGate256, ResidualPrefix3Gate256, ResidualWeightsGate256, SpineGate,
-            SpineGate256, ZcRoundGate, emit_mac256, emit_spine256, live_element_input_from_rows,
+            AssistLayerGate, HornerStepGate, MacGate, MacGate256, MergedRoundGate, PrefixGate,
+            PrefixGate256, ResidualAccGate256, ResidualPrefix3Gate256, ResidualWeightsGate256,
+            SpineGate, SpineGate256, SquareChainGate, ZcRoundGate, emit_mac256, emit_spine256,
+            live_element_input_from_rows,
         },
         geometry::{
             CollapsedSlots, Lvl, balance_extra_rows, cap_payloads, cap_wires, emit_publics_hash,

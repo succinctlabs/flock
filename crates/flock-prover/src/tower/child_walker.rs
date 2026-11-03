@@ -37,16 +37,16 @@ use crate::{
     r1cs_hashes::fs_chain::{FsChainTrace, IV},
     tower::{
         BusRec, CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind,
-        InnerPd, LeafEvalGate, LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner, MixedProof,
-        MpRec, OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire,
-        ag_seed_bytes, assertion_mac, bytes_payload_mask, cap_payloads, cap_wires,
-        check_residual_publics, circuit_structure_claim_wires, cw, declare_envelope_slots,
-        decode_ag_point, emit_boolean_reported_check, emit_bus, emit_element_reported_check,
-        emit_fiat_shamir_chain, emit_gkr_layers, emit_publics_hash, emit_query_phase,
-        emit_recombination, emit_residual_region, flatten_ops, level_geometry, level_sources,
-        observed_f256, pack8, parse_open_levels, payload_words, pin_bus_sides, pin_recombination,
-        query_phase_blake3_rows, recombination_positions, replay_ligerito_spine256,
-        squeeze_word_wire, strat_scheds, walker_common,
+        InnerPd, KEY_HORNER_STEP, KEY_SQUARE_CHAIN, LeafEvalGate, LeafEvalGate256, Lvl, MacGate,
+        MergedChain, MixedInner, MixedProof, MpRec, OpenLevel, PdRec, RoundRec, SLOT_WORDS,
+        ShapeBuilder, UnionInstance, Wire, ag_seed_bytes, assertion_mac, bytes_payload_mask,
+        cap_payloads, cap_wires, check_residual_publics, circuit_structure_claim_wires, cw,
+        declare_envelope_slots, decode_ag_point, emit_boolean_reported_check, emit_bus,
+        emit_element_reported_check, emit_fiat_shamir_chain, emit_gkr_layers, emit_publics_hash,
+        emit_query_phase, emit_recombination, emit_residual_region, flatten_ops, level_geometry,
+        level_sources, observed_f256, pack8, parse_open_levels, payload_words, pin_bus_sides,
+        pin_recombination, query_phase_blake3_rows, recombination_positions,
+        replay_ligerito_spine256, squeeze_word_wire, strat_scheds, walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_BUS, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -1830,7 +1830,6 @@ fn fin_at(ops: &[Op], end: usize) -> usize {
 /// cache hits require same-shape children (the keyed constructor parameters
 /// must match, which the merge test asserts by requiring one shared circuit).
 pub(super) struct ChildSlots {
-    pub(super) nu: usize,
     pub(super) q: CollapsedSlots,
     pub(super) macs: SlotId,
     pub(super) fold_macs: SlotId,
@@ -1846,7 +1845,8 @@ pub(super) struct ChildSlots {
     /// `701` = the shared extension-field MAC; `100 + pl` = the base-field
     /// ResidualGate at that suffix-fold count; `310 + width` and
     /// `1000 + width` = base/extension prefix gates; and `880..=882` = the
-    /// three shared extension-field residual relations.
+    /// three shared extension-field residual relations; `890`/`891` = family
+    /// H's squaring chain and Horner step.
     pub(super) resid: Vec<(usize, SlotId)>,
 }
 
@@ -1869,7 +1869,6 @@ impl ChildSlots {
         let b3 = sb.slot(Blake3Gate { nu: nu2 });
         let b3_alt = split_b3.then(|| sb.slot(Blake3Gate { nu: nu2 }));
         ChildSlots {
-            nu: nu2,
             q: CollapsedSlots {
                 b3,
                 b3_alt,
@@ -1892,7 +1891,18 @@ impl ChildSlots {
             // Key 600 pre-seeds the SHARED MacGate into the residual cache:
             // emit_residual_region's close-out rows land on the same slot
             // instead of registering a duplicate type.
-            resid: vec![(600, macs), (701, mac256)],
+            resid: vec![
+                (600, macs),
+                (701, mac256),
+                (
+                    KEY_SQUARE_CHAIN,
+                    sb.slot(crate::tower::SquareChainGate::new()),
+                ),
+                (
+                    KEY_HORNER_STEP,
+                    sb.slot(crate::tower::HornerStepGate::new()),
+                ),
+            ],
         }
     }
 
@@ -1912,7 +1922,6 @@ impl ChildSlots {
                 .1
         };
         ChildSlots {
-            nu: nu2,
             q,
             macs: take(600),
             fold_macs: take(602),
@@ -1932,11 +1941,21 @@ impl ChildSlots {
                         || (100..200).contains(&k)
                         || (310..400).contains(&k)
                         || (880..=882).contains(&k)
+                        || matches!(k, KEY_SQUARE_CHAIN | KEY_HORNER_STEP)
                         || (1000..1100).contains(&k)
                 })
                 .cloned()
                 .collect(),
         }
+    }
+
+    /// A slot from the residual-namespace cache, by key.
+    pub(super) fn resid_slot(&self, key: usize) -> SlotId {
+        self.resid
+            .iter()
+            .find(|&&(k, _)| k == key)
+            .unwrap_or_else(|| panic!("the child slots declare key {key}"))
+            .1
     }
 
     /// The keyed cache view `pad_envelope_counts` consumes — envelope path

@@ -22,10 +22,10 @@ use flock_transcript::transcript_record::{
 use crate::{
     r1cs_hashes::fs_chain::FsChainTrace,
     tower::{
-        BusRec, ChildSlots, F128, GkrLayerRec, GkrRec, InnerPd, Lvl, MergedChain, MixedProof,
-        MpRec, OpenLevel, PdRec, RoundRec, ShapeBuilder, Wire, ZskipTapeRec, ZskipWires,
-        assert_chain_replays, duplex_row_count_model, emit_family_h, emit_spine256,
-        level_query_phase_blake3_rows, merge_chain, squeeze_word_wire,
+        BusRec, ChildSlots, F128, GkrLayerRec, GkrRec, InnerPd, KEY_HORNER_STEP, KEY_SQUARE_CHAIN,
+        Lvl, MergedChain, MixedProof, MpRec, OpenLevel, PdRec, RoundRec, ShapeBuilder, Wire,
+        ZskipTapeRec, ZskipWires, assert_chain_replays, duplex_row_count_model, emit_family_h,
+        emit_spine256, level_query_phase_blake3_rows, merge_chain, squeeze_word_wire,
     },
 };
 
@@ -825,14 +825,8 @@ pub(super) fn emit_family_h_boundary(
         cs.q.family.expect("family-H slot"),
         cs.macs,
         cs.fold_macs,
-        cs.spine,
-        cs.spine256,
-        cs.resid
-            .iter()
-            .find(|&&(key, _)| key == 701)
-            .expect("the child slots declare an F256 MAC slot")
-            .1,
-        1usize << cs.nu,
+        cs.resid_slot(KEY_SQUARE_CHAIN),
+        cs.resid_slot(KEY_HORNER_STEP),
         &shv_w,
         &value_w,
         &rdp_w,
