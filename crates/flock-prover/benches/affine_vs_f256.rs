@@ -35,8 +35,8 @@ use flock_prover::{
         ligerito::{
             LigeritoProfile, ProverConfig, VerifierConfig, VirtualEqBasis,
             affine::{
-                AffineL0, affine_ladder, prove_affine, prove_affine_l0,
-                verify_affine, verify_affine_l0,
+                AffineL0, affine_ladder, prove_affine, prove_affine_l0, verify_affine,
+                verify_affine_l0,
             },
             ligero_commit, prover_config_for, recursive_prover_with_basis,
             recursive_prover_with_basis_precomputed_round0_lanes,
@@ -199,7 +199,7 @@ fn lanes_mode(split: &ProverConfig, affine: &ProverConfig, affine_v: &VerifierCo
         LOG_N,
         target,
         &commitment.cap,
-        (LIVE_LANES, true),
+        (LIVE_LANES, Some(&point[..log_cols])),
         |rs, residual_log| {
             let prefix = rotated
                 .iter()

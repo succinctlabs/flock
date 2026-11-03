@@ -782,6 +782,14 @@ pub enum AffineL0 {
     /// `witness[lane · 2^c0 + col]`, lanes `>= num_lanes` zero. The basis is
     /// `gamma · eq(point, ·)` in the same index order, never materialized.
     /// `seeded_stats`, when given, are the per-lane `<lane, eq(point_lo)>`.
+    ///
+    /// The L0 OOD points reuse `point_lo` (the column coordinates) and draw
+    /// only the row coordinates, so every L0 term has the same per-lane
+    /// statistics. This keeps the OOD bound only if `point_lo` is sampled
+    /// uniformly after the L0 commitment: the list of codewords is fixed by
+    /// the commitment, and two distinct list members then differ at
+    /// `(point_lo, z_hi)` except with probability `log_n / |F|`, as for a
+    /// fresh point.
     Lanes {
         witness: Vec<F128>,
         point: Vec<F128>,
@@ -1324,58 +1332,33 @@ fn lane_rounds<Ch: Challenger>(
     assert_eq!(point.len(), k + c);
     let claim_bits = config.claim_batch_grinding_bits[0] as u32;
     let t0 = Instant::now();
-    // The first OOD point is fixed before any answer is sent, so its
-    // statistics share the seeded term's sweep. Later points (no shipped
-    // config takes them at L0) depend on the previous answer.
-    let first_z = (config.ood_samples[0] > 0).then(|| challenger.sample_f128_vec(k + c));
-    let mut sweep_points: Vec<&[F128]> = vec![&point[..c]];
-    if let Some(z) = &first_z {
-        sweep_points.push(&z[..c]);
-    }
-    let mut swept = lane_statistics_fused(
+    // Every L0 OOD point reuses the seeded point's column coordinates and
+    // draws only fresh row coordinates, so all terms share one statistics
+    // vector and one sweep. The terms then merge into one, whose row
+    // weight is `γ eq(point_hi) + Σ_t β_t eq(z_t)`.
+    let mut stats = lane_statistics_fused(
         witness,
         d,
         lanes,
         num_lanes,
-        &sweep_points,
+        &[&point[..c]],
         k,
         p,
         LANE_LOW_BITS,
     )
-    .into_iter();
-    let seed_stats = swept.next().expect("seeded term");
+    .remove(0);
     if let Some(given) = &seeded_stats {
         debug_assert!(
-            given.iter().zip(&seed_stats).all(|(&a, s)| a == s[0]),
+            given.iter().zip(&stats).all(|(&a, s)| a == s[0]),
             "seeded statistics disagree with the witness"
         );
     }
-    let mut terms = vec![LaneTerm {
-        scale: gamma,
-        col_point: point[..c].to_vec(),
-        rows: build_eq_table(&point[c..]),
-        stats: seed_stats,
-    }];
+    let mut rows = build_eq_table(&point[c..]);
+    rows.iter_mut().for_each(|w| *w *= gamma);
     let mut claim = target;
-    let mut first = first_z.map(|z| (z, swept.next().expect("first OOD term")));
     for _ in 0..config.ood_samples[0] {
-        let (z, stats) = first.take().unwrap_or_else(|| {
-            let z = challenger.sample_f128_vec(k + c);
-            let stats = lane_statistics_fused(
-                witness,
-                d,
-                lanes,
-                num_lanes,
-                &[&z[..c]],
-                k,
-                p,
-                LANE_LOW_BITS,
-            )
-            .remove(0);
-            (z, stats)
-        });
-        let rows = build_eq_table(&z[c..]);
-        let y = rows
+        let ood_rows = build_eq_table(&challenger.sample_f128_vec(k));
+        let y = ood_rows
             .iter()
             .zip(&stats)
             .fold(F128::ZERO, |acc, (&w, s)| acc + w * s[0]);
@@ -1384,13 +1367,16 @@ fn lane_rounds<Ch: Challenger>(
         let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits);
         proof.claim_batch_grinding_nonces.push(nonce);
         claim += beta * y;
-        terms.push(LaneTerm {
-            scale: beta,
-            col_point: z[..c].to_vec(),
-            rows,
-            stats,
-        });
+        rows.iter_mut()
+            .zip(&ood_rows)
+            .for_each(|(w, &o)| *w += beta * o);
     }
+    let mut terms = vec![LaneTerm {
+        scale: F128::ONE,
+        col_point: point[..c].to_vec(),
+        rows,
+        stats: std::mem::take(&mut stats),
+    }];
     let t_stats = t0.elapsed();
 
     let mut gammas = Vec::with_capacity(k);
@@ -1585,17 +1571,20 @@ where
         log_n,
         target,
         expected_initial_cap,
-        (lanes, false),
+        (lanes, None),
         eval_b_residual,
         challenger,
     )
 }
 
-/// [`verify_affine`] for either L0 layout: `(l0_num_lanes, lane_major)`.
-/// On the lane-major path the L0 rounds bind the lane (high) variables
-/// first, so the binding order of a lane-major index is its coordinates
-/// rotated left by `log_n - initial_k`; `eval_b_residual` receives the
-/// challenges in that order.
+/// [`verify_affine`] for either L0 layout: `(l0_num_lanes, lane_cols)`,
+/// with `lane_cols = Some(column point)` on the lane-major path. There the
+/// L0 rounds bind the lane (high) variables first, so the binding order of
+/// a lane-major index is its coordinates rotated left by `log_n -
+/// initial_k`; `eval_b_residual` receives the challenges in that order.
+/// The L0 OOD points take their column coordinates from the opening point
+/// (`lane_cols`, its low `log_n - initial_k` coordinates) and only their
+/// row coordinates from the transcript (see [`AffineL0::Lanes`]).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_affine_l0<Ch, F>(
     config: &VerifierConfig,
@@ -1603,7 +1592,7 @@ pub fn verify_affine_l0<Ch, F>(
     log_n: usize,
     target: F128,
     expected_initial_cap: &[Hash],
-    (l0_num_lanes, lane_major): (usize, bool),
+    (l0_num_lanes, lane_cols): (usize, Option<&[F128]>),
     eval_b_residual: F,
     challenger: &mut Ch,
 ) -> bool
@@ -1649,11 +1638,19 @@ where
     if l0_num_lanes == 0 || l0_num_lanes > 1usize << config.initial_k {
         return false;
     }
+    if lane_cols.is_some_and(|cols| cols.len() != log_n - config.initial_k) {
+        return false;
+    }
     for _ in 0..config.ood_samples[0] {
-        let mut point = challenger.sample_f128_vec(log_n);
-        if lane_major {
-            point.rotate_left(log_n - config.initial_k);
-        }
+        let point = match lane_cols {
+            // Binding order: the fresh row coordinates, then the columns.
+            Some(cols) => {
+                let mut point = challenger.sample_f128_vec(config.initial_k);
+                point.extend_from_slice(cols);
+                point
+            }
+            None => challenger.sample_f128_vec(log_n),
+        };
         let y = *next!(proof.ood_values, ood_i);
         challenger.observe_f128(y);
         let nonce = *next!(proof.claim_batch_grinding_nonces, claim_i);
@@ -2194,7 +2191,7 @@ mod tests {
             assert_eq!(proof.openings[0].opened_rows[0].len(), live);
             let mut rotated = point.clone();
             rotated.rotate_left(c0);
-            let check = |proof: &AffineProof, target: F128| {
+            let check_cols = |proof: &AffineProof, target: F128, cols: &[F128]| {
                 let mut ch = FsChallenger::new(b"affine-lanes");
                 verify_affine_l0(
                     &verifier,
@@ -2202,7 +2199,7 @@ mod tests {
                     log_n,
                     target,
                     &cap,
-                    (live, true),
+                    (live, Some(cols)),
                     |rs, residual_log| {
                         let prefix = rotated
                             .iter()
@@ -2218,7 +2215,13 @@ mod tests {
                     &mut ch,
                 )
             };
+            let check = |proof: &AffineProof, target: F128| check_cols(proof, target, &point[..c0]);
             assert!(check(&proof, target), "lane-major roundtrip, ood = {ood}");
+            if ood > 0 {
+                let mut cols = point[..c0].to_vec();
+                cols[0] += F128::ONE;
+                assert!(!check_cols(&proof, target, &cols), "OOD column point");
+            }
             assert!(!check(&proof, target + F128::ONE), "wrong target");
             for e in 0..5 {
                 let mut bad = proof.clone();
