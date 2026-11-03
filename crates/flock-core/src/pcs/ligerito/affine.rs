@@ -193,6 +193,7 @@ pub fn affine_ladder(
 const AFFINE_LADDERS: &[((usize, usize), &[usize], &[usize])] = &[
     ((17, 6), &[1, 5], &[4, 5]),
     ((25, 6), &[1, 3, 5, 7], &[4, 5, 5, 5]),
+    ((26, 6), &[1, 3, 5, 7], &[4, 5, 5, 5]),
 ];
 
 /// The `FastAffine` configs for a shape, or an error if none is registered.

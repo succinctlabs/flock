@@ -550,7 +550,7 @@ columns are sound on this path. \texttt{MergedOpenProof.inner} is now
 an enum (\texttt{MergedInnerOpen::\{Split, Affine\}}); its variant tag
 moved the proof-IO version to $24$ and re-pinned the byte fixtures,
 with transcripts unchanged. The ladders are registered per shape in
-\texttt{affine\_ladder\_for}: $m = 32$ (rates $[1,3,5,7]$, fold bits
+\texttt{affine\_ladder\_for}: $m = 32$ and $m = 33$ (rates $[1,3,5,7]$, fold bits
 $[4,5,5,5]$) and $m = 24$ (rates $[1,5]$, fold bits $[4,5]$; at rate
 $1/8$ its $2^7$-column level has no certificate), which
 \texttt{tests/fast\_affine.rs} proves and verifies end to end. The
@@ -563,6 +563,25 @@ and verification stays at about $4$ ms. Whole-prove times varied by
 $\pm 40$ ms between runs on the battery-powered test machine. Best of
 five, over three alternating pairs: $240.9$ / $249.7$ / $251.2$ ms for
 \texttt{fast} against $234.3$ / $231.5$ / $234.1$ ms.
+
+At $m = 33$ ($2^{19}$ compressions; ladder rates $[1,3,5,7]$, fold bits
+$[4,5,5,5]$, every round certified) the gap is wider, since the F256
+inner opening more than doubles from $m = 32$. In two traced pairs:
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+$m = 33$ & \texttt{fast} & \texttt{fast-affine} \\
+\midrule
+merged open (ms) & $160.8$ / $157.0$ & $71.6$ / $72.7$ \\
+whole prove (ms) & $606.7$ / $624.3$ & $521.9$ / $557.1$ \\
+proof (KiB) & $466.3$ & $423.5$ \\
+peak memory (MB) & $14028$ & $13303$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+The rest of the prove is unchanged: witness generation (about
+$55$ ms), the L0 commit ($160$--$190$ ms), and the boolean zerocheck
+and lincheck ($230$--$240$ ms).
 
 \section{Implementation plan}\label{sec:plan}
 
