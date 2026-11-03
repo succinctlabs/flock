@@ -71,8 +71,8 @@ use crate::{
         },
         envelope::{
             ENV_ACC_CHAIN_WORDS, ENV_ACC_MAIN_WORDS, ENV_APP_WORDS, EnvShape, EnvTail,
-            KEY_HORNER_STEP, KEY_SQUARE_CHAIN, declare_envelope_slots, env_acc_chain_base,
-            env_acc_main_base, env_app_base, env_pass_base, envelope_shape,
+            KEY_HORNER_STEP, KEY_SQUARE_CHAIN, KEY_TRANSPOSE_DOT, declare_envelope_slots,
+            env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base, envelope_shape,
             envelope_shape_with_lane, lane_block_words, outer_lanes, pad_envelope_counts,
             slot_cached, span_count_word, steady_reps,
         },
@@ -102,8 +102,8 @@ use crate::{
         gates_spine::{
             AssistLayerGate, HornerStepGate, MacGate, MacGate256, MergedRoundGate, PrefixGate,
             PrefixGate256, ResidualAccGate256, ResidualPrefix3Gate256, ResidualWeightsGate256,
-            SpineGate, SpineGate256, SquareChainGate, ZcRoundGate, emit_mac256, emit_spine256,
-            live_element_input_from_rows,
+            SpineGate, SpineGate256, SquareChainGate, TransposeDotGate, ZcRoundGate, emit_mac256,
+            emit_spine256, live_element_input_from_rows,
         },
         geometry::{
             CollapsedSlots, Lvl, balance_extra_rows, cap_payloads, cap_wires, emit_publics_hash,

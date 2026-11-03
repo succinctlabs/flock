@@ -10,13 +10,17 @@ use crate::tower::{
     FamilyTransposeTileGate, GateType, HornerStepGate, LeafEvalGate, LeafEvalGate256, MacGate,
     MacGate256, MergedRoundGate, PowMaskGate, PrefixGate, PrefixGate256, ResidualAccGate256,
     ResidualPrefix3Gate256, ResidualWeightsGate256, SLOT_WORDS, ShapeBuilder, SpineGate,
-    SpineGate256, SquareChainGate, SwapGate, UnionInstance, Wire, ZcRoundGate, cw,
+    SpineGate256, SquareChainGate, SwapGate, TransposeDotGate, UnionInstance, Wire, ZcRoundGate,
+    cw,
 };
 
 /// Family H's Frobenius squaring chains ([`SquareChainGate`]).
 pub(super) const KEY_SQUARE_CHAIN: usize = 890;
 /// Family H's Horner steps ([`HornerStepGate`]).
 pub(super) const KEY_HORNER_STEP: usize = 891;
+/// Family H's bit-transpose dot, one row per transposed word
+/// ([`TransposeDotGate`]).
+pub(super) const KEY_TRANSPOSE_DOT: usize = 892;
 
 /// Wall 2's registry-geometry constants at the settled envelope (slim,
 /// m* = 29): the UNION of the leaf-outer's and the node's type sets, at the
@@ -31,9 +35,10 @@ pub(super) const KEY_HORNER_STEP: usize = 891;
 /// - `nu` 14: each of the two independent child verifiers has its own
 ///   identical BLAKE slot, and the consolidated extension-field residual
 ///   gates keep every physical slot below 2^14 rows.
-/// - 31 table types (family H's squaring chain and Horner step joined the
-///   29 on 2026-11-02) declare 375 gate cell slots; with one public slot the
-///   cell address still fits 9 bits and `mu = nu + 9 = 23` tower-wide.
+/// - 32 table types (family H's squaring chain and Horner step joined the
+///   29 on 2026-11-02, the transpose dot on 2026-11-03) declare 394 gate
+///   cell slots; with one public slot the cell address still fits 9 bits
+///   and `mu = nu + 9 = 23` tower-wide.
 ///
 /// A ladder that drifts off these constants surfaces as a NEW slot at
 /// emission time and hence a registry-digest mismatch — the failure is
@@ -47,7 +52,7 @@ pub(super) struct EnvShape {
     /// determine the circuit digest; `counts_el` remains the canonical
     /// element-slot key list and retains the old cap census for
     /// comparison.
-    pub(super) counts_el: [(usize, usize); 17],
+    pub(super) counts_el: [(usize, usize); 18],
     /// publics* — the ONE public-segment length every envelope outer pads
     /// to (published zeros appended after all real publics). The child's
     /// publics count is what a PARENT's walk consumes — H(publics) chain
@@ -317,6 +322,8 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
             // 256 Horner steps per child region.
             (KEY_SQUARE_CHAIN, 160),
             (KEY_HORNER_STEP, 512),
+            // The transpose dot: 128 rows per claim, two claims per child.
+            (KEY_TRANSPOSE_DOT, 512),
         ],
         // Preserve the existing public body while enlarging ACC_MAIN:
         // 5684 at the chain tower's lane width.
@@ -329,13 +336,15 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
         // stays circuit structure (the parent hashes `num_lanes`-word
         // leaves), so it is pinned while everything count-shaped rides the
         // jagged claims. The largest member is the leanXMSS first-level
-        // node: 28.44 lanes of 2^17 words after family H by Horner (30.96
-        // before, which forced 31), so 29 covers every member; the outer
-        // asserts content ≤ pin. Lanes past the content are zero and the
-        // commit's NTT skips them, but the Merkle leaves and the parent's
-        // opened rows still carry them. 29 < `2^initial_k = 32`, so
-        // children remain lane-major.
-        lanes: 29,
+        // node: 27.21 lanes of 2^17 words after family H by Horner, ĝ on
+        // forward chains and the sum-first transpose dot (30.96 before
+        // Horner, 28.44 after), so 28 covers every member; the outer asserts
+        // content ≤ pin. Lanes past the content are zero and the commit's
+        // NTT skips them, but the Merkle leaves and the parent's opened rows
+        // still carry them. 28 words are 448 B, exactly 7 BLAKE3 blocks
+        // (29–31 words take 8). 28 < `2^initial_k = 32`, so children remain
+        // lane-major.
+        lanes: 28,
         acc_chain_words,
     }
 }
@@ -344,7 +353,7 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
 /// (0 spine / 8 leaf-eval / 400 mrs / 500 zcr / 600 mac / 601 assist /
 /// 602 fold-mac / 700 spine256 / 701 mac256 / 808 leaf-eval256 /
 /// 880 resid-weights / 881 resid-prefix3 / 882 resid-acc /
-/// 890 square-chain / 891 Horner step /
+/// 890 square-chain / 891 Horner step / 892 transpose dot /
 /// 310+w prefix / 1000+w prefix256). Every element-slot declaration on the
 /// recursion path routes through this, so the envelope can pre-seed the
 /// cache (fixing the declaration order registry-wide) while the
@@ -371,7 +380,7 @@ where
     }
 }
 
-/// Declare the envelope's 31 table types in one canonical order.
+/// Declare the envelope's 32 table types in one canonical order.
 /// `Registry::new` sorts class-major then k_log-descending with a
 /// STABLE sort, so the declaration order here fixes every same-k_log
 /// tie-break — the leaf-outer and node registries become the same sorted
@@ -414,6 +423,7 @@ pub(super) fn declare_envelope_slots(
     slot_cached(sb, cache, 1000 + env.pf_w, || PrefixGate256::new(env.pf_w));
     slot_cached(sb, cache, KEY_SQUARE_CHAIN, SquareChainGate::new);
     slot_cached(sb, cache, KEY_HORNER_STEP, HornerStepGate::new);
+    slot_cached(sb, cache, KEY_TRANSPOSE_DOT, TransposeDotGate::new);
     q
 }
 

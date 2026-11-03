@@ -37,16 +37,17 @@ use crate::{
     r1cs_hashes::fs_chain::{FsChainTrace, IV},
     tower::{
         BusRec, CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind,
-        InnerPd, KEY_HORNER_STEP, KEY_SQUARE_CHAIN, LeafEvalGate, LeafEvalGate256, Lvl, MacGate,
-        MergedChain, MixedInner, MixedProof, MpRec, OpenLevel, PdRec, RoundRec, SLOT_WORDS,
-        ShapeBuilder, UnionInstance, Wire, ag_seed_bytes, assertion_mac, bytes_payload_mask,
-        cap_payloads, cap_wires, check_residual_publics, circuit_structure_claim_wires, cw,
-        declare_envelope_slots, decode_ag_point, emit_boolean_reported_check, emit_bus,
-        emit_element_reported_check, emit_fiat_shamir_chain, emit_gkr_layers, emit_publics_hash,
-        emit_query_phase, emit_recombination, emit_residual_region, flatten_ops, level_geometry,
-        level_sources, observed_f256, pack8, parse_open_levels, payload_words, pin_bus_sides,
-        pin_recombination, query_phase_blake3_rows, recombination_positions,
-        replay_ligerito_spine256, squeeze_word_wire, strat_scheds, walker_common,
+        InnerPd, KEY_HORNER_STEP, KEY_SQUARE_CHAIN, KEY_TRANSPOSE_DOT, LeafEvalGate,
+        LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner, MixedProof, MpRec, OpenLevel,
+        PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ag_seed_bytes,
+        assertion_mac, bytes_payload_mask, cap_payloads, cap_wires, check_residual_publics,
+        circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
+        emit_boolean_reported_check, emit_bus, emit_element_reported_check, emit_fiat_shamir_chain,
+        emit_gkr_layers, emit_publics_hash, emit_query_phase, emit_recombination,
+        emit_residual_region, flatten_ops, level_geometry, level_sources, observed_f256, pack8,
+        parse_open_levels, payload_words, pin_bus_sides, pin_recombination,
+        query_phase_blake3_rows, recombination_positions, replay_ligerito_spine256,
+        squeeze_word_wire, strat_scheds, walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_BUS, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -1902,6 +1903,10 @@ impl ChildSlots {
                     KEY_HORNER_STEP,
                     sb.slot(crate::tower::HornerStepGate::new()),
                 ),
+                (
+                    KEY_TRANSPOSE_DOT,
+                    sb.slot(crate::tower::TransposeDotGate::new()),
+                ),
             ],
         }
     }
@@ -1941,7 +1946,7 @@ impl ChildSlots {
                         || (100..200).contains(&k)
                         || (310..400).contains(&k)
                         || (880..=882).contains(&k)
-                        || matches!(k, KEY_SQUARE_CHAIN | KEY_HORNER_STEP)
+                        || matches!(k, KEY_SQUARE_CHAIN | KEY_HORNER_STEP | KEY_TRANSPOSE_DOT)
                         || (1000..1100).contains(&k)
                 })
                 .cloned()
@@ -2275,7 +2280,6 @@ pub(super) fn emit_child_region(
         consts,
         zw,
         ow,
-        zassert,
     );
 
     // The aggregate verifier's scalar closures are part of the recursive
@@ -2819,7 +2823,6 @@ fn emit_anchor_expect(
     consts: &mut Vec<(F128, Wire)>,
     zw: Wire,
     ow: Wire,
-    zassert: Wire,
 ) -> (
     Vec<Wire>,
     Vec<Vec<Wire>>,
@@ -2880,37 +2883,29 @@ fn emit_anchor_expect(
         assert_eq!(nv, xn, "c point coord {i2} is the located wire");
     }
 
-    // ĝ(ρ″): advice square-root chains for ρ^(2^-j), bound by forward
-    // squaring deltas y·y + prev = 0.
-    let rho_mrg_n: Vec<F128> = w_coords.iter().map(|rr| chals[rr.ch]).collect();
     let rho_mrg_w: Vec<Wire> = w_coords
         .iter()
         .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
         .collect();
-    let mut rinv_n2: Vec<F128> = rho_mrg_n.clone();
-    let mut rinv_w: Vec<Wire> = rho_mrg_w.clone();
+    // ĝ(ρ″) = Σ_j γ^j·eq(ρ^(2^-j), ρ″). ρ^(2^-j) = ρ^(2^(128-j)) is read
+    // off forward Frobenius chains (no square-root advice); one eq product
+    // and one MAC per j.
+    assert_eq!(rho_mrg_w.len(), m_mp2, "ρ has the merged sumcheck's arity");
+    assert_eq!(mp_rho2_w.len(), m_mp2, "ρ″ has the merged sumcheck's arity");
+    let rho_pows: Vec<Vec<Wire>> = rho_mrg_w
+        .iter()
+        .map(|&x| walker_common::frobenius_chain(sb, cs.resid_slot(KEY_SQUARE_CHAIN), x))
+        .collect();
     let mut ghat = zw;
     for j in 0..RS_SHAT_WORDS {
-        if j > 0 {
-            let mut lvl_w = Vec::with_capacity(m_mp2);
-            for t2 in 0..m_mp2 {
-                let y = frob_inv(rinv_n2[t2]);
-                rinv_n2[t2] = y;
-                vals.push(y);
-                let yw = sb.input();
-                let d = sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3];
-                sb.connect(d, zassert);
-                lvl_w.push(yw);
-            }
-            rinv_w = lvl_w;
-        }
-        let factors: Vec<(Wire, Wire)> = rinv_w
+        let i = (128 - j) % 128;
+        let factors: Vec<(Wire, Wire)> = rho_pows
             .iter()
-            .copied()
+            .map(|p| p[i])
             .zip(mp_rho2_w.iter().copied())
             .collect();
         let eqj = walker_common::prefix_product(sb, pfslot, pf_w, zw, ow, &factors);
-        ghat = sb.gate(spine, &[zw, zw, zw, ghat, zw, zw, mp_pws[j], eqj, zw])[3];
+        ghat = sb.gate(macs, &[ghat, mp_pws[j], eqj])[0];
     }
     // e_at = eq(ρ, ρ″) for the group coefficients.
     let e_at_w = {

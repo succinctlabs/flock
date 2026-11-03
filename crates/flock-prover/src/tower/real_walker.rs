@@ -27,16 +27,18 @@ use crate::{
     r1cs_hashes::fs_chain::{FsChainTrace, IV},
     tower::{
         ChildSlots, CollapsedSlots, F128, F256, FsChallenger, GkrRec, HashKind, InnerPd,
-        LeafEvalGate, LeafEvalGate256, LeafOuter, Lvl, MergedChain, MixedProof, MpRec, OpenLevel,
-        PdRec, PiopRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ZskipTapeRec,
-        ZskipWires, ag_seed_bytes, bytes_payload_mask, cap_payloads, cap_wires,
+        KEY_SQUARE_CHAIN, LeafEvalGate, LeafEvalGate256, LeafOuter, Lvl, MergedChain, MixedProof,
+        MpRec, OpenLevel, PdRec, PiopRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire,
+        ZskipTapeRec, ZskipWires, ag_seed_bytes, bytes_payload_mask, cap_payloads, cap_wires,
         check_residual_publics, circuit_structure_claim_wires, cw, decode_ag_point,
         emit_boolean_reported_check, emit_element_reported_check, emit_fiat_shamir_chain,
         emit_pow_checks, emit_publics_hash, emit_query_phase, emit_recombination,
-        emit_residual_region, flatten_ops, leaf_boolean_lcs, level_geometry, level_sources,
-        observed_f256, outer_union, pack8, parse_open_levels, payload_words, pin_recombination,
-        query_phase_blake3_rows, recombination_positions, replay_ligerito_spine256,
-        squeeze_word_wire, strat_scheds, walker_common,
+        emit_residual_region, flatten_ops,
+        gates_spine::TD_PARTS,
+        leaf_boolean_lcs, level_geometry, level_sources, observed_f256, outer_union, pack8,
+        parse_open_levels, payload_words, pin_recombination, query_phase_blake3_rows,
+        recombination_positions, replay_ligerito_spine256, squeeze_word_wire, strat_scheds,
+        walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -1590,7 +1592,7 @@ pub(super) fn emit_family_h(
     sb: &mut ShapeBuilder,
     tile: SlotId,
     macs: SlotId,
-    fold_macs: SlotId,
+    tdot: SlotId,
     square_chain: SlotId,
     horner: SlotId,
     shv: &[Vec<Wire>; 2],
@@ -1638,14 +1640,14 @@ pub(super) fn emit_family_h(
     }
 
     // The transpose is tiled so the boolean relation needs only 17 wired
-    // words.  Dot-product linearity lets us accumulate each partial output
-    // directly, without materializing the 128 transposed words in the element
-    // layer.  Claim 0 uses the main MAC slot and claim 1 the fold MAC slot;
-    // this split keeps both below 2^14 rows at the two-child fixed point.
+    // words. Tile (source byte s, destination byte d) returns transposed
+    // words 8s..8s+8 restricted to destination byte d, so a transposed word
+    // is the sum of its 16 disjoint byte pieces. One TransposeDot row sums
+    // them and multiplies by the word's eq weight: 128 rows per claim,
+    // without materializing the transposed words.
     let mut rs_half = zw;
     for k in 0..2 {
-        let dot_slot = if k == 0 { macs } else { fold_macs };
-        let mut dot = zw;
+        let mut pieces: Vec<Vec<Wire>> = (0..128).map(|_| Vec::with_capacity(TD_PARTS)).collect();
         for destination_byte in 0..16 {
             let rows = &shv[k][8 * destination_byte..8 * destination_byte + 8];
             for source_byte in 0..16 {
@@ -1659,9 +1661,15 @@ pub(super) fn emit_family_h(
                 input.push(selector);
                 let partial = sb.gate(tile, &input);
                 for c in 0..8 {
-                    dot = sb.gate(dot_slot, &[dot, partial[c], eq_w[k][8 * source_byte + c]])[0];
+                    pieces[8 * source_byte + c].push(partial[c]);
                 }
             }
+        }
+        let mut dot = zw;
+        for (t, word) in pieces.iter().enumerate() {
+            let mut input = vec![dot, eq_w[k][t]];
+            input.extend_from_slice(word);
+            dot = sb.gate(tdot, &input)[0];
         }
         rs_half = sb.gate(macs, &[rs_half, gamma[k], dot])[0];
     }
@@ -1693,19 +1701,13 @@ pub(super) fn emit_family_h(
             }
         }
     }
-    let chain = |sb: &mut ShapeBuilder, x: Wire| -> Vec<Wire> {
-        let mut pows = vec![x];
-        while pows.len() < 128 {
-            let last = *pows.last().expect("a chain has its seed");
-            pows.extend(sb.gate(square_chain, &[last]));
-        }
-        pows.truncate(128);
-        pows
-    };
     let mut vrs = zw;
     for k in 0..2 {
-        let r_pows: Vec<Vec<Wire>> = r_dprime[k].iter().map(|&x| chain(sb, x)).collect();
-        let g_pows = chain(sb, gamma[k]);
+        let r_pows: Vec<Vec<Wire>> = r_dprime[k]
+            .iter()
+            .map(|&x| walker_common::frobenius_chain(sb, square_chain, x))
+            .collect();
+        let g_pows = walker_common::frobenius_chain(sb, square_chain, gamma[k]);
         let mut h = zw;
         for j in (0..128).rev() {
             let i = (128 - j) % 128;
@@ -1899,7 +1901,7 @@ pub(super) fn emit_real_child_region(
 
     let (jag_w, jag_row_w, mlv_pw, lc_pw) = emit_anchor_expect(
         sb, cs, rt, &outs, &mp_pws, &mp_rho2_w, &mp_sig_w, &pt_w, anc_w, pfslot, pf_w, zw, ow,
-        zassert, vals, consts, &mut cen,
+        vals, consts, &mut cen,
     );
     let AssertionPublics {
         mat_pub,
@@ -2435,7 +2437,6 @@ fn emit_anchor_expect(
     pf_w: usize,
     zw: Wire,
     ow: Wire,
-    zassert: Wire,
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
     cen: &mut Vec<(&'static str, usize, usize)>,
@@ -2496,35 +2497,29 @@ fn emit_anchor_expect(
         assert_eq!(nv, xn, "c point coord {i2} is the located wire");
     }
 
-    let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
     let rho_mrg_w: Vec<Wire> = w_rounds
         .iter()
         .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
         .collect();
-    let mut rinv_n2: Vec<F128> = rho_mrg_n.clone();
-    let mut rinv_w: Vec<Wire> = rho_mrg_w.clone();
+    // ĝ(ρ″) = Σ_j γ^j·eq(ρ^(2^-j), ρ″). ρ^(2^-j) = ρ^(2^(128-j)) is read
+    // off forward Frobenius chains (no square-root advice); one eq product
+    // and one MAC per j.
+    assert_eq!(rho_mrg_w.len(), m_mp2, "ρ has the merged sumcheck's arity");
+    assert_eq!(mp_rho2_w.len(), m_mp2, "ρ″ has the merged sumcheck's arity");
+    let rho_pows: Vec<Vec<Wire>> = rho_mrg_w
+        .iter()
+        .map(|&x| walker_common::frobenius_chain(sb, cs.resid_slot(KEY_SQUARE_CHAIN), x))
+        .collect();
     let mut ghat = zw;
     for j in 0..RS_SHAT_WORDS {
-        if j > 0 {
-            let mut lvl_w = Vec::with_capacity(m_mp2);
-            for t3 in 0..m_mp2 {
-                let y = frob_inv(rinv_n2[t3]);
-                rinv_n2[t3] = y;
-                vals.push(y);
-                let yw = sb.input();
-                let d = sb.gate(spine, &[zw, zw, zw, rinv_w[t3], zw, zw, yw, yw, zw])[3];
-                sb.connect(d, zassert);
-                lvl_w.push(yw);
-            }
-            rinv_w = lvl_w;
-        }
-        let factors: Vec<(Wire, Wire)> = rinv_w
+        let i = (128 - j) % 128;
+        let factors: Vec<(Wire, Wire)> = rho_pows
             .iter()
-            .copied()
+            .map(|p| p[i])
             .zip(mp_rho2_w.iter().copied())
             .collect();
         let eqj = walker_common::prefix_product(sb, pfslot, pf_w, zw, ow, &factors);
-        ghat = sb.gate(spine, &[zw, zw, zw, ghat, zw, zw, mp_pws[j], eqj, zw])[3];
+        ghat = sb.gate(macs, &[ghat, mp_pws[j], eqj])[0];
     }
     let e_at_w = {
         let factors: Vec<(Wire, Wire)> = rho_mrg_w

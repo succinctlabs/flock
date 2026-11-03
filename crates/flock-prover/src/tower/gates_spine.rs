@@ -1267,6 +1267,67 @@ impl GateType for HornerStepGate {
     }
 }
 
+/// Partial words summed per [`TransposeDotGate`] row: the 16 destination
+/// bytes of one transposed word.
+pub(super) const TD_PARTS: usize = 16;
+const TD_EQ: usize = 1;
+const TD_P: usize = 2;
+const TD_M: usize = TD_P + TD_PARTS;
+const TD_OUT: usize = TD_M + 1;
+
+/// One transposed word of family H's bit-transpose dot:
+///
+/// ```text
+///   out = acc + eq · (p_0 + … + p_15)
+/// ```
+///
+/// The 8×8 transpose tiles hand back transposed word `t` as 16 disjoint
+/// byte pieces (one per destination byte), so the word is their sum, and
+/// the sum is free inside one product of linear forms. Inputs: `acc, eq,
+/// p_0..p_15`; output `out`. 128 rows per claim, where multiplying every
+/// piece into the dot separately took 2,048 MACs.
+pub(super) struct TransposeDotGate {
+    pub(super) ty: Arc<ElementTableType>,
+}
+
+impl TransposeDotGate {
+    pub(super) fn new() -> Self {
+        let o = F128::ONE;
+        let mut b = ElementTableBuilder::new(gate_kappa(TD_OUT + 1));
+        for w in 0..TD_M {
+            b.free_wire(w);
+        }
+        let parts: Vec<(usize, F128)> = (TD_P..TD_M).map(|w| (w, o)).collect();
+        b.mult_lin(TD_M, &[(TD_EQ, o)], &parts);
+        b.linear(TD_OUT, &[(0, o), (TD_M, o)]);
+        Self {
+            ty: Arc::new(b.build().expect("transpose dot gate")),
+        }
+    }
+}
+
+impl GateType for TransposeDotGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        let mut schema: Vec<IoWord> = (0..TD_M).map(IoWord::input).collect();
+        schema.push(IoWord::output(TD_OUT));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let mut z = vec![F128::ZERO; TD_OUT + 1];
+        z[..TD_M].copy_from_slice(&inputs[..TD_M]);
+        let sum = z[TD_P..TD_M].iter().fold(F128::ZERO, |a, &p| a + p);
+        z[TD_M] = z[TD_EQ] * sum;
+        z[TD_OUT] = z[0] + z[TD_M];
+        outputs.push(z[TD_OUT]);
+        z
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
+    }
+}
+
 #[cfg(test)]
 mod horner_tests {
     use flock_core::pcs::ring_switch::moore_inverse;
@@ -1382,5 +1443,32 @@ mod horner_tests {
             h = out[0];
         }
         assert_eq!(h, brute);
+    }
+
+    #[test]
+    fn transpose_dot_rows_satisfy() {
+        let g = TransposeDotGate::new();
+        let mut rng = StdRng::seed_from_u64(13);
+        let mut rows = Vec::new();
+        for _ in 0..8 {
+            let inp: Vec<F128> = (0..TD_M).map(|_| rand_f(&mut rng)).collect();
+            let mut out = Vec::new();
+            rows.push(g.eval(&inp, &(), &mut out));
+            let sum = inp[TD_P..].iter().fold(F128::ZERO, |a, &p| a + p);
+            assert_eq!(out[0], inp[0] + inp[TD_EQ] * sum);
+        }
+        let mut out = Vec::new();
+        rows.push(g.eval(&[F128::ZERO; TD_M], &(), &mut out));
+        let n_log = 4;
+        let mut z = vec![F128::ZERO; g.ty.width() << n_log];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &x) in row.iter().enumerate() {
+                z[(col << n_log) + j] = x;
+            }
+        }
+        assert!(
+            g.ty.satisfies(&z, n_log, rows.len()),
+            "transpose dot rows satisfy"
+        );
     }
 }

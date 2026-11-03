@@ -23,9 +23,10 @@ use crate::{
     r1cs_hashes::fs_chain::FsChainTrace,
     tower::{
         BusRec, ChildSlots, F128, GkrLayerRec, GkrRec, InnerPd, KEY_HORNER_STEP, KEY_SQUARE_CHAIN,
-        Lvl, MergedChain, MixedProof, MpRec, OpenLevel, PdRec, RoundRec, ShapeBuilder, Wire,
-        ZskipTapeRec, ZskipWires, assert_chain_replays, duplex_row_count_model, emit_family_h,
-        emit_spine256, level_query_phase_blake3_rows, merge_chain, squeeze_word_wire,
+        KEY_TRANSPOSE_DOT, Lvl, MergedChain, MixedProof, MpRec, OpenLevel, PdRec, RoundRec,
+        ShapeBuilder, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays, duplex_row_count_model,
+        emit_family_h, emit_spine256, level_query_phase_blake3_rows, merge_chain,
+        squeeze_word_wire,
     },
 };
 
@@ -736,6 +737,22 @@ pub(super) const Z_PARTIAL_WORDS: usize = 64;
 /// [`emit_multipoint_intake`]'s doc); BOTH walkers pin the same span.
 pub(super) const RS_SHAT_WORDS: usize = 128;
 
+/// `x^(2^i)` for `i = 0..128` on [`SquareChainGate`] rows (31 squarings
+/// per row, chained, so 5 rows). The Frobenius has order 128 on
+/// F_{2^128}, so `x^(2^-j) = x^(2^(128-j))` is element `(128 - j) % 128`:
+/// inverse Frobenius powers need no square-root advice.
+///
+/// [`SquareChainGate`]: crate::tower::SquareChainGate
+pub(super) fn frobenius_chain(sb: &mut ShapeBuilder, slot: SlotId, x: Wire) -> Vec<Wire> {
+    let mut pows = vec![x];
+    while pows.len() < 128 {
+        let last = *pows.last().expect("a chain has its seed");
+        pows.extend(sb.gate(slot, &[last]));
+    }
+    pows.truncate(128);
+    pows
+}
+
 /// One block of a walker's published TAIL: its name and the wires it
 /// publishes, in order. A walker's tail is a `Vec<TailEntry>` — THE
 /// PUBLISH SCHEDULE AS DATA: [`publish_tail`] iterates it, `n_tail` is
@@ -824,7 +841,7 @@ pub(super) fn emit_family_h_boundary(
         sb,
         cs.q.family.expect("family-H slot"),
         cs.macs,
-        cs.fold_macs,
+        cs.resid_slot(KEY_TRANSPOSE_DOT),
         cs.resid_slot(KEY_SQUARE_CHAIN),
         cs.resid_slot(KEY_HORNER_STEP),
         &shv_w,

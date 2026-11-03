@@ -237,11 +237,39 @@ The differences are inside the Ligerito grinding draw (about ±7 ms). This is ex
 
 What it does buy: the node proof drops from 255.1 to 251.3 KiB. The pin that would matter is **28**: a 448 B leaf is exactly 7 blocks. That needs the FL under 28 lanes; the ĝ narrow-chain change is the likely way there.
 
+## ĝ chains, sum-first transpose dot, lane pin 28 (2026-11-03)
+
+Two ring-switch changes, then the pin they made room for.
+
+- **ĝ on forward chains.** The anchor's ĝ(ρ″) = Σ_j γ^j·eq(ρ^(2^-j), ρ″) took every ρ^(2^-j) as square-root advice, one 21-column spine-gate row per check: 127 × 22 = 2,794 rows per child. Since ρ^(2^-j) = ρ^(2^(128-j)), the same values now come off forward `SquareChainGate` chains (31 squarings per row, 5 rows per coordinate), with no advice. ĝ's 128 accumulations move from spine-gate rows to MAC rows. Horner cannot help here: the twist is on ρ only, inside a 22-factor product, so the 22 × 127 Frobenius steps are inherent; only their gate changed.
+- **Sum-first transpose dot.** Transpose tile (s, d) returns transposed words 8s..8s+8 restricted to byte d, so a transposed word is the sum of its 16 pieces. A new element type, `TransposeDotGate` (`out = acc + eq·Σp`, one `mult_lin` column, 20 columns, key 892), takes all 16 pieces per row: 128 rows per claim instead of 2,048 MACs.
+- **Lane pin 28.** The first-level node dropped from 28.44 to 27.21 lanes, so the pin went to 28. A 28-word Merkle leaf is 448 B, exactly 7 BLAKE3 blocks; 29 to 31 words take 8.
+
+Sizes per node:
+
+| | FL | base | spine |
+|---|---:|---:|---:|
+| dense words before | 3,727,616 | 3,258,368 | 3,209,984 |
+| dense words after | 3,566,592 | 3,096,576 | 3,041,536 |
+| fingerprint live entries before | 1,026,979 | 908,963 | 902,307 |
+| fingerprint live entries after | 919,971 | 814,755 | 803,235 |
+
+In the first-level node, the spine-gate table went from 6,846 rows to 240 and the main MAC table from 11,239 to 7,399 (of 2^14). Base and spine dropped from 25 to 24 NTT lanes. Each node circuit has 256 fewer BLAKE rows (opened child rows hash in 7 blocks). The node proof is 249.8 KiB (251.3 before). There are 32 table types and 394 gate cell slots; μ stays 23.
+
+Measured on a quiet M4 at 1 thread, two alternating runs per binary, median of 6 steady proves. The fingerprint PoW is replaced by its expected value (live × 22.4 ns); totals in ms:
+
+| | FL | base | spine |
+|---|---:|---:|---:|
+| before (0f45d5e) | 602 | 558 | 559 |
+| after | 586 | 530 | 531 |
+
+The Ligerito step inside the open is a per-transcript grinding draw that moved by up to ±8 ms between binaries (FL +8, base −4, spine −7). With it held equal, every node saves about 20–24 ms, of which the 28 pin is about 4–9 ms (Merkle 50.5 → 45.9 ms in every commit). The rest is the commit NTT (−4 ms on base and spine), wiring and expected PoW. The W build and merged sumcheck did not move. At 10 threads (n = 3, noisy) the spine went 154 → 147 ms with PoW excluded.
+
 ## Open questions
 
 1. **Tree shape.** The driver is the chain tower's spine: a base over the last two first-level nodes, then each level prepends the next-earlier one. The statement is `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))` over fixed 992-signature batches, and the verifier rebuilds it from the batches (`xmss_statement`). A balanced tree would need a second internal shape.
 2. **Leaf batch size.** It is 992. One more signature tips the statement hash's compressions into a third slot, and the layout planner to ν = 14.
-3. **Margin.** The first-level node runs at 28.44 of 29 lanes, and its MAC slot at 98%. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
+3. **Margin.** The first-level node runs at 27.21 of 28 lanes, and its main MAC slot at 7,399 of 2^14 rows. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
 4. **Node cost.** A node is 35–46% of a leaf's time for an eighth of its words (above). The candidates:
    - the ragged multipoint weight: aligned envelope columns, or a closed-form ragged weight;
    - the family tiles' bool-path witness;
