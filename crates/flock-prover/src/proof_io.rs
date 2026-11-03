@@ -11,7 +11,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 23)
+//!   byte  5       VERSION                  (currently 24)
 //!   bytes 6..7    flavor: 2 = R1cs, 4 = Mixed, 5 = TowerRoot, 6 = R1csAg
 //!                 (0/1 reserved: legacy BaseFold; 3 was the retired chain)
 //!   bytes 7..     bincode-serialized payload
@@ -72,8 +72,11 @@ const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 /// nine words (`g^{n_blocks}` composed child-to-parent), so every tower
 /// outer's transcript moved; a v22 tower-root bundle cannot verify under
 /// v23 shapes. R1cs/Mixed payloads are structurally unchanged.
+/// v24 (2026-11-03): the merged open's inner opening became an enum
+/// (`MergedInnerOpen::{Split, Affine}`, the `fast-affine` profile), which
+/// adds a variant tag to every merged-open payload.
 /// (The per-version history this file used to carry lives in git.)
-const VERSION: u8 = 23;
+const VERSION: u8 = 24;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see

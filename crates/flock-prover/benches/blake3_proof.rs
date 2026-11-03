@@ -89,12 +89,14 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         witness_bytes >> 20
     );
 
-    // BLAKE3_PROFILE=fast|slim|secure selects the Ligerito profile (default fast).
+    // BLAKE3_PROFILE=fast|fast-affine|slim|secure selects the Ligerito profile
+    // (default fast; fast-affine is registered at m = 32 only).
     let mut setup = match var("BLAKE3_PROFILE").as_deref() {
         Ok("slim") => Blake3Setup::with_profile(n_blocks, LigeritoProfile::Slim),
         Ok("secure") => Blake3Setup::with_profile(n_blocks, LigeritoProfile::Secure),
+        Ok("fast-affine") => Blake3Setup::with_profile(n_blocks, LigeritoProfile::FastAffine),
         Ok("fast") | Err(_) => Blake3Setup::new(n_blocks),
-        Ok(p) => panic!("BLAKE3_PROFILE must be fast, slim, or secure (got {p})"),
+        Ok(p) => panic!("BLAKE3_PROFILE must be fast, fast-affine, slim, or secure (got {p})"),
     };
     // FLOCK_MERKLE_HASH=sha256|blake3 selects the PCS Merkle hash (default
     // sha256). Setting it on `pcs_params` is enough: the Ligerito prover and

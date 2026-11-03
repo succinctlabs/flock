@@ -101,9 +101,10 @@ impl PcsParams {
     /// bounds. Ligerito derives its own schedule from the selected profile.
     pub fn zerocheck_grinding(&self) -> ZerocheckGrinding {
         match self.profile {
-            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
-                ZerocheckGrinding::per_challenge_128()
-            }
+            LigeritoProfile::Fast
+            | LigeritoProfile::FastAffine
+            | LigeritoProfile::Slim
+            | LigeritoProfile::Secure => ZerocheckGrinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => ZerocheckGrinding::disabled(),
         }
     }
@@ -116,9 +117,10 @@ impl PcsParams {
     /// profiles retain their legacy transcript shape.
     pub fn lincheck_grinding(&self) -> LincheckGrinding {
         match self.profile {
-            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
-                LincheckGrinding::per_challenge_128()
-            }
+            LigeritoProfile::Fast
+            | LigeritoProfile::FastAffine
+            | LigeritoProfile::Slim
+            | LigeritoProfile::Secure => LincheckGrinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => LincheckGrinding::disabled(),
         }
     }
@@ -126,9 +128,10 @@ impl PcsParams {
     /// Grinding policy for the large-field element/dense PIOP.
     pub fn element_grinding(&self) -> Grinding {
         match self.profile {
-            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
-                Grinding::per_challenge_128()
-            }
+            LigeritoProfile::Fast
+            | LigeritoProfile::FastAffine
+            | LigeritoProfile::Slim
+            | LigeritoProfile::Secure => Grinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => Grinding::disabled(),
         }
     }
@@ -141,9 +144,10 @@ impl PcsParams {
     /// jagged reductions rather than the proximity protocol.
     pub fn opening_grinding(&self) -> OpeningGrinding {
         match self.profile {
-            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
-                OpeningGrinding::per_challenge_128()
-            }
+            LigeritoProfile::Fast
+            | LigeritoProfile::FastAffine
+            | LigeritoProfile::Slim
+            | LigeritoProfile::Secure => OpeningGrinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => OpeningGrinding::disabled(),
         }
     }
@@ -151,9 +155,10 @@ impl PcsParams {
     /// Grinding policy for the circuit-wiring Product-GKR permutation check.
     pub fn product_gkr_grinding(&self) -> BatchedGrinding {
         match self.profile {
-            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
-                BatchedGrinding::per_challenge_128()
-            }
+            LigeritoProfile::Fast
+            | LigeritoProfile::FastAffine
+            | LigeritoProfile::Slim
+            | LigeritoProfile::Secure => BatchedGrinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => BatchedGrinding::disabled(),
         }
     }
@@ -161,9 +166,10 @@ impl PcsParams {
     /// Grinding policy for recursive dense/sigma/jagged accumulation folds.
     pub fn matrix_fold_grinding(&self) -> FoldGrinding {
         match self.profile {
-            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Secure => {
-                FoldGrinding::per_challenge_128()
-            }
+            LigeritoProfile::Fast
+            | LigeritoProfile::FastAffine
+            | LigeritoProfile::Slim
+            | LigeritoProfile::Secure => FoldGrinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => FoldGrinding::disabled(),
         }
     }

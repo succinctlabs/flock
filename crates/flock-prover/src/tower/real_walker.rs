@@ -284,7 +284,7 @@ impl<'p> RealTape<'p> {
 
         // parse_open_levels + level_geometry — the assembly's own walkers,
         // unchanged, on the real-inner tape.
-        let lig = &lo.proof.pcs_open().inner.ligerito;
+        let lig = &lo.proof.pcs_open().inner.split().ligerito;
         let r = lig.recursive_caps.len();
         let lvl_src = level_sources(lig);
         let (start_v_i, piop_i, gammas_i, w_rounds, mp_i, inner_pd_i, yr_v_i, levels) =

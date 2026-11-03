@@ -204,7 +204,7 @@ pub(super) fn parse_residual_rotation(
     levels: &[OpenLevel],
     w_rounds: &[RoundRec],
 ) -> (usize, Vec<RoundRec>) {
-    let yr_len = proof.pcs_open().inner.ligerito.final_proof.yr.len() / 2;
+    let yr_len = proof.pcs_open().inner.split().ligerito.final_proof.yr.len() / 2;
     let lane_major = geo[0].row_words < geo[0].lanes;
     let w_resid: Vec<RoundRec> = if lane_major {
         let k_rot = w_rounds.len() - levels[0].fold_fins.len();

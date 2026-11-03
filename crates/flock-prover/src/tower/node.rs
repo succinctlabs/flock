@@ -2831,7 +2831,7 @@ pub(super) fn real_tape_regions_pinned() {
 
     // Structural counts against the PROOF OBJECT, not the parse.
     let open = fl.lo.proof.pcs_open();
-    let lig = &open.inner.ligerito;
+    let lig = &open.inner.split().ligerito;
     assert_eq!(
         rt.levels.len(),
         lig.recursive_caps.len() + 1,

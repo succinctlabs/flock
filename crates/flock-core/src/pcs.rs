@@ -35,8 +35,10 @@ use jagged::{
 };
 use ligerito::{
     BasisWindowFn, FoldLookahead, LigeritoProof, ProverConfig, VerifierConfig, VirtualEqBasis,
-    extension::recursive_verifier_with_basis_succinct, lookahead_accum_group, lookahead_finish,
-    recursive_prover_with_basis_precomputed_round0_lanes, xor_acc8,
+    affine::{AffineL0, AffineProof, prove_affine_l0, verify_affine_l0},
+    extension::recursive_verifier_with_basis_succinct,
+    lookahead_accum_group, lookahead_finish, recursive_prover_with_basis_precomputed_round0_lanes,
+    xor_acc8,
 };
 pub use pack::{LOG_PACKING, pack_witness};
 use rayon::{
@@ -339,6 +341,10 @@ pub fn open_batch_mixed_ligerito_seeded<Ch: Challenger>(
     let trace = var("PCS_TRACE").is_ok();
     let t_total = Instant::now();
 
+    assert!(
+        !commitment.params.profile.affine_fold(),
+        "the affine fold opens only through open_batch_merged"
+    );
     assert_eq!(
         lig_config.initial_k, commitment.params.log_batch_size,
         "ligerito initial_k ({}) must match PcsParams.log_batch_size ({}) for L0 reuse",
@@ -1247,6 +1253,11 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     let n_pd = packed_direct.len();
     assert_eq!(skip_weights.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
+    // A FastAffine commitment is opened only by the merged open's affine
+    // inner proof; its split-ladder configs do not exist.
+    if commitment.params.profile.affine_fold() {
+        return Err(PcsError::Ligerito);
+    }
     if proof.ring_switches.len() != n_rs {
         return Err(PcsError::RingSwitch(RingSwitchError::MalformedProof));
     }
@@ -1449,7 +1460,7 @@ fn rotate_lane_point(point: &[F128], k: usize) -> Vec<F128> {
 /// sumcheck's `(G(1), G(∞))` messages (`m_dense − 7` rounds, LSB first);
 /// `q_eval = q̂(ρ)`; the Frobenius assist carries and proves the twisted
 /// evaluation `V = Ŵ(ρ)`; `inner` is the eq-basis Ligerito opening of
-/// `q̂(ρ)`.
+/// `q̂(ρ)` ([`MergedInnerOpen`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergedOpenProof {
     pub ring_switches: Vec<RingSwitchProof>,
@@ -1463,7 +1474,43 @@ pub struct MergedOpenProof {
     pub merged_round_nonces: Vec<u64>,
     pub q_eval: F128,
     pub frobenius: MultipointTwistedProof,
-    pub inner: BatchOpeningProofLigerito,
+    pub inner: MergedInnerOpen,
+}
+
+/// The merged open's inner opening of `q̂(ρ)`, chosen by the commitment's
+/// profile ([`ligerito::LigeritoProfile::affine_fold`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergedInnerOpen {
+    /// The F256 split ladder on the mixed path: every shipped profile.
+    Split(BatchOpeningProofLigerito),
+    /// The affine F128 ladder (`FastAffine`, lane-major commitments only):
+    /// one eq claim at `ρ` with weight one, its L0 OOD points sharing `ρ`'s
+    /// column coordinates (sound because every coordinate of `ρ` is a
+    /// merged-sumcheck challenge drawn after the commitment).
+    Affine(AffineProof),
+}
+
+impl MergedInnerOpen {
+    /// The split-ladder proof. Panics on an affine proof: the recursion
+    /// tower, its walkers and the GPU twin read split proofs only.
+    pub fn split(&self) -> &BatchOpeningProofLigerito {
+        match self {
+            Self::Split(p) => p,
+            Self::Affine(_) => {
+                panic!("affine inner open: no split-ladder proof (FastAffine is native-only)")
+            }
+        }
+    }
+
+    /// [`Self::split`], mutably.
+    pub fn split_mut(&mut self) -> &mut BatchOpeningProofLigerito {
+        match self {
+            Self::Split(p) => p,
+            Self::Affine(_) => {
+                panic!("affine inner open: no split-ladder proof (FastAffine is native-only)")
+            }
+        }
+    }
 }
 
 /// γ-combine the packed-direct claims into merged-column scalar groups,
@@ -2297,19 +2344,41 @@ pub fn open_batch_merged<Ch: Challenger>(
             )
         },
         || {
-            open_batch_mixed_ligerito_seeded(
-                q,
-                prover_data,
-                commitment,
-                &[],
-                &[],
-                &[pd],
-                &PaddingSpec::dense(commitment.params.m),
-                lig_config,
-                grinding,
-                seeded_stats,
-                challenger,
-            )
+            if commitment.params.profile.affine_fold() {
+                let num_lanes = commitment.params.num_ntts();
+                assert!(
+                    num_lanes < 1usize << lig_config.initial_k,
+                    "the affine inner open needs an integer-lane (lane-major) commitment"
+                );
+                MergedInnerOpen::Affine(prove_affine_l0(
+                    lig_config,
+                    AffineL0::Lanes {
+                        witness: q,
+                        point: rho.clone(),
+                        gamma: F128::ONE,
+                        seeded_stats,
+                        num_lanes,
+                    },
+                    q_eval,
+                    &prover_data.codeword,
+                    &prover_data.merkle_tree,
+                    challenger,
+                ))
+            } else {
+                MergedInnerOpen::Split(open_batch_mixed_ligerito_seeded(
+                    q,
+                    prover_data,
+                    commitment,
+                    &[],
+                    &[],
+                    &[pd],
+                    &PaddingSpec::dense(commitment.params.m),
+                    lig_config,
+                    grinding,
+                    seeded_stats,
+                    challenger,
+                ))
+            }
         },
     );
     challenger.merge_child(ch_a);
@@ -2821,22 +2890,39 @@ fn verify_batch_merged_core<Ch: Challenger>(
         );
     }
     let t = Instant::now();
-    let pd = PackedDirectClaimRef {
-        point: &rho,
-        value: proof.q_eval,
-    };
-    verify_opening_batch_ligerito_mixed_with_grinding(
-        commitment,
-        &[],
-        &[],
-        &[],
-        &[pd],
-        &proof.inner,
-        lig_config,
-        grinding,
-        challenger,
-    )
-    .map_err(|_| PcsOpenError::Ligerito)?;
+    match (&proof.inner, commitment.params.profile.affine_fold()) {
+        (MergedInnerOpen::Split(inner), false) => {
+            let pd = PackedDirectClaimRef {
+                point: &rho,
+                value: proof.q_eval,
+            };
+            verify_opening_batch_ligerito_mixed_with_grinding(
+                commitment,
+                &[],
+                &[],
+                &[],
+                &[pd],
+                inner,
+                lig_config,
+                grinding,
+                challenger,
+            )
+            .map_err(|_| PcsOpenError::Ligerito)?;
+        }
+        (MergedInnerOpen::Affine(inner), true) => {
+            if !verify_inner_affine(
+                commitment,
+                &rho,
+                proof.q_eval,
+                inner,
+                lig_config,
+                challenger,
+            ) {
+                return Err(PcsOpenError::Ligerito);
+            }
+        }
+        _ => return Err(PcsOpenError::Ligerito),
+    }
     challenger.merge_child(ch_a);
     // The assist's claim against the merged sumcheck's folded target. A pure
     // arithmetic check — it consumes no challenges, so the fork moved it here
@@ -2851,6 +2937,47 @@ fn verify_batch_merged_core<Ch: Challenger>(
         );
     }
     Ok(())
+}
+
+/// The affine inner open's verifier: `q̂(ρ) = q_eval` against the
+/// lane-major L0 commitment, basis `eq(ρ, ·)`. The lane-major rounds bind
+/// the lane coordinates first, so `eq` residuals are taken over `ρ`
+/// rotated left by the column count.
+fn verify_inner_affine<Ch: Challenger>(
+    commitment: &Commitment,
+    rho: &[F128],
+    q_eval: F128,
+    proof: &AffineProof,
+    lig_config: &VerifierConfig,
+    challenger: &mut Ch,
+) -> bool {
+    let log_n = commitment.params.m - LOG_PACKING;
+    let k = lig_config.initial_k;
+    let lanes = commitment.params.num_ntts();
+    if rho.len() != log_n || k >= log_n || lanes >= 1usize << k {
+        return false;
+    }
+    let cols = log_n - k;
+    let mut rotated = rho.to_vec();
+    rotated.rotate_left(cols);
+    verify_affine_l0(
+        lig_config,
+        proof,
+        log_n,
+        q_eval,
+        &commitment.cap,
+        (lanes, Some(&rho[..cols])),
+        |rs, residual_log| {
+            let prefix = rotated
+                .iter()
+                .zip(rs)
+                .fold(F128::ONE, |acc, (&z, &r)| acc * (F128::ONE + z + r));
+            let out = build_eq_scaled_parallel(&rotated[rs.len()..], prefix);
+            debug_assert_eq!(out.len(), 1usize << residual_log);
+            out
+        },
+        challenger,
+    )
 }
 
 #[cfg(test)]

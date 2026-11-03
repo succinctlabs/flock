@@ -142,7 +142,7 @@ pub(super) fn proof_census_parts(
     // (not recomputed from the schedule), so `redundant` certifies the
     // truncation stays landed: anything past q·(d − c1) is waste.
     if let Ok(cfg) = pcs.ligerito_prover_config() {
-        let lig = &pcs_open.inner.ligerito;
+        let lig = &pcs_open.inner.split().ligerito;
         let r = lig.recursive_caps.len();
         assert_eq!(cfg.stratified.len(), r + 1, "one schedule per open level");
         let level_paths = |lvl: usize| -> usize {
@@ -179,7 +179,7 @@ pub(super) fn proof_census_parts(
         );
     }
     let sz = |b: Result<Vec<u8>, _>| b.map(|v| v.len()).unwrap_or(0) as f64 / 1024.0;
-    let lig = &pcs_open.inner.ligerito;
+    let lig = &pcs_open.inner.split().ligerito;
     let rows = |v: &Vec<RecursiveProof>| -> (f64, f64) {
         (
             v.iter().map(|r| sz(serialize(&r.opened_rows))).sum(),

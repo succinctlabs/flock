@@ -474,7 +474,7 @@ fn element_claims_are_bound_by_the_opening() {
 
     // The inner eq-basis opening of q̂(ρ).
     let mut bad = proof.clone();
-    bad.pcs_open.inner.ligerito.initial_cap = vec![[0u8; 32]];
+    bad.pcs_open.inner.split_mut().ligerito.initial_cap = vec![[0u8; 32]];
     assert!(verify(&bad).is_err(), "tampered inner open root");
 }
 
@@ -1185,6 +1185,9 @@ fn boolean_only_mixed_class_matches_the_plain_entry() {
 // change with `ELEMENT_FIXTURES_PRINT=1 ... --nocapture`.
 // ---------------------------------------------------------------------------
 
+// Re-pinned 2026-11-03: proof-IO v24 — the merged open's inner opening is
+// an enum (`MergedInnerOpen`), adding a variant tag to the payload;
+// transcripts unchanged. Two deterministic print runs agreed.
 // Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
 // per-statement assist became 128K dual values + one product sumcheck +
 // one untwisted anchor; transcript + wire moved by design.
@@ -1300,39 +1303,39 @@ fn mixed_class_merged_proof_bytes_pinned() {
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "29c86f0b9211babda7a64cb57456b3b7c76341ce470c773d0ed08ed211a37205",
+            "5dfbd9c815612b1d83ca4aa40461af52b2afc19629f631729194f4f9f0f5a895",
         ),
         (
             "elem-merged-nu12-2731",
             2731,
-            "ad0497a7863b73cda94d3ca7463d0b91359262fc962ce8c9f12f19e69ed753d9",
+            "bf86fee5cb0cc60316724fa65ff0e93cc0f7a378057e0505e3bea425e1cda159",
         ),
         (
             "elem-merged-nu12-0",
             0,
-            "92e265b26dd16b274c0f4d985449efaad0020a9deb1d283cdf1cda2d2c29f813",
+            "7e3083c59e1da418be85cee410b1be795e06994189b84db3636cd7350342b79e",
         ),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "a7df4157d729a14cebd2953784a87bb299244bb7204988eb6710d2a21e9447f6",
+            "6c48d468d8b5cd29bdbbf5650092bcc9e47679c696971d380b80326bbf4b4e44",
         ),
         (
             "mix-merged-nu7-100-90",
             [100, 90],
-            "ecbfcfd4d98318e537b0b5090b3b9306ea142a2d88a5bb48f89498fdf3bbfff6",
+            "94da94fbc0dc14d4729dfb474c05808585daead319a87b9507805249ac6ff464",
         ),
         (
             "mix-merged-nu7-0-90",
             [0, 90],
-            "4fbd01dfdb65e0be475acef7dc8a728ba68af08f22a48c1ecc8599f12704dd57",
+            "1595a4865e41fb2c8be006e31fe81dfdc23727dbac02244ca3b6fd0acd53e740",
         ),
         (
             "mix-merged-nu7-100-0",
             [100, 0],
-            "bd1ed5ee049132b7950b8dedb667475d19d5f6fc977eab8b65b7774875c7719d",
+            "8ea355df858af1224aa71a6bdae94ca764eee28b0788d4794f1e46a8aba52709",
         ),
     ];
 

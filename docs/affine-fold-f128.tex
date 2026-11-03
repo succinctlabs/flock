@@ -537,6 +537,33 @@ message become $\F_{2^{128}}$, and the recursive Merkle leaves halve.
 The 100-bit profiles benefit as well, since they pay for
 $\F_{2^{256}}$ today with no security gain.
 
+\paragraph{Wiring.} The profile \texttt{fast-affine}
+(\texttt{LigeritoProfile::FastAffine}) selects the affine inner opening
+in \texttt{pcs::open\_batch\_merged}. Its commitment, transport and
+grinding are those of \texttt{fast}; only the inner opening of
+$\hat q(\rho)$ changes. The prover runs \texttt{AffineL0::Lanes} at
+$\rho$ with weight one and the merged sumcheck's seeded statistics. The
+verifier dispatches on the commitment's profile and rejects a proof
+whose inner opening does not match it. Every coordinate of $\rho$ is a
+merged-sumcheck challenge drawn after the commitment, so the shared OOD
+columns are sound on this path. \texttt{MergedOpenProof.inner} is now
+an enum (\texttt{MergedInnerOpen::\{Split, Affine\}}); its variant tag
+moved the proof-IO version to $24$ and re-pinned the byte fixtures,
+with transcripts unchanged. The ladders are registered per shape in
+\texttt{affine\_ladder\_for}: $m = 32$ (rates $[1,3,5,7]$, fold bits
+$[4,5,5,5]$) and $m = 24$ (rates $[1,5]$, fold bits $[4,5]$; at rate
+$1/8$ its $2^7$-column level has no certificate), which
+\texttt{tests/fast\_affine.rs} proves and verifies end to end. The
+tower, its walkers and the GPU twin read split proofs only.
+
+At $m = 32$ (BLAKE3, $2^{18}$ compressions) the merged open takes
+$37.7$--$39.1$ ms against $73.5$--$75.3$ ms for \texttt{fast}, in
+traced runs. The proof shrinks from $451.2$ to $408.6$ KiB ($-9.4\%$),
+and verification stays at about $4$ ms. Whole-prove times varied by
+$\pm 40$ ms between runs on the battery-powered test machine. Best of
+five, over three alternating pairs: $240.9$ / $249.7$ / $251.2$ ms for
+\texttt{fast} against $234.3$ / $231.5$ / $234.1$ ms.
+
 \section{Implementation plan}\label{sec:plan}
 
 \begin{enumerate}[leftmargin=2em]
@@ -555,9 +582,9 @@ $\F_{2^{256}}$ today with no security gain.
   where most of the engineering time goes. \emph{Status:} the
   lane-major L0 with the factored basis is done (statistics-only
   rounds, \S\ref{sec:cost}), with a chunked L0 materialize and a
-  three-level ladder (rates $[1,3,5,7]$). Open: the merged-transport wiring
-  (\texttt{pcs::open\_batch\_merged}), the recursive-level kernels, and
-  a profile TOML for the affine ladder.
+  three-level ladder (rates $[1,3,5,7]$). The merged-transport wiring is done (profile \texttt{fast-affine}).
+  Open: the recursive-level kernels, ladders for more shapes, and
+  proof-IO for the tower.
 \item \textbf{Recursion and GPU.} Port the in-circuit verifier
   (\texttt{tower/query.rs}, \texttt{gates\_spine.rs}, the walkers):
   remove the $\F_{2^{256}}$ gadgets and add the grid check, per-query

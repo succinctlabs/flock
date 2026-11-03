@@ -23,6 +23,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::{Deserialize, Serialize};
+
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
     ParallelSlice, ParallelSliceMut,
@@ -44,7 +46,7 @@ use crate::{
 const LABEL: &[u8] = b"flock-ligerito-affine-f128-v0";
 
 /// Proof of the affine ladder. Every vector is in transcript order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AffineProof {
     /// L0 cap (`2^c₀` nodes at the schedule's cap depth).
     pub initial_cap: Vec<Hash>,
@@ -180,6 +182,35 @@ pub fn affine_ladder(
         })
         .collect();
     build_ladder(split, log_n, &ks, rates, &queries, fold_grinding_bits)
+}
+
+/// The registered affine ladders for [`super::LigeritoProfile::FastAffine`]:
+/// `(log_n, initial_k) -> (rates, fold grinding bits)`, each certified
+/// round by round by `scripts/affine_fold_params.py`, on top of the `Fast`
+/// config of the same shape.
+/// The m = 24 entry is the small shape the end-to-end tests run; at rate
+/// 1/8 its level of 2^7 columns has no certificate, at 1/32 it does.
+const AFFINE_LADDERS: &[((usize, usize), &[usize], &[usize])] = &[
+    ((17, 6), &[1, 5], &[4, 5]),
+    ((25, 6), &[1, 3, 5, 7], &[4, 5, 5, 5]),
+];
+
+/// The `FastAffine` configs for a shape, or an error if none is registered.
+pub fn affine_ladder_for(
+    log_n: usize,
+    initial_k: usize,
+) -> Result<(ProverConfig, VerifierConfig), String> {
+    let (_, rates, fold) = AFFINE_LADDERS
+        .iter()
+        .find(|(shape, _, _)| *shape == (log_n, initial_k))
+        .ok_or_else(|| {
+            format!(
+                "no affine ladder registered for (log_n={log_n}, initial_k={initial_k}); \
+                 add one to AFFINE_LADDERS after running scripts/affine_fold_params.py"
+            )
+        })?;
+    let split = super::prover_config_for(log_n, initial_k, super::LigeritoProfile::Fast)?;
+    Ok(affine_ladder(&split, log_n, rates, fold))
 }
 
 /// The native recursive ks of `split`, at most `max_levels` of them.

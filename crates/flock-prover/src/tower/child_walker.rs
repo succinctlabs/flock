@@ -1480,7 +1480,7 @@ impl<'p> ChildTape<'p> {
             ops,
             chals,
         );
-        let lig = &proof.pcs_open().inner.ligerito;
+        let lig = &proof.pcs_open().inner.split().ligerito;
         assert_eq!(
             inner.commitment.cap, lig.initial_cap,
             "commitment IS the L0 cap"
