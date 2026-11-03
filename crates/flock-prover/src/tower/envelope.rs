@@ -401,6 +401,12 @@ pub(super) fn declare_envelope_slots(
     q
 }
 
+/// Every envelope slot's count rounds up to a multiple of `2^8` rows
+/// ([`pad_envelope_counts`]): the alignment the opening's multipoint assist
+/// needs for its closed form, at a few percent of area (the first-level
+/// node over two 992-signature leaves: 30.47 → 30.96 lanes, inside the pin).
+pub(super) const ENV_ROW_ALIGN_LOG: usize = 8;
+
 /// Pad every envelope slot's declared count up to counts* (the counts pin:
 /// one declared-count vector for every envelope outer, so the union content
 /// a parent walks is level-independent). Call once per builder, AFTER all
@@ -470,7 +476,19 @@ pub(super) fn pad_envelope_counts(
     // a singleton run and the run count is registry-derived EXCEPT through
     // the predicate `n_t > 0`. Keep every type non-empty and the counts
     // become pure values.
-    let floor1 = |sb: &ShapeBuilder, s| sb.rows_in_slot(s).max(1);
+    // COUNT ALIGNMENT: every slot rounds up to a multiple of
+    // `2^ENV_ROW_ALIGN_LOG` rows (real padding gates, as above), so every
+    // committed column height is too and the dense stack is aligned at that
+    // granularity — the multipoint assist's closed form over sub-columns
+    // instead of a 2^m weight. No dummy row is committed: the padding rows
+    // are live, declared gates.
+    let align = 1usize << ENV_ROW_ALIGN_LOG;
+    let floor1 = |sb: &ShapeBuilder, s| {
+        sb.rows_in_slot(s)
+            .max(1)
+            .next_multiple_of(align)
+            .min(1usize << env.nu)
+    };
     let t_b3 = floor1(sb, q.b3);
     let b3_alt = q.b3_alt.expect("the envelope declares two BLAKE slots");
     let t_b3_alt = floor1(sb, b3_alt);

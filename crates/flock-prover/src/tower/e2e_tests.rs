@@ -1333,10 +1333,14 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 // Blessed 2026-09-07 (second cut: the grounded counter-base word)
 // (chain circuit + registries UNCHANGED by design; the three outer
 // circuits moved with the nine-word app block).
+// Re-blessed 2026-11-02: the three outer circuits move with the 2^8 slot
+// count alignment (`ENV_ROW_ALIGN_LOG`); chain circuit, registries and
+// publics UNCHANGED. The FL pin was already stale before (76f8… at
+// b30e6d9).
 const PIN_CHAIN_CIRCUIT: &str = "b8f442da32b9961612ccaf9acb39cadcd4592e913b2b208a1b9740d01c10e9c9";
-const PIN_FL_CIRCUIT: &str = "45c54e4003df6692d180ac70187b3ce5c34be259a7174f328d9ab95b6acb2f2a";
-const PIN_BASE_CIRCUIT: &str = "0c8d7382f9824b4fe4894786494e5887e8cad3af262eaf6655cb2116a7830153";
-const PIN_STEADY_CIRCUIT: &str = "fafab0ced83b6f778e799c926041fad49625cce69075093fe3305b7ffb5e22c7";
+const PIN_FL_CIRCUIT: &str = "973ae39a699468d97793eb88a424bece34214eca52050d5de9c210fd56bedc08";
+const PIN_BASE_CIRCUIT: &str = "4e88a4944aa261e5cfb93c1c3596e5d6557b8e7a9953bed014ab62be23d3a8a9";
+const PIN_STEADY_CIRCUIT: &str = "3ed2322c5593ea1542b4f783418f2e4d8e1099e7ca02357c48c88e00d8484ff5";
 const PIN_CHAIN_REGISTRY: &str = "3126c5ce825e8fc3942843c0548ba43964b1daa5751a834fcbbc1c3ab58e40fe";
 const PIN_OUTER_REGISTRY: &str = "acfbc7354af8436af480ea66609bb9b1cd0856b27426db2b4d8a69fe9014c10e";
 const PIN_PUBLICS_LEN: usize = 5684;
