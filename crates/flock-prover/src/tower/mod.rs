@@ -126,6 +126,7 @@ use crate::{
     },
     union::UnionInstance,
 };
+mod affine_fold;
 mod chain;
 mod child_walker;
 mod config;

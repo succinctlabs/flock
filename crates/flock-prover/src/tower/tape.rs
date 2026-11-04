@@ -724,11 +724,26 @@ pub(super) fn parse_affine_open(
     ks: &[usize],
     yr_len: usize,
 ) -> AffineOpenTape {
-    let (mut cur, prefix) = walk_open_prefix(ops, cap0_bytes, LBL_AFFINE_OPEN);
+    let (cur, prefix) = walk_open_prefix(ops, cap0_bytes, LBL_AFFINE_OPEN);
     assert!(
         prefix.inner_pd.is_none(),
         "the affine opening has no packed-direct intake"
     );
+    let (initial_ood, levels) = walk_affine_levels(cur, ks, yr_len);
+    AffineOpenTape {
+        prefix,
+        initial_ood,
+        levels,
+    }
+}
+
+/// The affine opening proper, from the cursor parked on its L0 cap absorb:
+/// the L0 OOD claims, then one [`AffineLevel`] per entry of `ks`.
+fn walk_affine_levels(
+    mut cur: Cur<'_>,
+    ks: &[usize],
+    yr_len: usize,
+) -> (Vec<AffineOodRec>, Vec<AffineLevel>) {
     cur.bump(); // the L0 cap absorb
     fn expect_slice(cur: &mut Cur<'_>, n: usize, what: &str) -> usize {
         assert!(
@@ -840,11 +855,36 @@ pub(super) fn parse_affine_open(
             beta: Some((b_fin, b_ch)),
         });
     }
-    AffineOpenTape {
-        prefix,
-        initial_ood,
-        levels,
+    (initial_ood, levels)
+}
+
+/// [`parse_affine_open`] for a tape that holds ONLY an affine opening (a
+/// direct `verify_affine_l0` call, no merged-open prefix): the target's
+/// value index, the L0 OOD claims, and the levels.
+#[cfg(test)]
+pub(super) fn parse_affine_direct(
+    ops: &[TranscriptOp],
+    ks: &[usize],
+    yr_len: usize,
+) -> (usize, Vec<AffineOodRec>, Vec<AffineLevel>) {
+    let label = ops
+        .iter()
+        .position(|o| matches!(o, Op::Label(l) if l.as_slice() == LBL_AFFINE_OPEN))
+        .expect("the affine opening's label");
+    let mut cur = Cur {
+        ops,
+        i: 0,
+        fin: 0,
+        ch: 0,
+        v: 0,
+    };
+    while cur.i <= label {
+        cur.bump();
     }
+    let target_v = cur.v;
+    cur.expect_obs_scalar();
+    let (initial_ood, levels) = walk_affine_levels(cur, ks, yr_len);
+    (target_v, initial_ood, levels)
 }
 
 #[cfg(test)]

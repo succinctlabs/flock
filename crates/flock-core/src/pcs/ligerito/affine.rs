@@ -781,7 +781,7 @@ impl EqFactors {
 }
 
 /// `v' = Σ_{u,b} a_u e_b G[u][b]`, `a = (1, α, β)`, `e = (1 + r, r)`.
-fn fold_claim(g: &[F128; 6], alpha: F128, beta: F128, r: F128) -> F128 {
+pub fn fold_claim(g: &[F128; 6], alpha: F128, beta: F128, r: F128) -> F128 {
     let e0 = F128::ONE + r;
     let pair = |x: F128, y: F128| e0 * x + r * y;
     pair(g[0], g[1]) + alpha * pair(g[2], g[3]) + beta * pair(g[4], g[5])
@@ -1635,10 +1635,49 @@ pub fn verify_affine_l0<Ch, F>(
     log_n: usize,
     target: F128,
     expected_initial_cap: &[Hash],
-    (l0_num_lanes, lane_cols): (usize, Option<&[F128]>),
+    lanes: (usize, Option<&[F128]>),
     eval_b_residual: F,
     challenger: &mut Ch,
 ) -> bool
+where
+    Ch: Challenger,
+    F: Fn(&[F128], usize) -> Vec<F128>,
+{
+    verify_affine_l0_traced(
+        config,
+        proof,
+        log_n,
+        target,
+        expected_initial_cap,
+        lanes,
+        eval_b_residual,
+        challenger,
+    )
+    .is_some()
+}
+
+/// What an accepting [`verify_affine_l0_traced`] saw: the running claim at
+/// the end (it equals the final residual), and each non-final level's
+/// batched consistency value, in level order. The recursion tower's native
+/// claim replay is checked against these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AffineVerifyTrace {
+    pub final_claim: F128,
+    pub enforced: Vec<F128>,
+}
+
+/// [`verify_affine_l0`], returning the [`AffineVerifyTrace`] on accept.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_affine_l0_traced<Ch, F>(
+    config: &VerifierConfig,
+    proof: &AffineProof,
+    log_n: usize,
+    target: F128,
+    expected_initial_cap: &[Hash],
+    (l0_num_lanes, lane_cols): (usize, Option<&[F128]>),
+    eval_b_residual: F,
+    challenger: &mut Ch,
+) -> Option<AffineVerifyTrace>
 where
     Ch: Challenger,
     F: Fn(&[F128], usize) -> Vec<F128>,
@@ -1649,11 +1688,11 @@ where
         || proof.initial_cap != expected_initial_cap
         || config.validate_stratified().is_err()
     {
-        return false;
+        return None;
     }
     let shapes = level_shapes(log_n, config.initial_k, &config.recursive_ks);
     if config.recursive_log_msg_cols != shapes[1..].iter().map(|s| s.1).collect::<Vec<_>>() {
-        return false;
+        return None;
     }
     let strat = |level: usize| &config.stratified[level];
     let claim_bits = |level: usize| config.claim_batch_grinding_bits[level] as u32;
@@ -1664,25 +1703,24 @@ where
     challenger.observe_bytes(proof.initial_cap.as_flattened());
 
     let mut claim = target;
+    let mut enforced_log: Vec<F128> = Vec::with_capacity(r);
     let mut contexts: Vec<(usize, Context)> = Vec::new();
     let mut all_rs: Vec<F128> = Vec::with_capacity(log_n);
     let (mut ood_i, mut claim_i, mut grid_i) = (0usize, 0usize, 0usize);
 
     macro_rules! next {
         ($v:expr, $i:ident) => {{
-            let Some(x) = $v.get($i) else {
-                return false;
-            };
+            let x = $v.get($i)?;
             $i += 1;
             x
         }};
     }
 
     if l0_num_lanes == 0 || l0_num_lanes > 1usize << config.initial_k {
-        return false;
+        return None;
     }
     if lane_cols.is_some_and(|cols| cols.len() != log_n - config.initial_k) {
-        return false;
+        return None;
     }
     for _ in 0..config.ood_samples[0] {
         let point = match lane_cols {
@@ -1697,9 +1735,7 @@ where
         let y = *next!(proof.ood_values, ood_i);
         challenger.observe_f128(y);
         let nonce = *next!(proof.claim_batch_grinding_nonces, claim_i);
-        let Some(beta) = challenger.verify_pow_and_sample_f128(nonce, claim_bits(0)) else {
-            return false;
-        };
+        let beta = challenger.verify_pow_and_sample_f128(nonce, claim_bits(0))?;
         claim += beta * y;
         contexts.push((log_n, Context::Ood { point, beta }));
     }
@@ -1712,43 +1748,33 @@ where
             let sent = *next!(proof.grids, grid_i);
             challenger.observe_f128_slice(&sent);
             let g = [sent[0], sent[1], sent[2], claim + sent[0], sent[3], sent[4]];
-            let Some(&nonce) = proof.fold_grinding_nonces.get(grid_i - 1) else {
-                return false;
-            };
-            let Some(ch) = challenger.verify_pow_and_sample_f128_vec(
+            let &nonce = proof.fold_grinding_nonces.get(grid_i - 1)?;
+            let ch = challenger.verify_pow_and_sample_f128_vec(
                 nonce,
                 config.fold_grinding_bits[li] as u32,
                 3,
-            ) else {
-                return false;
-            };
+            )?;
             claim = fold_claim(&g, ch[0], ch[1], ch[2]);
             gammas.push((ch[0], ch[1]));
             all_rs.push(ch[2]);
         }
         let block_len = 1usize << (c + config.log_inv_rates[li]);
-        let Some(opening) = proof.openings.get(li) else {
-            return false;
-        };
-        let Some(&query_nonce) = proof.grinding_nonces.get(li) else {
-            return false;
-        };
+        let opening = proof.openings.get(li)?;
+        let &query_nonce = proof.grinding_nonces.get(li)?;
 
         if li == r {
             if proof.yr.len() != (1usize << c) + k {
-                return false;
+                return None;
             }
             challenger.observe_f128_slice(&proof.yr);
-            let Some(queries) = verify_and_sample_queries(
+            let queries = verify_and_sample_queries(
                 challenger,
                 query_nonce,
                 config.grinding_bits[li] as u32,
                 block_len,
                 config.queries[li],
                 strat(li),
-            ) else {
-                return false;
-            };
+            )?;
             if !verify_level_opens(
                 prev_cap,
                 block_len,
@@ -1759,7 +1785,7 @@ where
                 config.merkle_hash,
                 strat(li),
             ) {
-                return false;
+                return None;
             }
             // Direct consistency: Enc(yr)(x) against the folded leaf.
             for (row, &q) in opening.opened_rows.iter().zip(&queries) {
@@ -1770,17 +1796,17 @@ where
                     .zip(novel_basis_evals(x, proof.yr.len()))
                     .fold(F128::ZERO, |acc, (&y, b)| acc + y * b);
                 if enc != consistency_value(row, q, &gammas, &[], c) {
-                    return false;
+                    return None;
                 }
             }
             // Final claim: <yr_lo, W_final> = v.
             let residual_log = c;
             if all_rs.len() + residual_log != log_n {
-                return false;
+                return None;
             }
             let mut w = eval_b_residual(&all_rs, residual_log);
             if w.len() != 1usize << residual_log {
-                return false;
+                return None;
             }
             for (dim, ctx) in &contexts {
                 let fixed = &all_rs[log_n - dim..];
@@ -1803,7 +1829,7 @@ where
                 .iter()
                 .zip(&w)
                 .fold(F128::ZERO, |acc, (&y, &b)| acc + y * b);
-            return residual_claim == claim
+            let accepted = residual_claim == claim
                 && ood_i == proof.ood_values.len()
                 && claim_i == proof.claim_batch_grinding_nonces.len()
                 && grid_i == proof.grids.len()
@@ -1813,18 +1839,18 @@ where
                 && li == proof.overflows.len()
                 && li == proof.recursive_caps.len()
                 && li == proof.consistency_batch_grinding_nonces.len();
+            return accepted.then_some(AffineVerifyTrace {
+                final_claim: claim,
+                enforced: enforced_log,
+            });
         }
 
-        let Some(overflow) = proof.overflows.get(li) else {
-            return false;
-        };
+        let overflow = proof.overflows.get(li)?;
         if overflow.len() != k {
-            return false;
+            return None;
         }
         challenger.observe_f128_slice(overflow);
-        let Some(cap) = proof.recursive_caps.get(li) else {
-            return false;
-        };
+        let cap = proof.recursive_caps.get(li)?;
         challenger.observe_bytes(cap.as_flattened());
 
         for _ in 0..config.ood_samples[li + 1] {
@@ -1832,34 +1858,25 @@ where
             let y = *next!(proof.ood_values, ood_i);
             challenger.observe_f128(y);
             let nonce = *next!(proof.claim_batch_grinding_nonces, claim_i);
-            let Some(beta) = challenger.verify_pow_and_sample_f128(nonce, claim_bits(li + 1))
-            else {
-                return false;
-            };
+            let beta = challenger.verify_pow_and_sample_f128(nonce, claim_bits(li + 1))?;
             claim += beta * y;
             contexts.push((c, Context::Ood { point, beta }));
         }
 
-        let Some(queries) = verify_and_sample_queries(
+        let queries = verify_and_sample_queries(
             challenger,
             query_nonce,
             config.grinding_bits[li] as u32,
             block_len,
             config.queries[li],
             strat(li),
-        ) else {
-            return false;
-        };
-        let Some(&nonce) = proof.consistency_batch_grinding_nonces.get(li) else {
-            return false;
-        };
-        let Some(alpha) = challenger.verify_pow_and_sample_f128_vec(
+        )?;
+        let &nonce = proof.consistency_batch_grinding_nonces.get(li)?;
+        let alpha = challenger.verify_pow_and_sample_f128_vec(
             nonce,
             consistency_bits(li),
             ceil_log2(config.queries[li]),
-        ) else {
-            return false;
-        };
+        )?;
         if !verify_level_opens(
             prev_cap,
             block_len,
@@ -1870,15 +1887,14 @@ where
             config.merkle_hash,
             strat(li),
         ) {
-            return false;
+            return None;
         }
         let enforced =
             batched_consistency(&opening.opened_rows, &queries, &gammas, overflow, c, &alpha);
         let nonce = *next!(proof.claim_batch_grinding_nonces, claim_i);
-        let Some(beta) = challenger.verify_pow_and_sample_f128(nonce, claim_bits(li + 1)) else {
-            return false;
-        };
+        let beta = challenger.verify_pow_and_sample_f128(nonce, claim_bits(li + 1))?;
         claim += beta * enforced;
+        enforced_log.push(enforced);
         contexts.push((
             c,
             Context::Consistency {
@@ -1890,7 +1906,7 @@ where
         ));
         prev_cap = cap;
     }
-    false
+    None
 }
 
 #[cfg(test)]
