@@ -294,18 +294,24 @@ impl ResidualWeightsGate256 {
     pub(super) const N_WEIGHTS: usize = 19;
 
     pub(super) fn new() -> Self {
+        Self::with_weights(Self::N_WEIGHTS)
+    }
+
+    /// The same ladder emitting `W_1 .. W_{n-1}`. The affine query phase
+    /// needs `W_c` at the level's own `c`, which reaches 19 at the m32 L0.
+    pub(super) fn with_weights(n: usize) -> Self {
         let o = F128::ONE;
         // The subspace-polynomial chain constants `s_k(v_k)`, straight from
         // ligerito (the residual boundary check pins the spine against them).
-        let sks = eval_sk_at_vks(Self::N_WEIGHTS);
-        let coeffs: Vec<F128> = (0..Self::N_WEIGHTS - 1)
+        let sks = eval_sk_at_vks(n);
+        let coeffs: Vec<F128> = (0..n - 1)
             .map(|k| {
                 assert_ne!(sks[k + 1], F128::ZERO, "novel-basis normalizer is nonzero");
                 sks[k] * sks[k] * sks[k + 1].inv()
             })
             .collect();
-        // in: W_0=q, one. out: W_1..W_18.
-        let mut b = ElementTableBuilder::new(5);
+        // in: W_0=q, one. out: W_1..W_{n-1}.
+        let mut b = ElementTableBuilder::new((n + 1).next_power_of_two().trailing_zeros() as usize);
         b.free_wire(0).free_wire(1);
         let mut prev = 0;
         for (j, &d) in coeffs.iter().enumerate() {

@@ -1664,6 +1664,8 @@ where
 pub struct AffineVerifyTrace {
     pub final_claim: F128,
     pub enforced: Vec<F128>,
+    /// Every level's sampled query positions, in level order.
+    pub queries: Vec<Vec<usize>>,
 }
 
 /// [`verify_affine_l0`], returning the [`AffineVerifyTrace`] on accept.
@@ -1704,6 +1706,7 @@ where
 
     let mut claim = target;
     let mut enforced_log: Vec<F128> = Vec::with_capacity(r);
+    let mut query_log: Vec<Vec<usize>> = Vec::with_capacity(r + 1);
     let mut contexts: Vec<(usize, Context)> = Vec::new();
     let mut all_rs: Vec<F128> = Vec::with_capacity(log_n);
     let (mut ood_i, mut claim_i, mut grid_i) = (0usize, 0usize, 0usize);
@@ -1839,9 +1842,11 @@ where
                 && li == proof.overflows.len()
                 && li == proof.recursive_caps.len()
                 && li == proof.consistency_batch_grinding_nonces.len();
+            query_log.push(queries);
             return accepted.then_some(AffineVerifyTrace {
                 final_claim: claim,
                 enforced: enforced_log,
+                queries: query_log,
             });
         }
 
@@ -1895,6 +1900,7 @@ where
         let beta = challenger.verify_pow_and_sample_f128(nonce, claim_bits(li + 1))?;
         claim += beta * enforced;
         enforced_log.push(enforced);
+        query_log.push(queries.clone());
         contexts.push((
             c,
             Context::Consistency {
