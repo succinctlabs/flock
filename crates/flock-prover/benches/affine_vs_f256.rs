@@ -19,7 +19,7 @@
 //! ([`affine_ladder`]: that many levels, Johnson queries recomputed); the
 //! fold grinding comes from `scripts/affine_fold_params.py` on that ladder.
 //!
-//! Run: `cargo bench --bench affine_vs_f256 [-- lanes] [rates=.. fold=..]`
+//! Run: `cargo bench --bench affine_vs_f256 [-- lanes] [shape=slim29] [rates=.. fold=..]`
 //! Phase breakdown of one run each: `LIG_PROVE_TRACE=1 cargo bench --bench affine_vs_f256 -- trace`
 
 use std::time::Instant;
@@ -44,16 +44,54 @@ use flock_prover::{
     },
 };
 
-const LOG_N: usize = 25;
-const INITIAL_K: usize = 6;
-/// The default affine ladder: L0 and three recursive levels at the split
-/// ladder's rates. The split ladder's native twin has a fourth level of 8
-/// columns, where `scripts/affine_fold_params.py` finds no fold bound for
-/// two of its rounds. `rates=1,2,5,7 fold=4,4,5,5` is about 3 ms faster
-/// for about 21 KiB more proof.
-const RATES: [usize; 4] = [1, 3, 5, 7];
-/// Per-level fold grinding from `scripts/affine_fold_params.py` on `RATES`.
-const FOLD_BITS: [usize; 4] = [4, 5, 5, 5];
+/// The bench shape: `shape=fast32` (default; the m = 32 Fast leaf) or
+/// `shape=slim29` (the recursion tower's outer nodes: m = 29 Slim, 2^5
+/// lanes at rate 1/4, 31 live).
+struct Shape {
+    log_n: usize,
+    initial_k: usize,
+    profile: LigeritoProfile,
+    live_lanes: usize,
+    rates: &'static [usize],
+    fold_bits: &'static [usize],
+}
+
+/// The m = 32 Fast default ladder: L0 and three recursive levels at the
+/// split ladder's rates. The split ladder's native twin has a fourth level
+/// of 8 columns, where `scripts/affine_fold_params.py` finds no fold bound
+/// for two of its rounds. `rates=1,2,5,7 fold=4,4,5,5` is about 3 ms faster
+/// for about 21 KiB more proof. Fold grinding from the same script.
+const FAST32: Shape = Shape {
+    log_n: 25,
+    initial_k: 6,
+    profile: LigeritoProfile::Fast,
+    live_lanes: 46,
+    rates: &[1, 3, 5, 7],
+    fold_bits: &[4, 5, 5, 5],
+};
+
+/// The tower's m = 29 Slim outer: the split ladder's rates on the three
+/// native recursive levels (13, 9, 5 columns); every round certifies.
+const SLIM29: Shape = Shape {
+    log_n: 22,
+    initial_k: 5,
+    profile: LigeritoProfile::Slim,
+    live_lanes: 31,
+    rates: &[2, 4, 6, 8],
+    fold_bits: &[4, 5, 5, 5],
+};
+
+fn shape() -> &'static Shape {
+    static S: std::sync::OnceLock<&'static Shape> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        match std::env::args().find_map(|a| a.strip_prefix("shape=").map(str::to_owned)) {
+            None => &FAST32,
+            Some(s) if s == "fast32" => &FAST32,
+            Some(s) if s == "slim29" => &SLIM29,
+            Some(s) => panic!("shape must be fast32 or slim29 (got {s})"),
+        }
+    })
+}
 
 fn rand_vec(len: usize, seed: u64) -> Vec<F128> {
     let mut s = seed | 1;
@@ -99,18 +137,15 @@ fn report(ta: Vec<f64>, tb: Vec<f64>, sa: usize, sb: usize) {
     );
 }
 
-/// Live lanes of the m = 32 production L0 commit.
-const LIVE_LANES: usize = 46;
-
 fn lanes_mode(split: &ProverConfig, affine: &ProverConfig, affine_v: &VerifierConfig, trace: bool) {
-    let log_cols = LOG_N - INITIAL_K;
+    let log_cols = shape().log_n - shape().initial_k;
     let d = 1usize << log_cols;
-    let mut q = rand_vec(LIVE_LANES * d, 0xA11E);
-    q.resize(1 << LOG_N, F128::ZERO);
-    let point = rand_vec(LOG_N, 0x5EED);
+    let mut q = rand_vec(shape().live_lanes * d, 0xA11E);
+    q.resize(1 << shape().log_n, F128::ZERO);
+    let point = rand_vec(shape().log_n, 0x5EED);
     let gamma = F128::new(0x1234_5678, 0x9abc);
     let low = build_eq_table(&point[..log_cols]);
-    let mut seeded: Vec<F128> = (0..LIVE_LANES)
+    let mut seeded: Vec<F128> = (0..shape().live_lanes)
         .map(|l| {
             q[l * d..(l + 1) * d]
                 .iter()
@@ -118,18 +153,18 @@ fn lanes_mode(split: &ProverConfig, affine: &ProverConfig, affine_v: &VerifierCo
                 .fold(F128::ZERO, |acc, (&a, &b)| acc + a * b)
         })
         .collect();
-    seeded.resize(1 << INITIAL_K, F128::ZERO);
+    seeded.resize(1 << shape().initial_k, F128::ZERO);
     let target = build_eq_table(&point[log_cols..])
         .iter()
         .zip(&seeded)
         .fold(F128::ZERO, |acc, (&a, &b)| acc + a * b)
         * gamma;
     let params = PcsParams {
-        m: LOG_N + 7,
+        m: shape().log_n + 7,
         log_inv_rate: split.log_inv_rates[0],
-        log_batch_size: INITIAL_K,
-        profile: LigeritoProfile::Fast,
-        num_lanes: Some(LIVE_LANES),
+        log_batch_size: shape().initial_k,
+        profile: shape().profile,
+        num_lanes: Some(shape().live_lanes),
         merkle_hash: split.merkle_hash,
     };
     let (commitment, pd) = commit_lane_major(&q, &params);
@@ -145,7 +180,7 @@ fn lanes_mode(split: &ProverConfig, affine: &ProverConfig, affine_v: &VerifierCo
             target,
             &pd.codeword,
             &pd.merkle_tree,
-            LIVE_LANES,
+            shape().live_lanes,
             true,
             (F128::ZERO, F128::ZERO),
             None,
@@ -167,7 +202,7 @@ fn lanes_mode(split: &ProverConfig, affine: &ProverConfig, affine_v: &VerifierCo
                 point: point.clone(),
                 gamma,
                 seeded_stats: Some(seeded.clone()),
-                num_lanes: LIVE_LANES,
+                num_lanes: shape().live_lanes,
             },
             target,
             &pd.codeword,
@@ -196,10 +231,10 @@ fn lanes_mode(split: &ProverConfig, affine: &ProverConfig, affine_v: &VerifierCo
     let ok = verify_affine_l0(
         affine_v,
         &proof,
-        LOG_N,
+        shape().log_n,
         target,
         &commitment.cap,
-        (LIVE_LANES, Some(&point[..log_cols])),
+        (shape().live_lanes, Some(&point[..log_cols])),
         |rs, residual_log| {
             let prefix = rotated
                 .iter()
@@ -234,10 +269,51 @@ fn lanes_mode(split: &ProverConfig, affine: &ProverConfig, affine_v: &VerifierCo
     report(ta, tb, sa, sb);
 }
 
+/// Rough in-circuit verifier cost of one opening, per level: BLAKE3 rows
+/// for the Merkle openings (leaf chunk blocks plus path compressions below
+/// the cap, plus the cap tree), and the final level's residual work. A
+/// child-verifier estimate for the recursion tower, not a measurement.
+/// `affine` levels commit F128 rows of `2^k` words; split recursive rows
+/// are `2^k` words too (the F256 coordinate bit is one of the k).
+fn census(label: &str, cfg: &ProverConfig, affine: bool) {
+    let levels = cfg.log_inv_rates.len();
+    let (mut b3, mut sib) = (0usize, 0usize);
+    println!("{label}:");
+    for (l, sch) in cfg.stratified.iter().enumerate() {
+        let words = if l == 0 {
+            shape().live_lanes
+        } else {
+            1usize << cfg.recursive_ks[l - 1]
+        };
+        let (q, d, c1) = (sch.queries(), sch.log_block_len, sch.cap_depth());
+        let rows = q * (words.div_ceil(4) + d - c1) + (1usize << c1) - 1;
+        b3 += rows;
+        sib += q * (d - c1);
+        println!("  L{l}: q={q:>3} d={d:>2} cap={c1} row={words:>2} words -> {rows:>5} b3 rows");
+    }
+    let c = cfg.recursive_log_msg_cols[levels - 2];
+    let q_final = cfg.queries[levels - 1];
+    let k_last = cfg.recursive_ks[levels - 2];
+    let (yr_words, final_macs) = if affine {
+        // Enc(yr)(x_q) per final query: one MAC per coefficient.
+        let n = (1usize << c) + k_last;
+        (n, q_final * n)
+    } else {
+        // yr is 2^c F256 elements; one F256 dot against the residual weights.
+        (2usize << c, 1usize << c)
+    };
+    let rounds: usize = cfg.initial_k + cfg.recursive_ks.iter().sum::<usize>();
+    println!(
+        "  total {b3} b3 rows ({sib} siblings), {rounds} fold rounds, final c={c}: yr {yr_words} words, \
+         ~{final_macs} final-check MAC rows ({})",
+        if affine { "F128, per query" } else { "F256, once" }
+    );
+}
+
 fn main() {
     init_perf_thread_pool();
     let trace_only = std::env::args().any(|a| a == "trace");
-    let split = prover_config_for(LOG_N, INITIAL_K, LigeritoProfile::Fast).expect("m32 fast");
+    let split = prover_config_for(shape().log_n, shape().initial_k, shape().profile).expect("split config");
     let list = |key: &str| {
         std::env::args()
             .find_map(|a| a.strip_prefix(key).map(str::to_owned))
@@ -248,13 +324,18 @@ fn main() {
             })
     };
     let (affine, affine_v) = match list("rates=") {
-        Some(rates) => affine_ladder(&split, LOG_N, &rates, &list("fold=").expect("fold=..")),
-        None => affine_ladder(&split, LOG_N, &RATES, &FOLD_BITS),
+        Some(rates) => affine_ladder(&split, shape().log_n, &rates, &list("fold=").expect("fold=..")),
+        None => affine_ladder(&split, shape().log_n, shape().rates, shape().fold_bits),
     };
     println!(
         "affine ladder: ks {:?}, rates {:?}, queries {:?}, fold bits {:?}",
         affine.recursive_ks, affine.log_inv_rates, affine.queries, affine.fold_grinding_bits
     );
+    if std::env::args().any(|a| a == "census") {
+        census("F256 split", &split, false);
+        census("affine", &affine, true);
+        return;
+    }
     if std::env::args().any(|a| a == "lanes") {
         lanes_mode(&split, &affine, &affine_v, trace_only);
         return;
@@ -271,17 +352,17 @@ fn main() {
         affine.fold_grinding_bits
     );
 
-    let witness = rand_vec(1 << LOG_N, 0xA11E);
-    let z = rand_vec(LOG_N, 0x5EED);
+    let witness = rand_vec(1 << shape().log_n, 0xA11E);
+    let z = rand_vec(shape().log_n, 0x5EED);
     let basis = build_eq_table(&z);
     let target = witness
         .iter()
         .zip(&basis)
         .fold(F128::ZERO, |acc, (&a, &b)| acc + a * b);
-    let log_cols = LOG_N - INITIAL_K;
+    let log_cols = shape().log_n - shape().initial_k;
     let rate = split.log_inv_rates[0];
     let ntt = AdditiveNttF128::standard(log_cols + rate);
-    let l0 = ligero_commit(&witness, log_cols, INITIAL_K, rate, &ntt, split.merkle_hash);
+    let l0 = ligero_commit(&witness, log_cols, shape().initial_k, rate, &ntt, split.merkle_hash);
 
     let run_f256 = || {
         let (w, b) = (witness.clone(), basis.clone());
@@ -315,7 +396,7 @@ fn main() {
     let ok = verify_affine(
         &affine_v,
         &proof,
-        LOG_N,
+        shape().log_n,
         target,
         &cap,
         |rs, residual_log| {
