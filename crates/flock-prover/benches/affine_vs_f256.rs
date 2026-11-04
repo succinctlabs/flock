@@ -306,14 +306,19 @@ fn census(label: &str, cfg: &ProverConfig, affine: bool) {
     println!(
         "  total {b3} b3 rows ({sib} siblings), {rounds} fold rounds, final c={c}: yr {yr_words} words, \
          ~{final_macs} final-check MAC rows ({})",
-        if affine { "F128, per query" } else { "F256, once" }
+        if affine {
+            "F128, per query"
+        } else {
+            "F256, once"
+        }
     );
 }
 
 fn main() {
     init_perf_thread_pool();
     let trace_only = std::env::args().any(|a| a == "trace");
-    let split = prover_config_for(shape().log_n, shape().initial_k, shape().profile).expect("split config");
+    let split =
+        prover_config_for(shape().log_n, shape().initial_k, shape().profile).expect("split config");
     let list = |key: &str| {
         std::env::args()
             .find_map(|a| a.strip_prefix(key).map(str::to_owned))
@@ -324,7 +329,12 @@ fn main() {
             })
     };
     let (affine, affine_v) = match list("rates=") {
-        Some(rates) => affine_ladder(&split, shape().log_n, &rates, &list("fold=").expect("fold=..")),
+        Some(rates) => affine_ladder(
+            &split,
+            shape().log_n,
+            &rates,
+            &list("fold=").expect("fold=.."),
+        ),
         None => affine_ladder(&split, shape().log_n, shape().rates, shape().fold_bits),
     };
     println!(
@@ -362,7 +372,14 @@ fn main() {
     let log_cols = shape().log_n - shape().initial_k;
     let rate = split.log_inv_rates[0];
     let ntt = AdditiveNttF128::standard(log_cols + rate);
-    let l0 = ligero_commit(&witness, log_cols, shape().initial_k, rate, &ntt, split.merkle_hash);
+    let l0 = ligero_commit(
+        &witness,
+        log_cols,
+        shape().initial_k,
+        rate,
+        &ntt,
+        split.merkle_hash,
+    );
 
     let run_f256 = || {
         let (w, b) = (witness.clone(), basis.clone());

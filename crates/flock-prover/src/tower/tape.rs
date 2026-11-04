@@ -7,8 +7,8 @@ use crate::{
     tower::{
         Wire,
         walker_common::{
-            LBL_ELEMENT_LC, LBL_ELEMENT_ZC, LBL_FROBENIUS, LBL_INNER_PD, LBL_MERGED_OPEN,
-            LBL_MULTIPOINT, LBL_OPEN_BASIS, LBL_RING_SWITCH,
+            LBL_AFFINE_OPEN, LBL_ELEMENT_LC, LBL_ELEMENT_ZC, LBL_FROBENIUS, LBL_INNER_PD,
+            LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_OPEN_BASIS, LBL_RING_SWITCH,
         },
     },
 };
@@ -133,87 +133,91 @@ pub(super) struct InitialOodRec {
     pub(super) beta_ch: usize,
 }
 
-/// Walk the recorded transcript ops and locate every open-phase squeeze the
-/// circuit needs. The walk MIRRORS the succinct verifier's structure (folds,
-/// cap absorbs, OOD groups, PoW, queries, alpha, beta per level), asserting
-/// each op kind — a config change that moves the shape fails here, loudly,
-/// not as a wrong wire.
-#[allow(clippy::type_complexity)]
-pub(super) fn parse_open_levels(
-    ops: &[TranscriptOp],
+/// A cursor over a recorded op tape, counting finalizations (`fin`),
+/// challenge words (`ch`) and observed values (`v`) as it walks.
+struct Cur<'a> {
+    ops: &'a [Op],
+    i: usize,
+    fin: usize,
+    ch: usize,
+    v: usize,
+}
+impl Cur<'_> {
+    fn bump(&mut self) {
+        let op = &self.ops[self.i];
+        if op.finalizes() {
+            self.fin += 1;
+        }
+        match op {
+            Op::SqueezeScalar => self.ch += 1,
+            Op::SqueezeSlice(n) => self.ch += n,
+            Op::ObserveScalar => self.v += 1,
+            Op::ObserveSlice(n) => self.v += n,
+            _ => {}
+        }
+        self.i += 1;
+    }
+    fn expect_obs_scalar(&mut self) {
+        assert!(
+            matches!(self.ops[self.i], Op::ObserveScalar),
+            "op {}: expected ObserveScalar, got {:?}",
+            self.i,
+            self.ops[self.i]
+        );
+        self.bump();
+    }
+
+    fn expect_obs_f256(&mut self) {
+        assert!(
+            matches!(self.ops[self.i], Op::ObserveSlice(2)),
+            "op {}: expected ObserveSlice(2), got {:?}",
+            self.i,
+            self.ops[self.i]
+        );
+        self.bump();
+    }
+
+    /// PoW finalizes the transcript and absorbs a nonce but creates no
+    /// field challenge or scalar message.  PIOP locators call this before
+    /// every protected squeeze; the generic circuit relation constrains
+    /// the skipped operation separately.
+    fn skip_pows(&mut self) {
+        while matches!(self.ops[self.i], Op::Pow { .. }) {
+            self.bump();
+        }
+    }
+}
+
+/// What precedes the inner opening on a merged-open tape: the element
+/// PIOP, the packed-direct coefficients, the merged W-rounds, the
+/// multipoint region, and (split ladder only) the inner packed-direct
+/// intake. Returned with the cursor parked on the opening's L0 cap absorb.
+pub(super) struct OpenPrefix {
+    pub(super) piop: Option<PiopRec>,
+    pub(super) gammas: Vec<PdRec>,
+    pub(super) rounds: Vec<RoundRec>,
+    pub(super) mp: MpRec,
+    pub(super) inner_pd: Option<InnerPd>,
+    /// Value index of the opening's target (`ObserveScalar` after its label).
+    #[allow(dead_code)] // the affine claim fold starts from it (next step)
+    pub(super) target_v: usize,
+}
+
+/// Walk a merged-open tape up to the inner opening, whose domain label is
+/// `open_label`; the cursor ends ON the opening's L0 cap absorb.
+fn walk_open_prefix<'a>(
+    ops: &'a [TranscriptOp],
     cap0_bytes: usize,
-    r: usize,
-) -> (
-    usize,
-    Option<PiopRec>,
-    Vec<PdRec>,
-    Vec<RoundRec>,
-    MpRec,
-    InnerPd,
-    usize,
-    Vec<OpenLevel>,
-) {
-    struct Cur<'a> {
-        ops: &'a [Op],
-        i: usize,
-        fin: usize,
-        ch: usize,
-        v: usize,
-    }
-    impl Cur<'_> {
-        fn bump(&mut self) {
-            let op = &self.ops[self.i];
-            if op.finalizes() {
-                self.fin += 1;
-            }
-            match op {
-                Op::SqueezeScalar => self.ch += 1,
-                Op::SqueezeSlice(n) => self.ch += n,
-                Op::ObserveScalar => self.v += 1,
-                Op::ObserveSlice(n) => self.v += n,
-                _ => {}
-            }
-            self.i += 1;
-        }
-        fn expect_obs_scalar(&mut self) {
-            assert!(
-                matches!(self.ops[self.i], Op::ObserveScalar),
-                "op {}: expected ObserveScalar, got {:?}",
-                self.i,
-                self.ops[self.i]
-            );
-            self.bump();
-        }
-
-        fn expect_obs_f256(&mut self) {
-            assert!(
-                matches!(self.ops[self.i], Op::ObserveSlice(2)),
-                "op {}: expected ObserveSlice(2), got {:?}",
-                self.i,
-                self.ops[self.i]
-            );
-            self.bump();
-        }
-
-        /// PoW finalizes the transcript and absorbs a nonce but creates no
-        /// field challenge or scalar message.  PIOP locators call this before
-        /// every protected squeeze; the generic circuit relation constrains
-        /// the skipped operation separately.
-        fn skip_pows(&mut self) {
-            while matches!(self.ops[self.i], Op::Pow { .. }) {
-                self.bump();
-            }
-        }
-    }
-
+    open_label: &[u8],
+) -> (Cur<'a>, OpenPrefix) {
     // The opening protocol begins at its domain label. Cap byte lengths are
     // not structural delimiters: under strict profiles a later recursive cap
     // can have the same length as L0, so a last-matching-length heuristic can
     // enter the tape at the wrong level.
     let label = ops
         .iter()
-        .position(|o| matches!(o, Op::Label(l) if l.as_slice() == LBL_OPEN_BASIS))
-        .expect("Ligerito opening label");
+        .position(|o| matches!(o, Op::Label(l) if l.as_slice() == open_label))
+        .expect("the inner opening's label");
     assert!(
         matches!(ops.get(label + 1), Some(Op::ObserveScalar)),
         "opening target"
@@ -457,8 +461,53 @@ pub(super) fn parse_open_levels(
         }
         cur.bump();
     }
-    let inner_pd = inner_pd.expect("the inner ligerito intake");
     let mp = mp.expect("the multipoint region");
+    // The loop bumped the target observe at `label + 1` generically.
+    let target_v = cur.v - 1;
+    debug_assert_eq!(cur.i, start);
+    (
+        cur,
+        OpenPrefix {
+            piop,
+            gammas,
+            rounds,
+            mp,
+            inner_pd,
+            target_v,
+        },
+    )
+}
+
+/// Walk the recorded transcript ops and locate every open-phase squeeze the
+/// circuit needs. The walk MIRRORS the succinct verifier's structure (folds,
+/// cap absorbs, OOD groups, PoW, queries, alpha, beta per level), asserting
+/// each op kind — a config change that moves the shape fails here, loudly,
+/// not as a wrong wire.
+#[allow(clippy::type_complexity)]
+pub(super) fn parse_open_levels(
+    ops: &[TranscriptOp],
+    cap0_bytes: usize,
+    r: usize,
+) -> (
+    usize,
+    Option<PiopRec>,
+    Vec<PdRec>,
+    Vec<RoundRec>,
+    MpRec,
+    InnerPd,
+    usize,
+    Vec<OpenLevel>,
+) {
+    let (mut cur, pre) = walk_open_prefix(ops, cap0_bytes, LBL_OPEN_BASIS);
+    let OpenPrefix {
+        piop,
+        gammas,
+        rounds,
+        mp,
+        inner_pd,
+        ..
+    } = pre;
+    let inner_pd = inner_pd.expect("the inner ligerito intake");
     cur.bump(); // the open-phase initial cap absorb
     let mut initial_ood = Vec::new();
     while matches!(cur.ops[cur.i], Op::SqueezeSlice(_)) {
@@ -606,4 +655,326 @@ pub(super) fn parse_open_levels(
         });
     }
     (start_v, piop, gammas, rounds, mp, inner_pd, yr_v, levels)
+}
+
+/// One affine fold round on the tape: the 5-word grid absorb, then the
+/// fold-grinding PoW fused with the 3-word `(alpha, beta, r)` squeeze.
+#[allow(dead_code)] // consumed by the affine child walker (next step)
+pub(super) struct AffineRoundRec {
+    /// Value index of the grid's first word (`G00`; `G11` is implied).
+    pub(super) grid_v: usize,
+    pub(super) fin: usize,
+    /// Challenge index of `alpha`; `beta` and `r` follow.
+    pub(super) ch: usize,
+}
+
+/// One affine OOD claim: a fresh point squeeze (all `c` coordinates on a
+/// recursive level; only the `initial_k` row coordinates on a lane-major
+/// L0, whose columns are the opening point's), its `y`, and its `beta`.
+#[allow(dead_code)] // consumed by the affine child walker (next step)
+pub(super) struct AffineOodRec {
+    pub(super) z_fin: usize,
+    pub(super) z_ch: usize,
+    pub(super) z_len: usize,
+    pub(super) y_v: usize,
+    pub(super) beta_fin: usize,
+    pub(super) beta_ch: usize,
+}
+
+/// One affine level on the tape, in transcript order. Non-final levels
+/// carry the overflow, the next cap, OOD claims, the queries, the
+/// consistency `alpha` vector and the consistency `beta`; the final level
+/// carries `yr` and the queries.
+#[allow(dead_code)] // consumed by the affine child walker (next step)
+pub(super) struct AffineLevel {
+    pub(super) rounds: Vec<AffineRoundRec>,
+    /// Non-final: value index of the `k` overflow words.
+    pub(super) overflow_v: Option<usize>,
+    pub(super) ood: Vec<AffineOodRec>,
+    /// Final: value index of the `2^c + k` yr words.
+    pub(super) yr_v: Option<usize>,
+    pub(super) q_fin: usize,
+    pub(super) q_ch: usize,
+    pub(super) q_count: usize,
+    /// Non-final: the consistency alpha squeeze `(fin, ch, count)`.
+    pub(super) alpha: Option<(usize, usize, usize)>,
+    /// Non-final: the consistency beta squeeze `(fin, ch)`.
+    pub(super) beta: Option<(usize, usize)>,
+}
+
+/// The affine inner opening on a merged-open tape: what precedes it, the
+/// L0 OOD claims, and one [`AffineLevel`] per level.
+#[allow(dead_code)] // consumed by the affine child walker (next step)
+pub(super) struct AffineOpenTape {
+    pub(super) prefix: OpenPrefix,
+    pub(super) initial_ood: Vec<AffineOodRec>,
+    pub(super) levels: Vec<AffineLevel>,
+}
+
+/// Locate every affine-opening absorb and squeeze on a recorded verify
+/// tape, mirroring [`flock_core::pcs::ligerito::affine::verify_affine_l0`]
+/// op by op. `ks` are the levels' fold counts (`initial_k`, then the
+/// recursive ks) and `yr_len` is `2^c + k` of the final level; both are
+/// config authority, so the walk counts rather than infers, and a shape
+/// change fails here loudly instead of as a wrong wire.
+#[allow(dead_code)] // consumed by the affine child walker (next step)
+pub(super) fn parse_affine_open(
+    ops: &[TranscriptOp],
+    cap0_bytes: usize,
+    ks: &[usize],
+    yr_len: usize,
+) -> AffineOpenTape {
+    let (mut cur, prefix) = walk_open_prefix(ops, cap0_bytes, LBL_AFFINE_OPEN);
+    assert!(
+        prefix.inner_pd.is_none(),
+        "the affine opening has no packed-direct intake"
+    );
+    cur.bump(); // the L0 cap absorb
+    fn expect_slice(cur: &mut Cur<'_>, n: usize, what: &str) -> usize {
+        assert!(
+            matches!(cur.ops[cur.i], Op::ObserveSlice(m) if m == n),
+            "op {}: expected {what} ObserveSlice({n}), got {:?}",
+            cur.i,
+            cur.ops[cur.i]
+        );
+        let v = cur.v;
+        cur.bump();
+        v
+    }
+    /// A PoW fused with the squeeze after it; returns that squeeze's
+    /// `(fin, ch, count)`.
+    fn pow_squeeze(cur: &mut Cur<'_>, what: &str) -> (usize, usize, usize) {
+        assert!(
+            matches!(cur.ops[cur.i], Op::Pow { .. }),
+            "op {}: expected the {what} PoW, got {:?}",
+            cur.i,
+            cur.ops[cur.i]
+        );
+        cur.bump();
+        let n = match cur.ops[cur.i] {
+            Op::SqueezeSlice(n) => n,
+            Op::SqueezeScalar => 1,
+            ref o => panic!("op {}: expected the {what} squeeze, got {o:?}", cur.i),
+        };
+        let at = (cur.fin, cur.ch, n);
+        cur.bump();
+        at
+    }
+    fn ood(cur: &mut Cur<'_>) -> AffineOodRec {
+        let z_len = match cur.ops[cur.i] {
+            Op::SqueezeSlice(n) => n,
+            ref o => panic!("op {}: expected an OOD point, got {o:?}", cur.i),
+        };
+        let (z_fin, z_ch) = (cur.fin, cur.ch);
+        cur.bump();
+        let y_v = cur.v;
+        cur.expect_obs_scalar();
+        let (beta_fin, beta_ch, n) = pow_squeeze(cur, "OOD beta");
+        assert_eq!(n, 1, "one OOD beta");
+        AffineOodRec {
+            z_fin,
+            z_ch,
+            z_len,
+            y_v,
+            beta_fin,
+            beta_ch,
+        }
+    }
+
+    let mut initial_ood = Vec::new();
+    while matches!(cur.ops[cur.i], Op::SqueezeSlice(_)) {
+        initial_ood.push(ood(&mut cur));
+    }
+    let r = ks.len() - 1;
+    let mut levels = Vec::with_capacity(ks.len());
+    for (li, &k) in ks.iter().enumerate() {
+        let rounds = (0..k)
+            .map(|_| {
+                let grid_v = expect_slice(&mut cur, 5, "fold grid");
+                let (fin, ch, n) = pow_squeeze(&mut cur, "fold");
+                assert_eq!(n, 3, "(alpha, beta, r) per fold round");
+                AffineRoundRec { grid_v, fin, ch }
+            })
+            .collect();
+        if li == r {
+            let yr_v = expect_slice(&mut cur, yr_len, "yr");
+            let (q_fin, q_ch, q_count) = pow_squeeze(&mut cur, "query");
+            levels.push(AffineLevel {
+                rounds,
+                overflow_v: None,
+                ood: Vec::new(),
+                yr_v: Some(yr_v),
+                q_fin,
+                q_ch,
+                q_count,
+                alpha: None,
+                beta: None,
+            });
+            break;
+        }
+        let overflow_v = expect_slice(&mut cur, k, "overflow");
+        assert!(
+            matches!(cur.ops[cur.i], Op::ObserveBytes(_)),
+            "op {}: expected the next cap absorb, got {:?}",
+            cur.i,
+            cur.ops[cur.i]
+        );
+        cur.bump();
+        let mut oods = Vec::new();
+        while matches!(cur.ops[cur.i], Op::SqueezeSlice(_)) {
+            oods.push(ood(&mut cur));
+        }
+        let (q_fin, q_ch, q_count) = pow_squeeze(&mut cur, "query");
+        let alpha = pow_squeeze(&mut cur, "consistency alpha");
+        let (b_fin, b_ch, n) = pow_squeeze(&mut cur, "consistency beta");
+        assert_eq!(n, 1, "one consistency beta");
+        levels.push(AffineLevel {
+            rounds,
+            overflow_v: Some(overflow_v),
+            ood: oods,
+            yr_v: None,
+            q_fin,
+            q_ch,
+            q_count,
+            alpha: Some(alpha),
+            beta: Some((b_fin, b_ch)),
+        });
+    }
+    AffineOpenTape {
+        prefix,
+        initial_ood,
+        levels,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use flock_core::{
+        pcs::{
+            MergedInnerOpen,
+            ligerito::{LigeritoProfile, prover_config_for},
+        },
+        test_rng::Rng,
+    };
+    use flock_transcript::transcript_record::RecordingChallenger;
+
+    use super::parse_affine_open;
+    use crate::{
+        challenger::FsChallenger,
+        r1cs_hashes::blake3::{Blake3Setup, Compression},
+    };
+
+    /// The affine walk over a real recorded verify tape (a `fast-affine`
+    /// BLAKE3 union at m = 24): every located absorb holds the proof's own
+    /// words, every squeeze has the configured width, and the walk ends on
+    /// the tape's last op.
+    #[test]
+    fn affine_open_tape_matches_the_proof() {
+        const D: &[u8] = b"tower-affine-tape";
+        let n_blocks = 1 << 10;
+        let setup = Blake3Setup::with_profile(n_blocks, LigeritoProfile::FastAffine);
+        let mut rng = Rng::new(0x7A9E_AFF1);
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64u32, 11u32)
+            })
+            .collect();
+        let (proof, commitment, _) =
+            setup.prove_fast(&blocks, &mut FsChallenger::with_chained_blake3(D));
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(D));
+        setup
+            .verify(&commitment, &proof, &mut rec)
+            .expect("the recorded verify accepts");
+        let MergedInnerOpen::Affine(aff) = &proof.pcs_open.inner else {
+            panic!("fast-affine takes the affine inner open")
+        };
+        let p = &setup.pcs_params;
+        let cfg = prover_config_for(p.m - 7, p.log_batch_size, p.profile).expect("affine ladder");
+        let mut ks = vec![cfg.initial_k];
+        ks.extend(&cfg.recursive_ks);
+        let c_final = *cfg.recursive_log_msg_cols.last().unwrap();
+        let yr_len = (1usize << c_final) + ks[ks.len() - 1];
+
+        let shape = rec.shape();
+        let ops = crate::tower::fs_chain::flatten_ops(shape.ops());
+        let t = parse_affine_open(&ops, 32 * aff.initial_cap.len(), &ks, yr_len);
+        let (vals, chals) = (rec.values(), rec.challenges());
+
+        assert_eq!(t.levels.len(), ks.len());
+        assert_eq!(t.initial_ood.len(), cfg.ood_samples[0]);
+        let mut oods = t.initial_ood.iter().collect::<Vec<_>>();
+        assert!(t.initial_ood.iter().all(|o| o.z_len == cfg.initial_k));
+        let mut grid = 0usize;
+        for (li, lvl) in t.levels.iter().enumerate() {
+            assert_eq!(lvl.rounds.len(), ks[li]);
+            for rd in &lvl.rounds {
+                assert_eq!(vals[rd.grid_v..rd.grid_v + 5], aff.grids[grid]);
+                grid += 1;
+                assert!(rd.ch + 3 <= chals.len());
+            }
+            assert_eq!(lvl.q_count, cfg.queries[li]);
+            if let Some(ov) = lvl.overflow_v {
+                assert_eq!(vals[ov..ov + ks[li]], aff.overflows[li][..]);
+                // The OOD point is on this level's folded message: its own c.
+                let c = if li == 0 {
+                    cfg.initial_log_msg_cols
+                } else {
+                    cfg.recursive_log_msg_cols[li - 1]
+                };
+                assert!(lvl.ood.iter().all(|o| o.z_len == c));
+                assert_eq!(lvl.ood.len(), cfg.ood_samples[li + 1]);
+                let (_, _, n) = lvl.alpha.expect("consistency alpha");
+                assert_eq!(
+                    n,
+                    cfg.queries[li].next_power_of_two().trailing_zeros() as usize
+                );
+                assert!(lvl.beta.is_some());
+            } else {
+                let yr = lvl.yr_v.expect("final yr");
+                assert_eq!(vals[yr..yr + yr_len], aff.yr[..]);
+                assert!(lvl.alpha.is_none() && lvl.beta.is_none());
+            }
+            oods.extend(&lvl.ood);
+        }
+        assert_eq!(grid, aff.grids.len());
+        let ys: Vec<_> = oods.iter().map(|o| vals[o.y_v]).collect();
+        assert_eq!(ys, aff.ood_values);
+        // The final query squeeze is the last op of the tape.
+        let last = t.levels.last().unwrap();
+        assert_eq!(last.q_ch + last.q_count, chals.len());
+        assert!(!t.prefix.mp.rounds.is_empty() && !t.prefix.rounds.is_empty());
+    }
+
+    /// The split walk, after the prefix walk moved into [`super::walk_open_prefix`],
+    /// still parses a chained-BLAKE3 `fast` union tape to one level per open
+    /// level.
+    #[test]
+    fn split_open_tape_still_parses() {
+        const D: &[u8] = b"tower-affine-tape";
+        let n_blocks = 1 << 10;
+        let setup = Blake3Setup::with_profile(n_blocks, LigeritoProfile::Fast);
+        let mut rng = Rng::new(0x7A9E_AFF1);
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64u32, 11u32)
+            })
+            .collect();
+        let (proof, commitment, _) =
+            setup.prove_fast(&blocks, &mut FsChallenger::with_chained_blake3(D));
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(D));
+        setup.verify(&commitment, &proof, &mut rec).unwrap();
+        let lig = &proof.pcs_open.inner.split().ligerito;
+        let shape = rec.shape();
+        let r = lig.recursive_caps.len();
+        let (.., levels) = super::parse_open_levels(
+            &crate::tower::fs_chain::flatten_ops(shape.ops()),
+            32 * lig.initial_cap.len(),
+            r,
+        );
+        assert_eq!(levels.len(), r + 1);
+    }
 }

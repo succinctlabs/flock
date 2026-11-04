@@ -103,6 +103,7 @@ impl PcsParams {
         match self.profile {
             LigeritoProfile::Fast
             | LigeritoProfile::FastAffine
+            | LigeritoProfile::SlimAffine
             | LigeritoProfile::Slim
             | LigeritoProfile::Secure => ZerocheckGrinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => ZerocheckGrinding::disabled(),
@@ -119,6 +120,7 @@ impl PcsParams {
         match self.profile {
             LigeritoProfile::Fast
             | LigeritoProfile::FastAffine
+            | LigeritoProfile::SlimAffine
             | LigeritoProfile::Slim
             | LigeritoProfile::Secure => LincheckGrinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => LincheckGrinding::disabled(),
@@ -130,6 +132,7 @@ impl PcsParams {
         match self.profile {
             LigeritoProfile::Fast
             | LigeritoProfile::FastAffine
+            | LigeritoProfile::SlimAffine
             | LigeritoProfile::Slim
             | LigeritoProfile::Secure => Grinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => Grinding::disabled(),
@@ -146,6 +149,7 @@ impl PcsParams {
         match self.profile {
             LigeritoProfile::Fast
             | LigeritoProfile::FastAffine
+            | LigeritoProfile::SlimAffine
             | LigeritoProfile::Slim
             | LigeritoProfile::Secure => OpeningGrinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => OpeningGrinding::disabled(),
@@ -157,6 +161,7 @@ impl PcsParams {
         match self.profile {
             LigeritoProfile::Fast
             | LigeritoProfile::FastAffine
+            | LigeritoProfile::SlimAffine
             | LigeritoProfile::Slim
             | LigeritoProfile::Secure => BatchedGrinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => BatchedGrinding::disabled(),
@@ -168,6 +173,7 @@ impl PcsParams {
         match self.profile {
             LigeritoProfile::Fast
             | LigeritoProfile::FastAffine
+            | LigeritoProfile::SlimAffine
             | LigeritoProfile::Slim
             | LigeritoProfile::Secure => FoldGrinding::per_challenge_128(),
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => FoldGrinding::disabled(),

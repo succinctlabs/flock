@@ -627,6 +627,9 @@ pub(super) const LBL_MULTIPOINT: &[u8] = b"flock-multipoint-twisted-v1";
 pub(super) const LBL_FROBENIUS: &[u8] = b"flock-frobenius-assist-v0";
 pub(super) const LBL_OPEN_BASIS: &[u8] = b"flock-ligerito-basis-f256-split-v0";
 pub(super) const LBL_INNER_PD: &[u8] = b"flock-pcs-packed-direct-v0";
+/// The affine F128 inner opening's own domain label (it replaces both
+/// [`LBL_INNER_PD`] and [`LBL_OPEN_BASIS`] on an affine tape).
+pub(super) const LBL_AFFINE_OPEN: &[u8] = flock_core::pcs::ligerito::affine::LABEL;
 
 /// The boolean zerocheck's absorbed `z_partial` slice, in words. The
 /// checker's matrix block and the assertion publics count by it — BOTH

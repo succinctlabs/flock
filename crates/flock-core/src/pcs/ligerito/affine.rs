@@ -34,16 +34,18 @@ use crate::{
     merkle::cap_layer,
     pcs::{
         ligerito::{
-            AdditiveNttF128, Challenger, F128, Hash, LigeroWitness, ProverConfig, RecursiveProof,
-            VerifierConfig, build_eq_table, ceil_log2, eval_sk_at_vks, grind_and_sample_queries,
-            induce_sumcheck_poly_auto, ligero_commit, merkle_paths_for, next_s,
-            verify_and_sample_queries, verify_level_opens,
+            AdditiveNttF128, Challenger, F128, Hash, LigeritoProfile, LigeroWitness, ProverConfig,
+            RecursiveProof, VerifierConfig, build_eq_table, ceil_log2, eval_sk_at_vks,
+            grind_and_sample_queries, induce_sumcheck_poly_auto, ligero_commit, merkle_paths_for,
+            next_s, verify_and_sample_queries, verify_level_opens,
         },
         ring_switch::{build_eq_scaled_parallel, build_eq_split},
     },
 };
 
-const LABEL: &[u8] = b"flock-ligerito-affine-f128-v0";
+/// The affine opening's transcript domain label (the recursion tower's
+/// tape parser locates the opening by it).
+pub const LABEL: &[u8] = b"flock-ligerito-affine-f128-v0";
 
 /// Proof of the affine ladder. Every vector is in transcript order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,33 +186,42 @@ pub fn affine_ladder(
     build_ladder(split, log_n, &ks, rates, &queries, fold_grinding_bits)
 }
 
-/// The registered affine ladders for [`super::LigeritoProfile::FastAffine`]:
-/// `(log_n, initial_k) -> (rates, fold grinding bits)`, each certified
-/// round by round by `scripts/affine_fold_params.py`, on top of the `Fast`
-/// config of the same shape.
+/// The registered affine ladders: `(base profile, log_n, initial_k) ->
+/// (rates, fold grinding bits)`, each certified round by round by
+/// `scripts/affine_fold_params.py`, on top of the base profile's config of
+/// the same shape ([`super::LigeritoProfile::FastAffine`] → `Fast`,
+/// [`super::LigeritoProfile::SlimAffine`] → `Slim`).
 /// The m = 24 entry is the small shape the end-to-end tests run; at rate
 /// 1/8 its level of 2^7 columns has no certificate, at 1/32 it does.
-const AFFINE_LADDERS: &[((usize, usize), &[usize], &[usize])] = &[
-    ((17, 6), &[1, 5], &[4, 5]),
-    ((25, 6), &[1, 3, 5, 7], &[4, 5, 5, 5]),
-    ((26, 6), &[1, 3, 5, 7], &[4, 5, 5, 5]),
+/// The m = 29 Slim entry is the recursion tower's outer envelope: four
+/// levels (final c = 5) because the in-circuit verifier checks the final
+/// level per query, which a 3-level ladder's c = 9 makes ~20x dearer.
+const AFFINE_LADDERS: &[((LigeritoProfile, usize, usize), &[usize], &[usize])] = &[
+    ((LigeritoProfile::Fast, 17, 6), &[1, 5], &[4, 5]),
+    ((LigeritoProfile::Fast, 25, 6), &[1, 3, 5, 7], &[4, 5, 5, 5]),
+    ((LigeritoProfile::Fast, 26, 6), &[1, 3, 5, 7], &[4, 5, 5, 5]),
+    ((LigeritoProfile::Slim, 22, 5), &[2, 4, 6, 8], &[4, 5, 5, 5]),
 ];
 
-/// The `FastAffine` configs for a shape, or an error if none is registered.
+/// The configs of an affine profile at a shape, or an error if none is
+/// registered.
 pub fn affine_ladder_for(
+    profile: LigeritoProfile,
     log_n: usize,
     initial_k: usize,
 ) -> Result<(ProverConfig, VerifierConfig), String> {
+    let base = profile.base();
     let (_, rates, fold) = AFFINE_LADDERS
         .iter()
-        .find(|(shape, _, _)| *shape == (log_n, initial_k))
+        .find(|(shape, _, _)| *shape == (base, log_n, initial_k))
         .ok_or_else(|| {
             format!(
-                "no affine ladder registered for (log_n={log_n}, initial_k={initial_k}); \
-                 add one to AFFINE_LADDERS after running scripts/affine_fold_params.py"
+                "no affine ladder registered for ({}, log_n={log_n}, initial_k={initial_k}); \
+                 add one to AFFINE_LADDERS after running scripts/affine_fold_params.py",
+                profile.as_str()
             )
         })?;
-    let split = super::prover_config_for(log_n, initial_k, super::LigeritoProfile::Fast)?;
+    let split = super::prover_config_for(log_n, initial_k, base)?;
     Ok(affine_ladder(&split, log_n, rates, fold))
 }
 
@@ -2296,6 +2307,22 @@ mod tests {
         let (fast, _) = affine_ladder(&split, 25, &[1, 2, 5, 7], &[4, 4, 5, 5]);
         assert_eq!(fast.queries, [244, 119, 48, 35]);
         assert_eq!(fast.recursive_log_msg_cols, [15, 11, 7]);
+    }
+
+    /// The tower's m = 29 Slim outer ladder: the split ladder's first four
+    /// rates on the native shapes, the shipped m29_slim query counts, final
+    /// level of 2^5 columns.
+    #[test]
+    fn slim_affine_ladder_is_registered() {
+        let (cfg, _) = super::affine_ladder_for(super::LigeritoProfile::SlimAffine, 22, 5)
+            .expect("m29 slim-affine");
+        assert_eq!(cfg.log_inv_rates, [2, 4, 6, 8]);
+        assert_eq!(cfg.queries, [119, 60, 41, 32]);
+        assert_eq!(cfg.recursive_ks, [4, 4, 4]);
+        assert_eq!(cfg.recursive_log_msg_cols, [13, 9, 5]);
+        assert_eq!(cfg.fold_grinding_bits, [4, 5, 5, 5]);
+        assert!(super::affine_ladder_for(super::LigeritoProfile::FastAffine, 22, 5).is_err());
+        assert!(super::affine_ladder_for(super::LigeritoProfile::SlimAffine, 25, 6).is_err());
     }
 
     #[test]
