@@ -170,36 +170,8 @@ pub(super) fn emit_affine_claim_fold(
 
 #[cfg(test)]
 mod tests {
-    use flock_core::{
-        challenger::FsChallenger,
-        lincheck::build_eq_table,
-        ntt::additive_ntt_f128::AdditiveNttF128,
-        pcs::ligerito::{
-            LigeritoProfile,
-            affine::{affine_ladder_for, prove_affine, verify_affine_l0_traced},
-            ligero_commit,
-        },
-    };
-    use flock_transcript::transcript_record::RecordingChallenger;
-
     use super::*;
-    use crate::tower::{MacGate, fs_chain::flatten_ops, tape::parse_affine_direct};
-
-    fn rand_vec(len: usize, seed: u64) -> Vec<F128> {
-        let mut s = seed | 1;
-        (0..len)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                let lo = s;
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                F128::new(lo, s)
-            })
-            .collect()
-    }
+    use crate::tower::{MacGate, affine_fixture::affine_fixture};
 
     /// A direct affine opening at the registered m = 24 shape, verified
     /// through the RECORDING challenger: the native replay over the parsed
@@ -209,56 +181,14 @@ mod tests {
     /// fails its constraints.
     #[test]
     fn claim_fold_matches_the_verifier() {
-        const D: &[u8] = b"tower-affine-claim-fold";
-        let (log_n, initial_k) = (17, 6);
-        let (pc, vc) = affine_ladder_for(LigeritoProfile::FastAffine, log_n, initial_k)
-            .expect("m24 fast-affine");
-        let witness = rand_vec(1 << log_n, 0xA11E);
-        let z = rand_vec(log_n, 0x5EED);
-        let basis = build_eq_table(&z);
-        let target = witness
-            .iter()
-            .zip(&basis)
-            .fold(F128::ZERO, |acc, (&a, &b)| acc + a * b);
-        let log_cols = log_n - initial_k;
-        let rate = pc.log_inv_rates[0];
-        let ntt = AdditiveNttF128::standard(log_cols + rate);
-        let l0 = ligero_commit(&witness, log_cols, initial_k, rate, &ntt, pc.merkle_hash);
-        let mut ch = FsChallenger::with_chained_blake3(D);
-        let proof = prove_affine(&pc, witness, basis, target, &l0.mat, &l0.tree, &mut ch);
-        let cap = l0.cap(pc.level_zero_cap_depth()).to_vec();
-        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(D));
-        let trace = verify_affine_l0_traced(
-            &vc,
-            &proof,
-            log_n,
-            target,
-            &cap,
-            (1 << initial_k, None),
-            |rs, residual_log| {
-                let prefix = z
-                    .iter()
-                    .zip(rs)
-                    .fold(F128::ONE, |acc, (&zi, &ri)| acc * (F128::ONE + zi + ri));
-                let mut out = build_eq_table(&z[rs.len()..]);
-                assert_eq!(out.len(), 1usize << residual_log);
-                out.iter_mut().for_each(|v| *v *= prefix);
-                out
-            },
-            &mut rec,
-        )
-        .expect("the recorded affine verify accepts");
-
-        let mut ks = vec![pc.initial_k];
-        ks.extend(&pc.recursive_ks);
-        let yr_len = (1usize << pc.recursive_log_msg_cols.last().unwrap()) + ks[ks.len() - 1];
-        let ops = flatten_ops(rec.shape().ops());
-        let (target_v, initial_ood, levels) = parse_affine_direct(&ops, &ks, yr_len);
-        let (vals, chals) = (rec.values(), rec.challenges());
+        let fx = affine_fixture(b"tower-affine-claim-fold");
+        let (target, trace, ks) = (fx.target, &fx.trace, &fx.ks);
+        let (initial_ood, levels) = (&fx.initial_ood, &fx.levels);
+        let (vals, chals) = (&fx.vals[..], &fx.chals[..]);
+        let target_v = fx.target_v;
         assert_eq!(vals[target_v], target);
         assert_eq!(trace.enforced.len(), levels.len() - 1);
-        let native =
-            replay_affine_claim(target, &initial_ood, &levels, vals, chals, &trace.enforced);
+        let native = replay_affine_claim(target, initial_ood, levels, vals, chals, &trace.enforced);
         assert_eq!(native, trace.final_claim, "native replay = verifier");
 
         // The circuit: every value and challenge enters as an input wire.

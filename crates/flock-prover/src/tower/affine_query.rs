@@ -410,10 +410,17 @@ pub(super) struct AffineQueryLevel {
     pub(super) alpha: Vec<Wire>,
 }
 
+/// What [`emit_affine_consistency`] leaves for the claim fold and the
+/// residual: the `enforced` wire (the value the claim fold joins), each
+/// query's ladder `Ŵ_0..`, and the `eq(α)` tensor (one weight per query).
+pub(super) struct AffineConsistency {
+    pub(super) enforced: Wire,
+    pub(super) ladders: Vec<Vec<Wire>>,
+    pub(super) eq: Vec<Wire>,
+}
+
 /// Emit one level's batched consistency: per query a ladder row and an
 /// [`AffineLeafGate`] row on `leaf`, plus the level's `eq(α)` tensor.
-/// Returns the `enforced` wire (the value the claim fold joins) and each
-/// query's ladder, which the residual region reuses.
 pub(super) fn emit_affine_consistency(
     sb: &mut ShapeBuilder,
     leaf: SlotId,
@@ -422,9 +429,9 @@ pub(super) fn emit_affine_consistency(
     lvl: &AffineQueryLevel,
     zw: Wire,
     ow: Wire,
-) -> (Wire, Vec<Vec<Wire>>) {
+) -> AffineConsistency {
     assert_eq!(lvl.rows.len(), lvl.xs.len());
-    let eq = emit_eq_tensor(sb, mac, &lvl.alpha, zw, ow);
+    let mut eq = emit_eq_tensor(sb, mac, &lvl.alpha, zw, ow);
     assert!(
         eq.len() >= lvl.xs.len(),
         "the alpha tensor covers every query"
@@ -446,7 +453,12 @@ pub(super) fn emit_affine_consistency(
         acc = sb.gate(leaf, &ins)[0];
         ladders.push(w);
     }
-    (acc, ladders)
+    eq.truncate(lvl.xs.len());
+    AffineConsistency {
+        enforced: acc,
+        ladders,
+        eq,
+    }
 }
 
 /// The final level's query-phase wires.
@@ -495,38 +507,10 @@ pub(super) fn emit_affine_final_check(
 
 #[cfg(test)]
 mod tests {
-    use flock_core::{
-        challenger::FsChallenger,
-        lincheck::build_eq_table,
-        ntt::additive_ntt_f128::AdditiveNttF128,
-        pcs::ligerito::{
-            LigeritoProfile,
-            affine::{affine_ladder_for, prove_affine, verify_affine_l0_traced},
-            ligero_commit,
-        },
-    };
-    use flock_transcript::transcript_record::RecordingChallenger;
+    use flock_core::pcs::ligerito::{LigeritoProfile, affine::affine_ladder_for};
 
     use super::*;
-    use crate::tower::{
-        MacGate, ResidualWeightsGate256, fs_chain::flatten_ops, tape::parse_affine_direct,
-    };
-
-    fn rand_vec(len: usize, seed: u64) -> Vec<F128> {
-        let mut s = seed | 1;
-        (0..len)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                let lo = s;
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                F128::new(lo, s)
-            })
-            .collect()
-    }
+    use crate::tower::{MacGate, ResidualWeightsGate256, affine_fixture::affine_fixture};
 
     fn satisfied(ty: &ElementTableType, row: &[F128]) -> bool {
         let mut z = row.to_vec();
@@ -541,55 +525,9 @@ mod tests {
     /// constraints, and a tampered intermediate column fails the leaf gate.
     #[test]
     fn consistency_matches_the_verifier() {
-        const D: &[u8] = b"tower-affine-query";
-        let (log_n, initial_k) = (17, 6);
-        let (pc, vc) = affine_ladder_for(LigeritoProfile::FastAffine, log_n, initial_k)
-            .expect("m24 fast-affine");
-        let witness = rand_vec(1 << log_n, 0xA11E);
-        let z = rand_vec(log_n, 0x5EED);
-        let basis = build_eq_table(&z);
-        let target = witness
-            .iter()
-            .zip(&basis)
-            .fold(F128::ZERO, |acc, (&a, &b)| acc + a * b);
-        let log_cols = log_n - initial_k;
-        let rate = pc.log_inv_rates[0];
-        let ntt = AdditiveNttF128::standard(log_cols + rate);
-        let l0 = ligero_commit(&witness, log_cols, initial_k, rate, &ntt, pc.merkle_hash);
-        let mut ch = FsChallenger::with_chained_blake3(D);
-        let proof = prove_affine(&pc, witness, basis, target, &l0.mat, &l0.tree, &mut ch);
-        let cap = l0.cap(pc.level_zero_cap_depth()).to_vec();
-        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(D));
-        let trace = verify_affine_l0_traced(
-            &vc,
-            &proof,
-            log_n,
-            target,
-            &cap,
-            (1 << initial_k, None),
-            |rs, residual_log| {
-                let prefix = z
-                    .iter()
-                    .zip(rs)
-                    .fold(F128::ONE, |acc, (&zi, &ri)| acc * (F128::ONE + zi + ri));
-                let mut out = build_eq_table(&z[rs.len()..]);
-                assert_eq!(out.len(), 1usize << residual_log);
-                out.iter_mut().for_each(|v| *v *= prefix);
-                out
-            },
-            &mut rec,
-        )
-        .expect("the recorded affine verify accepts");
-
-        let mut ks = vec![pc.initial_k];
-        ks.extend(&pc.recursive_ks);
-        let mut cs = vec![log_cols];
-        cs.extend(&pc.recursive_log_msg_cols);
-        let yr_len = (1usize << cs[cs.len() - 1]) + ks[ks.len() - 1];
-        let ops = flatten_ops(rec.shape().ops());
-        let (_, _, levels) = parse_affine_direct(&ops, &ks, yr_len);
-        let (vals, chals) = (rec.values(), rec.challenges());
-        assert_eq!(trace.queries.len(), levels.len());
+        let fx = affine_fixture(b"tower-affine-query");
+        let (proof, trace, ks, cs, levels) = (&fx.proof, &fx.trace, &fx.ks, &fx.cs, &fx.levels);
+        let (vals, chals) = (&fx.vals, &fx.chals);
 
         let max_c = *cs.iter().max().unwrap();
         let mut sb = ShapeBuilder::new(11);
@@ -652,7 +590,7 @@ mod tests {
             };
             outs.push((
                 slot,
-                emit_affine_consistency(&mut sb, slot, ladder, mac, &q, zw, ow).0,
+                emit_affine_consistency(&mut sb, slot, ladder, mac, &q, zw, ow).enforced,
             ));
         }
         // The final level: one direct Enc(yr) check per query.
