@@ -1273,6 +1273,9 @@ pub struct LeafOuter {
     pub(super) spread_slot: usize,
     pub(super) pow_slot: usize,
     pub(super) family_slot: usize,
+    /// The tower's affine slot layouts (the envelope's), carried so a
+    /// parent declares the same list as this child.
+    pub(super) affine_env: crate::tower::affine_walk::AffineEnvLayouts,
 }
 
 pub(super) fn leaf_boolean_lcs(lo: &LeafOuter) -> Vec<&dyn LincheckCircuit> {

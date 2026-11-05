@@ -3,7 +3,10 @@ use std::ops::Range;
 use flock_core::{
     circuit::builder::SlotId,
     lincheck::build_eq_table,
-    pcs::{ligerito::LigeritoProof, stratified::LevelSchedule},
+    pcs::{
+        ligerito::{LigeritoProof, affine::AffineProof},
+        stratified::LevelSchedule,
+    },
 };
 use flock_merkle::{hash_leaf, hash_pair, verify_merkle_proof_capped};
 use flock_multilinear::{IndexOrder, eq_table};
@@ -234,6 +237,94 @@ pub(super) fn level_sources(
                     &lig.final_proof.merkle_proof,
                 )
             }
+        })
+        .collect()
+}
+
+/// [`level_sources`] for an affine opening: level `li` opens against the
+/// cap it was committed under (L0's initial cap, then `recursive_caps[li-1]`).
+pub(super) fn affine_level_sources(
+    p: &AffineProof,
+) -> Vec<(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)> {
+    p.openings
+        .iter()
+        .enumerate()
+        .map(|(li, o)| {
+            let cap = if li == 0 {
+                p.initial_cap.as_slice()
+            } else {
+                p.recursive_caps[li - 1].as_slice()
+            };
+            (cap, &o.opened_rows, &o.merkle_proof)
+        })
+        .collect()
+}
+
+/// The affine opening's per-level geometry: `ks[li]` folds (the lane-weight
+/// domain is `2^k`), `q_chs[li]` the level's query squeeze ordinal. Every
+/// opened row is verified NATIVELY against its cap at the position the
+/// recorded challenge maps to, as [`level_geometry`] does.
+pub(super) fn affine_level_geometry(
+    ks: &[usize],
+    q_chs: &[usize],
+    lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
+    chals: &[F128],
+    hash: HashKind,
+    scheds: &[LevelSchedule],
+) -> Vec<Lvl> {
+    assert_eq!(scheds.len(), ks.len(), "one schedule per open level");
+    (0..ks.len())
+        .map(|li| {
+            let (cap, rows, paths) = lvl_src[li];
+            let sched = &scheds[li];
+            let q = sched.queries();
+            assert_eq!(rows.len(), q, "L{li}: one opened row per query");
+            let c = sched.cap_depth();
+            assert_eq!(cap.len(), 1 << c, "L{li}: cap is the schedule's top layer");
+            assert_eq!(
+                paths.len(),
+                sched.total_path_siblings(),
+                "L{li}: flat paths"
+            );
+            let depth = sched.log_block_len;
+            let lanes = 1usize << ks[li];
+            let raw_row_words = rows[0].len();
+            assert!(
+                raw_row_words >= 1 && raw_row_words <= lanes,
+                "L{li}: row width"
+            );
+            let c_min = sched.summand_depths.last().copied().unwrap_or(c);
+            let lv = Lvl {
+                q,
+                c,
+                depth,
+                lanes,
+                row_words: raw_row_words,
+                raw_row_words,
+                sched: sched.clone(),
+                cap_layers: native_cap_layers(cap, c - c_min, hash),
+            };
+            for (k, row) in rows.iter().enumerate() {
+                let pos = lv.q_pos(k, chals[q_chs[li] + k].lo);
+                let mut leaf_bytes = Vec::with_capacity(16 * row.len());
+                for f in row {
+                    leaf_bytes.extend_from_slice(&f.lo.to_le_bytes());
+                    leaf_bytes.extend_from_slice(&f.hi.to_le_bytes());
+                }
+                let lh = hash_leaf(&leaf_bytes, hash);
+                assert!(
+                    verify_merkle_proof_capped(
+                        cap,
+                        1 << depth,
+                        &lh,
+                        pos,
+                        &paths[lv.path_range(k)],
+                        hash
+                    ),
+                    "L{li} query {k}: capped path verifies natively"
+                );
+            }
+            lv
         })
         .collect()
 }

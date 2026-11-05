@@ -716,7 +716,7 @@ pub(super) fn emit_family_h_boundary(
     mp: &MpRec,
     gammas: &[PdRec],
     w_rounds: &[RoundRec],
-    inner_pd: &InnerPd,
+    q_v: usize,
     pfslot: SlotId,
     pf_w: usize,
     vals: &mut Vec<F128>,
@@ -766,7 +766,7 @@ pub(super) fn emit_family_h_boundary(
         vgrp_w = sb.gate(cs.macs, &[vgrp_w, ow, wv(vi)])[0];
     }
     let v_w = sb.gate(cs.macs, &[vrs_w, ow, vgrp_w])[0];
-    let rhs_v_w = sb.gate(cs.macs, &[zw, wv(inner_pd.q_v), v_w])[0];
+    let rhs_v_w = sb.gate(cs.macs, &[zw, wv(q_v), v_w])[0];
     sb.connect(runw, rhs_v_w);
     (tgt_w, runw)
 }

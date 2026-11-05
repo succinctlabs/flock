@@ -9,6 +9,7 @@ use flock_core::{
     lincheck::{LincheckCircuit, MatrixAssertion, SkipPoint, build_eq_table},
     matrix_fold::{JaggedAssertion, JaggedRowWeight},
     pcs::{
+        MergedInnerOpen,
         jagged::{
             JaggedParams, MultipointTwistedProof, STATE_INITIAL, STATE_SUCCESS, assist_boundaries,
             assist_sparse_transitions, frob_inv,
@@ -41,14 +42,15 @@ use crate::{
     tower::{
         CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind, InnerPd,
         LeafEvalGate, LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner, MixedProof, MpRec,
-        OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ag_seed_bytes,
-        assertion_mac, bytes_payload_mask, cap_payloads, cap_wires, check_residual_publics,
-        circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
-        emit_boolean_reported_check, emit_element_reported_check, emit_fiat_shamir_chain,
-        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region, flatten_ops,
-        level_geometry, level_sources, observed_f256, pack8, parse_open_levels, payload_words,
-        pin_recombination, query_phase_blake3_rows, replay_ligerito_spine256, squeeze_word_wire,
-        strat_scheds, walker_common,
+        OpenLevel, PdRec, PrefixGate, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire,
+        affine_walk::{AffineInner, AffineSlots, emit_affine_inner, rho_wires},
+        ag_seed_bytes, assertion_mac, bytes_payload_mask, cap_payloads, cap_wires,
+        check_residual_publics, circuit_structure_claim_wires, cw, declare_envelope_slots,
+        decode_ag_point, emit_boolean_reported_check, emit_element_reported_check,
+        emit_fiat_shamir_chain, emit_publics_hash, emit_query_phase, emit_recombination,
+        emit_residual_region, flatten_ops, level_geometry, level_sources, observed_f256, pack8,
+        parse_open_levels, payload_words, pin_recombination, query_phase_blake3_rows,
+        replay_ligerito_spine256, squeeze_word_wire, strat_scheds, walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -91,7 +93,12 @@ pub(super) struct ChildTape<'p> {
     pub(super) w_coords: Vec<RoundRec>,
     pub(super) w_resid: Vec<RoundRec>,
     mp_o: MpRec,
-    inner_pd2: InnerPd,
+    /// The split inner's packed-direct intake (`None` on an affine inner).
+    inner_pd2: Option<InnerPd>,
+    /// Value index of the inner opening's `q_eval`.
+    pub(super) q_v: usize,
+    /// The affine inner, when the child's PCS opens with the affine fold.
+    pub(super) affine: Option<AffineInner<'p>>,
     yr_v2: usize,
     pub(super) yr_len: usize,
     pub(super) levels: Vec<OpenLevel>,
@@ -211,7 +218,9 @@ struct ChainOpenParse<'p> {
     gammas_o: Vec<PdRec>,
     w_rounds: Vec<RoundRec>,
     mp_o: MpRec,
-    inner_pd2: InnerPd,
+    inner_pd2: Option<InnerPd>,
+    q_v: usize,
+    affine: Option<AffineInner<'p>>,
     yr_v2: usize,
     levels: Vec<OpenLevel>,
     geo: Vec<Lvl>,
@@ -332,6 +341,8 @@ impl<'p> ChildTape<'p> {
             w_rounds,
             mp_o,
             inner_pd2,
+            q_v,
+            affine,
             yr_v2,
             levels,
             geo,
@@ -347,18 +358,21 @@ impl<'p> ChildTape<'p> {
         }
 
         let (native_target, native_running) = Self::parse_merged_intake_natives(
-            &vals_rec, &chals, &rs_recs, rs_gam_ch, &gammas_o, &w_rounds, fro, &inner_pd2,
+            &vals_rec, &chals, &rs_recs, rs_gam_ch, &gammas_o, &w_rounds, fro, q_v,
         );
 
-        // ---- the spine's native quad replay ----
-        let t_final_n = replay_ligerito_spine256(
-            &levels,
-            &vals_rec,
-            &chals,
-            start_v,
-            chals[inner_pd2.ch] * vals_rec[inner_pd2.q_v],
-            &native_sums,
-        );
+        // ---- the split spine's native quad replay (the affine inner
+        // closes in-circuit: no native endpoint is published) ----
+        let t_final_n = inner_pd2.as_ref().map_or(F256::ZERO, |pd| {
+            replay_ligerito_spine256(
+                &levels,
+                &vals_rec,
+                &chals,
+                start_v,
+                chals[pd.ch] * vals_rec[pd.q_v],
+                &native_sums,
+            )
+        });
 
         let anc_end_n = walker_common::parse_anchor_native_endpoint(&vals_rec, &chals, &mp_o);
 
@@ -919,8 +933,11 @@ impl<'p> ChildTape<'p> {
             );
         }
 
-        let (yr_len, w_resid) =
-            walker_common::parse_residual_rotation(proof, &geo, &levels, &w_coords);
+        let (yr_len, w_resid) = if affine.is_some() {
+            (0, Vec::new())
+        } else {
+            walker_common::parse_residual_rotation(proof, &geo, &levels, &w_coords)
+        };
 
         let z_ix = el_assert.as_ref().map(|assertion| {
             gammas_o
@@ -950,6 +967,8 @@ impl<'p> ChildTape<'p> {
             w_resid,
             mp_o,
             inner_pd2,
+            q_v,
+            affine,
             yr_v2,
             yr_len,
             levels,
@@ -1480,15 +1499,55 @@ impl<'p> ChildTape<'p> {
             ops,
             chals,
         );
-        let lig = &proof.pcs_open().inner.split().ligerito;
-        assert_eq!(
-            inner.commitment.cap, lig.initial_cap,
-            "commitment IS the L0 cap"
-        );
-        let r_lvl = lig.recursive_caps.len();
-        let lvl_src = level_sources(lig);
-        let (start_v, piop_o, gammas_o, w_rounds, mp_o, inner_pd2, yr_v2, levels) =
-            parse_open_levels(ops, 32 * lig.initial_cap.len(), r_lvl);
+        let mut split_levels: Option<(usize, Vec<OpenLevel>)> = None;
+        // The inner opening: the split F256 ladder or the affine F128 fold.
+        // Either way the merged-open prefix (pd gammas, W-rounds, the
+        // multipoint assist) is the same; only the levels differ.
+        let (lvl_src, start_v, piop_o, gammas_o, w_rounds, mp_o, inner_pd2, q_v, affine) =
+            match &proof.pcs_open().inner {
+                MergedInnerOpen::Split(p) => {
+                    let lig = &p.ligerito;
+                    assert_eq!(
+                        inner.commitment.cap, lig.initial_cap,
+                        "commitment IS the L0 cap"
+                    );
+                    let r_lvl = lig.recursive_caps.len();
+                    let lvl_src = level_sources(lig);
+                    let (start_v, piop_o, gammas_o, w_rounds, mp_o, inner_pd2, yr_v2, levels) =
+                        parse_open_levels(ops, 32 * lig.initial_cap.len(), r_lvl);
+                    let q_v = inner_pd2.q_v;
+                    split_levels = Some((yr_v2, levels));
+                    (
+                        lvl_src,
+                        start_v,
+                        piop_o,
+                        gammas_o,
+                        w_rounds,
+                        mp_o,
+                        Some(inner_pd2),
+                        q_v,
+                        None,
+                    )
+                }
+                MergedInnerOpen::Affine(p) => {
+                    assert_eq!(
+                        inner.commitment.cap, p.initial_cap,
+                        "commitment IS the L0 cap"
+                    );
+                    let (ai, pre) = AffineInner::parse(ops, p, chals, &inner.pcs);
+                    (
+                        ai.lvl_src.clone(),
+                        0,
+                        pre.piop,
+                        pre.gammas,
+                        pre.rounds,
+                        pre.mp,
+                        None,
+                        ai.q_v,
+                        Some(ai),
+                    )
+                }
+            };
         assert_eq!(
             piop_o.is_some(),
             has_el,
@@ -1499,14 +1558,20 @@ impl<'p> ChildTape<'p> {
             pd_recs.len(),
             "the parser and the region walk agree on the pd claims"
         );
-        let (geo, native_sums) = level_geometry(
-            &levels,
-            &lvl_src,
-            chals,
-            HashKind::Blake3,
-            &strat_scheds(&inner.pcs),
-        );
-        let b3_rows = trace.rows.len() + h_rows + query_phase_blake3_rows(&geo);
+        let (yr_v2, levels) = split_levels.unwrap_or_default();
+        let (geo, native_sums) = if affine.is_some() {
+            (Vec::new(), Vec::new())
+        } else {
+            level_geometry(
+                &levels,
+                &lvl_src,
+                chals,
+                HashKind::Blake3,
+                &strat_scheds(&inner.pcs),
+            )
+        };
+        let open_geo = affine.as_ref().map_or(&geo, |ai| &ai.geo);
+        let b3_rows = trace.rows.len() + h_rows + query_phase_blake3_rows(open_geo);
         if var("B3_CENSUS").is_ok() {
             let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
             let blocks = trace.rows.len() - parents;
@@ -1521,9 +1586,9 @@ impl<'p> ChildTape<'p> {
                 b3_rows - trace.rows.len() - h_rows,
                 b3_rows
             );
-            walker_common::census_levels_and_chain_rows(ops, t_shape, domain, &geo, &trace);
+            walker_common::census_levels_and_chain_rows(ops, t_shape, domain, open_geo, &trace);
         }
-        let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
+        let spread_w = open_geo.iter().map(|g| g.depth).max().unwrap().max(1);
         // Recursive caps are PROOF BODY — the in-circuit cap trees bind them
         // (chain + root connects, nothing checker-read); only the L0 cap —
         // the commitment — stays a statement public.
@@ -1539,6 +1604,8 @@ impl<'p> ChildTape<'p> {
             w_rounds,
             mp_o,
             inner_pd2,
+            q_v,
+            affine,
             yr_v2,
             levels,
             geo,
@@ -1559,7 +1626,7 @@ impl<'p> ChildTape<'p> {
         gammas_o: &[PdRec],
         w_rounds: &[RoundRec],
         fro: &MultipointTwistedProof,
-        inner_pd2: &InnerPd,
+        q_v: usize,
     ) -> (F128, F128) {
         let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch + k]).collect();
         let mut target = F128::ZERO;
@@ -1604,7 +1671,7 @@ impl<'p> ChildTape<'p> {
         }
         assert_eq!(
             running,
-            vals_rec[inner_pd2.q_v] * big_v,
+            vals_rec[q_v] * big_v,
             "the R=2 + P merged boundary replays"
         );
         (target, running)
@@ -1722,6 +1789,10 @@ pub(super) struct ChildSlots {
     /// `1000 + width` = base/extension prefix gates; and `880..=882` = the
     /// three shared extension-field residual relations.
     pub(super) resid: Vec<(usize, SlotId)>,
+    /// The affine inner's slots ([`AffineSlots`]); on the envelope path,
+    /// pre-declared and frozen, with their envelope keys in `affine_keyed`.
+    pub(super) affine: AffineSlots,
+    pub(super) affine_keyed: Vec<(usize, SlotId)>,
 }
 
 impl ChildSlots {
@@ -1767,6 +1838,8 @@ impl ChildSlots {
             // emit_residual_region's close-out rows land on the same slot
             // instead of registering a duplicate type.
             resid: vec![(600, macs), (701, mac256)],
+            affine: AffineSlots::new(),
+            affine_keyed: Vec::new(),
         }
     }
 
@@ -1785,9 +1858,16 @@ impl ChildSlots {
                 .expect("an envelope slot")
                 .1
         };
+        let affine_keys = env.affine.keys();
         ChildSlots {
             nu: nu2,
             q,
+            affine: AffineSlots::from_cache(&cache, &env.affine),
+            affine_keyed: cache
+                .iter()
+                .filter(|e| affine_keys.contains(&e.0))
+                .copied()
+                .collect(),
             macs: take(600),
             fold_macs: take(602),
             zcr: take(500),
@@ -1827,6 +1907,7 @@ impl ChildSlots {
         ];
         v.extend(self.le.iter().map(|&(n, s)| (n, s)));
         v.extend(self.resid.iter().filter(|&&(k, _)| k != 600).cloned());
+        v.extend(self.affine_keyed.iter().copied());
         v
     }
 
@@ -1849,6 +1930,7 @@ impl ChildSlots {
                 .filter(|&&(k, _)| k != 600)
                 .map(|&(_, s)| s),
         );
+        v.extend(self.affine.owned_slots());
         v
     }
 }
@@ -1878,6 +1960,9 @@ pub(super) fn expected_child_tail_schedule(ct: &ChildTape<'_>) -> Vec<(&'static 
             .iter()
             .map(|(combo, dense)| usize::from(combo.is_some()) + dense.len())
             .sum::<usize>();
+    // The split inner publishes its spine endpoint and residual inner; the
+    // affine inner closes in-circuit and publishes neither.
+    let split_w = |w: usize| if ct.affine.is_some() { 0 } else { w };
     vec![
         ("chain ordinals ga+mg", 2),
         (
@@ -1885,11 +1970,11 @@ pub(super) fn expected_child_tail_schedule(ct: &ChildTape<'_>) -> Vec<(&'static 
             if ct.el_assert.is_some() { 2 } else { 0 },
         ),
         ("anchor end", 1),
-        ("spine t_final", 2),
+        ("spine t_final", split_w(2)),
         ("intake target", 1),
         ("intake running", 1),
         ("residual accs", 2 * ct.levels.len() * ct.yr_len),
-        ("residual inner", 2),
+        ("residual inner", split_w(2)),
         ("sigma value", 1),
         ("sigma point", ct.mu_i),
         ("jagged claim values", jag_vals),
@@ -2001,22 +2086,26 @@ pub(super) fn emit_child_region(
     );
     let pub_w = emit_h_publics_region(sb, child_q, iv2, ct, stream, &ww, vals, consts);
     let cap_w = cap_wires(stream, &ww, &ct.cap_pays);
-    let (to_publish, level_accs, query_positions) = emit_query_phase(
-        sb,
-        child_q,
-        iv2,
-        &leafeval,
-        levels,
-        geo,
-        &ct.lvl_src,
-        trace,
-        &outs,
-        chals,
-        &cap_w,
-        vals,
-        consts,
-        hints,
-    );
+    let (to_publish, level_accs, query_positions) = if ct.affine.is_some() {
+        (Vec::new(), Vec::new(), Vec::new())
+    } else {
+        emit_query_phase(
+            sb,
+            child_q,
+            iv2,
+            &leafeval,
+            levels,
+            geo,
+            &ct.lvl_src,
+            trace,
+            &outs,
+            chals,
+            &cap_w,
+            vals,
+            consts,
+            hints,
+        )
+    };
     let ga_w = outs[trace.squeezes[ct.ga_fin][0]][0];
     let mg_w = outs[trace.squeezes[ct.mg_fin][0]][0];
 
@@ -2056,21 +2145,45 @@ pub(super) fn emit_child_region(
         sb, cs, trace, &outs, &wv, &ct.mp_o, ct.m_mp2, zw, ow,
     );
 
-    let t_final = emit_ligerito_spine(sb, cs, ct, trace, &outs, &wv, &level_accs, zw, ow);
-
-    let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region_shared(
-        sb,
-        cs,
-        ct,
-        trace,
-        &outs,
-        &wv,
-        &to_publish,
-        &query_positions,
-        t_final,
-        zw,
-        ow,
-    );
+    let (t_final, resid_pub, inner_w, (pfslot, pf_w)) = if let Some(ai) = &ct.affine {
+        let rho_w = rho_wires(&ct.w_coords, &outs, trace);
+        emit_affine_inner(
+            sb,
+            &mut cs.affine,
+            child_q,
+            iv2,
+            ai,
+            trace,
+            &outs,
+            &wv,
+            chals,
+            &rho_w,
+            &cap_w,
+            vals,
+            consts,
+            hints,
+            zw,
+            ow,
+            zassert,
+        );
+        (None, Vec::new(), None, base_prefix_slot(sb, cs))
+    } else {
+        let t_final = emit_ligerito_spine(sb, cs, ct, trace, &outs, &wv, &level_accs, zw, ow);
+        let (resid_pub, inner_w, pf) = emit_residual_region_shared(
+            sb,
+            cs,
+            ct,
+            trace,
+            &outs,
+            &wv,
+            &to_publish,
+            &query_positions,
+            t_final,
+            zw,
+            ow,
+        );
+        (Some(t_final), resid_pub, Some(inner_w), pf)
+    };
 
     let (tgt_w, runw) = emit_family_h_and_intake_boundary(
         sb, cs, ct, trace, &outs, &wv, pfslot, pf_w, vals, consts, zw, ow,
@@ -2256,14 +2369,20 @@ pub(super) fn emit_child_region(
             el_pub.map_or_else(Vec::new, |(el_zr, el_lcw, _, _, _)| vec![el_zr, el_lcw]),
         ),
         TailEntry::new("anchor end", vec![anc_w]),
-        TailEntry::new("spine t_final", t_final.to_vec()),
+        TailEntry::new(
+            "spine t_final",
+            t_final.map_or_else(Vec::new, |t| t.to_vec()),
+        ),
         TailEntry::new("intake target", vec![tgt_w]),
         TailEntry::new("intake running", vec![runw]),
         TailEntry::new(
             "residual accs",
             resid_pub.iter().flatten().flatten().copied().collect(),
         ),
-        TailEntry::new("residual inner", inner_w.to_vec()),
+        TailEntry::new(
+            "residual inner",
+            inner_w.map_or_else(Vec::new, |w| w.to_vec()),
+        ),
         // The SIGMA ASSERTION emission (route B, in-circuit): the value
         // is the deferred s_sigma stream word — the SAME wire the rhs
         // input check just consumed — and the point is the GKR's own
@@ -2462,12 +2581,30 @@ fn emit_ligerito_spine(
         trace,
         wv,
         &ct.levels,
-        &ct.inner_pd2,
+        ct.inner_pd2
+            .as_ref()
+            .expect("the split spine walks the split intake"),
         ct.start_v,
         level_accs,
         zw,
         ow,
     )
+}
+
+/// The shared base-field prefix slot (key `310 + 8`) the family-H and
+/// anchor-expect arithmetic ride. The split residual region hands it back;
+/// an affine child finds (or, off the envelope, creates) it here.
+pub(super) fn base_prefix_slot(sb: &mut ShapeBuilder, cs: &mut ChildSlots) -> (SlotId, usize) {
+    const PF_W: usize = 8;
+    let s = match cs.resid.iter().find(|&&(k, _)| k == 310 + PF_W) {
+        Some(&(_, s)) => s,
+        None => {
+            let s = sb.slot(PrefixGate::new(PF_W));
+            cs.resid.push((310 + PF_W, s));
+            s
+        }
+    };
+    (s, PF_W)
 }
 
 /// ---- the RESIDUAL region (shared emitter) ----
@@ -2488,7 +2625,10 @@ fn emit_residual_region_shared(
 ) -> (Vec<Vec<[Wire; 2]>>, [Wire; 2], (SlotId, usize)) {
     let levels = &ct.levels[..];
     let geo = &ct.geo[..];
-    let inner_pd2 = &ct.inner_pd2;
+    let inner_pd2 = ct
+        .inner_pd2
+        .as_ref()
+        .expect("the split residual walks the split intake");
     let yr_wires: Vec<[Wire; 2]> = (0..ct.yr_len)
         .map(|y| [wv(ct.yr_v2 + 2 * y), wv(ct.yr_v2 + 2 * y + 1)])
         .collect();
@@ -2546,7 +2686,7 @@ fn emit_family_h_and_intake_boundary(
         &ct.mp_o,
         &ct.gammas_o,
         &ct.w_rounds,
-        &ct.inner_pd2,
+        ct.q_v,
         pfslot,
         pf_w,
         vals,
@@ -2949,43 +3089,50 @@ pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildR
         "the anchor rounds end at the native claim"
     );
     // THE LIGERITO CLOSE: the in-circuit spine reaches the native t_r.
-    assert_eq!(
-        F256::new(public[mp_base + 1], public[mp_base + 2]),
-        ct.t_final_n,
-        "the spine's final t_r matches the native replay"
-    );
+    // (An affine inner closes in-circuit and publishes no endpoint.)
+    let split = ct.affine.is_none();
+    let sp = if split { 2 } else { 0 };
+    if split {
+        assert_eq!(
+            F256::new(public[mp_base + 1], public[mp_base + 2]),
+            ct.t_final_n,
+            "the spine's final t_r matches the native replay"
+        );
+    }
     // The merged intake is fully constrained; its publications retain the
     // native replay as a test oracle.
     assert_eq!(
-        public[mp_base + 3],
+        public[mp_base + 1 + sp],
         ct.native_target,
         "the computed RS target matches the native gamma-combination"
     );
     assert_eq!(
-        public[mp_base + 4],
+        public[mp_base + 2 + sp],
         ct.native_running,
         "the W-rounds fold the target to the native running claim"
     );
     // The residual region against the shared native replica — and THE
     // CLOSURE: the residual-side inner and the spine's t_r are the same
     // statement scalar, both held against published circuit outputs.
-    let inner_n = check_residual_publics(
-        public,
-        mp_base + 5,
-        &ct.levels,
-        &ct.geo,
-        &ct.w_resid,
-        ct.inner_pd2.ch,
-        &observed_f256(&ct.vals_rec, ct.yr_v2, ct.yr_len),
-        chals,
-    );
-    assert_eq!(
-        inner_n, ct.t_final_n,
-        "inner == t_r: the mixed statement closes"
-    );
+    if split {
+        let inner_n = check_residual_publics(
+            public,
+            mp_base + 5,
+            &ct.levels,
+            &ct.geo,
+            &ct.w_resid,
+            ct.inner_pd2.as_ref().expect("split intake").ch,
+            &observed_f256(&ct.vals_rec, ct.yr_v2, ct.yr_len),
+            chals,
+        );
+        assert_eq!(
+            inner_n, ct.t_final_n,
+            "inner == t_r: the mixed statement closes"
+        );
+    }
     // The sigma assertion, as the accumulator would read it: the value and
     // the mu point coordinates, matched against the native claim.
-    let sig_base = mp_base + 5 + 2 * ct.levels.len() * ct.yr_len + 2;
+    let sig_base = mp_base + 3 + 2 * sp + 2 * ct.levels.len() * ct.yr_len;
     assert_eq!(
         public[sig_base],
         ct.inner.proof.wiring().gkr.s_sigma_eval,

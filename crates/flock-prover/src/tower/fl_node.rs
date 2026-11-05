@@ -24,7 +24,8 @@ use flock_transcript::transcript_record::{RecordingChallenger, StreamWord, Trans
 #[cfg(test)]
 use {
     crate::tower::{
-        ChainLane, build_chain_proof, build_node_outer_app, gates_blake3::Rng, test_config,
+        ChainLane, DEV_BLOCKS, build_chain_proof, build_node_outer_app, gates_blake3::Rng,
+        test_config,
     },
     bincode::serialize,
     std::array::from_fn,
@@ -371,7 +372,9 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
         );
         assert_chain_replays(&ops, &trace, chals);
 
-        let env = envelope_shape();
+        // The affine slot layouts are the chain leaf's plus the outer's;
+        // every outer of this tower declares the same list.
+        let env = envelope_shape().with_affine(&cp0.inner.pcs, cfg.outer_profile());
         let split_b3 = tapes.len() == 2;
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = tapes[0].b3_rows;
@@ -1283,6 +1286,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
                 spread_slot: spread_ri,
                 pow_slot: pow_ri,
                 family_slot: family_ri,
+                affine_env: env.affine.clone(),
             },
             acc: acc_pub,
             stmt_base,
@@ -1302,7 +1306,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn first_level_node_two_chains_fold_and_adjacency() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_0004);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);

@@ -36,7 +36,8 @@ use flock_field::{F128, F256};
 use flock_merkle::HashKind;
 #[cfg(test)]
 use {
-    crate::tower::config::test_config, crate::tower::fl_node::chain_jagged_params,
+    crate::tower::config::{DEV_BLOCKS, test_config},
+    crate::tower::fl_node::chain_jagged_params,
     crate::tower::node::node_jagged_params,
 };
 
@@ -129,8 +130,10 @@ use crate::{
 #[cfg(test)]
 mod affine_fixture;
 mod affine_fold;
+mod affine_gates;
 mod affine_query;
 mod affine_residual;
+mod affine_walk;
 mod chain;
 mod child_walker;
 mod config;

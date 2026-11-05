@@ -13,8 +13,8 @@ use flock_core::{
 use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
-        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, RootBundle,
-        RootDischargeFailure, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
+        ChainLane, ChainProof, DEV_BLOCKS, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online,
+        RootBundle, RootDischargeFailure, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
         UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
         chain_blake_r1cs, chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base,
         env_pass_base,
@@ -64,7 +64,7 @@ pub(super) fn chain_spine_converges() {
     let cfg = test_config();
 
     let env = envelope_shape();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_5B1E);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let mut cps = Vec::new();
@@ -425,7 +425,7 @@ pub(super) fn chain_spine_converges() {
 pub(super) fn chain_tower_e2e_with_lane() {
     let cfg = test_config();
 
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_0007);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
@@ -795,7 +795,7 @@ pub(super) fn tower_online_bench() {
     let n_blocks: usize = var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(256);
+        .unwrap_or(DEV_BLOCKS);
     let mut rng = Rng(0xC4A1_00BE);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
 
@@ -993,7 +993,7 @@ pub(super) fn tower_online_bench() {
 #[ignore] // Heavy — eight chain proofs and seven outers via the driver.
 pub(super) fn tower_driver_e2e() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xD41_4E12);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
 
@@ -1107,7 +1107,7 @@ pub(super) fn tower_driver_e2e() {
 #[ignore] // Heavy — four towers (6+8+6+4 leaves) end to end.
 pub(super) fn tower_verify_root_e2e() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let env = envelope_shape();
     let vk = TowerVk::generate(cfg, n_blocks);
 
@@ -1286,7 +1286,7 @@ pub(super) fn tower_vk_fingerprint_pinned() {
         eprintln!("the fingerprint pin is chain128-only; skipping under {cfg:?}");
         return;
     }
-    let vk = TowerVk::generate(cfg, 256);
+    let vk = TowerVk::generate(cfg, DEV_BLOCKS);
     let fp = vk.fingerprint();
     let hex = |d: &[u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
     if var("TOWER_VK_FP_PRINT").is_ok() {
@@ -1298,7 +1298,7 @@ pub(super) fn tower_vk_fingerprint_pinned() {
         println!("outer_registry: {}", hex(&fp.outer_registry));
         println!("publics_len:    {}", fp.publics_len);
     }
-    assert_eq!(fp.blocks_per_leaf, 256);
+    assert_eq!(fp.blocks_per_leaf, DEV_BLOCKS);
     assert_eq!(hex(&fp.chain_circuit), PIN_CHAIN_CIRCUIT, "chain circuit");
     assert_eq!(hex(&fp.fl_circuit), PIN_FL_CIRCUIT, "FL circuit");
     assert_eq!(hex(&fp.base_circuit), PIN_BASE_CIRCUIT, "base circuit");

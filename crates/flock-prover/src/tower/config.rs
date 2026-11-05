@@ -44,17 +44,24 @@ impl TowerConfig {
     pub fn leaf_profile(self) -> LigeritoProfile {
         match self {
             TowerConfig::Chain100 => LigeritoProfile::Fast100,
-            TowerConfig::Chain128 => LigeritoProfile::Fast,
+            TowerConfig::Chain128 => LigeritoProfile::FastAffine,
         }
     }
     /// The recursion-path OUTER profile (rate 1/4, envelope-ON).
     pub fn outer_profile(self) -> LigeritoProfile {
         match self {
             TowerConfig::Chain100 => LigeritoProfile::Slim100,
-            TowerConfig::Chain128 => LigeritoProfile::Slim,
+            TowerConfig::Chain128 => LigeritoProfile::SlimAffine,
         }
     }
 }
+
+/// The chain-leaf length the tower tests run at: 1024 blocks is the
+/// smallest leaf (`(Fast, log_n 17, initial_k 6)`, m = 24) with a
+/// certified affine ladder — at 256 blocks the affine fold bound has no
+/// valid certificate (`scripts/affine_fold_params.py`).
+#[cfg(test)]
+pub(super) const DEV_BLOCKS: usize = 1024;
 
 /// Bench/test knob: which production tower the ignored tower tests and
 /// benches exercise. `TOWER_CONFIG=chain100` selects [`TowerConfig::Chain100`];

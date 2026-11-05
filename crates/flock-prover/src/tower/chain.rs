@@ -21,7 +21,7 @@ use {
     crate::{
         r1cs_hashes::blake3::{Compression, build_block_r1cs},
         tower::{
-            ChildSlots, ChildTape, SLOT_WORDS, check_child_region, emit_child_region,
+            ChildSlots, ChildTape, DEV_BLOCKS, SLOT_WORDS, check_child_region, emit_child_region,
             expected_child_tail_schedule, gates_blake3::Rng, test_config,
         },
     },
@@ -601,7 +601,7 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn chain_leaf_ag_roundtrip() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_00A6);
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
 
@@ -715,7 +715,7 @@ pub(super) fn chain_leaf_ag_roundtrip() {
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_0002);
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
 
@@ -858,7 +858,7 @@ pub(super) fn chain_tape_regions_pinned() {
     let cfg = test_config();
     let mut rng = Rng(0xC4A1_0003);
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let cp = build_chain_proof(cfg, h_start, n_blocks);
     let ct = ChildTape::new(&cp.inner, DOMAIN);
 
@@ -896,8 +896,8 @@ pub(super) fn chain_tape_regions_pinned() {
         ct.mu_i,
         cp.inner.proof.wiring().gkr.layers.len(),
         ct.b3_rows,
-        ct.geo[0].lanes,
-        ct.geo[0].row_words,
+        ct.affine.as_ref().expect("affine leaf").geo[0].lanes,
+        ct.affine.as_ref().expect("affine leaf").geo[0].row_words,
     );
 }
 
@@ -908,7 +908,7 @@ pub(super) fn chain_child_region_emits_alone() {
     let cfg = test_config();
     let mut rng = Rng(0xC4A1_0005);
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
-    let cp = build_chain_proof(cfg, h_start, 256);
+    let cp = build_chain_proof(cfg, h_start, DEV_BLOCKS);
     let ct = ChildTape::new(&cp.inner, DOMAIN);
     let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
     let mut sb = ShapeBuilder::new(nu2);

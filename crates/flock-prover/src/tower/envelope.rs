@@ -3,14 +3,15 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use flock_core::circuit::builder::SlotId;
+use flock_core::{circuit::builder::SlotId, pcs::ligerito::embedded_initial_k_or_default};
 
 use crate::tower::{
     AssistLayerGate, BitSpreadGate, BitSpreadTable, Blake3Gate, CollapsedSlots, F128,
-    FamilyTransposeTileGate, GateType, LeafEvalGate, LeafEvalGate256, MacGate, MacGate256,
-    MergedRoundGate, PowMaskGate, PrefixGate, PrefixGate256, ResidualAccGate256,
-    ResidualPrefix3Gate256, ResidualWeightsGate256, SLOT_WORDS, ShapeBuilder, SpineGate,
-    SpineGate256, SwapGate, UnionInstance, Wire, ZcRoundGate, cw,
+    FamilyTransposeTileGate, GateType, HashKind, LeafEvalGate, LeafEvalGate256, LigeritoProfile,
+    MacGate, MacGate256, MergedRoundGate, PcsParams, PowMaskGate, PrefixGate, PrefixGate256,
+    ResidualAccGate256, ResidualPrefix3Gate256, ResidualWeightsGate256, SLOT_WORDS, ShapeBuilder,
+    SpineGate, SpineGate256, SwapGate, UnionInstance, Wire, ZcRoundGate,
+    affine_walk::AffineEnvLayouts, config::ENVELOPE_FLOOR_M, cw,
 };
 
 /// Wall 2's registry-geometry constants at the settled envelope (slim,
@@ -54,6 +55,33 @@ pub(super) struct EnvShape {
     /// one aggregate of a child's layout that stays circuit structure
     /// under FREE COUNTS.
     pub(super) lanes: usize,
+    /// The affine inner's slot layouts ([`AffineEnvLayouts::of`]): the
+    /// union of the chain leaf's and the envelope outer's, so every outer
+    /// of one tower declares the same types. Empty for split-profile
+    /// towers; set by the builders through [`EnvShape::with_affine`].
+    pub(super) affine: AffineEnvLayouts,
+}
+
+impl EnvShape {
+    /// This envelope with the affine layouts of a tower whose chain leaf
+    /// commits under `leaf` and whose outers prove under `outer_profile`.
+    pub(super) fn with_affine(mut self, leaf: &PcsParams, outer_profile: LigeritoProfile) -> Self {
+        self.affine = AffineEnvLayouts::of(&[leaf, &self.outer_params(outer_profile)]);
+        self
+    }
+
+    /// The envelope outer's commitment parameters: the m* floor at the
+    /// profile's own interleave, `lanes*` lanes.
+    pub(super) fn outer_params(&self, profile: LigeritoProfile) -> PcsParams {
+        PcsParams {
+            m: ENVELOPE_FLOOR_M,
+            log_inv_rate: profile.log_inv_rate(),
+            log_batch_size: embedded_initial_k_or_default(ENVELOPE_FLOOR_M, profile),
+            profile,
+            num_lanes: Some(self.lanes),
+            merkle_hash: HashKind::Blake3,
+        }
+    }
 }
 
 /// The APPLICATION STATEMENT's width in the envelope's public segment:
@@ -292,6 +320,7 @@ pub(super) fn envelope_shape() -> EnvShape {
         // lanes; 31 stays below `2^initial_k = 32`, so children remain
         // lane-major.
         lanes: 31,
+        affine: AffineEnvLayouts::default(),
     }
 }
 
@@ -366,6 +395,7 @@ pub(super) fn declare_envelope_slots(
     slot_cached(sb, cache, 882, ResidualAccGate256::new);
     slot_cached(sb, cache, 310 + env.pf_w, || PrefixGate::new(env.pf_w));
     slot_cached(sb, cache, 1000 + env.pf_w, || PrefixGate256::new(env.pf_w));
+    env.affine.declare(sb, cache);
     q
 }
 
@@ -468,7 +498,13 @@ pub(super) fn pad_envelope_counts(
     pad(
         sb, hints, &mut over, "family", family, t_family, false, None,
     );
-    for &(key, count) in &env.counts_el {
+    let affine_keys = env.affine.keys();
+    let keys = env
+        .counts_el
+        .iter()
+        .map(|&(k, c)| (k, c))
+        .chain(affine_keys.iter().map(|&k| (k, 0)));
+    for (key, count) in keys {
         let &(_, s) = cache
             .iter()
             .find(|&&(k, _)| k == key)
@@ -494,7 +530,7 @@ pub(super) fn pad_envelope_counts(
     let stray: Vec<usize> = cache
         .iter()
         .map(|&(k, _)| k)
-        .filter(|k| !env.counts_el.iter().any(|&(c, _)| c == *k))
+        .filter(|k| !env.counts_el.iter().any(|&(c, _)| c == *k) && !affine_keys.contains(k))
         .collect();
     assert!(
         stray.is_empty(),

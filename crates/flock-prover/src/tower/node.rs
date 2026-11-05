@@ -29,8 +29,8 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 #[cfg(test)]
 use {
     crate::tower::{
-        build_chain_proof, build_first_level_node, gates_blake3::Rng, native_chain, pack4,
-        test_config,
+        DEV_BLOCKS, build_chain_proof, build_first_level_node, gates_blake3::Rng, native_chain,
+        pack4, test_config,
     },
     std::array::from_fn,
 };
@@ -791,7 +791,15 @@ pub fn build_node_outer_app(
         );
         assert_chain_replays(&ops, &trace, chals);
 
-        let env = envelope_shape();
+        // The affine layouts are the tower's (the FL computed them from the
+        // chain leaf): every child carries the same list, and so does this
+        // node.
+        let mut env = envelope_shape();
+        env.affine = los[0].affine_env.clone();
+        assert!(
+            los.iter().all(|lo| lo.affine_env == env.affine),
+            "every child declares the tower's affine layouts"
+        );
         let split_b3 = n_kids == 2;
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = rts[0].b3_rows;
@@ -2696,6 +2704,7 @@ pub fn build_node_outer_app(
                 spread_r1cs: spread_r1cs2,
                 pow_r1cs: pow_r1cs2,
                 family_r1cs: family_r1cs2,
+                affine_env: env.affine.clone(),
                 b3_slots: b3_slots2,
                 swap_slot: swap_slot2,
                 spread_slot: spread_slot2,
@@ -2738,7 +2747,7 @@ pub fn build_node_outer_app(
 #[ignore] // Heavier — builds two chain leaves + one FL node.
 pub(super) fn real_tape_regions_pinned() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_0007);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
@@ -2831,27 +2840,30 @@ pub(super) fn real_tape_regions_pinned() {
 
     // Structural counts against the PROOF OBJECT, not the parse.
     let open = fl.lo.proof.pcs_open();
-    let lig = &open.inner.split().ligerito;
+    let flock_core::pcs::MergedInnerOpen::Affine(aff) = &open.inner else {
+        panic!("the tower's outers open with the affine fold")
+    };
+    let ai = rt
+        .affine
+        .as_ref()
+        .expect("the tape parses the affine inner");
+    let n_levels = ai.levels.len();
     assert_eq!(
-        rt.levels.len(),
-        lig.recursive_caps.len() + 1,
+        n_levels,
+        aff.recursive_caps.len() + 1,
         "one open level per recursive cap plus the base"
     );
-    assert_eq!(rt.levels.len(), rt.geo.len(), "one geometry per open level");
+    assert_eq!(n_levels, ai.geo.len(), "one geometry per open level");
+    assert_eq!(n_levels, rt.lvl_src.len(), "one source triple per level");
     assert_eq!(
-        rt.levels.len(),
-        rt.lvl_src.len(),
-        "one source triple per level"
-    );
-    assert_eq!(
-        rt.levels.len(),
+        n_levels,
         rt.cap_pays.len(),
         "one public cap payload per level"
     );
     assert_eq!(
-        rt.yr_len,
-        lig.final_proof.yr.len() / 2,
-        "the residual length is the proof's yr pairs"
+        (1usize << ai.cs[n_levels - 1]) + ai.ks[n_levels - 1],
+        aff.yr.len(),
+        "the final message is 2^c + k words"
     );
     assert_eq!(
         rt.rs_recs.len(),
@@ -2931,9 +2943,9 @@ pub(super) fn real_tape_regions_pinned() {
     println!(
         "\nREAL TAPE (FL leaf-outer as inner)\n           inner: dense_m {} | open levels {} | pows {} | yr {} | mu {}\n           zc rounds {} | lc rounds {} | betas {} | pd pts {} x {} | groups {}\n           b3 rows (tape model) {} | L0 lanes {} x {} words | pub slots (child) {}\n",
         union.dense_m(),
-        rt.levels.len(),
+        n_levels,
         rt.pows.len(),
-        rt.yr_len,
+        aff.yr.len(),
         rt.mu_i,
         rt.zc_rounds_b.len(),
         rt.lc_rounds_b.len(),
@@ -2942,8 +2954,8 @@ pub(super) fn real_tape_regions_pinned() {
         rt.pd_pts.first().map(|p| p.len()).unwrap_or(0),
         rt.groups_ix.len(),
         rt.b3_rows,
-        rt.geo[0].lanes,
-        rt.geo[0].row_words,
+        ai.geo[0].lanes,
+        ai.geo[0].row_words,
         rt.n_pub_slots_c,
     );
 }
@@ -2962,7 +2974,7 @@ pub(super) fn real_tape_regions_pinned() {
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn internal_node_over_two_first_level_nodes() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_0006);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
