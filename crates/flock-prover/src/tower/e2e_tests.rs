@@ -1272,7 +1272,7 @@ pub(super) fn tower_verify_root_e2e() {
     verify_root(&vk, t2.statement(), &t2.root_bundle()).expect("the k = 2 root verifies");
 }
 
-/// **THE VK'S PUBLISHED IDENTITY, PINNED** (chain128 @ 256-block
+/// **THE VK'S PUBLISHED IDENTITY, PINNED** (chain128 @ DEV_BLOCKS
 /// leaves): the digest fingerprint a consumer compares their locally
 /// generated VK against instead of trusting a shipped blob. Any
 /// deliberate shape change moves these — re-bless with
@@ -1320,14 +1320,14 @@ pub(super) fn tower_vk_fingerprint_pinned() {
     assert_eq!(fp.publics_len, PIN_PUBLICS_LEN, "publics length");
 }
 
-// The blessed chain128@256 fingerprint (see `tower_vk_fingerprint_pinned`).
-// Blessed 2026-09-07 (second cut: the grounded counter-base word)
-// (chain circuit + registries UNCHANGED by design; the three outer
-// circuits moved with the nine-word app block).
-const PIN_CHAIN_CIRCUIT: &str = "b8f442da32b9961612ccaf9acb39cadcd4592e913b2b208a1b9740d01c10e9c9";
-const PIN_FL_CIRCUIT: &str = "45c54e4003df6692d180ac70187b3ce5c34be259a7174f328d9ab95b6acb2f2a";
-const PIN_BASE_CIRCUIT: &str = "0c8d7382f9824b4fe4894786494e5887e8cad3af262eaf6655cb2116a7830153";
-const PIN_STEADY_CIRCUIT: &str = "fafab0ced83b6f778e799c926041fad49625cce69075093fe3305b7ffb5e22c7";
-const PIN_CHAIN_REGISTRY: &str = "3126c5ce825e8fc3942843c0548ba43964b1daa5751a834fcbbc1c3ab58e40fe";
-const PIN_OUTER_REGISTRY: &str = "acfbc7354af8436af480ea66609bb9b1cd0856b27426db2b4d8a69fe9014c10e";
+// The blessed chain128 fingerprint at DEV_BLOCKS = 1024-block leaves (see
+// `tower_vk_fingerprint_pinned`). Re-blessed 2026-11-05: the affine F128
+// inner (FastAffine leaf, SlimAffine outers) moves every digest; the
+// publics length is unchanged.
+const PIN_CHAIN_CIRCUIT: &str = "f7a065447042245cccc573887e714d1a9f754583a7d0f120c9753e51d6037fa3";
+const PIN_FL_CIRCUIT: &str = "e09cc16d7ba0a8b17cf21104ec543c7089261956b0ec6815e81634fde26aa906";
+const PIN_BASE_CIRCUIT: &str = "1d8cb89d2f265b1b658cccfc8ec3e0c8a58668df81ad8f29612435e08f21b54e";
+const PIN_STEADY_CIRCUIT: &str = "6b14ebbe9aa60265f95d714bcb49d0beaf3f136d1a044a5cd8b7f19842304858";
+const PIN_CHAIN_REGISTRY: &str = "c2a387fffa3d06ccf25e341c2faa4e5d9b62015fc3f74a8364206ff08abb24a3";
+const PIN_OUTER_REGISTRY: &str = "ddec75513eabfbfc6367ca1e69b05015217f2328ba4afefafba6c912a2c1ae8f";
 const PIN_PUBLICS_LEN: usize = 5684;
