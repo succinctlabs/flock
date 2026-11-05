@@ -22,6 +22,10 @@
 //! alpha wires, and the per-query sum by ONE [`AffineLeafGate`] row. No
 //! weight enters as checker-tier advice.
 //!
+//! The FINAL level has no overflow and no batching: each query's folded row
+//! must equal `Enc(yr)(x_q)` directly, one [`AffineFinalGate`] row per
+//! query, checked inside the row against a zero-wired input.
+//!
 //! Not yet consumed outside tests: the affine child walker wires these to
 //! the opening's leaf words and the FS chain's squeezes.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -154,16 +158,50 @@ fn fold_forms(vals: Vec<Option<Form>>, g: &[Form], rows: &mut Vec<Row>, next: &m
     cur.pop().flatten().unwrap_or_default()
 }
 
+/// The element table of a row program over `n_in` inputs: an input no row
+/// targets is a free wire; an input a row targets is CHECKED by it (the
+/// final gate's zero-wired column).
+fn build_table(n_in: usize, rows: &[Row], width: usize, what: &str) -> Arc<ElementTableType> {
+    let one = |f: &Form| -> Vec<(usize, F128)> { f.iter().map(|&c| (c, F128::ONE)).collect() };
+    let kappa = width.next_power_of_two().trailing_zeros().max(2) as usize;
+    let mut b = ElementTableBuilder::new(kappa);
+    for w in (0..n_in).filter(|&w| rows.iter().all(|r| r.out != w)) {
+        b.free_wire(w);
+    }
+    for r in rows {
+        if r.b.is_empty() {
+            b.linear(r.out, &one(&r.a));
+        } else {
+            b.mult_lin(r.out, &one(&r.a), &one(&r.b));
+        }
+    }
+    Arc::new(b.build().expect(what))
+}
+
+/// Evaluate a row program: inputs first, then every row that derives a
+/// column (a row that checks an input leaves the input as supplied).
+fn run_rows(rows: &[Row], width: usize, n_in: usize, inputs: &[F128]) -> Vec<F128> {
+    let mut z = vec![F128::ZERO; width];
+    z[..n_in].copy_from_slice(&inputs[..n_in]);
+    let sum = |z: &[F128], f: &Form| f.iter().fold(F128::ZERO, |acc, &c| acc + z[c]);
+    for r in rows.iter().filter(|r| r.out >= n_in) {
+        let a = sum(&z, &r.a);
+        z[r.out] = if r.b.is_empty() { a } else { a * sum(&z, &r.b) };
+    }
+    z
+}
+
+fn col(rows: &mut Vec<Row>, next: &mut usize, a: Form, b: Form) -> usize {
+    let out = *next;
+    *next += 1;
+    rows.push(Row { out, a, b });
+    out
+}
+
 impl AffineLeafGate {
     pub(super) fn new(lay: AffineLeafLayout) -> Self {
         let mut rows = Vec::new();
         let mut next = lay.n_in();
-        fn col(rows: &mut Vec<Row>, next: &mut usize, a: Form, b: Form) -> usize {
-            let out = *next;
-            *next += 1;
-            rows.push(Row { out, a, b });
-            out
-        }
         let g: Vec<Form> = (0..lay.k)
             .map(|j| {
                 let d = col(&mut rows, &mut next, vec![lay.beta(j)], vec![lay.x()]);
@@ -186,21 +224,8 @@ impl AffineLeafGate {
         let out = col(&mut rows, &mut next, vec![lay.acc(), m], vec![]);
         let width = out + 1;
 
-        let one = |f: &Form| -> Vec<(usize, F128)> { f.iter().map(|&c| (c, F128::ONE)).collect() };
-        let kappa = width.next_power_of_two().trailing_zeros().max(2) as usize;
-        let mut b = ElementTableBuilder::new(kappa);
-        for w in 0..lay.n_in() {
-            b.free_wire(w);
-        }
-        for r in &rows {
-            if r.b.is_empty() {
-                b.linear(r.out, &one(&r.a));
-            } else {
-                b.mult_lin(r.out, &one(&r.a), &one(&r.b));
-            }
-        }
         Self {
-            ty: Arc::new(b.build().expect("affine leaf gate")),
+            ty: build_table(lay.n_in(), &rows, width, "affine leaf gate"),
             lay,
             rows,
             width,
@@ -222,15 +247,113 @@ impl GateType for AffineLeafGate {
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
     fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
-        let mut z = vec![F128::ZERO; self.width];
-        z[..self.lay.n_in()].copy_from_slice(&inputs[..self.lay.n_in()]);
-        let sum = |z: &[F128], f: &Form| f.iter().fold(F128::ZERO, |acc, &c| acc + z[c]);
-        for r in &self.rows {
-            let a = sum(&z, &r.a);
-            z[r.out] = if r.b.is_empty() { a } else { a * sum(&z, &r.b) };
-        }
+        let z = run_rows(&self.rows, self.width, self.lay.n_in(), inputs);
         outputs.push(z[self.out()]);
         z
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
+    }
+}
+
+/// The column layout of an [`AffineFinalGate`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AffineFinalLayout {
+    pub(super) lanes: usize,
+    pub(super) k: usize,
+    /// The final level's own `c`: `yr` has `2^c + k` words.
+    pub(super) c: usize,
+}
+
+impl AffineFinalLayout {
+    pub(super) fn new(lanes: usize, k: usize, c: usize) -> Self {
+        assert!(lanes >= 1 && lanes <= 1 << k, "a row has at most 2^k lanes");
+        assert!(c >= 1 && k <= 1 << c, "the overflow fits under X_{{2^c}}");
+        Self { lanes, k, c }
+    }
+    pub(super) fn yr_len(&self) -> usize {
+        (1 << self.c) + self.k
+    }
+    /// The input order: `row[lanes]`, `α[k]`, `β[k]`, `x`, `Ŵ_1..Ŵ_c`,
+    /// `yr[2^c + k]`, `zero`. (`Ŵ_0 = x`.)
+    pub(super) fn n_in(&self) -> usize {
+        self.lanes + 2 * self.k + 1 + self.c + self.yr_len() + 1
+    }
+    fn x(&self) -> usize {
+        self.lanes + 2 * self.k
+    }
+    pub(super) fn yr(&self, s: usize) -> usize {
+        self.x() + 1 + self.c + s
+    }
+    pub(super) fn zero(&self) -> usize {
+        self.n_in() - 1
+    }
+}
+
+/// The final level's direct check at one query: `Enc(yr)(x) = Σ_i
+/// ω_i(x)·row[i]`, with `Enc(yr)(x) = Σ_s yr_s·X_s(x)` over `2^c + k` novel
+/// basis words (`X_{2^c + s} = Ŵ_c·X_s`). The row fold is the
+/// [`AffineLeafGate`]'s; `Enc(yr)` is the same fold over `g = Ŵ_0..Ŵ_c`
+/// with the slots past `2^c + k` absent. The last row CHECKS the input
+/// column `zero`, which the caller wires to the zero constant:
+///
+/// ```text
+///   zero = Σ_i ω_i(x)·row[i] + Enc(yr)(x)
+/// ```
+///
+/// No outputs: an accepting row is the whole statement.
+pub(super) struct AffineFinalGate {
+    pub(super) ty: Arc<ElementTableType>,
+    pub(super) lay: AffineFinalLayout,
+    rows: Vec<Row>,
+    width: usize,
+}
+
+impl AffineFinalGate {
+    pub(super) fn new(lay: AffineFinalLayout) -> Self {
+        let mut rows = Vec::new();
+        let mut next = lay.n_in();
+        let x = lay.x();
+        let g: Vec<Form> = (0..lay.k)
+            .map(|j| {
+                let d = col(&mut rows, &mut next, vec![lay.k + lay.lanes + j], vec![x]);
+                vec![lay.lanes + j, d]
+            })
+            .collect();
+        let lanes: Vec<Option<Form>> = (0..1usize << lay.k)
+            .map(|i| (i < lay.lanes).then(|| vec![i]))
+            .collect();
+        let mut check = fold_forms(lanes, &g, &mut rows, &mut next);
+        // Ŵ_b lives at x + b (Ŵ_0 = x).
+        let wb: Vec<Form> = (0..=lay.c).map(|b| vec![x + b]).collect();
+        let yr: Vec<Option<Form>> = (0..1usize << (lay.c + 1))
+            .map(|s| (s < lay.yr_len()).then(|| vec![lay.yr(s)]))
+            .collect();
+        check.extend(fold_forms(yr, &wb, &mut rows, &mut next));
+        rows.push(Row {
+            out: lay.zero(),
+            a: check,
+            b: vec![],
+        });
+        let width = next;
+        Self {
+            ty: build_table(lay.n_in(), &rows, width, "affine final gate"),
+            lay,
+            rows,
+            width,
+        }
+    }
+}
+
+impl GateType for AffineFinalGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        let schema: Vec<IoWord> = (0..self.lay.n_in()).map(IoWord::input).collect();
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &(), _outputs: &mut Vec<F128>) -> Self::Row {
+        run_rows(&self.rows, self.width, self.lay.n_in(), inputs)
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         SlotWitness::element_from_rows(self.ty.width(), nu, rows)
@@ -324,6 +447,50 @@ pub(super) fn emit_affine_consistency(
         ladders.push(w);
     }
     (acc, ladders)
+}
+
+/// The final level's query-phase wires.
+pub(super) struct AffineFinalLevel {
+    /// Per query: the opened row's live lanes.
+    pub(super) rows: Vec<Vec<Wire>>,
+    /// Per query: the position wire (`x_q`).
+    pub(super) xs: Vec<Wire>,
+    /// The level's fold challenges `(α_j, β_j)`, in binding order.
+    pub(super) gammas: Vec<(Wire, Wire)>,
+    /// The absorbed `yr`, `2^c + k` words.
+    pub(super) yr: Vec<Wire>,
+    /// The final level's own `c`.
+    pub(super) log_cols: usize,
+}
+
+/// Emit the final level's direct checks: per query a ladder row and an
+/// [`AffineFinalGate`] row on `fin` with its `zero` input wired to `zw`.
+/// Returns each query's ladder.
+pub(super) fn emit_affine_final_check(
+    sb: &mut ShapeBuilder,
+    fin: SlotId,
+    ladder: SlotId,
+    lvl: &AffineFinalLevel,
+    zw: Wire,
+    ow: Wire,
+) -> Vec<Vec<Wire>> {
+    assert_eq!(lvl.rows.len(), lvl.xs.len());
+    assert_eq!(lvl.yr.len(), (1 << lvl.log_cols) + lvl.gammas.len());
+    let mut ladders = Vec::with_capacity(lvl.xs.len());
+    for (row, &x) in lvl.rows.iter().zip(&lvl.xs) {
+        let w = emit_subspace_ladder(sb, ladder, x, ow);
+        let mut ins: Vec<Wire> = row.clone();
+        ins.extend(lvl.gammas.iter().map(|g| g.0));
+        ins.extend(lvl.gammas.iter().map(|g| g.1));
+        ins.push(x);
+        ins.extend_from_slice(&w[1..=lvl.log_cols]);
+        ins.extend_from_slice(&lvl.yr);
+        ins.push(zw);
+        let out = sb.gate(fin, &ins);
+        debug_assert!(out.is_empty());
+        ladders.push(w);
+    }
+    ladders
 }
 
 #[cfg(test)]
@@ -488,6 +655,38 @@ mod tests {
                 emit_affine_consistency(&mut sb, slot, ladder, mac, &q, zw, ow).0,
             ));
         }
+        // The final level: one direct Enc(yr) check per query.
+        let fl = levels.len() - 1;
+        let (fk, fc) = (ks[fl], cs[fl]);
+        let f_rows = &proof.openings[fl].opened_rows;
+        let f_lay = AffineFinalLayout::new(f_rows[0].len(), fk, fc);
+        let fin = sb.slot(AffineFinalGate::new(f_lay));
+        let yr_v = levels[fl].yr_v.expect("final yr");
+        let final_lvl = AffineFinalLevel {
+            rows: f_rows
+                .iter()
+                .map(|r| r.iter().map(|&v| input(&mut sb, &mut ins, v)).collect())
+                .collect(),
+            xs: trace.queries[fl]
+                .iter()
+                .map(|&q| input(&mut sb, &mut ins, F128::new(q as u64, 0)))
+                .collect(),
+            gammas: levels[fl]
+                .rounds
+                .iter()
+                .map(|rd| {
+                    (
+                        input(&mut sb, &mut ins, chals[rd.ch]),
+                        input(&mut sb, &mut ins, chals[rd.ch + 1]),
+                    )
+                })
+                .collect(),
+            yr: (0..f_lay.yr_len())
+                .map(|s| input(&mut sb, &mut ins, vals[yr_v + s]))
+                .collect(),
+            log_cols: fc,
+        };
+        emit_affine_final_check(&mut sb, fin, ladder, &final_lvl, zw, ow);
         let shape = sb.finish().expect("the consistency circuit builds");
         let built = shape.run(&ins, &[]);
 
@@ -531,8 +730,23 @@ mod tests {
         let ladder_ty = ResidualWeightsGate256::with_weights(max_c + 1).ty;
         let ladder_rows = built.rows::<ResidualWeightsGate256>(ladder);
         assert!(ladder_rows.iter().all(|r| satisfied(&ladder_ty, r)));
-        let total_q: usize = trace.queries[..levels.len() - 1].iter().map(Vec::len).sum();
+        let total_q: usize = trace.queries.iter().map(Vec::len).sum();
         assert_eq!(ladder_rows.len(), total_q, "one ladder row per query");
+
+        // Every final row accepts (Enc(yr)(x_q) = the folded row), and a
+        // wrong yr word, lane or derived column rejects.
+        let f_gate = AffineFinalGate::new(f_lay);
+        let f_built = built.rows::<AffineFinalGate>(fin);
+        assert_eq!(f_built.len(), trace.queries[fl].len());
+        assert!(
+            f_built.iter().all(|r| satisfied(&f_gate.ty, r)),
+            "final rows"
+        );
+        for col in [0, f_lay.yr(0), f_lay.yr(f_lay.yr_len() - 1), f_lay.n_in()] {
+            let mut bad = f_built[0].clone();
+            bad[col] += F128::ONE;
+            assert!(!satisfied(&f_gate.ty, &bad), "a wrong column {col} fails");
+        }
     }
 
     /// The leaf gate's size at the tower's affine shapes (`--nocapture`).
@@ -558,6 +772,18 @@ mod tests {
                 );
                 assert!(g.ty.kappa() <= if li == 0 { 8 } else { 7 });
             }
+            let fl = ks.len() - 1;
+            let fc = *pc.recursive_log_msg_cols.last().unwrap();
+            let f = AffineFinalGate::new(AffineFinalLayout::new(1 << ks[fl], ks[fl], fc));
+            println!(
+                "{name} final: lanes {} k {} c {fc} q {}: {} inputs, {} cols, kappa {}",
+                1 << ks[fl],
+                ks[fl],
+                pc.queries[fl],
+                f.lay.n_in(),
+                f.width,
+                f.ty.kappa(),
+            );
         }
     }
 }
