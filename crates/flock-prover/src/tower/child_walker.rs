@@ -2578,9 +2578,10 @@ fn emit_wiring_gkr_and_recombination(
     let beta_w = outs[trace.squeezes[g.beta_fin][0]][0];
     // The grand products agree: a COPY CONSTRAINT on the tops (every
     // former published-zero delta in this region is now a connect — the
-    // proof itself fails on a broken identity; no public, no checker item).
+    // proof itself fails on a broken identity; no public, no checker item),
+    // and they are nonzero (`emit_nonzero_top`).
     let (cl_w, cr_w, pt_w) = emit_gkr_layers(
-        sb, macs, zcr, &g.layers, g.top_v, trace, outs, wv, vals, zw, ow, zassert,
+        sb, macs, zcr, &g.layers, g.top_v, g.top, trace, outs, wv, vals, zw, ow, zassert,
     );
     assert_eq!(
         pt_w.len(),

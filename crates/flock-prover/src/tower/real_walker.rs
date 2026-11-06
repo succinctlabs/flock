@@ -32,7 +32,7 @@ use crate::{
         ZskipTapeRec, ZskipWires, ag_seed_bytes, bytes_payload_mask, cap_payloads, cap_wires,
         check_residual_publics, circuit_structure_claim_wires, cw, decode_ag_point,
         emit_boolean_reported_check, emit_element_reported_check, emit_fiat_shamir_chain,
-        emit_pow_checks, emit_publics_hash, emit_query_phase, emit_recombination,
+        emit_nonzero_top, emit_pow_checks, emit_publics_hash, emit_query_phase, emit_recombination,
         emit_residual_region, flatten_ops,
         gates_spine::TD_PARTS,
         leaf_boolean_lcs, level_geometry, level_sources, observed_f256, outer_union, pack8,
@@ -2229,6 +2229,8 @@ fn emit_wiring_gkr_sigma(
     // CONSTRAINT now — the proof itself fails on a broken identity.
     let (mut cl_w, mut cr_w) = (wv(gr.top_v), wv(gr.top_v + 1));
     sb.connect(cl_w, cr_w);
+    // ... and nonzero: two zero products agree whatever their leaves.
+    emit_nonzero_top(sb, macs, cl_w, gr.top, vals, ow, zassert);
     let mut pt_w: Vec<Wire> = Vec::new();
     for lr in &gr.layers {
         let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
