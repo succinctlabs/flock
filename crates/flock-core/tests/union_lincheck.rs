@@ -1789,6 +1789,24 @@ fn dropped_words_report_static_claims() {
     let mut ch_v = FsChallenger::new(DOMAIN);
     let zc = verify_zerocheck(m, &zc_proof, &mut ch_v).expect("zerocheck accepts");
     let circuits: [&dyn LincheckCircuit; 1] = [&circuit];
+    // The extra pair's second slot is padding: a nonzero one is refused
+    // rather than accepted as an unbound, malleable word.
+    {
+        let mut padded = lc_proof.clone();
+        padded.matrix_evals[1].1 = F128::ONE;
+        let mut ch_v = ch_v.clone();
+        assert!(
+            matches!(
+                verify_union_deferred(
+                    &union, &circuits, &x_ab, zc.a_eval, zc.b_eval, &padded, &mut ch_v,
+                ),
+                Err(LincheckError::ConsistencyFailed {
+                    which: "linear-evals padding"
+                })
+            ),
+            "a nonzero padding word in the extra pair"
+        );
+    }
     let (_, assertion) = verify_union_deferred(
         &union, &circuits, &x_ab, zc.a_eval, zc.b_eval, &lc_proof, &mut ch_v,
     )
@@ -1816,6 +1834,72 @@ fn dropped_words_report_static_claims() {
     );
 }
 
+/// One honest witness of a single dropping type per seed, and its deferred
+/// assertion (the union's one slot, under `η`).
+fn dropped_word_assertion(
+    (nu, n): (usize, usize),
+    registry: &Registry,
+    union: &UnionInstance<'_>,
+    circuit: &SparseMatrixCircuit,
+    seed: u64,
+) -> MatrixAssertion {
+    let ty = &registry.types()[0];
+    let (k_log, k) = (ty.k_log, 1usize << ty.k_log);
+    let mut rng = Rng::new(seed);
+    let pin = ty.const_pin.unwrap();
+    let mut z = vec![false; k << nu];
+    for z_row in z.chunks_mut(k).take(n) {
+        z_row[pin] = true;
+        for v in 1..128 {
+            z_row[v] = rng.bit();
+        }
+        for i in 128..384 {
+            z_row[i] = dot(z_row, &ty.a_0.rows[i]) & dot(z_row, &ty.b_0.rows[i]);
+        }
+    }
+    let dropped = |i: usize| union.zeroed_word_cols(0).contains(&(i / 128));
+    let apply = |row_bit: &dyn Fn(&[bool], usize) -> bool| -> Vec<bool> {
+        z.chunks(k)
+            .flat_map(|z_row| (0..k).map(move |i| !dropped(i) && row_bit(z_row, i)))
+            .collect()
+    };
+    let a_sem = apply(&|z_row, i| dot(z_row, &ty.a_0.rows[i]));
+    let b_sem = apply(&|z_row, i| dot(z_row, &ty.b_0.rows[i]));
+    let c_sem = apply(&|z_row, i| z_row[i]);
+    let m = registry.m_total();
+    let offset = registry.slots()[0].offset;
+    let addr = |sem: &[bool]| {
+        let mut out = vec![false; 1 << m];
+        place_addr(&mut out, sem, k_log, nu, offset);
+        pack_bits(&out)
+    };
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (zc_proof, zc_claim) = prove_packed_padded(
+        &addr(&a_sem),
+        &addr(&b_sem),
+        &addr(&c_sem),
+        m,
+        &union.boolean_padding_spec(),
+        &mut ch_p,
+    );
+    let x_ab =
+        union.x_ab_from_multilinear_values(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
+    let stripe = pack_z_lincheck(&z, nu + k_log, k_log);
+    let slot = UnionLincheckSlot {
+        z_lincheck: &stripe,
+        circuit,
+    };
+    let (lc_proof, _, _) = prove_union_capture_z_vec(union, &[slot], &x_ab, &mut ch_p);
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    let zc = verify_zerocheck(m, &zc_proof, &mut ch_v).expect("zerocheck accepts");
+    let circuits: [&dyn LincheckCircuit; 1] = [circuit];
+    verify_union_deferred(
+        union, &circuits, &x_ab, zc.a_eval, zc.b_eval, &lc_proof, &mut ch_v,
+    )
+    .expect("deferred verify accepts")
+    .1
+}
+
 /// Shared binding over a type that drops words under `η`: two proofs'
 /// assertions fold 2 → 1 into one KEPT pair and one linear-identity claim,
 /// and a merge folds two such accumulators with a third proof; every
@@ -1828,64 +1912,8 @@ fn shared_binding_folds_dropped_words() {
     let union = UnionInstance::new(&registry, vec![n]);
     assert!(union.checks_linear_rows());
     let ty = &registry.types()[0];
-    let (k_log, k) = (ty.k_log, 1usize << ty.k_log);
     let circuit = SparseMatrixCircuit::new(&ty.a_0, &ty.b_0).with_const_pin(ty.const_pin);
-    // One honest witness of the type per seed, its deferred assertion.
-    let assertion = |seed: u64| -> MatrixAssertion {
-        let mut rng = Rng::new(seed);
-        let pin = ty.const_pin.unwrap();
-        let mut z = vec![false; k << nu];
-        for z_row in z.chunks_mut(k).take(n) {
-            z_row[pin] = true;
-            for v in 1..128 {
-                z_row[v] = rng.bit();
-            }
-            for i in 128..384 {
-                z_row[i] = dot(z_row, &ty.a_0.rows[i]) & dot(z_row, &ty.b_0.rows[i]);
-            }
-        }
-        let dropped = |i: usize| union.zeroed_word_cols(0).contains(&(i / 128));
-        let apply = |row_bit: &dyn Fn(&[bool], usize) -> bool| -> Vec<bool> {
-            z.chunks(k)
-                .flat_map(|z_row| (0..k).map(move |i| !dropped(i) && row_bit(z_row, i)))
-                .collect()
-        };
-        let a_sem = apply(&|z_row, i| dot(z_row, &ty.a_0.rows[i]));
-        let b_sem = apply(&|z_row, i| dot(z_row, &ty.b_0.rows[i]));
-        let c_sem = apply(&|z_row, i| z_row[i]);
-        let m = registry.m_total();
-        let offset = registry.slots()[0].offset;
-        let addr = |sem: &[bool]| {
-            let mut out = vec![false; 1 << m];
-            place_addr(&mut out, sem, k_log, nu, offset);
-            pack_bits(&out)
-        };
-        let mut ch_p = FsChallenger::new(DOMAIN);
-        let (zc_proof, zc_claim) = prove_packed_padded(
-            &addr(&a_sem),
-            &addr(&b_sem),
-            &addr(&c_sem),
-            m,
-            &union.boolean_padding_spec(),
-            &mut ch_p,
-        );
-        let x_ab = union
-            .x_ab_from_multilinear_values(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
-        let stripe = pack_z_lincheck(&z, nu + k_log, k_log);
-        let slot = UnionLincheckSlot {
-            z_lincheck: &stripe,
-            circuit: &circuit,
-        };
-        let (lc_proof, _, _) = prove_union_capture_z_vec(&union, &[slot], &x_ab, &mut ch_p);
-        let mut ch_v = FsChallenger::new(DOMAIN);
-        let zc = verify_zerocheck(m, &zc_proof, &mut ch_v).expect("zerocheck accepts");
-        let circuits: [&dyn LincheckCircuit; 1] = [&circuit];
-        verify_union_deferred(
-            &union, &circuits, &x_ab, zc.a_eval, zc.b_eval, &lc_proof, &mut ch_v,
-        )
-        .expect("deferred verify accepts")
-        .1
-    };
+    let assertion = |seed: u64| dropped_word_assertion((nu, n), &registry, &union, &circuit, seed);
     let dropped = aggregate::Dropped::of(&union);
     let tables = aggregate::SharedTables::new(&registry, &dropped);
     let mats = [(&ty.a_0, &ty.b_0)];
@@ -1945,5 +1973,130 @@ fn shared_binding_folds_dropped_words() {
     assert!(
         !bad.discharge_linear(&tables.linear_refs()),
         "a moved linear claim"
+    );
+}
+
+/// Ron's probe (#70 review, item 2): on the PER-CLAIM path nothing folds a
+/// linear-identity claim, so an assertion's `α·η·v_L` term would be checked
+/// against nothing. Report the FULL-matrix `(A, B)` values (they discharge
+/// against `A_0`/`B_0`), shift the target, and solve for `v_L`: the
+/// reported check passes, and only the aggregate's binding-surface check
+/// stands between it and an accumulator. Both sides reject it, and the
+/// honest dropping assertion too; the shared path still takes the honest one
+/// and rejects one whose linear values disagree with its `Dropped`.
+#[test]
+fn unshared_aggregate_rejects_dropped_words() {
+    let (nu, n) = (6, 43);
+    let (ty, _) = gate_slot(nu, n, 0x5_4A12);
+    let registry = Registry::new(vec![ty.with_zeroed_linear_words()], nu);
+    let union = UnionInstance::new(&registry, vec![n]);
+    assert!(union.checks_linear_rows());
+    let ty = &registry.types()[0];
+    let circuit = SparseMatrixCircuit::new(&ty.a_0, &ty.b_0).with_const_pin(ty.const_pin);
+    let honest = dropped_word_assertion((nu, n), &registry, &union, &circuit, 7);
+    honest.check_reported(&registry).expect("honest report");
+
+    // The forgery: full-matrix (A, B) values, a shifted target, v_L solved.
+    let mut forged = honest.clone();
+    let (ca, cb) = &honest.claims(&registry)[0];
+    let full_a = MatrixClaim::honest(ca.row.clone(), ca.col.clone(), &ty.a_0).value;
+    let full_b = MatrixClaim::honest(cb.row.clone(), cb.col.clone(), &ty.b_0).value;
+    let inner = ty.k_log - K_SKIP;
+    let slot = &registry.slots()[0];
+    let w_t = eq_prefix_weight(&honest.x_inner_rest[inner..], slot.prefix);
+    let p_t = eq_prefix_weight(&honest.rr[inner..], slot.prefix);
+    let (alpha, eta) = (honest.alpha, honest.eta.expect("η checks the dropped rows"));
+    let (v_a, v_b) = honest.evals[0];
+    let delta = F128::new(0x5EED, 0xF0F0);
+    forged.target += delta;
+    forged.evals[0] = (full_a, full_b);
+    // p·w·(α·Δa + Δb + α·η·Δl) = δ (characteristic 2: Δ is a sum).
+    let moved = p_t * w_t * (alpha * (full_a + v_a) + (full_b + v_b));
+    let dl = (delta + moved) * (p_t * w_t * alpha * eta).inv();
+    forged.linear_evals[0] = forged.linear_evals[0].map(|v| v + dl);
+    forged
+        .check_reported(&registry)
+        .expect("the forged report reproduces the shifted target");
+    assert!(
+        MatrixClaim::honest(ca.row.clone(), ca.col.clone(), &ty.a_0).check_direct(&ty.a_0),
+        "the full-matrix A value discharges"
+    );
+
+    let mats = [(&ty.a_0, &ty.b_0)];
+    let circs: Vec<&dyn LincheckCircuit> = vec![&circuit];
+    for (what, a) in [("forged", &forged), ("honest", &honest)] {
+        let mut chp = FsChallenger::new(b"agg-unshared");
+        let got = prove_aggregate(
+            &registry,
+            &mats,
+            &circs,
+            std::slice::from_ref(a),
+            &[],
+            &mut chp,
+        );
+        assert!(
+            matches!(got, Err(AggregateError::DroppedWordsUnshared)),
+            "the per-claim prover refuses the {what} dropping assertion"
+        );
+    }
+    // The verifier, fed a proof made over the honest-but-undropped surface:
+    // an empty fold set would be `Malformed`, so build the proof the
+    // per-claim prover would have made with the drop stripped.
+    let mut stripped = forged.clone();
+    stripped.zeroed = vec![Vec::new(); registry.num_boolean()];
+    stripped.linear_evals = vec![None; registry.num_boolean()];
+    let mut chp = FsChallenger::new(b"agg-unshared");
+    let (proof, _) = prove_aggregate(
+        &registry,
+        &mats,
+        &circs,
+        std::slice::from_ref(&stripped),
+        &[],
+        &mut chp,
+    )
+    .expect("a non-dropping surface proves");
+    let mut chv = FsChallenger::new(b"agg-unshared");
+    assert!(
+        matches!(
+            verify_aggregate(
+                &registry,
+                std::slice::from_ref(&forged),
+                &[],
+                &proof,
+                &mut chv
+            ),
+            Err(AggregateError::DroppedWordsUnshared)
+        ),
+        "the per-claim verifier refuses the forged assertion"
+    );
+
+    // Shared binding: the honest assertion folds; one whose linear value
+    // disappears (η's presence disagreeing with `Dropped::checked`) is
+    // malformed, not a panic in the linear gather.
+    let dropped = aggregate::Dropped::of(&union);
+    let shared = |a: &MatrixAssertion| {
+        let mut chp = FsChallenger::new(b"agg-unshared");
+        prove_aggregate_classes_shared_with_grinding(
+            &registry,
+            &dropped,
+            &mats,
+            &circs,
+            std::slice::from_ref(a),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            FoldGrinding::disabled(),
+            &mut chp,
+        )
+        .map(|_| ())
+    };
+    shared(&honest).expect("the shared path folds the honest assertion");
+    let mut no_linear = honest.clone();
+    no_linear.linear_evals = vec![None; registry.num_boolean()];
+    assert!(
+        matches!(shared(&no_linear), Err(AggregateError::Malformed)),
+        "a linear value missing where Dropped checks one"
     );
 }

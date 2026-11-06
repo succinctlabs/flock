@@ -23,7 +23,8 @@
 //! ([`Tower::discharge_root`]), not a consumer's input.
 
 use flock_core::{
-    aggregate::Accumulator, matrix_fold::MatrixClaim, pcs::Commitment, verifier::FlockVerifyError,
+    aggregate::Accumulator, matrix_fold::MatrixClaim, pcs::Commitment, schedule::Registry,
+    verifier::FlockVerifyError,
 };
 
 use crate::proof_io::{DeserializeError, TowerRootBundle};
@@ -161,6 +162,25 @@ impl TowerVk {
     }
 }
 
+/// The tower's MAIN accumulator has no linear-identity group: the outer
+/// fold binds per claim (`prove_aggregate_classes_with_grinding`), which
+/// folds none and refuses an assertion that drops words, so `per_linear` is
+/// empty by construction, [`reassemble_parts`] rebuilds it empty and no
+/// discharge leg reads it. That holds only while no outer type drops a
+/// word; an outer registry that does would need shared binding and a
+/// discharged linear leg first. Asserted wherever the main fold is built
+/// or rebuilt.
+pub(super) fn assert_outer_drops_nothing(registry: &Registry) {
+    assert!(
+        registry
+            .types()
+            .iter()
+            .all(|ty| ty.zeroed_word_cols.is_empty()),
+        "an outer (node) type drops words: the main accumulator's per_linear \
+         would go undischarged"
+    );
+}
+
 /// Reassemble the published accumulators — main, passenger, chain lane —
 /// from a root's PUBLIC SEGMENT alone, per the VK's decode plan. Live
 /// keyed slots must name a circuit the VK knows (FL / steady / base);
@@ -240,6 +260,7 @@ pub(super) fn reassemble_parts(
             jagged.push((name(k)?, c));
         }
     }
+    assert_outer_drops_nothing(&steady_lo.shape.registry);
     let main = Accumulator {
         registry_digest: steady_lo.shape.registry.digest(),
         per_type,

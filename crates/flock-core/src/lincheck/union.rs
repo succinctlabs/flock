@@ -1142,6 +1142,17 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
             got: proof.matrix_evals.len(),
         });
     }
+    // Each extra pair is `(⟨W_t, D_t·(A_0 + I)⟩, 0)`: its second slot
+    // carries nothing, and nothing would bind it, so a nonzero one is a
+    // malleated proof.
+    if proof.matrix_evals[n_types..]
+        .iter()
+        .any(|&(_, pad)| pad != F128::ZERO)
+    {
+        return Err(LincheckError::ConsistencyFailed {
+            which: "linear-evals padding",
+        });
+    }
     let mut extra = proof.matrix_evals[n_types..].iter();
     let linear_evals: Vec<Option<F128>> = zeroed
         .iter()
