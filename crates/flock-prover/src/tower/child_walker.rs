@@ -62,6 +62,14 @@ use crate::{
 /// One recorded child verification, parsed: the tape pinned op-for-op, every
 /// region located, and every native replica the emitter and checker consume.
 /// `new` records the verification and checks the map for that tape.
+///
+/// The LEAF walker (chain and leanXMSS leaves) handles every wiring feature
+/// a leaf circuit has: a tuple bus (`walk_bus_gkr`, `emit_bus`, plane 6),
+/// pruned slots (only `gathered_slots` are claimed), public columns (plane
+/// 7; the deferred wiring verify asserts they read fixed public words) and
+/// packed slots (each read at its `gkr_slot`). The leanXMSS recursion leaf
+/// has all four. The NODE walker handles none of them and refuses them
+/// ([`super::real_walker::assert_node_child_wiring`]).
 pub(super) struct ChildTape<'p> {
     pub(super) inner: &'p MixedInner,
     // the recorded tape
