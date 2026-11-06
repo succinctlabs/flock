@@ -109,7 +109,13 @@ GKR transcript, the gather values and at most one PoW nonce. A proof whose
   coordinates, which the merged opening checks. This is the same contract as
   the wiring's `f`-side gather (`circuit.rs`, "What the caller owes", item 4).
   The prover's fold reads only the live prefix, so it relies on dead rows being
-  zero in the committed buffer, exactly as the wiring does.
+  zero in the committed buffer, exactly as the wiring does. That is item 5 of
+  the same list, the **dead-row invariant**, with where it is enforced (§4).
+- **A zero product is rejected.** `verify_reduction` refuses `∏ L = ∏ R = 0`
+  (`ProductGkrError::ZeroProduct`), for the bus and the wiring alike. One zero
+  leaf zeroes its side whatever the others hold, so `0 = 0` proves nothing.
+  An honest product is zero only if a fingerprint vanishes at `(β, γ)`, which
+  the Schwartz–Zippel bound above already counts.
 - **Both sides bound.** Each side's claim is checked against its own
   reconstruction, so neither product's leaves are prover-chosen. Compare the
   wiring's `f_eval == g_eval` requirement.
@@ -466,6 +472,25 @@ signatures) brings it to 2^-128. Two independent points give
    (simpler degree bound, `w` extra samples).
 3. Grinding: `β` is ground like the wiring's `α` (sized to the live entry
    count); the layer challenges reuse the wiring's per-layer policy.
+   - *Answer (review of 10-29 and 11-03):* sizing to the live count is right
+     only because committed dead rows hold zero io words. A dead row with
+     words `w_k` would be a β-free leaf `1 + Σ_k γ_k·w_k`. It cannot pair
+     with a live leaf, so multiset equality survives, but it raises the
+     Schwartz–Zippel degree from the live entries to the covered rows (up to
+     ports × `2^ν`), up to about one bit more than the grind covers.
+   - The invariant is now written down as item 5 of the wiring's "What the
+     caller owes" (`flock-core/src/circuit.rs`), with where it holds:
+     height-`n_t` stacking commits no dead row; the full-height commit
+     (`UnionInstance::set_full_height_commit`, which leanXMSS uses) commits
+     them, holds the pin at `0` there through the lincheck's count claim,
+     and keeps every `(A z)·pin = x` row of a slot that commits dummy rows
+     (`UnionInstance::zeroed_word_cols` drops nothing there).
+   - The same invariant used to carry the wiring's grand product: a dead
+     leaf is `w + 1`, so a dead word of `1` zeroed both products. The
+     product verifier now rejects a zero product (§1.3), so that no longer
+     depends on it. `a_dead_io_word_of_one_is_rejected` (`circuit.rs`)
+     forges that proof, and `full_height_dummy_input_word_is_rejected`
+     (leanXMSS) tampers a committed dummy row end to end.
 4. The counting argument in §2.3 is what replaces a range check on the step
    field. It needs the codeword gadget's digit-sum check and the exact row
    count per layer. Both are fixed by the circuit, but they are now

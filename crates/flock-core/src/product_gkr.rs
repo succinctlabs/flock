@@ -102,6 +102,14 @@ pub enum ProductGkrError {
     /// `∏ lhs ≠ ∏ rhs`: the two grand products differ, so the witnesses are
     /// not a valid permuted pair.
     ProductMismatch,
+    /// The two grand products agree but are zero. One zero leaf zeroes its
+    /// product whatever the other leaves hold, so `0 = 0` says nothing about
+    /// the multisets. A masked dead leaf is `w + 1` ([`LiveMask`]), which a
+    /// committed dead word of `1` zeroes on both sides at once; a bus's dead
+    /// leaf is `1 + Σ_k γ_k·w_k`. An honest product is zero only when a
+    /// fingerprint vanishes at the sampled challenges, an event the
+    /// Schwartz–Zippel bound already counts.
+    ZeroProduct,
     /// A per-layer sumcheck's final value disagreed with the product of the
     /// claimed boundary values.
     LayerCheckFailed,
@@ -1278,6 +1286,64 @@ pub(crate) fn prove_batched_dense_masked_for_tests<C: Challenger>(
     prove_batched_impl(f, g, sigma, live, true, BatchedGrinding::disabled(), ch)
 }
 
+/// A cheating prover's masked batched proof at `f = g = w` (no grinding):
+/// the GKR runs over the leaves the verifier's input check actually
+/// reconstructs, `w + α·s + β` on live cells and `w + 1` on dead ones —
+/// where the honest prover writes `1`, because it takes dead words to be
+/// zero. With every dead word zero the two agree; a dead word of `1`
+/// zeroes both products. Every input claim is the true MLE at `ρ`, so the
+/// proof passes every check except a product check. Returns the proof and
+/// `ρ`.
+#[cfg(test)]
+pub(crate) fn forge_masked_batched_for_tests<C: Challenger>(
+    w: &[F128],
+    sigma: &[usize],
+    live: &LiveMask,
+    ch: &mut C,
+) -> (ProductGkrBatchedProof, Vec<F128>) {
+    let n = w.len();
+    let mu = n.trailing_zeros() as usize;
+    ch.observe_label(DOMAIN_BATCHED);
+    let alpha = ch.sample_f128();
+    let beta = ch.sample_f128();
+    let tag = |i: usize| F128::new(i as u64, 0);
+    let leaves = |id: &dyn Fn(usize) -> usize| GVec {
+        buf: (0..n)
+            .map(|x| {
+                if live.is_live(x) {
+                    w[x] + alpha * tag(id(x)) + beta
+                } else {
+                    w[x] + F128::ONE
+                }
+            })
+            .collect(),
+        lens: vec![n],
+        rows: n,
+    };
+    let (lhs, rhs) = (leaves(&|x| x), leaves(&|x| sigma[x]));
+    let mut grinding_nonces = Vec::new();
+    let r = reduce_grouped(
+        lhs,
+        rhs,
+        mu,
+        BatchedGrinding::disabled(),
+        &mut grinding_nonces,
+        ch,
+        &mut Instant::now(),
+    );
+    let w_eval = mle_eval(w, &r.rho);
+    let proof = ProductGkrBatchedProof {
+        top_lhs: r.top_lhs,
+        top_rhs: r.top_rhs,
+        layers: r.layers,
+        f_eval: w_eval,
+        g_eval: w_eval,
+        s_sigma_eval: sparse_sigma_eval(sigma, live, &r.rho),
+        grinding_nonces,
+    };
+    (proof, r.rho)
+}
+
 /// The sparse masked σ evaluation: `Σ_live eq_lo(row)·eq_hi(slot)·tag(σ(x))`
 /// — O(live + 2^ν + 2^c), exact under XOR addition, identical to the dense
 /// masked-table MLE.
@@ -2098,9 +2164,16 @@ impl<'a> NonceReader<'a> {
 }
 
 /// Replay both product circuits' layer reductions from their roots: checks
-/// the roots agree and every layer's sumcheck, and returns the final point
-/// `ρ` with the LHS and RHS leaf claims there. The caller checks those claims
-/// against the leaves it can reconstruct.
+/// the roots agree and are nonzero, and every layer's sumcheck, and returns
+/// the final point `ρ` with the LHS and RHS leaf claims there. The caller
+/// checks those claims against the leaves it can reconstruct.
+///
+/// Both entry points run through here — [`verify_batched_core`] (the
+/// wiring) and [`verify_leaves`] (the tuple bus) — so both reject a zero
+/// product ([`ProductGkrError::ZeroProduct`]). That takes the grand
+/// products off the dead-row invariant (`circuit.rs`, "What the caller
+/// owes", item 5): a committed dead word other than the one that zeroes
+/// its leaf multiplies both sides of the wiring by the same factor.
 fn verify_reduction<C: Challenger>(
     top_lhs: F128,
     top_rhs: F128,
@@ -2113,6 +2186,9 @@ fn verify_reduction<C: Challenger>(
     ch.observe_f128(top_rhs);
     if top_lhs != top_rhs {
         return Err(ProductGkrError::ProductMismatch);
+    }
+    if top_lhs == F128::ZERO {
+        return Err(ProductGkrError::ZeroProduct);
     }
 
     let mut claim_l = top_lhs;
@@ -2283,9 +2359,10 @@ mod tests {
         ntt::AdditiveNttF128,
         product_gkr::{
             BatchedGrinding, Challenger, DOMAIN_BATCHED, F128, LiveMask, ProductGkrBatchedProof,
-            ProductGkrError, build_s_id_vec, mle_eval, prove_batched,
-            prove_batched_dense_masked_for_tests, prove_batched_with_grinding, s_id_basis,
-            s_id_value, verify_batched, verify_batched_with_grinding, verify_batched_with_sigma,
+            ProductGkrError, ProductLeaves, build_s_id_vec, forge_masked_batched_for_tests,
+            mle_eval, prove_batched, prove_batched_dense_masked_for_tests,
+            prove_batched_with_grinding, prove_leaves, s_id_basis, s_id_value, verify_batched,
+            verify_batched_with_grinding, verify_batched_with_sigma, verify_leaves,
         },
         test_rng::Rng,
     };
@@ -2798,5 +2875,113 @@ mod tests {
         padded.resize(128, F128::ZERO);
         ntt7.forward_transform_scalar(&mut padded);
         assert_eq!(&padded[..64], &vals[..], "prefix basis: S evals reproduced");
+    }
+
+    /// A masked dead leaf is `w + 1`, so a dead word of `1` zeroes BOTH
+    /// products, and `0 = 0` hides whatever the live cells hold. A forger
+    /// whose live cells break the permutation then passes every check but a
+    /// product check; only the zero-product check rejects. The same forger
+    /// is accepted with a dead word other than `1` and an honest
+    /// permutation: that word scales both products alike.
+    #[test]
+    fn a_zero_product_is_rejected() {
+        let (nu, c) = (3usize, 2usize);
+        let mu = nu + c;
+        let n = 1usize << mu;
+        let mask = LiveMask {
+            nu,
+            counts: vec![5, 8, 0, 3],
+        };
+        let mut rng = Rng::new(0x2E80_0001);
+        let live_ix: Vec<usize> = (0..n).filter(|&x| mask.is_live(x)).collect();
+        let perm = rng.permutation(live_ix.len());
+        let mut sigma: Vec<usize> = (0..n).collect();
+        for (a, &pb) in perm.iter().enumerate() {
+            sigma[live_ix[a]] = live_ix[pb];
+        }
+        // `w` constant on σ's orbits, zero on dead cells.
+        let mut w = vec![F128::ZERO; n];
+        let mut seen = vec![false; n];
+        for &x in &live_ix {
+            let v = rng.f128();
+            let mut y = x;
+            while !seen[y] {
+                seen[y] = true;
+                w[y] = v;
+                y = sigma[y];
+            }
+        }
+        let dead = 6; // slot 0, past its 5 live rows
+        assert!(!mask.is_live(dead));
+        let moved = *live_ix.iter().find(|&&x| sigma[x] != x).unwrap();
+        let check = |w: &[F128]| {
+            let mut chp = FsChallenger::new(b"prod-gkr-zero");
+            let (proof, _) = forge_masked_batched_for_tests(w, &sigma, &mask, &mut chp);
+            let mut chv = FsChallenger::new(b"prod-gkr-zero");
+            let verdict = verify_batched_with_sigma(mu, &proof, &sigma, Some(&mask), &mut chv);
+            (proof.top_lhs, verdict)
+        };
+
+        let (top, verdict) = check(&w);
+        assert_ne!(top, F128::ZERO);
+        verdict.expect("the forger's proof of an honest w verifies");
+        let mut junk = w.clone();
+        junk[dead] = F128::new(5, 0);
+        check(&junk)
+            .1
+            .expect("a dead word other than 1 scales both products alike");
+
+        let mut broken = w.clone();
+        broken[moved] += F128::ONE;
+        assert_eq!(check(&broken).1, Err(ProductGkrError::ProductMismatch));
+        broken[dead] = F128::ONE;
+        let (top, verdict) = check(&broken);
+        assert_eq!(top, F128::ZERO, "the dead word zeroes the products");
+        assert_eq!(verdict, Err(ProductGkrError::ZeroProduct));
+    }
+
+    /// The bus's entry point rejects a zero product too: one zero leaf per
+    /// side makes two different multisets' products agree.
+    #[test]
+    fn leaves_reject_a_zero_product() {
+        let (rows, lens) = (8usize, vec![8usize, 5]);
+        let mu = 4;
+        let mut rng = Rng::new(0x2E80_0002);
+        let mut side = |zero: Option<usize>| {
+            let mut buf: Vec<F128> = (0..rows * lens.len()).map(|_| rng.f128()).collect();
+            if let Some(x) = zero {
+                buf[x] = F128::ZERO;
+            }
+            ProductLeaves {
+                buf,
+                lens: lens.clone(),
+                rows,
+            }
+        };
+        let run = |lhs: ProductLeaves, rhs: ProductLeaves| {
+            let mut chp = FsChallenger::new(b"prod-gkr-leaves-zero");
+            let (proof, _) = prove_leaves(lhs, rhs, BatchedGrinding::disabled(), &mut chp);
+            let mut chv = FsChallenger::new(b"prod-gkr-leaves-zero");
+            (
+                proof.top_lhs,
+                verify_leaves(mu, &proof, BatchedGrinding::disabled(), &mut chv),
+            )
+        };
+        // The same leaves on both sides, reordered: equal products.
+        let lhs = side(None);
+        let mut rhs_buf = lhs.buf.clone();
+        rhs_buf.swap(1, 9);
+        let rhs = ProductLeaves {
+            buf: rhs_buf,
+            lens: lens.clone(),
+            rows,
+        };
+        let (top, verdict) = run(lhs, rhs);
+        assert_ne!(top, F128::ZERO);
+        verdict.expect("equal multisets verify");
+        // Different leaves, a zero in each side's live prefix.
+        let (top, verdict) = run(side(Some(2)), side(Some(11)));
+        assert_eq!(top, F128::ZERO);
+        assert_eq!(verdict.err(), Some(ProductGkrError::ZeroProduct));
     }
 }
