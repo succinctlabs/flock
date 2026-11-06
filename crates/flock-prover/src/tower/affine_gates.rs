@@ -1,8 +1,8 @@
 //! The narrow arithmetic the affine inner verifier rides.
 //!
 //! Every gate type's IO schema is a cell slot of the outer's wiring space
-//! (and a gather claim), and the whole envelope shares ~512 of them
-//! (`mu = nu + 9`). So the affine verifier is built from a few SHAPE-FREE
+//! (and a gather claim), and the whole envelope shares 256 of them
+//! (`mu = nu + 8`). So the affine verifier is built from a few SHAPE-FREE
 //! types whose width does not grow with lanes, `yr` or the residual
 //! point, and pays for size in rows instead:
 //!

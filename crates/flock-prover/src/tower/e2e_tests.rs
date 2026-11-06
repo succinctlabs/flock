@@ -1316,12 +1316,14 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 
 // The blessed chain128 fingerprint at DEV_BLOCKS = 1024-block leaves (see
 // `tower_vk_fingerprint_pinned`). Re-blessed 2026-11-05: the affine F128
-// inner (FastAffine leaf, SlimAffine outers) moves every digest; the
-// publics length is unchanged.
+// inner (FastAffine leaf, SlimAffine outers) moves every digest.
+// Re-blessed 2026-11-06: the envelope retune (publics 5684 -> 3712,
+// ACC_MAIN 1152 -> 832, lanes 31 -> 26) moves the three outer circuits;
+// the chain leaf and both registries are unchanged.
 const PIN_CHAIN_CIRCUIT: &str = "f7a065447042245cccc573887e714d1a9f754583a7d0f120c9753e51d6037fa3";
-const PIN_FL_CIRCUIT: &str = "81366efbe7260f6b064d7e3f8bc354add14049f7b685117304e66c103edf0037";
-const PIN_BASE_CIRCUIT: &str = "2b61d84c11eeb61a726c2b5f3f87cce8b57e24abe4a395d9b191758c989dd988";
-const PIN_STEADY_CIRCUIT: &str = "2b54adf37f41df645ee02799b58a33023a31d00291e3f3e46a5cacbbd928c8ab";
+const PIN_FL_CIRCUIT: &str = "ce4612e10dcbddac22576188aad82d5776bcfb5dbeb136115c984a0ad9241679";
+const PIN_BASE_CIRCUIT: &str = "a0ac7db0c2537838dec2925db1ced13931388d22011a90ab7ee8a40c4d151962";
+const PIN_STEADY_CIRCUIT: &str = "922aef651517ddd70beae10abc1d80b9e716b0c91a9443a5343b16d528f29811";
 const PIN_CHAIN_REGISTRY: &str = "c2a387fffa3d06ccf25e341c2faa4e5d9b62015fc3f74a8364206ff08abb24a3";
 const PIN_OUTER_REGISTRY: &str = "5bdf79293868d752b83306b0b77cf26067b86b779eb1edc1a4ac7f00ddb35520";
-const PIN_PUBLICS_LEN: usize = 5684;
+const PIN_PUBLICS_LEN: usize = 3712;

@@ -24,9 +24,9 @@ use crate::tower::{
 ///   [`AffineEnvLayouts`]), independent of lanes and residual length.
 /// - `nu` 14: each of the two independent child verifiers has its own
 ///   identical BLAKE slot, and every physical slot stays below 2^14 rows.
-/// - The table types' IO words plus one public slot stay within 512 cell
-///   slots, so the cell address needs 9 bits and `mu = nu + 9 = 23`
-///   tower-wide.
+/// - The table types' IO words plus one public slot stay within 256 cell
+///   slots (243 + 1 live), so the cell address needs 8 bits and
+///   `mu = nu + 8 = 22` tower-wide.
 ///
 /// A ladder that drifts off these constants surfaces as a NEW slot at
 /// emission time and hence a registry-digest mismatch — the failure is
@@ -188,10 +188,10 @@ pub(super) fn steady_reps() -> usize {
 /// shorter shape — a dev-size chain, a fold with fewer groups — rides the
 /// same layout and a reader simply stops at its own group widths.
 pub(super) const ENV_ACC_CHAIN_WORDS: usize = 160;
-// Sized under the old F256 inner, when a live node used 1,028 words; the
-// fixed-shape margin lets the same block carry the accumulator at every
-// recursive level.
-pub(super) const ENV_ACC_MAIN_WORDS: usize = 1152;
+// A live internal or spine node publishes 800 words (measured at both the
+// dev shape and m32, 2026-11-06); 32 words of margin. The block is fixed
+// so that the same layout carries the accumulator at every level.
+pub(super) const ENV_ACC_MAIN_WORDS: usize = 832;
 
 /// THE PASSENGER (wall 3): one sigma-shaped and one jagged-shaped entry,
 /// same layout as the ACC_MAIN keyed slots. A spine node's node-slot
@@ -260,8 +260,8 @@ pub(super) fn envelope_shape() -> EnvShape {
     EnvShape {
         // The two-child envelope fits at 14 with each independent child
         // verifier on its own identical BLAKE slot. Every physical slot
-        // remains below 2^14 rows, while 512 cell slots give mu = 14 + 9 =
-        // 23.
+        // remains below 2^14 rows, while 256 cell slots give mu = 14 + 8 =
+        // 22.
         nu: 14,
         // 20 = the m32 FAST chain leaf's L0 depth (log_msg_cols 19 +
         // log_inv_rate 1), which the B-fast PoC's first-level node walks;
@@ -297,16 +297,18 @@ pub(super) fn envelope_shape() -> EnvShape {
             (8, 4200),    // leaf-eval 8-lane
             (318, 15000), // prefix w 8
         ],
-        // Preserve the existing public body while enlarging ACC_MAIN.
-        publics: 5684,
+        // 58 KiB (a whole number of the parent's 1 KiB H(publics)
+        // chunks). The body gets 3712 - 1098 tail words = 2614; the
+        // largest live body is 2580 (the m32 FL, measured 2026-11-06).
+        publics: 3712,
         // The committed lane count — the ONE piece of a child's layout that
         // stays circuit structure (the parent hashes `num_lanes`-word
         // leaves), so it is pinned while everything count-shaped rides the
-        // jagged claims. 24 covers every envelope member's content-derived
-        // count at min-one-row; 31 (set when the F256 inner raised the
-        // largest live content to 25 lanes) stays below `2^initial_k = 32`,
-        // so children remain lane-major.
-        lanes: 31,
+        // jagged claims. 26 is the largest content-derived count (the m32
+        // FL, measured 2026-11-06; the dev shape needs 21). It stays below
+        // `2^initial_k = 32`, so children remain lane-major. A bigger
+        // content fails loudly in `outer_lanes`.
+        lanes: 26,
         affine: AffineEnvLayouts::default(),
     }
 }
