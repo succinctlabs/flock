@@ -1109,7 +1109,7 @@ fn parse_anchor_boolean_replica(
                 let pt = decode_ag_point(
                     &ag_seed_bytes(chals[*seed_ch], chals[*seed_ch + 1]),
                     nonce,
-                    lo.pcs.zerocheck_grinding().ag_round_one_bits(),
+                    lo.ag_round_one_bits(),
                 );
                 assert_eq!(
                     mat_assert.z_skip,
