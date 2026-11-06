@@ -307,9 +307,10 @@ pub(super) fn content_census(label: &str, registry: &Registry, counts: &[usize])
     let dw = u.dense_words();
     let lane = 1usize << (29 - 7 - 5);
     println!(
-        "  [{label} content] dense words {dw} = {:.2} lanes of 2^{} words (pin 31)",
+        "  [{label} content] dense words {dw} = {:.2} lanes of 2^{} words (pin {})",
         dw as f64 / lane as f64,
         29 - 7 - 5,
+        crate::tower::envelope_shape().lanes,
     );
     let mut per: Vec<(usize, usize, usize, usize)> = registry
         .types()

@@ -318,9 +318,12 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
             (881, 12690),  // three-factor extension prefix
             (882, 4150),   // eight-way residual accumulation
             (1008, 15000), // extension prefix w 8
-            // Family H's Horner form: 16 squaring chains (5 rows each) and
-            // 256 Horner steps per child region.
-            (KEY_SQUARE_CHAIN, 160),
+            // Census only, like every count here (free counts never pad to
+            // it). Square chains: family H's 16 Horner chains plus ĝ's
+            // forward chains, 170 rows per child region (340 live at the
+            // first-level node, 2026-11-05; 160 predated ĝ's chains).
+            // Horner: 256 steps per child region.
+            (KEY_SQUARE_CHAIN, 340),
             (KEY_HORNER_STEP, 512),
             // The transpose dot: 128 rows per claim, two claims per child.
             (KEY_TRANSPOSE_DOT, 512),
