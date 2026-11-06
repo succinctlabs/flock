@@ -1323,9 +1323,11 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 // The blessed chain128@256 fingerprint (see `tower_vk_fingerprint_pinned`).
 // Blessed 2026-09-07 (second cut: the grounded counter-base word)
 // (chain circuit + registries UNCHANGED by design; the three outer
-// circuits moved with the nine-word app block).
+// circuits moved with the nine-word app block). Re-blessed 2026-11-03: the
+// FL circuit alone moved, with the leaf children's PoW predicate rows
+// (`emit_child_region`); base, steady, registries and publics unchanged.
 const PIN_CHAIN_CIRCUIT: &str = "b8f442da32b9961612ccaf9acb39cadcd4592e913b2b208a1b9740d01c10e9c9";
-const PIN_FL_CIRCUIT: &str = "45c54e4003df6692d180ac70187b3ce5c34be259a7174f328d9ab95b6acb2f2a";
+const PIN_FL_CIRCUIT: &str = "008b38cae4c0c86f93305e1c909f8d5cb9280d5812259d57ac841f130e52c3e3";
 const PIN_BASE_CIRCUIT: &str = "0c8d7382f9824b4fe4894786494e5887e8cad3af262eaf6655cb2116a7830153";
 const PIN_STEADY_CIRCUIT: &str = "fafab0ced83b6f778e799c926041fad49625cce69075093fe3305b7ffb5e22c7";
 const PIN_CHAIN_REGISTRY: &str = "3126c5ce825e8fc3942843c0548ba43964b1daa5751a834fcbbc1c3ab58e40fe";

@@ -21,7 +21,7 @@ use {
     crate::{
         r1cs_hashes::blake3::{Compression, build_block_r1cs},
         tower::{
-            ChildSlots, ChildTape, SLOT_WORDS, check_child_region, emit_child_region,
+            ChildSlots, ChildTape, PowMaskGate, SLOT_WORDS, check_child_region, emit_child_region,
             expected_child_tail_schedule, gates_blake3::Rng, test_config,
         },
     },
@@ -30,6 +30,7 @@ use {
         pcs::ligerito::LigeritoProfile,
         product_gkr::ProductGkrError,
     },
+    flock_transcript::transcript_record::TranscriptOp,
     std::{any::Any, array::from_fn},
 };
 
@@ -934,6 +935,23 @@ pub(super) fn chain_child_region_emits_alone() {
         region.pub_base + consumed,
         built2.public.len(),
         "the region's publics are the whole tail"
+    );
+    // Every PoW the child's verifier checks natively has its predicate row.
+    let pows = ct
+        .ops
+        .iter()
+        .filter(|op| matches!(op, TranscriptOp::Pow { .. }))
+        .count();
+    assert!(pows > 0, "the chain leaf grinds");
+    let rows = built2.rows::<PowMaskGate>(cs.q.pow);
+    assert_eq!(rows.len(), pows, "one PowMask row per recorded child PoW");
+    // The rows read the real predicate words: an honest leaf passes each one
+    // (`recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce` shows
+    // the row rejects a nonce that fails).
+    assert!(
+        rows.iter()
+            .all(|r| r.pred & r.mask == 0 && r.nonce >> 64 == 0),
+        "the honest leaf's nonces satisfy every PoW row"
     );
     assert_eq!(
         region.tail_schedule,

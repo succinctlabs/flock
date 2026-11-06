@@ -45,10 +45,10 @@ use crate::{
         assertion_mac, bytes_payload_mask, cap_payloads, cap_wires, check_residual_publics,
         circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
         emit_boolean_reported_check, emit_element_reported_check, emit_fiat_shamir_chain,
-        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region, flatten_ops,
-        level_geometry, level_sources, observed_f256, pack8, parse_open_levels, payload_words,
-        pin_recombination, query_phase_blake3_rows, replay_ligerito_spine256, squeeze_word_wire,
-        strat_scheds, walker_common,
+        emit_publics_hash, emit_query_phase, emit_recombination, emit_recorded_pow_checks,
+        emit_residual_region, flatten_ops, level_geometry, level_sources, observed_f256, pack8,
+        parse_open_levels, payload_words, pin_recombination, query_phase_blake3_rows,
+        replay_ligerito_spine256, squeeze_word_wire, strat_scheds, walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -75,6 +75,10 @@ pub(super) struct ChildTape<'p> {
     pub(super) trace: FsChainTrace,
     pub(super) stream: Stream,
     pub(super) bytes: Vec<u8>,
+    /// The recorded op schedule, flattened. [`emit_child_region`] reads its
+    /// `Pow` markers: the fused chain rows only bind each nonce, and the
+    /// predicate (leading zeros, 64-bit nonce) is a separate check.
+    pub(super) ops: Vec<Op>,
     /// The fork's four cross-link wires ([`MergedChain::cross`]).
     pub(super) cross: Vec<Option<(usize, usize)>>,
     pub(super) b3_rows: usize,
@@ -938,6 +942,7 @@ impl<'p> ChildTape<'p> {
             trace,
             stream,
             bytes,
+            ops,
             cross,
             b3_rows,
             spread_w,
@@ -1998,6 +2003,13 @@ pub(super) fn emit_child_region(
         consts,
         &ct.pub_payloads,
         &ct.cross,
+    );
+    // The chain's fused rows bind every PoW nonce and derive the protected
+    // challenge from it; the predicate the native verifier checks (leading
+    // zeros, nonce < 2^64) is its own relation. Without it the leaf's grinds
+    // go unchecked here, where `emit_real_child_region` checks a node child's.
+    emit_recorded_pow_checks(
+        sb, b3_slot, cs.q.pow, iv2, &ct.ops, trace, stream, &outs, &ww, vals, consts,
     );
     let pub_w = emit_h_publics_region(sb, child_q, iv2, ct, stream, &ww, vals, consts);
     let cap_w = cap_wires(stream, &ww, &ct.cap_pays);
