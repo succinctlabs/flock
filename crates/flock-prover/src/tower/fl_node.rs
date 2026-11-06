@@ -1254,6 +1254,35 @@ pub(super) fn build_first_level_core(
                     }
                 }
             }
+            // Shared binding absorbed the child's WHOLE `x_inner_rest` and
+            // `rr` once; each claim above wires only its type's head (`inner`
+            // coordinates). Wire the tails beyond the longest head too, so
+            // every absorbed point word is the child's (no claim reads them;
+            // the reported check reads them from the region's own wires).
+            if family.shared.is_some() {
+                let a = &tk.bool_assert;
+                let (fi0, ci0, _) = child_claims[0];
+                let cl0 = &locs[fi0].claims[ci0];
+                let (mut row_head, mut col_head) = (0, 0);
+                for &(fi, ci, _) in &child_claims {
+                    let cl = &locs[fi].claims[ci];
+                    assert_eq!(
+                        (cl.row_pt_v, cl.col_pt_v),
+                        (cl0.row_pt_v, cl0.col_pt_v),
+                        "a shared-bound child's claims read one surface"
+                    );
+                    row_head = row_head.max(cl.row_pt_n);
+                    col_head = col_head.max(cl.col_pt_n);
+                }
+                for j in row_head..a.x_inner_rest.len() {
+                    sb.connect(wv(cl0.row_pt_v + j), rk.b_mlv_w[tk.n_log_i + j]);
+                }
+                let n_lc = rk.b_lc_w.len();
+                assert_eq!(n_lc, a.rr.len(), "one lincheck round per rr coordinate");
+                for j in col_head..a.rr.len() {
+                    sb.connect(wv(cl0.col_pt_v + j), rk.b_lc_w[n_lc - 1 - j]);
+                }
+            }
             for &(fi, ci, t) in &child_claims {
                 let cl = &locs[fi].claims[ci];
                 let value_w = if fi >= n_ab {
