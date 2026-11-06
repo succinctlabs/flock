@@ -1992,11 +1992,11 @@ pub fn build_node_outer_app(
             app_w.as_ref().map(|_| env_app_base(&env))
         };
         let shape2 = sb.finish().expect("the 2->1 node circuit builds");
-        // The two-limb Ligerito verifier plus the split BLAKE table stays
-        // below 512 cell slots, which pins the optimized mu=23 boundary.
+        // The affine verifier plus the split BLAKE table stays below 512
+        // cell slots, which pins the optimized mu=23 boundary.
         assert!(
             shape2.circuit.cells().slots().len() <= 512,
-            "the F256 node's cell-slot budget regressed ({} slots)",
+            "the node's cell-slot budget regressed ({} slots)",
             shape2.circuit.cells().slots().len()
         );
         // ROUND-3 DATA (NODE_CENSUS=1): per-type schema words — each one a
@@ -2016,7 +2016,7 @@ pub fn build_node_outer_app(
                 (shape2.registry_slot(cs.zcr), "zcr".to_string()),
                 (shape2.registry_slot(cs.mrs), "mrs".to_string()),
                 (shape2.registry_slot(cs.spine), "spine".to_string()),
-                (shape2.registry_slot(cs.spine256), "spine256".to_string()),
+                (shape2.registry_slot(cs.sq), "square".to_string()),
                 (shape2.registry_slot(cs.alslot), "assist".to_string()),
             ];
             if let Some(slot) = cs.q.b3_alt {
@@ -2030,8 +2030,7 @@ pub fn build_node_outer_app(
                 // the shared mac (600) is already labeled above.
                 let name = match k {
                     600 => continue,
-                    k if k >= 310 => format!("pf{}", k - 310),
-                    k => format!("resid{}", k - 100),
+                    k => format!("pf{}", k - 310),
                 };
                 lab.push((shape2.registry_slot(s), name));
             }
@@ -2843,10 +2842,7 @@ pub(super) fn real_tape_regions_pinned() {
     let flock_core::pcs::MergedInnerOpen::Affine(aff) = &open.inner else {
         panic!("the tower's outers open with the affine fold")
     };
-    let ai = rt
-        .affine
-        .as_ref()
-        .expect("the tape parses the affine inner");
+    let ai = &rt.affine;
     let n_levels = ai.levels.len();
     assert_eq!(
         n_levels,
@@ -2854,7 +2850,7 @@ pub(super) fn real_tape_regions_pinned() {
         "one open level per recursive cap plus the base"
     );
     assert_eq!(n_levels, ai.geo.len(), "one geometry per open level");
-    assert_eq!(n_levels, rt.lvl_src.len(), "one source triple per level");
+    assert_eq!(n_levels, ai.lvl_src.len(), "one source triple per level");
     assert_eq!(
         n_levels,
         rt.cap_pays.len(),

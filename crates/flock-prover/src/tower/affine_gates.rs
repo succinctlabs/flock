@@ -24,7 +24,6 @@
 //!
 //! Zero padding is exact in both modes: an absent slot is a zero value,
 //! and a padded round (`g = 0`) passes `lo` through.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::sync::Arc;
 

@@ -2,19 +2,13 @@ use std::ops::Range;
 
 use flock_core::{
     circuit::builder::SlotId,
-    lincheck::build_eq_table,
-    pcs::{
-        ligerito::{LigeritoProof, affine::AffineProof},
-        stratified::LevelSchedule,
-    },
+    pcs::{ligerito::affine::AffineProof, stratified::LevelSchedule},
 };
 use flock_merkle::{hash_leaf, hash_pair, verify_merkle_proof_capped};
-use flock_multilinear::{IndexOrder, eq_table};
 use flock_transcript::transcript_record::{Stream, StreamWord};
 
 use crate::tower::{
-    CHUNK_END, CHUNK_START, F128, F256, HashKind, OpenLevel, PARENT, PcsParams, ShapeBuilder, Wire,
-    cw, pack_params,
+    CHUNK_END, CHUNK_START, F128, HashKind, PARENT, PcsParams, ShapeBuilder, Wire, cw, pack_params,
 };
 
 /// The three slots a collapsed opening writes into, plus the fused PoW mask
@@ -60,30 +54,9 @@ pub(super) struct Lvl {
     /// stratum, path slice) through this.
     pub(super) sched: LevelSchedule,
     /// The tree's layers from the cap upward, folded natively by
-    /// `level_geometry`: entry `i` is the depth-`(c − i)` layer, entry 0
+    /// [`affine_level_geometry`]: entry `i` is the depth-`(c − i)` layer, entry 0
     /// the cap itself — [`Self::full_path`]'s sibling sources.
     cap_layers: Vec<Vec<[u8; 32]>>,
-}
-
-/// Map actual sumcheck-fold order back to the transcript point's natural
-/// coordinate order. Partial L0 lane grids bind the high lane coordinates
-/// first; full grids and every later level use ordinary low-to-high order.
-pub(super) fn level_zero_ood_z_index(
-    z_len: usize,
-    initial_k: usize,
-    committed_row_words: usize,
-    fold_order: usize,
-) -> usize {
-    if committed_row_words == 1usize << initial_k {
-        fold_order
-    } else {
-        let log_msg_cols = z_len - initial_k;
-        if fold_order < initial_k {
-            log_msg_cols + fold_order
-        } else {
-            fold_order - initial_k
-        }
-    }
 }
 
 impl Lvl {
@@ -108,7 +81,7 @@ impl Lvl {
     /// Query `k`'s FULL climb siblings — the truncated proof slice extended
     /// up to its stratum terminal at depth `c_k` with the cap-fold siblings
     /// the proof no longer carries (`self.cap_layers`, folded natively by
-    /// `level_geometry`). Advice either way: the synthesized entries feed
+    /// [`affine_level_geometry`]). Advice either way: the synthesized entries feed
     /// the same hint stream, and the constant-stratum terminal connect is
     /// what binds the climb.
     pub(super) fn full_path(&self, k: usize, pos: usize, paths: &[[u8; 32]]) -> Vec<[u8; 32]> {
@@ -135,7 +108,7 @@ impl Lvl {
     }
 }
 
-/// Exact BLAKE compression rows emitted by [`emit_query_phase`]. Each level
+/// Exact BLAKE compression rows the level openings emit. Each level
 /// materializes only the cap layers down to its shallowest configured
 /// stratum. A query hashes its committed row, climbs to that stratum, and
 /// top-stratum queries take one additional edge so the opening binds to a
@@ -207,40 +180,6 @@ pub(super) fn strat_scheds(params: &PcsParams) -> Vec<LevelSchedule> {
         .stratified
 }
 
-/// The per-level `(cap, opened rows, flat sibling paths)` triples a Ligerito
-/// proof reports, in level order: L0's initial cap, then each recursive cap,
-/// with the FINAL level reusing the last recursive cap. Since Merkle
-/// capping, this is the whole witness a query phase needs — the proof itself
-/// carries it, so no prover data is ever plumbed through.
-pub(super) fn level_sources(
-    lig: &LigeritoProof,
-) -> Vec<(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)> {
-    let r = lig.recursive_caps.len();
-    (0..=r)
-        .map(|li| {
-            if li == 0 {
-                (
-                    lig.initial_cap.as_slice(),
-                    &lig.initial_proof.opened_rows,
-                    &lig.initial_proof.merkle_proof,
-                )
-            } else if li < r {
-                (
-                    lig.recursive_caps[li - 1].as_slice(),
-                    &lig.recursive_proofs[li - 1].opened_rows,
-                    &lig.recursive_proofs[li - 1].merkle_proof,
-                )
-            } else {
-                (
-                    lig.recursive_caps[r - 1].as_slice(),
-                    &lig.final_proof.opened_rows,
-                    &lig.final_proof.merkle_proof,
-                )
-            }
-        })
-        .collect()
-}
-
 /// [`level_sources`] for an affine opening: level `li` opens against the
 /// cap it was committed under (L0's initial cap, then `recursive_caps[li-1]`).
 pub(super) fn affine_level_sources(
@@ -263,7 +202,7 @@ pub(super) fn affine_level_sources(
 /// The affine opening's per-level geometry: `ks[li]` folds (the lane-weight
 /// domain is `2^k`), `q_chs[li]` the level's query squeeze ordinal. Every
 /// opened row is verified NATIVELY against its cap at the position the
-/// recorded challenge maps to, as [`level_geometry`] does.
+/// recorded challenge maps to.
 pub(super) fn affine_level_geometry(
     ks: &[usize],
     q_chs: &[usize],
@@ -326,164 +265,6 @@ pub(super) fn affine_level_geometry(
             }
             lv
         })
-        .collect()
-}
-
-/// Per level: `q`, cap bits `c`, path length `d − c`, depth, lanes — plus
-/// the NATIVE cross-checks that pin every piece of the plumbing before any
-/// circuit exists: each opened row verifies against its cap under the
-/// recorded challenge, and the recorded weights reproduce
-/// `induce_sumcheck_enforced_sum`. Returns `(geo, native_sums)`; the sums
-/// are what the in-circuit leaf-eval accumulators must equal.
-pub(super) fn level_geometry(
-    levels: &[OpenLevel],
-    lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
-    chals: &[F128],
-    hash: HashKind,
-    scheds: &[LevelSchedule],
-) -> (Vec<Lvl>, Vec<F256>) {
-    assert_eq!(scheds.len(), levels.len(), "one schedule per open level");
-    let mut geo: Vec<Lvl> = Vec::new();
-    let mut native_sums: Vec<F256> = Vec::new();
-    for (li, lvl) in levels.iter().enumerate() {
-        let (cap, rows, paths) = lvl_src[li];
-        let q = lvl.q_count;
-        assert_eq!(rows.len(), q, "L{li}: one opened row per query");
-        let sched = &scheds[li];
-        // The proof is VALIDATED against the statement's schedule — never
-        // the other way around.
-        assert_eq!(sched.queries(), q, "L{li}: schedule owes the query count");
-        let c = sched.cap_depth();
-        assert_eq!(cap.len(), 1 << c, "L{li}: cap is the schedule's top layer");
-        assert_eq!(
-            paths.len(),
-            sched.total_path_siblings(),
-            "L{li}: flat paths sum the per-summand walks"
-        );
-        let depth = sched.log_block_len;
-        // The lane-fold weights are `2^folds` wide; the committed row may be
-        // NARROWER (its top lanes are definitionally zero), and the dot below
-        // zips — which IS the zero-fill, exactly as the native verifier does.
-        let lanes = 1usize << lvl.fold_fins.len();
-        let raw_row_words = rows[0].len();
-        let row_words = raw_row_words;
-        assert!(
-            row_words >= 1 && row_words <= lanes,
-            "L{li}: opened width {row_words} must fit the fold width {lanes}"
-        );
-        let fold_vals: Vec<F256> = lvl
-            .fold_chs
-            .iter()
-            .map(|&i| F256::new(chals[i], chals[i + 1]))
-            .collect();
-        let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
-        let eqv = eq_table(&fold_vals, F256::ONE, IndexOrder::LowToHigh);
-        let aw = build_eq_table(&alpha_vals);
-        let c_min = sched.summand_depths.last().copied().unwrap_or(c);
-        let lv = Lvl {
-            q,
-            c,
-            depth,
-            lanes,
-            row_words,
-            raw_row_words,
-            sched: sched.clone(),
-            cap_layers: native_cap_layers(cap, c - c_min, hash),
-        };
-        // Paths truncate at the cap, so every query verifies directly
-        // against the absorbed layer — no terminal-layer rebuild; the
-        // stratum needs no enforcement because `q_pos` derives the index
-        // itself with the stratum in the top bits.
-        let mut sum = F256::ZERO;
-        for (k, row) in rows.iter().enumerate() {
-            let pos = lv.q_pos(k, chals[lvl.q_ch + k].lo);
-            let mut leaf_bytes = Vec::with_capacity(16 * lanes);
-            for f in row {
-                leaf_bytes.extend_from_slice(&f.lo.to_le_bytes());
-                leaf_bytes.extend_from_slice(&f.hi.to_le_bytes());
-            }
-            let lh = hash_leaf(&leaf_bytes, hash);
-            assert!(
-                verify_merkle_proof_capped(
-                    cap,
-                    1 << depth,
-                    &lh,
-                    pos,
-                    &paths[lv.path_range(k)],
-                    hash,
-                ),
-                "L{li} query {k}: capped path verifies natively"
-            );
-            let dot = row
-                .iter()
-                .zip(eqv.iter())
-                .map(|(&x, &e)| F256::from(x) * e)
-                .fold(F256::ZERO, |a, v| a + v);
-            sum += aw[k] * dot;
-        }
-        native_sums.push(sum);
-        geo.push(lv);
-    }
-    (geo, native_sums)
-}
-
-pub(super) fn replay_ligerito_spine256(
-    levels: &[OpenLevel],
-    values: &[F128],
-    challenges: &[F128],
-    start_v: usize,
-    initial_target: F128,
-    enforced_sums: &[F256],
-) -> F256 {
-    let msg = |at: usize| {
-        (
-            F256::new(values[at], values[at + 1]),
-            F256::new(values[at + 2], values[at + 3]),
-        )
-    };
-    let quad = |at: usize, target: F256| {
-        let (u0, u2) = msg(at);
-        (u0, target + u2, u2)
-    };
-    let eval = |q: (F256, F256, F256), r: F256| q.0 + r * q.1 + r * r * q.2;
-
-    let mut target = F256::from(initial_target);
-    for od in &levels[0].initial_ood {
-        target += F256::from(challenges[od.beta_ch] * values[od.y_v]);
-    }
-    let mut q = quad(start_v, target);
-    for (li, level) in levels.iter().enumerate() {
-        for (j, &mv) in level.fold_msg_vs.iter().enumerate() {
-            let ch = level.fold_chs[j];
-            target = eval(q, F256::new(challenges[ch], challenges[ch + 1]));
-            q = quad(mv, target);
-        }
-        if li + 1 < levels.len() {
-            for od in &level.ood {
-                let y = F256::from(values[od.y_v]);
-                let iq = quad(od.intro_v, y);
-                let beta = challenges[od.beta_ch];
-                q.0 += iq.0 * beta;
-                q.1 += iq.1 * beta;
-                q.2 += iq.2 * beta;
-                target += y * beta;
-            }
-            let iq = quad(level.intro_v, enforced_sums[li]);
-            let beta = challenges[level.beta_ch];
-            q.0 += iq.0 * beta;
-            q.1 += iq.1 * beta;
-            q.2 += iq.2 * beta;
-            target += enforced_sums[li] * beta;
-        } else {
-            target += enforced_sums[li] * challenges[level.beta_ch];
-        }
-    }
-    target
-}
-
-pub(super) fn observed_f256(values: &[F128], start: usize, len: usize) -> Vec<F256> {
-    (0..len)
-        .map(|i| F256::new(values[start + 2 * i], values[start + 2 * i + 1]))
         .collect()
 }
 

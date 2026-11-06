@@ -4,10 +4,10 @@
 //!
 //! The walker keeps everything before the inner opening (the merged
 //! sumcheck's rounds, the multipoint assist, the family-H boundary). This
-//! module replaces the split inner's three regions:
+//! module emits the opening's three regions:
 //!
 //! - the QUERY PHASE: the level openings (Merkle paths against the absorbed
-//!   caps, as `query::emit_query_phase` emits them) feeding the affine
+//!   caps) feeding the affine
 //!   consistency and final checks ([`super::affine_query`]);
 //! - the SPINE: the affine claim fold from the absorbed `q_eval`
 //!   ([`super::affine_fold`]);
@@ -25,7 +25,7 @@ use flock_transcript::transcript_record::TranscriptOp as Op;
 use crate::{
     r1cs_hashes::fs_chain::FsChainTrace,
     tower::{
-        CollapsedSlots, F128, HashKind, Lvl, MacGate, PARENT, PrefixGate, ResidualWeightsGate256,
+        CollapsedSlots, F128, HashKind, Lvl, MacGate, PARENT, PrefixGate, ResidualWeightsGate,
         RoundRec, ShapeBuilder, Wire,
         affine_fold::{AffineFoldGate, AffineLevelWires, JoinWires, emit_affine_claim_fold},
         affine_gates::{Arith, FoldChunkGate, NovelPrefixGate, PREFIX},
@@ -82,10 +82,6 @@ impl<'p> AffineInner<'p> {
             initial_ood,
             levels,
         } = parse_affine_open(ops, 32 * proof.initial_cap.len(), &ks, yr_len);
-        assert!(
-            prefix.inner_pd.is_none(),
-            "the affine opening has no split intake"
-        );
         assert_eq!(levels.len(), ks.len(), "one tape level per config level");
         assert_eq!(proof.openings.len(), ks.len(), "one opening per level");
         let lvl_src = affine_level_sources(proof);
@@ -136,8 +132,7 @@ pub(super) const KEY_NPREFIX: usize = 904;
 const KEY_PREFIX: usize = 310 + PREFIX;
 
 impl AffineEnvLayouts {
-    /// The layouts every affine-profile shape in `shapes` needs
-    /// (split-profile shapes contribute nothing).
+    /// The layouts every affine-profile shape in `shapes` needs.
     pub(super) fn of(shapes: &[&PcsParams]) -> Self {
         let ladder_n = shapes
             .iter()
@@ -177,7 +172,7 @@ impl AffineEnvLayouts {
         }
         slot_cached(sb, cache, KEY_FOLD, AffineFoldGate::new);
         slot_cached(sb, cache, KEY_LADDER, || {
-            ResidualWeightsGate256::with_weights(self.ladder_n)
+            ResidualWeightsGate::with_weights(self.ladder_n)
         });
         slot_cached(sb, cache, KEY_CHUNK, FoldChunkGate::new);
         slot_cached(sb, cache, KEY_MAC, MacGate::new);
@@ -205,7 +200,7 @@ impl AffineSlots {
         }
     }
 
-    /// The envelope's pre-declared affine slots (none for a split tower).
+    /// The envelope's pre-declared affine slots.
     pub(super) fn from_cache(cache: &[(usize, SlotId)], lay: &AffineEnvLayouts) -> Self {
         let take = |k: usize| {
             cache
@@ -252,7 +247,7 @@ impl AffineSlots {
             assert!(!self.frozen, "the envelope declares no affine slots");
             self.slots = Some((
                 sb.slot(AffineFoldGate::new()),
-                (n, sb.slot(ResidualWeightsGate256::with_weights(n))),
+                (n, sb.slot(ResidualWeightsGate::with_weights(n))),
                 sb.slot(FoldChunkGate::new()),
                 sb.slot(MacGate::new()),
                 sb.slot(NovelPrefixGate::new()),
@@ -276,7 +271,7 @@ impl AffineSlots {
     }
 }
 
-/// Emit one level's openings, as `query::emit_query_phase` does: the cap
+/// Emit one level's openings: the cap
 /// layers above the shallowest stratum folded from the ABSORBED cap wires,
 /// each query hashed from its leaf and climbed to its stratum terminal
 /// (top-stratum queries one edge further, bound to the DERIVED layer-1

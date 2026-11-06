@@ -725,7 +725,11 @@ pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
     // h_start yields the same h_end.
     let cp = build_chain_proof(cfg, h_start, n_blocks);
     assert_eq!(cp.h_end, native_chain(&h_start, n_blocks));
-    assert_eq!(cp.inner.nu, 8);
+    assert_eq!(
+        cp.inner.nu,
+        n_blocks.trailing_zeros() as usize,
+        "the leaf is one block per row"
+    );
 
     // The tamper legs run on a fresh circuit build (the honest one's rows,
     // modified), against the PLAIN verifier so every check is in force.
@@ -896,8 +900,8 @@ pub(super) fn chain_tape_regions_pinned() {
         ct.mu_i,
         cp.inner.proof.wiring().gkr.layers.len(),
         ct.b3_rows,
-        ct.affine.as_ref().expect("affine leaf").geo[0].lanes,
-        ct.affine.as_ref().expect("affine leaf").geo[0].row_words,
+        ct.affine.geo[0].lanes,
+        ct.affine.geo[0].row_words,
     );
 }
 

@@ -1,5 +1,3 @@
-use std::mem::take;
-
 use flock_transcript::transcript_record::{TranscriptOp, TranscriptOp as Op};
 
 use crate::{
@@ -7,8 +5,8 @@ use crate::{
     tower::{
         Wire,
         walker_common::{
-            LBL_AFFINE_OPEN, LBL_ELEMENT_LC, LBL_ELEMENT_ZC, LBL_FROBENIUS, LBL_INNER_PD,
-            LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_OPEN_BASIS, LBL_RING_SWITCH,
+            LBL_AFFINE_OPEN, LBL_ELEMENT_LC, LBL_ELEMENT_ZC, LBL_FROBENIUS, LBL_MERGED_OPEN,
+            LBL_MULTIPOINT, LBL_RING_SWITCH,
         },
     },
 };
@@ -45,13 +43,6 @@ pub(super) struct RoundRec {
     pub(super) ch: usize,
 }
 
-/// The inner ligerito intake's single claim: q_eval's value index + gamma'.
-pub(super) struct InnerPd {
-    pub(super) q_v: usize,
-    pub(super) fin: usize,
-    pub(super) ch: usize,
-}
-
 /// The element PIOP on the tape: tau, the zerocheck rounds, (ea, eb, ec),
 /// alpha, and the lincheck rounds.
 pub(super) struct PiopRec {
@@ -63,18 +54,6 @@ pub(super) struct PiopRec {
     pub(super) alpha_fin: usize,
     pub(super) alpha_ch: usize,
     pub(super) lc_rounds: Vec<RoundRec>,
-}
-
-/// One OOD claim on the tape: where its `z` squeezed, its `y`/intro-msg
-/// values, and its beta.
-pub(super) struct OodRec {
-    pub(super) z_fin: usize,
-    pub(super) z_ch: usize,
-    pub(super) z_len: usize,
-    pub(super) y_v: usize,
-    pub(super) intro_v: usize,
-    pub(super) beta_fin: usize,
-    pub(super) beta_ch: usize,
 }
 
 /// The multipoint region of the merged open, located on the tape:
@@ -94,43 +73,6 @@ pub(super) struct MpRec {
     pub(super) anchor_v: usize,
     /// The anchor's `2(m + 1)` rounds.
     pub(super) anchor_rounds: Vec<RoundRec>,
-}
-
-/// One open-phase level, located on a recorded op tape. `*_fin` are finalize
-/// ordinals (indices into `FsChainTrace::squeezes`); `*_ch` index into
-/// `RecordingChallenger::challenges()`.
-pub(super) struct OpenLevel {
-    /// Additional L0 OOD claims batched into the initial sumcheck before its
-    /// first message. Nonempty only on level 0.
-    pub(super) initial_ood: Vec<InitialOodRec>,
-    pub(super) fold_fins: Vec<usize>,
-    pub(super) fold_chs: Vec<usize>,
-    /// Value index of each fold round's message `u_0` (`u_2` is `+1`).
-    pub(super) fold_msg_vs: Vec<usize>,
-    /// OOD claims folded before this level's queries.
-    pub(super) ood: Vec<OodRec>,
-    /// The level's intro message value idx (unused for the final level).
-    pub(super) intro_v: usize,
-    /// The intro/final beta: `(fin, ch)`.
-    pub(super) beta_fin: usize,
-    pub(super) beta_ch: usize,
-    pub(super) q_fin: usize,
-    pub(super) q_ch: usize,
-    pub(super) q_count: usize,
-    pub(super) a_fin: usize,
-    pub(super) a_ch: usize,
-    pub(super) a_count: usize,
-}
-
-/// An L0 OOD claim has no separate intro quadratic: its equality basis and
-/// target are combined before the initial sumcheck message is emitted.
-pub(super) struct InitialOodRec {
-    pub(super) z_fin: usize,
-    pub(super) z_ch: usize,
-    pub(super) z_len: usize,
-    pub(super) y_v: usize,
-    pub(super) beta_fin: usize,
-    pub(super) beta_ch: usize,
 }
 
 /// A cursor over a recorded op tape, counting finalizations (`fin`),
@@ -167,16 +109,6 @@ impl Cur<'_> {
         self.bump();
     }
 
-    fn expect_obs_f256(&mut self) {
-        assert!(
-            matches!(self.ops[self.i], Op::ObserveSlice(2)),
-            "op {}: expected ObserveSlice(2), got {:?}",
-            self.i,
-            self.ops[self.i]
-        );
-        self.bump();
-    }
-
     /// PoW finalizes the transcript and absorbs a nonce but creates no
     /// field challenge or scalar message.  PIOP locators call this before
     /// every protected squeeze; the generic circuit relation constrains
@@ -190,16 +122,13 @@ impl Cur<'_> {
 
 /// What precedes the inner opening on a merged-open tape: the element
 /// PIOP, the packed-direct coefficients, the merged W-rounds, the
-/// multipoint region, and (split ladder only) the inner packed-direct
-/// intake. Returned with the cursor parked on the opening's L0 cap absorb.
+/// multipoint region. Returned with the cursor parked on the opening's L0 cap absorb.
 pub(super) struct OpenPrefix {
     pub(super) piop: Option<PiopRec>,
     pub(super) gammas: Vec<PdRec>,
     pub(super) rounds: Vec<RoundRec>,
     pub(super) mp: MpRec,
-    pub(super) inner_pd: Option<InnerPd>,
     /// Value index of the opening's target (`ObserveScalar` after its label).
-    #[allow(dead_code)] // the affine claim fold starts from it (next step)
     pub(super) target_v: usize,
 }
 
@@ -241,7 +170,6 @@ fn walk_open_prefix<'a>(
     let mut gammas: Vec<PdRec> = Vec::new();
     let mut rounds: Vec<RoundRec> = Vec::new();
     let mut mp: Option<MpRec> = None;
-    let mut inner_pd: Option<InnerPd> = None;
     let mut piop: Option<PiopRec> = None;
     let mut in_pd = false;
     let mut intake_rs = 0usize;
@@ -443,22 +371,6 @@ fn walk_open_prefix<'a>(
             });
             continue;
         }
-        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == LBL_INNER_PD) {
-            cur.bump();
-            let q_v = cur.v;
-            cur.expect_obs_scalar(); // q_eval
-            assert!(
-                matches!(ops[cur.i], Op::SqueezeSlice(1)),
-                "inner gamma vector"
-            );
-            inner_pd = Some(InnerPd {
-                q_v,
-                fin: cur.fin,
-                ch: cur.ch,
-            });
-            cur.bump();
-            continue;
-        }
         cur.bump();
     }
     let mp = mp.expect("the multipoint region");
@@ -472,212 +384,34 @@ fn walk_open_prefix<'a>(
             gammas,
             rounds,
             mp,
-            inner_pd,
             target_v,
         },
     )
 }
 
-/// Walk the recorded transcript ops and locate every open-phase squeeze the
-/// circuit needs. The walk MIRRORS the succinct verifier's structure (folds,
-/// cap absorbs, OOD groups, PoW, queries, alpha, beta per level), asserting
-/// each op kind — a config change that moves the shape fails here, loudly,
-/// not as a wrong wire.
-#[allow(clippy::type_complexity)]
-pub(super) fn parse_open_levels(
-    ops: &[TranscriptOp],
-    cap0_bytes: usize,
-    r: usize,
-) -> (
-    usize,
-    Option<PiopRec>,
-    Vec<PdRec>,
-    Vec<RoundRec>,
-    MpRec,
-    InnerPd,
-    usize,
-    Vec<OpenLevel>,
-) {
-    let (mut cur, pre) = walk_open_prefix(ops, cap0_bytes, LBL_OPEN_BASIS);
-    let OpenPrefix {
-        piop,
-        gammas,
-        rounds,
-        mp,
-        inner_pd,
-        ..
-    } = pre;
-    let inner_pd = inner_pd.expect("the inner ligerito intake");
-    cur.bump(); // the open-phase initial cap absorb
-    let mut initial_ood = Vec::new();
-    while matches!(cur.ops[cur.i], Op::SqueezeSlice(_)) {
-        let z_len = match cur.ops[cur.i] {
-            Op::SqueezeSlice(n) => n,
-            _ => unreachable!(),
-        };
-        let (z_fin, z_ch) = (cur.fin, cur.ch);
-        cur.bump();
-        let y_v = cur.v;
-        cur.expect_obs_scalar();
-        cur.skip_pows();
-        assert!(
-            matches!(cur.ops[cur.i], Op::SqueezeScalar),
-            "L0 OOD beta at op {}: context {:?}",
-            cur.i,
-            &cur.ops[cur.i.saturating_sub(4)..(cur.i + 4).min(cur.ops.len())]
-        );
-        initial_ood.push(InitialOodRec {
-            z_fin,
-            z_ch,
-            z_len,
-            y_v,
-            beta_fin: cur.fin,
-            beta_ch: cur.ch,
-        });
-        cur.bump();
-    }
-    let start_v = cur.v;
-    cur.expect_obs_f256(); // sumcheck start msg u_0
-    cur.expect_obs_f256(); // ... u_2
-
-    let mut levels = Vec::new();
-    let mut yr_v = 0usize;
-    for li in 0..=r {
-        // Fold batch: one double-width squeeze and two F256 message absorbs
-        // per round. Fold grinding is zero in the F256 protocol.
-        let mut fold_fins = Vec::new();
-        let mut fold_chs = Vec::new();
-        let mut fold_msg_vs = Vec::new();
-        loop {
-            match cur.ops[cur.i] {
-                Op::Pow { .. } if matches!(cur.ops.get(cur.i + 1), Some(Op::SqueezeSlice(2))) => {
-                    cur.bump()
-                }
-                Op::SqueezeSlice(2) => {
-                    fold_fins.push(cur.fin);
-                    fold_chs.push(cur.ch);
-                    cur.bump();
-                    fold_msg_vs.push(cur.v);
-                    cur.expect_obs_f256();
-                    cur.expect_obs_f256();
-                }
-                _ => break,
-            }
-        }
-        let mut ood = Vec::new();
-        if li < r {
-            // The NEXT commitment's cap, then its OOD groups.
-            assert!(
-                matches!(cur.ops[cur.i], Op::ObserveBytes(_)),
-                "op {}: expected the next cap absorb, got {:?}",
-                cur.i,
-                cur.ops[cur.i]
-            );
-            cur.bump();
-            while !matches!(cur.ops[cur.i], Op::Pow { .. }) {
-                let z_len = match cur.ops[cur.i] {
-                    Op::SqueezeSlice(n) => n,
-                    ref o => panic!("OOD z, got {o:?}"),
-                };
-                let (z_fin, z_ch) = (cur.fin, cur.ch);
-                cur.bump();
-                let y_v = cur.v;
-                cur.expect_obs_scalar(); // base-field y
-                let intro_v = cur.v;
-                cur.expect_obs_f256(); // intro u_0
-                cur.expect_obs_f256(); // intro u_2
-                cur.skip_pows();
-                assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "OOD beta");
-                ood.push(OodRec {
-                    z_fin,
-                    z_ch,
-                    z_len,
-                    y_v,
-                    intro_v,
-                    beta_fin: cur.fin,
-                    beta_ch: cur.ch,
-                });
-                cur.bump();
-            }
-        } else {
-            // Final level: the yr observes.
-            yr_v = cur.v;
-            while matches!(cur.ops[cur.i], Op::ObserveScalar) {
-                cur.expect_obs_scalar();
-            }
-        }
-        assert!(
-            matches!(cur.ops[cur.i], Op::Pow { .. }),
-            "op {}: expected query-grinding Pow, got {:?}",
-            cur.i,
-            cur.ops[cur.i]
-        );
-        cur.bump();
-        let (q_fin, q_ch, q_count) = match cur.ops[cur.i] {
-            Op::SqueezeSlice(n) => (cur.fin, cur.ch, n),
-            ref o => panic!("op {}: expected queries squeeze, got {o:?}", cur.i),
-        };
-        cur.bump();
-        cur.skip_pows();
-        let (a_fin, a_ch, a_count) = match cur.ops[cur.i] {
-            Op::SqueezeSlice(n) => (cur.fin, cur.ch, n),
-            ref o => panic!("op {}: expected alpha squeeze, got {o:?}", cur.i),
-        };
-        cur.bump();
-        let intro_v = cur.v;
-        if li < r {
-            cur.expect_obs_f256(); // intro u_0
-            cur.expect_obs_f256(); // intro u_2
-        }
-        cur.skip_pows();
-        assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "beta");
-        let (beta_fin, beta_ch) = (cur.fin, cur.ch);
-        cur.bump();
-        levels.push(OpenLevel {
-            initial_ood: if li == 0 {
-                take(&mut initial_ood)
-            } else {
-                Vec::new()
-            },
-            fold_fins,
-            fold_chs,
-            fold_msg_vs,
-            ood,
-            intro_v,
-            beta_fin,
-            beta_ch,
-            q_fin,
-            q_ch,
-            q_count,
-            a_fin,
-            a_ch,
-            a_count,
-        });
-    }
-    (start_v, piop, gammas, rounds, mp, inner_pd, yr_v, levels)
-}
-
 /// One affine fold round on the tape: the 5-word grid absorb, then the
 /// fold-grinding PoW fused with the 3-word `(alpha, beta, r)` squeeze.
-#[allow(dead_code)] // consumed by the affine child walker (next step)
 pub(super) struct AffineRoundRec {
     /// Value index of the grid's first word (`G00`; `G11` is implied).
     pub(super) grid_v: usize,
     pub(super) fin: usize,
-    /// Challenge index of `alpha`; `beta` and `r` follow.
+    /// Challenge index of `alpha`; `beta` and `r` follow. The walkers wire
+    /// challenges by finalization; the native test replays read this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) ch: usize,
 }
 
 /// One affine OOD claim: a fresh point squeeze (all `c` coordinates on a
 /// recursive level; only the `initial_k` row coordinates on a lane-major
 /// L0, whose columns are the opening point's), its `y`, and its `beta`.
-#[allow(dead_code)] // consumed by the affine child walker (next step)
 pub(super) struct AffineOodRec {
     pub(super) z_fin: usize,
+    #[cfg_attr(not(test), allow(dead_code))] // native test replays
     pub(super) z_ch: usize,
     pub(super) z_len: usize,
     pub(super) y_v: usize,
     pub(super) beta_fin: usize,
+    #[cfg_attr(not(test), allow(dead_code))] // native test replays
     pub(super) beta_ch: usize,
 }
 
@@ -685,7 +419,6 @@ pub(super) struct AffineOodRec {
 /// carry the overflow, the next cap, OOD claims, the queries, the
 /// consistency `alpha` vector and the consistency `beta`; the final level
 /// carries `yr` and the queries.
-#[allow(dead_code)] // consumed by the affine child walker (next step)
 pub(super) struct AffineLevel {
     pub(super) rounds: Vec<AffineRoundRec>,
     /// Non-final: value index of the `k` overflow words.
@@ -704,7 +437,6 @@ pub(super) struct AffineLevel {
 
 /// The affine inner opening on a merged-open tape: what precedes it, the
 /// L0 OOD claims, and one [`AffineLevel`] per level.
-#[allow(dead_code)] // consumed by the affine child walker (next step)
 pub(super) struct AffineOpenTape {
     pub(super) prefix: OpenPrefix,
     pub(super) initial_ood: Vec<AffineOodRec>,
@@ -717,7 +449,6 @@ pub(super) struct AffineOpenTape {
 /// recursive ks) and `yr_len` is `2^c + k` of the final level; both are
 /// config authority, so the walk counts rather than infers, and a shape
 /// change fails here loudly instead of as a wrong wire.
-#[allow(dead_code)] // consumed by the affine child walker (next step)
 pub(super) fn parse_affine_open(
     ops: &[TranscriptOp],
     cap0_bytes: usize,
@@ -725,10 +456,6 @@ pub(super) fn parse_affine_open(
     yr_len: usize,
 ) -> AffineOpenTape {
     let (cur, prefix) = walk_open_prefix(ops, cap0_bytes, LBL_AFFINE_OPEN);
-    assert!(
-        prefix.inner_pd.is_none(),
-        "the affine opening has no packed-direct intake"
-    );
     let (initial_ood, levels) = walk_affine_levels(cur, ks, yr_len);
     AffineOpenTape {
         prefix,
@@ -985,36 +712,5 @@ mod tests {
         let last = t.levels.last().unwrap();
         assert_eq!(last.q_ch + last.q_count, chals.len());
         assert!(!t.prefix.mp.rounds.is_empty() && !t.prefix.rounds.is_empty());
-    }
-
-    /// The split walk, after the prefix walk moved into [`super::walk_open_prefix`],
-    /// still parses a chained-BLAKE3 `fast` union tape to one level per open
-    /// level.
-    #[test]
-    fn split_open_tape_still_parses() {
-        const D: &[u8] = b"tower-affine-tape";
-        let n_blocks = 1 << 10;
-        let setup = Blake3Setup::with_profile(n_blocks, LigeritoProfile::Fast);
-        let mut rng = Rng::new(0x7A9E_AFF1);
-        let blocks: Vec<Compression> = (0..n_blocks)
-            .map(|_| {
-                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-                (cv, m, rng.next_u32() as u64, 64u32, 11u32)
-            })
-            .collect();
-        let (proof, commitment, _) =
-            setup.prove_fast(&blocks, &mut FsChallenger::with_chained_blake3(D));
-        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(D));
-        setup.verify(&commitment, &proof, &mut rec).unwrap();
-        let lig = &proof.pcs_open.inner.split().ligerito;
-        let shape = rec.shape();
-        let r = lig.recursive_caps.len();
-        let (.., levels) = super::parse_open_levels(
-            &crate::tower::fs_chain::flatten_ops(shape.ops()),
-            32 * lig.initial_cap.len(),
-            r,
-        );
-        assert_eq!(levels.len(), r + 1);
     }
 }

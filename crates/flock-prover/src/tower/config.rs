@@ -18,24 +18,18 @@ pub(super) fn pcs_batch_for(union: &UnionInstance, profile: LigeritoProfile) -> 
     embedded_initial_k_or_default(union.dense_m(), profile)
 }
 
-/// The two production recursion towers. The LEAF (the application's chain
-/// segment — the workload inner proof) proves under the rate-1/2 Fast twin
-/// of the tower's security level; the OUTERS (FL / internal / spine) prove
-/// under the Slim twin at the m* = 29 / nu* = 14 envelope, always ON.
+/// The production recursion tower. The LEAF (the application's chain
+/// segment — the workload inner proof) proves under the rate-1/2
+/// FastAffine profile; the OUTERS (FL / internal / spine) prove under
+/// SlimAffine at the m* = 29 / nu* = 14 envelope, always ON. Every inner
+/// opening is the affine F128 fold, so the walkers carry no F256 ladder.
 ///
-/// Fast leaf + Slim outers is deliberate. The leaf keeps the SAME tape
-/// structure as Fast (the FL/node tape walkers are level-blind), while its
-/// query count follows the tower's security level: a 100-bit recursion
-/// carries a 100-bit leaf (Fast100, 448q — a 128-bit leaf under a 100-bit
-/// recursion balloons the FL's replayed transcript past the arity-2
-/// envelope), and the 128-bit aggressive recursion carries the aggressive
-/// Fast128 leaf (rate-1/2 on the rate+2 ladder; m32: Σq 675 → 527).
+/// Fast leaf + Slim outers is deliberate: the leaf keeps the SAME tape
+/// structure as the outers (the FL/node tape walkers are level-blind) at
+/// the cheaper rate-1/2 commit.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TowerConfig {
-    /// The 100-bit tower: Fast100 leaf, Slim100 outers.
-    Chain100,
-    /// The 128-bit tower on the aggressive rate ladder: Fast128 leaf,
-    /// Slim128 outers.
+    /// The 128-bit tower: FastAffine leaf, SlimAffine outers.
     Chain128,
 }
 
@@ -43,14 +37,12 @@ impl TowerConfig {
     /// The chain leaf's WORKLOAD inner-proof profile (rate 1/2).
     pub fn leaf_profile(self) -> LigeritoProfile {
         match self {
-            TowerConfig::Chain100 => LigeritoProfile::Fast100,
             TowerConfig::Chain128 => LigeritoProfile::FastAffine,
         }
     }
     /// The recursion-path OUTER profile (rate 1/4, envelope-ON).
     pub fn outer_profile(self) -> LigeritoProfile {
         match self {
-            TowerConfig::Chain100 => LigeritoProfile::Slim100,
             TowerConfig::Chain128 => LigeritoProfile::SlimAffine,
         }
     }
@@ -64,15 +56,14 @@ impl TowerConfig {
 pub(super) const DEV_BLOCKS: usize = 1024;
 
 /// Bench/test knob: which production tower the ignored tower tests and
-/// benches exercise. `TOWER_CONFIG=chain100` selects [`TowerConfig::Chain100`];
-/// `TOWER_CONFIG=chain128`, or unset, the 128-bit production tower. Any other
-/// value is a typo and panics instead of silently selecting the default.
+/// benches exercise. `TOWER_CONFIG=chain128`, or unset, selects the one
+/// production tower; any other value is a typo and panics instead of
+/// silently selecting the default.
 #[cfg(test)]
 pub(super) fn test_config() -> TowerConfig {
     match var("TOWER_CONFIG").as_deref() {
-        Ok("chain100") => TowerConfig::Chain100,
         Ok("chain128") | Err(VarError::NotPresent) => TowerConfig::Chain128,
-        other => panic!("TOWER_CONFIG must be `chain100` or `chain128`, got {other:?}"),
+        other => panic!("TOWER_CONFIG must be `chain128`, got {other:?}"),
     }
 }
 

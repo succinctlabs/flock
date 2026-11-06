@@ -14,10 +14,9 @@ use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
         ChainLane, ChainProof, DEV_BLOCKS, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online,
-        RootBundle, RootDischargeFailure, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
-        UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
-        chain_blake_r1cs, chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base,
-        env_pass_base,
+        RootBundle, RootDischargeFailure, SpineIn, Tower, TowerVerifyError, TowerVk, UnionInstance,
+        build_chain_proof, build_first_level_node, build_node_outer_app, chain_blake_r1cs,
+        chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
         envelope::STEADY_OVERRIDE,
         envelope_shape,
         gates_blake3::Rng,
@@ -1281,12 +1280,7 @@ pub(super) fn tower_verify_root_e2e() {
 #[test]
 #[ignore] // Heavy — one VK generation (a six-leaf reference tower).
 pub(super) fn tower_vk_fingerprint_pinned() {
-    let cfg = test_config();
-    if cfg != TowerConfig::Chain128 {
-        eprintln!("the fingerprint pin is chain128-only; skipping under {cfg:?}");
-        return;
-    }
-    let vk = TowerVk::generate(cfg, DEV_BLOCKS);
+    let vk = TowerVk::generate(test_config(), DEV_BLOCKS);
     let fp = vk.fingerprint();
     let hex = |d: &[u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
     if var("TOWER_VK_FP_PRINT").is_ok() {
@@ -1325,9 +1319,9 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 // inner (FastAffine leaf, SlimAffine outers) moves every digest; the
 // publics length is unchanged.
 const PIN_CHAIN_CIRCUIT: &str = "f7a065447042245cccc573887e714d1a9f754583a7d0f120c9753e51d6037fa3";
-const PIN_FL_CIRCUIT: &str = "e09cc16d7ba0a8b17cf21104ec543c7089261956b0ec6815e81634fde26aa906";
-const PIN_BASE_CIRCUIT: &str = "1d8cb89d2f265b1b658cccfc8ec3e0c8a58668df81ad8f29612435e08f21b54e";
-const PIN_STEADY_CIRCUIT: &str = "6b14ebbe9aa60265f95d714bcb49d0beaf3f136d1a044a5cd8b7f19842304858";
+const PIN_FL_CIRCUIT: &str = "81366efbe7260f6b064d7e3f8bc354add14049f7b685117304e66c103edf0037";
+const PIN_BASE_CIRCUIT: &str = "2b61d84c11eeb61a726c2b5f3f87cce8b57e24abe4a395d9b191758c989dd988";
+const PIN_STEADY_CIRCUIT: &str = "2b54adf37f41df645ee02799b58a33023a31d00291e3f3e46a5cacbbd928c8ab";
 const PIN_CHAIN_REGISTRY: &str = "c2a387fffa3d06ccf25e341c2faa4e5d9b62015fc3f74a8364206ff08abb24a3";
-const PIN_OUTER_REGISTRY: &str = "ddec75513eabfbfc6367ca1e69b05015217f2328ba4afefafba6c912a2c1ae8f";
+const PIN_OUTER_REGISTRY: &str = "5bdf79293868d752b83306b0b77cf26067b86b779eb1edc1a4ac7f00ddb35520";
 const PIN_PUBLICS_LEN: usize = 5684;

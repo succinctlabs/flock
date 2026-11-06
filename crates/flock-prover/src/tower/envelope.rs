@@ -7,11 +7,10 @@ use flock_core::{circuit::builder::SlotId, pcs::ligerito::embedded_initial_k_or_
 
 use crate::tower::{
     AssistLayerGate, BitSpreadGate, BitSpreadTable, Blake3Gate, CollapsedSlots, F128,
-    FamilyTransposeTileGate, GateType, HashKind, LeafEvalGate, LeafEvalGate256, LigeritoProfile,
-    MacGate, MacGate256, MergedRoundGate, PcsParams, PowMaskGate, PrefixGate, PrefixGate256,
-    ResidualAccGate256, ResidualPrefix3Gate256, ResidualWeightsGate256, SLOT_WORDS, ShapeBuilder,
-    SpineGate, SpineGate256, SwapGate, UnionInstance, Wire, ZcRoundGate,
-    affine_walk::AffineEnvLayouts, config::ENVELOPE_FLOOR_M, cw,
+    FamilyTransposeTileGate, GateType, HashKind, LeafEvalGate, LigeritoProfile, MacGate,
+    MergedRoundGate, PcsParams, PowMaskGate, PrefixGate, SLOT_WORDS, ShapeBuilder, SpineGate,
+    SquareChainGate, SwapGate, UnionInstance, Wire, ZcRoundGate, affine_walk::AffineEnvLayouts,
+    config::ENVELOPE_FLOOR_M, cw,
 };
 
 /// Wall 2's registry-geometry constants at the settled envelope (slim,
@@ -21,14 +20,13 @@ use crate::tower::{
 ///
 /// - `spread_w` 20 covers the m32 FAST chain leaf's L0 depth; the m29 Slim
 ///   outer ladder needs 19 and leaves the high output unread.
-/// - Extension-field residual work uses three reusable gates, independent
-///   of prefix length (the base-field per-prefix `ResidualGate` family died
-///   in the stage-3 registry diet).
+/// - The affine inner verifier rides five shape-free gates (keys 900..=904,
+///   [`AffineEnvLayouts`]), independent of lanes and residual length.
 /// - `nu` 14: each of the two independent child verifiers has its own
-///   identical BLAKE slot, and the consolidated extension-field residual
-///   gates keep every physical slot below 2^14 rows.
-/// - 29 table types occupy 511 gate slots; with one public slot, the cell
-///   address needs 9 bits and `mu = nu + 9 = 23` tower-wide.
+///   identical BLAKE slot, and every physical slot stays below 2^14 rows.
+/// - The table types' IO words plus one public slot stay within 512 cell
+///   slots, so the cell address needs 9 bits and `mu = nu + 9 = 23`
+///   tower-wide.
 ///
 /// A ladder that drifts off these constants surfaces as a NEW slot at
 /// emission time and hence a registry-digest mismatch — the failure is
@@ -42,7 +40,7 @@ pub(super) struct EnvShape {
     /// determine the circuit digest; `counts_el` remains the canonical
     /// element-slot key list and retains the old cap census for
     /// comparison.
-    pub(super) counts_el: [(usize, usize); 15],
+    pub(super) counts_el: [(usize, usize); 9],
     /// publics* — the ONE public-segment length every envelope outer pads
     /// to (published zeros appended after all real publics). The child's
     /// publics count is what a PARENT's walk consumes — H(publics) chain
@@ -57,8 +55,8 @@ pub(super) struct EnvShape {
     pub(super) lanes: usize,
     /// The affine inner's slot layouts ([`AffineEnvLayouts::of`]): the
     /// union of the chain leaf's and the envelope outer's, so every outer
-    /// of one tower declares the same types. Empty for split-profile
-    /// towers; set by the builders through [`EnvShape::with_affine`].
+    /// of one tower declares the same types; set by the builders through
+    /// [`EnvShape::with_affine`].
     pub(super) affine: AffineEnvLayouts,
 }
 
@@ -190,9 +188,9 @@ pub(super) fn steady_reps() -> usize {
 /// shorter shape — a dev-size chain, a fold with fewer groups — rides the
 /// same layout and a reader simply stops at its own group widths.
 pub(super) const ENV_ACC_CHAIN_WORDS: usize = 160;
-// F256 verification adds extension-field table claims to the shared
-// registry. A live node uses 1,028 words; keep a fixed-shape margin so the
-// same block carries the accumulator at every recursive level.
+// Sized under the old F256 inner, when a live node used 1,028 words; the
+// fixed-shape margin lets the same block carry the accumulator at every
+// recursive level.
 pub(super) const ENV_ACC_MAIN_WORDS: usize = 1152;
 
 /// THE PASSENGER (wall 3): one sigma-shaped and one jagged-shaped entry,
@@ -260,10 +258,10 @@ pub(super) struct EnvTail<'w> {
 /// convergence below is pinned to m* = 29's measured geometry.
 pub(super) fn envelope_shape() -> EnvShape {
     EnvShape {
-        // The two-child envelope fits at 14 after consolidating the F256
-        // residual tables and assigning each independent child verifier to
-        // its own identical BLAKE slot. Every physical slot remains below
-        // 2^14 rows, while 512 cell slots give mu = 14 + 9 = 23.
+        // The two-child envelope fits at 14 with each independent child
+        // verifier on its own identical BLAKE slot. Every physical slot
+        // remains below 2^14 rows, while 512 cell slots give mu = 14 + 9 =
+        // 23.
         nu: 14,
         // 20 = the m32 FAST chain leaf's L0 depth (log_msg_cols 19 +
         // log_inv_rate 1), which the B-fast PoC's first-level node walks;
@@ -294,21 +292,10 @@ pub(super) fn envelope_shape() -> EnvShape {
             // extra keyed slot's rounds (measured 949 live).
             (400, 1000),
             (0, 9000),    // spine
-            (700, 9000),  // extension-field Ligerito spine
-            (701, 15000), // extension-field multiply-accumulate
+            (705, 4600),  // family-H Frobenius square chains
             (601, 300),   // assist
             (8, 4200),    // leaf-eval 8-lane
-            (808, 4200),  // extension-field leaf evaluation
             (318, 15000), // prefix w 8
-            // The extension residual relation is decomposed into three
-            // shared tables: one normalized-weight row and one accumulator
-            // row per query, plus one three-factor prefix row per later
-            // Ligerito level. These caps are the sums of the former six
-            // per-prefix variants at the envelope maxima above.
-            (880, 4150),   // normalized W_0..W_18 chain
-            (881, 12690),  // three-factor extension prefix
-            (882, 4150),   // eight-way residual accumulation
-            (1008, 15000), // extension prefix w 8
         ],
         // Preserve the existing public body while enlarging ACC_MAIN.
         publics: 5684,
@@ -316,9 +303,9 @@ pub(super) fn envelope_shape() -> EnvShape {
         // stays circuit structure (the parent hashes `num_lanes`-word
         // leaves), so it is pinned while everything count-shaped rides the
         // jagged claims. 24 covers every envelope member's content-derived
-        // count at min-one-row. F256 raises the largest live content to 25
-        // lanes; 31 stays below `2^initial_k = 32`, so children remain
-        // lane-major.
+        // count at min-one-row; 31 (set when the F256 inner raised the
+        // largest live content to 25 lanes) stays below `2^initial_k = 32`,
+        // so children remain lane-major.
         lanes: 31,
         affine: AffineEnvLayouts::default(),
     }
@@ -326,9 +313,8 @@ pub(super) fn envelope_shape() -> EnvShape {
 
 /// Find-or-create a slot under this file's keyed-cache scheme
 /// (0 spine / 8 leaf-eval / 400 mrs / 500 zcr / 600 mac / 601 assist /
-/// 602 fold-mac / 700 spine256 / 701 mac256 / 808 leaf-eval256 /
-/// 880 resid-weights / 881 resid-prefix3 / 882 resid-acc /
-/// 310+w prefix / 1000+w prefix256). Every element-slot declaration on the
+/// 602 fold-mac / 705 square chain / 310+w prefix / 900..=904
+/// the affine inner). Every element-slot declaration on the
 /// recursion path routes through this, so the envelope can pre-seed the
 /// cache (fixing the declaration order registry-wide) while the
 /// off-envelope path creates on first use, in the historical order,
@@ -385,16 +371,10 @@ pub(super) fn declare_envelope_slots(
     slot_cached(sb, cache, 500, ZcRoundGate::new);
     slot_cached(sb, cache, 400, MergedRoundGate::new);
     slot_cached(sb, cache, 0, SpineGate::new);
-    slot_cached(sb, cache, 700, SpineGate256::new);
-    slot_cached(sb, cache, 701, MacGate256::new);
+    slot_cached(sb, cache, 705, SquareChainGate::new);
     slot_cached(sb, cache, 601, AssistLayerGate::new);
     slot_cached(sb, cache, 8, || LeafEvalGate::new(8));
-    slot_cached(sb, cache, 808, || LeafEvalGate256::new(8));
-    slot_cached(sb, cache, 880, ResidualWeightsGate256::new);
-    slot_cached(sb, cache, 881, ResidualPrefix3Gate256::new);
-    slot_cached(sb, cache, 882, ResidualAccGate256::new);
     slot_cached(sb, cache, 310 + env.pf_w, || PrefixGate::new(env.pf_w));
-    slot_cached(sb, cache, 1000 + env.pf_w, || PrefixGate256::new(env.pf_w));
     env.affine.declare(sb, cache);
     q
 }

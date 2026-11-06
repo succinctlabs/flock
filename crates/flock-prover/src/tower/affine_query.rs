@@ -1,6 +1,4 @@
-//! The affine inner opening's QUERY-PHASE CHECKS — the F128 replacement for
-//! the split walker's leaf-eval accumulators
-//! (`gates_leaf::LeafEvalGate256`, `query::emit_query_phase`).
+//! The affine inner opening's QUERY-PHASE CHECKS.
 //!
 //! At every non-final level the affine verifier
 //! (`flock_core::pcs::ligerito::affine::verify_affine_l0`) checks the opened
@@ -24,7 +22,7 @@
 //! wire.
 //!
 //! Every weight is computed in the circuit from wires: the `Ŵ` ladder by
-//! the shared [`ResidualWeightsGate256`](crate::tower::ResidualWeightsGate256)
+//! the shared [`ResidualWeightsGate`](crate::tower::ResidualWeightsGate)
 //! relation from the position wire, the `eq(α)` tensor by MAC rows from the
 //! squeezed alpha wires. No weight enters as checker-tier advice.
 
@@ -33,8 +31,7 @@ use flock_core::circuit::builder::{ShapeBuilder, SlotId, Wire};
 use crate::tower::affine_gates::{Arith, FoldMode};
 
 /// `eq(α, ·)` over `2^|α|` entries, LSB-first (`build_eq_table`'s order),
-/// from the squeezed alpha wires: two MAC rows per entry, as the split
-/// residual region builds it.
+/// from the squeezed alpha wires: two MAC rows per entry.
 pub(super) fn emit_eq_tensor(sb: &mut ShapeBuilder, ar: &Arith, alpha: &[Wire]) -> Vec<Wire> {
     let mut aw = vec![ar.ow];
     for &r in alpha {
@@ -46,7 +43,7 @@ pub(super) fn emit_eq_tensor(sb: &mut ShapeBuilder, ar: &Arith, alpha: &[Wire]) 
 }
 
 /// The normalized subspace ladder `Ŵ_0(x) .. Ŵ_{n-1}(x)` at a position wire:
-/// `x` itself, then one `ResidualWeightsGate256::with_weights` row.
+/// `x` itself, then one `ResidualWeightsGate::with_weights` row.
 pub(super) fn emit_subspace_ladder(
     sb: &mut ShapeBuilder,
     ladder: SlotId,
@@ -178,7 +175,7 @@ pub(super) fn emit_affine_final_check(
 mod tests {
     use super::*;
     use crate::tower::{
-        F128, MacGate, PrefixGate, ResidualWeightsGate256,
+        F128, MacGate, PrefixGate, ResidualWeightsGate,
         affine_fixture::affine_fixture,
         affine_gates::{FoldChunkGate, NovelPrefixGate, PREFIX},
     };
@@ -201,7 +198,7 @@ mod tests {
         let build = |yr_tweak: Option<usize>| {
             let mut sb = ShapeBuilder::new(12);
             let max_c = *cs.iter().max().unwrap();
-            let ladder = sb.slot(ResidualWeightsGate256::with_weights(max_c + 1));
+            let ladder = sb.slot(ResidualWeightsGate::with_weights(max_c + 1));
             let mut ins: Vec<F128> = Vec::new();
             let ar = Arith {
                 mac: sb.slot(MacGate::new()),
@@ -291,7 +288,7 @@ mod tests {
             "every level's enforced = verifier"
         );
         let total_q: usize = trace.queries.iter().map(Vec::len).sum();
-        let ladder_rows = built.rows::<ResidualWeightsGate256>(ladder).len();
+        let ladder_rows = built.rows::<ResidualWeightsGate>(ladder).len();
         assert_eq!(ladder_rows, total_q, "one ladder row per query");
 
         let (shape, ins, _) = build(Some(2));

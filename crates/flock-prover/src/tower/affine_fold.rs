@@ -1,6 +1,5 @@
 //! The affine inner opening's CLAIM FOLD — the F128 replacement for the
-//! F256 Ligerito sumcheck spine (`gates_spine::SpineGate256`,
-//! `walker_common::emit_ligerito_spine_walk`).
+//! old F256 Ligerito sumcheck spine.
 //!
 //! The affine verifier (`flock_core::pcs::ligerito::affine::verify_affine_l0`)
 //! runs no sumcheck: each fold round sends a 5-word grid
@@ -15,22 +14,20 @@
 //! claim as `v += β·y`. [`AffineFoldGate`] is one fold round in ONE element
 //! row; the joins are rows of the shared [`MacGate`]. The claim that leaves
 //! the last round is the one the residual check binds.
-//!
-//! Not yet consumed outside tests: the affine child walker (query phase,
-//! final check, residual region) is the next step of the tower port.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::sync::Arc;
 
 use flock_core::{
     circuit::builder::{GateType, ShapeBuilder, SlotId, SlotWitness, Wire},
     element_r1cs::{ElementTableBuilder, ElementTableType},
-    pcs::ligerito::affine::fold_claim,
     schedule::{IoWord, TableType},
 };
 use flock_field::F128;
-
-use crate::tower::tape::{AffineLevel, AffineOodRec};
+#[cfg(test)]
+use {
+    crate::tower::tape::{AffineLevel, AffineOodRec},
+    flock_core::pcs::ligerito::affine::fold_claim,
+};
 
 /// One affine fold round: inputs `claim(0), G00(1), G01(2), G10(3), G20(4),
 /// G21(5), α(6), β(7), r(8)`, output `v'`(14). Each product of two linear
@@ -97,6 +94,7 @@ impl GateType for AffineFoldGate {
 /// target, through every L0 OOD join, fold round, recursive OOD join and
 /// consistency join, to the claim the residual check binds. `enforced[li]`
 /// is level `li`'s batched consistency value (the query phase computes it).
+#[cfg(test)]
 pub(super) fn replay_affine_claim(
     target: F128,
     initial_ood: &[AffineOodRec],

@@ -3,7 +3,7 @@
 //! residue.
 //!
 //! ```sh
-//! cargo run --release --example tower -- [n_leaves] [blocks_per_leaf] [chain128|chain100] [verify]
+//! cargo run --release --example tower -- [n_leaves] [blocks_per_leaf] [chain128] [verify]
 //! ```
 //!
 //! Defaults: 8 leaves x 256 compressions under the 128-bit tower — the
@@ -29,8 +29,7 @@ fn main() {
     });
     let cfg = match args.next().as_deref() {
         None | Some("chain128") => TowerConfig::Chain128,
-        Some("chain100") => TowerConfig::Chain100,
-        Some(other) => panic!("unknown tower config {other:?}: chain128 or chain100"),
+        Some(other) => panic!("unknown tower config {other:?}: chain128"),
     };
     let do_verify = match args.next().as_deref() {
         None => false,

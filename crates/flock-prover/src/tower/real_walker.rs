@@ -20,7 +20,6 @@ use flock_core::{
     proof::UnionClassClaims,
     zerocheck::univariate_skip::build_eq,
 };
-use flock_field::QUADRATIC_NONRESIDUE;
 use flock_transcript::transcript_record::{
     RecordingChallenger, Stream, StreamWord, TranscriptOp as Op, TranscriptShape,
 };
@@ -28,20 +27,17 @@ use flock_transcript::transcript_record::{
 use crate::{
     r1cs_hashes::fs_chain::{FsChainTrace, IV},
     tower::{
-        ChildSlots, CollapsedSlots, F128, F256, FsChallenger, GkrRec, HashKind, InnerPd,
-        LeafEvalGate, LeafEvalGate256, LeafOuter, Lvl, MergedChain, MixedProof, MpRec, OpenLevel,
-        PdRec, PiopRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ZskipTapeRec,
-        ZskipWires,
+        ChildSlots, CollapsedSlots, F128, FsChallenger, GkrRec, LeafEvalGate, LeafOuter, Lvl,
+        MergedChain, MixedProof, MpRec, PdRec, PiopRec, RoundRec, SLOT_WORDS, ShapeBuilder,
+        UnionInstance, Wire, ZskipTapeRec, ZskipWires,
         affine_walk::{AffineInner, emit_affine_inner, rho_wires},
-        ag_seed_bytes, bytes_payload_mask, cap_payloads, cap_wires, check_residual_publics,
+        ag_seed_bytes, bytes_payload_mask, cap_payloads, cap_wires,
         child_walker::base_prefix_slot,
         circuit_structure_claim_wires, cw, decode_ag_point, emit_boolean_reported_check,
-        emit_element_reported_check, emit_fiat_shamir_chain, emit_mac256, emit_pow_checks,
-        emit_publics_hash, emit_query_phase, emit_recombination, emit_residual_region,
-        emit_spine256, flatten_ops, leaf_boolean_lcs, level_geometry, level_sources, observed_f256,
-        outer_union, pack8, parse_open_levels, payload_words, pin_recombination,
-        query_phase_blake3_rows, replay_ligerito_spine256, squeeze_word_wire, strat_scheds,
-        walker_common,
+        emit_element_reported_check, emit_fiat_shamir_chain, emit_pow_checks, emit_publics_hash,
+        emit_recombination, flatten_ops, frobenius_orbit, frobenius_power, leaf_boolean_lcs,
+        outer_union, pack8, payload_words, pin_recombination, query_phase_blake3_rows,
+        squeeze_word_wire, walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -73,25 +69,15 @@ pub(super) struct RealTape<'p> {
     // located regions
     pub(super) gkr: GkrRec,
     piop_i: PiopRec,
-    start_v_i: usize,
     gammas_i: Vec<PdRec>,
     pub(super) w_rounds: Vec<RoundRec>,
-    pub(super) w_resid: Vec<RoundRec>,
     mp_i: MpRec,
-    /// The split inner's packed-direct intake (`None` on an affine inner).
-    inner_pd_i: Option<InnerPd>,
     /// Value index of the inner opening's `q_eval`.
     pub(super) q_v: usize,
-    /// The affine inner, when the outer's PCS opens with the affine fold.
-    pub(super) affine: Option<AffineInner<'p>>,
+    /// The outer's affine F128 inner opening.
+    pub(super) affine: AffineInner<'p>,
     /// ρ in coordinate order (block-first transport rotates it).
     pub(super) w_coords: Vec<RoundRec>,
-    yr_v_i: usize,
-    pub(super) yr_len: usize,
-    pub(super) levels: Vec<OpenLevel>,
-    pub(super) lvl_src: Vec<(&'p [[u8; 32]], &'p Vec<Vec<F128>>, &'p Vec<[u8; 32]>)>,
-    pub(super) geo: Vec<Lvl>,
-    pub(super) native_sums: Vec<F256>,
     /// The grinding ops: (fin ordinal, payload ordinal, bits).
     pub(super) pows: Vec<(usize, usize, u32)>,
     n_gather: usize,
@@ -131,7 +117,6 @@ pub(super) struct RealTape<'p> {
     pub(super) b_sum_n: F128,
     pub(super) native_target: F128,
     pub(super) native_running: F128,
-    pub(super) t_final_n: F256,
     pub(super) anc_end_n: F128,
     pub(super) mid_n: F128,
     pub(super) live_n: F128,
@@ -293,61 +278,13 @@ impl<'p> RealTape<'p> {
         assert!(el_l[0] < mo_l[0]);
         assert!(mo_l[0] < rs_l[0] && rs_l[1] < mp_l[0] && mp_l[0] < fa_l[0]);
 
-        // parse_open_levels + level_geometry — the assembly's own walkers,
-        // unchanged, on the real-inner tape.
-        let (
-            lvl_src,
-            start_v_i,
-            piop_i,
-            gammas_i,
-            w_rounds,
-            mp_i,
-            inner_pd_i,
-            q_v,
-            affine,
-            yr_v_i,
-            levels,
-        ) = match &lo.proof.pcs_open().inner {
-            MergedInnerOpen::Split(p) => {
-                let lig = &p.ligerito;
-                let r = lig.recursive_caps.len();
-                let lvl_src = level_sources(lig);
-                let (start_v_i, piop_i, gammas_i, w_rounds, mp_i, inner_pd_i, yr_v_i, levels) =
-                    parse_open_levels(&ops, 32 * lig.initial_cap.len(), r);
-                assert_eq!(levels.len(), r + 1);
-                let q_v = inner_pd_i.q_v;
-                (
-                    lvl_src,
-                    start_v_i,
-                    piop_i,
-                    gammas_i,
-                    w_rounds,
-                    mp_i,
-                    Some(inner_pd_i),
-                    q_v,
-                    None,
-                    yr_v_i,
-                    levels,
-                )
-            }
-            MergedInnerOpen::Affine(p) => {
-                assert_eq!(lo.commitment.cap, p.initial_cap, "commitment IS the L0 cap");
-                let (ai, pre) = AffineInner::parse(&ops, p, &chals, &lo.pcs);
-                (
-                    ai.lvl_src.clone(),
-                    0,
-                    pre.piop,
-                    pre.gammas,
-                    pre.rounds,
-                    pre.mp,
-                    None,
-                    ai.q_v,
-                    Some(ai),
-                    0,
-                    Vec::new(),
-                )
-            }
+        let MergedInnerOpen::Affine(p) = &lo.proof.pcs_open().inner else {
+            panic!("the tower walks the affine F128 inner opening");
         };
+        assert_eq!(lo.commitment.cap, p.initial_cap, "commitment IS the L0 cap");
+        let (affine, pre) = AffineInner::parse(&ops, p, &chals, &lo.pcs);
+        let (piop_i, gammas_i, w_rounds, mp_i, q_v) =
+            (pre.piop, pre.gammas, pre.rounds, pre.mp, affine.q_v);
         let piop_i = piop_i.expect("the real inner HAS an element PIOP");
         assert!(!piop_i.zc_rounds.is_empty() && !piop_i.lc_rounds.is_empty());
         let n_gather = lo.proof.wiring().gather.len();
@@ -357,18 +294,7 @@ impl<'p> RealTape<'p> {
             "pd claims = the element (c, lc) pair + the outer's gathers"
         );
         assert_eq!(w_rounds.len(), lo.pcs.m - 7, "W spans the dense domain");
-        let (geo, native_sums) = if affine.is_some() {
-            (Vec::new(), Vec::new())
-        } else {
-            level_geometry(
-                &levels,
-                &lvl_src,
-                &chals,
-                HashKind::Blake3,
-                &strat_scheds(&lo.pcs),
-            )
-        };
-        let open_geo = affine.as_ref().map_or(&geo, |ai| &ai.geo);
+        let open_geo = &affine.geo;
         assert!(
             open_geo[0].row_words <= open_geo[0].lanes,
             "committed width fits the fold"
@@ -436,7 +362,7 @@ impl<'p> RealTape<'p> {
             &chals,
             h_rows,
             open_geo,
-            &lvl_src,
+            &affine.lvl_src,
             &mut pub_payloads,
         );
 
@@ -444,24 +370,6 @@ impl<'p> RealTape<'p> {
             parse_rs_regions_and_two_halves(
                 lo, &ops, rs_l[0], &gammas_i, &w_rounds, q_v, &vals_rec, &chals, &vc_at, &fin_at,
             );
-
-        // ---- the spine's native quad replay ----
-        let t_final_n = inner_pd_i.as_ref().map_or(F256::ZERO, |pd| {
-            replay_ligerito_spine256(
-                &levels,
-                &vals_rec,
-                &chals,
-                start_v_i,
-                chals[pd.ch] * vals_rec[pd.q_v],
-                &native_sums,
-            )
-        });
-
-        let (yr_len, w_resid) = if affine.is_some() {
-            (0, Vec::new())
-        } else {
-            walker_common::parse_residual_rotation(&lo.proof, &geo, &levels, &w_rounds)
-        };
 
         let (a_sum_n, b_sum_n, el_g0, el_run_n, z_ix) =
             element_piop_natives(&union_i, &piop_i, &el_assert, &gammas_i, &vals_rec, &chals);
@@ -528,21 +436,12 @@ impl<'p> RealTape<'p> {
             spread_w,
             gkr: gkr_rec,
             piop_i,
-            start_v_i,
             gammas_i,
             w_rounds,
-            w_resid,
             mp_i,
-            inner_pd_i,
             q_v,
             affine,
             w_coords,
-            yr_v_i,
-            yr_len,
-            levels,
-            lvl_src,
-            geo,
-            native_sums,
             pows,
             n_gather,
             n_pub_slots_c,
@@ -567,7 +466,6 @@ impl<'p> RealTape<'p> {
             b_sum_n,
             native_target,
             native_running,
-            t_final_n,
             anc_end_n,
             mid_n,
             live_n,
@@ -1558,15 +1456,9 @@ pub(super) fn expected_real_tail_schedule(rt: &RealTape<'_>) -> Vec<(&'static st
             .iter()
             .map(|(combo, dense)| usize::from(combo.is_some()) + dense.len())
             .sum::<usize>();
-    // The split inner publishes its spine endpoint and residual inner; the
-    // affine inner closes in-circuit and publishes neither.
-    let split_w = |w: usize| if rt.affine.is_some() { 0 } else { w };
     vec![
-        ("spine t_final", split_w(2)),
         ("intake target", 1),
         ("intake running", 1),
-        ("residual accs", 2 * rt.levels.len() * rt.yr_len),
-        ("residual inner", split_w(2)),
         ("sigma value", 1),
         ("sigma point", rt.mu_i),
         ("element zc+lc ends", 2),
@@ -1582,7 +1474,6 @@ pub(super) fn expected_real_tail_schedule(rt: &RealTape<'_>) -> Vec<(&'static st
 /// node CONNECTS the fold region's claim words to — all three families.
 pub(super) struct RealRegion {
     pub(super) pub_base: usize,
-    pub(super) n_query_pub: usize,
     pub(super) n_tail: usize,
     /// The published tail's `(name, width)` schedule, as emitted — held
     /// against [`expected_real_tail_schedule`] at every build.
@@ -1670,9 +1561,7 @@ pub(super) fn emit_family_h(
     macs: SlotId,
     fold_macs: SlotId,
     spine: SlotId,
-    spine256: SlotId,
-    mac256: SlotId,
-    row_capacity: usize,
+    sq: SlotId,
     shv: &[Vec<Wire>; 2],
     values: &[Vec<Wire>; 2],
     r_dprime: &[Vec<Wire>; 2],
@@ -1708,8 +1597,6 @@ pub(super) fn emit_family_h(
     let spine_mac = |sb: &mut ShapeBuilder, acc: Wire, x: Wire, y: Wire| {
         sb.gate(spine, &[zw, zw, zw, acc, zw, zw, x, y, zw])[3]
     };
-    let spine_square =
-        |sb: &mut ShapeBuilder, x: Wire| sb.gate(spine, &[zw, zw, ow, zw, zw, zw, zw, zw, x])[4];
 
     // Equality weights are shared by the transpose dot and the seven sparse
     // corrections in every inverse-Moore coefficient.
@@ -1758,13 +1645,20 @@ pub(super) fn emit_family_h(
     // changing any of them changes the circuit digest.
     let (mut g0_j, mut ratio_j, mut corrections_j) = family_h_dual_decomposition();
     let minv = moore_inverse();
-    // Only the eight orbit seeds are fixed publics.  Successive Frobenius
-    // powers are derived by the existing spine's squaring cell, saving more
-    // than one thousand public constants at a two-child node.
-    let mut g0_j_w = cw(sb, vals, consts, g0_j);
-    let mut corrections_j_w: [Wire; 7] = from_fn(|t| cw(sb, vals, consts, corrections_j[t]));
+    // Only the eight orbit seeds are fixed publics.  Their successive
+    // Frobenius powers ride one square chain each (sixteen rows a seed),
+    // saving more than one thousand public constants at a two-child node.
+    let orbit = |sb: &mut ShapeBuilder, vals: &mut Vec<F128>, consts: &mut Vec<_>, c: F128| {
+        let seed = cw(sb, vals, consts, c);
+        let mut o = vec![seed];
+        o.extend(frobenius_orbit(sb, sq, seed, 127));
+        o
+    };
+    let g0_orbit = orbit(sb, vals, consts, g0_j);
+    let corrections_orbit: [Vec<Wire>; 7] = from_fn(|t| orbit(sb, vals, consts, corrections_j[t]));
     let mut coeff_w: [Vec<Wire>; 2] = from_fn(|_| Vec::with_capacity(128));
     for j in 0..128 {
+        let g0_j_w = g0_orbit[j];
         let mut ratio_pows = [F128::ZERO; 7];
         ratio_pows[0] = ratio_j;
         for q in 1..7 {
@@ -1779,7 +1673,7 @@ pub(super) fn emit_family_h(
                 .collect();
             let mut mle = prefix(sb, g0_j_w, &r_dprime[k], &scaled_r);
             for t in 0..7 {
-                mle = sb.gate(macs, &[mle, corrections_j_w[t], eq_w[k][t]])[0];
+                mle = sb.gate(macs, &[mle, corrections_orbit[t][j], eq_w[k][t]])[0];
             }
             coeff_w[k].push(sb.gate(macs, &[zw, gamma[k], mle])[0]);
         }
@@ -1798,49 +1692,16 @@ pub(super) fn emit_family_h(
         for d in &mut corrections_j {
             *d *= *d;
         }
-        if j + 1 < 128 {
-            g0_j_w = spine_square(sb, g0_j_w);
-            for d in &mut corrections_j_w {
-                *d = spine_square(sb, *d);
-            }
-        }
     }
 
-    // Pair the two RS claims in one F256 squaring chain.  After j extension-
-    // field squarings of a+b*u, the second component is b^(2^j) and the first
-    // is a^(2^j)+K_j*b^(2^j), with K_{j+1}=K_j^2+NR.  One base-field MAC
-    // recovers a^(2^j). The squarings fill the residual region's narrower
-    // F256 MAC relation first, then spill into the equivalent Ligerito-spine
-    // multiplication only at that slot's physical row limit. This keeps both
-    // existing slots in bounds without adding a table type.
+    // The Frobenius recombination: V_rs = Σ_j c0_j·a_j^(2^j) + c1_j·b_j^(2^j),
+    // each power on ceil(j/8) square-chain rows.
     let mut vrs = zw;
-    let mut k_j = F128::ZERO;
     for j in 0..128 {
-        let mut pair = [values[0][j], values[1][j]];
-        for _ in 0..j {
-            pair = if sb.rows_in_slot(mac256) < row_capacity {
-                emit_mac256(sb, mac256, [zw, zw], pair, pair)
-            } else {
-                emit_spine256(
-                    sb,
-                    spine256,
-                    [zw, zw],
-                    [zw, zw],
-                    [ow, zw],
-                    [zw, zw],
-                    [zw, zw],
-                    [zw, zw],
-                    [zw, zw],
-                    zw,
-                    pair,
-                )[4]
-            };
+        for k in 0..2 {
+            let p = frobenius_power(sb, sq, values[k][j], j);
+            vrs = sb.gate(macs, &[vrs, coeff_w[k][j], p])[0];
         }
-        let kw = cw(sb, vals, consts, k_j);
-        let p0 = sb.gate(macs, &[pair[0], kw, pair[1]])[0];
-        vrs = sb.gate(macs, &[vrs, coeff_w[0][j], p0])[0];
-        vrs = sb.gate(macs, &[vrs, coeff_w[1][j], pair[1]])[0];
-        k_j = k_j * k_j + QUADRATIC_NONRESIDUE;
     }
     (rs_half, vrs)
 }
@@ -1867,25 +1728,9 @@ pub(super) fn emit_real_child_region(
     };
     let trace = &rt.trace;
     let stream = &rt.stream;
-    let levels = &rt.levels[..];
-    let geo = &rt.geo[..];
     let piop_i = &rt.piop_i;
     let n_log_i = rt.n_log_i;
 
-    let leafeval: Vec<_> = geo
-        .iter()
-        .map(|g| {
-            let lanes = g.lanes.min(8);
-            match cs.le.iter().find(|(n, _)| *n == 800 + lanes) {
-                Some((_, sl)) => *sl,
-                None => {
-                    let sl = sb.slot(LeafEvalGate256::new(lanes));
-                    cs.le.push((800 + lanes, sl));
-                    sl
-                }
-            }
-        })
-        .collect();
     let mut cen: Vec<(&'static str, usize, usize)> =
         vec![("start", sb.public_len(), sb.rows_in_slot(cs.macs))];
     let iv_w = pack8(&IV);
@@ -1954,80 +1799,43 @@ pub(super) fn emit_real_child_region(
     let (cd_w, pub_w) =
         emit_h_publics_region(sb, cs, child_q, iv2, rt, &ww, &mut cen, vals, consts);
     let cap_w = cap_wires(stream, &ww, &rt.cap_pays);
-    let (to_publish, level_accs, query_positions) = if rt.affine.is_some() {
-        (Vec::new(), Vec::new(), Vec::new())
-    } else {
-        emit_query_phase(
-            sb,
-            child_q,
-            iv2,
-            &leafeval,
-            levels,
-            geo,
-            &rt.lvl_src,
-            trace,
-            &outs,
-            &rt.chals,
-            &cap_w,
-            vals,
-            consts,
-            hints,
-        )
-    };
     cen.push((
         "query phase decl",
         sb.public_len(),
         sb.rows_in_slot(cs.macs),
     ));
-    let IntakeSpineResidual {
+    let IntakeBoundary {
         vmap,
         zw,
         ow,
         zassert,
-        t_final,
-        resid_pub,
-        inner_w,
         pf: (pfslot, pf_w),
         tgt_w,
         runw,
-    } = emit_intake_spine_residual(
-        sb,
-        cs,
-        rt,
-        &ww,
-        &outs,
-        &to_publish,
-        &query_positions,
-        &level_accs,
-        &mut cen,
-        vals,
-        consts,
-    );
+    } = emit_intake_boundary(sb, cs, rt, &ww, &outs, &mut cen, vals, consts);
     let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
     // The affine inner: openings + the whole affine verifier, closed
-    // in-circuit (the split inner's spine and residual ran above).
-    if let Some(ai) = &rt.affine {
-        let rho_w = rho_wires(&rt.w_coords, &outs, trace);
-        emit_affine_inner(
-            sb,
-            &mut cs.affine,
-            child_q,
-            iv2,
-            ai,
-            trace,
-            &outs,
-            &wv,
-            &rt.chals,
-            &rho_w,
-            &cap_w,
-            vals,
-            consts,
-            hints,
-            zw,
-            ow,
-            zassert,
-        );
-    }
+    // in-circuit.
+    let rho_w = rho_wires(&rt.w_coords, &outs, trace);
+    emit_affine_inner(
+        sb,
+        &mut cs.affine,
+        child_q,
+        iv2,
+        &rt.affine,
+        trace,
+        &outs,
+        &wv,
+        &rt.chals,
+        &rho_w,
+        &cap_w,
+        vals,
+        consts,
+        hints,
+        zw,
+        ow,
+        zassert,
+    );
 
     let WiringGkrWires {
         pt_w,
@@ -2068,27 +1876,10 @@ pub(super) fn emit_real_child_region(
         ow, vals, &mut cen,
     );
     let (pub_base, n_tail, tail_schedule) = emit_publishes_in_swap_order(
-        sb,
-        cs,
-        &to_publish,
-        &level_accs,
-        t_final,
-        tgt_w,
-        runw,
-        &resid_pub,
-        inner_w,
-        sig_w,
-        &pt_w,
-        el_zr,
-        el_lcw,
-        anc_w,
-        &mat_pub,
-        &ela_pub,
-        &jag_w,
+        sb, cs, tgt_w, runw, sig_w, &pt_w, el_zr, el_lcw, anc_w, &mat_pub, &ela_pub, &jag_w,
         &mut cen,
     );
 
-    let n_query_pub: usize = 2 * levels.len() + levels.iter().map(|l| l.a_count).sum::<usize>();
     let el_zc_rho_w: Vec<Wire> = piop_i
         .zc_rounds
         .iter()
@@ -2119,7 +1910,6 @@ pub(super) fn emit_real_child_region(
     );
     RealRegion {
         pub_base,
-        n_query_pub,
         n_tail,
         tail_schedule,
         n_mat_pub: mat_pub.len(),
@@ -2195,42 +1985,31 @@ fn emit_h_publics_region(
     (cd_w, pub_w)
 }
 
-/// What [`emit_intake_spine_residual`] threads forward to the later
-/// regions.
-struct IntakeSpineResidual {
+/// What [`emit_intake_boundary`] threads forward to the later regions.
+struct IntakeBoundary {
     vmap: Vec<Option<usize>>,
     zw: Wire,
     ow: Wire,
     zassert: Wire,
-    /// The split inner's spine endpoint and residual inner (`None` on an
-    /// affine inner, which closes in-circuit).
-    t_final: Option<[Wire; 2]>,
-    resid_pub: Vec<Vec<[Wire; 2]>>,
-    inner_w: Option<[Wire; 2]>,
     pf: (SlotId, usize),
     tgt_w: Wire,
     runw: Wire,
 }
 
-/// intake W-rounds, spine, residual
+/// The zero/one constants, family H and the merged intake boundary.
 #[allow(clippy::too_many_arguments)]
-fn emit_intake_spine_residual(
+fn emit_intake_boundary(
     sb: &mut ShapeBuilder,
     cs: &mut ChildSlots,
     rt: &RealTape<'_>,
     ww: &[Option<Wire>],
     outs: &[Vec<Wire>],
-    to_publish: &[Vec<Wire>],
-    query_positions: &[Vec<Wire>],
-    level_accs: &[[Wire; 2]],
     cen: &mut Vec<(&'static str, usize, usize)>,
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
-) -> IntakeSpineResidual {
+) -> IntakeBoundary {
     let trace = &rt.trace;
     let stream = &rt.stream;
-    let levels = &rt.levels[..];
-    let geo = &rt.geo[..];
     let w_rounds = &rt.w_rounds[..];
     let mp_i = &rt.mp_i;
     let gammas_i = &rt.gammas_i[..];
@@ -2248,7 +2027,6 @@ fn emit_intake_spine_residual(
     let zw = sb.public_input();
     vals.push(F128::ONE);
     let ow = sb.public_input();
-    let spine256 = cs.spine256;
     // The assert-zero anchor: a dedicated zero public NO gate consumes,
     // so the zero-delta outputs connected into its class add no
     // dataflow edges (connecting them to the ubiquitous `zw` creates
@@ -2261,49 +2039,7 @@ fn emit_intake_spine_residual(
         sb.public_len(),
         sb.rows_in_slot(cs.macs),
     ));
-    let (t_final, resid_pub, inner_w, (pfslot, pf_w)) = if let Some(inner_pd_i) = &rt.inner_pd_i {
-        // The ligerito SPINE: start gamma'·q_eval, eval/build per fold,
-        // intro-folds consuming the query phase's accumulator wires.
-        let t_final = walker_common::emit_ligerito_spine_walk(
-            sb,
-            spine256,
-            outs,
-            trace,
-            &wv,
-            levels,
-            inner_pd_i,
-            rt.start_v_i,
-            level_accs,
-            zw,
-            ow,
-        );
-
-        // The RESIDUAL region via the shared emitter (lane-major rotation).
-        let yr_wires: Vec<[Wire; 2]> = (0..rt.yr_len)
-            .map(|y| [wv(rt.yr_v_i + 2 * y), wv(rt.yr_v_i + 2 * y + 1)])
-            .collect();
-        let (resid_pub, inner_w, pf) = emit_residual_region(
-            sb,
-            &mut cs.resid,
-            levels,
-            geo,
-            to_publish,
-            query_positions,
-            &rt.w_resid,
-            inner_pd_i.fin,
-            &yr_wires,
-            trace,
-            outs,
-            zw,
-            ow,
-        );
-        // THE CLOSURE, in-circuit: inner == t_r as a copy constraint.
-        sb.connect(inner_w[0], t_final[0]);
-        sb.connect(inner_w[1], t_final[1]);
-        (Some(t_final), resid_pub, Some(inner_w), pf)
-    } else {
-        (None, Vec::new(), None, base_prefix_slot(sb, cs))
-    };
+    let (pfslot, pf_w) = base_prefix_slot(sb, cs);
 
     // The complete family-H relation.  All inputs below are already bound
     // transcript or proof wires; no target/V advice and no native checker are
@@ -2333,20 +2069,11 @@ fn emit_intake_spine_residual(
         sb.public_len(),
         sb.rows_in_slot(cs.macs),
     ));
-
-    cen.push((
-        "spine + residual advice",
-        sb.public_len(),
-        sb.rows_in_slot(cs.macs),
-    ));
-    IntakeSpineResidual {
+    IntakeBoundary {
         vmap,
         zw,
         ow,
         zassert,
-        t_final,
-        resid_pub,
-        inner_w,
         pf: (pfslot, pf_w),
         tgt_w,
         runw,
@@ -3030,13 +2757,8 @@ fn emit_assertion_families(
 fn emit_publishes_in_swap_order(
     sb: &mut ShapeBuilder,
     cs: &ChildSlots,
-    to_publish: &[Vec<Wire>],
-    level_accs: &[[Wire; 2]],
-    t_final: Option<[Wire; 2]>,
     tgt_w: Wire,
     runw: Wire,
-    resid_pub: &[Vec<[Wire; 2]>],
-    inner_w: Option<[Wire; 2]>,
     sig_w: Wire,
     pt_w: &[Wire],
     el_zr: Wire,
@@ -3048,36 +2770,9 @@ fn emit_publishes_in_swap_order(
     cen: &mut Vec<(&'static str, usize, usize)>,
 ) -> (usize, usize, Vec<(&'static str, usize)>) {
     let pub_base = sb.public_len();
-    for a_wires in to_publish {
-        for w in a_wires {
-            sb.publish(*w);
-        }
-    }
-    for w in level_accs {
-        sb.publish(w[0]);
-        sb.publish(w[1]);
-    }
-    cen.push((
-        "TAIL: query alphas + native accs",
-        sb.public_len(),
-        sb.rows_in_slot(cs.macs),
-    ));
     let tail = [
-        TailEntry::new(
-            "spine t_final",
-            t_final.map_or_else(Vec::new, |t| t.to_vec()),
-        ),
         TailEntry::new("intake target", vec![tgt_w]),
-        TailEntry::new("intake running", vec![runw]),
-        TailEntry::new(
-            "residual accs",
-            resid_pub.iter().flatten().flatten().copied().collect(),
-        )
-        .with_census("TAIL: chain ends + residual accs"),
-        TailEntry::new(
-            "residual inner",
-            inner_w.map_or_else(Vec::new, |w| w.to_vec()),
-        ),
+        TailEntry::new("intake running", vec![runw]).with_census("TAIL: intake ends"),
         TailEntry::new("sigma value", vec![sig_w]),
         TailEntry::new("sigma point", pt_w.to_vec()).with_census("TAIL: sigma + GKR point"),
         TailEntry::new("element zc+lc ends", vec![el_zr, el_lcw]),
@@ -3102,62 +2797,19 @@ fn emit_publishes_in_swap_order(
 /// checker, extracted and base-relative. Returns the entries consumed.
 pub(super) fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -> usize {
     let chals = &rt.chals[..];
-    let mut at2 = r.pub_base;
-    // The openings bind to the absorbed caps by COPY CONSTRAINT (the
-    // in-circuit cap tree) — no per-query publics, no checker walk.
-    for (li, lvl) in rt.levels.iter().enumerate() {
-        for j in 0..lvl.a_count {
-            assert_eq!(public[at2 + j], chals[lvl.a_ch + j], "L{li} alpha {j}");
-        }
-        at2 += lvl.a_count;
-    }
-    for (li, want) in rt.native_sums.iter().enumerate() {
-        assert_eq!(
-            F256::new(public[at2 + 2 * li], public[at2 + 2 * li + 1]),
-            *want,
-            "L{li} enforced sum matches the native replica"
-        );
-    }
-    let sp_base = at2 + 2 * rt.native_sums.len();
-    // An affine inner closes in-circuit and publishes no spine endpoint.
-    let split = rt.affine.is_none();
-    let sp = if split { 2 } else { 0 };
-    if split {
-        assert_eq!(
-            F256::new(public[sp_base], public[sp_base + 1]),
-            rt.t_final_n,
-            "the spine's t_r matches the native replay"
-        );
-    }
+    let sp_base = r.pub_base;
     assert_eq!(
-        public[sp_base + sp],
-        rt.native_target,
+        public[sp_base], rt.native_target,
         "the computed target is the native two-halves combination"
     );
     assert_eq!(
-        public[sp_base + sp + 1],
+        public[sp_base + 1],
         rt.native_running,
         "the W-rounds fold the target to the native running claim"
     );
-    if split {
-        let inner_n = check_residual_publics(
-            public,
-            sp_base + 4,
-            &rt.levels,
-            &rt.geo,
-            &rt.w_resid,
-            rt.inner_pd_i.as_ref().expect("split intake").ch,
-            &observed_f256(&rt.vals_rec, rt.yr_v_i, rt.yr_len),
-            chals,
-        );
-        assert_eq!(
-            inner_n, rt.t_final_n,
-            "inner == t_r: the real-inner statement closes"
-        );
-    }
     // The GKR/element/multipoint/anchor identities are COPY CONSTRAINTS —
     // no publics, no checker items; the proof itself carries them.
-    let sig_base = sp_base + 2 + 2 * sp + 2 * rt.levels.len() * rt.yr_len;
+    let sig_base = sp_base + 2;
     assert_eq!(
         public[sig_base],
         rt.lo.proof.wiring().gkr.s_sigma_eval,
@@ -3325,8 +2977,8 @@ pub(super) fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &Re
     }
     assert_eq!(
         fq,
-        r.pub_base + r.n_query_pub + r.n_tail,
+        r.pub_base + r.n_tail,
         "the jagged publics close the region's tail"
     );
-    r.n_query_pub + r.n_tail
+    r.n_tail
 }

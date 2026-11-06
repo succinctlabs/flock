@@ -1,5 +1,4 @@
-//! The affine inner opening's RESIDUAL CHECK — the F128 replacement for the
-//! split walker's residual region (`query::emit_residual_region`).
+//! The affine inner opening's RESIDUAL CHECK.
 //!
 //! The affine verifier ends on `⟨yr_lo, W⟩ = claim`, where `W` over the
 //! final `2^c` positions is the caller's basis plus every introduced weight
@@ -85,7 +84,7 @@ pub(super) fn emit_affine_residual(
 mod tests {
     use super::*;
     use crate::tower::{
-        F128, MacGate, PrefixGate, ResidualWeightsGate256,
+        F128, MacGate, PrefixGate, ResidualWeightsGate,
         affine_fixture::affine_fixture,
         affine_fold::{AffineFoldGate, AffineLevelWires, JoinWires, emit_affine_claim_fold},
         affine_gates::{FoldChunkGate, NovelPrefixGate, PREFIX},
@@ -114,7 +113,7 @@ mod tests {
             let mut sb = ShapeBuilder::new(13);
             let fold = sb.slot(AffineFoldGate::new());
             let max_c = *fx.cs.iter().max().unwrap();
-            let ladder = sb.slot(ResidualWeightsGate256::with_weights(max_c + 1));
+            let ladder = sb.slot(ResidualWeightsGate::with_weights(max_c + 1));
             let mut ins = Vec::new();
             let ar = Arith {
                 mac: sb.slot(MacGate::new()),
