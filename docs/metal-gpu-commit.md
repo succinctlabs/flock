@@ -249,20 +249,22 @@ At the level-0 split's ~18% gain that is about 4–6 ms, and the levels run
 one at a time between sumcheck rounds, so the GPU work overlaps nothing. The
 challenge's recursive-Merkle GPU switch measured as noise in yukon's A/B.
 
-## GPU zerocheck round 1 (prototype, not wired)
+## GPU zerocheck round 1 (prototype, kept on a branch)
 
 A Metal kernel for the AG round-1 sums over Full blocks: the 160 product
-coordinates and both `c` banks. It is test-only and equal to
-`round1_straight_line_program_packed_banks_fused_padded`
-(`ag_round1_matches_cpu`).
+coordinates and both `c` banks, equal to
+`round1_straight_line_program_packed_banks_fused_padded`. It was never wired
+into the prover and is not on this branch. The code (`gpu_ag_round1.msl`,
+the generated `gpu_ag_round1_gen.msl`, `scripts/gen_gpu_ag_round1.py`, and
+the tests `ag_round1_matches_cpu` and `ag_round1_timing`) is kept on the
+branch `metal-ag-round1-prototype` (at `03c955a`).
 - **v1:** each thread transposes its 32 rows into plane words and runs the
   Paar encode. At 2^17 blocks it took 68–92 ms against the CPU's ~20 ms
   (10 threads). It was spill-bound: about 800 live words per thread.
 - **v2:** only `a`'s and `b`'s 64 plane words stay in registers. Each
-  encoded word is an unrolled XOR chain straight from the 160×64 matrix
-  (`scripts/gen_gpu_ag_round1.py` → `gpu_ag_round1_gen.msl`). Products go
-  through threadgroup memory in three coordinate sets, each folded at once.
-  50–64 ms; 28–35 ms without the `eq` multiplications.
+  encoded word is an unrolled XOR chain straight from the 160×64 matrix.
+  Products go through threadgroup memory in three coordinate sets, each
+  folded at once. 50–64 ms; 28–35 ms without the `eq` multiplications.
 
 The remaining costs are the 128 live plane words and ~4,600 table lookups
 per block for the `eq` multiplications, which the M4's GPU has no carryless
@@ -295,8 +297,6 @@ same multiplications.
   transform.
 - **`gpu_graph_timing`** (ignored): per-stage GPU timestamps at production
   size.
-- **`ag_round1_matches_cpu`:** the round-1 prototype against the CPU
-  kernel; **`ag_round1_timing`** (ignored) times it at 2^17 blocks.
 - **Without the feature:** the workspace tests, clippy and fmt pass
   unchanged. The sub-block twiddle offsets are compiled only with the
   feature (and in tests), so the default build's NTT is main's: single
