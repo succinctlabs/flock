@@ -56,7 +56,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             ~/.rustup/
-            target/
+          # target/ is left out: a macOS release target is several GB and
+          # would crowd the repository's 10 GB Actions cache.
           key: flock-metal-${{ runner.arch }}-${{ runner.os }}-${{ steps.rust-version.outputs.date }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             flock-metal-${{ runner.arch }}-${{ runner.os }}-${{ steps.rust-version.outputs.date }}-
