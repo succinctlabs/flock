@@ -312,7 +312,10 @@ fn beta_sites<'c>(
 /// The linear check's `η`, sampled right after `α` when the union drops
 /// linear rows ([`UnionInstance::checks_linear_rows`]): it batches their
 /// identity into the A-claim, one linear identity like a pin's `β`, and
-/// grinds like one.
+/// grinds like one. The term `α·η·ρ̂` vanishes at `α = 0` as well as at
+/// `η = 0`, so a nonzero residual survives with probability `2/|F|`; each
+/// challenge has at most one bad value, so each keeps its one bit
+/// (`docs/zeroed-linear-words.md`, soundness item 2).
 fn prove_eta<Ch: Challenger>(
     union: &UnionInstance<'_>,
     grinding: LincheckGrinding,

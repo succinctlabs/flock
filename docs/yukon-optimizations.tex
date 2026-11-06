@@ -1325,10 +1325,14 @@ $(A_0z)_i = z_i$ for every $i\in D$ and every instance (lincheck). On a
 declared instance $z_p = 1$, so this is exactly the original relation.
 
 \paragraph{The $\eta$ batch.} $\eta$ is sampled after the commitment and
-after the zerocheck has fixed $\hat a'(r)$ and $\hat b'(r)$; the identity
-is affine in $\eta$, so a nonzero $\hat\rho(r)$ survives with probability
-$1/|\mathbb{F}|$ --- one more site like a pin's $\beta$, with one PoW bit in
-the strict schedule.
+after the zerocheck has fixed $\hat a'(r)$ and $\hat b'(r)$. The term
+$\alpha\eta\,\hat\rho(r)$ vanishes at $\eta = 0$ and also at $\alpha = 0$
+($\alpha$ is sampled first), so a nonzero $\hat\rho(r)$ survives with
+probability at most $2/|\mathbb{F}|$, not $1/|\mathbb{F}|$: once
+$\alpha \neq 0$ the identity is affine in $\eta$ with a nonzero
+coefficient. Each challenge still has at most one bad value, so $\eta$ is
+one more site like a pin's $\beta$, with one PoW bit in the strict
+schedule, and $\alpha$'s bit is unchanged.
 
 \paragraph{The point $r$.} $\rho$ is fixed by the commitment before $r$
 is drawn. A nonzero $\rho$ has $\hat\rho(r) = 0$ only if $r$ lands in a

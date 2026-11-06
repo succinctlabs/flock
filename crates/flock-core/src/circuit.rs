@@ -93,10 +93,13 @@
 //!      `x·pin = x`), which forces `x = 0`. A slot that commits dummy rows
 //!      therefore keeps those rows in the zerocheck
 //!      ([`crate::union::UnionInstance::zeroed_word_cols`] returns nothing
-//!      for it); `full_height_dummy_input_word_is_rejected`
-//!      (`flock-prover`, leanXMSS) tampers one. A public column's claim
-//!      ([`Circuit::with_public_columns_opened`]) sums its live rows only,
-//!      so its opening forces zero on its dead rows by itself.
+//!      for it); `full_height_dummy_row_input_word_is_rejected`
+//!      (`tests/union_lincheck.rs`) commits one. The honest prover commits
+//!      dummy rows as zeros whatever its buffers hold
+//!      ([`crate::union::UnionInstance::compact_witness`]). A public
+//!      column's claim ([`Circuit::with_public_columns_opened`]) sums its
+//!      live rows only, so its opening forces zero on its dead rows by
+//!      itself.
 
 use std::{env::var, sync::OnceLock, time::Instant};
 
