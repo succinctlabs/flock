@@ -37,6 +37,14 @@ The chain tower (`crates/flock-prover/src/tower/`) already verifies circuit-unio
 | Chain statement: `h_start`, `h_end`, span counter, `ChainLane` | `(pk, msg)` list, 4,046 public words at n = 1000 | `envelope.rs`, `fl_node.rs`, `node.rs` |
 | Envelope sized to the m32 chain leaf (m* = 29, ν = 14) | Larger verifier surface per child | `config.rs`, `envelope.rs` |
 
+## What the root proves
+
+Decided 2026-11-05 (Ron's #66 and #70 reviews): the epoch stays private.
+
+- **The statement.** For each listed `(pk, msg)`, some valid signature under `pk` on `msg` exists, at some epoch `< 2^32`. `statement_words` (`leanxmss/circuit.rs`) hashes only `P`, the root and the two message halves; the epoch `idx` is a private `b.input` of the leaf circuit.
+- **No distinct epochs, no replay protection.** The root cannot show that two entries use distinct epochs, and it accepts a replayed old signature. An application that needs slot binding must put the epoch (or a nonce it tracks) inside `msg`.
+- **`n_signatures` counts entries.** It is the number of listed `(pk, msg)` entries, not of distinct signers or signatures. Nothing deduplicates: one valid signature listed 992 times fills a leaf. "992 different signers" describes the test generator, not the statement.
+
 ## Phases
 
 **1. Recursion leaf.** Add an `XmssCircuit` option that proves in the tower's posture:

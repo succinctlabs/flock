@@ -13,6 +13,19 @@
 //! publishes `hash_pair` of its leaves' publics digests, and each spine
 //! node `hash_pair(D_fresh, D_prev)` — see [`xmss_statement`], which a
 //! verifier recomputes from the batches.
+//!
+//! **What a root proves** ([`XmssStatement`]): for each listed `(pk, msg)`
+//! entry, SOME valid signature under `pk` on `msg` exists, at SOME epoch
+//! `< 2^32`. The epoch (`idx`) is a private input of the leaf circuit
+//! (decided 2026-11-05: it stays private); the hashed statement holds only
+//! the key (its parameter `P` and Merkle root) and the message. Hence:
+//! - the root cannot show that two entries use distinct epochs, and it
+//!   accepts a replayed old signature, unless `msg` itself encodes the
+//!   epoch (or a nonce the application tracks);
+//! - [`XmssStatement::n_signatures`] counts ENTRIES, not distinct signers or
+//!   signatures: nothing deduplicates, so one valid signature listed 992
+//!   times fills a leaf. "992 different signers" describes the test
+//!   generator, not the statement.
 
 use flock_core::{
     aggregate::{Accumulator, Dropped, SharedTables},
@@ -44,12 +57,16 @@ use crate::{
     },
 };
 
-/// What an leanXMSS tower attests: every signature of every batch verifies,
-/// against the batches' statements as `digest` binds them, and there are
-/// `n_signatures` of them.
+/// What a leanXMSS tower attests: for every `(pk, msg)` entry of every
+/// batch, in order, as `digest` binds them, some valid signature under `pk`
+/// on `msg` exists at some epoch `< 2^32` (the epoch is private; see the
+/// module doc for what that leaves out), and there are `n_signatures`
+/// entries.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct XmssStatement {
     pub digest: [u8; 32],
+    /// The number of ENTRIES, not of distinct signers or signatures: an
+    /// entry repeated `k` times counts `k` (no deduplication anywhere).
     pub n_signatures: usize,
 }
 
