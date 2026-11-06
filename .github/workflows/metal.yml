@@ -78,11 +78,14 @@ jobs:
         shell: bash
         run: system_profiler SPDisplaysDataType || true
 
-      # No -C target-cpu=native here: on the hosted VM, native CPU detection
-      # drops the crypto extensions, so target_feature = "aes" goes away and the
-      # whole PMULL NTT path compiles out (its helpers then fail -D dead_code).
-      # The aarch64-apple-darwin default (apple-m1) already enables aes/neon.
+      # target-cpu=apple-m1, set here because RUSTFLAGS overrides the repo's
+      # .cargo/config.toml (target-cpu=native). On the hosted VM, native CPU
+      # detection drops the crypto extensions, so target_feature = "aes" goes
+      # away, the PMULL NTT path compiles out and its helpers fail -D dead_code
+      # (reproduced locally with target-cpu=generic: the same 11 errors).
       - name: cargo clippy (metal)
+        env:
+          RUSTFLAGS: -C target-cpu=apple-m1
         run: cargo clippy --release --workspace --all-targets --features flock-prover/metal -- -D warnings
 
       # The GPU graph and hybrid tests against the CPU commit, the sub-block
@@ -91,5 +94,5 @@ jobs:
       # overflow checks on, as in test.yml.
       - name: cargo test (metal)
         env:
-          RUSTFLAGS: -C debug-assertions=on -C overflow-checks=on
+          RUSTFLAGS: -C target-cpu=apple-m1 -C debug-assertions=on -C overflow-checks=on
         run: cargo test --release -p flock-core --features metal --lib -- gpu_commit sub_block pcs::commit --nocapture
