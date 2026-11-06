@@ -1156,6 +1156,11 @@ impl BatchedGrinding {
     /// `L` rather than the next power of two; a transcript without targets
     /// grinds the covering bit count, which is the old
     /// `max(fingerprint_bits, grinding_bits_for_degree(L − 1))`.
+    ///
+    /// Not opt-in: it applies to every policy with `fingerprint_bits != 0`,
+    /// so wiring and bus proofs on a transcript that implements targets
+    /// (the plain `FsChallenger`) differ from the bit grind's bytes; only the
+    /// chained transcript keeps them (`docs/tuple-bus-design.md` §1.9).
     #[inline]
     pub(crate) fn fingerprint_target_for(self, live_entries: usize) -> Option<u64> {
         (self.fingerprint_bits != 0).then(|| {

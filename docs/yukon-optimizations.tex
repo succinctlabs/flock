@@ -1166,6 +1166,12 @@ After it the sum is $\approx340$.
 \item[Result:] Merged sumcheck $46\to14\,$ms, weight build gone; open $137\to109\,$ms MT, prove $\approx-15\,$ms net of the C fold ($3/3$).
 \end{optsummary}
 
+The predicate was later widened from a full-height column prefix to any
+stack whose used columns are all full height, gaps allowed
+(\texttt{pcs::full\_height\_columns}); that moved the transcript of
+full-count layouts with a gap, a protocol change described with the
+predicate in the ring-switching note (\S\,``The prover's transport'').
+
 The full fusion (the weight as the open's level-0 basis, no merged
 sumcheck at all) was built to the native verifier and parked: the
 residual side of the recursive verifier does not twist for free, and

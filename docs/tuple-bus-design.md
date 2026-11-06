@@ -244,6 +244,16 @@ the recursion replays in-circuit with leading-zero rows, falls back to the
 fewest bits that cover the target. That is exactly the old bit count, so
 recursion transcripts do not change.
 
+**This is not opt-in.** `fingerprint_target_for` applies whenever the
+policy grinds the fingerprint (`fingerprint_bits != 0`), so every wiring
+and bus proof on a transcript that implements targets (the plain
+`FsChallenger`, BLAKE3 or SHA-256) changes bytes, whatever the circuit:
+the nonce passes a target rather than a bit count, and the fingerprint
+challenge follows it. A verifier from before this change can reject the
+new proofs. Only the chained transcript keeps its bytes. It is a protocol
+change for those proofs, like the block-first predicate's
+(`docs/capacity-free-ring-switching.tex`, §blockfirst, "Predicate").
+
 Over 40 transcripts on one thread, at `L − 1 = 1,226,045`: 21 bits averaged
 60 ms (2.50M hashes), the target 28 ms (1.19M hashes). The bus's 504k live
 leaves sit just under `2^19`, so its grind barely changes.
