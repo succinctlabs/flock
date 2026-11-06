@@ -727,11 +727,23 @@ fn pipelined_commit(
         // transform alone, and 141 with the all-core deep pass and two
         // helpers. Queue depth 2× helpers bounds the unhashed window.
         //
-        // The split assumes the caller's pool is the P-core pool and the
-        // spare cores are the E-cores: a narrower caller pool would pin the
-        // deep pass to a few P-cores while helpers took the rest, so E-core
-        // hashing needs a caller pool at least as wide as the P-cluster, and
-        // the helpers never outnumber the E-cores.
+        // The split needs spare cores: the all-core pool at least two
+        // threads wider than the caller's pool, and the caller's pool at
+        // least as wide as the P-cluster (a narrower one would pin the deep
+        // pass to a few P-cores while helpers took the rest). The helpers
+        // never outnumber the E-cores. So the split runs only when the
+        // caller's pool is the P-core pool:
+        // - `init_perf_thread_pool` on a chip with fewer E- than P-cores
+        //   (M4 Max: 10P+4E);
+        // - a caller that installs a P-core-wide pool of its own (the
+        //   measurement above).
+        // It is off under the default pool on the M4 (4P+6E):
+        // `init_perf_thread_pool` builds an all-core global pool there, so
+        // `spare_cores = 0`. It is also off under `RAYON_NUM_THREADS`, which
+        // sizes both pools alike. The commit then takes the other arm: the
+        // deep pass on the global pool (every core) plus two helpers, 12
+        // threads on 10 cores on the M4. That arm is the 141 ms above,
+        // against 135 for the split.
         let spare_cores = crate::all_core_pool()
             .current_num_threads()
             .saturating_sub(current_num_threads())
