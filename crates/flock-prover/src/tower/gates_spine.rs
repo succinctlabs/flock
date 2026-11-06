@@ -1375,6 +1375,35 @@ mod horner_tests {
         })
     }
 
+    /// Lay `rows` out column-major at `n_log`, then check that the honest
+    /// layout satisfies and that `+1` on ANY used column of row 0 (a random
+    /// row) does not: the outputs are bound by their defining constraint and
+    /// every input feeds one. The regression Ron's probe asked to keep: the
+    /// honest-row tests above would pass a relation that left a column free.
+    fn assert_every_column_bound(ty: &ElementTableType, rows: &[Vec<F128>], n_log: usize) {
+        let layout = |rows: &[Vec<F128>]| {
+            let mut z = vec![F128::ZERO; ty.width() << n_log];
+            for (j, row) in rows.iter().enumerate() {
+                for (col, &x) in row.iter().enumerate() {
+                    z[(col << n_log) + j] = x;
+                }
+            }
+            z
+        };
+        assert!(
+            ty.satisfies(&layout(rows), n_log, rows.len()),
+            "the honest rows satisfy"
+        );
+        for col in 0..rows[0].len() {
+            let mut bad = rows.to_vec();
+            bad[0][col] += F128::ONE;
+            assert!(
+                !ty.satisfies(&layout(&bad), n_log, rows.len()),
+                "+1 on column {col} must break the relation"
+            );
+        }
+    }
+
     #[test]
     fn horner_step_rows_satisfy_and_evaluate_row_zero() {
         let g = HornerStepGate::new();
@@ -1401,6 +1430,7 @@ mod horner_tests {
             }
         }
         assert!(g.ty.satisfies(&z, n_log, rows.len()), "Horner rows satisfy");
+        assert_every_column_bound(&g.ty, &rows, n_log);
     }
 
     #[test]
@@ -1417,6 +1447,9 @@ mod horner_tests {
             z[col << n_log] = v;
         }
         assert!(g.ty.satisfies(&z, n_log, 2));
+        // A second chained row: its input is the first row's last power.
+        let row2 = g.eval(&[out[SQ_N - 1]], &(), &mut Vec::new());
+        assert_every_column_bound(&g.ty, &[row, row2], n_log);
     }
 
     /// The identity family H's Horner chain rests on, end to end at the
@@ -1470,5 +1503,6 @@ mod horner_tests {
             g.ty.satisfies(&z, n_log, rows.len()),
             "transpose dot rows satisfy"
         );
+        assert_every_column_bound(&g.ty, &rows, n_log);
     }
 }
