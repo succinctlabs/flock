@@ -250,25 +250,83 @@ mod imp {
 
     pub(crate) const NIL: Id = std::ptr::null_mut();
 
-    /// Function pointers resolved from libobjc and Metal at init.
+    /// Function pointers resolved from libobjc and Metal at init, and the
+    /// selectors the module sends.
     pub(crate) struct Api {
         msg_send: *const c_void,
         get_class: unsafe extern "C" fn(*const i8) -> Id,
-        sel_register: unsafe extern "C" fn(*const i8) -> Sel,
         pool_push: unsafe extern "C" fn() -> *mut c_void,
         pool_pop: unsafe extern "C" fn(*mut c_void),
         create_system_default_device: unsafe extern "C" fn() -> Id,
         copy_all_devices: unsafe extern "C" fn() -> Id,
+        sels: Sels,
     }
-    // SAFETY: all fields are process-global immutable function pointers.
+    // SAFETY: all fields are process-global immutable function pointers and
+    // selectors (registered selectors are never freed).
     unsafe impl Send for Api {}
     unsafe impl Sync for Api {}
 
-    /// `objc_msgSend` cast to a concrete signature per call site.
+    /// Declares [`Sels`], one field per selector, registered once when the
+    /// API loads rather than on every message.
+    macro_rules! selectors {
+        ($($field:ident = $name:literal,)*) => {
+            struct Sels {
+                $($field: Sel,)*
+            }
+
+            impl Sels {
+                unsafe fn register(
+                    register: unsafe extern "C" fn(*const i8) -> Sel,
+                ) -> Result<Sels, String> {
+                    let one = |name: &core::ffi::CStr| -> Result<Sel, String> {
+                        let sel = unsafe { register(name.as_ptr().cast()) };
+                        if sel.is_null() {
+                            Err(format!("sel_registerName {name:?} failed"))
+                        } else {
+                            Ok(sel)
+                        }
+                    };
+                    Ok(Sels {
+                        $($field: one($name)?,)*
+                    })
+                }
+            }
+        };
+    }
+
+    selectors! {
+        string_with_utf8_string = c"stringWithUTF8String:",
+        localized_description = c"localizedDescription",
+        utf8_string = c"UTF8String",
+        first_object = c"firstObject",
+        new_command_queue = c"newCommandQueue",
+        new_library_with_source = c"newLibraryWithSource:options:error:",
+        new_function_with_name = c"newFunctionWithName:",
+        new_compute_pipeline_state = c"newComputePipelineStateWithFunction:error:",
+        release = c"release",
+        new_buffer_with_length = c"newBufferWithLength:options:",
+        contents = c"contents",
+        command_buffer = c"commandBuffer",
+        compute_command_encoder = c"computeCommandEncoder",
+        set_compute_pipeline_state = c"setComputePipelineState:",
+        set_buffer = c"setBuffer:offset:atIndex:",
+        set_bytes = c"setBytes:length:atIndex:",
+        dispatch_threadgroups = c"dispatchThreadgroups:threadsPerThreadgroup:",
+        end_encoding = c"endEncoding",
+        commit = c"commit",
+        wait_until_completed = c"waitUntilCompleted",
+        status = c"status",
+        error = c"error",
+        gpu_start_time = c"GPUStartTime",
+        gpu_end_time = c"GPUEndTime",
+    }
+
+    /// `objc_msgSend` cast to a concrete signature per call site; `$sel`
+    /// names a field of [`Sels`].
     macro_rules! send {
-        ($api:expr, $ty:ty, $obj:expr, $sel:expr $(, $a:expr)* $(,)?) => {{
+        ($api:expr, $ty:ty, $obj:expr, $sel:ident $(, $a:expr)* $(,)?) => {{
             let f: $ty = core::mem::transmute($api.msg_send);
-            f($obj, ($api.sel_register)($sel.as_ptr()) $(, $a)*)
+            f($obj, $api.sels.$sel $(, $a)*)
         }};
     }
 
@@ -325,10 +383,6 @@ mod imp {
                         objc,
                         c"objc_getClass",
                     )?),
-                    sel_register: core::mem::transmute::<*mut c_void, SelFn>(sym(
-                        objc,
-                        c"sel_registerName",
-                    )?),
                     pool_push: core::mem::transmute::<*mut c_void, PushFn>(sym(
                         objc,
                         c"objc_autoreleasePoolPush",
@@ -344,6 +398,10 @@ mod imp {
                         metal,
                         c"MTLCopyAllDevices",
                     )?),
+                    sels: Sels::register(core::mem::transmute::<*mut c_void, SelFn>(sym(
+                        objc,
+                        c"sel_registerName",
+                    )?))?,
                 })
             }
         }
@@ -362,7 +420,7 @@ mod imp {
                     self,
                     unsafe extern "C" fn(Id, Sel, *const u8) -> Id,
                     cls,
-                    c"stringWithUTF8String:",
+                    string_with_utf8_string,
                     buf.as_ptr()
                 );
                 if ns.is_null() {
@@ -382,7 +440,7 @@ mod imp {
                     self,
                     unsafe extern "C" fn(Id, Sel) -> Id,
                     err,
-                    c"localizedDescription"
+                    localized_description
                 );
                 if desc.is_null() {
                     return "unknown error (nil description)".into();
@@ -391,7 +449,7 @@ mod imp {
                     self,
                     unsafe extern "C" fn(Id, Sel) -> *const u8,
                     desc,
-                    c"UTF8String"
+                    utf8_string
                 );
                 if cstr.is_null() {
                     return "unknown error (nil UTF8String)".into();
@@ -1263,12 +1321,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     // built-in GPU.
                     let all = (api.copy_all_devices)();
                     if !all.is_null() {
-                        device = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel) -> Id,
-                            all,
-                            c"firstObject"
-                        );
+                        device = send!(api, unsafe extern "C" fn(Id, Sel) -> Id, all, first_object);
                     }
                 }
                 if device.is_null() {
@@ -1278,7 +1331,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     api,
                     unsafe extern "C" fn(Id, Sel) -> Id,
                     device,
-                    c"newCommandQueue"
+                    new_command_queue
                 );
                 if queue.is_null() {
                     return Err("newCommandQueue failed".into());
@@ -1289,7 +1342,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     api,
                     unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
                     device,
-                    c"newLibraryWithSource:options:error:",
+                    new_library_with_source,
                     src,
                     NIL,
                     &mut err
@@ -1303,7 +1356,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         api,
                         unsafe extern "C" fn(Id, Sel, Id) -> Id,
                         library,
-                        c"newFunctionWithName:",
+                        new_function_with_name,
                         ns
                     );
                     if f.is_null() {
@@ -1314,11 +1367,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         api,
                         unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
                         device,
-                        c"newComputePipelineStateWithFunction:error:",
+                        new_compute_pipeline_state,
                         f,
                         &mut err
                     );
-                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, release);
                     if p.is_null() {
                         return Err(format!("pipeline {name}: {}", api.error_string(err)));
                     }
@@ -1328,12 +1381,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 for (slot, name) in psos.iter_mut().zip(KERNELS) {
                     *slot = pso(name)?;
                 }
-                send!(
-                    api,
-                    unsafe extern "C" fn(Id, Sel) -> Id,
-                    library,
-                    c"release"
-                );
+                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, release);
                 Ok((device, queue, psos))
             })();
             (api.pool_pop)(pool);
@@ -1390,7 +1438,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel, u64, u64) -> Id,
                     self.device,
-                    c"newBufferWithLength:options:",
+                    new_buffer_with_length,
                     len as u64,
                     0u64 // MTLResourceStorageModeShared
                 );
@@ -1408,7 +1456,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel) -> *mut u8,
                     buf,
-                    c"contents"
+                    contents
                 )
             }
         }
@@ -1416,12 +1464,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         unsafe fn release(&self, obj: Id) {
             if !obj.is_null() {
                 unsafe {
-                    send!(
-                        self.api,
-                        unsafe extern "C" fn(Id, Sel) -> Id,
-                        obj,
-                        c"release"
-                    );
+                    send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, obj, release);
                 }
             }
         }
@@ -1432,7 +1475,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel) -> Id,
                     self.queue,
-                    c"commandBuffer"
+                    command_buffer
                 );
                 if cb.is_null() {
                     Err("commandBuffer failed".into())
@@ -1448,7 +1491,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel) -> Id,
                     cb,
-                    c"computeCommandEncoder"
+                    compute_command_encoder
                 );
                 if e.is_null() {
                     Err("computeCommandEncoder failed".into())
@@ -1464,7 +1507,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel, Id),
                     enc,
-                    c"setComputePipelineState:",
+                    set_compute_pipeline_state,
                     pso
                 );
             }
@@ -1476,7 +1519,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel, Id, u64, u64),
                     enc,
-                    c"setBuffer:offset:atIndex:",
+                    set_buffer,
                     buf,
                     offset as u64,
                     index as u64
@@ -1490,7 +1533,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel, *const c_void, u64, u64),
                     enc,
-                    c"setBytes:length:atIndex:",
+                    set_bytes,
                     (value as *const T).cast(),
                     core::mem::size_of::<T>() as u64,
                     index as u64
@@ -1504,7 +1547,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel, MtlSize, MtlSize),
                     enc,
-                    c"dispatchThreadgroups:threadsPerThreadgroup:",
+                    dispatch_threadgroups,
                     MtlSize {
                         width: groups,
                         height: 1,
@@ -1521,13 +1564,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
         unsafe fn end_encoding(&self, enc: Id) {
             unsafe {
-                send!(self.api, unsafe extern "C" fn(Id, Sel), enc, c"endEncoding");
+                send!(self.api, unsafe extern "C" fn(Id, Sel), enc, end_encoding);
             }
         }
 
         unsafe fn commit_async(&self, cb: Id) {
             unsafe {
-                send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
+                send!(self.api, unsafe extern "C" fn(Id, Sel), cb, commit);
             }
         }
 
@@ -1547,19 +1590,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel),
                     cb,
-                    c"waitUntilCompleted"
+                    wait_until_completed
                 );
-                let status: u64 = send!(
-                    self.api,
-                    unsafe extern "C" fn(Id, Sel) -> u64,
-                    cb,
-                    c"status"
-                );
+                let status: u64 = send!(self.api, unsafe extern "C" fn(Id, Sel) -> u64, cb, status);
                 if status == 4 {
                     Ok(())
                 } else {
-                    let err: Id =
-                        send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                    let err: Id = send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, error);
                     Err(format!(
                         "command buffer status {status}: {}",
                         self.api.error_string(err)
@@ -2008,13 +2045,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 gpu.api,
                 unsafe extern "C" fn(Id, Sel) -> f64,
                 cb,
-                c"GPUStartTime"
+                gpu_start_time
             );
             let t1: f64 = send!(
                 gpu.api,
                 unsafe extern "C" fn(Id, Sel) -> f64,
                 cb,
-                c"GPUEndTime"
+                gpu_end_time
             );
             (t1 - t0) * 1e3
         }
