@@ -41,6 +41,7 @@ const ELEMENT_CLASS_LABEL: &[u8] = b"flock-element-class-v0";
 /// Domain label for non-empty IO schemas in [`Registry::digest`]. Registries
 /// without schemas do not absorb this label.
 const IO_SCHEMA_LABEL: &[u8] = b"flock-io-schema-v0";
+const ZEROED_WORDS_LABEL: &[u8] = b"flock-zeroed-words-v0";
 
 /// Which side of a gate an [`IoWord`] is. **Metadata for circuit validation
 /// only** — the wiring argument is direction-blind (a permutation neither
@@ -156,6 +157,20 @@ pub struct TableType {
     /// circuit builders use those two contiguous regions as gate arguments
     /// and results.
     pub io_schema: Vec<IoWord>,
+    /// Word-columns, ascending, whose 128 constraint rows all have degree
+    /// one ([`Self::is_linear_row`]: `B = {const_pin}`, or `A = B = ∅`, with
+    /// `C = {i}`) and which the zerocheck drops: they are zero runs of
+    /// [`Instance::boolean_padding_spec`], the lincheck's `A_0`/`B_0` lose
+    /// those rows, and `C` becomes `diag(mask)`, so the C claim's opening
+    /// weight zeroes these columns. The lincheck checks the dropped rows
+    /// instead, as the linear identity `(A_0 + I)·z = 0` at the zerocheck's
+    /// point; for the `x·1 = x` rows of an input word that identity is
+    /// empty. Where a slot commits its dummy rows the words are kept
+    /// ([`crate::union::UnionInstance::zeroed_word_cols`]). EMPTY by default,
+    /// absorbing nothing into [`Registry::digest`]; set by
+    /// [`Self::with_zeroed_linear_words`] (or its identity-only subset) and
+    /// checked by [`Registry::new`].
+    pub zeroed_word_cols: Vec<usize>,
 }
 
 impl TableType {
@@ -174,6 +189,7 @@ impl TableType {
             const_pin: r1cs.const_pin,
             class: TableClass::Boolean,
             io_schema: Vec::new(),
+            zeroed_word_cols: Vec::new(),
         }
     }
 
@@ -192,6 +208,7 @@ impl TableType {
             const_pin: None,
             class: TableClass::element(ty),
             io_schema: Vec::new(),
+            zeroed_word_cols: Vec::new(),
         }
     }
 
@@ -201,6 +218,50 @@ impl TableType {
     pub fn with_io_schema(mut self, io_schema: Vec<IoWord>) -> Self {
         self.io_schema = io_schema;
         self
+    }
+
+    /// This type with every word-column whose 128 rows all have degree one
+    /// dropped from the zerocheck (see [`Self::zeroed_word_cols`]): input
+    /// words (`x·1 = x`), output words defined by a copy or an XOR
+    /// (`(A_0 z)·1 = x`), and words of bits forced to zero (`0·0 = x`). Needs
+    /// the real `a_0`/`b_0`/`c_0` and a const pin; a type without either
+    /// (stubs, element types) keeps every row.
+    pub fn with_zeroed_linear_words(self) -> Self {
+        self.with_zeroed_words_where(Self::is_linear_row)
+    }
+
+    /// [`Self::with_zeroed_linear_words`] restricted to words of `x·1 = x`
+    /// rows, the only ones whose lincheck identity is empty.
+    pub fn with_zeroed_identity_words(self) -> Self {
+        self.with_zeroed_words_where(Self::is_identity_row)
+    }
+
+    fn with_zeroed_words_where(mut self, row_drops: fn(&Self, usize, usize) -> bool) -> Self {
+        self.zeroed_word_cols = match self.const_pin {
+            Some(pin) if !self.is_element() => (0..self.useful_bits / 128)
+                .filter(|&w| (128 * w..128 * (w + 1)).all(|i| row_drops(&self, i, pin)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        self
+    }
+
+    fn row(m: &SparseBinaryMatrix, i: usize) -> &[usize] {
+        m.rows.get(i).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether constraint row `i` is `z_i · z_pin = z_i`.
+    pub fn is_identity_row(&self, i: usize, pin: usize) -> bool {
+        self.is_linear_row(i, pin) && Self::row(&self.a_0, i) == [i]
+    }
+
+    /// Whether constraint row `i` has degree one: `(A_0 z)_i · z_pin = z_i`
+    /// or `0 · (B_0 z)_i = z_i` with `B_0`'s row empty too. Once the const
+    /// pin fixes `z_pin = 1` on declared rows, either reads `(A_0 z)_i = z_i`
+    /// (`A_0`'s row may be empty), a linear identity.
+    pub fn is_linear_row(&self, i: usize, pin: usize) -> bool {
+        let (a, b) = (Self::row(&self.a_0, i), Self::row(&self.b_0, i));
+        Self::row(&self.c_0, i) == [i] && (b == [pin] || (a.is_empty() && b.is_empty()))
     }
 
     /// Number of 128-bit word-columns a row of this type really uses:
@@ -378,6 +439,26 @@ impl Registry {
                     w.word_col
                 );
             }
+            // Zeroed words: ascending whole words of degree-one rows only, so
+            // the lincheck's linear identity can stand in for them.
+            if !ty.zeroed_word_cols.is_empty() {
+                let pin = ty.const_pin.expect("zeroed words need the const pin");
+                assert!(!ty.is_element(), "element types cannot zero words");
+                assert!(
+                    ty.zeroed_word_cols.windows(2).all(|w| w[0] < w[1]),
+                    "zeroed word-columns must be ascending and distinct"
+                );
+                for &w in &ty.zeroed_word_cols {
+                    assert!(
+                        128 * (w + 1) <= ty.useful_bits,
+                        "zeroed word-column {w} is not a whole useful word"
+                    );
+                    assert!(
+                        (128 * w..128 * (w + 1)).all(|i| ty.is_linear_row(i, pin)),
+                        "zeroed word-column {w} has a row of degree two"
+                    );
+                }
+            }
         }
         // Class-major, then non-increasing capacity area = k_log descending
         // (uniform capacity). Stable, so equal-width types keep their given
@@ -518,17 +599,20 @@ impl Registry {
     ///    [`IoWord`] in schema order its `word_col` (u32 LE) and direction
     ///    byte. A registry whose types carry no schema — every registry
     ///    that predates the wiring layer — absorbs nothing here, the same
-    ///    byte-identity bar.
+    ///    byte-identity bar;
+    /// 8. **for types with zeroed words only**, appended last: the label
+    ///    [`ZEROED_WORDS_LABEL`], the count as u32 LE, then each word-column
+    ///    as u32 LE ([`TableType::zeroed_word_cols`]).
     ///
     /// The conditional suffixes keep the encoding injective: a type's boolean
     /// part is self-delimiting (fixed 21-byte header + three length-prefixed
-    /// matrices), and after it the next four bytes either begin one of the two
+    /// matrices), and after it the next four bytes either begin one of the
     /// labels (`"floc"`, i.e. `0x636f6c66` read as u32 LE) or the next type's
     /// `k_log`, which [`MAX_K_LOG`] bounds far below that — so a left-to-right
-    /// parse can never confuse a suffix with the next type. The two labels are
-    /// distinct and neither is a prefix of the other, they appear in a fixed
-    /// order, and the schema payload is length-prefixed, so the suffixes cannot
-    /// be confused with each other either.
+    /// parse can never confuse a suffix with the next type. The labels are
+    /// distinct and none is a prefix of another, they appear in a fixed
+    /// order, and the schema and zeroed-word payloads are length-prefixed, so
+    /// the suffixes cannot be confused with each other either.
     ///
     /// Lazily cached in `digest_cache`; first call materializes it,
     /// subsequent calls are essentially free.
@@ -563,6 +647,14 @@ impl Registry {
                     for w in &ty.io_schema {
                         h.update(&(w.word_col as u32).to_le_bytes());
                         h.update(&[w.dir.code()]);
+                    }
+                }
+                // Zeroed words append ONLY when non-empty — see above.
+                if !ty.zeroed_word_cols.is_empty() {
+                    h.update(ZEROED_WORDS_LABEL);
+                    h.update(&(ty.zeroed_word_cols.len() as u32).to_le_bytes());
+                    for &w in &ty.zeroed_word_cols {
+                        h.update(&(w as u32).to_le_bytes());
                     }
                 }
             }
@@ -755,17 +847,32 @@ impl<'r> Instance<'r> {
     /// the boolean region `[0, 2^{M_bool})` alone, which is the domain the
     /// boolean zerocheck runs on. Identical to [`Self::padding_spec`] for a
     /// boolean-only registry (the element runs and the class gap are exactly
-    /// what it drops), so the boolean PIOP is untouched there.
+    /// what it drops), so the boolean PIOP is untouched there — except that
+    /// a type's zeroed words ([`TableType::zeroed_word_cols`]) are zero runs
+    /// here and data in [`Self::padding_spec`]: they are committed, and only
+    /// the boolean PIOP drops their rows.
     pub fn boolean_padding_spec(&self) -> PaddingSpec {
+        self.boolean_padding_spec_dropping(|t| &self.registry.types()[t].zeroed_word_cols)
+    }
+
+    /// [`Self::boolean_padding_spec`] with slot `t`'s zero runs at the words
+    /// `dropped(t)` instead of its type's whole list — the union instance
+    /// keeps the words of a slot that commits its dummy rows
+    /// ([`crate::union::UnionInstance::zeroed_word_cols`]).
+    pub fn boolean_padding_spec_dropping<'a>(
+        &self,
+        dropped: impl Fn(usize) -> &'a [usize],
+    ) -> PaddingSpec {
         let nu = self.registry.nu();
         let col_bits = 7 + nu;
         let nb = self.registry.num_boolean();
         let mut runs = Vec::with_capacity(3 * nb);
         let mut cursor = 0usize;
-        for ((ty, slot), &n_t) in self.registry.types()[..nb]
+        for (t, ((ty, slot), &n_t)) in self.registry.types()[..nb]
             .iter()
             .zip(&self.registry.slots()[..nb])
             .zip(&self.counts[..nb])
+            .enumerate()
         {
             let gap = slot.offset - cursor;
             runs.push(PaddingRun {
@@ -775,10 +882,27 @@ impl<'r> Instance<'r> {
             });
             let n_cols = 1usize << (ty.k_log - 7);
             let useful_cols = ty.useful_bits.div_ceil(128).min(n_cols);
+            // Zeroed words ([`TableType::zeroed_word_cols`]) are zero runs
+            // inside the data: the zerocheck reads nothing there, which is
+            // exactly the relation with those rows dropped (a = b = c = 0).
+            let mut from = 0;
+            for &w in dropped(t) {
+                runs.push(PaddingRun {
+                    k_log: col_bits,
+                    useful_bits_per_block: n_t << 7,
+                    n_blocks: w - from,
+                });
+                runs.push(PaddingRun {
+                    k_log: col_bits,
+                    useful_bits_per_block: 0,
+                    n_blocks: 1,
+                });
+                from = w + 1;
+            }
             runs.push(PaddingRun {
                 k_log: col_bits,
                 useful_bits_per_block: n_t << 7,
-                n_blocks: useful_cols,
+                n_blocks: useful_cols - from,
             });
             runs.push(PaddingRun {
                 k_log: col_bits,
@@ -823,6 +947,7 @@ mod tests {
             const_pin: None,
             class: TableClass::Boolean,
             io_schema: Vec::new(),
+            zeroed_word_cols: Vec::new(),
         }
     }
 
@@ -1063,6 +1188,7 @@ mod tests {
                         const_pin: Some(2),
                         class: TableClass::Boolean,
                         io_schema: Vec::new(),
+                        zeroed_word_cols: Vec::new(),
                     },
                 ],
                 3,
@@ -1100,6 +1226,7 @@ mod tests {
                         const_pin,
                         class: TableClass::Boolean,
                         io_schema: Vec::new(),
+                        zeroed_word_cols: Vec::new(),
                     },
                 ],
                 nu,
@@ -1148,6 +1275,7 @@ mod tests {
                     const_pin: Some(2),
                     class: TableClass::Boolean,
                     io_schema: Vec::new(),
+                    zeroed_word_cols: Vec::new(),
                 },
             ],
             3,
@@ -1187,6 +1315,77 @@ mod tests {
             "8010ecf651ca43eadfe415eac6a081c8f9022dd077070da0f22cea19297699ea",
             "an empty IO schema must absorb nothing"
         );
+    }
+
+    /// A 256-row type pinned at row 255: word 0 is all `x·1 = x`, word 1
+    /// checks its bits are Boolean (`x·x = x`), so only word 0 can drop.
+    fn identity_word_ty() -> TableType {
+        let (n, pin) = (256, 255);
+        let m = |f: &dyn Fn(usize) -> usize| {
+            SparseBinaryMatrix::new(n, n, (0..n).map(|i| vec![f(i)]).collect())
+        };
+        TableType {
+            k_log: 8,
+            useful_bits: n,
+            a_0: m(&|i| i),
+            b_0: m(&|i| if i < 128 { pin } else { i }),
+            c_0: m(&|i| i),
+            const_pin: Some(pin),
+            class: TableClass::Boolean,
+            io_schema: Vec::new(),
+            zeroed_word_cols: Vec::new(),
+        }
+    }
+
+    /// Only whole words of `x·1 = x` rows drop; the list binds the digest;
+    /// the zerocheck's run-list skips the word while the committed one keeps
+    /// it.
+    #[test]
+    fn zeroed_words_are_whole_identity_words() {
+        let zeroed_ty = identity_word_ty().with_zeroed_identity_words();
+        assert_eq!(zeroed_ty.zeroed_word_cols, vec![0]);
+        // `x·x = x` is not linear either: the linear words are the same.
+        assert_eq!(
+            identity_word_ty()
+                .with_zeroed_linear_words()
+                .zeroed_word_cols,
+            vec![0]
+        );
+        let plain = Registry::new(vec![identity_word_ty()], 3);
+        let zeroed = Registry::new(vec![zeroed_ty], 3);
+        assert_ne!(plain.digest(), zeroed.digest(), "the zeroed words bind");
+        let live = |spec: crate::zerocheck::PaddingSpec| -> usize {
+            spec.runs()
+                .iter()
+                .map(|r| r.useful_bits_per_block * r.n_blocks)
+                .sum()
+        };
+        let (p, z) = (
+            Instance::new(&plain, vec![8]),
+            Instance::new(&zeroed, vec![8]),
+        );
+        assert_eq!(live(p.padding_spec()), 2 * 8 * 128);
+        assert_eq!(
+            live(z.padding_spec()),
+            2 * 8 * 128,
+            "zeroed words stay committed"
+        );
+        assert_eq!(live(p.boolean_padding_spec()), 2 * 8 * 128);
+        assert_eq!(
+            live(z.boolean_padding_spec()),
+            8 * 128,
+            "the zerocheck skips word 0"
+        );
+    }
+
+    /// Zeroing a word with a degree-two row would drop a constraint the
+    /// lincheck cannot check: refused.
+    #[test]
+    #[should_panic(expected = "has a row of degree two")]
+    fn zeroed_word_with_a_real_row_is_rejected() {
+        let mut ty = identity_word_ty();
+        ty.zeroed_word_cols = vec![1];
+        Registry::new(vec![ty], 3);
     }
 
     /// Every part of a schema moves the digest: its presence, the entry count,

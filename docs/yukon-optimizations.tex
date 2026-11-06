@@ -55,7 +55,14 @@ that were landed on the new protocol --- among them the statistics
 ladder in the open, the any-size Merkle leaf batcher, and the
 promotion of the AG zerocheck --- which together took the $m{=}32$
 prove from $854$ to $438$\,ms multi-threaded and from $5.25$ to
-$2.91$\,s single-threaded.
+$2.91$\,s single-threaded. A last section (Section~\ref{sec:degreeone})
+records a protocol change rather than a kernel: whole words of degree-one
+constraint rows --- a gate's inputs, its XORed outputs, its constant's word
+--- leave the zerocheck and are checked by the lincheck as one linear
+identity, at no measurable lincheck cost; it includes a soundness gap the
+first version had under the full-height commit, and its fix, and a
+lookahead pass over live spans that lets the sparse tail run two rounds
+per pass on any layout, which more than halves the multi-threaded tail.
 \end{abstract}
 
 \section*{Preliminaries}
@@ -1211,6 +1218,338 @@ the phase it changed). And wiring the pool's large buffers with
 within $\pm10\,$ms on min, median and max) while adding $\approx63$k
 faults per prove for the wiring walks.
 
+\section{Degree-one rows out of the zerocheck}\label{sec:degreeone}
+
+The entries above change kernels and leave the statement alone. This one
+changes the protocol: it removes whole words of constraint rows from the
+zerocheck and has the lincheck check them as one linear identity instead.
+It was built on the leanXMSS verifier circuit (branch
+\code{zerocheck-input-rows}, stacked on \code{leanxmss}) and is
+measured there: on an Apple M4 (4P$+$6E), ten threads, at $1000$ leanXMSS
+signatures ($201{,}000$ BLAKE3 compressions over seven gate kinds) and on
+the pure BLAKE3 union at $2^{18}$ compressions.
+
+\subsection{The census: products the zerocheck does not need}\label{sec:census}
+
+\begin{optsummary}
+\item[Baseline:] Every constraint row of every Boolean gate went through the zerocheck, including rows with a constant factor.
+\item[Observation:] A gate's input words, its outputs that are copies or XORs, and the word that holds its constant wire consist entirely of rows that are linear once the constant is fixed --- $11$ of the compression gate's $92$ words, and every word of three of the five gadget gates.
+\item[Mechanism:] Drop such words from the zerocheck; check their linear identity in the lincheck (\S\ref{sec:degreeone-protocol}).
+\item[Result:] see \S\ref{sec:degreeone-measure}.
+\end{optsummary}
+
+A Boolean gate type is a square R1CS over $\Ftwo$: $k = 2^\kappa$
+positions per instance, matrices $A_0, B_0$ and $C_0 = I$, so constraint
+$i$ of an instance $z$ reads $(A_0 z)_i\,(B_0 z)_i = z_i$, and a constant
+wire $z_p$ that the lincheck's count target pins to $1$ on declared
+instances and $0$ on dummy ones. Call row $i$ \emph{degree-one} if
+$B_{0,i} = \{p\}$, or $A_{0,i} = B_{0,i} = \emptyset$. On a declared
+instance such a row reads $(A_0 z)_i = z_i$. Three kinds of words consist
+of nothing else:
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\item \emph{input words}: each bit has the row $z_i\cdot z_p = z_i$, i.e.\ $A_{0,i} = \{i\}$ --- a row every witness satisfies;
+\item \emph{output words} whose bits are copies or XORs of earlier bits: $(A_0z)_i\cdot z_p = z_i$; in the compression gate each is an XOR of about $5{,}000$ bits, because the circuit inlines BLAKE3's XORs into its linear forms;
+\item the \emph{constant's word}: the circuit builder gives the pin a word of its own, whose other $127$ rows are $0\cdot 0 = z_i$.
+\end{itemize}
+An exhaustive classification of every row of the seven leanXMSS gates
+(Table~\ref{tab:census}) shows chain, address and address-step contain
+no product at all --- they route and XOR bits --- and that the remaining
+mixed words (the codeword gate's $64/64$ halves, the compression gate's
+word $8$ with $70$ forced-zero bits) are not whole words and stay.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Gate & words & inputs & pin word & linear outputs & left in the zerocheck\\
+\midrule
+compression (leanXMSS) & 92 & 7 & 1 & 3 & 81\\
+chain & 7 & 4 & 1 & 2 & 0\\
+swap & 8 & 3 & 1 & 2 & 2\\
+codeword & 14 & 1 & 1 & 0 & 12\\
+address & 4 & 2 & 1 & 1 & 0\\
+address step & 5 & 2 & 1 & 2 & 0\\
+compression (hand-written) & 92 & 7 & --- & 4 & 81\\
+\bottomrule
+\end{tabular}
+\caption{Words per gate by kind of row. The hand-written BLAKE3 R1CS keeps
+its constant in a mixed word.}\label{tab:census}
+\end{table}
+
+\subsection{The protocol}\label{sec:degreeone-protocol}
+
+Let $D$ be the rows of the dropped words and $m_i = [i\notin D]$. The
+registry derives $D$ from the type's matrices, rejects any word with a
+degree-two row, and binds the list into its digest; the verifier never
+takes it from the proof.
+
+\paragraph{Zerocheck.} It proves $a'\circ b' = c'$ for
+$a' = \mathrm{diag}(m)A_0 z$, $b' = \mathrm{diag}(m)B_0 z$,
+$c' = \mathrm{diag}(m)z$. The run-list it reads marks $D$'s words as zero
+runs, and both round-1 kernels (AG and RS) are read-exact against the
+run-list, so the zerocheck reads nothing there --- no kernel changes.
+
+\paragraph{Lincheck.} The comb's row weights become
+$u_i = \eq_i\,(m_i + \eta\,(1 - m_i))$, with $\eq$ the row-eq table at the
+zerocheck's point $r$ and $\eta$ a fresh challenge sampled after the
+lincheck's $\alpha$. The usual fold gives $\alpha A_0^{\top}u + B_0^{\top}u$; an
+$O(k)$ pass then adds, for every $i\in D$, $\alpha u_i$ at column $i$
+and, if $B_{0,i} = \{p\}$, $u_i$ at the pin column, which cancels the
+$B$ share in characteristic two. The result is
+\[
+\mathrm{Comb} \;=\; \alpha\,A'^{\top}\eq + B'^{\top}\eq
+\;+\; \alpha\eta\sum_{i\in D}\eq_i\,(A_{0,i} + e_i),
+\]
+so the sumcheck proves
+$\alpha\,\hat a'(r) + \hat b'(r) + \alpha\eta\,\hat\rho(r) = \mathrm{target}$,
+where $\rho$ is the residual $(A_0 + I)z$ restricted to $D$. The target
+carries no $\eta$ term, so the identity forces $\hat\rho(r) = 0$. The fold
+touches the same nonzeros as before; the extra work is the $O(k)$ pass per
+distinct gate.
+
+\paragraph{The C claim.} $\hat c'(r_c) = \sum_x \eq(r_c,x)\,m(x)\,z(x)$.
+The mask depends only on the column, so the opening's weight for this
+claim is $\eq_{\mathrm{row}}\otimes(\eq_{\mathrm{col}}\odot m)$. Every
+ring-switched claim's weight is already a per-column factor times a row
+tensor, and a $0/1$ mask is fixed by Frobenius and passes through the
+$\Ftwo$-linear fold, so the mask enters each opening path --- block-first
+banks, the baked weight, the multipoint dual values, the anchor --- as one
+multiply on the column factor.
+
+\subsection{Soundness}\label{sec:degreeone-sound}
+
+\paragraph{The relation.} The PIOP proves the kept rows (zerocheck) and
+$(A_0z)_i = z_i$ for every $i\in D$ and every instance (lincheck). On a
+declared instance $z_p = 1$, so this is exactly the original relation.
+
+\paragraph{The $\eta$ batch.} $\eta$ is sampled after the commitment and
+after the zerocheck has fixed $\hat a'(r)$ and $\hat b'(r)$; the identity
+is affine in $\eta$, so a nonzero $\hat\rho(r)$ survives with probability
+$1/|\mathbb{F}|$ --- one more site like a pin's $\beta$, with one PoW bit in
+the strict schedule.
+
+\paragraph{The point $r$.} $\rho$ is fixed by the commitment before $r$
+is drawn. A nonzero $\rho$ has $\hat\rho(r) = 0$ only if $r$ lands in a
+bad set, and these add to the zerocheck's own bad sets at the same
+challenges: at the skip coordinate, the zeros of one more base-code word
+(at most $158$ for the genus-$95$ AG code, $63$ for the RS skip); in each
+multilinear round, one more degree. The strict schedule grinds each
+challenge to $\mathrm{bits}(\text{bad set})$ with
+$\mathrm{bits}(n) = \lfloor\log_2 n\rfloor + 1$, so:
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+challenge & bad set before & with the linear check & PoW bits\\
+\midrule
+AG skip point $r_1$ & $316 + 158 = 474$ & $632$ & $9\to10$\\
+RS skip point & $127$ & $190$ & $7\to8$\\
+each multilinear round & $2$ & $3$ & $2$ (unchanged)\\
+\bottomrule
+\end{tabular}
+\end{center}
+The raised bits apply only when some dropped row is not $z_i\cdot z_p = z_i$
+(\S\ref{sec:identity-special}).
+
+\paragraph{Dummy rows.} A slot's dummy instances $n_t\le j<2^\nu$ have
+$z_p = 0$. There the \emph{original} row $(A_0z)_i\cdot z_p = z_i$ forces
+$z_i = 0$ for every input and output word, while the lincheck's identity,
+which has no pin, does not. Under the default height-$n_t$ stacking this
+is immaterial: dummy rows are not committed and are virtual zeros. Under
+the full-height commit (which the leanXMSS circuit uses, for the
+block-first transport of \S\ref{sec:blockfirst}) they are committed, and
+two arguments read them: the wiring's and the tuple bus's gathers take
+each committed word's whole column and assume dummy rows are zero. The
+masked wiring product gives a dead cell the leaf $1 + w$, so a dummy
+input word $w = 1$ would zero \emph{both} grand products and make every
+copy constraint vacuous; the bus's dead leaves $1 + \sum_k\gamma_k w_k$
+cannot be zeroed by the prover, but they enlarge the Schwartz--Zippel
+degree beyond the live entries its grinding is sized for. So a slot that
+commits dummy rows ($0 < n_t < 2^\nu$ under full height) keeps all of its
+rows, and the dropped set is read per slot from the instance, never from
+the type alone.
+
+\paragraph{Small slots.} Below $\nu = 6$ nothing drops either. A dropped
+word still holds its witness bits ($C$ aliases $z$). The RS zerocheck's
+round~1 reads each $8192$-bit window up to its highest useful bit, so it
+skips a dropped column only when the column, $2^{7+\nu}$ bits, covers whole
+windows. At $\nu = 5$ the round-1 message counted a dropped column that
+the fold treated as zero, and the final check failed on x86, where the RS
+route runs; the AG zerocheck reads per block and never showed it. The
+same window read a partial slot's dummy rows, which the union prover
+leaves dirty on the stated assumption that neither zerocheck reads a dead
+bit: a flaky failure that depended on what earlier tests had left in the
+scratch pool. One predicate, $7 + \nu \ge 13$, now gates both the dropped
+words and the dirty buffers. Production slots are far above the threshold
+($\nu = 15$ for leanXMSS at $1000$ signatures).
+
+The first version of this change dropped input words regardless of the
+commit mode. Reading the full-height soundness note against the wiring's
+dead-leaf formula found the gap; the version recorded here closes it.
+The cost is the partial slots: one per gate kind in leanXMSS --- including
+the only slot of the swap, codeword, address and address-step kinds ---
+or about a quarter of the droppable blocks at $1000$ signatures.
+
+\subsection{Identity words are the special case}\label{sec:identity-special}
+
+\begin{optsummary}
+\item[Question:] The input words could be handled by the general linear check, or by dedicated code (the first version of this change: clear their rows, mask the C claim). Is the general route slower?
+\item[Answer:] It is the same computation. For $A_{0,i} = \{i\}$, $B_{0,i}=\{p\}$ the $\eta$-scaled fold adds $\alpha\eta\,\eq_i$ at $i$ and $\eta\,\eq_i$ at $p$, and the fix-ups add the same two terms: they cancel, and $(A_0 + I)_i = 0$ makes $\rho\equiv 0$ there.
+\item[Mechanism:] With only identity words dropped the implementation samples no $\eta$ and keeps the grinding unchanged, so it runs exactly the first version's comb; a unit test checks the combs agree for random $\eta$, and that adding an XOR word changes the comb by exactly $\alpha\eta\,\eq\odot(A_0+I)$ over its rows.
+\item[Result:] see \S\ref{sec:degreeone-measure}.
+\end{optsummary}
+
+The prover-only reading of the same idea --- keep the transcript and
+special-case degree-one rows inside the zerocheck --- was weighed before
+the protocol change (not built) and saves less by construction. AG round~1 emits the $a\cdot b$
+and $c$ messages separately (the $c$ claim closes at $r_1$), so an
+identity block still costs its $c$-side bank, its $a$ fold, and its share
+of every tail round; only the $b$ side becomes a constant. Dropping the
+rows from the relation removes all three.
+
+\subsection{Measurements}\label{sec:degreeone-measure}
+
+\begin{optsummary}
+\item[Baseline:] leanXMSS at $1000$ signatures: zerocheck $156$, zerocheck$+$lincheck window $208$, prove $505\,$ms (10 threads, median of three alternating rounds' fastest proves).
+\item[Improvement:] Degree-one words out of the zerocheck in every full slot (\S\ref{sec:degreeone-protocol}).
+\item[Mechanism:] Round~1 and the skip$\to$multilinear fold read $\approx13\%$ fewer blocks; the tail, which overlaps the wiring GKR, moves least; the lincheck pays $+2\,$ms for the partial slots' own combs.
+\item[Result:] zerocheck $156\to140$, window $208\to194$, prove $505\to494\,$ms ($-2.2\%$, $3/3$); lincheck $19\,$ms in every pure-BLAKE3 arm (the linear check is free). Pure BLAKE3 at full utilization \emph{regresses} ($445\to463$), for a reason outside this change, which \S\ref{sec:livelookahead} removes.
+\end{optsummary}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+leanXMSS, $1000$ signatures & before & inputs, all slots & degree-one, full slots\\
+\midrule
+zerocheck & 156 & 144 & 140\\
+\quad round 1 / fold / tail & 53 / 40 / 61 & 50 / 36 / 57 & 44 / 34 / 55\\
+lincheck & 29 & 29 & 31\\
+zerocheck $+$ lincheck window & 208 & 195 & 194\\
+prove & 505 & 494 & 494\\
+\midrule
+pure BLAKE3, $2^{18}$ (one full slot) & none & inputs & inputs $+$ outputs\\
+\midrule
+zerocheck & 136 & 157 & 152\\
+\quad round 1 / fold / tail & 59 / 46 / 31 & 54 / 41 / 63 & 52 / 39 / 61\\
+lincheck & 19 & 19 & 19\\
+prove & 445 & 468 & 463\\
+\bottomrule
+\end{tabular}
+\caption{M4, ten threads, ms; phase rows are medians over three alternating
+rounds of each round's fastest prove, sub-phases medians over all proves.
+The middle leanXMSS column is the first version (unsound under the
+full-height commit, \S\ref{sec:degreeone-sound}); the identity-only
+pure-BLAKE3 arm built from that version measured the same as this one
+($471$ against $468$).}\label{tab:degreeone}
+\end{table}
+
+Two readings. First, the linear check costs nothing measurable: the
+lincheck is $19\,$ms in every pure-BLAKE3 arm, as
+\S\ref{sec:identity-special} predicts. Second, at full utilization the
+zerocheck gets \emph{slower} although round~1 and the fold shrink by the
+expected $12\%$: the multilinear tail doubles ($31\to61$--$63$). The sparse
+tail (\S\ref{sec:foldentry}) runs its two-rounds-per-pass lookahead only
+when the live layout is a single interval starting at $0$ --- exactly a
+full slot's used words --- and dropped words split it. leanXMSS never has
+that layout (many slots, gaps, partial columns), so its tail runs without
+the lookahead in every arm; at $55$--$61\,$ms it is its largest zerocheck
+phase. The remedy belongs to the tail, not to this change
+(\S\ref{sec:livelookahead}).
+
+\subsection{The lookahead over live spans}\label{sec:livelookahead}
+
+\begin{optsummary}
+\item[Baseline:] The sparse tail ran the lookahead ladder of \S\ref{sec:foldentry} only on a single live interval starting at~$0$. On any other layout it resolved the fold-level entry's deferred challenge with a \emph{serial} in-place fold over the whole live set, then ran one round per pass. leanXMSS never qualified: at the tail's entry its $34.6$M live positions form $227$ intervals, aligned only to $128$ positions, because a partial slot's columns are live on $2n_t$ of their $2^{\nu+1}$ positions. Pure BLAKE3 with dropped words is a single interval, but it starts at column~$11$.
+\item[Improvement:] A lookahead pass over live-span buffers. Every group of inputs (16 with two pending variables, 8 with one) is weighted by its global index. A run of groups inside one stored interval goes through the dense NEON kernel on the compacted slice; a group straddling a live/dead boundary gathers its inputs with the dead ones at their honest zero. The output layout is the group cover of the live set, merged where groups touch, so its intervals are multiples of $4$ and the ladder continues on any layout.
+\item[Mechanism:] Two effects, separated by a third arm that only parallelizes the resolve: the serial pass leaves the critical path, and the two-rounds-per-pass ladder reads and writes the live set about half as often. Single-threaded neither shows: both routes do about $3L$ multiplications for $L$ live positions.
+\item[Result:] Ten threads: tail $56\to24\,$ms on leanXMSS and $62\to28$ on pure BLAKE3 with dropped words; zerocheck $146\to110$ and $167\to129$; prove faster in $5/5$ rounds on each. One thread: tail unchanged.
+\end{optsummary}
+
+The pass needs nothing from the layout. Its eight sums are sums over
+groups of products of folded values, each group weighted by
+$\eq_{\mathrm{lo}}\cdot\eq_{\mathrm{hi}}$ at its global index; a group
+whose inputs are all dead folds to zero and contributes nothing, and a
+group with some dead inputs is computed exactly as the dense pass computes
+it on the expanded buffer. So the sums, and the stored outputs, are the
+dense pass's, and the transcript is unchanged. The tasks are cut at the
+$\eq_{\mathrm{hi}}$ boundaries, so each carries one high weight; on a
+dense prefix they are the dense pass's chunks. A unit test compares the
+pass with the dense one on expanded buffers for prefixes, an offset
+interval, slot-shaped runs, and intervals that start, end, or meet inside
+a group.
+
+The single-threaded null is the expected one. Per $16$ inputs a fold-2
+pass does $24$ folding multiplications, $4$ eq scalings and $8$ products,
+$2.25$ per input over $L, L/4, L/16,\dots$, so $3L$ in all. The classic
+route does $1$ per input for the resolve and $2$ per input for each
+fold-and-message round over $L/2, L/4,\dots$, again $3L$. What the ladder
+saves is traffic, and the old route's resolve was a single-threaded loop
+over the whole live set; both matter only when the cores compete for
+bandwidth and wait at the pass boundary. The decision was therefore taken
+on the ten-thread measurement (Table~\ref{tab:livelookahead}).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+ten threads & before & resolve parallel only & live-span lookahead\\
+\midrule
+leanXMSS, $1000$ signatures: tail & 56 & 43 & 24\\
+\quad zerocheck & 146 & 136 & 110\\
+\quad zerocheck $+$ lincheck window & 203 & 194 & 184\\
+pure BLAKE3 $2^{18}$, degree-one words dropped: tail & 62 & 50 & 28\\
+\quad zerocheck & 167 & 147 & 129\\
+\quad zerocheck $+$ lincheck window & 205 & 184 & 162\\
+\midrule
+one thread (tail) & before & & live-span lookahead\\
+\midrule
+leanXMSS, $1000$ signatures & 92 & & 91\\
+pure BLAKE3, degree-one words dropped & 112 & & 114\\
+pure BLAKE3, nothing dropped (single prefix) & 126 & & 126\\
+\bottomrule
+\end{tabular}
+\caption{M4, ms. Ten threads: medians over three alternating rounds of each
+round's fastest prove. One thread: medians over three rounds of each
+round's per-phase minimum. ``Before'' is \S\ref{sec:degreeone} as
+measured in Table~\ref{tab:degreeone}. The prove totals were faster in
+every one of five ten-thread rounds on both workloads, by medians of
+$28$ (leanXMSS) and $20\,$ms (pure BLAKE3); the desktop was shared, so the
+window is the steadier figure.}\label{tab:livelookahead}
+\end{table}
+
+With it, dropping words pays at full utilization too. Over the same
+ten-thread rounds pure BLAKE3's zerocheck has a median of $140\,$ms with
+nothing dropped ($136$--$146$, four proves) and $129$ with its degree-one
+words dropped ($121$--$143$, five), against $167$ before ($157$--$181$). leanXMSS's tail, its largest zerocheck phase in every arm of
+Table~\ref{tab:degreeone}, is now its smallest.
+
+\subsection{What is left}\label{sec:degreeone-left}
+
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\item \emph{Partial slots under full height.} Keeping their savings needs
+  the C claim's weight
+  $\eq_{\mathrm{row}}\otimes(\eq_{\mathrm{col}}\odot m)
+  + (\eq_{\mathrm{row}}\odot\mathrm{dead}_t)\otimes(\eq_{\mathrm{col}}\odot(1-m))$,
+  whose row factor is masked to each slot's dummy suffix; the zerocheck
+  then enforces $z_i = 0$ there, as the original relation did, at no
+  prover cost (honest dummy rows are zero). Every opening path would have
+  to carry a per-slot row mask; the dead suffix is $O(\nu)$ aligned
+  subcubes, so the verifier's evaluation stays succinct.
+\item \emph{Prover-only leftovers.} The C claim's column bit-bank fold
+  still folds the masked columns, and the witness packers still write
+  $A z$ and $B z$ for words nothing reads.
+\item \emph{Recursion.} The deferred verification paths (jagged-layout
+  export, matrix-claim accumulation) describe rows with plain eqs and
+  refuse zeroed words; carrying them needs a masked row weight and the
+  linear check's terms in the tower's fold region.
+\end{itemize}
+
 \section*{Summary}
 
 \paragraph{Measurement protocol.} Results before 2026-08-27 include
@@ -1271,6 +1610,10 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:blockfirst} & protocol transport & open: $137\to109\,$ms 8T & $3/3$\\
 \S\ref{sec:lanefill} & store pattern & lane fill: $-31\%$ ST & sweep\\
 \S\ref{sec:poolcap} & allocation & prove: $-68\,$ms 8T (mean) & $4/4$\\
+\midrule
+\multicolumn{4}{@{}l}{\emph{protocol, leanXMSS at $1000$ signatures, M4, ten threads}}\\
+\S\ref{sec:degreeone} & protocol (work removal) & zerocheck $156\to140$; prove $-2.2\%$ & $3/3$\\
+\S\ref{sec:livelookahead} & pass fusion, scheduling & zc tail: $56\to24\,$ms 10T, $\pm0$ ST & $5/5$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\

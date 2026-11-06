@@ -1066,12 +1066,22 @@ fn partial_fold_packed_z_rows_best(
     n_rows: usize,
 ) -> Vec<F128> {
     let n_outer = 1usize << (m - k_log);
-    if n_rows < n_outer {
+    let narrow = k_log < ROW_FOLD_MAX_K_LOG && m - k_log < ROW_FOLD_MAX_N_LOG;
+    if n_rows < n_outer || narrow {
         partial_fold_packed_z_rows_padded(z_packed, m, k_log, useful_bits, eq_outer, n_rows)
     } else {
         partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, eq_outer)
     }
 }
+
+/// Below this width (and outer size) a full slot folds by rows too. There
+/// the dense kernels split the columns over the workers, so each worker
+/// builds every stripe's sum table: on a narrow block those builds swamp the
+/// lookups (leanXMSS chain rows, `k_log` 10 at `n_log` 15: 1.6 ms dense
+/// against ~0.45 by rows). Larger outer sizes take the tiled kernel, which
+/// builds each table once.
+const ROW_FOLD_MAX_K_LOG: usize = 12;
+const ROW_FOLD_MAX_N_LOG: usize = 16;
 
 /// Outer-dimension threshold (`n_log = m − k_log`) at/above which the
 /// outer(tile)-partitioned fold beats the i_inner-partitioned one. See
