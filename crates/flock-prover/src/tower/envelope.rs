@@ -320,10 +320,11 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
             (1008, 15000), // extension prefix w 8
             // Census only, like every count here (free counts never pad to
             // it). Square chains: family H's 16 Horner chains plus ĝ's
-            // forward chains, 170 rows per child region (340 live at the
-            // first-level node, 2026-11-05; 160 predated ĝ's chains).
-            // Horner: 256 steps per child region.
-            (KEY_SQUARE_CHAIN, 340),
+            // forward chains, which scale with the child's geometry: 410
+            // live at the production first-level node (2 × 992 signatures),
+            // 340 at the 4-signature test leaf's (2026-11-05; 160 predated
+            // ĝ's chains). Horner: 256 steps per child region.
+            (KEY_SQUARE_CHAIN, 410),
             (KEY_HORNER_STEP, 512),
             // The transpose dot: 128 rows per claim, two claims per child.
             (KEY_TRANSPOSE_DOT, 512),
@@ -339,9 +340,10 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
         // stays circuit structure (the parent hashes `num_lanes`-word
         // leaves), so it is pinned while everything count-shaped rides the
         // jagged claims. The largest member is the leanXMSS first-level
-        // node: 27.21 lanes of 2^17 words after family H by Horner, ĝ on
-        // forward chains and the sum-first transpose dot (30.96 before
-        // Horner, 28.44 after), so 28 covers every member; the outer asserts
+        // node: 27.25 lanes of 2^17 words after family H by Horner, ĝ on
+        // forward chains, the sum-first transpose dot (30.96 before Horner,
+        // 28.44 after, 27.21 after the dot) and the leaf PoW rows and
+        // nonzero-top checks, so 28 covers every member; the outer asserts
         // content ≤ pin. Lanes past the content are zero and the commit's
         // NTT skips them, but the Merkle leaves and the parent's opened rows
         // still carry them. 28 words are 448 B, exactly 7 BLAKE3 blocks

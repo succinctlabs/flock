@@ -287,7 +287,7 @@ The Ligerito step inside the open is a per-transcript grinding draw that moved b
 
 1. **Tree shape.** The driver is the chain tower's spine: a base over the last two first-level nodes, then each level prepends the next-earlier one. The statement is `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))` over fixed 992-signature batches, and the verifier rebuilds it from the batches (`xmss_statement`). A balanced tree would need a second internal shape.
 2. **Leaf batch size.** It is 992. One more signature tips the statement hash's compressions into a third slot, and the layout planner to ν = 14.
-3. **Margin.** The first-level node runs at 27.21 of 28 lanes, and its main MAC slot at 7,399 of 2^14 rows. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
+3. **Margin.** The first-level node runs at 27.25 of 28 lanes (27.21 before the leaf PoW rows and nonzero-top checks of 2026-11-05), and its main MAC slot at 7,403 of 2^14 rows. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
 4. **Node cost.** A node is 35–46% of a leaf's time for an eighth of its words (above). The candidates:
    - the ragged multipoint weight: aligned envelope columns, or a closed-form ragged weight;
    - the family tiles' bool-path witness;
