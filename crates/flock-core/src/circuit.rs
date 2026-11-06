@@ -972,6 +972,10 @@ pub enum WiringError {
     BusGkr(ProductGkrError),
     /// The gather values do not rebuild the bus products' leaf claims.
     BusRecombination,
+    /// A deferred verify ([`verify_wiring_deferred`]) of a circuit whose
+    /// public column reads a public word that is not fixed: the sigma
+    /// assertion's structure table holds fixed words only.
+    UnfixedPublicColumn,
 }
 
 /// Prove the circuit's wiring equalities against the committed witness.
@@ -1555,14 +1559,18 @@ fn verify_wiring_core<C: Challenger>(
         return Err(WiringError::MalformedProof);
     }
     // A deferred verify hands the public columns' values to the structure
-    // table, which knows only FIXED public words.
-    assert!(
-        !defer_sigma
-            || circuit.public_columns().all(|(_, words)| words
+    // table, which knows only FIXED public words. A circuit whose public
+    // column reads a free public word cannot be deferred: a rejection, not a
+    // panic, since a recursion layer takes the circuit from its key.
+    if defer_sigma
+        && !circuit.public_columns().all(|(_, words)| {
+            words
                 .iter()
-                .all(|&p| circuit.fixed_public(p as usize).is_some())),
-        "a deferred public column reads fixed public words"
-    );
+                .all(|&p| circuit.fixed_public(p as usize).is_some())
+        })
+    {
+        return Err(WiringError::UnfixedPublicColumn);
+    }
 
     let mask = circuit.live_mask();
     let claim = if defer_sigma {
@@ -2798,5 +2806,20 @@ mod tests {
         let mut bad = assertion.clone();
         bad.public_columns.as_mut().unwrap().values[0] += F128::ONE;
         assert!(!bad.check(&circuit), "a moved public-column value");
+
+        // The same column over a FREE public word cannot be deferred: the
+        // deferred verify rejects it (it used to panic), and the plain
+        // verify still takes it.
+        let free = plain.with_public_columns_opened().with_live_slots_packed();
+        assert!(free.public_columns().next().is_some());
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (proof, _) = prove_wiring(&free, &packed, &public, &mut ch);
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        assert_eq!(
+            verify_wiring_deferred(&free, &public, &proof, &mut ch).err(),
+            Some(WiringError::UnfixedPublicColumn)
+        );
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        verify_wiring(&free, &public, &proof, &mut ch).expect("the plain verify");
     }
 }
