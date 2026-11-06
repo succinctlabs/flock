@@ -541,14 +541,38 @@ over the whole cube, and the batching across claims survives because
 every claim contributes its own rank-one terms to one sumcheck.
 
 \paragraph{Predicate.} The rank-one split needs the column boundaries
-to respect the row cube: the transport below is used exactly when the
-committed stack is a \emph{full-height column prefix} --- columns
-$0..p{-}1$ of height $2^{n}$, every later column empty (in the code,
-\texttt{rectangular\_prefix\_columns}). This is the union at full
-utilization (identity compaction). Under partial utilization the
-jagged twist cuts rows and the materialized path stays; the predicate
-is public data, so prover, verifier and the recursive verifier agree on
+to respect the row cube: the transport below is used exactly when every
+\emph{used} column of the committed stack has height $2^{n}$, empty
+columns anywhere (in the code, \texttt{pcs::full\_height\_columns}).
+The stack holds the used columns back to back, so dense column $t$ is
+column $\mathrm{used}[t]$ and every row lines up with the row cube; the
+statistics, the packed-direct groups and the closed-form row weight
+index columns through $\mathrm{used}$. A full-height column
+\emph{prefix} (identity compaction, the union at full utilization) is
+the case $\mathrm{used} = 0..p{-}1$, on which the messages are the same
+field elements as before. Under partial utilization the jagged twist
+cuts rows and the materialized path stays, unless the union commits its
+used columns at full height (\texttt{UnionInstance::set\_full\_height\_commit},
+dummy rows committed as zeros), which leanXMSS does. The predicate is
+public data, so prover, verifier and the recursive verifier agree on
 which order was used.
+
+\emph{A transcript change for existing shapes.} The predicate first
+covered only a full-height prefix (\texttt{rectangular\_prefix\_columns}).
+Allowing gaps (commit \texttt{134a965}) moves every layout whose used
+columns are all full but not a prefix from the materialized path to
+block-first, and the merged sumcheck then binds the dense column
+coordinates first: a different transcript, so pinned verifiers and
+verifying keys for those layouts move. Examples are full-count mixed
+registries with a gap before the second table (BLAKE3 uses $92$ of its
+$128$ chunk-columns, SHA-256 $199$ of $256$): the fixtures \texttt{mix-merged-nu7-128-128}
+(\texttt{union\_element}) and \texttt{merged-nu10-1024-1024}
+(\texttt{union\_m6\_fixtures}) were re-pinned for it, and reverting the
+predicate alone restores the old pins. Layouts that are partial without
+the full-height commit, or already a prefix, keep their bytes; the
+tower's transcripts held byte-identical.
+The proof-bundle format version (\texttt{proof\_io::VERSION}) was not
+bumped for it.
 
 \paragraph{The split.} Write the dense index as
 $d = e\cdot 2^{n+1} + c_0\cdot 2^{n} + r$: a \emph{block} $e \in

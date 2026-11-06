@@ -21,6 +21,18 @@
 //!
 //! Per signer the statement is public: `P`, the root and the 32-byte message.
 //! The leaf index, randomizers, chain values and Merkle siblings are private.
+//!
+//! ## What a proof guarantees
+//!
+//! For each listed `(pk, msg)`, some valid signature exists at some epoch
+//! `< 2^32`. The epoch (the leaf index `idx`) is a private input, so the
+//! proof does not say which one, and two entries need not use different
+//! epochs. leanSig's `verify` takes the epoch as an argument; this circuit
+//! does not. A replayed old signature is therefore accepted unless `msg`
+//! itself encodes the epoch: an application that needs slot binding must put
+//! the slot in the message, or publish the epoch. Nor does the proof count
+//! distinct signers: nothing deduplicates the list, so one valid signature
+//! listed twice is two entries.
 
 use flock_core::{
     challenger::FsChallenger,
@@ -317,6 +329,10 @@ struct Constants {
     address: [Vec<Wire>; 2],
 }
 
+/// The low bit of an address word's chain step field (bits 61..62 of its
+/// low half: byte 7 is `tag + 32·step`).
+const STEP_FIELD: u32 = 61;
+
 /// Positions within [`layer_address_constants`].
 const MSG: usize = 0;
 const CHAIN: usize = 1;
@@ -467,7 +483,7 @@ fn declare_slots(
             vec![layer, m(3), BusTerm::word(NEXT), BusTerm::word(O0)],
         );
     }
-    let step3 = F128::new(3 << 61, 0);
+    let step3 = F128::new(3 << STEP_FIELD, 0);
     for (i, &id) in slots.chain.slots.iter().enumerate() {
         let (layer, chain) = (tag(i, V, 0), tag(i, 1, V));
         b.sb.bus_port(
@@ -565,6 +581,15 @@ fn hash_statement(b: &mut Builder, slots: &mut Slots, k: &Constants) {
 }
 
 fn declare_constants(b: &mut Builder) -> Constants {
+    // The bus's counting argument (`docs/tuple-bus-design.md` §2.3) needs
+    // A(0)'s step field to be zero: the chain row builds A(d_c) by XOR,
+    // while a step adds 1 mod 4. `a_chain` is this constant's address.
+    debug_assert!(
+        (0..2).all(|layer| {
+            word(&layer_address_constants(layer)[CHAIN]).lo >> STEP_FIELD & 3 == 0
+        }),
+        "A(0) has a nonzero step field"
+    );
     Constants {
         iv: iv_words().map(|w| b.constant(w)),
         zero: b.constant(F128::ZERO),
@@ -824,11 +849,18 @@ impl XmssCircuit {
         XmssProof { proof, commitment }
     }
 
+    /// Verify `proof` for `statements`, one per signature the circuit was
+    /// built for. A wrong count is a rejection
+    /// ([`FlockVerifyError::CircuitMismatch`]: the statement does not fit
+    /// the circuit), not a panic.
     pub fn verify(
         &self,
         statements: &[Statement],
         proof: &XmssProof,
     ) -> Result<(), FlockVerifyError> {
+        if statements.len() != self.n {
+            return Err(FlockVerifyError::CircuitMismatch);
+        }
         let union = self.union();
         let pcs = Self::pcs_params(&union);
         let mut challenger = self.challenger();

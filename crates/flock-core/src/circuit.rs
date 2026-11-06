@@ -66,7 +66,40 @@
 //! 3. verification uses the σ-AWARE verifier ([`product_gkr::
 //!    verify_batched_with_sigma`]), never the trusting variant;
 //! 4. the returned gather claims reach the PCS opening, which is what binds
-//!    them to the commitment (and observes their values before `γ`).
+//!    them to the commitment (and observes their values before `γ`);
+//! 5. **dead rows hold zero io words** in the committed witness: every row
+//!    `j ≥ count(ty)` of every gate slot the wiring or the bus gathers reads
+//!    `0` in each io word. A gather claim is the evaluation of the WHOLE
+//!    committed column, dead rows included, while the verifier rebuilds the
+//!    leaves as if those words were zero.
+//!    - *What rests on it.* The bus's grinding: a dead row with words `w_k`
+//!      is a β-free leaf `1 + Σ_k γ_k·w_k` that cannot pair with a live one,
+//!      but it adds a factor to the products, so the Schwartz–Zippel degree
+//!      becomes the covered rows (up to ports × `2^ν`) instead of the live
+//!      entries the fingerprint grind is sized to
+//!      ([`product_gkr::BatchedGrinding::fingerprint_target_for`]). The
+//!      wiring's grand product: a dead leaf is `w + 1`, so a dead word of `1`
+//!      would zero both products. The product verifier rejects a zero
+//!      product ([`product_gkr::ProductGkrError::ZeroProduct`]), which takes
+//!      the grand products (wiring and bus) off the invariant; any other dead
+//!      word scales both wiring products alike. The bus's degree bound still
+//!      needs it.
+//!    - *Where it is enforced.* Under the default height-`n_t` stacking the
+//!      dead rows are not committed: the opening reads them as zeros. Under
+//!      [`crate::union::UnionInstance::set_full_height_commit`] (boolean
+//!      slots only) they are committed and constrained by the relation
+//!      alone: the lincheck's const-pin count claim holds the pin at `0`
+//!      there, and every io word's rows read `(A z)·pin = x` (an input's
+//!      `x·pin = x`), which forces `x = 0`. A slot that commits dummy rows
+//!      therefore keeps those rows in the zerocheck
+//!      ([`crate::union::UnionInstance::zeroed_word_cols`] returns nothing
+//!      for it); `full_height_dummy_row_input_word_is_rejected`
+//!      (`tests/union_lincheck.rs`) commits one. The honest prover commits
+//!      dummy rows as zeros whatever its buffers hold
+//!      ([`crate::union::UnionInstance::compact_witness`]). A public
+//!      column's claim ([`Circuit::with_public_columns_opened`]) sums its
+//!      live rows only, so its opening forces zero on its dead rows by
+//!      itself.
 
 use std::{env::var, sync::OnceLock, time::Instant};
 
@@ -939,6 +972,10 @@ pub enum WiringError {
     BusGkr(ProductGkrError),
     /// The gather values do not rebuild the bus products' leaf claims.
     BusRecombination,
+    /// A deferred verify ([`verify_wiring_deferred`]) of a circuit whose
+    /// public column reads a public word that is not fixed: the sigma
+    /// assertion's structure table holds fixed words only.
+    UnfixedPublicColumn,
 }
 
 /// Prove the circuit's wiring equalities against the committed witness.
@@ -1522,14 +1559,18 @@ fn verify_wiring_core<C: Challenger>(
         return Err(WiringError::MalformedProof);
     }
     // A deferred verify hands the public columns' values to the structure
-    // table, which knows only FIXED public words.
-    assert!(
-        !defer_sigma
-            || circuit.public_columns().all(|(_, words)| words
+    // table, which knows only FIXED public words. A circuit whose public
+    // column reads a free public word cannot be deferred: a rejection, not a
+    // panic, since a recursion layer takes the circuit from its key.
+    if defer_sigma
+        && !circuit.public_columns().all(|(_, words)| {
+            words
                 .iter()
-                .all(|&p| circuit.fixed_public(p as usize).is_some())),
-        "a deferred public column reads fixed public words"
-    );
+                .all(|&p| circuit.fixed_public(p as usize).is_some())
+        })
+    {
+        return Err(WiringError::UnfixedPublicColumn);
+    }
 
     let mask = circuit.live_mask();
     let claim = if defer_sigma {
@@ -2084,6 +2125,97 @@ mod tests {
         assert_eq!(
             roundtrip(&circuit, &packed, &bad_public),
             Err(WiringError::Gkr(ProductGkrError::ProductMismatch))
+        );
+    }
+
+    /// "What the caller owes", item 5: a committed dead io word of `1`
+    /// makes its masked leaf `w + 1 = 0` on both sides. A forger who runs
+    /// the GKR over the leaves the verifier reconstructs and sends the
+    /// gather values the opening checks (whole committed columns, dead rows
+    /// included) passes every check but the products' — here with a copy
+    /// constraint broken. The verifier rejects the zero product. The same
+    /// forger with a dead word other than `1` and the wiring intact
+    /// verifies: such a word scales both products alike.
+    #[test]
+    fn a_dead_io_word_of_one_is_rejected() {
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let circuit = Circuit::new(
+            &reg,
+            vec![5usize, 4, 6],
+            9,
+            vec![
+                vec![Cell::new(2, 0), Cell::new(0, 1), Cell::new(3, 2)],
+                vec![
+                    Cell::new(2, 1),
+                    Cell::new(4, 3),
+                    Cell::new(6, 0),
+                    Cell::new(8, 4),
+                ],
+                vec![Cell::new(5, 1), Cell::new(1, 2)],
+            ],
+        )
+        .expect("valid circuit");
+        let mut rng = Rng::new(0xC1C0_0DEA);
+        let (packed, public) = buffer_for(&reg, &circuit, &mut rng);
+        roundtrip(&circuit, &packed, &public).expect("honest wiring verifies");
+        let cells = circuit.cells();
+        let (mu, rows) = (cells.mu(), 1usize << nu);
+        let forge = |packed: &[F128]| {
+            let mut w = vec![F128::ZERO; 1 << mu];
+            for (iota, slot) in cells.slots().iter().enumerate() {
+                for row in 0..rows {
+                    w[(iota << nu) + row] = match *slot {
+                        CellSlot::Gate { .. } => packed[cells.gate_word_addr(iota, row)],
+                        CellSlot::Public { s } => {
+                            public.get((s << nu) + row).copied().unwrap_or(F128::ZERO)
+                        }
+                        CellSlot::Pad => F128::ZERO,
+                    };
+                }
+            }
+            let mut ch = FsChallenger::new(b"circuit-unit");
+            let (gkr, rho) = crate::product_gkr::forge_masked_batched_for_tests(
+                &w,
+                circuit.sigma(),
+                &circuit.live_mask(),
+                &mut ch,
+            );
+            let eq_row = build_eq(&rho[..nu]);
+            let gather = circuit
+                .gathered_slots()
+                .into_iter()
+                .map(|iota| {
+                    (0..rows).fold(F128::ZERO, |acc, row| {
+                        acc + eq_row[row] * packed[cells.gate_word_addr(iota, row)]
+                    })
+                })
+                .collect();
+            let proof = super::WiringProof {
+                gkr,
+                gather,
+                bus: None,
+            };
+            let mut ch = FsChallenger::new(b"circuit-unit");
+            verify_wiring(&circuit, &public, &proof, &mut ch).map(|_| ())
+        };
+        // Cell-slot 0 is a wired boolean input word with 5 live rows of 8.
+        let dead = cells.gate_word_addr(0, 6);
+        let mut junk = packed.clone();
+        junk[dead] = F128::new(5, 0);
+        forge(&junk).expect("a dead word other than 1 verifies");
+
+        let mut bad = packed.clone();
+        bad[cells.gate_word_addr(0, 1)] += F128::ONE;
+        assert_eq!(
+            forge(&bad),
+            Err(WiringError::Gkr(ProductGkrError::ProductMismatch))
+        );
+        bad[dead] = F128::ONE;
+        assert_eq!(
+            forge(&bad),
+            Err(WiringError::Gkr(ProductGkrError::ZeroProduct)),
+            "a dead word of 1 zeroes both products"
         );
     }
 
@@ -2674,5 +2806,20 @@ mod tests {
         let mut bad = assertion.clone();
         bad.public_columns.as_mut().unwrap().values[0] += F128::ONE;
         assert!(!bad.check(&circuit), "a moved public-column value");
+
+        // The same column over a FREE public word cannot be deferred: the
+        // deferred verify rejects it (it used to panic), and the plain
+        // verify still takes it.
+        let free = plain.with_public_columns_opened().with_live_slots_packed();
+        assert!(free.public_columns().next().is_some());
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (proof, _) = prove_wiring(&free, &packed, &public, &mut ch);
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        assert_eq!(
+            verify_wiring_deferred(&free, &public, &proof, &mut ch).err(),
+            Some(WiringError::UnfixedPublicColumn)
+        );
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        verify_wiring(&free, &public, &proof, &mut ch).expect("the plain verify");
     }
 }

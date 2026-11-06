@@ -109,7 +109,13 @@ GKR transcript, the gather values and at most one PoW nonce. A proof whose
   coordinates, which the merged opening checks. This is the same contract as
   the wiring's `f`-side gather (`circuit.rs`, "What the caller owes", item 4).
   The prover's fold reads only the live prefix, so it relies on dead rows being
-  zero in the committed buffer, exactly as the wiring does.
+  zero in the committed buffer, exactly as the wiring does. That is item 5 of
+  the same list, the **dead-row invariant**, with where it is enforced (§4).
+- **A zero product is rejected.** `verify_reduction` refuses `∏ L = ∏ R = 0`
+  (`ProductGkrError::ZeroProduct`), for the bus and the wiring alike. One zero
+  leaf zeroes its side whatever the others hold, so `0 = 0` proves nothing.
+  An honest product is zero only if a fingerprint vanishes at `(β, γ)`, which
+  the Schwartz–Zippel bound above already counts.
 - **Both sides bound.** Each side's claim is checked against its own
   reconstruction, so neither product's leaves are prover-chosen. Compare the
   wiring's `f_eval == g_eval` requirement.
@@ -238,6 +244,16 @@ the recursion replays in-circuit with leading-zero rows, falls back to the
 fewest bits that cover the target. That is exactly the old bit count, so
 recursion transcripts do not change.
 
+**This is not opt-in.** `fingerprint_target_for` applies whenever the
+policy grinds the fingerprint (`fingerprint_bits != 0`), so every wiring
+and bus proof on a transcript that implements targets (the plain
+`FsChallenger`, BLAKE3 or SHA-256) changes bytes, whatever the circuit:
+the nonce passes a target rather than a bit count, and the fingerprint
+challenge follows it. A verifier from before this change can reject the
+new proofs. Only the chained transcript keeps its bytes. It is a protocol
+change for those proofs, like the block-first predicate's
+(`docs/capacity-free-ring-switching.tex`, §blockfirst, "Predicate").
+
 Over 40 transcripts on one thread, at `L − 1 = 1,226,045`: 21 bits averaged
 60 ms (2.50M hashes), the target 28 ms (1.19M hashes). The bus's 504k live
 leaves sit just under `2^19`, so its grind barely changes.
@@ -307,6 +323,20 @@ received tuples exists. Follow it from chain `c`'s start `(S, c, A(d_c), x_c)`:
 - **Path lengths.** Each step advances the step field by one, mod 4. A path
   from `d_c` to 3 therefore takes `3 − d_c + 4k_c` steps, and a cycle takes a
   positive multiple of 4.
+  - This needs `A(0)`'s step field to be **zero**. The chain row builds its
+    start `A(d_c)` by XOR-ing the digit into the step field of `A(0)`, and
+    its end `A(3)` by XOR-ing 3, while a step adds 1 mod 4. With a nonzero
+    field `f` the start and end would sit at `f ⊕ d_c` and `f ⊕ 3`, whose
+    distance mod 4 is not `3 − d_c` in general, and the count below would
+    not balance. It is zero: `A(0)` is the address gadget's output for the
+    layer's chain constant (`layer_address_constants(·)[CHAIN]`, step 0), and
+    that gadget passes bits 32..127 of the constant through.
+  - `steps_balance_the_codeword_sum` (`leanxmss/circuit/tests.rs`) pins
+    both sides of the count: the codeword gadget accepts exactly the digit
+    sum `3·58 − STEPS` (and not one more or less), each layer has `STEPS`
+    step rows, and `A(0)`'s step field is zero with `A(0) ⊕ d·2^61` the
+    reference chain address at position `d`. `declare_constants` also
+    debug-asserts the zero step field.
 - **Counting forces the honest walk.** The paths and cycles use exactly the
   68 rows, and `Σ_c (3 − d_c) = 3·58 − 106 = 68`. So every `k_c = 0` and
   there are no cycles. Chain `c` is walked exactly from `d_c` to 3.
@@ -338,6 +368,23 @@ Two points the static `S` handles:
   rows cost 6 words each, 116 per signature.
 - The circuit's statement is unchanged: per signer `P`, root and message
   public, everything else private.
+
+### 2.5 What the statement guarantees
+
+For each listed `(pk, msg)`, some valid signature exists at some epoch
+`< 2^32`. The epoch, the leaf index `idx`, is a private input (a decision
+taken in review: it stays private). So:
+- the proof does not say which epoch signed, and two entries need not use
+  different epochs;
+- a replayed old signature is accepted unless `msg` encodes the epoch.
+  leanSig's `verify` takes the epoch as an argument; an application that
+  needs slot binding must put the slot in the message, or publish the
+  epoch;
+- nothing deduplicates the list, so the count of entries is not a count of
+  distinct signers.
+
+The circuit module's docs (`leanxmss/circuit.rs`, "What a proof
+guarantees") say the same.
 
 ## 3. Results
 
@@ -466,7 +513,31 @@ signatures) brings it to 2^-128. Two independent points give
    (simpler degree bound, `w` extra samples).
 3. Grinding: `β` is ground like the wiring's `α` (sized to the live entry
    count); the layer challenges reuse the wiring's per-layer policy.
+   - *Answer (review of 10-29 and 11-03):* sizing to the live count is right
+     only because committed dead rows hold zero io words. A dead row with
+     words `w_k` would be a β-free leaf `1 + Σ_k γ_k·w_k`. It cannot pair
+     with a live leaf, so multiset equality survives, but it raises the
+     Schwartz–Zippel degree from the live entries to the covered rows (up to
+     ports × `2^ν`), up to about one bit more than the grind covers.
+   - The invariant is now written down as item 5 of the wiring's "What the
+     caller owes" (`flock-core/src/circuit.rs`), with where it holds:
+     height-`n_t` stacking commits no dead row; the full-height commit
+     (`UnionInstance::set_full_height_commit`, which leanXMSS uses) commits
+     them, holds the pin at `0` there through the lincheck's count claim,
+     and keeps every `(A z)·pin = x` row of a slot that commits dummy rows
+     (`UnionInstance::zeroed_word_cols` drops nothing there).
+   - The same invariant used to carry the wiring's grand product: a dead
+     leaf is `w + 1`, so a dead word of `1` zeroed both products. The
+     product verifier now rejects a zero product (§1.3), so that no longer
+     depends on it. `a_dead_io_word_of_one_is_rejected` (`circuit.rs`)
+     forges that proof, and `full_height_dummy_row_input_word_is_rejected`
+     (`flock-core/tests/union_lincheck.rs`) shows the kept `x·pin = x` row
+     rejecting a committed dummy input word of `1`.
 4. The counting argument in §2.3 is what replaces a range check on the step
    field. It needs the codeword gadget's digit-sum check and the exact row
    count per layer. Both are fixed by the circuit, but they are now
    load-bearing for the bus.
+   - *Answer (review of 10-29):* correct, with one unstated assumption, now
+     stated in §2.3: `A(0)`'s step field is zero. A test ties the step count
+     to the gadget's enforced sum and checks the field
+     (`steps_balance_the_codeword_sum`).
