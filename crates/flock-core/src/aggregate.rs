@@ -218,6 +218,11 @@ pub enum AggregateError {
     Fold(FoldError),
     /// The accumulated claims did not hold against the real matrices.
     Discharge,
+    /// An assertion drops words (a non-empty [`MatrixAssertion::zeroed`] or
+    /// a reported linear value) but the aggregation is not shared. Only
+    /// shared binding folds the linear-identity claims; without it the
+    /// reported `v_L` would be checked against nothing.
+    DroppedWordsUnshared,
 }
 
 /// Claims to fold for one group, in a fixed order: the prior accumulators'
@@ -398,6 +403,45 @@ impl SharedTables {
     pub fn linear_refs(&self) -> Vec<&SparseBinaryMatrix> {
         self.linear.iter().collect()
     }
+}
+
+/// The per-assertion surface checks that depend on the binding mode.
+///
+/// - Per-claim binding (`shared == None`) folds no linear-identity group, so
+///   an assertion that drops words would have its `α·η·v_L` term accepted by
+///   [`MatrixAssertion::check_reported`] and then never discharged: a prover
+///   could report the full-matrix values and solve for `v_L`. Reject any
+///   dropped word or linear value outright.
+/// - Shared binding folds by `shared`'s dropped words, so the assertion's
+///   must be those, with a linear value exactly where `shared.checked` makes
+///   [`linear_groups`] gather one.
+fn check_binding_surface(
+    assertions: &[MatrixAssertion],
+    shared: Option<&Dropped>,
+) -> Result<(), AggregateError> {
+    for a in assertions {
+        match shared {
+            None => {
+                if a.zeroed.iter().any(|z| !z.is_empty())
+                    || a.linear_evals.iter().any(Option::is_some)
+                {
+                    return Err(AggregateError::DroppedWordsUnshared);
+                }
+            }
+            Some(d) => {
+                if a.zeroed != d.zeroed
+                    || a.linear_evals.len() != d.zeroed.len()
+                    || a.linear_evals
+                        .iter()
+                        .zip(&d.zeroed)
+                        .any(|(v, z)| v.is_some() != (d.checked && !z.is_empty()))
+                {
+                    return Err(AggregateError::Malformed);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The prior COUNT is one transcript byte — `0`/`1` coincide with the old
@@ -617,6 +661,7 @@ fn prove_aggregate_impl<Ch: Challenger>(
     if mats.len() != registry.num_boolean() {
         return Err(AggregateError::Malformed);
     }
+    check_binding_surface(assertions, shared)?;
     let groups = groups(registry, shared);
     let linear = linear_groups(&groups, shared);
     check_priors(registry, priors, groups.len(), linear.len(), el_mats.len())?;
@@ -1169,13 +1214,10 @@ fn verify_aggregate_impl<Ch: Challenger>(
         assertion
             .check_reported(registry)
             .map_err(AggregateError::Reported)?;
-        // The assertion's dropped words are the circuit's.
-        if let Some(d) = shared
-            && assertion.zeroed != d.zeroed
-        {
-            return Err(AggregateError::Malformed);
-        }
     }
+    // Shared: the assertion's dropped words are the circuit's. Per-claim:
+    // it drops none, since nothing here would check its linear value.
+    check_binding_surface(assertions, shared)?;
 
     bind(registry, priors, ch);
     if shared.is_some() {
