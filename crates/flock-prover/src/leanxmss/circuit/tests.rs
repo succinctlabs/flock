@@ -44,7 +44,9 @@ fn layout_plan_for_1000_signatures() {
 }
 
 /// Every slot of a two-signature witness packs the same, batched or not:
-/// the batched packer keeps the walk's bits on every gadget kind.
+/// the batched packer keeps the walk's bits on every gadget kind. With
+/// padding writes elided, both write the same slot into zeroed buffers and
+/// the same stripe on its live batches.
 #[test]
 fn every_slot_packs_as_the_walk() {
     use flock_core::union::SlotWitnessDest;
@@ -54,14 +56,18 @@ fn every_slot_packs_as_the_walk() {
     for (id, gate) in &circuit.gadgets {
         let rows = witness.rows::<BooleanGate>(*id);
         let len = 1usize << (circuit.nu() + gate.k_log() - 7);
-        let pack = |batched: bool| {
-            let poison = F128::new(0xDEAD, 0xBEEF);
-            let (mut z, mut a, mut b) = (vec![poison; len], vec![poison; len], vec![poison; len]);
+        let pack = |batched: bool, elide: bool| {
+            let fill = if elide {
+                F128::ZERO
+            } else {
+                F128::new(0xDEAD, 0xBEEF)
+            };
+            let (mut z, mut a, mut b) = (vec![fill; len], vec![fill; len], vec![fill; len]);
             let dst = SlotWitnessDest {
                 z: &mut z,
                 a: &mut a,
                 b: &mut b,
-                elide_padding_writes: false,
+                elide_padding_writes: elide,
                 dead_padding_unread: false,
             };
             let stripe = if batched {
@@ -71,12 +77,18 @@ fn every_slot_packs_as_the_walk() {
             };
             (z, a, b, stripe)
         };
-        assert!(
-            pack(true) == pack(false),
-            "{}: {} rows",
-            gate.name(),
-            rows.len()
-        );
+        let want = pack(false, false);
+        let what = format!("{}: {} rows", gate.name(), rows.len());
+        assert!(pack(true, false) == want, "{what}");
+        let live = rows.len().div_ceil(8) << gate.k_log();
+        for batched in [false, true] {
+            let got = pack(batched, true);
+            assert!(
+                (&got.0, &got.1, &got.2) == (&want.0, &want.1, &want.2)
+                    && got.3[..live] == want.3[..live],
+                "{what}, batched {batched}, padding writes elided"
+            );
+        }
     }
 }
 
