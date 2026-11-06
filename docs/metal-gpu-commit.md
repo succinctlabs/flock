@@ -44,6 +44,54 @@ lanes, and its codeword is at least 2^20 words. The GPU's buffers must also
 be free: an earlier GPU commit's `ProverData` still holds them until it
 drops, and a commit that arrives meanwhile runs on the CPU.
 
+## The first commit, and warming up
+
+The first GPU commit in a process pays three one-time costs:
+1. **Compiling the kernels.** Metal compiles the MSL source at runtime
+   (`newLibraryWithSource:`), once per process.
+2. **The shape's buffers.** Allocating the message, codeword and tree
+   buffers, and the first touch of their pages (about 1.2 GB at BLAKE3
+   2^18).
+3. **The check commit.** The first commit of each shape also runs the CPU
+   commit and compares the two byte for byte (see *Correctness*).
+
+On an M4 Max, the first BLAKE3 2^18 commit took ~265 ms, against ~46 ms
+warm and ~64 ms for the CPU commit. The results in this document are warm
+medians, so **a process that makes one proof is slower with Metal on.**
+
+**`gpu_commit::warm_up(&[params])`** pays all three ahead of time. A
+long-lived prover calls it at startup with the `PcsParams` it will commit
+under:
+- it loads Metal and compiles the kernels;
+- for each shape the GPU takes, it allocates the buffers and runs the
+  checked first commit on a synthetic (pseudo-random) message.
+
+After it, commits of those shapes run warm. `warm_up(&[])` only compiles. It
+returns `false` when Metal is off or unavailable, when the GPU disagreed
+with the CPU (Metal is then off for the process), or when live prover data
+holds the buffers. Commits stay correct in each case, on the CPU. The check
+on a synthetic message is as strong as one on the witness: the dispatches,
+the split and the kernels' control flow depend only on the shape, and a
+pseudo-random message reaches every lane and every table entry.
+
+**A precompiled metallib** is the other option for cost 1: compile the MSL
+at build time (`xcrun metal`, `xcrun metallib`, which need the Metal
+toolchain on the build machine), embed the library, and load it with
+`newLibraryWithData:`. It is not built. `warm_up` covers a long-lived
+prover, and a one-proof process would still pay costs 2 and 3.
+
+## Buffers between commits
+
+The buffers of the two most recently used shapes (`CACHED_SHAPES`) stay
+allocated between commits; a third shape evicts the older one. A workload
+that alternates two shapes, such as tower leaf and node commits, therefore
+allocates each shape once instead of on every switch. (With one cached
+shape it reallocated on every switch; that cost was not measured.) The
+price is memory: up to two shapes' buffers stay resident, about 1.2 GB per
+shape at BLAKE3 2^18. **`gpu_commit::release()`** frees every cached buffer
+that no prover data holds. The next commit of a freed shape allocates again;
+the compiled kernels, the shape checks and the tuned splits are kept.
+
 ## Design
 
 **The graph.** For `log_d` = log2 positions:
@@ -131,6 +179,13 @@ write is a whole 256-byte span:
   is used.
 - **Fallback:** a GPU error falls back to the CPU from the message buffer,
   which the GPU never writes.
+- **CI:** the Metal code compiles only on macOS/aarch64 with the feature, so
+  the Linux lint and test jobs never build it. `.github/workflows/metal.yml`
+  runs clippy (`--features flock-prover/metal`, all targets, `-D warnings`)
+  and the Metal unit tests on a GitHub-hosted Apple Silicon runner. Those
+  runners are virtual machines; on one without a Metal device the GPU tests
+  print `no Metal device; skipping` and pass, and any other Metal init error
+  fails them.
 
 ## Measurements
 
@@ -295,6 +350,17 @@ same multiplications.
 - **`sub_block_transforms_match_the_full_transform`:** the tile-split first
   pass plus `sub_block` transforms through the tuned NTT path equal the full
   transform.
+- **`production_shape_matches_cpu`** (ignored, ~2.2 GB peak; run it alone
+  with `cargo test --release -p flock-core --features metal --lib
+  production_shape -- --ignored`): the production shape, 2^20 positions ×
+  46 lanes (BLAKE3 2^18), against the CPU commit byte for byte:
+  - the whole graph, with the mixed and the half-footprint final pass;
+  - the hybrid at the initial split (6/16, 7), the split an M4 Max tuned to
+    (5/16, 10), and the extremes 0/16, 1 and 16/16, 15;
+  - `warm_up`'s checked first commit through `try_commit`, which must take
+    the GPU.
+- **`buffer_cache_keeps_two_shapes`:** the cache's order, reuse, eviction
+  and `release` (which keeps the leased buffers), on a local cache.
 - **`gpu_graph_timing`** (ignored): per-stage GPU timestamps at production
   size.
 - **Without the feature:** the workspace tests, clippy and fmt pass
