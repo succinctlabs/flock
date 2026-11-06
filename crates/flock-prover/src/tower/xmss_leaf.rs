@@ -13,7 +13,7 @@ use {
         },
         tower::{
             ChildSlots, ChildTape, SLOT_WORDS, ShapeBuilder, Wire, check_child_region,
-            emit_child_region, expected_child_tail_schedule,
+            child_walker::child_pow_rows_hold, emit_child_region, expected_child_tail_schedule,
         },
     },
     std::{any::Any, time::Instant},
@@ -247,6 +247,15 @@ fn xmss_child_region_emits_alone() {
     let consumed = check_child_region(&built2.public, &ct, &region);
     assert_eq!(region.pub_base + consumed, built2.public.len());
     assert_eq!(region.tail_schedule, expected_child_tail_schedule(&ct));
+    // One PowMask row per grind the leaf's verifier checks (fingerprint,
+    // GKR, lincheck, zerocheck, Ligerito), each satisfied by the honest
+    // nonces.
+    let rows = child_pow_rows_hold(&ct, &built2, cs.q.pow);
+    eprintln!("leaf PoW rows: {}", rows.len());
+    assert!(
+        rows.into_iter().all(|ok| ok),
+        "the honest leaf's nonces satisfy every PoW row"
+    );
 }
 
 /// Emit `ct`'s child region alone at `nu2` rows a slot and report what it

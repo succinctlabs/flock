@@ -26,10 +26,11 @@ use flock_transcript::transcript_record::{
 use {
     crate::tower::{
         AssistLayerGate, BitSpreadGate, BitSpreadTable, Blake3Gate, FamilyTransposeTileGate,
-        MacGate256, MergedRoundGate, PowMaskGate, SpineGate, SpineGate256, SwapGate, ZcRoundGate,
-        digest_words, gates_blake3::Rng, gates_blake3::Tree, gates_blake3::leaf_word,
-        hash_to_digest, query::emit_opening,
+        MacGate256, MergedRoundGate, PowMaskGate, PowMaskTable, SpineGate, SpineGate256, SwapGate,
+        ZcRoundGate, digest_words, gates_blake3::Rng, gates_blake3::Tree, gates_blake3::leaf_word,
+        hash_to_digest, query::emit_opening, query::pow_leading_zero_mask,
     },
+    flock_core::circuit::builder::CircuitWitness,
     std::any::Any,
 };
 
@@ -44,8 +45,8 @@ use crate::{
         circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
         emit_boolean_reported_check, emit_bus, emit_element_reported_check, emit_fiat_shamir_chain,
         emit_gkr_layers, emit_publics_hash, emit_query_phase, emit_recombination,
-        emit_residual_region, flatten_ops, level_geometry, level_sources, observed_f256, pack8,
-        parse_open_levels, payload_words, pin_bus_sides, pin_recombination,
+        emit_recorded_pow_checks, emit_residual_region, flatten_ops, level_geometry, level_sources,
+        observed_f256, pack8, parse_open_levels, payload_words, pin_bus_sides, pin_recombination,
         query_phase_blake3_rows, recombination_positions, replay_ligerito_spine256,
         squeeze_word_wire, strat_scheds, walker_common,
         walker_common::{
@@ -74,6 +75,10 @@ pub(super) struct ChildTape<'p> {
     pub(super) trace: FsChainTrace,
     pub(super) stream: Stream,
     pub(super) bytes: Vec<u8>,
+    /// The recorded op schedule, flattened. [`emit_child_region`] reads its
+    /// `Pow` markers: the fused chain rows only bind each nonce, and the
+    /// predicate (leading zeros, 64-bit nonce) is a separate check.
+    pub(super) ops: Vec<Op>,
     /// The fork's four cross-link wires ([`MergedChain::cross`]).
     pub(super) cross: Vec<Option<(usize, usize)>>,
     pub(super) b3_rows: usize,
@@ -1046,6 +1051,7 @@ impl<'p> ChildTape<'p> {
             trace,
             stream,
             bytes,
+            ops,
             cross,
             b3_rows,
             spread_w,
@@ -2154,6 +2160,13 @@ pub(super) fn emit_child_region(
         consts,
         &ct.pub_payloads,
         &ct.cross,
+    );
+    // The chain's fused rows bind every PoW nonce and derive the protected
+    // challenge from it; the predicate the native verifier checks (leading
+    // zeros, nonce < 2^64) is its own relation. Without it the leaf's grinds
+    // go unchecked here, where `emit_real_child_region` checks a node child's.
+    emit_recorded_pow_checks(
+        sb, b3_slot, cs.q.pow, iv2, &ct.ops, trace, stream, &outs, &ww, vals, consts,
     );
     let (pub_w, pub_digest_w) =
         emit_h_publics_region(sb, child_q, iv2, ct, stream, &ww, vals, consts);
@@ -3301,4 +3314,48 @@ pub(super) fn partial_block_leaves_hash_correctly() {
             "width {words}: the opening folds to the tree root"
         );
     }
+}
+
+/// The PowMask rows of a LONE child region ([`emit_child_region`] alone in
+/// its builder, so the slot holds only the child's rows): asserts one row
+/// per recorded child `Pow`, in tape order, and returns per row whether its
+/// relation holds — the [`PowMaskTable`] R1CS on the row, and the mask word
+/// equal to the site's statement constant (the all-ones low half at a
+/// zero-bit site, whose row reads the nonce twice).
+#[cfg(test)]
+pub(super) fn child_pow_rows_hold(
+    ct: &ChildTape<'_>,
+    built: &CircuitWitness,
+    pow: SlotId,
+) -> Vec<bool> {
+    let bits: Vec<u32> = ct
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Pow { bits } => Some(*bits),
+            _ => None,
+        })
+        .collect();
+    assert!(!bits.is_empty(), "the leaf grinds");
+    let rows = built.rows::<PowMaskGate>(pow);
+    assert_eq!(
+        rows.len(),
+        bits.len(),
+        "one PowMask row per recorded child PoW"
+    );
+    let ty = PowMaskTable;
+    let r1cs = ty.build_block_r1cs(0);
+    rows.iter()
+        .zip(&bits)
+        .map(|(row, &b)| {
+            let want = if b == 0 {
+                u128::from(u64::MAX)
+            } else {
+                let m = pow_leading_zero_mask(b);
+                u128::from(m.lo) | (u128::from(m.hi) << 64)
+            };
+            let [z, _, _] = ty.build_witness(*row);
+            r1cs.satisfies(&z) && row.mask == want
+        })
+        .collect()
 }
