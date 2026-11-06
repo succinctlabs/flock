@@ -1539,6 +1539,24 @@ fn dropped_words_report_static_claims() {
     let mut ch_v = FsChallenger::new(DOMAIN);
     let zc = verify_zerocheck(m, &zc_proof, &mut ch_v).expect("zerocheck accepts");
     let circuits: [&dyn LincheckCircuit; 1] = [&circuit];
+    // The extra pair's second slot is padding: a nonzero one is refused
+    // rather than accepted as an unbound, malleable word.
+    {
+        let mut padded = lc_proof.clone();
+        padded.matrix_evals[1].1 = F128::ONE;
+        let mut ch_v = ch_v.clone();
+        assert!(
+            matches!(
+                verify_union_deferred(
+                    &union, &circuits, &x_ab, zc.a_eval, zc.b_eval, &padded, &mut ch_v,
+                ),
+                Err(LincheckError::ConsistencyFailed {
+                    which: "linear-evals padding"
+                })
+            ),
+            "a nonzero padding word in the extra pair"
+        );
+    }
     let (_, assertion) = verify_union_deferred(
         &union, &circuits, &x_ab, zc.a_eval, zc.b_eval, &lc_proof, &mut ch_v,
     )
