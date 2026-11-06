@@ -347,6 +347,47 @@ impl XmssTowerVk {
     }
 }
 
+/// The leanXMSS VK's IDENTITY, small enough to publish (the
+/// [`super::TowerVkFingerprint`] of this tower): the config, the leaf
+/// size, and the digests of every circuit and registry the verifier checks
+/// against. The leaf circuit's digest binds the leaf's whole shape (the
+/// signature count, `ν`, the [`crate::leanxmss::circuit::XmssOptions`]
+/// posture, the dropped words, the bus). Shapes are statement-independent,
+/// so two honestly generated VKs at the same `(cfg, circuit)` agree: a
+/// consumer regenerates the key locally and compares this, instead of
+/// trusting a shipped key or proving six batches it cannot check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XmssTowerVkFingerprint {
+    pub config: TowerConfig,
+    pub signatures_per_leaf: usize,
+    pub leaf_circuit: [u8; 32],
+    pub fl_circuit: [u8; 32],
+    pub base_circuit: [u8; 32],
+    pub steady_circuit: [u8; 32],
+    pub leaf_registry: [u8; 32],
+    pub outer_registry: [u8; 32],
+    pub publics_len: usize,
+}
+
+impl XmssTowerVk {
+    pub fn fingerprint(&self) -> XmssTowerVkFingerprint {
+        let t = &self.tower;
+        let base_lo = &t.base.as_ref().expect("the VK tower keeps its base").lo;
+        let leaf = &t.leaf.inner.built.shape;
+        XmssTowerVkFingerprint {
+            config: t.cfg,
+            signatures_per_leaf: t.per_leaf,
+            leaf_circuit: leaf.circuit.digest(),
+            fl_circuit: t.fl.lo.shape.circuit.digest(),
+            base_circuit: base_lo.shape.circuit.digest(),
+            steady_circuit: t.root.lo.shape.circuit.digest(),
+            leaf_registry: leaf.registry.digest(),
+            outer_registry: t.root.lo.shape.registry.digest(),
+            publics_len: t.root.lo.public.len(),
+        }
+    }
+}
+
 /// **VERIFY A leanXMSS TOWER ROOT, STANDALONE**: the VK, the claimed
 /// statement (recomputed by the consumer with [`xmss_statement`] from the
 /// batches it holds), and the root bundle. The root proof verifies against
@@ -481,6 +522,60 @@ fn xmss_tower_e2e() {
     let st = xmss_statement(&circuit, &statements);
     assert_eq!(&st, tower.statement());
     verify_xmss_root(&vk, &st, &tower.root_bundle()).expect("the root verifies standalone");
+    // The other two root depths. k = 2: the base, over the last two
+    // first-level nodes (batches 4..8), is its own root. k = 3: the VK's
+    // reference tower roots at its first spine node, over six batches.
+    let base = tower.base.as_ref().expect("an 8-leaf tower keeps its base");
+    let base_bundle = RootBundle {
+        public: &base.lo.public,
+        proof: &base.lo.proof,
+        commitment: &base.lo.commitment,
+    };
+    let st2 = xmss_statement(&circuit, &statements[4..]);
+    assert_eq!(st2.n_signatures, 4 * n);
+    verify_xmss_root(&vk, &st2, &base_bundle).expect("the k = 2 root (the base) verifies");
+    let vk_statements: Vec<Vec<Statement>> = vk_batches.iter().map(|b| b.0.clone()).collect();
+    let st3 = xmss_statement(&circuit, &vk_statements);
+    verify_xmss_root(&vk, &st3, &vk.tower.root_bundle()).expect("the k = 3 root verifies");
+    assert!(
+        matches!(
+            verify_xmss_root(&vk, &st, &base_bundle),
+            Err(TowerVerifyError::Proof(_))
+        ),
+        "the base's proof claimed as an eight-batch root"
+    );
+    assert!(
+        matches!(
+            verify_xmss_root(
+                &vk,
+                &xmss_statement(&circuit, &statements[2..]),
+                &base_bundle
+            ),
+            Err(TowerVerifyError::Proof(_))
+        ),
+        "the base's proof claimed as a six-batch root"
+    );
+    let mut st2_other = st2;
+    st2_other.digest = xmss_statement(&circuit, &statements[..4]).digest;
+    assert!(
+        matches!(
+            verify_xmss_root(&vk, &st2_other, &base_bundle),
+            Err(TowerVerifyError::Discharge(RootDischargeFailure::Statement))
+        ),
+        "the base claimed over the other four batches"
+    );
+    // The key is statement-independent: this VK, from other batches, has
+    // the pinned fingerprint at the pinned shape.
+    if n == 4 && nu == Some(9) {
+        let fp = vk.fingerprint();
+        let hex = |d: &[u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hex(&fp.fl_circuit), PIN_XMSS_FL_CIRCUIT, "FL circuit");
+        assert_eq!(
+            hex(&fp.steady_circuit),
+            PIN_XMSS_STEADY_CIRCUIT,
+            "steady circuit"
+        );
+    }
     let mut swapped = statements.clone();
     swapped.swap(0, 1);
     assert!(
@@ -556,6 +651,128 @@ fn xmss_tower_e2e() {
     );
 }
 
+/// **THE leanXMSS VK'S PUBLISHED IDENTITY, PINNED** at the test leaf (4
+/// signatures in a 2^9-row slot, `RECURSION_LEAF`, the test config): any
+/// deliberate shape change moves these. Re-bless with
+/// `XMSS_VK_FP_PRINT=1 ... --nocapture`, two identical prints before
+/// committing. The fingerprint is statement-independent: the batches here
+/// are not `xmss_tower_e2e`'s, and its VK must print the same.
+#[test]
+#[ignore] // Heavy — one VK generation (a six-leaf reference tower).
+fn xmss_tower_vk_fingerprint_pinned() {
+    use crate::tower::{test_config, xmss_leaf::signed};
+    let cfg = test_config();
+    if cfg != TowerConfig::Chain128 {
+        eprintln!("the fingerprint pin is chain128-only; skipping under {cfg:?}");
+        return;
+    }
+    let n = 4;
+    let circuit = XmssCircuit::with_options(
+        n,
+        Some(9),
+        crate::leanxmss::circuit::XmssOptions::RECURSION_LEAF,
+    );
+    let batches: Vec<(Vec<Statement>, Vec<Signature>)> =
+        (0..6u64).map(|i| signed(n, 501 + i)).collect();
+    let fp = XmssTowerVk::generate(cfg, &circuit, &batches).fingerprint();
+    let hex = |d: &[u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    if std::env::var("XMSS_VK_FP_PRINT").is_ok() {
+        println!("leaf_circuit:   {}", hex(&fp.leaf_circuit));
+        println!("fl_circuit:     {}", hex(&fp.fl_circuit));
+        println!("base_circuit:   {}", hex(&fp.base_circuit));
+        println!("steady_circuit: {}", hex(&fp.steady_circuit));
+        println!("leaf_registry:  {}", hex(&fp.leaf_registry));
+        println!("outer_registry: {}", hex(&fp.outer_registry));
+        println!("publics_len:    {}", fp.publics_len);
+    }
+    assert_eq!(fp.config, cfg);
+    assert_eq!(fp.signatures_per_leaf, n);
+    assert_eq!(hex(&fp.leaf_circuit), PIN_XMSS_LEAF_CIRCUIT, "leaf circuit");
+    assert_eq!(hex(&fp.fl_circuit), PIN_XMSS_FL_CIRCUIT, "FL circuit");
+    assert_eq!(hex(&fp.base_circuit), PIN_XMSS_BASE_CIRCUIT, "base circuit");
+    assert_eq!(
+        hex(&fp.steady_circuit),
+        PIN_XMSS_STEADY_CIRCUIT,
+        "steady circuit"
+    );
+    assert_eq!(
+        hex(&fp.leaf_registry),
+        PIN_XMSS_LEAF_REGISTRY,
+        "leaf registry"
+    );
+    assert_eq!(
+        hex(&fp.outer_registry),
+        PIN_XMSS_OUTER_REGISTRY,
+        "outer registry"
+    );
+    assert_eq!(fp.publics_len, PIN_XMSS_PUBLICS_LEN, "publics length");
+}
+
+// The blessed leanXMSS test-leaf fingerprint (see
+// `xmss_tower_vk_fingerprint_pinned`). First blessed 2026-11-05, two
+// identical prints, after the review fixes (leaf PoW rows, in-circuit
+// nonzero grand products, the wired shared-binding tails). The outer
+// registry is the chain tower's (one envelope registry).
+#[cfg(test)]
+const PIN_XMSS_LEAF_CIRCUIT: &str =
+    "d83e5ba428a73c8488197e7d1a26c5ab9d17b6a0fc08cebae5465da314955ed4";
+#[cfg(test)]
+const PIN_XMSS_FL_CIRCUIT: &str =
+    "ae13d7065e65a898d53a54543ed85dfef92226bec26589dbf96a7eddbe906ae0";
+#[cfg(test)]
+const PIN_XMSS_BASE_CIRCUIT: &str =
+    "82f3c6108ac88d6730ebe119ccbf5dfd5ad918e6cf983afc52ee3eb85f065cf4";
+#[cfg(test)]
+const PIN_XMSS_STEADY_CIRCUIT: &str =
+    "167e6bbee13eb6f14342b3e879e944c712a865a320cad5e10ba0b9596910bae6";
+#[cfg(test)]
+const PIN_XMSS_LEAF_REGISTRY: &str =
+    "8ff30c7b07014589d55707fd8a968df8337fc9beb9d4520c350d31b23d56d85b";
+#[cfg(test)]
+const PIN_XMSS_OUTER_REGISTRY: &str =
+    "c36112d619a1907c2132257f311ec7a90e81b932d20257b197d458b4267201c0";
+#[cfg(test)]
+const PIN_XMSS_PUBLICS_LEN: usize = 5963;
+
+/// Signing grinds each signature's digest onto a codeword (~30 s per
+/// 1000 signatures on every core), so the batches are signed once on a
+/// full-width pool, whatever RAYON_NUM_THREADS says, and cached on disk.
+#[cfg(test)]
+pub(super) fn cached_keyless_batch(n: usize, seed: u64) -> (Vec<Statement>, Vec<Signature>) {
+    use crate::leanxmss::reference::{PK_LEN, PublicKey, SIG_LEN};
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(format!("leanxmss-blake3-keyless-v2-{n}-seed{seed}.bin"));
+    let record = PK_LEN + 32 + SIG_LEN;
+    if let Ok(bytes) = std::fs::read(&path)
+        && bytes.len() == n * record
+    {
+        return bytes
+            .chunks_exact(record)
+            .map(|r| {
+                let pk = PublicKey::from_bytes(r[..PK_LEN].try_into().unwrap());
+                let msg = r[PK_LEN..PK_LEN + 32].try_into().unwrap();
+                let sig = Signature::from_bytes(&r[PK_LEN + 32..]).unwrap();
+                (Statement { pk, msg }, sig)
+            })
+            .unzip();
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
+    let (statements, sigs) = rayon::ThreadPoolBuilder::new()
+        .num_threads(cores)
+        .build()
+        .unwrap()
+        .install(|| crate::leanxmss::circuit::keyless_batch(n, seed));
+    let mut bytes = Vec::with_capacity(n * record);
+    for (st, sig) in statements.iter().zip(&sigs) {
+        bytes.extend_from_slice(&st.pk.to_bytes());
+        bytes.extend_from_slice(&st.msg);
+        bytes.extend_from_slice(&sig.to_bytes());
+    }
+    let _ = std::fs::write(&path, bytes);
+    (statements, sigs)
+}
+
 /// The leanXMSS tower's ONLINE cost per stage, under `tower_online_bench`'s
 /// discipline: one setup per stage, then `BENCH_RUNS` steady online
 /// iterations after a warmup (the warmup reports on the setup tier). Each
@@ -567,7 +784,7 @@ fn xmss_tower_online_bench() {
     use std::{sync::atomic::Ordering, time::Instant};
 
     use crate::{
-        leanxmss::circuit::{XmssOptions, keyless_batch},
+        leanxmss::circuit::XmssOptions,
         tower::{
             envelope::STEADY_OVERRIDE,
             online::{Online, median_total, report_stage},
@@ -579,43 +796,7 @@ fn xmss_tower_online_bench() {
     let runs = env("BENCH_RUNS").unwrap_or(3);
     let n = env("XMSS_N").unwrap_or(992);
     let circuit = XmssCircuit::with_options(n, env("XMSS_NU"), XmssOptions::RECURSION_LEAF);
-    // Signing grinds each signature's digest onto a codeword (~30 s per
-    // 1000 signatures on every core), so the batches are signed once on a
-    // full-width pool, whatever RAYON_NUM_THREADS says, and cached on disk.
-    let cached = |seed: u64| -> (Vec<Statement>, Vec<Signature>) {
-        use crate::leanxmss::reference::{PK_LEN, PublicKey, SIG_LEN};
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(format!("leanxmss-blake3-keyless-v2-{n}-seed{seed}.bin"));
-        let record = PK_LEN + 32 + SIG_LEN;
-        if let Ok(bytes) = std::fs::read(&path)
-            && bytes.len() == n * record
-        {
-            return bytes
-                .chunks_exact(record)
-                .map(|r| {
-                    let pk = PublicKey::from_bytes(r[..PK_LEN].try_into().unwrap());
-                    let msg = r[PK_LEN..PK_LEN + 32].try_into().unwrap();
-                    let sig = Signature::from_bytes(&r[PK_LEN + 32..]).unwrap();
-                    (Statement { pk, msg }, sig)
-                })
-                .unzip();
-        }
-        let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
-        let (statements, sigs) = rayon::ThreadPoolBuilder::new()
-            .num_threads(cores)
-            .build()
-            .unwrap()
-            .install(|| keyless_batch(n, seed));
-        let mut bytes = Vec::with_capacity(n * record);
-        for (st, sig) in statements.iter().zip(&sigs) {
-            bytes.extend_from_slice(&st.pk.to_bytes());
-            bytes.extend_from_slice(&st.msg);
-            bytes.extend_from_slice(&sig.to_bytes());
-        }
-        let _ = std::fs::write(&path, bytes);
-        (statements, sigs)
-    };
+    let cached = |seed: u64| cached_keyless_batch(n, seed);
     let batches: Vec<(Vec<Statement>, Vec<Signature>)> =
         (0..6u64).map(|i| cached(101 + i)).collect();
     let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;

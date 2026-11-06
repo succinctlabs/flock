@@ -258,6 +258,60 @@ fn xmss_child_region_emits_alone() {
     );
 }
 
+/// Node-circuit negatives through a tampered leaf child: the leaf's
+/// lincheck REPORT is advice in the parent (the child never absorbs it), so
+/// only the in-circuit reported check binds it to the child's transcript.
+/// The honest region runs; with the η report (a dropped-row identity value
+/// `v_L`) or one type's reported `A` value moved by one, the region's
+/// witness cannot be completed: the reported check's sum no longer meets
+/// the transcript-derived target, and `run` refuses the connect. (The bad
+/// leaf nonce is `chain_child_region_rejects_a_missed_leaf_grind`.)
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn xmss_child_region_rejects_a_tampered_report() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let n = 4;
+    let circuit = XmssCircuit::with_options(n, None, XmssOptions::RECURSION_LEAF);
+    let (statements, sigs) = signed(n, 17);
+    let leaf = build_xmss_leaf(&circuit, &statements, &sigs);
+    let lcs = circuit.lincheck_circuits();
+    let mut ct = ChildTape::new(&leaf.inner, XMSS_DOMAIN, &lcs);
+    let runs = |ct: &ChildTape<'_>| -> bool {
+        let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(16);
+        let mut sb = ShapeBuilder::new(nu2);
+        let mut cs = ChildSlots::new(&mut sb, nu2, ct.spread_w);
+        let (mut vals, mut hints, mut consts) = (Vec::new(), Vec::new(), Vec::new());
+        let b3_slot = cs.q.b3;
+        let _ = emit_child_region(
+            &mut sb,
+            &mut cs,
+            b3_slot,
+            ct,
+            &mut vals,
+            &mut hints,
+            &mut consts,
+        );
+        let shape2 = sb.finish().expect("the leanXMSS child circuit builds");
+        let hint_refs: Vec<&(dyn Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
+        catch_unwind(AssertUnwindSafe(|| shape2.run(&vals, &hint_refs))).is_ok()
+    };
+    assert!(runs(&ct), "the honest region runs");
+    let t = ct
+        .bool_assert
+        .linear_evals
+        .iter()
+        .position(Option::is_some)
+        .expect("the recursion leaf reports a dropped-row value under η");
+    let honest = ct.bool_assert.clone();
+    ct.bool_assert.linear_evals[t] = ct.bool_assert.linear_evals[t].map(|v| v + F128::ONE);
+    assert!(!runs(&ct), "a moved η report (type {t}'s v_L)");
+    ct.bool_assert = honest;
+    ct.bool_assert.evals[0].0 += F128::ONE;
+    assert!(!runs(&ct), "a moved reported A value");
+}
+
 /// Emit `ct`'s child region alone at `nu2` rows a slot and report what it
 /// occupies: per gate type the rows used, and the dense words a union over
 /// that content commits.
@@ -390,11 +444,13 @@ fn xmss_first_level_node_over_two_leaves() {
         .and_then(|v| v.parse().ok())
         .or((n < 64).then_some(9));
     let circuit = XmssCircuit::with_options(n, nu, XmssOptions::RECURSION_LEAF);
+    // A production-size batch reads the bench's signed-batch cache (seeds
+    // 101 and 102), signing once if it is missing.
     let batch = |seed: u64| {
         if n < 64 {
             signed(n, seed)
         } else {
-            crate::leanxmss::circuit::keyless_batch(n, seed)
+            crate::tower::xmss_tower::cached_keyless_batch(n, 84 + seed)
         }
     };
     let (s0, g0) = batch(17);

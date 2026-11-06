@@ -97,7 +97,8 @@ Phase 5's order: the dropped words first (half the cost, all in the zerocheck), 
 - `XmssTower::prove` runs the chain tower's spine over leanXMSS first-level nodes: the base over the last two, then each level prepends the next-earlier one. `xmss_statement` recomputes the root digest from the batches: `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))`.
 - `XmssTower::discharge_root`: the statement, the lane against the leaf tables per class, and the main fold and passenger (`discharge_outer`, shared with the chain tower).
 - **Tests.** `xmss_internal_node_over_two_first_level_nodes`, `xmss_tower_e2e` (8 batches, a steady root; refuses a wrong digest, a wrong count, a moved lane claim).
-- **Root verifier.** `XmssTowerVk::generate` builds the VK from a reference tower over six batches. `verify_xmss_root(vk, statement, bundle)` checks the root proof against the VK alone. It then reassembles the accumulator from the root's publics, checks the statement, and runs the discharge. `xmss_tower_e2e` also refuses swapped batches, an edited message and a forged public.
+- **Root verifier.** `XmssTowerVk::generate` builds the VK from a reference tower over six batches. `verify_xmss_root(vk, statement, bundle)` checks the root proof against the VK alone. It then reassembles the accumulator from the root's publics, checks the statement, and runs the discharge. `xmss_tower_e2e` also refuses swapped batches, an edited message and a forged public, and verifies the k = 2 (base) and k = 3 roots as well as k = 4.
+- **VK identity.** `XmssTowerVk::fingerprint` (the leaf, FL, base and steady circuit digests, both registries, the publics length, the leaf size), pinned at the test leaf by `xmss_tower_vk_fingerprint_pinned`.
 - **Full size.** 8 × 992 = 7,936 signatures, with the final leaf posture (phase 5): the end-to-end test passes, including the standalone verify. The root proof is 254 KiB. Per-stage timings are in the measured section below.
 
 **5. Put the leaf optimisations back.** Done: `RECURSION_LEAF` now has every optimisation of the default proof, plus the chained transcript and the hashed statement.
@@ -272,6 +273,15 @@ Measured on a quiet M4 at 1 thread, two alternating runs per binary, median of 6
 | after | 586 | 530 | 531 |
 
 The Ligerito step inside the open is a per-transcript grinding draw that moved by up to ±8 ms between binaries (FL +8, base −4, spine −7). With it held equal, every node saves about 20–24 ms, of which the 28 pin is about 4–9 ms (Merkle 50.5 → 45.9 ms in every commit). The rest is the commit NTT (−4 ms on base and spine), wiring and expected PoW. The W build and merged sumcheck did not move. At 10 threads (n = 3, noisy) the spine went 154 → 147 ms with PoW excluded.
+
+## Review fixes (2026-11-05, Ron's #70 review)
+
+- **Leaf PoW in the first-level node.** `emit_child_region` now emits one PowMask row per recorded leaf `Pow` (347 on a leanXMSS leaf: fingerprint, GKR, lincheck, zerocheck, Ligerito). Before, only the AG round-one point was checked, so a recursive prover could skip every other leaf grind. The port of PR #71.
+- **Zero grand products.** Every product GKR the tower verifies (a leaf's wiring and bus, a node child's wiring) checks `top·t = 1` with a witness inverse, beside the native `top_lhs ≠ 0` check.
+- **Shared binding.** The tails of `x_inner_rest` and `rr` beyond the longest type head are wired to the child's challenges in-circuit, as every other absorbed word is.
+- **Aggregation.** The per-claim path refuses an assertion that drops words (it would never check `v_L`); the shared path refuses a linear value where `Dropped` gathers none.
+- **Guards.** The node walker refuses a child with a bus, public columns, pruned or packed slots; the main accumulator's empty `per_linear` is asserted on the outer registry.
+- **Negative tests.** A leaf nonce that misses its target, and a moved η or `A` report, each make the child region unsatisfiable.
 
 ## Open questions
 
