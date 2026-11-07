@@ -281,6 +281,156 @@ fn row_weights(
     u
 }
 
+/// One distinct `(circuit, dropped words)` pair's column marginals.
+struct Marginals {
+    /// The pair's first slot: its registry type and dropped words.
+    slot: usize,
+    /// Its row weights ([`row_weights`]).
+    u: Vec<F128>,
+    /// `A_0ᵀu`, or the α-batched `α·A_0ᵀu + B_0ᵀu`.
+    a: Vec<F128>,
+    /// `B_0ᵀu`; empty when α-batched.
+    b: Vec<F128>,
+}
+
+/// Every slot's lincheck column marginals, walking each distinct circuit
+/// ONCE — the `O(nnz)` part of both the prover's comb and the verifier's
+/// [`MatrixAssertion::check`].
+///
+/// Slots of one gate share its circuit, and the marginals depend only on the
+/// row weights `u`. Those differ between a gate's slots only in the rows of
+/// dropped words: a full slot drops them, one with dummy rows keeps them
+/// ([`UnionInstance::zeroed_word_cols`]). So the first pair of each circuit
+/// walks it, and every other pair adds the scatter of its weight difference
+/// over the rows where the two differ — the words dropped by exactly one of
+/// them, 128 rows each, read from the registry type as [`linear_row_fixups`]
+/// reads them. The fold is linear in `u`, so this is the walk's result
+/// exactly. (A leanXMSS leaf's 16k-column compression gate fills 8–13
+/// slots of both kinds: one walk instead of the verifier's one per slot,
+/// ~9 ms each at one thread, and of the prover's two.)
+///
+/// `alpha = Some(α)` returns the α-batched marginal in `a` (one multiply per
+/// column, the verifier's need); `None` keeps `A_0ᵀu` and `B_0ᵀu` apart for
+/// the prover's matrix-eval report. Returns each slot's pair index and the
+/// pairs in first-appearance order.
+fn slot_marginals(
+    union: &UnionInstance<'_>,
+    circuits: &[&dyn LincheckCircuit],
+    alpha: Option<F128>,
+    eta: Option<F128>,
+    skip_weights: &[F128],
+    x_inner_rest: &[F128],
+) -> (Vec<usize>, Vec<Marginals>) {
+    let types = union.registry().boolean_types();
+    let same_circuit = |s: usize, t: usize| std::ptr::addr_eq(circuits[s], circuits[t]);
+    let mut pairs: Vec<usize> = Vec::new();
+    let pair_of: Vec<usize> = (0..circuits.len())
+        .map(|t| {
+            let same = |&s: &usize| {
+                same_circuit(s, t) && union.zeroed_word_cols(s) == union.zeroed_word_cols(t)
+            };
+            pairs.iter().position(same).unwrap_or_else(|| {
+                pairs.push(t);
+                pairs.len() - 1
+            })
+        })
+        .collect();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (p, &s) in pairs.iter().enumerate() {
+        match groups.iter_mut().find(|g| same_circuit(pairs[g[0]], s)) {
+            Some(g) => g.push(p),
+            None => groups.push(vec![p]),
+        }
+    }
+    let weights = |s: usize| {
+        let inner = types[s].k_log - K_SKIP;
+        row_weights(
+            union.zeroed_word_cols(s),
+            eta,
+            skip_weights,
+            &x_inner_rest[..inner],
+        )
+    };
+    let walked: Vec<Vec<(usize, Marginals)>> = groups
+        .into_par_iter()
+        .map(|group| {
+            let s0 = pairs[group[0]];
+            let u0 = weights(s0);
+            let (a0, b0) = match alpha {
+                Some(alpha) => (circuits[s0].fold_alpha_batched(alpha, &u0), Vec::new()),
+                None => circuits[s0].fold_split(&u0),
+            };
+            let z0 = union.zeroed_word_cols(s0);
+            let mut out: Vec<(usize, Marginals)> = group[1..]
+                .iter()
+                .map(|&p| {
+                    let s = pairs[p];
+                    let (u, z) = (weights(s), union.zeroed_word_cols(s));
+                    let (mut a, mut b) = (a0.clone(), b0.clone());
+                    shift_marginals(&types[s], (z0, &u0), (z, &u), alpha, &mut a, &mut b);
+                    (p, Marginals { slot: s, u, a, b })
+                })
+                .collect();
+            out.insert(
+                0,
+                (
+                    group[0],
+                    Marginals {
+                        slot: s0,
+                        u: u0,
+                        a: a0,
+                        b: b0,
+                    },
+                ),
+            );
+            out
+        })
+        .collect();
+    let mut by_pair: Vec<Option<Marginals>> = (0..pairs.len()).map(|_| None).collect();
+    for (p, m) in walked.into_iter().flatten() {
+        by_pair[p] = Some(m);
+    }
+    let marginals = by_pair
+        .into_iter()
+        .map(|m| m.expect("every pair is walked"))
+        .collect();
+    (pair_of, marginals)
+}
+
+/// Move a type's marginals `(a, b)` from one set of dropped words and row
+/// weights `(z0, u0)` to another `(z, u)` ([`row_weights`] of the same
+/// point): add the scatter of `u − u0` over the rows of the words dropped by
+/// exactly one of `z0`, `z` — the only rows where the weights differ.
+/// `alpha` as in [`slot_marginals`] (`b` untouched when batched).
+fn shift_marginals(
+    ty: &TableType,
+    (z0, u0): (&[usize], &[F128]),
+    (z, u): (&[usize], &[F128]),
+    alpha: Option<F128>,
+    a: &mut [F128],
+    b: &mut [F128],
+) {
+    let differ = z0.iter().filter(|w| !z.contains(w));
+    for &w in differ.chain(z.iter().filter(|w| !z0.contains(w))) {
+        for i in 128 * w..128 * (w + 1) {
+            let d = u[i] + u0[i]; // char 2: the difference
+            let row_a = ty.a_0.rows.get(i).into_iter().flatten();
+            let row_b = ty.b_0.rows.get(i).into_iter().flatten();
+            match alpha {
+                Some(alpha) => {
+                    let ad = alpha * d;
+                    row_a.for_each(|&c| a[c] += ad);
+                    row_b.for_each(|&c| a[c] += d);
+                }
+                None => {
+                    row_a.for_each(|&c| a[c] += d);
+                    row_b.for_each(|&c| b[c] += d);
+                }
+            }
+        }
+    }
+}
+
 /// Turn the dropped rows' share of a comb `α·A_0ᵀu + B_0ᵀu` (`u` from
 /// [`row_weights`], `u_i = η·eq_i` there) into `α·η·Σ_i eq_i·(A_0 + I)_i`,
 /// the weighted residual of their identities `(A_0 z)_i = z_i`: add
@@ -409,53 +559,36 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     } else {
         vec![F128::ZERO; 1usize << col_vars]
     };
-    // Per-type (ξ_A, ξ_B), kept for the matrix-eval report after the sumcheck.
-    // Slots of one gate share its circuit (and so its width), and the fold
-    // depends on nothing else: each distinct circuit folds once, the
-    // distinct ones concurrently.
+    // Per-type (ξ_A, ξ_B), kept for the matrix-eval report after the sumcheck
+    // (split: same nonzeros as the α-batched fold, only the accumulation
+    // differs). Each distinct circuit is walked once — see `slot_marginals`.
     let types = registry.boolean_types();
-    let mut distinct: Vec<usize> = Vec::new();
-    let comb_of: Vec<usize> = slots
-        .iter()
-        .enumerate()
-        .map(|(t, slot_in)| {
-            let same = |&u: &usize| {
-                std::ptr::addr_eq(slots[u].circuit, slot_in.circuit)
-                    && union.zeroed_word_cols(u) == union.zeroed_word_cols(t)
-            };
-            distinct.iter().position(same).unwrap_or_else(|| {
-                distinct.push(t);
-                distinct.len() - 1
-            })
-        })
-        .collect();
-    let unique: Vec<((Vec<F128>, Vec<F128>), Vec<F128>)> = distinct
-        .into_par_iter()
-        .map(|t| {
-            let inner = types[t].k_log - k_skip;
-            let zeroed = union.zeroed_word_cols(t);
-            let u = row_weights(
-                zeroed,
-                eta,
-                &x_ab.z_skip.weights(k_skip),
-                &x_ab.x_inner_rest[..inner],
-            );
-            // Split, so the per-matrix bilinear values can be reported below.
-            // Same nonzeros as the α-batched fold; only the accumulation
-            // differs.
-            let (comb_a, comb_b) = slots[t].circuit.fold_split(&u);
-            let mut comb_t: Vec<F128> = comb_a
-                .iter()
-                .zip(&comb_b)
-                .map(|(a, b)| alpha * *a + *b)
-                .collect();
+    let circuits: Vec<&dyn LincheckCircuit> = slots.iter().map(|s| s.circuit).collect();
+    let (comb_of, marginals) = slot_marginals(
+        union,
+        &circuits,
+        None,
+        eta,
+        &x_ab.z_skip.weights(k_skip),
+        &x_ab.x_inner_rest,
+    );
+    let unique: Vec<((Vec<F128>, Vec<F128>), Vec<F128>)> = marginals
+        .into_iter()
+        .map(|m| {
+            let mut comb_t: Vec<F128> =
+                m.a.iter().zip(&m.b).map(|(a, b)| alpha * *a + *b).collect();
             if eta.is_some() {
-                linear_row_fixups(&types[t], zeroed, alpha, &u, &mut comb_t);
+                linear_row_fixups(
+                    &types[m.slot],
+                    union.zeroed_word_cols(m.slot),
+                    alpha,
+                    &m.u,
+                    &mut comb_t,
+                );
             }
-            ((comb_a, comb_b), comb_t)
+            ((m.a, m.b), comb_t)
         })
         .collect();
-    let split_combs: Vec<&(Vec<F128>, Vec<F128>)> = comb_of.iter().map(|&u| &unique[u].0).collect();
     for ((ty, slot), &u) in types.iter().zip(registry.slots()).zip(&comb_of) {
         let comb_t = &unique[u].1;
         if single {
@@ -543,11 +676,17 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     //     the dropped rows' identity value: with `u = u_keep + η·u_drop`,
     //     `A_0ᵀu_keep = A_0ᵀu + η·A_0ᵀu_drop` (char 2), and `A_0ᵀu_drop`
     //     reads only the dropped rows — a sparse pass beside the fold.
-    let (evals, linear): (Vec<(F128, F128)>, Vec<Option<F128>>) = types
+    //     Slots of one (circuit, dropped words) pair report the same values,
+    //     so each pair computes them once.
+    let pair_reports: Vec<((F128, F128), Option<F128>)> = unique
         .iter()
         .enumerate()
-        .zip(&split_combs)
-        .map(|((t, ty), (comb_a, comb_b))| {
+        .map(|(p, ((comb_a, comb_b), _))| {
+            let t = comb_of
+                .iter()
+                .position(|&q| q == p)
+                .expect("every pair has a slot");
+            let ty = &types[t];
             let inner = ty.k_log - k_skip;
             let w_col = col_weight(&proof.z_partial, &claim.r_inner_rest[..inner], k_skip);
             let (v_a, v_b) = (inner_product(&w_col, comb_a), inner_product(&w_col, comb_b));
@@ -574,7 +713,9 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
             }
             ((v_a + eta * d_a, v_b + eta * d_b), Some(d_a + d_id))
         })
-        .unzip();
+        .collect();
+    let (evals, linear): (Vec<(F128, F128)>, Vec<Option<F128>>) =
+        comb_of.iter().map(|&p| pair_reports[p]).unzip();
     proof.matrix_evals = evals;
     proof
         .matrix_evals
@@ -809,24 +950,25 @@ impl MatrixAssertion {
                 got: circuits.len(),
             });
         }
+        let (pair_of, marginals) = slot_marginals(
+            union,
+            circuits,
+            Some(self.alpha),
+            self.eta,
+            &self.z_skip.weights(k_skip),
+            &self.x_inner_rest,
+        );
         let mut combs: Vec<Vec<F128>> = registry
             .boolean_types()
             .iter()
             .zip(registry.slots())
-            .zip(circuits)
             .enumerate()
-            .map(|(t, ((ty, slot), circuit))| {
+            .map(|(t, (ty, slot))| {
                 let inner = ty.k_log - k_skip;
-                let zeroed = union.zeroed_word_cols(t);
-                let u = row_weights(
-                    zeroed,
-                    self.eta,
-                    &self.z_skip.weights(k_skip),
-                    &self.x_inner_rest[..inner],
-                );
-                let mut comb = circuit.fold_alpha_batched(self.alpha, &u);
+                let m = &marginals[pair_of[t]];
+                let mut comb = m.a.clone();
                 if self.eta.is_some() {
-                    linear_row_fixups(ty, zeroed, self.alpha, &u, &mut comb);
+                    linear_row_fixups(ty, union.zeroed_word_cols(t), self.alpha, &m.u, &mut comb);
                 }
                 if slot.prefix_bits > 0 {
                     let w_t = eq_prefix_weight(&self.x_inner_rest[inner..], slot.prefix);
@@ -1227,10 +1369,10 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
 mod tests {
     use crate::{
         lincheck::{
-            LincheckCircuit, SkipPoint, SparseMatrixCircuit,
+            CscCircuit, LincheckCircuit, SkipPoint, SparseMatrixCircuit,
             union::{
                 F128, K_SKIP, Registry, build_eq_table, build_quirky_eq_table_from_weights,
-                eq_prefix_sum, eq_prefix_weight, linear_row_fixups, row_weights,
+                eq_prefix_sum, eq_prefix_weight, linear_row_fixups, row_weights, shift_marginals,
                 union_comb_partial,
             },
         },
@@ -1407,5 +1549,37 @@ mod tests {
             }
         }
         assert_eq!(comb(&[0, 2], Some(eta)), expected);
+    }
+
+    /// `shift_marginals` moves one walk's marginals to any other set of
+    /// dropped words exactly — split and α-batched, with and without `η`,
+    /// in both directions and between two non-empty sets.
+    #[test]
+    fn shifted_marginals_match_a_fresh_walk() {
+        let mut rng = Rng::new(0x5417);
+        let ty = gate_ty(&mut rng);
+        let circuit = CscCircuit::from_matrices(&ty.a_0, &ty.b_0);
+        let skip = SkipPoint::Phi8(rng.f128()).weights(K_SKIP);
+        let x_inner = rng.f128_vec(ty.k_log - K_SKIP);
+        let alpha = rng.f128();
+        let sets: [&[usize]; 4] = [&[], &[0], &[2], &[0, 2]];
+        for eta in [Some(rng.f128()), None] {
+            for (z0, z) in sets.iter().flat_map(|a| sets.iter().map(move |b| (*a, *b))) {
+                let (u0, u) = (
+                    row_weights(z0, eta, &skip, &x_inner),
+                    row_weights(z, eta, &skip, &x_inner),
+                );
+                let (mut a, mut b) = circuit.fold_split(&u0);
+                shift_marginals(&ty, (z0, &u0), (z, &u), None, &mut a, &mut b);
+                assert_eq!((a, b), circuit.fold_split(&u), "split {z0:?} → {z:?}");
+                let mut c = circuit.fold_alpha_batched(alpha, &u0);
+                shift_marginals(&ty, (z0, &u0), (z, &u), Some(alpha), &mut c, &mut []);
+                assert_eq!(
+                    c,
+                    circuit.fold_alpha_batched(alpha, &u),
+                    "batched {z0:?} → {z:?}"
+                );
+            }
+        }
     }
 }

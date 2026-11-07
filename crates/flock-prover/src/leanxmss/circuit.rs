@@ -397,7 +397,7 @@ pub fn layout_kinds(n: usize, options: XmssOptions) -> Vec<(usize, usize)> {
 /// The `nu` with the smallest [`layout_cost`]. Every slot has `2^nu` rows
 /// whatever its count, so a large `nu` inflates the small gadget kinds
 /// (more committed cells), and a small `nu` declares a heavy kind many times
-/// over (more columns, which the opening and the verifier pay per column).
+/// over (more columns, which the opening pays per column).
 pub fn plan_nu(kinds: &[(usize, usize)]) -> usize {
     (3..=24)
         .min_by(|&a, &b| layout_cost(kinds, a).total_cmp(&layout_cost(kinds, b)))
@@ -420,6 +420,15 @@ const COMMITTED_FRACTION: f64 = 0.73;
 ///
 /// The dense stack is estimated as [`COMMITTED_FRACTION`] of the declared
 /// cells.
+///
+/// The verifying term was the lincheck walking the compression gate's
+/// matrices once per slot. It now walks each gate once (`slot_marginals` in
+/// `flock_core::lincheck::union`), and verifying costs 12–18 ms at every
+/// layout. A refit without the term (0.38 ms/Mbit, 0.034 ms/column) moves
+/// 992 to `nu` 13 but 256 to 12 (5% slower). The weights above stay: on the
+/// one-thread sweep after the change (2026-11-06) their picks are within
+/// 2.6% of the best measured `nu` everywhere, and bigger `nu` keeps its
+/// edge at ten threads.
 fn layout_cost(kinds: &[(usize, usize)], nu: usize) -> f64 {
     let (mut bits, mut columns) = (0f64, 0f64);
     for &(count, k_log) in kinds {
