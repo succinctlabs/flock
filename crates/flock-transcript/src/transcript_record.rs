@@ -42,8 +42,8 @@ use flock_hash::HashKind;
 use sha2::{Digest, Sha256};
 
 use crate::challenger::{
-    Challenger, KIND_NONE, KIND_RUN, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE,
-    OP_SQUEEZE,
+    Challenger, KIND_NONE, KIND_RUN, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL,
+    OP_OBSERVE, OP_SQUEEZE,
 };
 
 /// One protocol-level transcript action, with values stripped.
@@ -1406,7 +1406,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(runs, [1, 3, 2], "one header per scalar run, carrying its length");
+        assert_eq!(
+            runs,
+            [1, 3, 2],
+            "one header per scalar run, carrying its length"
+        );
     }
 
     /// A scalar run is its own record kind: the same values observed as a

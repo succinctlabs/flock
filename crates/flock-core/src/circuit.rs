@@ -76,7 +76,9 @@ use product_gkr::{
     prove_batched_with_grinding, s_id_basis, verify_batched_with_grinding,
     verify_batched_with_sigma_and_grinding,
 };
-use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -1057,29 +1059,87 @@ impl<'a> CircuitStructureMatrix<'a> {
 }
 
 impl FoldMatrix for CircuitStructureMatrix<'_> {
+    /// `out[r] = Σ_c w[c] · entry(r, c)`. The element planes do not depend
+    /// on the row, so their whole contribution is one constant; the other
+    /// planes are summed per row, rows in parallel, over the columns that
+    /// can be nonzero (cell slots below `cell_cols`, boolean pin slots).
+    /// Addition in GF(2^128) is exact, so this equals the plain double loop.
     fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
         assert_eq!(n_rows, self.n_rows());
         assert_eq!(w.len(), self.n_cols());
-        let mut out = vec![F128::ZERO; n_rows];
-        for (c, &wc) in w.iter().enumerate() {
-            if wc.is_zero() {
-                continue;
-            }
-            for (r, dst) in out.iter_mut().enumerate() {
-                *dst += wc * self.entry(r, c);
-            }
-        }
-        out
+        let base_cols = self.base_cols();
+        let cell_cols = 1usize << (self.circuit.cells().mu() - self.circuit.cells().nu());
+        let in_plane = |plane: usize, slots: usize| {
+            (plane * base_cols..plane * base_cols + slots.min(base_cols))
+                .filter(|&c| !w[c].is_zero())
+                .collect::<Vec<usize>>()
+        };
+        let element_const = [
+            SigmaAssertion::ELEMENT_A_PLANE,
+            SigmaAssertion::ELEMENT_B_PLANE,
+        ]
+        .into_iter()
+        .flat_map(|plane| in_plane(plane, base_cols))
+        .fold(F128::ZERO, |acc, c| acc + w[c] * self.entry(0, c));
+        let row_cols: Vec<usize> = [
+            SigmaAssertion::MASKED_ID_PLANE,
+            SigmaAssertion::LIVE_PLANE,
+            SigmaAssertion::SIGMA_PLANE,
+        ]
+        .into_iter()
+        .flat_map(|plane| in_plane(plane, cell_cols))
+        .chain(in_plane(
+            SigmaAssertion::BOOLEAN_PIN_PLANE,
+            self.circuit.registry().num_boolean(),
+        ))
+        .collect();
+        (0..n_rows)
+            .into_par_iter()
+            .map(|r| {
+                row_cols
+                    .iter()
+                    .fold(element_const, |acc, &c| acc + w[c] * self.entry(r, c))
+            })
+            .collect()
     }
 
+    /// `out[c] = Σ_r w[r] · entry(r, c)`, by plane: the cell planes sum
+    /// only their live rows (a prefix of each cell slot), the element planes
+    /// do not depend on the row (so they are `Σ w` times one entry), and the
+    /// unused planes are zero. Columns run in parallel. Addition in GF(2^128)
+    /// is exact, so the regrouping gives the same vector as the plain double
+    /// loop over [`Self::entry`].
     fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
         assert_eq!(w.len(), self.n_rows());
         assert_eq!(n_cols, self.n_cols());
+        let base_cols = self.base_cols();
+        let cell_cols = 1usize << (self.circuit.cells().mu() - self.circuit.cells().nu());
+        let w_sum = w.iter().fold(F128::ZERO, |acc, &wr| acc + wr);
+        let dense = |c: usize| {
+            w.iter()
+                .enumerate()
+                .fold(F128::ZERO, |acc, (r, &wr)| acc + wr * self.entry(r, c))
+        };
         (0..n_cols)
-            .map(|c| {
-                w.iter()
-                    .enumerate()
-                    .fold(F128::ZERO, |acc, (r, &wr)| acc + wr * self.entry(r, c))
+            .into_par_iter()
+            .map(|c| match c / base_cols {
+                SigmaAssertion::MASKED_ID_PLANE
+                | SigmaAssertion::LIVE_PLANE
+                | SigmaAssertion::SIGMA_PLANE => {
+                    if c % base_cols >= cell_cols {
+                        return F128::ZERO;
+                    }
+                    let x0 = (c % base_cols) << self.circuit.cells().nu();
+                    w.iter()
+                        .enumerate()
+                        .take_while(|&(r, _)| self.mask.is_live(x0 | r))
+                        .fold(F128::ZERO, |acc, (r, &wr)| acc + wr * self.entry(r, c))
+                }
+                SigmaAssertion::ELEMENT_A_PLANE | SigmaAssertion::ELEMENT_B_PLANE => {
+                    w_sum * self.entry(0, c)
+                }
+                SigmaAssertion::BOOLEAN_PIN_PLANE => dense(c),
+                _ => F128::ZERO,
             })
             .collect()
     }
@@ -1233,6 +1293,7 @@ mod tests {
             verify_wiring, verify_wiring_deferred,
         },
         element_r1cs::ElementTableBuilder,
+        matrix_fold::FoldMatrix,
         r1cs::SparseBinaryMatrix,
         schedule::{TableClass, TableType},
         test_rng::Rng,
@@ -1726,6 +1787,18 @@ mod tests {
             mc.value,
             "the MatrixClaim form discharges — the accumulator's path"
         );
+        // The plane-wise marginals equal the plain double loop over `entry`.
+        let (n_rows, n_cols) = (m.n_rows(), m.n_cols());
+        let w_row: Vec<F128> = (0..n_rows).map(|_| rng.f128()).collect();
+        let w_col: Vec<F128> = (0..n_cols).map(|_| rng.f128()).collect();
+        let naive_col: Vec<F128> = (0..n_cols)
+            .map(|c| (0..n_rows).fold(F128::ZERO, |a, r| a + w_row[r] * m.entry(r, c)))
+            .collect();
+        let naive_row: Vec<F128> = (0..n_rows)
+            .map(|r| (0..n_cols).fold(F128::ZERO, |a, c| a + w_col[c] * m.entry(r, c)))
+            .collect();
+        assert_eq!(m.col_marginal(&w_row, n_cols), naive_col, "col marginal");
+        assert_eq!(m.row_marginal(&w_col, n_rows), naive_row, "row marginal");
 
         let mut bad = assertion.clone();
         bad.value += F128::ONE;

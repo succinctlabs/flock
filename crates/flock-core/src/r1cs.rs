@@ -22,7 +22,10 @@ use std::{
 use blake3::Hasher;
 use rayon::{
     current_num_threads,
-    prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut},
+    prelude::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+        ParallelSlice, ParallelSliceMut,
+    },
 };
 
 use crate::{
@@ -451,14 +454,39 @@ impl BlockR1cs {
 /// `pub(crate)` so [`crate::schedule::Registry::digest`] absorbs matrices
 /// with the exact same encoding rather than duplicating it.
 pub(crate) fn absorb_matrix(h: &mut Hasher, m: &SparseBinaryMatrix) {
-    h.update(&(m.num_rows as u64).to_le_bytes());
-    h.update(&(m.num_cols as u64).to_le_bytes());
+    // The byte stream is `num_rows, num_cols`, then per row its length and
+    // its columns, all u64 LE. It is serialized whole (in parallel, each row
+    // at its prefix-sum offset) and hashed with `update_rayon`: one `update`
+    // per word cost ~0.5 s for the BLAKE3 table's matrices, and the hash
+    // only sees the concatenated bytes, so the digest is unchanged.
+    let mut offsets = Vec::with_capacity(m.rows.len() + 1);
+    let mut at = 16usize;
     for row in m.rows.iter() {
-        h.update(&(row.len() as u64).to_le_bytes());
-        for &col in row {
-            h.update(&(col as u64).to_le_bytes());
-        }
+        offsets.push(at);
+        at += 8 * (1 + row.len());
     }
+    offsets.push(at);
+    let mut buf = vec![0u8; at];
+    buf[..8].copy_from_slice(&(m.num_rows as u64).to_le_bytes());
+    buf[8..16].copy_from_slice(&(m.num_cols as u64).to_le_bytes());
+    let mut parts = Vec::with_capacity(m.rows.len());
+    let mut rest = &mut buf[16..];
+    for w in offsets.windows(2) {
+        let (part, tail) = rest.split_at_mut(w[1] - w[0]);
+        parts.push(part);
+        rest = tail;
+    }
+    parts
+        .into_par_iter()
+        .zip(m.rows.par_iter())
+        .for_each(|(part, row)| {
+            let (len, cols) = part.split_at_mut(8);
+            len.copy_from_slice(&(row.len() as u64).to_le_bytes());
+            for (dst, &col) in cols.as_chunks_mut::<8>().0.iter_mut().zip(row) {
+                dst.copy_from_slice(&(col as u64).to_le_bytes());
+            }
+        });
+    h.update_rayon(&buf);
 }
 
 /// Block-diagonal `(I_{2^n_log} ⊗ M_0) · z` over GF(2).
