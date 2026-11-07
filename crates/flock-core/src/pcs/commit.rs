@@ -1076,19 +1076,31 @@ fn replicate_lane_major_fill(codeword: &mut [F128], q: &[F128], t: usize, d: usi
     // small commits do not lose their parallelism to one huge tile.
     let threads = rayon::current_num_threads().max(1);
     let tile = (d / (4 * threads)).clamp(64, 1024);
-    codeword.par_chunks_mut(msg_len).for_each(|rep| {
-        rep.par_chunks_mut(tile * t)
-            .enumerate()
-            .for_each(|(tile_idx, out)| {
-                let p0 = tile_idx * tile;
-                let n = tile.min(d - p0);
-                for lane in 0..t {
-                    let src = &q[lane * d + p0..lane * d + p0 + n];
-                    for (p, &v) in src.iter().enumerate() {
-                        out[p * t + lane] = v;
-                    }
+    // TRANSPOSE ONCE. Only the first replica is transposed out of the
+    // lane-major stack; the others are straight copies of it. The strided
+    // transposition is the expensive part (one read stream per lane), the
+    // copies run at memcpy speed: at rate 1/4, 31 lanes, 2^17 positions the
+    // fill goes 14 → ~9 ms at one thread.
+    let (first, rest) = codeword.split_at_mut(msg_len);
+    first
+        .par_chunks_mut(tile * t)
+        .enumerate()
+        .for_each(|(tile_idx, out)| {
+            let p0 = tile_idx * tile;
+            let n = tile.min(d - p0);
+            for lane in 0..t {
+                let src = &q[lane * d + p0..lane * d + p0 + n];
+                for (p, &v) in src.iter().enumerate() {
+                    out[p * t + lane] = v;
                 }
-            });
+            }
+        });
+    let first = &*first;
+    const COPY_CHUNK: usize = 1 << 16;
+    rest.par_chunks_mut(msg_len).for_each(|rep| {
+        rep.par_chunks_mut(COPY_CHUNK)
+            .zip(first.par_chunks(COPY_CHUNK))
+            .for_each(|(dst, src)| dst.copy_from_slice(src));
     });
 }
 
