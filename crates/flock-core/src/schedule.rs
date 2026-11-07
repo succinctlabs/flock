@@ -264,6 +264,43 @@ impl TableType {
         Self::row(&self.c_0, i) == [i] && (b == [pin] || (a.is_empty() && b.is_empty()))
     }
 
+    /// `A_0` and `B_0` with the rows of the `zeroed` words cleared: what a
+    /// dropping union's reported lincheck values are about
+    /// ([`crate::lincheck::MatrixAssertion::evals`]).
+    pub fn kept_matrices(&self, zeroed: &[usize]) -> (SparseBinaryMatrix, SparseBinaryMatrix) {
+        let keep = |m: &SparseBinaryMatrix| {
+            let mut rows = m.rows.as_ref().clone();
+            for &w in zeroed {
+                for row in rows.iter_mut().skip(128 * w).take(128) {
+                    row.clear();
+                }
+            }
+            SparseBinaryMatrix::new(m.num_rows, m.num_cols, rows)
+        };
+        (keep(&self.a_0), keep(&self.b_0))
+    }
+
+    /// `D·(A_0 + I)`: the `zeroed` words' rows of `A_0` with the identity
+    /// added, every other row empty — the matrix the lincheck's linear
+    /// identity value is about
+    /// ([`crate::lincheck::MatrixAssertion::linear_evals`]).
+    pub fn linear_identity_matrix(&self, zeroed: &[usize]) -> SparseBinaryMatrix {
+        let mut rows = vec![Vec::new(); self.a_0.num_rows];
+        for &w in zeroed {
+            for i in 128 * w..128 * (w + 1) {
+                let mut row: Vec<usize> = Self::row(&self.a_0, i).to_vec();
+                match row.iter().position(|&c| c == i) {
+                    Some(at) => {
+                        row.remove(at);
+                    }
+                    None => row.push(i),
+                }
+                rows[i] = row;
+            }
+        }
+        SparseBinaryMatrix::new(self.a_0.num_rows, self.a_0.num_cols, rows)
+    }
+
     /// Number of 128-bit word-columns a row of this type really uses:
     /// `ceil(useful_bits / 128)`. The IO schema's `word_col` bound.
     pub fn used_word_cols(&self) -> usize {

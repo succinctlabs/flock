@@ -14,6 +14,7 @@ unsound-challenger = [
     "flock-core/unsound-challenger",
     "flock-transcript/unsound-challenger",
 ]
+metal = ["flock-core/metal"]
 
 [dependencies]
 flock-core = { path = "../flock-core" }

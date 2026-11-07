@@ -8,16 +8,32 @@
 //! which the tuple bus needs to hand the result to the following step
 //! ([`super::circuit`]); other rows ignore it.
 
-use flock_core::circuit::boolean::{
-    BooleanCircuit, BooleanGate, BooleanGateError, CircuitBuilder, ColumnRole, ColumnSchema,
-    ColumnVisitor, LinearExpr as Expr, SchemaOperation, Var,
+use flock_core::{
+    circuit::{
+        boolean::{
+            BooleanCircuit, BooleanGate, BooleanGateError, CircuitBuilder, ColumnRole,
+            ColumnSchema, ColumnVisitor, LinearExpr as Expr, OperationKernel, SchemaOperation, Var,
+        },
+        builder::GateType,
+    },
+    union::SlotWitnessDest,
 };
 use flock_field::F128;
 
 use crate::r1cs_hashes::{
-    blake3_dsl::{GCols, compress_op, round_columns},
+    blake3::{Blake3Kernel, G_REGION_BITS},
+    blake3_dsl::{GCols, OPERATION, compress_op, round_columns},
+    common::{BM_V, BmRow, drive_witness_batch_major_partial_into},
     dsl::{Word, boolean_gate},
 };
+
+/// The gate's name.
+pub const NAME: &str = "leanxmss.compress";
+
+/// The compression's first bit within its block word: the padding that ends
+/// the rounds on a word boundary starts them here. A constant so the kernel's
+/// fields compile to fixed shifts ([`Blake3Kernel::fill8_inline`]).
+const KERNEL_BIT: usize = 6;
 
 /// Wired inputs, in io-schema order.
 const INPUTS: [&str; 7] = ["cv0", "cv1", "m0", "m1", "m2", "m3", "ctl"];
@@ -132,7 +148,7 @@ pub fn compress_circuit() -> &'static (BooleanCircuit, Vec<SchemaOperation>) {
         let layout = probe.layout().expect("the compression row lays out");
         let columns = &operations
             .iter()
-            .find(|op| op.kind == crate::r1cs_hashes::blake3_dsl::OPERATION)
+            .find(|op| op.kind == OPERATION)
             .expect("the compression is an operation")
             .columns;
         let last_round = columns[columns.len() - 257];
@@ -168,15 +184,137 @@ fn native(inputs: &[F128], outputs: &mut Vec<F128>) {
 /// Inputs `[cv0, cv1, m0, m1, m2, m3, ctl]`, outputs `[o0, o1, next]`.
 pub fn compress_gate(nu: usize) -> Result<BooleanGate, BooleanGateError> {
     let (circuit, operations) = compress_circuit();
-    boolean_gate(
-        "leanxmss.compress",
-        circuit,
-        operations,
-        &INPUTS,
-        &OUTPUTS,
-        nu,
-    )
-    .map(|g| g.with_native(native))
+    boolean_gate(NAME, circuit, operations, &INPUTS, &OUTPUTS, nu).map(|g| g.with_native(native))
+}
+
+/// The compression slots' witness driver: [`BooleanGate::pack_into`] for
+/// this gate, written the way the hand-written BLAKE3 generator writes its
+/// own slot ([`drive_witness_batch_major_partial_into`]). Eight rows at a
+/// time, every word goes straight into row form: the wired inputs and
+/// `next` as whole words (identity and linear rows, `z = A·z`, `B·z = 1`),
+/// the compression by [`Blake3Kernel`], and the rest — the pin and the
+/// padding's rows, the same in every row — from a template. No walk, no
+/// plane transposes. Writes the same slot as the gate's packer.
+pub struct CompressPacker {
+    k_log: usize,
+    useful_bits: usize,
+    /// First block `u64` word of each wired input, and of `next`.
+    inputs: [usize; 7],
+    next: usize,
+    /// The kernel's first word: it starts at [`KERNEL_BIT`] in it.
+    kernel_word: usize,
+    /// Every other word as `z`, `A·z`, `B·z`, its kernel bits clear.
+    fixed: Vec<(usize, [u64; 3])>,
+}
+
+impl CompressPacker {
+    pub fn new(gate: &BooleanGate) -> Self {
+        assert_eq!(gate.name(), NAME);
+        let (circuit, operations) = compress_circuit();
+        let layout = circuit.layout().expect("the compression row lays out");
+        let op = operations.iter().find(|op| op.kind == OPERATION).unwrap();
+        let base = layout.value_position(op.columns[0]).expect("placed");
+        assert_eq!(
+            base % 64,
+            KERNEL_BIT,
+            "the compression moved within its word"
+        );
+        assert!(
+            (base + G_REGION_BITS).is_multiple_of(64),
+            "the rounds end mid-word"
+        );
+        let end = base + Blake3Kernel.width();
+        let io: Vec<usize> = gate
+            .table()
+            .io_schema
+            .iter()
+            .map(|w| 2 * w.word_col)
+            .collect();
+        let inputs: [usize; 7] = io[..7].try_into().unwrap();
+        let next = io[NEXT];
+        // The bits computed per row; the template supplies the rest.
+        let useful_words = gate.useful_bits().div_ceil(64);
+        let mut computed = vec![0u64; useful_words];
+        for &w in inputs.iter().chain([&next]) {
+            computed[w..w + 2].fill(!0);
+        }
+        for p in base..end {
+            computed[p / 64] |= 1 << (p % 64);
+        }
+        // The template: the gate's own packer on one group of zero rows.
+        let len = BM_V << (gate.k_log() - 7);
+        let mut z = vec![F128::ZERO; len];
+        let (mut a, mut b) = (z.clone(), z.clone());
+        let zero: Vec<Box<[F128]>> = vec![vec![F128::ZERO; 7].into(); BM_V];
+        gate.pack_into(
+            &zero,
+            SlotWitnessDest {
+                z: &mut z,
+                a: &mut a,
+                b: &mut b,
+                elide_padding_writes: false,
+                dead_padding_unread: false,
+            },
+        );
+        let word = |buf: &[F128], w: usize| {
+            let v = buf[(w / 2) * BM_V];
+            (if w.is_multiple_of(2) { v.lo } else { v.hi }) & !computed[w]
+        };
+        let fixed = (0..useful_words)
+            .filter(|&w| computed[w] != !0)
+            .map(|w| (w, [word(&z, w), word(&a, w), word(&b, w)]))
+            .collect();
+        Self {
+            k_log: gate.k_log(),
+            useful_bits: gate.useful_bits(),
+            inputs,
+            next,
+            kernel_word: base / 64,
+            fixed,
+        }
+    }
+
+    /// The slot's `z`, `A·z`, `B·z` into `dst`; returns the lincheck stripe.
+    pub fn pack_into(&self, rows: &[Box<[F128]>], dst: SlotWitnessDest<'_>) -> Vec<u8> {
+        let capacity = dst.z.len() >> (self.k_log - 7);
+        drive_witness_batch_major_partial_into(
+            rows,
+            capacity.trailing_zeros() as usize,
+            self.k_log,
+            self.useful_bits,
+            dst,
+            |rows, rz, ra, rb| self.group(rows.map(|r| &**r), rz, ra, rb),
+        )
+    }
+
+    fn group(&self, rows: [&[F128]; BM_V], rz: &mut [BmRow], ra: &mut [BmRow], rb: &mut [BmRow]) {
+        // The kernel stores every word of its run whole, keeping the fixed
+        // bits below it (its rounds end on a word boundary), so the rows
+        // need no clearing.
+        for &(w, [z, a, b]) in &self.fixed {
+            (rz[w], ra[w], rb[w]) = ([z; BM_V], [a; BM_V], [b; BM_V]);
+        }
+        // Arguments: cv, the block, the counter (zero), block length, flags.
+        let args: [[u64; 14]; BM_V] = rows.map(|r| {
+            let mut args = [0; 14];
+            for (i, w) in r[..6].iter().enumerate() {
+                (args[2 * i], args[2 * i + 1]) = (w.lo, w.hi);
+            }
+            args[13] = r[6].lo.rotate_left(32);
+            args
+        });
+        let base = 64 * self.kernel_word + KERNEL_BIT;
+        Blake3Kernel.fill8_inline(args.each_ref().map(|a| &a[..]), base, rz, ra, rb);
+        let mut store = |w: usize, v: [F128; BM_V]| {
+            for (w, half) in [(w, v.map(|x| x.lo)), (w + 1, v.map(|x| x.hi))] {
+                (rz[w], ra[w], rb[w]) = (half, half, [!0; BM_V]);
+            }
+        };
+        for (i, &w) in self.inputs.iter().enumerate() {
+            store(w, rows.map(|r| r[i]));
+        }
+        store(self.next, rows.map(|r| next_step(r[M + 1])));
+    }
 }
 
 #[cfg(test)]

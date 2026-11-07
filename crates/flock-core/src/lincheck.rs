@@ -424,6 +424,8 @@ impl CscCircuit {
     pub fn from_matrices(a_0: &SparseBinaryMatrix, b_0: &SparseBinaryMatrix) -> Self {
         assert_eq!(a_0.num_rows, b_0.num_rows);
         assert_eq!(a_0.num_cols, b_0.num_cols);
+        // `gather_sum` masks row indices by the width.
+        assert!(a_0.num_cols.is_power_of_two() && a_0.num_rows <= a_0.num_cols);
         let (a_col_ptr, a_rows) = csc_from_rows(a_0);
         let (b_col_ptr, b_rows) = csc_from_rows(b_0);
         Self {
@@ -441,6 +443,34 @@ impl CscCircuit {
         self.const_pin = const_pin;
         self
     }
+
+    /// Column `c`'s eq-weighted sums over `A_0` and `B_0`.
+    fn col_sums(&self, c: usize, eq_inner: &[F128]) -> (F128, F128) {
+        let a = &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize];
+        let b = &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize];
+        (gather_sum(a, eq_inner), gather_sum(b, eq_inner))
+    }
+}
+
+/// `Σ_{r ∈ rows} eq[r]` in two interleaved chains. One chain waits on each
+/// XOR; two keep the gather loads busy (BLAKE3's 44M nonzeros: 19.8 → 8.4 ms
+/// single-core). `eq.len()` is a power of two above every row
+/// ([`CscCircuit::from_matrices`]), so the mask is exact and lets the
+/// compiler drop the bounds checks.
+#[inline(always)]
+fn gather_sum(rows: &[u32], eq: &[F128]) -> F128 {
+    let mask = eq.len() - 1;
+    let eq = &eq[..=mask];
+    let (pairs, rest) = rows.as_chunks::<2>();
+    let (mut s0, mut s1) = (F128::ZERO, F128::ZERO);
+    for &[r0, r1] in pairs {
+        s0 += eq[r0 as usize & mask];
+        s1 += eq[r1 as usize & mask];
+    }
+    for &r in rest {
+        s0 += eq[r as usize & mask];
+    }
+    s0 + s1
 }
 
 impl LincheckCircuit for CscCircuit {
@@ -453,14 +483,7 @@ impl LincheckCircuit for CscCircuit {
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), self.n_cols);
         let one_col = |c: usize| {
-            let mut sa = F128::ZERO;
-            for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
-                sa += eq_inner[r as usize];
-            }
-            let mut sb = F128::ZERO;
-            for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
-                sb += eq_inner[r as usize];
-            }
+            let (sa, sb) = self.col_sums(c, eq_inner);
             alpha * sa + sb
         };
         if self.n_cols < SUMCHECK_PAR_THRESHOLD {
@@ -479,17 +502,7 @@ impl LincheckCircuit for CscCircuit {
     /// multiply disappears. The default would walk twice.
     fn fold_split(&self, eq_inner: &[F128]) -> (Vec<F128>, Vec<F128>) {
         assert_eq!(eq_inner.len(), self.n_cols);
-        let one_col = |c: usize| {
-            let mut sa = F128::ZERO;
-            for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
-                sa += eq_inner[r as usize];
-            }
-            let mut sb = F128::ZERO;
-            for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
-                sb += eq_inner[r as usize];
-            }
-            (sa, sb)
-        };
+        let one_col = |c: usize| self.col_sums(c, eq_inner);
         if self.n_cols < SUMCHECK_PAR_THRESHOLD {
             return (0..self.n_cols).map(one_col).unzip();
         }
@@ -560,6 +573,13 @@ pub struct LincheckProof {
     /// catches.
     ///
     /// Empty on the single-table path, which does not accumulate.
+    ///
+    /// When the union checks linear rows (`η` sampled), each type that
+    /// drops words reports its pair over its KEPT rows, and one more pair
+    /// `(⟨W_t, D_t·(A_0 + I)⟩, 0)` per such type follows the `T` pairs, in
+    /// type order: the dropped rows' identity value, so every reported
+    /// value names a static matrix. A union that drops nothing keeps
+    /// exactly `T` pairs.
     pub matrix_evals: Vec<(F128, F128)>,
     /// PoW nonces in Fiat--Shamir order: the α batching challenge, one β
     /// constant-wire challenge per pinned circuit, one nonce per multilinear
