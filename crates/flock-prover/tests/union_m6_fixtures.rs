@@ -142,6 +142,8 @@ fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<Sha2Compression> {
         .collect()
 }
 
+// Re-pinned 2026-11-07: proof-IO v25 (transcript-v4) — only the bundle
+// header byte moved; the header-less anchor did not, which is the cross-check.
 // Re-pinned 2026-11-03: proof-IO v24 (`MergedInnerOpen` variant tag); the
 // header-less anchors move too, since the tag is in the payload.
 // Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
@@ -221,22 +223,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "ff6884fb756442a24e312c8ec3fa0c9fdd372203b1639990906ec2123da11e04",
+            "413efa2da695c0c11760e8775feec1aae1e79c0e6e951c1aea02147d73e92d95",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "dbc650deede6af078a96635cd60f791c95048ca826ef6bba2cd4b129b248b4c5",
+            "faf2e1f1329adffd8a118f90b8dbfd758f65e3ca5f0e15866547759363b191aa",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "a4a1bde7a66898f72bfc0645be49c133f8769c0de2beadbb22121cb25fe72807",
+            "ec787e1dbf644867fb1aedf143d75b67fa8a919104e650a377d2846bbcc11a97",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "2672fc813da276e953037aa1b227658cc28ca3a8978c7d007e3a6a53b4f2058e",
+            "5e28a10b77b5441fda124322df3f664314996c56b779e1dba85f43cf8b16752d",
         ),
     ];
 

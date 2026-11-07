@@ -500,12 +500,12 @@ pub(super) fn merge_chain(
         let cm = cmap(i);
         for (k, half) in [(c.seed_squeeze, 0usize), (c.seed_squeeze + 1, 1)] {
             link_word(
-                woffs[i] + c.child_seed_word + 2 * half,
+                woffs[i] + c.child_seed_word + c.half_stride * half,
                 pmap(p.squeezes[k][0]),
             );
         }
         for (k, half) in [(c.digest_squeeze, 0usize), (c.digest_squeeze + 1, 1)] {
-            link_word(c.parent_digest_word + 2 * half, cm(c.trace.squeezes[k][0]));
+            link_word(c.parent_digest_word + c.half_stride * half, cm(c.trace.squeezes[k][0]));
         }
     }
 

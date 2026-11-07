@@ -1320,10 +1320,12 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 // Re-blessed 2026-11-06: the envelope retune (publics 5684 -> 3712,
 // ACC_MAIN 1152 -> 832, lanes 31 -> 26) moves the three outer circuits;
 // the chain leaf and both registries are unchanged.
+// Re-blessed 2026-11-07: transcript-v4 (scalar runs share one header)
+// moves the same three; chain circuit and registries unchanged.
 const PIN_CHAIN_CIRCUIT: &str = "f7a065447042245cccc573887e714d1a9f754583a7d0f120c9753e51d6037fa3";
-const PIN_FL_CIRCUIT: &str = "ce4612e10dcbddac22576188aad82d5776bcfb5dbeb136115c984a0ad9241679";
-const PIN_BASE_CIRCUIT: &str = "a0ac7db0c2537838dec2925db1ced13931388d22011a90ab7ee8a40c4d151962";
-const PIN_STEADY_CIRCUIT: &str = "922aef651517ddd70beae10abc1d80b9e716b0c91a9443a5343b16d528f29811";
+const PIN_FL_CIRCUIT: &str = "836df6b8094c0cd05d9014bcfc2d3b21d34bd62287052bc89d115a422b2b7c3b";
+const PIN_BASE_CIRCUIT: &str = "17626ba5d2beca46bc1e64529a6b3a51f848e19391fd63b8f493d7b4b8075322";
+const PIN_STEADY_CIRCUIT: &str = "5269f823a7b4c9a3ee93915aad0783150c1c195ec61ea3804b87cb2d9b94546d";
 const PIN_CHAIN_REGISTRY: &str = "c2a387fffa3d06ccf25e341c2faa4e5d9b62015fc3f74a8364206ff08abb24a3";
 const PIN_OUTER_REGISTRY: &str = "5bdf79293868d752b83306b0b77cf26067b86b779eb1edc1a4ac7f00ddb35520";
 const PIN_PUBLICS_LEN: usize = 3712;

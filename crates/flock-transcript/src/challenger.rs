@@ -4,7 +4,7 @@
 //! [`FsChallenger`] supports SHA-256 and BLAKE3.
 //! `RandomChallenger` supports tests and benchmarks only.
 
-use std::{array::from_fn, env::var_os, sync::LazyLock};
+use std::{array::from_fn, env::var_os, mem::take, sync::LazyLock};
 
 use blake3::{Hasher, IncrementCounter, hash, platform::Platform};
 use flock_field::{F128, F256};
@@ -298,6 +298,9 @@ pub const OP_BYTES: u8 = 0x05;
 
 pub const KIND_SCALAR: u8 = 0x01;
 pub const KIND_SLICE: u8 = 0x02;
+/// A RUN of consecutive `observe_f128` calls on the duplex chain
+/// (transcript-v4): one header carrying the run length, then the values.
+pub const KIND_RUN: u8 = 0x03;
 pub const KIND_NONE: u8 = 0x00;
 
 /// Global Fiat–Shamir hash counters, enabled with `--features hash-count`.
@@ -590,6 +593,14 @@ impl B3Chain {
 #[derive(Clone)]
 pub struct FsChallenger {
     state: FsState,
+    /// The duplex chain's pending SCALAR RUN (transcript-v4): consecutive
+    /// `observe_f128` values held back until the next other op, then
+    /// absorbed as ONE `[header(OP_OBSERVE, KIND_RUN, n) | values]` record.
+    /// The record is self-delimiting exactly like a slice, so the encoding
+    /// stays injective over every op sequence; it only drops the per-scalar
+    /// header words (a third of a recursion child's transcript replay).
+    /// Always empty for the SHA-256 and tree-BLAKE3 disciplines.
+    run: Vec<F128>,
     /// Running total of absorbed transcript bytes.
     #[cfg(feature = "hash-count")]
     n_absorbed: u64,
@@ -619,6 +630,7 @@ impl FsChallenger {
                 HashKind::Sha256 => FsState::Sha256(Sha256::new()),
                 HashKind::Blake3 => FsState::Blake3(Box::new(Hasher::new())),
             },
+            run: Vec::new(),
             #[cfg(feature = "hash-count")]
             n_absorbed: 0,
         };
@@ -636,6 +648,7 @@ impl FsChallenger {
     pub fn with_chained_blake3(domain: &[u8]) -> Self {
         let mut c = Self {
             state: FsState::Blake3Chain(B3Chain::new()),
+            run: Vec::new(),
             #[cfg(feature = "hash-count")]
             n_absorbed: 0,
         };
@@ -693,6 +706,28 @@ impl FsChallenger {
     /// `observe_f128`, and the length still binds.
     #[inline]
     fn absorb_header(&mut self, op: u8, kind: u8, len: u64) {
+        self.flush_run();
+        self.absorb_header_raw(op, kind, len);
+    }
+
+    /// Absorb the pending scalar run as one record. Every op other than
+    /// `observe_f128` calls this first (headers through
+    /// [`Self::absorb_header`], squeezes and the fused PoW explicitly), so
+    /// the run's bytes precede whatever ends it.
+    #[inline]
+    fn flush_run(&mut self) {
+        if self.run.is_empty() {
+            return;
+        }
+        let run = take(&mut self.run);
+        self.absorb_header_raw(OP_OBSERVE, KIND_RUN, run.len() as u64);
+        for v in run {
+            self.absorb_f128(v);
+        }
+    }
+
+    #[inline]
+    fn absorb_header_raw(&mut self, op: u8, kind: u8, len: u64) {
         let mut h = [0u8; 16];
         h[0] = op;
         h[1] = kind;
@@ -730,6 +765,7 @@ impl FsChallenger {
     /// finalizes the cloned state once and fills straight from the reader —
     /// no counter, and no per-32-byte re-finalization.
     fn squeeze_into(&mut self, out: &mut [u8]) {
+        self.flush_run();
         match &mut self.state {
             FsState::Sha256(hasher) => {
                 let mut off = 0usize;
@@ -756,6 +792,7 @@ impl FsChallenger {
     /// so both sides stay in lockstep.
     #[inline]
     fn state_digest(&mut self) -> [u8; 32] {
+        self.flush_run();
         #[cfg(feature = "hash-count")]
         {
             SQUEEZES.fetch_add(1, Ordering::Relaxed);
@@ -796,6 +833,10 @@ impl Challenger for FsChallenger {
     }
 
     fn observe_f128(&mut self, value: F128) {
+        if matches!(self.state, FsState::Blake3Chain(_)) {
+            self.run.push(value);
+            return;
+        }
         self.absorb_header(OP_OBSERVE, KIND_SCALAR, 1);
         self.absorb_f128(value);
     }
@@ -836,6 +877,7 @@ impl Challenger for FsChallenger {
         // 256 bits of parent state (sampled by `fork`'s default body, which
         // advances the parent and binds the fork point) seed the child under
         // its own domain.
+        debug_assert!(self.run.is_empty(), "a fork follows its seed squeezes");
         let mut child = match &self.state {
             FsState::Sha256(_) => Self::with_hash(label, HashKind::Sha256),
             FsState::Blake3(_) => Self::with_hash(label, HashKind::Blake3),
@@ -965,6 +1007,7 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow_and_sample_f128(&mut self, bits: u32) -> (u64, F128) {
+        self.flush_run();
         if let FsState::Blake3Chain(c) = &mut self.state {
             let mut bytes = [0u8; 16];
             let nonce = c.grind_pow_squeeze_into(bits, &mut bytes);
@@ -979,6 +1022,7 @@ impl Challenger for FsChallenger {
     }
 
     fn verify_pow_and_sample_f128(&mut self, nonce: u64, bits: u32) -> Option<F128> {
+        self.flush_run();
         if let FsState::Blake3Chain(c) = &mut self.state {
             let mut bytes = [0u8; 16];
             if !c.apply_pow_squeeze(nonce, bits, &mut bytes) {
@@ -996,6 +1040,7 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow_and_sample_f128_vec(&mut self, bits: u32, n: usize) -> (u64, Vec<F128>) {
+        self.flush_run();
         if let FsState::Blake3Chain(c) = &mut self.state {
             assert!(n != 0, "a fused PoW vector squeeze must be nonempty");
             let mut bytes = vec![0u8; 16 * n];
@@ -1012,6 +1057,7 @@ impl Challenger for FsChallenger {
         bits: u32,
         n: usize,
     ) -> Option<Vec<F128>> {
+        self.flush_run();
         if let FsState::Blake3Chain(c) = &mut self.state {
             assert!(n != 0, "a fused PoW vector squeeze must be nonempty");
             let mut bytes = vec![0u8; 16 * n];
