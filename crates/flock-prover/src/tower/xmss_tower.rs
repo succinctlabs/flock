@@ -720,18 +720,21 @@ fn xmss_tower_vk_fingerprint_pinned() {
 // identical prints, after the review fixes (leaf PoW rows, in-circuit
 // nonzero grand products, the wired shared-binding tails). The outer
 // registry is the chain tower's (one envelope registry).
+// Re-blessed 2026-11-06: the Fast leaf's +1/level ladder (proof-IO v25)
+// and the lane pin 28 → 31 move the FL, base and steady circuits; the leaf
+// circuit, both registries and publics UNCHANGED. Two identical prints.
 #[cfg(test)]
 const PIN_XMSS_LEAF_CIRCUIT: &str =
     "d83e5ba428a73c8488197e7d1a26c5ab9d17b6a0fc08cebae5465da314955ed4";
 #[cfg(test)]
 const PIN_XMSS_FL_CIRCUIT: &str =
-    "ae13d7065e65a898d53a54543ed85dfef92226bec26589dbf96a7eddbe906ae0";
+    "0578d284f96bb3708eced0076a138e745ddec978063f97b7ece658034eb0554f";
 #[cfg(test)]
 const PIN_XMSS_BASE_CIRCUIT: &str =
-    "82f3c6108ac88d6730ebe119ccbf5dfd5ad918e6cf983afc52ee3eb85f065cf4";
+    "e5c7a4268813111451ea4079b2e00f7f6c21c7cc5e94a98a0c184e10f06cb5db";
 #[cfg(test)]
 const PIN_XMSS_STEADY_CIRCUIT: &str =
-    "167e6bbee13eb6f14342b3e879e944c712a865a320cad5e10ba0b9596910bae6";
+    "57446ae5e0c8fa5fbc82d605b2eadb04f64067842001df3cb573668c8dc71ab1";
 #[cfg(test)]
 const PIN_XMSS_LEAF_REGISTRY: &str =
     "8ff30c7b07014589d55707fd8a968df8337fc9beb9d4520c350d31b23d56d85b";

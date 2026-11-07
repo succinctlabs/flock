@@ -36,6 +36,13 @@ against your unmodified tip, none introduced by our commits.
 > ladder, PoW and target — the "only the query target differs" statements
 > below describe the pre-consolidation code and are kept as the record of
 > how the 100-bit variants were derived.
+>
+> **Follow-up (2026-11-06, proof-IO v25):** strict `Fast` went back to the
+> +1/level ladder and kept its 16-bit query PoW (m29 rates 1/2/3/4/5, Σq
+> 550 vs 435; m32 Σq 591 vs 460). Natively, the +2 ladder's recursive
+> commits cost more than the extra queries: leanXMSS leaves prove 7–9%
+> faster for a 12–13% larger proof. `Slim`, which the tower outers verify
+> in-circuit per query, keeps the +2 ladder.
 
 | | 100-bit | 128-bit |
 | --- | --- | --- |

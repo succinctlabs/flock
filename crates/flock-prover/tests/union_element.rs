@@ -1302,45 +1302,49 @@ fn bundle_digest_merged(
 // the dense column coordinates first. The other six fixtures are partial or
 // already a prefix and held byte-identical. Two deterministic print runs
 // agreed.
+// Re-pinned 2026-11-06: proof-IO VERSION 24 -> 25, `Fast` back on the
+// +1/level recursion ladder (rates 1/2/3/4/5, keeping its 16-bit query
+// PoW). All seven fixtures moved (level rates, query counts and
+// caps). Two deterministic print runs agreed.
 #[test]
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "29c86f0b9211babda7a64cb57456b3b7c76341ce470c773d0ed08ed211a37205",
+            "7c65c5c50df4681275d1104dc0c35a3491fb25609408026c58763319c31bc6db",
         ),
         (
             "elem-merged-nu12-2731",
             2731,
-            "ad0497a7863b73cda94d3ca7463d0b91359262fc962ce8c9f12f19e69ed753d9",
+            "66e7613dad6ff08b0bd4bda8cdae42d34841ecaa2fc961ac6dca240d5c160431",
         ),
         (
             "elem-merged-nu12-0",
             0,
-            "92e265b26dd16b274c0f4d985449efaad0020a9deb1d283cdf1cda2d2c29f813",
+            "9dca3abda0e33206b28d636147cddd0dd03ed4f5bee124511aa3a7b5bf9c7952",
         ),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "cdd7c528fcbac61f708ef04d42ede15caf3c2b800b6fdf49682740c597bdeb06",
+            "8aade9e5c3b2a6731dcab2dde43063b648a17465ac9b6a2b1e0b2d852d195767",
         ),
         (
             "mix-merged-nu7-100-90",
             [100, 90],
-            "ecbfcfd4d98318e537b0b5090b3b9306ea142a2d88a5bb48f89498fdf3bbfff6",
+            "a4e1f5e643828a377c949ed256784667de78236a7d0925a46e76b25d3a483ec8",
         ),
         (
             "mix-merged-nu7-0-90",
             [0, 90],
-            "4fbd01dfdb65e0be475acef7dc8a728ba68af08f22a48c1ecc8599f12704dd57",
+            "3d5923643f364fffe0b089c0c092981a7888b92a53b3a82bbe927c7add7b7377",
         ),
         (
             "mix-merged-nu7-100-0",
             [100, 0],
-            "bd1ed5ee049132b7950b8dedb667475d19d5f6fc977eab8b65b7774875c7719d",
+            "d41b43c4bb63facde33e941425f0620390b759dd602b0ae258fc782c2b249cdb",
         ),
     ];
 
