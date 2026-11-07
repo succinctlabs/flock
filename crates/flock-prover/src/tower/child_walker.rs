@@ -1646,6 +1646,7 @@ impl<'p> ChildTape<'p> {
             chals,
             HashKind::Blake3,
             &strat_scheds(&inner.pcs),
+            inner.pcs.lane_major(),
         );
         let b3_rows = trace.rows.len() + h_rows + query_phase_blake3_rows(&geo);
         if var("B3_CENSUS").is_ok() {

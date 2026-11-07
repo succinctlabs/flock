@@ -350,12 +350,13 @@ pub fn open_batch_mixed_ligerito_seeded<Ch: Challenger>(
         lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
     );
 
-    // Integer-lane (lane-major) commitments are supported ONLY in the
-    // merged transport's inner-open configuration (no RS claims, one
-    // EqPoint claim): the eq basis folds honestly over the zero-padding
-    // lanes (live-block skip disabled) and the round-0 prime pairs blocks.
+    // Lane-major commitments (any lane count, full included — see
+    // `PcsParams::num_lanes`) are supported ONLY in the merged transport's
+    // inner-open configuration (no RS claims, one EqPoint claim): the eq
+    // basis folds honestly over the zero-padding lanes (live-block skip
+    // disabled) and the round-0 prime pairs blocks.
     let l0_num_lanes = commitment.params.num_ntts();
-    let lane_major = l0_num_lanes < 1usize << lig_config.initial_k;
+    let lane_major = commitment.params.lane_major();
     let log_n = commitment.params.m - LOG_PACKING;
     if lane_major {
         assert!(
@@ -402,8 +403,10 @@ pub fn open_batch_mixed_ligerito_seeded<Ch: Challenger>(
     // CERTIFICATION knob for alternating A/B runs; both settings produce the
     // same b values, hence byte-identical proofs.
     // Lane-major only: the virtual basis rides the BLOCKED L0 fold, which is
-    // what every shipped merged-transport open runs (a pow2-lane inner keeps
-    // the tuned element-pairing kernel and its round-0 JIT).
+    // what every shipped merged-transport open runs — union commits are
+    // lane-major at every fill, full grids included. A `num_lanes: None`
+    // inner (the low-bit grid) keeps the tuned element-pairing kernel and
+    // its round-0 JIT, at roughly twice the L0 cost.
     let virtual_b = eq_basis.is_some() && lane_major && virtual_b_enabled();
     let vbasis = if virtual_b {
         // The point IS the claim's, and γ is its single transcript scalar —
@@ -1261,7 +1264,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     // residual machinery has no rotated-point path; reject rather than
     // mis-evaluate. (The claim shapes are statement-derived, so this is an
     // assert, not an attacker-reachable rejection.)
-    let lane_major = commitment.params.num_ntts() < 1usize << lig_config.initial_k;
+    let lane_major = commitment.params.lane_major();
     assert!(
         !lane_major || n_rs == 0,
         "lane-major mixed verify: packed-direct claims only"
@@ -1407,7 +1410,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
         log_n,
         target_combined,
         &commitment.cap,
-        commitment.params.num_ntts(),
+        commitment.params.num_lanes,
         eval_b_residual,
         challenger,
     );

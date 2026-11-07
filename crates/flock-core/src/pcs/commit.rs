@@ -66,18 +66,24 @@ pub struct PcsParams {
     /// (`profile.log_inv_rate() == log_inv_rate`). Defaults to `Fast`.
     #[serde(default)]
     pub profile: LigeritoProfile,
-    /// **Integer-lane commit** (optional). `None` (the default) commits the
-    /// full `2^log_batch_size` interleaved lanes — today's power-of-two
-    /// scheme. `Some(t)` with `1 ≤ t ≤ 2^log_batch_size` commits exactly `t`
-    /// integer lanes, each of size `2^log_dim`, so the committed message is
-    /// `t · 2^log_dim ≤ 2^(m−7)` F_{2^128} words — eliminating the encode +
-    /// Merkle work of the `2^log_batch_size − t` zero lanes. The per-lane
-    /// codeword length (`n_positions = 2^k_code`, hence `n_leaves`) is
-    /// UNCHANGED; only the leaf width (`t` F128 = `t·16` bytes) and the total
-    /// codeword length shrink. When `t == 2^log_batch_size` the commit is
-    /// byte-identical to `None` (`num_ntts` and every derived quantity
-    /// coincide). The Ligerito `initial_k` stays `log_batch_size`; lanes
+    /// **Lane layout** of the committed grid. `None` (the default) is the
+    /// power-of-two scheme: all `2^log_batch_size` lanes, lane = the LOW
+    /// index bits (lane `l` holds words `l, l + 2^log_batch_size, …`).
+    ///
+    /// `Some(t)` with `1 ≤ t ≤ 2^log_batch_size` is the LANE-MAJOR layout
+    /// ([`commit_lane_major`]): lane = the HIGH index bits (lane `l` is the
+    /// contiguous block `q[l·2^log_dim .. (l+1)·2^log_dim)`), and only the
+    /// first `t` lanes are committed, so the encode + Merkle work of the
+    /// `2^log_batch_size − t` zero lanes disappears. The per-lane codeword
+    /// length (`n_positions = 2^k_code`, hence `n_leaves`) is UNCHANGED; only
+    /// the leaf width (`t` F128 = `t·16` bytes) and the total codeword length
+    /// shrink. The Ligerito `initial_k` stays `log_batch_size`; lanes
     /// `[t, 2^log_batch_size)` are definitionally zero on the opening side.
+    ///
+    /// `Some(2^log_batch_size)` is lane-major too — a full grid in the
+    /// rotated order, NOT the `None` grid: the opener and every verifier
+    /// read the layout from [`Self::lane_major`], never from `t`. (Only the
+    /// low-bit [`commit`] function ignores `num_lanes` at full width.)
     #[serde(default)]
     pub num_lanes: Option<usize>,
     /// Hash backing the Merkle commitment. Defaults to SHA-256, so params
@@ -189,6 +195,12 @@ impl PcsParams {
     /// scheme). Always in `[1, 2^log_batch_size]`.
     pub fn num_ntts(&self) -> usize {
         self.num_lanes.unwrap_or(1usize << self.log_batch_size)
+    }
+    /// Whether the committed grid is lane-major (lane = high index bits):
+    /// exactly when `num_lanes` is set, whatever its value. The opening and
+    /// every verifier — native and in-circuit — dispatch on this.
+    pub fn lane_major(&self) -> bool {
+        self.num_lanes.is_some()
     }
     /// Committed message length in F_{2^128} words = `num_ntts() · 2^log_dim`.
     /// Equals `2^log_msg_len` on the power-of-two path (`num_lanes == None`).
@@ -881,9 +893,9 @@ fn pipelined_commit(
 
 /// Number of nonzero high-bit lanes of a dense stack: `ceil(dense_words / D)`
 /// with `D = 2^log_dim`. Lanes `[t, 2^log_batch_size)` are wholly zero and are
-/// not committed. Returns `2^log_batch_size` when the stack is full (the
-/// power-of-two case — callers should then keep `num_lanes = None` so the
-/// commit stays byte-identical to today's).
+/// not committed. Returns `2^log_batch_size` when the stack is full — still
+/// a lane-major `num_lanes`, not the low-bit `None` grid (see
+/// `PcsParams::num_lanes`).
 pub fn dense_lanes(dense_words: usize, log_batch_size: usize, log_dim: usize) -> usize {
     dense_words
         .div_ceil(1usize << log_dim)
@@ -1567,11 +1579,11 @@ mod tests {
         }
     }
 
-    /// Oracle 1 (pow2 byte-identity anchor) at the commit level: committing
-    /// `num_lanes = Some(2^log_batch_size)` is byte-identical — root, codeword,
-    /// and full Merkle tree — to the default `num_lanes = None`. This is the
-    /// safety net: the integer-lane path collapses to today's path at full
-    /// lane utilization.
+    /// The low-bit [`commit`] function ignores `num_lanes` at full width:
+    /// `Some(2^log_batch_size)` commits the same bytes — root, codeword and
+    /// full Merkle tree — as `None`. (The OPENING does not: `Some` of any
+    /// value means the lane-major grid, which [`commit_lane_major`] builds;
+    /// see `PcsParams::num_lanes`.)
     #[test]
     fn commit_pow2_num_lanes_byte_identical() {
         let mut rng = Rng::new(0xA0C1);

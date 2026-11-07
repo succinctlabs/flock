@@ -730,3 +730,28 @@ fn dropped_word_tamper_is_rejected_end_to_end() {
         "{verdict:?}"
     );
 }
+
+/// A layout whose dense stack fills every commit lane — two signatures at
+/// `nu = 7`, 64 of 64 — commits lane-major like any other fill (it used to
+/// fall back to the low-bit power-of-two grid and lose the statistics
+/// ladder), then proves and verifies.
+#[test]
+fn full_lane_grid_proves_and_verifies() {
+    let (statements, sigs) = signed(2, 11);
+    let circuit = XmssCircuit::with_nu(2, Some(7));
+    let params = XmssCircuit::pcs_params(&circuit.union());
+    assert_eq!(
+        params.num_lanes,
+        Some(1 << params.log_batch_size),
+        "the dense stack fills every lane"
+    );
+    assert!(params.lane_major());
+    let witness = circuit.witness(&statements, &sigs);
+    let proof = circuit.prove(&witness);
+    circuit
+        .verify(&statements, &proof)
+        .expect("honest proof verifies");
+    let mut tampered = statements.clone();
+    tampered[1].msg[0] ^= 1;
+    assert!(circuit.verify(&tampered, &proof).is_err(), "message");
+}

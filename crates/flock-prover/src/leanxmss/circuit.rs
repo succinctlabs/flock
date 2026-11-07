@@ -416,12 +416,10 @@ const COMMITTED_FRACTION: f64 = 0.73;
 /// - 0.39 ms per declared Mbit: witness, commit, zerocheck, lincheck;
 /// - 0.124 ms per declared 128-bit column: 0.054 proving (the opening's
 ///   per-column statistics, one wiring port per slot), 0.070 verifying;
-/// - Ligerito on the dense stack, `2^m` words at 10.4 ns (75 ms floor),
-///   twice that when the stack fills every commit lane: the opening then
-///   loses its lane-major statistics ladder and sweeps the stack.
+/// - Ligerito on the dense stack, `2^m` words at 10.4 ns (75 ms floor).
 ///
 /// The dense stack is estimated as [`COMMITTED_FRACTION`] of the declared
-/// cells, so the full-lane test keeps half a percent of margin.
+/// cells.
 fn layout_cost(kinds: &[(usize, usize)], nu: usize) -> f64 {
     let (mut bits, mut columns) = (0f64, 0f64);
     for &(count, k_log) in kinds {
@@ -431,11 +429,7 @@ fn layout_cost(kinds: &[(usize, usize)], nu: usize) -> f64 {
     }
     let dense = COMMITTED_FRACTION * bits / (1u64 << LOG_PACKING) as f64;
     let m_words = (dense.log2().ceil() as usize).max(1);
-    let lanes_log = embedded_initial_k_or_default(m_words + LOG_PACKING, LigeritoProfile::Fast);
-    let lane = (1u64 << m_words.saturating_sub(lanes_log)) as f64;
-    let full_lanes = dense * 1.005 > ((1u64 << lanes_log) - 1) as f64 * lane;
-    let ligerito =
-        (10.4e-6 * (1u64 << m_words) as f64).max(75.0) * if full_lanes { 2.0 } else { 1.0 };
+    let ligerito = (10.4e-6 * (1u64 << m_words) as f64).max(75.0);
     0.39 * bits / 1e6 + 0.124 * columns + ligerito
 }
 
