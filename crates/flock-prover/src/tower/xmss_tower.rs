@@ -473,20 +473,27 @@ impl XmssTower {
 fn xmss_tower_e2e() {
     use std::time::Instant;
 
-    use crate::tower::{test_config, xmss_leaf::signed};
+    use crate::tower::{
+        test_config,
+        xmss_leaf::{XMSS_LEAF_NU, signed},
+    };
     let cfg = test_config();
     let n: usize = std::env::var("XMSS_N")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
     // A small batch takes a tall slot (one slot per gate kind, the
-    // production shape); `XMSS_NU` overrides.
+    // production shape), a production batch the envelope's
+    // [`XMSS_LEAF_NU`]; `XMSS_NU` overrides.
     let nu = std::env::var("XMSS_NU")
         .ok()
         .and_then(|v| v.parse().ok())
-        .or((n < 64).then_some(9));
-    let circuit =
-        XmssCircuit::with_options(n, nu, crate::leanxmss::circuit::XmssOptions::RECURSION_LEAF);
+        .unwrap_or(if n < 64 { 9 } else { XMSS_LEAF_NU });
+    let circuit = XmssCircuit::with_options(
+        n,
+        Some(nu),
+        crate::leanxmss::circuit::XmssOptions::RECURSION_LEAF,
+    );
     let batch = |seed: u64| {
         if n < 64 {
             signed(n, seed)
@@ -566,7 +573,7 @@ fn xmss_tower_e2e() {
     );
     // The key is statement-independent: this VK, from other batches, has
     // the pinned fingerprint at the pinned shape.
-    if n == 4 && nu == Some(9) {
+    if n == 4 && nu == 9 {
         let fp = vk.fingerprint();
         let hex = |d: &[u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
         assert_eq!(hex(&fp.fl_circuit), PIN_XMSS_FL_CIRCUIT, "FL circuit");
@@ -789,13 +796,15 @@ fn xmss_tower_online_bench() {
             envelope::STEADY_OVERRIDE,
             online::{Online, median_total, report_stage},
             test_config,
+            xmss_leaf::XMSS_LEAF_NU,
         },
     };
     let cfg = test_config();
     let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     let runs = env("BENCH_RUNS").unwrap_or(3);
     let n = env("XMSS_N").unwrap_or(992);
-    let circuit = XmssCircuit::with_options(n, env("XMSS_NU"), XmssOptions::RECURSION_LEAF);
+    let nu = env("XMSS_NU").unwrap_or(XMSS_LEAF_NU);
+    let circuit = XmssCircuit::with_options(n, Some(nu), XmssOptions::RECURSION_LEAF);
     let cached = |seed: u64| cached_keyless_batch(n, seed);
     let batches: Vec<(Vec<Statement>, Vec<Signature>)> =
         (0..6u64).map(|i| cached(101 + i)).collect();

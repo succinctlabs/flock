@@ -46,6 +46,15 @@ use crate::{
 /// BLAKE3 transcript with the leanXMSS domain.
 pub(super) const XMSS_DOMAIN: &[u8] = FIAT_SHAMIR_DOMAIN;
 
+/// `log2` rows per slot of a production leanXMSS leaf (992 signatures). The
+/// first-level envelope's public segment and tail blocks are fitted to this
+/// shape, and every slot adds claims the parent publishes, so the tower
+/// pins it rather than taking [`crate::leanxmss::circuit::plan_nu`]'s
+/// standalone choice: 992 signatures at `2^14`-row slots overshoot the
+/// envelope's publics (5065 > 4266).
+#[cfg(test)]
+pub(crate) const XMSS_LEAF_NU: usize = 15;
+
 /// One leanXMSS leaf: the proof, deferred-verified, as a tower child.
 pub struct XmssLeaf {
     pub(super) inner: MixedInner,
@@ -218,7 +227,7 @@ pub(super) fn signed(n: usize, seed: u64) -> (Vec<Statement>, Vec<Signature>) {
 #[ignore] // Heavier — run with `-- --ignored`.
 fn xmss_child_region_emits_alone() {
     let n = 4;
-    let circuit = XmssCircuit::with_options(n, None, XmssOptions::RECURSION_LEAF);
+    let circuit = XmssCircuit::with_options(n, Some(6), XmssOptions::RECURSION_LEAF);
     let (statements, sigs) = signed(n, 17);
     let t = Instant::now();
     let leaf = build_xmss_leaf(&circuit, &statements, &sigs);
@@ -272,7 +281,7 @@ fn xmss_child_region_rejects_a_tampered_report() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     let n = 4;
-    let circuit = XmssCircuit::with_options(n, None, XmssOptions::RECURSION_LEAF);
+    let circuit = XmssCircuit::with_options(n, Some(6), XmssOptions::RECURSION_LEAF);
     let (statements, sigs) = signed(n, 17);
     let leaf = build_xmss_leaf(&circuit, &statements, &sigs);
     let lcs = circuit.lincheck_circuits();
@@ -436,14 +445,14 @@ fn xmss_first_level_node_over_two_leaves() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
     // A tall slot keeps a small batch to a few slots per gate kind, the
-    // shape a production leaf has (plan_nu would spread 4 signatures over
-    // 2^6-row slots: twice the gather claims of a 1000-signature leaf);
-    // 2^9 still fills the step kind's first slot, so words drop.
+    // shape a production leaf has (2^6-row slots would spread 4 signatures
+    // over twice the gather claims of a 1000-signature leaf); 2^9 still
+    // fills the step kind's first slot, so words drop.
     let nu = std::env::var("XMSS_NU")
         .ok()
         .and_then(|v| v.parse().ok())
-        .or((n < 64).then_some(9));
-    let circuit = XmssCircuit::with_options(n, nu, XmssOptions::RECURSION_LEAF);
+        .unwrap_or(if n < 64 { 9 } else { XMSS_LEAF_NU });
+    let circuit = XmssCircuit::with_options(n, Some(nu), XmssOptions::RECURSION_LEAF);
     // A production-size batch reads the bench's signed-batch cache (seeds
     // 101 and 102), signing once if it is missing.
     let batch = |seed: u64| {
@@ -629,7 +638,7 @@ fn xmss_dropped_words_tape_probe() {
 #[ignore]
 fn xmss_masked_columns_census() {
     use flock_core::matrix_fold::JaggedRowWeight;
-    for (n, nu) in [(4usize, 8usize), (4, 10), (992, 15)] {
+    for (n, nu) in [(4usize, 8usize), (4, 10), (992, XMSS_LEAF_NU)] {
         let options = XmssOptions {
             zero_linear_words: true,
             ..XmssOptions::RECURSION_LEAF

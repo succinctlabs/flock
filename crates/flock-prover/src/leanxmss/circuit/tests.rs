@@ -31,14 +31,17 @@ fn compressions_per_signature() {
     assert_eq!(COMPRESSIONS_PER_SIGNATURE, 201);
 }
 
+/// One, two or four signatures at `2^(log2 n + 4)`-row slots: the shapes
+/// these tests were written against (which slots fill, which words drop),
+/// pinned rather than planned.
+fn small_circuit(n: usize) -> XmssCircuit {
+    XmssCircuit::with_nu(n, Some(n.trailing_zeros() as usize + 4))
+}
+
 /// 1000 signatures lay out in a 2^32 Boolean address space.
 #[test]
 fn layout_plan_for_1000_signatures() {
-    let kinds: Vec<(usize, usize)> = gates(3)
-        .iter()
-        .zip(GADGETS_PER_SIGNATURE)
-        .map(|(g, c)| (1000 * c, g.k_log()))
-        .collect();
+    let kinds = layout_kinds(1000, XmssOptions::DEFAULT);
     let nu = plan_nu(&kinds);
     let space: u128 = kinds
         .iter()
@@ -51,6 +54,27 @@ fn layout_plan_for_1000_signatures() {
     assert!(space <= 1 << 32);
 }
 
+/// The planner's slot heights for recursion leaves, each the best
+/// proving-plus-verifying time of a one-thread sweep (Apple M4, `nu` ±2
+/// around it). The address-space planner it replaced took 16 at 768 and 17
+/// at 1280 and 1536 signatures: 20–25% slower proofs.
+#[test]
+fn layout_plan_tracks_the_sweep() {
+    for (n, want) in [
+        (128, 12),
+        (256, 13),
+        (512, 13),
+        (768, 13),
+        (1000, 14),
+        (1280, 14),
+        (1536, 14),
+        (2048, 14),
+    ] {
+        let nu = plan_nu(&layout_kinds(n, XmssOptions::RECURSION_LEAF));
+        assert_eq!(nu, want, "{n} signatures");
+    }
+}
+
 /// Every slot of a two-signature witness packs the same, batched or not:
 /// the batched packer keeps the walk's bits on every gadget kind. With
 /// padding writes elided, both write the same slot into zeroed buffers and
@@ -59,7 +83,7 @@ fn layout_plan_for_1000_signatures() {
 fn every_slot_packs_as_the_walk() {
     use flock_core::union::SlotWitnessDest;
     let (statements, sigs) = signed(2, 5);
-    let circuit = XmssCircuit::new(2);
+    let circuit = small_circuit(2);
     let witness = circuit.witness(&statements, &sigs);
     for (id, gate) in &circuit.gadgets {
         let rows = witness.rows::<BooleanGate>(*id);
@@ -106,7 +130,7 @@ fn every_slot_packs_as_the_walk() {
 fn two_signatures_prove_and_verify() {
     let (statements, sigs) = signed(2, 11);
     let t = Instant::now();
-    let circuit = XmssCircuit::new(2);
+    let circuit = small_circuit(2);
     eprintln!(
         "shape: nu = {}, {:.0} ms",
         circuit.nu(),
@@ -164,7 +188,7 @@ fn two_signatures_prove_and_verify() {
     }
 }
 
-/// Four signatures plan `nu = 6`, the smallest slot height at which words
+/// Four signatures at `nu = 6`, the smallest slot height at which words
 /// drop: the commit is full height, so the full slots drop their degree-one
 /// words and the lincheck checks the linear ones. The proof verifies, and
 /// fails for a changed message. On x86 this is the RS zerocheck's test of
@@ -172,7 +196,7 @@ fn two_signatures_prove_and_verify() {
 #[test]
 fn four_signatures_drop_words() {
     let (statements, sigs) = signed(4, 13);
-    let circuit = XmssCircuit::new(4);
+    let circuit = small_circuit(4);
     assert_eq!(circuit.nu(), 6);
     let union = circuit.union();
     let full_drops = (0..union.registry().num_boolean())
@@ -199,7 +223,7 @@ fn four_signatures_drop_words() {
 #[test]
 fn recursion_leaf_proves_and_verifies() {
     let (statements, sigs) = signed(4, 17);
-    let leaf = XmssCircuit::with_options(4, None, XmssOptions::RECURSION_LEAF);
+    let leaf = XmssCircuit::with_options(4, Some(6), XmssOptions::RECURSION_LEAF);
     let circuit = &leaf.shape.circuit;
     assert!(circuit.public_columns().next().is_some() && circuit.live_slots_packed());
     let public = leaf.public(&statements);
@@ -218,7 +242,7 @@ fn recursion_leaf_proves_and_verifies() {
     tampered[3].msg[9] ^= 1;
     assert!(leaf.verify(&tampered, &proof).is_err(), "message");
 
-    let default = XmssCircuit::new(4);
+    let default = small_circuit(4);
     assert!(
         default.verify(&statements, &proof).is_err(),
         "leaf proof, default verifier"
@@ -236,7 +260,7 @@ fn recursion_leaf_proves_and_verifies() {
 fn invalid_signature_is_refused() {
     let (statements, mut sigs) = signed(1, 5);
     sigs[0].layers[0].y[0][0] ^= 1;
-    let circuit = XmssCircuit::new(1);
+    let circuit = small_circuit(1);
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         circuit.witness(&statements, &sigs)
     }));
@@ -294,7 +318,7 @@ fn unbalanced(r: Result<(), FlockVerifyError>) -> bool {
 #[test]
 fn the_bus_checks_the_chains() {
     let (statements, sigs) = signed(2, 23);
-    let circuit = XmssCircuit::new(2);
+    let circuit = small_circuit(2);
     let proves = |witness: &CircuitWitness| {
         let proof = circuit.prove(witness);
         circuit.verify(&statements, &proof)
@@ -566,7 +590,7 @@ fn resigned(
 #[test]
 fn edited_index_or_sibling_is_rejected() {
     let (statements, sigs) = signed(2, 29);
-    let circuit = XmssCircuit::new(2);
+    let circuit = small_circuit(2);
     let public = circuit.public(&statements);
     let edits: [(&str, Box<dyn Fn(&mut Signature)>); 3] = [
         ("idx bit 0", Box::new(|sig| sig.idx ^= 1)),
@@ -610,7 +634,7 @@ fn edited_index_or_sibling_is_rejected() {
 #[test]
 fn steps_swapped_between_signers_are_rejected() {
     let (statements, sigs) = signed(2, 31);
-    let circuit = XmssCircuit::new(2);
+    let circuit = small_circuit(2);
     let witness = edited_witness(&circuit, &statements, &sigs, |inputs, values| {
         for (row0, row1) in [(4, 4), (20, 33)] {
             for w in 0..3 {
@@ -630,7 +654,7 @@ fn steps_swapped_between_signers_are_rejected() {
 #[test]
 fn chain_start_off_by_one_is_rejected() {
     let (statements, sigs) = signed(2, 37);
-    let circuit = XmssCircuit::new(2);
+    let circuit = small_circuit(2);
     for delta in [1u64, 3] {
         let witness = edited_witness(&circuit, &statements, &sigs, |inputs, values| {
             // Row 0 of a layer is the first chain's first step: its A word
@@ -658,7 +682,7 @@ fn chain_start_off_by_one_is_rejected() {
 #[test]
 fn dropped_word_tamper_is_rejected_end_to_end() {
     let (statements, sigs) = signed(4, 41);
-    let circuit = XmssCircuit::new(4);
+    let circuit = small_circuit(4);
     assert_eq!(circuit.nu(), 6);
     let union = circuit.union();
     let ported: Vec<usize> = circuit

@@ -2674,6 +2674,72 @@ fn multipoint_values(
     claims: &[FrobeniusClaim<'_>],
     rho_pows: &[Vec<F128>],
 ) -> Vec<Vec<F128>> {
+    multipoint_values_full_height(params, claims, rho_pows)
+        .unwrap_or_else(|| multipoint_values_dp(params, claims, rho_pows))
+}
+
+/// [`multipoint_values`] when every column is empty or full height `2^n` at
+/// a multiple of `2^n`: the column of dense rank `t` covers
+/// `[t·2^n, (t+1)·2^n)`, so `eq(ρ, t·2^n + r) = eq(ρ[..n], r)·eq(ρ[n..], t)`
+/// and its row sum closes, `Σ_r eq(z_r, r)·eq(ρ[..n], r) = eq(z_r, ρ[..n])`.
+/// Per twist that is one eq table over the `2^(m−n)` dense columns, not a
+/// boundary DP over every column. The same field elements as
+/// [`multipoint_values_dp`]; `None` on any other layout.
+fn multipoint_values_full_height(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho_pows: &[Vec<F128>],
+) -> Option<Vec<Vec<F128>>> {
+    let (n, m) = (params.n, params.m);
+    if m <= n
+        || claims
+            .iter()
+            .any(|c| c.z_row.len() != n || c.z_col.len() != params.k)
+    {
+        return None;
+    }
+    let full = 1u64 << n;
+    // `(column, dense rank)` of every non-empty column.
+    let mut ranked: Vec<(usize, usize)> = Vec::new();
+    for (y, w) in params.col_prefix_sums.windows(2).enumerate() {
+        match w[1] - w[0] {
+            0 => {}
+            h if h == full && w[0] % full == 0 => ranked.push((y, (w[0] >> n) as usize)),
+            _ => return None,
+        }
+    }
+    Some(
+        claims
+            .iter()
+            .map(|claim| {
+                let weights = masked_eq(claim.z_col, claim.zeroed_cols);
+                (0..128usize)
+                    .into_par_iter()
+                    .map(|j| {
+                        let (lo, hi) = rho_pows[j].split_at(n);
+                        let row = claim
+                            .z_row
+                            .iter()
+                            .zip(lo)
+                            .fold(F128::ONE, |acc, (&z, &r)| acc * (F128::ONE + z + r));
+                        let eq_hi = build_eq_table(hi);
+                        let cols = ranked
+                            .iter()
+                            .fold(F128::ZERO, |acc, &(y, t)| acc + weights[y] * eq_hi[t]);
+                        row * cols
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// [`multipoint_values`] on any layout: the boundary DP per column.
+fn multipoint_values_dp(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho_pows: &[Vec<F128>],
+) -> Vec<Vec<F128>> {
     let m = params.m;
     let sparse = assist_sparse_transitions();
     claims
@@ -4925,9 +4991,10 @@ mod tests {
                 assist_suffix_low_blocked, assist_suffix_rows_blocked,
                 assist_test_support::{assist_suffix_rows, assist_w_at, prove_assist_naive},
                 assist_w_at_blocked, build_eq_table, f_hat_t, fold_and_round_oop_par, fold_oop_par,
-                fold_partials, frob_inv, generate_f_and_claim, int_bit, point_bit, prove,
-                prove_assist, prove_frobenius_assist, prove_multipoint_twisted,
-                prove_multipoint_twisted_with_grinding, prove_with_assist,
+                fold_partials, frob_inv, generate_f_and_claim, int_bit, multipoint_values_dp,
+                multipoint_values_full_height, point_bit, prove, prove_assist,
+                prove_frobenius_assist, prove_multipoint_twisted,
+                prove_multipoint_twisted_with_grinding, prove_with_assist, rho_inverse_powers,
                 round_test_support::{fold_and_round_fused, round_msg, round_msg_par},
                 verify, verify_assist, verify_frobenius_assist, verify_multipoint_twisted,
                 verify_multipoint_twisted_with_grinding, verify_with_assist,
@@ -5705,6 +5772,61 @@ mod tests {
                 &format!("aligned n={n} k={k} m={m} used={}", used.len()),
             );
         }
+    }
+
+    /// The full-height closed form of the multipoint values against the
+    /// boundary DP, with and without zeroed columns; partial heights fall
+    /// back.
+    #[test]
+    fn multipoint_values_full_height_match_the_dp() {
+        let mut ch = RandomChallenger::new(0xF0_11E1);
+        let cases: &[(usize, usize, usize, &[usize], &[usize])] = &[
+            (3, 2, 5, &[0, 1, 2, 3], &[]),
+            (4, 3, 7, &[0, 1, 2, 3, 4], &[2]),
+            (3, 4, 8, &[0, 2, 3, 7, 9, 12], &[3, 12, 5]),
+            (1, 3, 4, &[1, 4, 6], &[]),
+        ];
+        for &(n, k, m, used, zeroed) in cases {
+            let mut heights = vec![0u64; 1 << k];
+            for &y in used {
+                heights[y] = 1 << n;
+            }
+            let params = JaggedParams::from_heights(&heights, n, m);
+            let (zr, zc, c) = (
+                sample_vec(&mut ch, n),
+                sample_vec(&mut ch, k),
+                sample_vec(&mut ch, 128),
+            );
+            let claims = [FrobeniusClaim {
+                z_row: &zr,
+                z_col: &zc,
+                coeffs: &c,
+                zeroed_cols: zeroed,
+            }];
+            let rho_pows = rho_inverse_powers(&sample_vec(&mut ch, m));
+            assert_eq!(
+                multipoint_values_full_height(&params, &claims, &rho_pows),
+                Some(multipoint_values_dp(&params, &claims, &rho_pows)),
+                "n={n} k={k} m={m}"
+            );
+        }
+        let params = JaggedParams::from_heights(&[8, 4, 0, 8], 3, 5);
+        let (zr, zc, c) = (
+            sample_vec(&mut ch, 3),
+            sample_vec(&mut ch, 2),
+            sample_vec(&mut ch, 128),
+        );
+        let claims = [FrobeniusClaim {
+            z_row: &zr,
+            z_col: &zc,
+            coeffs: &c,
+            zeroed_cols: &[],
+        }];
+        let rho_pows = rho_inverse_powers(&sample_vec(&mut ch, 5));
+        assert_eq!(
+            multipoint_values_full_height(&params, &claims, &rho_pows),
+            None
+        );
     }
 
     /// Partially aligned shapes — every height a multiple of `2^g` below
