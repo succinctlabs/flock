@@ -35,20 +35,18 @@ use {
 };
 
 use crate::{
-    r1cs_hashes::{
-        blake3::build_block_r1cs,
-        fs_chain::{FsChainTrace, IV},
-    },
+    r1cs_hashes::fs_chain::{FsChainTrace, IV},
     tower::{
         CollapsedSlots, ElPiopRec, EnvShape, F128, FsChallenger, GkrRec, LeafEvalGate, MacGate,
         MergedChain, MixedInner, MixedProof, MpRec, PdRec, PrefixGate, RoundRec, SLOT_WORDS,
         ShapeBuilder, UnionInstance, Wire,
         affine_walk::{AffineInner, AffineSlots, emit_affine_inner, rho_wires},
         ag_seed_bytes, assertion_mac, bytes_payload_mask, cap_payloads, cap_wires,
-        circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
-        emit_boolean_reported_check, emit_element_reported_check, emit_fiat_shamir_chain,
-        emit_publics_hash, emit_recombination, flatten_ops, pack8, payload_words,
-        pin_recombination, query_phase_blake3_rows, squeeze_word_wire, walker_common,
+        chain_blake_r1cs, circuit_structure_claim_wires, cw, declare_envelope_slots,
+        decode_ag_point, emit_boolean_reported_check, emit_element_reported_check,
+        emit_fiat_shamir_chain, emit_publics_hash, emit_recombination, flatten_ops, pack8,
+        payload_words, pin_recombination, query_phase_blake3_rows, squeeze_word_wire,
+        walker_common,
         walker_common::{
             LBL_AG_R1_NONCE, LBL_AG_R1_POINT, LBL_AG_SKIP, LBL_ELEMENT_LC, LBL_ELEMENT_ZC,
             LBL_FROBENIUS, LBL_LINCHECK, LBL_MERGED_OPEN, LBL_MULTIPOINT, LBL_PRODUCT_GKR,
@@ -214,7 +212,7 @@ impl<'p> ChildTape<'p> {
         let built = &inner.built;
         let proof = &inner.proof;
         let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
-        let blake_r1cs = build_block_r1cs(inner.nu);
+        let blake_r1cs = chain_blake_r1cs(inner.nu);
         let blake_lc = blake_r1cs.csc_lincheck_circuit();
         let lcs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
