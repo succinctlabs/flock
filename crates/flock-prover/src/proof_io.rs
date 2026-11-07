@@ -79,8 +79,12 @@ const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 /// the merged opening's block-first transport covers full-height layouts
 /// with gaps (`pcs::full_height_columns`); unions may drop zeroed linear
 /// words. A v23 bundle cannot be interpreted under v24 rules.
+/// v25 (2026-11-06): the `fast` schedule climbs its recursion ladder +1 per
+/// level (rates 1/2/3/4/5 at m29, Σq 550) instead of +2, so a v24 `fast`
+/// proof carries a different level count and query schedule. `fast100`,
+/// `slim`, `slim100` and `secure` payloads are unchanged.
 /// (The per-version history this file used to carry lives in git.)
-const VERSION: u8 = 24;
+const VERSION: u8 = 25;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see

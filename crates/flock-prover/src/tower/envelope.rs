@@ -340,16 +340,16 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
         // stays circuit structure (the parent hashes `num_lanes`-word
         // leaves), so it is pinned while everything count-shaped rides the
         // jagged claims. The largest member is the leanXMSS first-level
-        // node: 27.25 lanes of 2^17 words after family H by Horner, ĝ on
-        // forward chains, the sum-first transpose dot (30.96 before Horner,
-        // 28.44 after, 27.21 after the dot) and the leaf PoW rows and
-        // nonzero-top checks, so 28 covers every member; the outer asserts
-        // content ≤ pin. Lanes past the content are zero and the commit's
-        // NTT skips them, but the Merkle leaves and the parent's opened rows
-        // still carry them. 28 words are 448 B, exactly 7 BLAKE3 blocks
-        // (29–31 words take 8). 28 < `2^initial_k = 32`, so children remain
-        // lane-major.
-        lanes: 28,
+        // node over two 992-signature leaves: 30.32 lanes of 2^17 words
+        // since the Fast leaf went to the +1/level ladder (2026-11-06: Σq
+        // 435 → 550 replayed per leaf), 27.21 before; the m32 chain
+        // first-level node is 28.34 and the internal nodes 22.62. So 31
+        // covers every member; the outer asserts content ≤ pin. Lanes past
+        // the content are zero and the commit's NTT skips them, but the
+        // Merkle leaves and the parent's opened rows still carry them.
+        // 29–32 words all hash as 8 BLAKE3 blocks (28 was exactly 7); 31
+        // keeps the opened rows a word short of the full grid.
+        lanes: 31,
         acc_chain_words,
     }
 }

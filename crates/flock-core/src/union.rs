@@ -507,9 +507,16 @@ impl<'r> UnionInstance<'r> {
         self.committed_words().trailing_zeros() as usize + 7
     }
 
-    /// The integer-lane count for this instance's commit, or `None` when the
-    /// dense stack fills every lane (the power-of-two case — keep today's
-    /// commit, byte-identically).
+    /// The lane count for this instance's commit — always `Some`: the union
+    /// commit is LANE-MAJOR at every fill (see `PcsParams::num_lanes`).
+    ///
+    /// A stack that fills every lane used to fall back to the low-bit
+    /// power-of-two grid (`None`), which kept those proofs byte-identical
+    /// to the pre-lane-major format but cost the inner open its statistics
+    /// ladder: Ligerito's L0 then swept the whole witness round by round
+    /// (leanXMSS, 512 signatures at ν = 15, one thread: Ligerito 416 ms
+    /// against 182 ms lane-major). The full grid is now committed lane-major
+    /// like any other, so the cost is continuous in the fill.
     ///
     /// [`Self::committed_words`] rounds the dense stack UP to a power of two,
     /// and that rounding tax is committed: the zero tail is RS-encoded and
@@ -525,8 +532,7 @@ impl<'r> UnionInstance<'r> {
     /// rotates).
     pub fn commit_lanes(&self, log_batch_size: usize) -> Option<usize> {
         let log_dim = self.dense_m() - 7 - log_batch_size;
-        let t = dense_lanes(self.dense_words(), log_batch_size, log_dim);
-        (t < 1usize << log_batch_size).then_some(t)
+        Some(dense_lanes(self.dense_words(), log_batch_size, log_dim))
     }
 
     /// Whether the compaction map is the identity: every slot is at FULL

@@ -49,6 +49,12 @@ pub(super) struct Lvl {
     /// definitionally zero and never encoded). Equal to `lanes` whenever
     /// the lane count happens to be a power of two.
     pub(super) row_words: usize,
+    /// Whether this level's grid is LANE-MAJOR (lane = the high index bits,
+    /// folded first): the child's `PcsParams::lane_major` at L0, false at
+    /// every recursive level. Config authority like the widths — NEVER
+    /// inferred from `row_words < lanes`, since a full lane-major grid has
+    /// `row_words == lanes` too.
+    pub(super) lane_major: bool,
     /// Number of committed F128 words. Recursive codewords are also base
     /// field rows; their extra coordinate bit is included in `folds`.
     pub(super) raw_row_words: usize,
@@ -63,15 +69,16 @@ pub(super) struct Lvl {
 }
 
 /// Map actual sumcheck-fold order back to the transcript point's natural
-/// coordinate order. Partial L0 lane grids bind the high lane coordinates
-/// first; full grids and every later level use ordinary low-to-high order.
+/// coordinate order. Lane-major L0 grids (any lane count, full included)
+/// bind the high lane coordinates first; low-bit grids and every later
+/// level use ordinary low-to-high order.
 pub(super) fn level_zero_ood_z_index(
     z_len: usize,
     initial_k: usize,
-    committed_row_words: usize,
+    lane_major: bool,
     fold_order: usize,
 ) -> usize {
-    if committed_row_words == 1usize << initial_k {
+    if !lane_major {
         fold_order
     } else {
         let log_msg_cols = z_len - initial_k;
@@ -250,6 +257,8 @@ pub(super) fn level_geometry(
     chals: &[F128],
     hash: HashKind,
     scheds: &[LevelSchedule],
+    // The child commitment's `PcsParams::lane_major` — L0's grid order.
+    l0_lane_major: bool,
 ) -> (Vec<Lvl>, Vec<F256>) {
     assert_eq!(scheds.len(), levels.len(), "one schedule per open level");
     let mut geo: Vec<Lvl> = Vec::new();
@@ -280,6 +289,10 @@ pub(super) fn level_geometry(
             row_words >= 1 && row_words <= lanes,
             "L{li}: opened width {row_words} must fit the fold width {lanes}"
         );
+        assert!(
+            li > 0 || l0_lane_major || row_words == lanes,
+            "L0: only a lane-major grid may commit fewer than {lanes} lanes"
+        );
         let fold_vals: Vec<F256> = lvl
             .fold_chs
             .iter()
@@ -295,6 +308,7 @@ pub(super) fn level_geometry(
             depth,
             lanes,
             row_words,
+            lane_major: li == 0 && l0_lane_major,
             raw_row_words,
             sched: sched.clone(),
             cap_layers: native_cap_layers(cap, c - c_min, hash),

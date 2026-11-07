@@ -350,12 +350,13 @@ pub fn open_batch_mixed_ligerito_seeded<Ch: Challenger>(
         lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
     );
 
-    // Integer-lane (lane-major) commitments are supported ONLY in the
-    // merged transport's inner-open configuration (no RS claims, one
-    // EqPoint claim): the eq basis folds honestly over the zero-padding
-    // lanes (live-block skip disabled) and the round-0 prime pairs blocks.
+    // Lane-major commitments (any lane count, full included — see
+    // `PcsParams::num_lanes`) are supported ONLY in the merged transport's
+    // inner-open configuration (no RS claims, one EqPoint claim): the eq
+    // basis folds honestly over the zero-padding lanes (live-block skip
+    // disabled) and the round-0 prime pairs blocks.
     let l0_num_lanes = commitment.params.num_ntts();
-    let lane_major = l0_num_lanes < 1usize << lig_config.initial_k;
+    let lane_major = commitment.params.lane_major();
     let log_n = commitment.params.m - LOG_PACKING;
     if lane_major {
         assert!(
@@ -402,8 +403,10 @@ pub fn open_batch_mixed_ligerito_seeded<Ch: Challenger>(
     // CERTIFICATION knob for alternating A/B runs; both settings produce the
     // same b values, hence byte-identical proofs.
     // Lane-major only: the virtual basis rides the BLOCKED L0 fold, which is
-    // what every shipped merged-transport open runs (a pow2-lane inner keeps
-    // the tuned element-pairing kernel and its round-0 JIT).
+    // what every shipped merged-transport open runs — union commits are
+    // lane-major at every fill, full grids included. A `num_lanes: None`
+    // inner (the low-bit grid) keeps the tuned element-pairing kernel and
+    // its round-0 JIT, at roughly twice the L0 cost.
     let virtual_b = eq_basis.is_some() && lane_major && virtual_b_enabled();
     let vbasis = if virtual_b {
         // The point IS the claim's, and γ is its single transcript scalar —
@@ -1261,7 +1264,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     // residual machinery has no rotated-point path; reject rather than
     // mis-evaluate. (The claim shapes are statement-derived, so this is an
     // assert, not an attacker-reachable rejection.)
-    let lane_major = commitment.params.num_ntts() < 1usize << lig_config.initial_k;
+    let lane_major = commitment.params.lane_major();
     assert!(
         !lane_major || n_rs == 0,
         "lane-major mixed verify: packed-direct claims only"
@@ -1407,7 +1410,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
         log_n,
         target_combined,
         &commitment.cap,
-        commitment.params.num_ntts(),
+        commitment.params.num_lanes,
         eval_b_residual,
         challenger,
     );
@@ -1542,6 +1545,128 @@ fn frob(mut x: F128, j: usize) -> F128 {
         x = x.square();
     }
     x
+}
+
+/// `γ^(k·2^j)` at `[j·128 + k]` as `(lo, hi, lo ^ hi)`, `γ` the generator:
+/// row `j` is the bit basis `γ^k` raised to `2^j` (the Moore matrix of the
+/// bit basis, transposed), each entry with its Karatsuba middle operand.
+/// Universal; built once per process (128² multiplies).
+fn frobenius_monomials() -> &'static [[u64; 3]] {
+    use std::sync::OnceLock;
+    const NB: usize = 1 << LOG_PACKING;
+    static TABLE: OnceLock<Vec<[u64; 3]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = Vec::with_capacity(NB * NB);
+        let mut g = F128::generator();
+        for _ in 0..NB {
+            let mut p = F128::ONE;
+            for _ in 0..NB {
+                table.push([p.lo, p.hi, p.lo ^ p.hi]);
+                p *= g;
+            }
+            g = g.square();
+        }
+        table
+    })
+}
+
+/// Every Frobenius statistic of one column bit-bank:
+/// `out[j] = (Σ_b β_b^(2^-j)·bank[b])^(2^j) = Σ_b β_b·bank[b]^(2^j)` for
+/// `j < 128`, `β_b = γ^b` the bit basis.
+///
+/// With `bank[b] = Σ_k B[b][k]·γ^k` the Frobenius acts on the basis alone,
+/// `bank[b]^(2^j) = Σ_k B[b][k]·γ^(k·2^j)`, so
+/// `out[j] = Σ_k T_k·γ^(k·2^j)` with the transposed rows
+/// `T_k = Σ_b B[b][k]·γ^b`. That is one bit transpose and a 128×128 product
+/// against [`frobenius_monomials`], reduced once per output — no
+/// squaring chains and no per-product reduction.
+fn frobenius_statistics(bank: &[F128], out: &mut [F128]) {
+    const NB: usize = 1 << LOG_PACKING;
+    assert_eq!((bank.len(), out.len()), (NB, NB));
+    // Four 64×64 transposes: rows `b` (bank entries) by bit `k`.
+    let quarter = |row0: usize, hi: bool| -> [u64; 64] {
+        crate::bits::transpose64(std::array::from_fn(|r| {
+            let w = bank[row0 + r];
+            if hi { w.hi } else { w.lo }
+        }))
+    };
+    let (ll, lh, hl, hh) = (
+        quarter(0, false),
+        quarter(0, true),
+        quarter(64, false),
+        quarter(64, true),
+    );
+    let t: [[u64; 3]; NB] = std::array::from_fn(|k| {
+        let (lo, hi) = if k < 64 {
+            (ll[k], hl[k])
+        } else {
+            (lh[k - 64], hh[k - 64])
+        };
+        [lo, hi, lo ^ hi]
+    });
+    moore_product(&t, frobenius_monomials(), out);
+}
+
+/// `out[j] = Σ_k T_k·G[j·128 + k]` over `(lo, hi, lo ^ hi)` triples:
+/// three carry-less products per term into three accumulators, the
+/// Karatsuba cross term and the reduction once per output. Four outputs
+/// share each `T_k` load.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn moore_product(t: &[[u64; 3]; 1 << LOG_PACKING], g: &[[u64; 3]], out: &mut [F128]) {
+    use std::arch::aarch64::{
+        uint64x2_t, vdupq_n_u64, veorq_u64, vgetq_lane_u64, vmull_p64, vreinterpretq_u64_p128,
+    };
+    const NB: usize = 1 << LOG_PACKING;
+    const J: usize = 4;
+    assert_eq!(g.len(), NB * NB);
+    #[inline(always)]
+    unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
+        // SAFETY: the caller is compiled with the `aes` target feature.
+        unsafe { vreinterpretq_u64_p128(vmull_p64(a, b)) }
+    }
+    // SAFETY: NEON is baseline on aarch64 and `aes` is statically enabled;
+    // `g` holds `NB²` entries, so every `(j0 + u)·NB + k` is in bounds.
+    unsafe {
+        for j0 in (0..NB).step_by(J) {
+            let z = vdupq_n_u64(0);
+            let (mut lo, mut hi, mut mid) = ([z; J], [z; J], [z; J]);
+            for (k, &[tl, th, tm]) in t.iter().enumerate() {
+                for u in 0..J {
+                    let [gl, gh, gm] = *g.get_unchecked((j0 + u) * NB + k);
+                    lo[u] = veorq_u64(lo[u], pmull(tl, gl));
+                    hi[u] = veorq_u64(hi[u], pmull(th, gh));
+                    mid[u] = veorq_u64(mid[u], pmull(tm, gm));
+                }
+            }
+            for u in 0..J {
+                let cross = veorq_u64(mid[u], veorq_u64(lo[u], hi[u]));
+                out[j0 + u] = F256Unreduced {
+                    r0: vgetq_lane_u64::<0>(lo[u]),
+                    r1: vgetq_lane_u64::<1>(lo[u]) ^ vgetq_lane_u64::<0>(cross),
+                    r2: vgetq_lane_u64::<0>(hi[u]) ^ vgetq_lane_u64::<1>(cross),
+                    r3: vgetq_lane_u64::<1>(hi[u]),
+                }
+                .reduce();
+            }
+        }
+    }
+}
+
+/// Portable [`moore_product`]: unreduced products, one reduction per output.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+fn moore_product(t: &[[u64; 3]; 1 << LOG_PACKING], g: &[[u64; 3]], out: &mut [F128]) {
+    const NB: usize = 1 << LOG_PACKING;
+    assert_eq!(g.len(), NB * NB);
+    for (j, slot) in out.iter_mut().enumerate() {
+        let row = &g[j * NB..(j + 1) * NB];
+        let acc =
+            t.iter()
+                .zip(row)
+                .fold(F256Unreduced::ZERO, |acc, (&[tl, th, _], &[gl, gh, _])| {
+                    acc ^ F128::new(tl, th).mul_unreduced(F128::new(gl, gh))
+                });
+        *slot = acc.reduce();
+    }
 }
 
 /// Round message of the product sumcheck from rank-1 terms `Σ_t A_t(e)·S_t(e)`
@@ -1716,16 +1841,30 @@ fn block_first_phase<Ch: Challenger>(
         })
         .collect();
 
+    let t_eq = t.elapsed();
+    // Every live column's 128 Frobenius statistics per claim, by dense
+    // column: `stats[t·128 + j] = S_j` of column `used[t]`.
+    let stats: Vec<Vec<F128>> = rs
+        .iter()
+        .map(|cl| {
+            let mut st = vec![F128::ZERO; live_cols * NB];
+            st.par_chunks_mut(NB).enumerate().for_each(|(t, out)| {
+                let y = used[t];
+                frobenius_statistics(&cl.bank[y * NB..(y + 1) * NB], out);
+            });
+            st
+        })
+        .collect();
+    let t_stats = t.elapsed();
+
     // Rank-1 terms on the block cube.
     let mut terms: Vec<(Vec<F128>, Vec<F128>)> = Vec::new();
-    for (cl, eq_col) in rs.iter().zip(&eq_cols) {
+    for ((cl, eq_col), stats) in rs.iter().zip(&eq_cols).zip(&stats) {
         let per_j: Vec<(Vec<F128>, Vec<F128>)> = (0..NB)
             .into_par_iter()
             .filter(|&j| cl.coeffs[j] != F128::ZERO)
             .flat_map_iter(|j| {
-                let pw = &pw;
                 let eq_col = &eq_col[j];
-                let kinv = (NB - j) % NB;
                 (0..2).map(move |c0| {
                     let live = live_e(c0);
                     let a: Vec<F128> = (0..n_e)
@@ -1739,16 +1878,11 @@ fn block_first_phase<Ch: Challenger>(
                         .collect();
                     let s: Vec<F128> = (0..n_e)
                         .map(|e| {
-                            if e >= live {
-                                return F128::ZERO;
+                            if e < live {
+                                stats[(2 * e + c0) * NB + j]
+                            } else {
+                                F128::ZERO
                             }
-                            let y = col(e, c0);
-                            let bank = &cl.bank[y * NB..(y + 1) * NB];
-                            let mut acc = F128::ZERO;
-                            for b in 0..NB {
-                                acc += pw[b][kinv] * bank[b];
-                            }
-                            frob(acc, j)
                         })
                         .collect();
                     (a, s)
@@ -1757,6 +1891,7 @@ fn block_first_phase<Ch: Challenger>(
             .collect();
         terms.extend(per_j);
     }
+    let t_terms = t.elapsed();
     for (z_row, cols) in pd_groups {
         let eq_row = crate::lincheck::build_eq_table(z_row);
         let f: Vec<F128> = (0..live_cols)
@@ -1787,9 +1922,14 @@ fn block_first_phase<Ch: Challenger>(
     }
     if trace {
         eprintln!(
-            "  [open_merged] block statistics ({} terms × {n_e}): {:6.2} ms",
+            "  [open_merged] block statistics ({} terms × {n_e}): {:6.2} ms \
+             (eq {:.2} | Frobenius {:.2} | terms {:.2} | packed-direct {:.2})",
             terms.len(),
-            t.elapsed().as_secs_f64() * 1e3
+            t.elapsed().as_secs_f64() * 1e3,
+            t_eq.as_secs_f64() * 1e3,
+            (t_stats - t_eq).as_secs_f64() * 1e3,
+            (t_terms - t_stats).as_secs_f64() * 1e3,
+            (t.elapsed() - t_terms).as_secs_f64() * 1e3,
         );
     }
 
@@ -2937,6 +3077,39 @@ mod tests {
         test_rng::Rng,
         zerocheck::{multilinear::lagrange_weights_naive, univariate_skip::build_eq},
     };
+
+    /// [`super::frobenius_statistics`] against the block-first phase's
+    /// original form, `(Σ_b β_b^(2^-j)·bank[b])^(2^j)` by squaring chains.
+    #[test]
+    fn frobenius_statistics_match_the_squaring_form() {
+        const NB: usize = 1 << LOG_PACKING;
+        let mut rng = Rng::new(0xF20B_57A7);
+        let pw: Vec<Vec<F128>> = (0..NB)
+            .map(|b| {
+                let mut row = vec![super::ring_switch::bit_basis(b)];
+                for k in 1..NB {
+                    row.push(row[k - 1].square());
+                }
+                row
+            })
+            .collect();
+        for case in 0..4 {
+            let bank: Vec<F128> = (0..NB)
+                .map(|b| match case {
+                    0 => super::ring_switch::bit_basis(b),
+                    1 if b != 77 => F128::ZERO,
+                    _ => rng.f128(),
+                })
+                .collect();
+            let mut out = vec![F128::ZERO; NB];
+            super::frobenius_statistics(&bank, &mut out);
+            for (j, &got) in out.iter().enumerate() {
+                let kinv = (NB - j) % NB;
+                let acc = (0..NB).fold(F128::ZERO, |acc, b| acc + pw[b][kinv] * bank[b]);
+                assert_eq!(got, super::frob(acc, j), "case {case}, j = {j}");
+            }
+        }
+    }
 
     fn zhat_skip_reference(z: &[bool], m: usize, z_skip: F128, x_outer: &[F128]) -> F128 {
         const K_SKIP: usize = 6;

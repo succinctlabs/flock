@@ -292,10 +292,11 @@ pub(super) fn merge_and_replay_chain(
     mc
 }
 
-/// The residual pairing's rotation (lane-major inners): a pow2-lane inner
-/// (row_words == lanes — e.g. the m28-k4 slim node whose 16-of-16 lanes
-/// make the commit exactly full) takes the IDENTITY pairing, same as the
-/// native side's rotate gate. BOTH walkers must rotate identically.
+/// The residual pairing's rotation (lane-major inners, full grids
+/// included): a low-bit grid inner (`num_lanes: None`) takes the IDENTITY
+/// pairing, same as the native side's rotate gate — which reads
+/// `PcsParams::lane_major`, never the opened width. BOTH walkers must
+/// rotate identically.
 pub(super) fn parse_residual_rotation(
     proof: &MixedProof,
     geo: &[Lvl],
@@ -303,7 +304,7 @@ pub(super) fn parse_residual_rotation(
     w_rounds: &[RoundRec],
 ) -> (usize, Vec<RoundRec>) {
     let yr_len = proof.pcs_open().inner.ligerito.final_proof.yr.len() / 2;
-    let lane_major = geo[0].row_words < geo[0].lanes;
+    let lane_major = geo[0].lane_major;
     let w_resid: Vec<RoundRec> = if lane_major {
         let k_rot = w_rounds.len() - levels[0].fold_fins.len();
         let mut v = w_rounds[k_rot..].to_vec();
