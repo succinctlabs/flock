@@ -19,6 +19,8 @@
 //! REASSEMBLED from the bundle's publics, after the native circuit
 //! verify.
 
+use std::thread::{ScopedJoinHandle, scope};
+
 use flock_core::{
     aggregate::Accumulator, circuit::Circuit, lincheck::LincheckCircuit, matrix_fold::MatrixClaim,
     pcs::jagged::JaggedParams,
@@ -27,7 +29,7 @@ use flock_core::{
 use crate::proof_io::TowerRootBundle;
 use crate::tower::{
     F128,
-    chain::{ChainProof, build_chain_proof},
+    chain::{ChainProof, ChainWalk, prove_chain_walk, walk_chain},
     config::TowerConfig,
     fl_node::{FlNode, build_first_level_node, chain_blake_r1cs, chain_jagged_params},
     gates_blake3::pack4,
@@ -135,18 +137,41 @@ impl Tower {
         // ---- LEAVES + FIRST LEVEL, interleaved: prove a segment pair
         // (each segment starts at the last h_end), fold it into its FL,
         // drop the pair ----
+        //
+        // The walks are PIPELINED: segment j + 1's walk (the single-threaded
+        // chain compute) runs on its own thread while segment j proves (and
+        // its FL folds) on the pool, so only the first walk is on the
+        // critical path. One walk in flight keeps one extra trace resident.
         let mut chain: Option<ChainProof> = None;
         let mut fls: Vec<FlNode> = Vec::with_capacity(n_leaves / 2);
-        let mut h = h_start;
-        for _ in 0..n_leaves / 2 {
-            let cp0 = build_chain_proof(cfg, h, blocks_per_leaf);
-            let cp1 = build_chain_proof(cfg, cp0.h_end, blocks_per_leaf);
-            h = cp1.h_end;
-            fls.push(build_first_level_node(cfg, &cp0, &cp1));
-            // Leaf 0 survives as the lane's chain-side material owner
-            // (one shape for every leaf); every other leaf drops here.
-            chain.get_or_insert(cp0);
-        }
+        let h = scope(|s| {
+            let mut ahead: Option<ScopedJoinHandle<ChainWalk>> = None;
+            let mut even: Option<ChainProof> = None;
+            let mut h = h_start;
+            for i in 0..n_leaves {
+                let walk = match ahead.take() {
+                    Some(t) => t.join().expect("the chain walk thread"),
+                    None => walk_chain(h_start, blocks_per_leaf),
+                };
+                if i + 1 < n_leaves {
+                    let h_next = walk.h_end;
+                    ahead = Some(s.spawn(move || walk_chain(h_next, blocks_per_leaf)));
+                }
+                let cp = prove_chain_walk(cfg, walk);
+                match even.take() {
+                    None => even = Some(cp),
+                    Some(cp0) => {
+                        h = cp.h_end;
+                        fls.push(build_first_level_node(cfg, &cp0, &cp));
+                        // Leaf 0 survives as the lane's chain-side material
+                        // owner (one shape for every leaf); every other leaf
+                        // drops here.
+                        chain.get_or_insert(cp0);
+                    }
+                }
+            }
+            h
+        });
         let statement = ChainStatement {
             h_start,
             h_end: h,

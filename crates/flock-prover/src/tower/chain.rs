@@ -6,7 +6,7 @@ use std::{
 use flock_core::{
     circuit::{
         Circuit, SigmaAssertion, WiringProof,
-        builder::{BuiltCircuit, CircuitShape, SlotId},
+        builder::{BuiltCircuit, CircuitShape, CircuitWitness, SlotId},
     },
     element_r1cs::union::Proof as ElementProof,
     lincheck::{LincheckCircuit, LincheckProof},
@@ -428,9 +428,71 @@ impl ChainProof {
 /// — the digest pin), the WALK is per-statement and is the chain compute
 /// itself, so it is reported apart from the proving phases.
 pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) -> ChainProof {
+    prove_chain_walk(cfg, walk_chain(h_start, n_blocks))
+}
+
+/// A walked chain segment: the circuit trace of `n_blocks` compressions from
+/// `h_start`, and the `h_end` it reaches (checked against the native chain).
+/// The walk is the chain's sequential compute; [`prove_chain_walk`] is the
+/// all-core part, so a driver can walk segment `j + 1` while it proves `j`.
+pub(super) struct ChainWalk {
+    cs: ChainShape,
+    witness: CircuitWitness,
+    h_start: [u32; 16],
+    pub(super) h_end: [u32; 16],
+    n_blocks: usize,
+    shape_ms: f64,
+    walk_ms: f64,
+}
+
+/// Walk one chain segment (single-threaded: the chain is sequential).
+pub(super) fn walk_chain(h_start: [u32; 16], n_blocks: usize) -> ChainWalk {
     let t_shape = Instant::now();
     let cs: ChainShape = chain_shape_cached(n_blocks).as_ref().clone();
     let shape_ms = t_shape.elapsed().as_secs_f64() * 1e3;
+    let t0 = Instant::now();
+    let witness = cs.shape.run(&chain_vals(&h_start), &[]);
+    let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
+    // The statement is bound end to end: publics[3..7] are h_start, the
+    // published tail is h_end, and h_end equals the native chain.
+    let h_end = native_chain(&h_start, n_blocks);
+    let public = &witness.public;
+    for j in 0..4 {
+        assert_eq!(
+            public[3 + j],
+            pack4(h_start[4 * j..4 * j + 4].try_into().unwrap()),
+            "public word {} is h_start[{}]",
+            3 + j,
+            j
+        );
+        assert_eq!(
+            public[public.len() - 4 + j],
+            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            "the published tail is the native h_end"
+        );
+    }
+    ChainWalk {
+        cs,
+        witness,
+        h_start,
+        h_end,
+        n_blocks,
+        shape_ms,
+        walk_ms,
+    }
+}
+
+/// Prove a walked segment: witgen, prove, and the deferred self-verify.
+pub(super) fn prove_chain_walk(cfg: TowerConfig, walk: ChainWalk) -> ChainProof {
+    let ChainWalk {
+        cs,
+        witness: walked,
+        h_start,
+        h_end,
+        n_blocks,
+        shape_ms,
+        walk_ms: walked_ms,
+    } = walk;
     let (nu, hash) = (cs.nu, cs.hash);
     let t_setup = Instant::now();
     let blake_r1cs = chain_blake_r1cs(nu);
@@ -439,14 +501,22 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
 
     // ONLINE, `1 + steady_reps()` iterations over the ONE shape: walk (the
     // chain compute itself), witgen, prove. Identical inputs, so every
-    // iteration's outputs match and the last one ships.
+    // iteration's outputs match and the last one ships. Iteration 0 takes
+    // the handed-in walk; the steady repeats re-walk inline so each one
+    // times the whole online span.
     let reps = 1 + steady_reps();
     let mut onlines: Vec<Online> = Vec::with_capacity(reps);
     let mut fin = None;
+    let mut walked = Some(walked);
     for _ in 0..reps {
         let t0 = Instant::now();
-        let witness = cs.shape.run(&chain_vals(&h_start), &[]);
-        let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let (witness, walk_ms) = match walked.take() {
+            Some(w) => (w, walked_ms),
+            None => (
+                cs.shape.run(&chain_vals(&h_start), &[]),
+                t0.elapsed().as_secs_f64() * 1e3,
+            ),
+        };
         let union = UnionInstance::new(&cs.shape.registry, cs.shape.counts.clone());
         assert!(!union.has_element(), "a chain proof is boolean-only");
         let pcs_params = PcsParams {
@@ -499,7 +569,9 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
         // `t0` opened before the walk, so this is the whole online span in
         // ONE timer — the honest per-leaf number, against which the phase
         // sum is only a lower bound.
-        let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+        // The handed-in walk ran before `t0`; its time joins the span.
+        let pre_walk = if onlines.is_empty() { walked_ms } else { 0.0 };
+        let wall_ms = pre_walk + t0.elapsed().as_secs_f64() * 1e3;
         onlines.push(Online {
             setup_ms,
             walk_ms,
@@ -549,25 +621,6 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
         .expect("the boolean matrix work discharges");
     assert!(work.element.is_none(), "no element class, no element work");
     assert!(sigma.check(&built.shape.circuit), "sigma discharges");
-
-    // The statement is bound end to end: publics[3..7] are h_start, the
-    // published tail is h_end, and h_end equals the native chain.
-    let h_end = native_chain(&h_start, n_blocks);
-    let public = &built.witness.public;
-    for j in 0..4 {
-        assert_eq!(
-            public[3 + j],
-            pack4(h_start[4 * j..4 * j + 4].try_into().unwrap()),
-            "public word {} is h_start[{}]",
-            3 + j,
-            j
-        );
-        assert_eq!(
-            public[public.len() - 4 + j],
-            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
-            "the published tail is the native h_end"
-        );
-    }
 
     ChainProof {
         inner: MixedInner {
