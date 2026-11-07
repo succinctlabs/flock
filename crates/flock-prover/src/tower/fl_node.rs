@@ -45,8 +45,8 @@ use crate::{
         BitSpreadGate, BitSpreadTable, Blake3Gate, ChainProof, ChildSlots, ChildTape, DOMAIN,
         EnvTail, F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FsChallenger, HashKind,
         LeafOuter, MergedChain, MixedProof, Online, PcsParams, PowMaskGate, PowMaskTable,
-        SLOT_WORDS, SelfCheck, ShapeBuilder, SwapGate, SwapTable, TowerConfig, UnionInstance,
-        UnionSlotProverInput, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays,
+        SLOT_WORDS, SelfCheck, ShapeBuilder, ShapeSlot, SwapGate, SwapTable, TowerConfig,
+        UnionInstance, UnionSlotProverInput, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays,
         balance_extra_rows, bytes_payload_mask, challenge_word_locs, check_ag_skip_publics,
         check_child_region, check_fold_publics, check_jagged_fold_publics, cw,
         emit_ag_point_binding, emit_child_region, emit_fiat_shamir_chain_partitioned,
@@ -169,7 +169,7 @@ pub(super) fn record_chain_child_verify(cp: &ChainProof, blake_lc: &dyn Lincheck
 }
 
 pub fn build_first_level_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
-    build_first_level_node_k(cfg, SelfCheck::Full, &[cp0, cp1])
+    build_first_level_node_k(cfg, SelfCheck::Full, &ShapeSlot::default(), &[cp0, cp1])
 }
 
 /// The 2-ary first-level node: two adjacent chain proofs verified deferred
@@ -180,10 +180,12 @@ pub fn build_first_level_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainPro
 /// child 1 only) has no slots for a third child.
 ///
 /// `checks` gates the builder's self-checks (see [`SelfCheck`]); the
-/// proof is the same either way.
+/// proof is the same either way. `slot` is the FL kind's setup cache (see
+/// [`ShapeSlot`]): a fresh one finishes the circuit here.
 pub fn build_first_level_node_k(
     cfg: TowerConfig,
     checks: SelfCheck,
+    slot: &ShapeSlot,
     cps: &[&ChainProof],
 ) -> FlNode {
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
@@ -929,15 +931,14 @@ pub fn build_first_level_node_k(
             );
             env_app_base(&env)
         };
-        let shape2 = sb.finish().expect("the first-level node circuit builds");
+        let (shape2, fill_plan) = slot.finish(sb, checks, "first-level node");
         let hint_refs: Vec<&(dyn Any + Sync)> =
             hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
-        // THE INDEX-FILL RUNNER (setup), the node's path: compile the plan,
-        // then pin it row-identical against the generic walk before the
+        // THE INDEX-FILL RUNNER (setup), the node's path: the plan comes
+        // with the shape (compiled once per kind), then pin it row-identical against the generic walk before the
         // online run trusts it. run() stays the differential oracle — this
         // pin is what keeps it one, now that the FL no longer walks in the
         // timed path either. It is a self-check: `SelfCheck::Skip` drops it.
-        let fill_plan = shape2.fill_plan();
         if checks.on() {
             let walk = shape2.run(&vals, &hint_refs);
             let fill = shape2.run_filled(&fill_plan, &vals, &hint_refs);

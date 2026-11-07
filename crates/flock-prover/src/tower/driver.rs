@@ -39,6 +39,7 @@ use crate::tower::{
     },
     online::census_kib,
     query::leaf_boolean_mats,
+    setup::TowerShapes,
     span_count_word,
     verify::RootBundle,
 };
@@ -111,6 +112,52 @@ pub struct Tower {
     pub(super) blocks_per_leaf: usize,
 }
 
+/// A tower prover after its SETUP phase: the per-kind circuits and fill
+/// plans (see [`TowerShapes`]) are built, and the memory pools are warm.
+/// [`TowerProver::prove`] then pays only per-statement work: the leaves,
+/// and for every FL and node its fold prove, child tapes, input values,
+/// walk and outer prove.
+pub struct TowerProver {
+    cfg: TowerConfig,
+    blocks_per_leaf: usize,
+    shapes: TowerShapes,
+}
+
+impl TowerProver {
+    /// THE SETUP: prove a six-leaf reference tower (the smallest that
+    /// builds every kind: FL, base, spine) under [`SelfCheck::Full`], and
+    /// keep its shapes. Statement-independent, so it runs once per
+    /// `(cfg, blocks_per_leaf)`.
+    pub fn setup(cfg: TowerConfig, blocks_per_leaf: usize) -> TowerProver {
+        let shapes = TowerShapes::default();
+        Tower::prove_with(
+            cfg,
+            SelfCheck::Full,
+            &shapes,
+            [0u32; 16],
+            blocks_per_leaf,
+            6,
+        );
+        TowerProver {
+            cfg,
+            blocks_per_leaf,
+            shapes,
+        }
+    }
+
+    /// The ONLINE phase: [`Tower::prove`] over the setup's shapes.
+    pub fn prove(&self, checks: SelfCheck, h_start: [u32; 16], n_leaves: usize) -> Tower {
+        Tower::prove_with(
+            self.cfg,
+            checks,
+            &self.shapes,
+            h_start,
+            self.blocks_per_leaf,
+            n_leaves,
+        )
+    }
+}
+
 impl Tower {
     /// PROVE THE CHAIN: `n_leaves` sequential segments of
     /// `blocks_per_leaf` compressions each, folded to one root.
@@ -130,6 +177,27 @@ impl Tower {
     pub fn prove(
         cfg: TowerConfig,
         checks: SelfCheck,
+        h_start: [u32; 16],
+        blocks_per_leaf: usize,
+        n_leaves: usize,
+    ) -> Tower {
+        Tower::prove_with(
+            cfg,
+            checks,
+            &TowerShapes::default(),
+            h_start,
+            blocks_per_leaf,
+            n_leaves,
+        )
+    }
+
+    /// [`Tower::prove`] over a setup cache: each kind of build (FL, base,
+    /// spine) takes its finished circuit and fill plan from `shapes`, and
+    /// fills its slot on first use.
+    fn prove_with(
+        cfg: TowerConfig,
+        checks: SelfCheck,
+        shapes: &TowerShapes,
         h_start: [u32; 16],
         blocks_per_leaf: usize,
         n_leaves: usize,
@@ -167,7 +235,12 @@ impl Tower {
                     None => even = Some(cp),
                     Some(cp0) => {
                         h = cp.h_end;
-                        fls.push(build_first_level_node_k(cfg, checks, &[&cp0, &cp]));
+                        fls.push(build_first_level_node_k(
+                            cfg,
+                            checks,
+                            &shapes.fl,
+                            &[&cp0, &cp],
+                        ));
                         // Leaf 0 survives as the lane's chain-side material
                         // owner (one shape for every leaf); every other leaf
                         // drops here.
@@ -200,6 +273,7 @@ impl Tower {
         let base = build_node_outer_with(
             cfg,
             checks,
+            &shapes.base,
             &[&fls[k - 2].lo, &fls[k - 1].lo],
             Some(app_base),
             Some(ChainLane {
@@ -225,6 +299,7 @@ impl Tower {
                 let n = build_node_outer_with(
                     cfg,
                     checks,
+                    &shapes.spine,
                     &[&fls[i].lo, &prev.lo],
                     Some(app_base),
                     Some(ChainLane {

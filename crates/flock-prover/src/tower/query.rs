@@ -531,7 +531,7 @@ pub(super) fn emit_opening(
 /// the BLAKE3/BLAKE3 circuit proof, and the boolean tables whose lincheck
 /// circuits a verifier needs (in registry order via the `*_slot` indices).
 pub struct LeafOuter {
-    pub(super) shape: CircuitShape,
+    pub(super) shape: Arc<CircuitShape>,
     pub(super) public: Vec<F128>,
     pub(super) proof: MixedProof,
     pub(super) commitment: Commitment,

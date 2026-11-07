@@ -42,10 +42,11 @@ use {
 pub use crate::tower::{
     chain::{ChainOnlineMs, ChainProof, build_chain_proof},
     config::{SelfCheck, TowerConfig},
-    driver::{ChainStatement, RootDischargeFailure, Tower},
+    driver::{ChainStatement, RootDischargeFailure, Tower, TowerProver},
     fl_node::{FlNode, build_first_level_node, build_first_level_node_k},
     node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app, build_node_outer_with},
     query::LeafOuter,
+    setup::{ShapeSlot, TowerShapes},
     verify::{
         RootBundle, TowerVerifyError, TowerVk, TowerVkFingerprint, verify_root, verify_root_bytes,
     },
@@ -144,6 +145,7 @@ mod node;
 mod online;
 mod query;
 mod real_walker;
+mod setup;
 mod tape;
 mod verify;
 mod walker_common;

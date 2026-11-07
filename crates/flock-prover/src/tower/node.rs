@@ -48,9 +48,9 @@ use crate::{
         BitSpreadGate, BitSpreadTable, Blake3Gate, ChildSlots, DOMAIN, ENV_ACC_MAIN_WORDS, EnvTail,
         F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FoldPub, FsChallenger, HashKind,
         LeafOuter, MatrixClaim, MergedChain, MixedProof, Online, PcsParams, PowMaskGate,
-        PowMaskTable, RealRegion, RealTape, SLOT_WORDS, SelfCheck, ShapeBuilder, SwapGate,
-        SwapTable, TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire, ZskipTapeRec,
-        ZskipWires, assert_chain_replays, balance_extra_rows, bytes_payload_mask,
+        PowMaskTable, RealRegion, RealTape, SLOT_WORDS, SelfCheck, ShapeBuilder, ShapeSlot,
+        SwapGate, SwapTable, TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire,
+        ZskipTapeRec, ZskipWires, assert_chain_replays, balance_extra_rows, bytes_payload_mask,
         challenge_word_locs, check_ag_skip_publics, check_fold_publics, check_jagged_fold_publics,
         check_real_child_region, cw, emit_ag_point_binding, emit_fiat_shamir_chain,
         emit_fiat_shamir_chain_partitioned, emit_fold_region, emit_jagged_fold_region,
@@ -245,14 +245,25 @@ pub fn build_node_outer_app(
     lane: Option<ChainLane<'_>>,
     spine: Option<SpineIn<'_>>,
 ) -> NodeOut {
-    build_node_outer_with(cfg, SelfCheck::Full, los, app_stmt, lane, spine)
+    build_node_outer_with(
+        cfg,
+        SelfCheck::Full,
+        &ShapeSlot::default(),
+        los,
+        app_stmt,
+        lane,
+        spine,
+    )
 }
 
 /// [`build_node_outer_app`] with its self-checks gated by `checks` (see
-/// [`SelfCheck`]): the same proof, publics and block either way.
+/// [`SelfCheck`]): the same proof, publics and block either way. `slot` is
+/// this node kind's setup cache (see [`ShapeSlot`]).
+#[allow(clippy::too_many_arguments)]
 pub fn build_node_outer_with(
     cfg: TowerConfig,
     checks: SelfCheck,
+    slot: &ShapeSlot,
     los: &[&LeafOuter],
     app_stmt: Option<usize>,
     lane: Option<ChainLane<'_>>,
@@ -2006,7 +2017,7 @@ pub fn build_node_outer_with(
             );
             app_w.as_ref().map(|_| env_app_base(&env))
         };
-        let shape2 = sb.finish().expect("the 2->1 node circuit builds");
+        let (shape2, fill_plan) = slot.finish(sb, checks, "2->1 node");
         // The affine verifier plus the split BLAKE table stays below 512
         // cell slots, which pins the optimized mu=23 boundary.
         assert!(
@@ -2088,14 +2099,12 @@ pub fn build_node_outer_with(
         let hint_refs: Vec<&(dyn Any + Sync)> =
             hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
         let build_ms = build_ms + t_build2.elapsed().as_secs_f64() * 1e3;
-        // THE INDEX-FILL RUNNER (setup): compile the fill plan, then pin it
+        // THE INDEX-FILL RUNNER (setup): the fill plan comes with the shape
+        // (compiled once per kind), then pin it
         // row-identical against the generic walk before the online loop
         // trusts it — publics, every boolean row store, and every
         // element slot's packed witness, field for field. The walk stays the
         // differential oracle; only the plan runs in the timed loop.
-        let t_plan = Instant::now();
-        let fill_plan = shape2.fill_plan();
-        let build_ms = build_ms + t_plan.elapsed().as_secs_f64() * 1e3;
         if checks.on() {
             let walk = shape2.run(&vals, &hint_refs);
             let fill = shape2.run_filled(&fill_plan, &vals, &hint_refs);

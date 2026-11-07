@@ -14,8 +14,8 @@ use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
         ChainLane, ChainProof, DEV_BLOCKS, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online,
-        RootBundle, RootDischargeFailure, SelfCheck, SpineIn, Tower, TowerVerifyError, TowerVk,
-        UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
+        RootBundle, RootDischargeFailure, SelfCheck, SpineIn, Tower, TowerProver, TowerVerifyError,
+        TowerVk, UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
         chain_blake_r1cs, chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base,
         env_pass_base,
         envelope::STEADY_OVERRIDE,
@@ -1272,25 +1272,32 @@ pub(super) fn tower_verify_root_e2e() {
     verify_root(&vk, t2.statement(), &t2.root_bundle()).expect("the k = 2 root verifies");
 }
 
-/// **SKIPPING THE SELF-CHECKS LEAVES THE ROOT ALONE.** The same six-leaf
-/// tower (base + one spine fold, every builder kind) proved under
-/// `SelfCheck::Full` and `SelfCheck::Skip` ships the same wire bundle,
-/// byte for byte — so the checks feed nothing, and the `Full` run's
-/// self-verifies vouch for the `Skip` root too.
+/// **SKIPPING THE SELF-CHECKS AND REUSING THE SETUP LEAVE THE ROOT
+/// ALONE.** The same eight-leaf tower (base + two spine folds, every
+/// builder kind, the spine slot reused) proved three ways ships the same
+/// wire bundle, byte for byte: `SelfCheck::Full` from scratch,
+/// `SelfCheck::Skip` from scratch, and `SelfCheck::Skip` over a
+/// [`TowerProver`] whose setup ran on a different statement. So the checks
+/// feed nothing, the cached shapes are the builds' own, and the `Full`
+/// run's self-verifies vouch for the other two roots.
 #[test]
-#[ignore] // Heavy — two six-leaf towers.
-pub(super) fn tower_skip_self_checks_byte_identical() {
+#[ignore] // Heavy — three eight-leaf towers and a six-leaf setup.
+pub(super) fn tower_skip_and_setup_byte_identical() {
     let cfg = test_config();
     let h0: [u32; 16] = from_fn(|i| 0x5E1F_C4EC ^ i as u32);
-    let full = Tower::prove(cfg, SelfCheck::Full, h0, DEV_BLOCKS, 6);
-    let skip = Tower::prove(cfg, SelfCheck::Skip, h0, DEV_BLOCKS, 6);
-    assert_eq!(skip.statement(), full.statement(), "one statement");
-    assert!(
-        skip.root_bundle_bytes() == full.root_bundle_bytes(),
-        "the Skip root's wire bundle differs from the Full root's"
-    );
-    skip.discharge_root()
-        .expect("the Skip root's residue discharges");
+    let full = Tower::prove(cfg, SelfCheck::Full, h0, DEV_BLOCKS, 8);
+    let skip = Tower::prove(cfg, SelfCheck::Skip, h0, DEV_BLOCKS, 8);
+    let prover = TowerProver::setup(cfg, DEV_BLOCKS);
+    let cached = prover.prove(SelfCheck::Skip, h0, 8);
+    let want = full.root_bundle_bytes();
+    for (name, t) in [("Skip", &skip), ("set-up Skip", &cached)] {
+        assert_eq!(t.statement(), full.statement(), "{name}: one statement");
+        assert!(
+            t.root_bundle_bytes() == want,
+            "the {name} root's wire bundle differs from the Full root's"
+        );
+        t.discharge_root().expect("the root's residue discharges");
+    }
 }
 
 /// **THE VK'S PUBLISHED IDENTITY, PINNED** (chain128 @ DEV_BLOCKS
