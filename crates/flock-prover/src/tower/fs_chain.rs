@@ -505,7 +505,10 @@ pub(super) fn merge_chain(
             );
         }
         for (k, half) in [(c.digest_squeeze, 0usize), (c.digest_squeeze + 1, 1)] {
-            link_word(c.parent_digest_word + c.half_stride * half, cm(c.trace.squeezes[k][0]));
+            link_word(
+                c.parent_digest_word + c.half_stride * half,
+                cm(c.trace.squeezes[k][0]),
+            );
         }
     }
 
