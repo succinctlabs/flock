@@ -1353,7 +1353,7 @@ pub(super) fn envelope_content_probe() {
     let n_blocks: usize = var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(256);
+        .unwrap_or(DEV_BLOCKS);
     let mut rng = Rng(0xC4A1_00CE);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let mut cps = Vec::new();

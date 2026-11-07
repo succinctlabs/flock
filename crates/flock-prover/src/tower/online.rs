@@ -2,7 +2,7 @@ use {bincode::serialize, serde::Serialize};
 
 #[cfg(test)]
 use flock_core::{
-    pcs::{MergedOpenProof, ligerito::RecursiveProof},
+    pcs::{MergedInnerOpen, MergedOpenProof, ligerito::RecursiveProof},
     proof::R1csProofCircuitMerged,
 };
 
@@ -135,60 +135,13 @@ pub(super) fn proof_census_parts(
     pcs_open: &MergedOpenProof,
     pcs: &PcsParams,
 ) {
-    // Per-level stratified schedules, and the siblings a path emits ABOVE
-    // the cap layer. The cap is the whole layer at the DEEPEST summand's
-    // depth c1, so every query can be checked with d - c1 siblings — since
-    // truncation, that is all the prover emits. MEASURED from the proof
-    // (not recomputed from the schedule), so `redundant` certifies the
-    // truncation stays landed: anything past q·(d − c1) is waste.
-    if let Ok(cfg) = pcs.ligerito_prover_config() {
-        let lig = &pcs_open.inner.split().ligerito;
-        let r = lig.recursive_caps.len();
-        assert_eq!(cfg.stratified.len(), r + 1, "one schedule per open level");
-        let level_paths = |lvl: usize| -> usize {
-            if lvl == 0 {
-                lig.initial_proof.merkle_proof.len()
-            } else if lvl < r {
-                lig.recursive_proofs[lvl - 1].merkle_proof.len()
-            } else {
-                lig.final_proof.merkle_proof.len()
-            }
-        };
-        let (mut waste, mut emitted) = (0usize, 0usize);
-        let mut per_level: Vec<String> = Vec::new();
-        for (lvl, sch) in cfg.stratified.iter().enumerate() {
-            let c1 = sch.cap_depth();
-            let e = level_paths(lvl);
-            let w = e - sch.queries() * (sch.log_block_len - c1);
-            per_level.push(format!(
-                "L{lvl}: q={} depths={:?} cap={c1} sibs={e} redundant={w}",
-                sch.queries(),
-                sch.summand_depths,
-            ));
-            waste += w;
-            emitted += e;
-        }
-        println!(
-            "\n  STRATIFIED PATHS — {label}\n    {}\n    \
-             emitted {emitted} siblings, {waste} redundant above the cap \
-             ({:.1} KiB of {:.1} KiB, {:.0}%)",
-            per_level.join("\n    "),
-            waste as f64 * 32.0 / 1024.0,
-            emitted as f64 * 32.0 / 1024.0,
-            100.0 * waste as f64 / emitted as f64,
-        );
-    }
     let sz = |b: Result<Vec<u8>, _>| b.map(|v| v.len()).unwrap_or(0) as f64 / 1024.0;
-    let lig = &pcs_open.inner.split().ligerito;
-    let rows = |v: &Vec<RecursiveProof>| -> (f64, f64) {
+    let rows = |v: &[RecursiveProof]| -> (f64, f64) {
         (
             v.iter().map(|r| sz(serialize(&r.opened_rows))).sum(),
             v.iter().map(|r| sz(serialize(&r.merkle_proof))).sum(),
         )
     };
-    let (rec_rows, rec_paths) = rows(&lig.recursive_proofs);
-    let l0_rows = sz(serialize(&lig.initial_proof.opened_rows));
-    let l0_paths = sz(serialize(&lig.initial_proof.merkle_proof));
     println!(
         "\n  PROOF CENSUS — {label}: {total:.1} KiB\n\
          \x20   boolean PIOP        {:6.1}\n\
@@ -198,14 +151,7 @@ pub(super) fn proof_census_parts(
          \x20   ring switches       {:6.1}\n\
          \x20   multipoint values   {:6.1}   (128 per rs claim)\n\
          \x20   multipoint rounds   {:6.1}\n\
-         \x20   multipoint anchor   {:6.1}\n\
-         \x20   inner: L0 rows      {:6.1}\n\
-         \x20   inner: L0 paths     {:6.1}\n\
-         \x20   inner: rec rows     {:6.1}\n\
-         \x20   inner: rec paths    {:6.1}\n\
-         \x20   inner: caps         {:6.1}   (L0 {:.1} + rec {:.1})\n\
-         \x20   inner: final block  {:6.1}\n\
-         \x20   inner: sumcheck     {:6.1}",
+         \x20   multipoint anchor   {:6.1}",
         boolean_kib,
         element_kib,
         wiring_kib,
@@ -214,16 +160,85 @@ pub(super) fn proof_census_parts(
         sz(serialize(&pcs_open.frobenius.values)),
         sz(serialize(&pcs_open.frobenius.rounds)),
         sz(serialize(&pcs_open.frobenius.anchor)),
-        l0_rows,
-        l0_paths,
-        rec_rows,
-        rec_paths,
-        sz(serialize(&lig.initial_cap)) + sz(serialize(&lig.recursive_caps)),
-        sz(serialize(&lig.initial_cap)),
-        sz(serialize(&lig.recursive_caps)),
-        sz(serialize(&lig.final_proof)),
-        sz(serialize(&lig.sumcheck_transcript)),
     );
+    match &pcs_open.inner {
+        MergedInnerOpen::Affine(a) => {
+            let (l0_rows, l0_paths) = rows(&a.openings[..1]);
+            let (rec_rows, rec_paths) = rows(&a.openings[1..]);
+            let nonces = sz(serialize(&a.fold_grinding_nonces))
+                + sz(serialize(&a.claim_batch_grinding_nonces))
+                + sz(serialize(&a.consistency_batch_grinding_nonces))
+                + sz(serialize(&a.grinding_nonces));
+            println!(
+                "\x20   affine: L0 rows     {:6.1}\n\
+                 \x20   affine: L0 paths    {:6.1}\n\
+                 \x20   affine: rec rows    {:6.1}\n\
+                 \x20   affine: rec paths   {:6.1}\n\
+                 \x20   affine: caps        {:6.1}   (L0 {:.1} + rec {:.1})\n\
+                 \x20   affine: fold grids  {:6.1}\n\
+                 \x20   affine: overflows   {:6.1}\n\
+                 \x20   affine: final yr    {:6.1}\n\
+                 \x20   affine: ood values  {:6.1}\n\
+                 \x20   affine: nonces      {:6.1}",
+                l0_rows,
+                l0_paths,
+                rec_rows,
+                rec_paths,
+                sz(serialize(&a.initial_cap)) + sz(serialize(&a.recursive_caps)),
+                sz(serialize(&a.initial_cap)),
+                sz(serialize(&a.recursive_caps)),
+                sz(serialize(&a.grids)),
+                sz(serialize(&a.overflows)),
+                sz(serialize(&a.yr)),
+                sz(serialize(&a.ood_values)),
+                nonces,
+            );
+        }
+        MergedInnerOpen::Split(split) => {
+            let lig = &split.ligerito;
+            // Per-level stratified schedules, and the siblings a path emits
+            // ABOVE the cap layer: anything past q·(d − c1) is waste.
+            if let Ok(cfg) = pcs.ligerito_prover_config() {
+                let r = lig.recursive_caps.len();
+                assert_eq!(cfg.stratified.len(), r + 1, "one schedule per open level");
+                let level_paths = |lvl: usize| -> usize {
+                    if lvl == 0 {
+                        lig.initial_proof.merkle_proof.len()
+                    } else if lvl < r {
+                        lig.recursive_proofs[lvl - 1].merkle_proof.len()
+                    } else {
+                        lig.final_proof.merkle_proof.len()
+                    }
+                };
+                let waste: usize = cfg
+                    .stratified
+                    .iter()
+                    .enumerate()
+                    .map(|(lvl, sch)| {
+                        level_paths(lvl) - sch.queries() * (sch.log_block_len - sch.cap_depth())
+                    })
+                    .sum();
+                println!("\x20   split: {waste} redundant siblings above the caps");
+            }
+            let (rec_rows, rec_paths) = rows(&lig.recursive_proofs);
+            println!(
+                "\x20   split: L0 rows      {:6.1}\n\
+                 \x20   split: L0 paths     {:6.1}\n\
+                 \x20   split: rec rows     {:6.1}\n\
+                 \x20   split: rec paths    {:6.1}\n\
+                 \x20   split: caps         {:6.1}\n\
+                 \x20   split: final block  {:6.1}\n\
+                 \x20   split: sumcheck     {:6.1}",
+                sz(serialize(&lig.initial_proof.opened_rows)),
+                sz(serialize(&lig.initial_proof.merkle_proof)),
+                rec_rows,
+                rec_paths,
+                sz(serialize(&lig.initial_cap)) + sz(serialize(&lig.recursive_caps)),
+                sz(serialize(&lig.final_proof)),
+                sz(serialize(&lig.sumcheck_transcript)),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -761,7 +761,7 @@ pub(super) fn chain_tower_m32_headline() {
         serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
     proof_census_mixed("internal node", &node.proof, &node.pcs);
-    proof_census_mixed("chain leaf (m32 Fast)", &cp0.inner.proof, &cp0.inner.pcs);
+    proof_census_mixed("chain leaf", &cp0.inner.proof, &cp0.inner.pcs);
     proof_census_mixed("FL node", &fl0.lo.proof, &fl0.lo.pcs);
 }
 
