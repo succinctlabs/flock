@@ -1,0 +1,98 @@
+# Metal gate: clippy and the GPU commit's tests with the `metal` feature.
+#
+# The Metal commit (crates/flock-core/src/gpu_commit.rs) compiles only under
+# cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+# so the self-hosted Linux runners of lint.yml and test.yml never build it,
+# and a refactor of the NTT, Merkle or ProverData code could break it
+# silently. This job runs on a GitHub-hosted Apple Silicon runner (macOS
+# minutes are free on a public repository).
+#
+# Hosted macOS runners are virtual machines and may expose no Metal device
+# (or only a paravirtual one). Without a device the GPU tests print "no Metal
+# device; skipping" and pass, and the PCS commit falls back to the CPU, so the
+# job still gates compilation, clippy and the CPU side of the hybrid. Any
+# other Metal init error (a kernel that no longer compiles, say) fails them.
+# The "Metal device" step logs what the runner has, and --nocapture keeps the
+# skip lines in the log.
+
+name: Metal
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  metal:
+    name: Metal clippy & tests (macOS arm64)
+    runs-on: macos-15
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Get stable toolchain date (cache key)
+        id: rust-version
+        shell: bash
+        run: |
+          # Same scheme as lint.yml: a new stable release invalidates the
+          # cached toolchain instead of updating it in place.
+          STABLE_DATE=$(curl -sS https://static.rust-lang.org/dist/channel-rust-stable-date.txt)
+          echo "date=$STABLE_DATE" >> $GITHUB_OUTPUT
+
+      - name: rust-cache
+        # actions/cache@v4.2.3 (pinned by sha, matching lint.yml / sp1)
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.rustup/
+          # target/ is left out: a macOS release target is several GB and
+          # would crowd the repository's 10 GB Actions cache.
+          key: flock-metal-${{ runner.arch }}-${{ runner.os }}-${{ steps.rust-version.outputs.date }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            flock-metal-${{ runner.arch }}-${{ runner.os }}-${{ steps.rust-version.outputs.date }}-
+
+      - name: Install Rust (stable + clippy)
+        shell: bash
+        run: |
+          if ! command -v rustup &> /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --component clippy
+          rustup default stable
+          rustc --version && cargo --version && cargo clippy --version
+
+      - name: Metal device
+        shell: bash
+        run: system_profiler SPDisplaysDataType || true
+
+      # target-cpu=apple-m1, set here because RUSTFLAGS overrides the repo's
+      # .cargo/config.toml (target-cpu=native). On the hosted VM, native CPU
+      # detection drops the crypto extensions, so target_feature = "aes" goes
+      # away, the PMULL NTT path compiles out and its helpers fail -D dead_code
+      # (reproduced locally with target-cpu=generic: the same 11 errors).
+      - name: cargo clippy (metal)
+        env:
+          RUSTFLAGS: -C target-cpu=apple-m1
+        run: cargo clippy --release --workspace --all-targets --features flock-prover/metal -- -D warnings
+
+      # The GPU graph and hybrid tests against the CPU commit, the sub-block
+      # transforms the hybrid's CPU side runs, and the PCS commit tests, which
+      # take the GPU path for codewords from 2^20 words. Debug assertions and
+      # overflow checks on, as in test.yml.
+      - name: cargo test (metal)
+        env:
+          RUSTFLAGS: -C target-cpu=apple-m1 -C debug-assertions=on -C overflow-checks=on
+        run: cargo test --release -p flock-core --features metal --lib -- gpu_commit sub_block pcs::commit --nocapture

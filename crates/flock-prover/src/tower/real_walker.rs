@@ -1,7 +1,7 @@
 use std::{array::from_fn, collections::BTreeMap, env::var, iter::repeat_n, sync::OnceLock};
 
 use flock_core::{
-    circuit::{SigmaAssertion, builder::SlotId},
+    circuit::{Circuit, SigmaAssertion, builder::SlotId},
     element_r1cs::union::{ElementAssertion, region_slots},
     lincheck::{MatrixAssertion, SkipPoint, build_eq_table},
     matrix_fold::{JaggedAssertion, JaggedRowWeight},
@@ -32,7 +32,7 @@ use crate::{
         ZskipTapeRec, ZskipWires, ag_seed_bytes, bytes_payload_mask, cap_payloads, cap_wires,
         check_residual_publics, circuit_structure_claim_wires, cw, decode_ag_point,
         emit_boolean_reported_check, emit_element_reported_check, emit_fiat_shamir_chain,
-        emit_pow_checks, emit_publics_hash, emit_query_phase, emit_recombination,
+        emit_nonzero_top, emit_pow_checks, emit_publics_hash, emit_query_phase, emit_recombination,
         emit_residual_region, flatten_ops,
         gates_spine::TD_PARTS,
         leaf_boolean_lcs, level_geometry, level_sources, observed_f256, outer_union, pack8,
@@ -47,6 +47,40 @@ use crate::{
         },
     },
 };
+
+/// THE NODE WALKER'S WIRING GUARD. [`RealTape`] replays a node child's
+/// wiring product GKR with every gate slot gathered at its own position and
+/// the publics recombined, and nothing else:
+/// - no tuple bus: it locates no bus region (the leaf walker's
+///   `walk_bus_gkr`/`emit_bus`), and its structure claims carry no plane 6;
+/// - no public columns: no plane-7 structure claims;
+/// - no pruned or packed slots: the recombination reads positions through
+///   the shared `recombination_positions`, but no node outer prunes or packs,
+///   so the path is unexercised.
+///
+/// Node outers have none of them. A child that did would otherwise surface
+/// as an unrelated assert deep in the walk, or as a region skipped; refuse it
+/// up front. Every node child passes here while the tower (and its VK) is
+/// built, so a node shape that grew one fails at VK build.
+pub(super) fn assert_node_child_wiring(circuit: &Circuit) {
+    assert!(
+        circuit.bus().is_none(),
+        "the node walker has no tuple bus: a node child must not carry one"
+    );
+    assert!(
+        circuit.public_columns().next().is_none(),
+        "the node walker has no public columns: a node child must not open any"
+    );
+    assert_eq!(
+        circuit.gathered_slots().len(),
+        circuit.cells().num_gate_slots(),
+        "the node walker gathers every gate slot: a node child must not prune"
+    );
+    assert!(
+        !circuit.live_slots_packed(),
+        "the node walker reads unpacked slots: a node child must not pack"
+    );
+}
 
 /// One recorded REAL-child verification (the leaf outer as inner), parsed:
 /// the tape, each region, and the native values used by the checker.
@@ -145,6 +179,7 @@ pub(super) struct RealTape<'p> {
 
 impl<'p> RealTape<'p> {
     pub(super) fn new(lo: &'p LeafOuter, domain: &'static [u8]) -> Self {
+        assert_node_child_wiring(&lo.shape.circuit);
         let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
         let lcs = leaf_boolean_lcs(lo);
         // ONE recorded DEFERRED verify serves both needs: it is
@@ -1109,7 +1144,7 @@ fn parse_anchor_boolean_replica(
                 let pt = decode_ag_point(
                     &ag_seed_bytes(chals[*seed_ch], chals[*seed_ch + 1]),
                     nonce,
-                    lo.pcs.zerocheck_grinding().ag_round_one_bits(),
+                    lo.ag_round_one_bits(),
                 );
                 assert_eq!(
                     mat_assert.z_skip,
@@ -2229,6 +2264,8 @@ fn emit_wiring_gkr_sigma(
     // CONSTRAINT now — the proof itself fails on a broken identity.
     let (mut cl_w, mut cr_w) = (wv(gr.top_v), wv(gr.top_v + 1));
     sb.connect(cl_w, cr_w);
+    // ... and nonzero: two zero products agree whatever their leaves.
+    emit_nonzero_top(sb, macs, cl_w, gr.top, vals, ow, zassert);
     let mut pt_w: Vec<Wire> = Vec::new();
     for lr in &gr.layers {
         let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];

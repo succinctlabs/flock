@@ -545,10 +545,25 @@ impl BooleanGate {
             dead_padding_unread,
         } = dst;
         let capacity = z.len() >> (k_log - 7);
+        // The groups below write through raw pointers, so the geometry is
+        // checked here, in release builds too. The stripe holds one `k`-byte
+        // batch per 8 rows, so a slot needs at least 8 (`pack_z_lincheck`'s
+        // `n_outer ≥ 8`): below that it would have no batch while the first
+        // group still writes one, out of bounds when the zero-fill that
+        // would otherwise panic first is elided. `a` and `b` take the same
+        // column runs as `z`.
         assert!(
-            capacity.is_power_of_two() && n <= capacity,
-            "{}: {n} rows",
+            capacity.is_power_of_two() && capacity >= 8 && n <= capacity,
+            "{}: {n} rows in a slot of {capacity} (a power of two, at least 8)",
             self.name
+        );
+        assert!(
+            a.len() == z.len() && b.len() == z.len(),
+            "{}: z, a and b hold {}, {} and {} words",
+            self.name,
+            z.len(),
+            a.len(),
+            b.len()
         );
         let nu = capacity.trailing_zeros() as usize;
         if !elide_padding_writes {

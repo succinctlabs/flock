@@ -102,10 +102,18 @@ Throughout, `D` is the set of dropped rows, the words of
    On a declared instance the pin is 1, so the second is exactly the
    original row.
 2. **The `η` batch.** `η` is sampled after `z` is committed and after the
-   zerocheck has fixed `a'(r)` and `b'(r)`. The sumcheck identity is affine
-   in `η`, so a nonzero `ρ̂(r)` survives with probability at most `1/|F|`.
-   That is one more `β`-like site, with one PoW bit under
-   `LincheckGrinding::per_challenge_128`.
+   zerocheck has fixed `a'(r)` and `b'(r)`. The term `α·η·ρ̂(r)` vanishes at
+   `η = 0` and also at `α = 0`, so a nonzero `ρ̂(r)` survives with
+   probability at most `2/|F|`, not `1/|F|`:
+   - `α` is sampled first. At `α = 0` the term is gone whatever `η` is.
+   - Once `α ≠ 0`, the identity is affine in `η` with the nonzero
+     coefficient `α·ρ̂(r)`: one bad `η`.
+
+   Each challenge still has at most one bad value (at `α = 0` the batch
+   reduces to `b'`'s own check, so `α` gains no second bad value), so
+   `η` is one more `β`-like site and the per-challenge grinding is
+   unchanged: one PoW bit each under `LincheckGrinding::per_challenge_128`
+   brings each share to `2^-129`, `2^-128` together.
 3. **The point `r`.** `ρ` is fixed by the commitment before `r` is drawn.
    A nonzero `ρ` has `ρ̂(r) = 0` only if `r` hits a bad set:
    - at the skip coordinate, the zeros of a nonzero skip slice's base-code
@@ -130,10 +138,13 @@ Throughout, `D` is the set of dropped rows, the words of
      They are virtual zeros, so nothing changes.
    - **`UnionInstance::set_full_height_commit`:** dummy rows are committed.
      The wiring and the bus then read them. Their gathers read each
-     committed word's whole column and treat dummy rows as zero. A dead
-     wiring leaf is `1 + w`, so a prover who could set a dummy input word
-     to `w = 1` would zero both grand products and void every copy
-     constraint.
+     committed word's whole column and treat dummy rows as zero (the
+     wiring's caller obligation 5, the dead-row invariant, in
+     `circuit.rs`). A dead wiring leaf is `1 + w`, so a prover who could set
+     a dummy input word to `w = 1` would zero both grand products and void
+     every copy constraint. The product verifier now also rejects a zero
+     product (`ProductGkrError::ZeroProduct`), but the bus's grinding still
+     counts on dead rows being zero.
    - **The rule:** a slot that commits dummy rows (full height,
      `0 < n_t < 2^ν`) keeps all its rows. `UnionInstance::zeroed_word_cols`
      returns nothing for it, and every consumer reads the list through
@@ -193,18 +204,20 @@ See *Measurements*.
 
 ## Not supported yet
 
-- **The deferred verification paths** (the jagged-layout export, and the
-  lincheck's matrix-claims accumulation, `MatrixAssertion::claims` and
-  `check_reported`) describe rows with plain eqs. With zeroed words they
-  assert. A prover cannot trigger this, since the list comes from the
-  verifier's registry.
-- **The recursion tower** never zeroes words.
 - **Partial slots under full-height commit** keep their rows. Recovering
   them would take the C claim's weight
   `eq_row ⊗ (eq_col ⊙ mask) + (eq_row ⊙ dead) ⊗ (eq_col ⊙ (1 − mask))`.
   Its row factor is masked to the dummy rows per slot, which every opening
   path would have to carry. In leanXMSS at 1000 signatures, those slots
   hold about a quarter of the droppable blocks.
+
+This list used to name the deferred verification paths (the jagged-layout
+export and the lincheck's matrix-claims accumulation), which asserted on a
+registry that drops words, and the recursion tower, which zeroed none. Both
+carry dropped words since `531ccc0` (#70): `MatrixAssertion` holds the
+dropped words and the linear values (`check_reported` adds `α·η·v_L`,
+`linear_claims` hands them out), the deferred merged open exports the
+masked C claim, and the recursion leaf drops its degree-one words.
 
 ## Measurements
 
@@ -343,11 +356,28 @@ full height.
 - `lincheck::union`:
   `identity_words_are_the_linear_check_with_nothing_to_check` checks the
   comb identity above, and the exact `α·η·eq⊙(A + I)` term for an XOR word.
-- `tests/union_lincheck.rs`: `dropped_linear_rows_are_checked_by_the_lincheck`.
-  A witness whose XOR output bit is wrong passes the zerocheck once the word
-  is dropped and is rejected by the lincheck. With only the input word
-  dropped, the zerocheck rejects it. Both are run without grinding and with
-  the strict schedule.
+- `tests/union_lincheck.rs`, each on the RS and (on aarch64) the AG
+  zerocheck:
+  - `dropped_linear_rows_are_checked_by_the_lincheck`. A witness whose XOR
+    output bit is wrong passes the zerocheck once the word is dropped and
+    is rejected by the lincheck. With only the input word dropped, the
+    zerocheck rejects it. Both are run without grinding and with the strict
+    schedule.
+  - `tampered_pin_is_checked_while_its_word_drops`: the pin cleared on a
+    declared row while word 0 (the pin's own row) is dropped. The const
+    pin's claim rejects it.
+  - `forced_zero_rows_are_checked_by_the_lincheck`: a `0·0 = x` bit set to
+    1 in a dropped word. The `η` term rejects it.
+  - `full_height_dummy_row_input_word_is_rejected`: the full-height
+    dummy-row attack, a committed dummy input word of 1 read by a
+    consistent cheater's zerocheck. The kept `x·pin = x` row rejects it,
+    and with the row dropped the zerocheck would not.
+- `leanxmss`: `dropped_word_tamper_is_rejected_end_to_end` flips a bit of
+  a dropped XOR word no wire or bus reads in a full slot, in the committed
+  witness and the lincheck's stripe alike, and the proof is rejected by the
+  lincheck (AG on aarch64, RS elsewhere).
+- `circuit`: `a_dead_io_word_of_one_is_rejected` forges the wiring proof a
+  dead word of 1 allows; the zero-product check rejects it.
 - `r1cs_hashes::blake3`: `zeroed_words_roundtrip` runs AG round trips for
   inputs only and for linear words, jagged and full height, with a partial
   slot (kept) and a full one (dropped). `zeroed_linear_words_roundtrip_rs`

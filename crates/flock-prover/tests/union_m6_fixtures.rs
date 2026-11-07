@@ -205,6 +205,10 @@ fn merged_bundle_digest(
 #[test]
 // Default-run (~2 s for both anchors): these pins are what makes the
 // "fixture anchors byte-stable" claim enforceable in CI.
+// Re-pinned 2026-11-05: proof-IO VERSION 23 -> 24 (the leanXMSS stack's
+// wiring fields and transcript rules) — the four merged bundles moved with
+// the header byte, the header-less anchors did not. Two deterministic print
+// runs agreed.
 // Re-pinned 2026-10-26 (merged-nu10-1024-1024 only): the block-first
 // transport now covers every layout whose used columns are all full height,
 // gaps allowed (`pcs::full_height_columns`), not just a full-height prefix.
@@ -224,22 +228,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "7a4af618435e3b67e7dea3f1f466a2aa843b73751ff7390cc51b67ceb86a2e14",
+            "e6770446d9f5660aa0c09fe28933b06222d3f483233cb343a0666200b4eb5219",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "e8e7a778e916fd39521d7f53fbd5ab1cc592799947c24bdf010cd7fd2dd21d5e",
+            "70c3361378138d909144f213b517afd48ed9fee4fbda7dbd8933ee116e02b6d3",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "96ae2fad523f7dfb131c9e927c95d6b00163bed9c08c71a95bc58068bf84c221",
+            "d94c69f20e26c2f819d9ed3412ff71264b81ede38e2dcc6317c36d711022412f",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "30286680ab5ce851884552eefd71e6e0c6950a91ae35a6bc683bcdb8a073006a",
+            "038786a6b5665b61cf59c00596a05c3a851bfa1e6a166a3a9eabd8c7ad7729d1",
         ),
     ];
 

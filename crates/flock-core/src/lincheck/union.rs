@@ -312,7 +312,10 @@ fn beta_sites<'c>(
 /// The linear check's `η`, sampled right after `α` when the union drops
 /// linear rows ([`UnionInstance::checks_linear_rows`]): it batches their
 /// identity into the A-claim, one linear identity like a pin's `β`, and
-/// grinds like one.
+/// grinds like one. The term `α·η·ρ̂` vanishes at `α = 0` as well as at
+/// `η = 0`, so a nonzero residual survives with probability `2/|F|`; each
+/// challenge has at most one bad value, so each keeps its one bit
+/// (`docs/zeroed-linear-words.md`, soundness item 2).
 fn prove_eta<Ch: Challenger>(
     union: &UnionInstance<'_>,
     grinding: LincheckGrinding,
@@ -799,11 +802,13 @@ impl MatrixAssertion {
     ) -> Result<(), LincheckError> {
         let registry = union.registry();
         let k_skip = K_SKIP;
-        assert_eq!(
-            circuits.len(),
-            registry.num_boolean(),
-            "one circuit per BOOLEAN registry type"
-        );
+        if circuits.len() != registry.num_boolean() {
+            return Err(LincheckError::BadVectorLength {
+                which: "circuits",
+                expected: registry.num_boolean(),
+                got: circuits.len(),
+            });
+        }
         let mut combs: Vec<Vec<F128>> = registry
             .boolean_types()
             .iter()
@@ -948,11 +953,16 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     let inner_rest_len = col_vars - k_skip;
     let n_skip = 1usize << k_skip;
 
-    assert_eq!(
-        circuits.len(),
-        registry.num_boolean(),
-        "one circuit per BOOLEAN registry type (element slots have their own PIOP)"
-    );
+    // One circuit per BOOLEAN registry type (element slots have their own
+    // PIOP), each with its type's width and const pin. Rejections, not
+    // panics: a recursion layer takes the registry from its key.
+    if circuits.len() != registry.num_boolean() {
+        return Err(LincheckError::BadVectorLength {
+            which: "circuits",
+            expected: registry.num_boolean(),
+            got: circuits.len(),
+        });
+    }
     for (ty, circuit) in registry.boolean_types().iter().zip(circuits) {
         let k = 1usize << ty.k_log;
         if circuit.n_cols() != k {
@@ -963,11 +973,11 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
                 got_cols: circuit.n_cols(),
             });
         }
-        assert_eq!(
-            circuit.const_pin_col(),
-            ty.const_pin,
-            "circuit const_pin must match the registry type"
-        );
+        if circuit.const_pin_col() != ty.const_pin {
+            return Err(LincheckError::ConsistencyFailed {
+                which: "circuit const pin",
+            });
+        }
     }
     if x_ab.x_inner_rest.len() != inner_rest_len {
         return Err(LincheckError::BadInnerRestLength {
@@ -1130,6 +1140,17 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
             which: "matrix_evals",
             expected: n_types + n_linear,
             got: proof.matrix_evals.len(),
+        });
+    }
+    // Each extra pair is `(⟨W_t, D_t·(A_0 + I)⟩, 0)`: its second slot
+    // carries nothing, and nothing would bind it, so a nonzero one is a
+    // malleated proof.
+    if proof.matrix_evals[n_types..]
+        .iter()
+        .any(|&(_, pad)| pad != F128::ZERO)
+    {
+        return Err(LincheckError::ConsistencyFailed {
+            which: "linear-evals padding",
         });
     }
     let mut extra = proof.matrix_evals[n_types..].iter();

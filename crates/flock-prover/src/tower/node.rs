@@ -302,6 +302,8 @@ pub fn build_node_outer_app(
         );
     }
     let registry = &lo0.shape.registry;
+    // The main fold below binds per claim and publishes no linear group.
+    crate::tower::verify::assert_outer_drops_nothing(registry);
     let unions: Vec<UnionInstance> = los
         .iter()
         .map(|lo| outer_union(&lo.shape.registry, lo.shape.counts.clone()))
@@ -1495,7 +1497,7 @@ pub fn build_node_outer_app(
                         [tk.chals[*seed_ch], tk.chals[*seed_ch + 1]],
                         nonce,
                         &pt,
-                        los[k].pcs.zerocheck_grinding().ag_round_one_bits(),
+                        los[k].ag_round_one_bits(),
                         &mut vals,
                         &mut consts,
                         zw,
@@ -2477,11 +2479,7 @@ pub fn build_node_outer_app(
                 // phase D; the checker holds the nonce range and the lows.
                 for (lo_c, base) in los.iter().zip(&ag_pub_bases) {
                     if let Some(base) = base {
-                        check_ag_skip_publics(
-                            &built2.public,
-                            *base,
-                            lo_c.pcs.zerocheck_grinding().ag_round_one_bits(),
-                        );
+                        check_ag_skip_publics(&built2.public, *base, lo_c.ag_round_one_bits());
                     }
                 }
                 for &(v, idx) in &jag_const_rec {

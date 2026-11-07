@@ -34,6 +34,9 @@ pub(super) struct GkrRec {
     pub(super) alpha_fin: usize,
     pub(super) beta_fin: usize,
     pub(super) top_v: usize,
+    /// The grand product's top, native (`top_lhs`): its inverse is the
+    /// witness of the in-circuit nonzero check ([`emit_nonzero_top`]).
+    pub(super) top: F128,
     pub(super) layers: Vec<GkrLayerRec>,
     pub(super) fgs_v: usize, // f_eval, g_eval, s_sigma consecutive
     pub(super) r_pt: Vec<F128>,
@@ -48,6 +51,8 @@ pub(super) struct BusRec {
     pub(super) beta_ch: usize,
     pub(super) gamma_fins: Vec<usize>,
     pub(super) top_v: usize,
+    /// The bus product's top, native ([`GkrRec::top`]).
+    pub(super) top: F128,
     pub(super) layers: Vec<GkrLayerRec>,
     pub(super) r_pt: Vec<F128>,
     pub(super) claim_l: F128,
@@ -157,6 +162,7 @@ pub(super) fn emit_gkr_layers(
     zcr: SlotId,
     layers: &[GkrLayerRec],
     top_v: usize,
+    top: F128,
     trace: &FsChainTrace,
     outs: &[Vec<Wire>],
     wv: &impl Fn(usize) -> Wire,
@@ -167,6 +173,7 @@ pub(super) fn emit_gkr_layers(
 ) -> (Wire, Wire, Vec<Wire>) {
     let (mut cl_w, mut cr_w) = (wv(top_v), wv(top_v + 1));
     sb.connect(cl_w, cr_w);
+    emit_nonzero_top(sb, macs, cl_w, top, vals, ow, zassert);
     let mut pt_w: Vec<Wire> = Vec::new();
     for lr in layers {
         let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
@@ -200,6 +207,30 @@ pub(super) fn emit_gkr_layers(
     (cl_w, cr_w, pt_w)
 }
 
+/// Reject a ZERO grand product in-circuit. The two tops are `connect`ed
+/// equal, but a product of `w + 1`-shaped leaves is zero as soon as one
+/// leaf is (a dead cell holding an io word of 1, a bus factor that
+/// vanishes), and two zero products agree whatever the rest of the
+/// multisets hold. A private witness `t = top⁻¹` and one MAC row
+/// `1 + top·t` on the assert-zero anchor force `top·t = 1`, so `top ≠ 0`.
+/// The native verifier makes the same check (`verify_reduction` rejects
+/// `top_lhs == 0`).
+pub(super) fn emit_nonzero_top(
+    sb: &mut ShapeBuilder,
+    macs: SlotId,
+    top_w: Wire,
+    top: F128,
+    vals: &mut Vec<F128>,
+    ow: Wire,
+    zassert: Wire,
+) {
+    assert_ne!(top, F128::ZERO, "an accepted grand product is nonzero");
+    vals.push(top.inv());
+    let t = sb.input();
+    let one_plus = sb.gate(macs, &[ow, top_w, t])[0];
+    sb.connect(one_plus, zassert);
+}
+
 /// The tuple bus in-circuit: its grand product's layers
 /// ([`emit_gkr_layers`]), then each side rebuilt from wires —
 /// `1 + Σ_p eq(ρ_port, p)·[(β + 1)·E_p + Σ_k γ_k·(c_k·E_p + ŵ_k + T_k)]` —
@@ -230,7 +261,7 @@ pub(super) fn emit_bus(
     let bus = circuit.bus().expect("a bus region needs a bus");
     let nu = circuit.cells().nu();
     let (cl_w, cr_w, pt_w) = emit_gkr_layers(
-        sb, macs, zcr, &br.layers, br.top_v, trace, outs, wv, vals, zw, ow, zassert,
+        sb, macs, zcr, &br.layers, br.top_v, br.top, trace, outs, wv, vals, zw, ow, zassert,
     );
     assert_eq!(
         pt_w.len(),
@@ -1046,4 +1077,34 @@ pub(super) struct ElPiopRec {
     pub(super) alpha_fin: usize,
     pub(super) alpha_ch: usize,
     pub(super) lc_rounds: Vec<(usize, usize, usize)>,
+}
+
+/// [`emit_nonzero_top`]: an honest nonzero top passes with its inverse, and
+/// a zero top fails the row whatever the prover offers as `t` (`1 + 0·t`
+/// misses the assert-zero anchor), as does a nonzero top with a wrong `t`.
+#[test]
+fn nonzero_top_rejects_a_zero_product() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use crate::tower::MacGate;
+    let top = F128::new(0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210);
+    let mut sb = ShapeBuilder::new(3);
+    let macs = sb.slot(MacGate::new());
+    let mut vals = vec![F128::ONE, F128::ZERO, top];
+    let ow = sb.public_input();
+    let zassert = sb.public_input();
+    let top_w = sb.input();
+    emit_nonzero_top(&mut sb, macs, top_w, top, &mut vals, ow, zassert);
+    let shape = sb.finish().expect("the gadget builds");
+    let _ = shape.run(&vals, &[]);
+    let runs = |v: &[F128]| catch_unwind(AssertUnwindSafe(|| shape.run(v, &[]))).is_ok();
+    for t in [F128::ZERO, F128::ONE, top.inv(), F128::new(7, 9)] {
+        let mut bad = vals.clone();
+        bad[2] = F128::ZERO;
+        bad[3] = t;
+        assert!(!runs(&bad), "a zero top with t = {t:?}");
+    }
+    let mut bad = vals.clone();
+    bad[3] += F128::ONE;
+    assert!(!runs(&bad), "a nonzero top with a wrong inverse");
 }

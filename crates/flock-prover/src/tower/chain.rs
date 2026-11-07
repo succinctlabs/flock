@@ -21,8 +21,9 @@ use {
     crate::{
         r1cs_hashes::blake3::{Compression, build_block_r1cs},
         tower::{
-            ChildSlots, ChildTape, SLOT_WORDS, check_child_region, emit_child_region,
-            expected_child_tail_schedule, gates_blake3::Rng, test_config,
+            ChildSlots, ChildTape, PowMaskGate, SLOT_WORDS, check_child_region,
+            child_walker::child_pow_rows_hold, emit_child_region, expected_child_tail_schedule,
+            gates_blake3::Rng, test_config,
         },
     },
     flock_core::{
@@ -30,6 +31,7 @@ use {
         pcs::ligerito::LigeritoProfile,
         product_gkr::ProductGkrError,
     },
+    flock_transcript::transcript_record::TranscriptOp,
     std::{any::Any, array::from_fn},
 };
 
@@ -963,9 +965,91 @@ pub(super) fn chain_child_region_emits_alone() {
         built2.public.len(),
         "the region's publics are the whole tail"
     );
+    // Every PoW the child's verifier checks natively has its predicate row,
+    // and the honest leaf's nonces satisfy each one
+    // (`chain_child_region_rejects_a_missed_leaf_grind` is the negative).
+    assert!(
+        child_pow_rows_hold(&ct, &built2, cs.q.pow)
+            .into_iter()
+            .all(|ok| ok),
+        "the honest leaf's nonces satisfy every PoW row"
+    );
     assert_eq!(
         region.tail_schedule,
         expected_child_tail_schedule(&ct),
         "the lone child region's tail publishes on its declared schedule"
     );
+}
+
+/// The bad-nonce negative for the first-level node's leaf PoW rows: a leaf
+/// nonce that misses its grinding target fails its region's PowMask row.
+/// The honest chain leaf's tape is re-read with ONE grinding site asking for
+/// one more leading zero than its fused predicate has — exactly what an
+/// un-ground nonce looks like to that row, since the chain rows still
+/// compute the real predicate from the real nonce. That row, and only that
+/// row, fails. Before the rows existed, any leaf nonce passed.
+#[test]
+#[ignore]
+pub(super) fn chain_child_region_rejects_a_missed_leaf_grind() {
+    let cfg = test_config();
+    let mut rng = Rng(0xC4A1_0005);
+    let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
+    let cp = build_chain_proof(cfg, h_start, 256);
+    let b3 = chain_blake_r1cs(cp.inner.nu);
+    let mut ct = ChildTape::new(&cp.inner, DOMAIN, &[b3.csc_lincheck_circuit()]);
+    let emit = |ct: &ChildTape<'_>| {
+        let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
+        let mut sb = ShapeBuilder::new(nu2);
+        let mut cs = ChildSlots::new(&mut sb, nu2, ct.spread_w);
+        let (mut vals, mut hints, mut consts) = (Vec::new(), Vec::new(), Vec::new());
+        let b3_slot = cs.q.b3;
+        let _ = emit_child_region(
+            &mut sb,
+            &mut cs,
+            b3_slot,
+            ct,
+            &mut vals,
+            &mut hints,
+            &mut consts,
+        );
+        let shape2 = sb.finish().expect("the chain child circuit builds");
+        let hint_refs: Vec<&(dyn Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
+        let built2 = shape2.run(&vals, &hint_refs);
+        let rows: Vec<_> = built2.rows::<PowMaskGate>(cs.q.pow).to_vec();
+        (child_pow_rows_hold(ct, &built2, cs.q.pow), rows)
+    };
+    let (honest, rows) = emit(&ct);
+    assert!(honest.iter().all(|&ok| ok), "the honest leaf passes");
+    // The first grinding site, and its predicate's real leading zeros (MSB
+    // first within each serialized byte, as the native check reads them).
+    let pow_at: Vec<usize> = ct
+        .ops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| matches!(op, TranscriptOp::Pow { .. }).then_some(i))
+        .collect();
+    let (site, op_i, lz) = pow_at
+        .iter()
+        .enumerate()
+        .find_map(|(site, &i)| {
+            let TranscriptOp::Pow { bits } = ct.ops[i] else {
+                unreachable!()
+            };
+            let pred = rows[site].pred.to_le_bytes();
+            let lz = (0..128)
+                .take_while(|&k| pred[k / 8] & (1 << (7 - k % 8)) == 0)
+                .count() as u32;
+            (bits > 0 && lz < 64).then_some((site, i, lz))
+        })
+        .expect("a grinding site the row can raise");
+    ct.ops[op_i] = TranscriptOp::Pow { bits: lz + 1 };
+    let (missed, _) = emit(&ct);
+    for (j, ok) in missed.iter().enumerate() {
+        assert_eq!(
+            *ok,
+            j != site,
+            "site {j}: only the missed grind fails its PowMask row"
+        );
+    }
 }

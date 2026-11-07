@@ -51,7 +51,10 @@ pub use crate::tower::{
         RootBundle, TowerVerifyError, TowerVk, TowerVkFingerprint, verify_root, verify_root_bytes,
     },
     xmss_leaf::{XmssFlNode, XmssLeaf, build_xmss_first_level_node, build_xmss_leaf},
-    xmss_tower::{XmssStatement, XmssTower, XmssTowerVk, verify_xmss_root, xmss_statement},
+    xmss_tower::{
+        XmssStatement, XmssTower, XmssTowerVk, XmssTowerVkFingerprint, verify_xmss_root,
+        xmss_statement,
+    },
 };
 // The wire format (`proof_io`'s tower-root bundle) carries a `MixedProof`.
 pub(crate) use crate::tower::chain::MixedProof;
@@ -114,8 +117,8 @@ use crate::{
         gkr::{
             BusRec, ElPiopRec, GkrLayerRec, GkrRec, assertion_mac, circuit_structure_claim_wires,
             emit_ag_point_binding, emit_boolean_reported_check, emit_bus,
-            emit_element_reported_check, emit_gkr_layers, emit_lagrange_lows, emit_recombination,
-            pin_bus_sides, pin_recombination, recombination_positions,
+            emit_element_reported_check, emit_gkr_layers, emit_lagrange_lows, emit_nonzero_top,
+            emit_recombination, pin_bus_sides, pin_recombination, recombination_positions,
         },
         online::Online,
         query::{
