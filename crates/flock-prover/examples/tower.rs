@@ -3,7 +3,7 @@
 //! residue.
 //!
 //! ```sh
-//! cargo run --release --example tower -- [n_leaves] [blocks_per_leaf] [chain128] [verify]
+//! cargo run --release --example tower -- [n_leaves] [blocks_per_leaf] [chain128] [verify] [checked]
 //! ```
 //!
 //! Defaults: 8 leaves x 256 compressions under the 128-bit tower — the
@@ -14,10 +14,14 @@
 //! With `verify`, the run also generates a verification key (a one-time
 //! six-leaf reference tower) and checks the root STANDALONE through
 //! `verify_root` — the consumer path, nothing prover-side trusted.
+//!
+//! The prove skips the builders' self-checks (`SelfCheck::Skip`, the
+//! production mode). With `checked`, every build re-checks its own output
+//! (`SelfCheck::Full`); the root is the same either way.
 
 use std::{env, time::Instant};
 
-use flock_prover::tower::{Tower, TowerConfig, TowerVk, verify_root_bytes};
+use flock_prover::tower::{SelfCheck, Tower, TowerConfig, TowerVk, verify_root_bytes};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -31,18 +35,21 @@ fn main() {
         None | Some("chain128") => TowerConfig::Chain128,
         Some(other) => panic!("unknown tower config {other:?}: chain128"),
     };
-    let do_verify = match args.next().as_deref() {
-        None => false,
-        Some("verify") => true,
-        Some(other) => panic!("unknown flag {other:?}: only `verify`"),
-    };
+    let (mut do_verify, mut checks) = (false, SelfCheck::Skip);
+    for flag in args {
+        match flag.as_str() {
+            "verify" => do_verify = true,
+            "checked" => checks = SelfCheck::Full,
+            other => panic!("unknown flag {other:?}: `verify` or `checked`"),
+        }
+    }
 
     // The demo chain starts at the zero state; a deployment starts at its
     // application's own h_start.
     let h_start = [0u32; 16];
 
     let t0 = Instant::now();
-    let tower = Tower::prove(cfg, h_start, blocks_per_leaf, n_leaves);
+    let tower = Tower::prove(cfg, checks, h_start, blocks_per_leaf, n_leaves);
     let prove_s = t0.elapsed().as_secs_f64();
 
     let t1 = Instant::now();
@@ -53,7 +60,7 @@ fn main() {
 
     let s = tower.statement();
     println!(
-        "\nTOWER {:?}: {n_leaves} leaves x {blocks_per_leaf} compressions = {} total\n  \
+        "\nTOWER {:?} ({checks:?} self-checks): {n_leaves} leaves x {blocks_per_leaf} compressions = {} total\n  \
          h_end = {:08x}{:08x}.. (== H^{}(h_start))\n  \
          ONE root proof: {:.1} KiB | prove {prove_s:.1}s | root discharge {discharge_s:.3}s",
         cfg,

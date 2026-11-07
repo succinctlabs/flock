@@ -40,8 +40,9 @@ use crate::{
     r1cs_hashes::blake3::generate_witness_batch_major_partial,
     tower::{
         Blake3Gate, CHUNK_END, CHUNK_START, DOMAIN, F128, FsChallenger, HashKind, IV, Online,
-        PcsParams, ROOT, ShapeBuilder, TowerConfig, UnionInstance, UnionSlotProverInput, Wire,
-        chain_blake_r1cs, leaf_zerocheck_ag, pack_params, pack4, pack8, pcs_batch_for, steady_reps,
+        PcsParams, ROOT, SelfCheck, ShapeBuilder, TowerConfig, UnionInstance, UnionSlotProverInput,
+        Wire, chain_blake_r1cs, leaf_zerocheck_ag, pack_params, pack4, pack8, pcs_batch_for,
+        steady_reps,
     },
     verifier::{
         verify_ligerito_union_circuit, verify_ligerito_union_circuit_ag,
@@ -428,7 +429,7 @@ impl ChainProof {
 /// — the digest pin), the WALK is per-statement and is the chain compute
 /// itself, so it is reported apart from the proving phases.
 pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) -> ChainProof {
-    prove_chain_walk(cfg, walk_chain(h_start, n_blocks))
+    prove_chain_walk(cfg, SelfCheck::Full, walk_chain(h_start, n_blocks))
 }
 
 /// A walked chain segment: the circuit trace of `n_blocks` compressions from
@@ -482,8 +483,10 @@ pub(super) fn walk_chain(h_start: [u32; 16], n_blocks: usize) -> ChainWalk {
     }
 }
 
-/// Prove a walked segment: witgen, prove, and the deferred self-verify.
-pub(super) fn prove_chain_walk(cfg: TowerConfig, walk: ChainWalk) -> ChainProof {
+/// Prove a walked segment: witgen, prove, and the deferred verify (its
+/// claims are what the FL folds). `checks` gates only the discharges of
+/// those claims against the native tables.
+pub(super) fn prove_chain_walk(cfg: TowerConfig, checks: SelfCheck, walk: ChainWalk) -> ChainProof {
     let ChainWalk {
         cs,
         witness: walked,
@@ -614,13 +617,15 @@ pub(super) fn prove_chain_walk(cfg: TowerConfig, walk: ChainWalk) -> ChainProof 
         ),
     }
     .expect("the deferred verify accepts an honest chain proof");
-    work.boolean
-        .as_ref()
-        .expect("the b3 slot yields boolean matrix work")
-        .check(&union, &lcs)
-        .expect("the boolean matrix work discharges");
     assert!(work.element.is_none(), "no element class, no element work");
-    assert!(sigma.check(&built.shape.circuit), "sigma discharges");
+    if checks.on() {
+        work.boolean
+            .as_ref()
+            .expect("the b3 slot yields boolean matrix work")
+            .check(&union, &lcs)
+            .expect("the boolean matrix work discharges");
+        assert!(sigma.check(&built.shape.circuit), "sigma discharges");
+    }
 
     ChainProof {
         inner: MixedInner {

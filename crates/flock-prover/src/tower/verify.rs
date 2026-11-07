@@ -28,7 +28,7 @@ use flock_core::{
 
 use crate::proof_io::{DeserializeError, TowerRootBundle};
 use crate::tower::{
-    DOMAIN, F128, FsChallenger, MixedProof, TowerConfig,
+    DOMAIN, F128, FsChallenger, MixedProof, SelfCheck, TowerConfig,
     driver::{ChainStatement, RootDischargeFailure, Tower},
     env_acc_main_base, env_pass_base, envelope_shape,
     fold_region::read_acc_entry,
@@ -139,7 +139,7 @@ impl TowerVk {
     /// Six leaves is the smallest run that materializes all four shapes
     /// (chain, FL, base, steady = the k = 3 root).
     pub fn generate(cfg: TowerConfig, blocks_per_leaf: usize) -> TowerVk {
-        let tower = Tower::prove(cfg, [0u32; 16], blocks_per_leaf, 6);
+        let tower = Tower::prove(cfg, SelfCheck::Full, [0u32; 16], blocks_per_leaf, 6);
         let layout = AccLayout::from_tower(&tower);
         TowerVk {
             tower,

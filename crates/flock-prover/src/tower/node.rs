@@ -48,10 +48,10 @@ use crate::{
         BitSpreadGate, BitSpreadTable, Blake3Gate, ChildSlots, DOMAIN, ENV_ACC_MAIN_WORDS, EnvTail,
         F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FoldPub, FsChallenger, HashKind,
         LeafOuter, MatrixClaim, MergedChain, MixedProof, Online, PcsParams, PowMaskGate,
-        PowMaskTable, RealRegion, RealTape, SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable,
-        TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire, ZskipTapeRec, ZskipWires,
-        assert_chain_replays, balance_extra_rows, bytes_payload_mask, challenge_word_locs,
-        check_ag_skip_publics, check_fold_publics, check_jagged_fold_publics,
+        PowMaskTable, RealRegion, RealTape, SLOT_WORDS, SelfCheck, ShapeBuilder, SwapGate,
+        SwapTable, TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire, ZskipTapeRec,
+        ZskipWires, assert_chain_replays, balance_extra_rows, bytes_payload_mask,
+        challenge_word_locs, check_ag_skip_publics, check_fold_publics, check_jagged_fold_publics,
         check_real_child_region, cw, emit_ag_point_binding, emit_fiat_shamir_chain,
         emit_fiat_shamir_chain_partitioned, emit_fold_region, emit_jagged_fold_region,
         emit_lagrange_lows, emit_real_child_region, emit_recorded_pow_checks, env_acc_chain_base,
@@ -240,6 +240,19 @@ pub struct ChainLane<'a> {
 /// level with the same plumbing.
 pub fn build_node_outer_app(
     cfg: TowerConfig,
+    los: &[&LeafOuter],
+    app_stmt: Option<usize>,
+    lane: Option<ChainLane<'_>>,
+    spine: Option<SpineIn<'_>>,
+) -> NodeOut {
+    build_node_outer_with(cfg, SelfCheck::Full, los, app_stmt, lane, spine)
+}
+
+/// [`build_node_outer_app`] with its self-checks gated by `checks` (see
+/// [`SelfCheck`]): the same proof, publics and block either way.
+pub fn build_node_outer_with(
+    cfg: TowerConfig,
+    checks: SelfCheck,
     los: &[&LeafOuter],
     app_stmt: Option<usize>,
     lane: Option<ChainLane<'_>>,
@@ -434,23 +447,25 @@ pub fn build_node_outer_app(
     )
     .expect("the node fold verifies");
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
-    assert!(acc_v.discharge(&mats), "the boolean group discharges");
-    assert!(
-        acc_v.discharge_element(&el_mats),
-        "the element group discharges"
-    );
-    assert!(
-        acc_v.discharge_sigma(&key_circuits),
-        "the sigma group discharges"
-    );
     assert_eq!(acc_v.jagged.len(), n_keys, "one jagged entry per key");
     let jag_tables: Vec<([u8; 32], &JaggedParams)> = (0..n_keys)
         .map(|j| (key_digests[j], &params_j[j]))
         .collect();
-    assert!(
-        acc_v.discharge_jagged(&jag_tables),
-        "the folded jagged entries discharge against their children's layouts"
-    );
+    if checks.on() {
+        assert!(acc_v.discharge(&mats), "the boolean group discharges");
+        assert!(
+            acc_v.discharge_element(&el_mats),
+            "the element group discharges"
+        );
+        assert!(
+            acc_v.discharge_sigma(&key_circuits),
+            "the sigma group discharges"
+        );
+        assert!(
+            acc_v.discharge_jagged(&jag_tables),
+            "the folded jagged entries discharge against their children's layouts"
+        );
+    }
 
     // The fold groups in aggregate order, from the CHILDREN'S OWN
     // assertion data (the same constructors the verifier gathers with).
@@ -688,7 +703,7 @@ pub fn build_node_outer_app(
             "the lane carries the chain jagged key"
         );
         assert!(
-            lacc_v.discharge_jagged(&[(ln.circuit.digest(), ln.params)]),
+            !checks.on() || lacc_v.discharge_jagged(&[(ln.circuit.digest(), ln.params)]),
             "the lane's folded jagged entry discharges against the chain layout"
         );
         let lclaims: Vec<Vec<MatrixClaim>> = vec![
@@ -2081,7 +2096,7 @@ pub fn build_node_outer_app(
         let t_plan = Instant::now();
         let fill_plan = shape2.fill_plan();
         let build_ms = build_ms + t_plan.elapsed().as_secs_f64() * 1e3;
-        {
+        if checks.on() {
             let walk = shape2.run(&vals, &hint_refs);
             let fill = shape2.run_filled(&fill_plan, &vals, &hint_refs);
             assert_eq!(walk.public, fill.public, "fill plan: public segment");
@@ -2167,7 +2182,7 @@ pub fn build_node_outer_app(
             // above (tape_setup_ms) — its indices are shape-stable.
             let tapes_ms = {
                 let t = Instant::now();
-                {
+                if checks.on() {
                     los.par_iter()
                         .for_each(|lo| record_child_verify(lo, DOMAIN));
                 }
@@ -2181,22 +2196,24 @@ pub fn build_node_outer_app(
 
             // The two child regions' checker walks — each child's whole
             // deferred-verifier statement held against its own replicas.
-            let consumed: Vec<usize> = rts
-                .iter()
-                .zip(&regions)
-                .map(|(rt, r)| check_real_child_region(&built2.public, rt, r))
-                .collect();
-            for i in 0..n_kids {
-                let end = regions[i].pub_base + consumed[i];
-                let next = if i + 1 < n_kids {
-                    regions[i + 1].pub_base
-                } else {
-                    fold_pub_base
-                };
-                assert!(
-                    end <= next,
-                    "child {i}'s public block overruns the next region"
-                );
+            if checks.on() {
+                let consumed: Vec<usize> = rts
+                    .iter()
+                    .zip(&regions)
+                    .map(|(rt, r)| check_real_child_region(&built2.public, rt, r))
+                    .collect();
+                for i in 0..n_kids {
+                    let end = regions[i].pub_base + consumed[i];
+                    let next = if i + 1 < n_kids {
+                        regions[i + 1].pub_base
+                    } else {
+                        fold_pub_base
+                    };
+                    assert!(
+                        end <= next,
+                        "child {i}'s public block overruns the next region"
+                    );
+                }
             }
             // The fold checker + the accumulator, reassembled from publics —
             // and THE BLOCK, which is the accumulator plus the dead slots and
@@ -2288,17 +2305,18 @@ pub fn build_node_outer_app(
                 "the Accumulator, reassembled from the public segment alone"
             );
             assert!(
-                acc_pub.discharge(&mats)
-                    && acc_pub.discharge_element(&el_mats)
-                    && acc_pub.discharge_sigma(&key_circuits)
-                    && acc_pub.discharge_jagged(&jag_tables),
+                !checks.on()
+                    || (acc_pub.discharge(&mats)
+                        && acc_pub.discharge_element(&el_mats)
+                        && acc_pub.discharge_sigma(&key_circuits)
+                        && acc_pub.discharge_jagged(&jag_tables)),
                 "the public-segment accumulator discharges all four groups"
             );
             // THE PASSENGER, natively: the child's own, unless this node is
             // the one whose node slot could not fold — then the orphan itself.
             // The two are never both live in a spine, and the in-circuit form
             // is their SUM, so this select and that sum agree.
-            if !passenger.is_empty() {
+            if checks.on() && !passenger.is_empty() {
                 let dead = |k_col: usize, k_row: usize| {
                     (
                         [F128::ZERO; 2],
@@ -2348,7 +2366,7 @@ pub fn build_node_outer_app(
             };
             // The lagrange-low constants: the one public surface the in-circuit
             // derivation adds — validated against the verifier's own values.
-            {
+            if checks.on() {
                 if let Some((lam_base, _, _, _)) = &rs_lam {
                     for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
                         assert_eq!(built2.public[*lam_base + i], v, "λ const {i}");
@@ -2583,32 +2601,36 @@ pub fn build_node_outer_app(
             let prove_ms = t0p.elapsed().as_secs_f64() * 1e3;
             let t0v = Instant::now();
             let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
-            let vres = oproof.verify_circuit(
-                &union2,
-                &shape2.circuit,
-                &built2.public,
-                &lcs2,
-                &ocommit,
-                &pcs2,
-                &mut ch2,
-            );
+            // The forge test needs the verifier's refusal, so it always
+            // verifies.
+            let vres = (forge_match || checks.on()).then(|| {
+                oproof.verify_circuit(
+                    &union2,
+                    &shape2.circuit,
+                    &built2.public,
+                    &lcs2,
+                    &ocommit,
+                    &pcs2,
+                    &mut ch2,
+                )
+            });
             if forge_match {
                 // The forged world's rows all satisfy their relations — only
                 // the wiring product can object, and it MUST.
                 assert!(
                     matches!(
                         vres,
-                        Err(FlockVerifyError::Wiring(WiringError::Gkr(
+                        Some(Err(FlockVerifyError::Wiring(WiringError::Gkr(
                             ProductGkrError::ProductMismatch
-                        )))
+                        ))))
                     ),
                     "a forged live fold of a mismatched entry must die on the wiring product"
                 );
-            } else {
+            } else if let Some(vres) = vres {
                 vres.expect("the 2->1 node verifies");
             }
             let verify_ms = t0v.elapsed().as_secs_f64() * 1e3;
-            let deferred_ms = if forge_match {
+            let deferred_ms = if forge_match || !checks.on() {
                 0.0
             } else {
                 let t0d = Instant::now();

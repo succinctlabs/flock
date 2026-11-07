@@ -45,7 +45,7 @@ use crate::{
         BitSpreadGate, BitSpreadTable, Blake3Gate, ChainProof, ChildSlots, ChildTape, DOMAIN,
         EnvTail, F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FsChallenger, HashKind,
         LeafOuter, MergedChain, MixedProof, Online, PcsParams, PowMaskGate, PowMaskTable,
-        SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable, TowerConfig, UnionInstance,
+        SLOT_WORDS, SelfCheck, ShapeBuilder, SwapGate, SwapTable, TowerConfig, UnionInstance,
         UnionSlotProverInput, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays,
         balance_extra_rows, bytes_payload_mask, challenge_word_locs, check_ag_skip_publics,
         check_child_region, check_fold_publics, check_jagged_fold_publics, cw,
@@ -169,7 +169,7 @@ pub(super) fn record_chain_child_verify(cp: &ChainProof, blake_lc: &dyn Lincheck
 }
 
 pub fn build_first_level_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
-    build_first_level_node_k(cfg, &[cp0, cp1])
+    build_first_level_node_k(cfg, SelfCheck::Full, &[cp0, cp1])
 }
 
 /// The 2-ary first-level node: two adjacent chain proofs verified deferred
@@ -178,7 +178,14 @@ pub fn build_first_level_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainPro
 /// the arity LEVER, but today it is pinned to exactly two children — the
 /// split-BLAKE slot assignment (`ChildSlots::new_env` sets `b3_alt` for
 /// child 1 only) has no slots for a third child.
-pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
+///
+/// `checks` gates the builder's self-checks (see [`SelfCheck`]); the
+/// proof is the same either way.
+pub fn build_first_level_node_k(
+    cfg: TowerConfig,
+    checks: SelfCheck,
+    cps: &[&ChainProof],
+) -> FlNode {
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
 
     let k_ary = cps.len();
@@ -262,16 +269,18 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
     .expect("the first-level fold verifies");
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
     assert!(acc_v.per_element.is_empty(), "no element group accumulated");
-    assert!(acc_v.discharge(&mats), "the boolean group discharges");
-    assert!(
-        acc_v.discharge_sigma(&[&cp0.inner.built.shape.circuit]),
-        "the sigma group discharges against the ONE chain circuit"
-    );
     assert_eq!(acc_v.jagged.len(), 1, "one jagged key: the chain layout");
-    assert!(
-        acc_v.discharge_jagged(&[(chain_digest, &chain_params_j)]),
-        "the folded jagged entry discharges against the chain layout"
-    );
+    if checks.on() {
+        assert!(acc_v.discharge(&mats), "the boolean group discharges");
+        assert!(
+            acc_v.discharge_sigma(&[&cp0.inner.built.shape.circuit]),
+            "the sigma group discharges against the ONE chain circuit"
+        );
+        assert!(
+            acc_v.discharge_jagged(&[(chain_digest, &chain_params_j)]),
+            "the folded jagged entry discharges against the chain layout"
+        );
+    }
 
     // The three folds' claim lists — no priors, so [fresh; k] each.
     let n_priors = 0usize;
@@ -927,9 +936,9 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
         // then pin it row-identical against the generic walk before the
         // online run trusts it. run() stays the differential oracle — this
         // pin is what keeps it one, now that the FL no longer walks in the
-        // timed path either.
+        // timed path either. It is a self-check: `SelfCheck::Skip` drops it.
         let fill_plan = shape2.fill_plan();
-        {
+        if checks.on() {
             let walk = shape2.run(&vals, &hint_refs);
             let fill = shape2.run_filled(&fill_plan, &vals, &hint_refs);
             assert_eq!(walk.public, fill.public, "fill plan: public segment");
@@ -1002,8 +1011,10 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
         let mut fin = None;
         for _ in 0..reps {
             let t_tapes = Instant::now();
-            for cp in cps {
-                record_chain_child_verify(cp, blake_lc);
+            if checks.on() {
+                for cp in cps {
+                    record_chain_child_verify(cp, blake_lc);
+                }
             }
             let tapes_ms_i = t_tapes.elapsed().as_secs_f64() * 1e3;
             let t_run = Instant::now();
@@ -1012,96 +1023,104 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
             let mut built2 = shape2.run_filled_deferred(&fill_plan, &vals, &hint_refs);
             let run_ms = t_run.elapsed().as_secs_f64() * 1e3;
 
-            // Child checkers (each child's whole deferred-verifier statement
-            // against its own native replicas), then the fold checker + the
-            // accumulator reassembled from publics, then the app statement.
-            let mut region_end = 0usize;
-            for (tk, rk) in tapes.iter().zip(&regions) {
-                let consumed = check_child_region(&built2.public, tk, rk);
-                assert!(
-                    region_end <= rk.pub_base && rk.pub_base + consumed <= fold_pub_base,
-                    "the regions' public blocks are disjoint and ordered"
-                );
-                region_end = rk.pub_base + consumed;
-            }
-            // ACC_CHAIN keeps the un-keyed entry layout: the lane's registry
-            // role has ONE key (the chain circuit), so nothing to disambiguate.
-            let (rebuilt, _, _) = check_fold_publics(
-                &built2.public,
-                fold_pub_base,
-                &locs,
-                &alpha_recs,
-                locs.len(),
-            );
-            for (r, o) in rebuilt.iter().zip(&outs) {
-                assert_eq!(r, o, "published fold output == located native output");
-            }
-            let jag_pub_at =
-                fold_pub_base + locs.iter().map(|l| 2 + l.k_col + l.k_row).sum::<usize>();
-            let (jrebuilt, _, _) =
-                check_jagged_fold_publics(&built2.public, jag_pub_at, &jlocs, false);
-            assert_eq!(
-                jrebuilt[0], jouts[0],
-                "published jagged entry == located native"
-            );
-            let acc_pub = Accumulator {
-                registry_digest: registry.digest(),
-                per_type: vec![(rebuilt[0].clone(), rebuilt[1].clone())],
-                per_element: Vec::new(),
-                sigma: vec![(cp0.inner.built.shape.circuit.digest(), rebuilt[2].clone())],
-                jagged: vec![(chain_digest, jrebuilt[0].clone())],
-            };
-            assert_eq!(
-                acc_pub, acc_v,
-                "the Accumulator, reassembled from the public segment alone"
-            );
-            assert!(
-                acc_pub.discharge(&mats)
-                    && acc_pub.discharge_sigma(&[&cp0.inner.built.shape.circuit])
-                    && acc_pub.discharge_jagged(&[(chain_digest, &chain_params_j)]),
-                "the public-segment accumulator discharges all three groups"
-            );
-            if let Some((lam_base, _, _, _)) = &rs_lam {
-                for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
-                    assert_eq!(built2.public[*lam_base + i], v, "λ const {i}");
+            // The checkers are self-checks: under `SelfCheck::Skip` the
+            // accumulator is the verifier's own (the checkers assert the
+            // public one equals it).
+            let acc_pub = if !checks.on() {
+                acc_v.clone()
+            } else {
+                // Child checkers (each child's whole deferred-verifier statement
+                // against its own native replicas), then the fold checker + the
+                // accumulator reassembled from publics, then the app statement.
+                let mut region_end = 0usize;
+                for (tk, rk) in tapes.iter().zip(&regions) {
+                    let consumed = check_child_region(&built2.public, tk, rk);
+                    assert!(
+                        region_end <= rk.pub_base && rk.pub_base + consumed <= fold_pub_base,
+                        "the regions' public blocks are disjoint and ordered"
+                    );
+                    region_end = rk.pub_base + consumed;
                 }
-            }
-            // The AG-skip blocks: the decode is in-circuit since phase D;
-            // the checker holds the nonce range and the row lows.
-            for (cp, base) in cps.iter().zip(&ag_pub_bases) {
-                if let Some(base) = base {
-                    check_ag_skip_publics(
-                        &built2.public,
-                        *base,
-                        cp.inner.pcs.zerocheck_grinding().ag_round_one_bits(),
+                // ACC_CHAIN keeps the un-keyed entry layout: the lane's registry
+                // role has ONE key (the chain circuit), so nothing to disambiguate.
+                let (rebuilt, _, _) = check_fold_publics(
+                    &built2.public,
+                    fold_pub_base,
+                    &locs,
+                    &alpha_recs,
+                    locs.len(),
+                );
+                for (r, o) in rebuilt.iter().zip(&outs) {
+                    assert_eq!(r, o, "published fold output == located native output");
+                }
+                let jag_pub_at =
+                    fold_pub_base + locs.iter().map(|l| 2 + l.k_col + l.k_row).sum::<usize>();
+                let (jrebuilt, _, _) =
+                    check_jagged_fold_publics(&built2.public, jag_pub_at, &jlocs, false);
+                assert_eq!(
+                    jrebuilt[0], jouts[0],
+                    "published jagged entry == located native"
+                );
+                let acc_pub = Accumulator {
+                    registry_digest: registry.digest(),
+                    per_type: vec![(rebuilt[0].clone(), rebuilt[1].clone())],
+                    per_element: Vec::new(),
+                    sigma: vec![(cp0.inner.built.shape.circuit.digest(), rebuilt[2].clone())],
+                    jagged: vec![(chain_digest, jrebuilt[0].clone())],
+                };
+                assert_eq!(
+                    acc_pub, acc_v,
+                    "the Accumulator, reassembled from the public segment alone"
+                );
+                assert!(
+                    acc_pub.discharge(&mats)
+                        && acc_pub.discharge_sigma(&[&cp0.inner.built.shape.circuit])
+                        && acc_pub.discharge_jagged(&[(chain_digest, &chain_params_j)]),
+                    "the public-segment accumulator discharges all three groups"
+                );
+                if let Some((lam_base, _, _, _)) = &rs_lam {
+                    for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
+                        assert_eq!(built2.public[*lam_base + i], v, "λ const {i}");
+                    }
+                }
+                // The AG-skip blocks: the decode is in-circuit since phase D;
+                // the checker holds the nonce range and the row lows.
+                for (cp, base) in cps.iter().zip(&ag_pub_bases) {
+                    if let Some(base) = base {
+                        check_ag_skip_publics(
+                            &built2.public,
+                            *base,
+                            cp.inner.pcs.zerocheck_grinding().ag_round_one_bits(),
+                        );
+                    }
+                }
+                for &(v, idx) in &jag_const_rec {
+                    assert_eq!(built2.public[idx], v, "jagged shared constant public");
+                }
+                // THE APPLICATION STATEMENT: the published span is (h_start of the
+                // first chain, h_end of the last) — the combined segment.
+                for j in 0..4 {
+                    assert_eq!(
+                        built2.public[stmt_base + j],
+                        pack4(cp0.h_start[4 * j..4 * j + 4].try_into().unwrap()),
+                        "node statement: h_start is the first child's"
+                    );
+                    assert_eq!(
+                        built2.public[stmt_base + 4 + j],
+                        pack4(cp_last.h_end[4 * j..4 * j + 4].try_into().unwrap()),
+                        "node statement: h_end is the last child's"
                     );
                 }
-            }
-            for &(v, idx) in &jag_const_rec {
-                assert_eq!(built2.public[idx], v, "jagged shared constant public");
-            }
-            // THE APPLICATION STATEMENT: the published span is (h_start of the
-            // first chain, h_end of the last) — the combined segment.
-            for j in 0..4 {
                 assert_eq!(
-                    built2.public[stmt_base + j],
-                    pack4(cp0.h_start[4 * j..4 * j + 4].try_into().unwrap()),
-                    "node statement: h_start is the first child's"
+                    cp_last.h_end,
+                    native_chain(
+                        &cp0.h_start,
+                        cps.iter().map(|cp| cp.inner.built.shape.counts[0]).sum(),
+                    ),
+                    "the combined span IS the concatenated chain"
                 );
-                assert_eq!(
-                    built2.public[stmt_base + 4 + j],
-                    pack4(cp_last.h_end[4 * j..4 * j + 4].try_into().unwrap()),
-                    "node statement: h_end is the last child's"
-                );
-            }
-            assert_eq!(
-                cp_last.h_end,
-                native_chain(
-                    &cp0.h_start,
-                    cps.iter().map(|cp| cp.inner.built.shape.counts[0]).sum(),
-                ),
-                "the combined span IS the concatenated chain"
-            );
+                acc_pub
+            };
 
             // Everything from here to the prove is WITNESS ASSEMBLY — packing
             // the walk's rows into the union's slot inputs. It is per-statement
@@ -1234,18 +1253,20 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
             };
             let prove_ms = t_prove.elapsed().as_secs_f64() * 1e3;
             let t_ver = Instant::now();
-            let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
-            oproof
-                .verify_circuit(
-                    &union2,
-                    &shape2.circuit,
-                    &built2.public,
-                    &lcs2,
-                    &ocommit,
-                    &pcs2,
-                    &mut ch2,
-                )
-                .expect("the first-level node verifies over the circuit path");
+            if checks.on() {
+                let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
+                oproof
+                    .verify_circuit(
+                        &union2,
+                        &shape2.circuit,
+                        &built2.public,
+                        &lcs2,
+                        &ocommit,
+                        &pcs2,
+                        &mut ch2,
+                    )
+                    .expect("the first-level node verifies over the circuit path");
+            }
             let verify_ms2 = t_ver.elapsed().as_secs_f64() * 1e3;
             onlines.push(Online {
                 setup_ms: build_ms,

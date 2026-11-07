@@ -41,10 +41,10 @@ use {
 
 pub use crate::tower::{
     chain::{ChainOnlineMs, ChainProof, build_chain_proof},
-    config::TowerConfig,
+    config::{SelfCheck, TowerConfig},
     driver::{ChainStatement, RootDischargeFailure, Tower},
     fl_node::{FlNode, build_first_level_node, build_first_level_node_k},
-    node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app},
+    node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app, build_node_outer_with},
     query::LeafOuter,
     verify::{
         RootBundle, TowerVerifyError, TowerVk, TowerVkFingerprint, verify_root, verify_root_bytes,

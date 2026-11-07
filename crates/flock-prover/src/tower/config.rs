@@ -48,6 +48,26 @@ impl TowerConfig {
     }
 }
 
+/// Whether a tower build re-checks its own output. `Full` runs every
+/// prover-side self-check: the fold discharges, the fill-plan pin against
+/// the generic walk, the native checkers over the publics, the native
+/// chain re-hash, and the outer's self-verify. `Skip` drops them. The
+/// proof bytes are identical either way: no check feeds the proof.
+/// A skipped check only means a prover bug surfaces at the consumer's
+/// `verify_root` (or the root discharge) instead of at the build that
+/// caused it. Tests and benches run `Full`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SelfCheck {
+    Full,
+    Skip,
+}
+
+impl SelfCheck {
+    pub(super) fn on(self) -> bool {
+        self == SelfCheck::Full
+    }
+}
+
 /// The chain-leaf length the tower tests run at: 1024 blocks is the
 /// smallest leaf (`(Fast, log_n 17, initial_k 6)`, m = 24) with a
 /// certified affine ladder — at 256 blocks the affine fold bound has no

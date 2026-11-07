@@ -14,9 +14,10 @@ use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
         ChainLane, ChainProof, DEV_BLOCKS, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online,
-        RootBundle, RootDischargeFailure, SpineIn, Tower, TowerVerifyError, TowerVk, UnionInstance,
-        build_chain_proof, build_first_level_node, build_node_outer_app, chain_blake_r1cs,
-        chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
+        RootBundle, RootDischargeFailure, SelfCheck, SpineIn, Tower, TowerVerifyError, TowerVk,
+        UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
+        chain_blake_r1cs, chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base,
+        env_pass_base,
         envelope::STEADY_OVERRIDE,
         envelope_shape,
         gates_blake3::Rng,
@@ -996,7 +997,7 @@ pub(super) fn tower_driver_e2e() {
     let mut rng = Rng(0xD41_4E12);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
 
-    let mut tower = Tower::prove(cfg, h0, n_blocks, 8);
+    let mut tower = Tower::prove(cfg, SelfCheck::Full, h0, n_blocks, 8);
     assert_eq!(
         tower.statement().h_start,
         h0,
@@ -1118,7 +1119,7 @@ pub(super) fn tower_verify_root_e2e() {
     // (1) a fresh k = 4 steady tower the VK never saw.
     let mut rng = Rng(0xD41_4E13);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
-    let tower = Tower::prove(cfg, h0, n_blocks, 8);
+    let tower = Tower::prove(cfg, SelfCheck::Full, h0, n_blocks, 8);
     let stmt = *tower.statement();
     verify_root(&vk, &stmt, &tower.root_bundle()).expect("the k = 4 root verifies");
 
@@ -1251,7 +1252,7 @@ pub(super) fn tower_verify_root_e2e() {
     );
 
     // (3) a fresh k = 3 tower — steady shape, passenger-less, exact span.
-    let t3 = Tower::prove(cfg, native_chain(&h0, 128), n_blocks, 6);
+    let t3 = Tower::prove(cfg, SelfCheck::Full, native_chain(&h0, 128), n_blocks, 6);
     verify_root(&vk, t3.statement(), &t3.root_bundle()).expect("the k = 3 root verifies");
     // A CROSS-CLASS span lie now dies on the statement leg too (the
     // counter mismatches before the passenger rule is consulted; the
@@ -1267,8 +1268,29 @@ pub(super) fn tower_verify_root_e2e() {
     );
 
     // (4) a fresh k = 2 base-rooted tower — the other root shape.
-    let t2 = Tower::prove(cfg, native_chain(&h0, 64), n_blocks, 4);
+    let t2 = Tower::prove(cfg, SelfCheck::Full, native_chain(&h0, 64), n_blocks, 4);
     verify_root(&vk, t2.statement(), &t2.root_bundle()).expect("the k = 2 root verifies");
+}
+
+/// **SKIPPING THE SELF-CHECKS LEAVES THE ROOT ALONE.** The same six-leaf
+/// tower (base + one spine fold, every builder kind) proved under
+/// `SelfCheck::Full` and `SelfCheck::Skip` ships the same wire bundle,
+/// byte for byte — so the checks feed nothing, and the `Full` run's
+/// self-verifies vouch for the `Skip` root too.
+#[test]
+#[ignore] // Heavy — two six-leaf towers.
+pub(super) fn tower_skip_self_checks_byte_identical() {
+    let cfg = test_config();
+    let h0: [u32; 16] = from_fn(|i| 0x5E1F_C4EC ^ i as u32);
+    let full = Tower::prove(cfg, SelfCheck::Full, h0, DEV_BLOCKS, 6);
+    let skip = Tower::prove(cfg, SelfCheck::Skip, h0, DEV_BLOCKS, 6);
+    assert_eq!(skip.statement(), full.statement(), "one statement");
+    assert!(
+        skip.root_bundle_bytes() == full.root_bundle_bytes(),
+        "the Skip root's wire bundle differs from the Full root's"
+    );
+    skip.discharge_root()
+        .expect("the Skip root's residue discharges");
 }
 
 /// **THE VK'S PUBLISHED IDENTITY, PINNED** (chain128 @ DEV_BLOCKS

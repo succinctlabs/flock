@@ -30,11 +30,11 @@ use crate::proof_io::TowerRootBundle;
 use crate::tower::{
     F128,
     chain::{ChainProof, ChainWalk, prove_chain_walk, walk_chain},
-    config::TowerConfig,
-    fl_node::{FlNode, build_first_level_node, chain_blake_r1cs, chain_jagged_params},
+    config::{SelfCheck, TowerConfig},
+    fl_node::{FlNode, build_first_level_node_k, chain_blake_r1cs, chain_jagged_params},
     gates_blake3::pack4,
     node::{
-        ChainLane, NodeOut, SpineIn, build_node_outer_app, digest_f128, entry_live,
+        ChainLane, NodeOut, SpineIn, build_node_outer_with, digest_f128, entry_live,
         node_jagged_params,
     },
     online::census_kib,
@@ -123,8 +123,13 @@ impl Tower {
     /// lane's material owner), so what stays resident is one leaf pair,
     /// the FL row (built forward, folded backward from the tail), and the
     /// current spine node.
+    ///
+    /// `checks` is [`SelfCheck::Full`] to re-check every build's own output
+    /// (tests), or [`SelfCheck::Skip`] for production speed. The root is
+    /// the same either way.
     pub fn prove(
         cfg: TowerConfig,
+        checks: SelfCheck,
         h_start: [u32; 16],
         blocks_per_leaf: usize,
         n_leaves: usize,
@@ -157,12 +162,12 @@ impl Tower {
                     let h_next = walk.h_end;
                     ahead = Some(s.spawn(move || walk_chain(h_next, blocks_per_leaf)));
                 }
-                let cp = prove_chain_walk(cfg, walk);
+                let cp = prove_chain_walk(cfg, checks, walk);
                 match even.take() {
                     None => even = Some(cp),
                     Some(cp0) => {
                         h = cp.h_end;
-                        fls.push(build_first_level_node(cfg, &cp0, &cp));
+                        fls.push(build_first_level_node_k(cfg, checks, &[&cp0, &cp]));
                         // Leaf 0 survives as the lane's chain-side material
                         // owner (one shape for every leaf); every other leaf
                         // drops here.
@@ -192,8 +197,9 @@ impl Tower {
         // ---- THE BASE: fresh-only over the LAST two FLs (the spine
         // grows by prepending, so the base covers the chain's tail) ----
         let k = fls.len();
-        let base = build_node_outer_app(
+        let base = build_node_outer_with(
             cfg,
+            checks,
             &[&fls[k - 2].lo, &fls[k - 1].lo],
             Some(app_base),
             Some(ChainLane {
@@ -216,8 +222,9 @@ impl Tower {
             for i in (0..k - 2).rev() {
                 let prev = cur.as_ref().unwrap_or(&base);
                 let prev_lane = prev.lane_acc.clone().expect("the lane rides every level");
-                let n = build_node_outer_app(
+                let n = build_node_outer_with(
                     cfg,
+                    checks,
                     &[&fls[i].lo, &prev.lo],
                     Some(app_base),
                     Some(ChainLane {
