@@ -1578,6 +1578,10 @@ fn build_group_batch_major(
     ra: &mut [BmRow],
     rb: &mut [BmRow],
 ) {
+    // The fields below are OR'd in; the rows hold the previous group's.
+    for rows in [&mut *rz, &mut *ra, &mut *rb] {
+        rows[..USEFUL_BITS.div_ceil(64)].fill([0; BM_V]);
+    }
     let mut rows = BmRows {
         z: rz,
         a: ra,

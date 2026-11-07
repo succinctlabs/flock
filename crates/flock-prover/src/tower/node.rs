@@ -6,13 +6,14 @@ use std::{
 };
 
 use aggregate::{
-    JaggedKeyProve, JaggedKeyVerify, SigmaKey, prove_aggregate_classes_with_grinding,
+    JaggedKeyProve, JaggedKeyVerify, SigmaKey, prove_aggregate_classes_shared_with_grinding,
+    prove_aggregate_classes_with_grinding, verify_aggregate_classes_shared_with_grinding,
     verify_aggregate_classes_with_grinding,
 };
 use bincode::serialize;
 use flock_core::{
     aggregate,
-    aggregate::{Accumulator, TypeMatrices},
+    aggregate::{Accumulator, Dropped, TypeMatrices},
     circuit::{Circuit, WiringError},
     element_r1cs::union::ElementAssertion,
     lincheck::{LincheckCircuit, SkipPoint},
@@ -47,7 +48,7 @@ use crate::{
     tower::{
         BitSpreadGate, BitSpreadTable, Blake3Gate, ChildSlots, DOMAIN, ENV_ACC_MAIN_WORDS, EnvTail,
         F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FoldPub, FsChallenger, HashKind,
-        LeafOuter, MatrixClaim, MergedChain, MixedProof, Online, PcsParams, PowMaskGate,
+        LeafOuter, MatrixClaim, MergedChain, MixedProof, Online, PARENT, PcsParams, PowMaskGate,
         PowMaskTable, RealRegion, RealTape, SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable,
         TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire, ZskipTapeRec, ZskipWires,
         assert_chain_replays, balance_extra_rows, bytes_payload_mask, challenge_word_locs,
@@ -55,13 +56,13 @@ use crate::{
         check_real_child_region, cw, emit_ag_point_binding, emit_fiat_shamir_chain,
         emit_fiat_shamir_chain_partitioned, emit_fold_region, emit_jagged_fold_region,
         emit_lagrange_lows, emit_real_child_region, emit_recorded_pow_checks, env_acc_chain_base,
-        env_acc_main_base, env_app_base, env_pass_base, envelope_shape,
+        env_acc_main_base, env_app_base, env_pass_base, envelope_shape, envelope_shape_with_lane,
         expected_real_tail_schedule, fl_node::chain_blake_r1cs, flatten_ops, fold_region_ops,
         jagged_fold_region_ops, labeled_bytes_payloads, leaf_boolean_lcs, leaf_boolean_mats,
         live_element_input_from_rows, locate_and_pin_folds, locate_and_pin_jagged_folds,
-        merge_chain, outer_lanes, outer_union, outer_zerocheck_ag, pack8, pad_envelope_counts,
-        payload_words, pcs_batch_for, read_acc_entry, replay_fold_endpoints,
-        replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+        merge_chain, outer_lanes, outer_union, outer_zerocheck_ag, pack_params, pack8,
+        pad_envelope_counts, payload_words, pcs_batch_for, read_acc_entry, replay_fold_endpoints,
+        replay_jagged_fold_endpoints, shared_binding_ops, steady_reps, tower_fold_grinding,
     },
 };
 
@@ -199,6 +200,26 @@ pub struct ChainLane<'a> {
     /// The published `[rho_col | rho_row | value]` fold blocks' base in
     /// EACH child's public segment (every child shares the layout).
     pub(super) claims_base: usize,
+    /// Which leaf family the lane carries — its fold binding, its block
+    /// width and how the node composes the children's statements.
+    pub(super) family: LaneFamily<'a>,
+}
+
+/// The leaf family a lane carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneFamily<'a> {
+    /// Hash-chain segments: one boolean type, per-claim binding, the
+    /// chain tower's ACC_CHAIN block, and adjacent spans
+    /// (`left.h_end == right.h_start`) in the statement.
+    Chain,
+    /// Signature batches (leanXMSS): the lane folds per matrix class under
+    /// shared binding (the leaf union's `dropped` words), rides an
+    /// ACC_CHAIN block of `block_words`, and the statement is
+    /// `hash_pair(D_left, D_right)` with the signature counter.
+    Batches {
+        block_words: usize,
+        dropped: &'a Dropped,
+    },
 }
 
 /// **THE 2→1 RECURSION NODE.** Two DISTINCT real recursion nodes (seeded
@@ -400,6 +421,7 @@ pub fn build_node_outer_app(
             registry_digest: registry.digest(),
             per_type: p.per_type.clone(),
             per_element: p.per_element.clone(),
+            per_linear: Vec::new(),
             sigma: norm(&p.sigma),
             jagged: norm(&p.jagged),
         }
@@ -653,33 +675,69 @@ pub fn build_node_outer_app(
         // fold with no fresh claims.
         let ljagged_p: Vec<JaggedKeyProve<'_>> = vec![(ln.circuit.digest(), ln.params, Vec::new())];
         let ljagged_v: Vec<JaggedKeyVerify<'_>> = vec![(ln.circuit.digest(), Vec::new())];
+        let shared = match ln.family {
+            LaneFamily::Batches { dropped, .. } => Some(dropped),
+            LaneFamily::Chain => None,
+        };
+        let lsigma = [(ln.circuit, Vec::new())];
+        let grinding = tower_fold_grinding(cfg);
         let mut chp = FsChallenger::with_chained_blake3(LANE_DOMAIN);
-        let (lagg, lacc_p) = prove_aggregate_classes_with_grinding(
-            ln.registry,
-            ln.mats,
-            ln.circs,
-            &[],
-            &[],
-            &el_asserts_l,
-            &[(ln.circuit, Vec::new())],
-            &ljagged_p,
-            ln.priors,
-            tower_fold_grinding(cfg),
-            &mut chp,
-        )
+        let (lagg, lacc_p) = match shared {
+            Some(dropped) => prove_aggregate_classes_shared_with_grinding(
+                ln.registry,
+                dropped,
+                ln.mats,
+                ln.circs,
+                &[],
+                &[],
+                &el_asserts_l,
+                &lsigma,
+                &ljagged_p,
+                ln.priors,
+                grinding,
+                &mut chp,
+            ),
+            None => prove_aggregate_classes_with_grinding(
+                ln.registry,
+                ln.mats,
+                ln.circs,
+                &[],
+                &[],
+                &el_asserts_l,
+                &lsigma,
+                &ljagged_p,
+                ln.priors,
+                grinding,
+                &mut chp,
+            ),
+        }
         .expect("the lane fold proves");
         let mut lrec = RecordingChallenger::new(FsChallenger::with_chained_blake3(LANE_DOMAIN));
-        let lacc_v = verify_aggregate_classes_with_grinding(
-            ln.registry,
-            &[],
-            &el_asserts_l,
-            &[(ln.circuit, Vec::new())],
-            &ljagged_v,
-            ln.priors,
-            &lagg,
-            tower_fold_grinding(cfg),
-            &mut lrec,
-        )
+        let lacc_v = match shared {
+            Some(dropped) => verify_aggregate_classes_shared_with_grinding(
+                ln.registry,
+                dropped,
+                &[],
+                &el_asserts_l,
+                &lsigma,
+                &ljagged_v,
+                ln.priors,
+                &lagg,
+                grinding,
+                &mut lrec,
+            ),
+            None => verify_aggregate_classes_with_grinding(
+                ln.registry,
+                &[],
+                &el_asserts_l,
+                &lsigma,
+                &ljagged_v,
+                ln.priors,
+                &lagg,
+                grinding,
+                &mut lrec,
+            ),
+        }
         .expect("the lane fold verifies");
         assert_eq!(lacc_p, lacc_v, "lane prover and verifier agree");
         assert_eq!(
@@ -691,16 +749,29 @@ pub fn build_node_outer_app(
             lacc_v.discharge_jagged(&[(ln.circuit.digest(), ln.params)]),
             "the lane's folded jagged entry discharges against the chain layout"
         );
-        let lclaims: Vec<Vec<MatrixClaim>> = vec![
-            ln.priors.iter().map(|p| p.per_type[0].0.clone()).collect(),
-            ln.priors.iter().map(|p| p.per_type[0].1.clone()).collect(),
+        // Per boolean group (a type, or a matrix class under shared
+        // binding) its A and B folds over the priors, then sigma.
+        let n_groups = lagg.folds.len();
+        let mut lclaims: Vec<Vec<MatrixClaim>> = Vec::with_capacity(2 * n_groups + 1);
+        let mut lproofs: Vec<&FoldProof> = Vec::with_capacity(2 * n_groups + 1);
+        for (g, (fa, fb)) in lagg.folds.iter().enumerate() {
+            lclaims.push(ln.priors.iter().map(|p| p.per_type[g].0.clone()).collect());
+            lclaims.push(ln.priors.iter().map(|p| p.per_type[g].1.clone()).collect());
+            lproofs.push(fa);
+            lproofs.push(fb);
+        }
+        for (lg, pf) in lagg.linear_folds.iter().enumerate() {
+            lclaims.push(ln.priors.iter().map(|p| p.per_linear[lg].clone()).collect());
+            lproofs.push(pf);
+        }
+        let n_lin = lagg.linear_folds.len();
+        lclaims.push(
             ln.priors
                 .iter()
                 .map(|p| p.sigma.first().expect("lane prior sigma").1.clone())
                 .collect(),
-        ];
-        let lproofs: Vec<&FoldProof> =
-            vec![&lagg.folds[0].0, &lagg.folds[0].1, &lagg.sigma_folds[0]];
+        );
+        lproofs.push(&lagg.sigma_folds[0]);
         let lops: Vec<Op> = flatten_ops(lrec.shape().ops());
         let lvals: Vec<F128> = lrec.values().to_vec();
         let lchals: Vec<F128> = lrec.challenges().to_vec();
@@ -709,6 +780,10 @@ pub fn build_node_outer_app(
             Op::ObserveBytes(32),
             Op::ObserveBytes(1),
         ];
+        if shared.is_some() {
+            // No fresh assertions: the shared block is its label alone.
+            want.extend(shared_binding_ops(&[], &[]));
+        }
         let n_uni_l = lclaims.len() - 1;
         want.extend(fold_region_ops(cfg, &lclaims[..n_uni_l]));
         want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
@@ -752,10 +827,19 @@ pub fn build_node_outer_app(
             lccur,
         );
         let louts = replay_fold_endpoints(&llocs, &lvals, &lchals);
-        assert_eq!(louts[0], lacc_v.per_type[0].0, "lane boolean A");
-        assert_eq!(louts[1], lacc_v.per_type[0].1, "lane boolean B");
+        for g in 0..n_groups {
+            assert_eq!(louts[2 * g], lacc_v.per_type[g].0, "lane boolean A");
+            assert_eq!(louts[2 * g + 1], lacc_v.per_type[g].1, "lane boolean B");
+        }
+        for lg in 0..n_lin {
+            assert_eq!(
+                louts[2 * n_groups + lg],
+                lacc_v.per_linear[lg],
+                "lane linear"
+            );
+        }
         let (ld, lc2) = lacc_v.sigma.first().expect("lane sigma out");
-        assert_eq!(louts[2], *lc2, "lane sigma accumulator");
+        assert_eq!(louts[2 * n_groups + n_lin], *lc2, "lane sigma accumulator");
         assert_eq!(
             *ld,
             ln.circuit.digest(),
@@ -791,7 +875,10 @@ pub fn build_node_outer_app(
         );
         assert_chain_replays(&ops, &trace, chals);
 
-        let env = envelope_shape();
+        let env = match lane.as_ref().map(|l| l.family) {
+            Some(LaneFamily::Batches { block_words, .. }) => envelope_shape_with_lane(block_words),
+            _ => envelope_shape(),
+        };
         let split_b3 = n_kids == 2;
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = rts[0].b3_rows;
@@ -1672,16 +1759,44 @@ pub fn build_node_outer_app(
         // child's h_start and the last child's h_end — the same statement
         // whatever the arity.
         let app_w: Option<Vec<Wire>> = app_stmt.map(|off| {
-            for w in regions.windows(2) {
-                for j in 0..4 {
-                    sb.connect(w[0].child_pub_w[off + 4 + j], w[1].child_pub_w[off + j]);
+            let batches = matches!(
+                lane.as_ref().map(|l| l.family),
+                Some(LaneFamily::Batches { .. })
+            );
+            let mut out: Vec<Wire> = if batches {
+                // THE BATCH DIGEST: the children's digests (words 0..2)
+                // hash as a BLAKE3 parent — the tree over the leaves'
+                // statement digests, left child first.
+                assert_eq!(n_kids, 2, "a batch digest pairs two children");
+                let params = cw(&mut sb, &mut vals, &mut consts, pack_params(0, 64, PARENT));
+                let (l, r) = (&regions[0].child_pub_w, &regions[1].child_pub_w);
+                let d = sb.gate(
+                    cs.q.b3,
+                    &[
+                        iv2[0],
+                        iv2[1],
+                        l[off],
+                        l[off + 1],
+                        r[off],
+                        r[off + 1],
+                        params,
+                    ],
+                );
+                let mut words = vec![d[0], d[1]];
+                words.resize(8, zw);
+                words
+            } else {
+                for w in regions.windows(2) {
+                    for j in 0..4 {
+                        sb.connect(w[0].child_pub_w[off + 4 + j], w[1].child_pub_w[off + j]);
+                    }
                 }
-            }
-            let last = &regions[n_kids - 1];
-            let mut out: Vec<Wire> = (0..4)
-                .map(|j| regions[0].child_pub_w[off + j])
-                .chain((0..4).map(|j| last.child_pub_w[off + 4 + j]))
-                .collect();
+                let last = &regions[n_kids - 1];
+                (0..4)
+                    .map(|j| regions[0].child_pub_w[off + j])
+                    .chain((0..4).map(|j| last.child_pub_w[off + 4 + j]))
+                    .collect()
+            };
             // THE SPAN COUNTER composes MULTIPLICATIVELY: the node's word
             // is the product of its children's (g^{a+b} = g^a · g^b), one
             // MAC row per extra child — depth never enters the shape.
@@ -2269,6 +2384,7 @@ pub fn build_node_outer_app(
                         )
                     })
                     .collect(),
+                per_linear: Vec::new(),
                 sigma: (0..n_keys)
                     .map(|j| (key_digests[j], rebuilt[n_uni + j].clone()))
                     .collect(),
@@ -2388,11 +2504,19 @@ pub fn build_node_outer_app(
                     let (ljrebuilt, _, _) =
                         check_jagged_fold_publics(&built2.public, *lpb + lu_len, ljlocs, false);
                     let lane_ref = lane.as_ref().expect("lane");
+                    let n_groups = lacc_n.per_type.len();
+                    let n_lin = lacc_n.per_linear.len();
                     let lacc_pub2 = Accumulator {
                         registry_digest: lane_ref.registry.digest(),
-                        per_type: vec![(lrebuilt[0].clone(), lrebuilt[1].clone())],
+                        per_type: (0..n_groups)
+                            .map(|g| (lrebuilt[2 * g].clone(), lrebuilt[2 * g + 1].clone()))
+                            .collect(),
                         per_element: Vec::new(),
-                        sigma: vec![(lane_ref.circuit.digest(), lrebuilt[2].clone())],
+                        per_linear: lrebuilt[2 * n_groups..2 * n_groups + n_lin].to_vec(),
+                        sigma: vec![(
+                            lane_ref.circuit.digest(),
+                            lrebuilt[2 * n_groups + n_lin].clone(),
+                        )],
                         jagged: vec![(lane_ref.circuit.digest(), ljrebuilt[0].clone())],
                     };
                     assert_eq!(

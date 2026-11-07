@@ -103,13 +103,15 @@ fn chain_step_row() {
 }
 
 /// Packing with the BLAKE3 kernel writes exactly the slot the walk writes:
-/// `z`, `A·z`, `B·z` and the lincheck stripe, batched or not.
+/// `z`, `A·z`, `B·z` and the lincheck stripe, batched or not, and so does
+/// [`CompressPacker`].
 #[test]
 fn kernel_packing_matches_the_walk() {
     let nu = 7;
     let (circuit, _) = compress_circuit();
     let walked = BooleanGate::new("walked", circuit, &INPUTS, &OUTPUTS, nu).unwrap();
     let kernel = compress_gate(nu).unwrap();
+    let rows = CompressPacker::new(&kernel);
     let mut rng = Rng(13);
     let all: Vec<Box<[F128]>> = (0..1 << nu)
         .map(|r| {
@@ -123,28 +125,31 @@ fn kernel_packing_matches_the_walk() {
         .collect();
     let len = 1usize << (nu + walked.k_log() - 7);
     for n in [1 << nu, 77, 64, 61, 8, 3] {
-        let pack = |gate: &BooleanGate, batched: bool| {
+        let pack = |packer: &dyn Fn(SlotWitnessDest<'_>) -> Vec<u8>| {
             let poison = F128::new(0xDEAD, 0xBEEF);
             let (mut z, mut a, mut b) = (vec![poison; len], vec![poison; len], vec![poison; len]);
-            let dst = SlotWitnessDest {
+            let stripe = packer(SlotWitnessDest {
                 z: &mut z,
                 a: &mut a,
                 b: &mut b,
                 elide_padding_writes: false,
                 dead_padding_unread: false,
-            };
-            let stripe = if batched {
-                gate.pack_into(&all[..n], dst)
-            } else {
-                gate.pack_into_unbatched(&all[..n], dst)
-            };
+            });
             (z, a, b, stripe)
         };
-        let want = pack(&walked, false);
+        let rows_n = &all[..n];
+        let want = pack(&|dst| walked.pack_into_unbatched(rows_n, dst));
         for (what, got) in [
-            ("walk, batched", pack(&walked, true)),
-            ("kernel", pack(&kernel, false)),
-            ("kernel, batched", pack(&kernel, true)),
+            ("walk, batched", pack(&|dst| walked.pack_into(rows_n, dst))),
+            (
+                "kernel",
+                pack(&|dst| kernel.pack_into_unbatched(rows_n, dst)),
+            ),
+            (
+                "kernel, batched",
+                pack(&|dst| kernel.pack_into(rows_n, dst)),
+            ),
+            ("CompressPacker", pack(&|dst| rows.pack_into(rows_n, dst))),
         ] {
             assert!(want.0 == got.0, "{what}, {n} rows: z differs");
             assert!(want.1 == got.1, "{what}, {n} rows: A·z differs");

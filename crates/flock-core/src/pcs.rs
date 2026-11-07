@@ -2425,6 +2425,7 @@ pub fn open_batch_merged<Ch: Challenger>(
 fn assemble_jagged_assertion(
     params: &JaggedParams,
     x_outers: &[&[F128]],
+    zeroed_cols: &[&[usize]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     gammas_pd: &[F128],
     pd_groups: &[(&[F128], Vec<F128>)],
@@ -2433,15 +2434,18 @@ fn assemble_jagged_assertion(
 ) -> JaggedAssertion {
     let table = JaggedTable::from_params(params);
 
-    // RS claims: raw eq(z_col) at σ, claim order.
+    // RS claims: raw eq(z_col) at σ, claim order — masked where the claim
+    // zeroes columns (the mask is registry-static, never prover input).
     let rs: Vec<JaggedClaim> = x_outers
         .iter()
-        .map(|x| {
-            JaggedClaim::honest(
-                JaggedRowWeight::eq(x[1 + n_log..].to_vec()),
-                mp.sigma.clone(),
-                &table,
-            )
+        .enumerate()
+        .map(|(i, x)| {
+            let z_col = x[1 + n_log..].to_vec();
+            let row = match zeroed_cols.get(i).filter(|z| !z.is_empty()) {
+                Some(z) => JaggedRowWeight::Masked(z_col, z.iter().map(|&y| y as u32).collect()),
+                None => JaggedRowWeight::eq(z_col),
+            };
+            JaggedClaim::honest(row, mp.sigma.clone(), &table)
         })
         .collect();
 
@@ -2660,12 +2664,6 @@ fn verify_batch_merged_core<Ch: Challenger>(
     assert_eq!(z_skips.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
     assert!(zeroed_cols.is_empty() || zeroed_cols.len() == n_rs);
-    // The jagged export's RS row weights are plain eqs: a masked claim has
-    // no export form yet. The mask is registry-static, never prover input.
-    assert!(
-        defer.is_none() || zeroed_cols.iter().all(|z| z.is_empty()),
-        "the deferred merged open does not carry zeroed columns"
-    );
     if proof.ring_switches.len() != n_rs {
         return Err(PcsOpenError::Assist);
     }
@@ -2867,6 +2865,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
         *out = Some(assemble_jagged_assertion(
             &params,
             x_outers,
+            zeroed_cols,
             packed_direct,
             gammas_pd,
             &pd_groups,

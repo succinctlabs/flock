@@ -41,7 +41,7 @@ use flock_core::{
 use flock_field::F128;
 
 use super::{
-    compress::{M, NEXT, O0, compress_gate, ctl},
+    compress::{self, CompressPacker, M, NEXT, O0, compress_gate, ctl},
     gadgets::{
         address_gate, address_step_gate, chain_gate, chain_io, codeword_gate,
         layer_address_constants, swap_gate,
@@ -61,11 +61,68 @@ pub const LEAF_BLOCKS: usize = (2 + V).div_ceil(4);
 /// and the digests (2 + 1).
 pub const COMPRESSIONS_PER_SIGNATURE: usize = 2 * (STEPS + LEAF_BLOCKS + HEIGHT) + 3;
 
-const FIAT_SHAMIR_DOMAIN: &[u8] = b"flock-leanxmss-blake3-v1";
+pub(crate) const FIAT_SHAMIR_DOMAIN: &[u8] = b"flock-leanxmss-blake3-v1";
+
+/// The proof's transcript and its optional optimisations.
+///
+/// [`Self::DEFAULT`] is the shipped proof. [`Self::RECURSION_LEAF`] is what
+/// the recursion tower's walkers replay in-circuit
+/// (`docs/leanxmss-recursion-plan.md`): every optimisation of the default,
+/// plus the chained BLAKE3 transcript and a hashed statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XmssOptions {
+    /// The chained BLAKE3 transcript ([`FsChallenger::with_chained_blake3`])
+    /// instead of the tree transcript.
+    pub chained_transcript: bool,
+    /// Each gate's degree-one words leave the zerocheck
+    /// ([`BooleanGate::with_zeroed_linear_words`]).
+    pub zero_linear_words: bool,
+    /// Cell-slots nobody wires leave the wiring
+    /// ([`ShapeBuilder::prune_unwired`]).
+    pub prune_unwired: bool,
+    /// Columns that take only public words leave the grand product
+    /// ([`ShapeBuilder::open_public_columns`]).
+    pub public_columns: bool,
+    /// The grand product's slots in order of live count
+    /// ([`ShapeBuilder::pack_live_slots`]).
+    pub pack_live_slots: bool,
+    /// The signers' words (`P`, root, message) are private and hashed
+    /// in-circuit; the statement digest ([`XmssCircuit::statement_digest`])
+    /// is published in their place, so a verifier of this proof reads two
+    /// words instead of four per signer.
+    pub hashed_statement: bool,
+}
+
+impl XmssOptions {
+    pub const DEFAULT: Self = Self {
+        chained_transcript: false,
+        zero_linear_words: true,
+        prune_unwired: true,
+        public_columns: true,
+        pack_live_slots: true,
+        hashed_statement: false,
+    };
+
+    pub const RECURSION_LEAF: Self = Self {
+        chained_transcript: true,
+        zero_linear_words: true,
+        prune_unwired: true,
+        public_columns: true,
+        pack_live_slots: true,
+        hashed_statement: true,
+    };
+}
+
+impl Default for XmssOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// BLAKE3 flags.
 const CHUNK_START: u32 = 1;
 const CHUNK_END: u32 = 2;
+const PARENT: u32 = 4;
 const ROOT: u32 = 8;
 
 /// One signer's public statement.
@@ -91,6 +148,8 @@ enum Source {
     End(usize, usize, usize),
     /// Signer, layer, step row, word (`[A, v, c]`).
     Step(usize, usize, usize, usize),
+    /// Word `k` of the statement digest ([`XmssOptions::hashed_statement`]).
+    Digest(usize),
 }
 
 /// One layer's chain values: the revealed values, the ends, and the step
@@ -192,8 +251,11 @@ pub struct XmssCircuit {
     shape: CircuitShape,
     plan: FillPlan,
     gadgets: Vec<(SlotId, BooleanGate)>,
+    /// The compression slots' driver, in place of the gate's packer.
+    compress: CompressPacker,
     inputs: Vec<Source>,
     publics: Vec<Source>,
+    options: XmssOptions,
 }
 
 /// Records each declared input's source alongside the shape.
@@ -201,9 +263,25 @@ struct Builder {
     sb: ShapeBuilder,
     inputs: Vec<Source>,
     publics: Vec<Source>,
+    /// The signers' words, when they are hashed rather than public.
+    statement: Option<Vec<Wire>>,
 }
 
 impl Builder {
+    /// A signer's word: public, or private and queued for the statement
+    /// hash.
+    fn statement_word(&mut self, source: Source) -> Wire {
+        match self.statement.as_mut() {
+            Some(words) => {
+                self.inputs.push(source);
+                let w = self.sb.input();
+                words.push(w);
+                w
+            }
+            None => self.public(source),
+        }
+    }
+
     fn input(&mut self, source: Source) -> Wire {
         self.inputs.push(source);
         self.sb.input()
@@ -310,6 +388,11 @@ pub fn plan_nu(kinds: &[(usize, usize)]) -> usize {
 /// word) from the zerocheck; chain, address and address-step have no other
 /// word.
 fn gates(nu: usize) -> [BooleanGate; 7] {
+    gates_keeping_every_word(nu).map(BooleanGate::with_zeroed_linear_words)
+}
+
+/// [`gates`] without dropping degree-one words from the zerocheck.
+fn gates_keeping_every_word(nu: usize) -> [BooleanGate; 7] {
     let compress = compress_gate(nu).unwrap();
     [
         compress.clone(),
@@ -320,7 +403,6 @@ fn gates(nu: usize) -> [BooleanGate; 7] {
         address_gate(nu).unwrap(),
         address_step_gate(nu).unwrap(),
     ]
-    .map(BooleanGate::with_zeroed_linear_words)
 }
 
 /// Declares every gate kind, the counts in [`Slots`] order, each over
@@ -330,9 +412,15 @@ fn declare_slots(
     b: &mut Builder,
     nu: usize,
     counts: &[usize],
+    zero_linear_words: bool,
 ) -> (Slots, Vec<(SlotId, BooleanGate)>) {
     let mut gadgets = Vec::new();
-    let mut declared: Vec<Kind> = gates(nu)
+    let kinds = if zero_linear_words {
+        gates(nu)
+    } else {
+        gates_keeping_every_word(nu)
+    };
+    let mut declared: Vec<Kind> = kinds
         .into_iter()
         .zip(counts)
         .map(|(gate, &count)| {
@@ -406,6 +494,76 @@ fn declare_slots(
     (slots, gadgets)
 }
 
+/// The signers' words in statement order: per signer `P`, the root and
+/// the message's two halves.
+fn statement_words(statements: &[Statement]) -> Vec<F128> {
+    statements
+        .iter()
+        .flat_map(|st| {
+            [
+                word(&st.pk.pp),
+                word(&st.pk.root),
+                word(&st.msg[..16].try_into().unwrap()),
+                word(&st.msg[16..].try_into().unwrap()),
+            ]
+        })
+        .collect()
+}
+
+/// The statement digest: [`flock_core::union::publics_digest`] of the
+/// signers' words — 1 KiB BLAKE3 chunks (16 signers each), left-folded
+/// through parents, never root-flagged.
+pub fn statement_digest(statements: &[Statement]) -> [u8; 32] {
+    flock_core::union::publics_digest(&statement_words(statements))
+}
+
+/// A 32-byte digest as two words, little-endian.
+fn digest_words(d: &[u8; 32]) -> [F128; 2] {
+    std::array::from_fn(|k| word(&d[16 * k..16 * k + 16].try_into().unwrap()))
+}
+
+/// Compressions the statement hash adds for `n` signers: one block per
+/// signer and a parent per chunk after the first.
+fn statement_hash_compressions(n: usize) -> usize {
+    n + n.div_ceil(16) - 1
+}
+
+/// Hash the queued signer words ([`statement_digest`], gate for gate) and
+/// publish the digest in their place.
+fn hash_statement(b: &mut Builder, slots: &mut Slots, k: &Constants) {
+    let words = b.statement.take().expect("hashed statement words");
+    let [first_last, last, parent] =
+        [CHUNK_START | CHUNK_END, CHUNK_END, PARENT].map(|f| b.constant(ctl(f, 64)));
+    let mut cv: Option<[Wire; 2]> = None;
+    for chunk in words.chunks(64) {
+        let blocks = chunk.len() / 4;
+        let mut lcv = k.iv;
+        for (i, m) in chunk.chunks(4).enumerate() {
+            let ctl = match (i == 0, i + 1 == blocks) {
+                (true, true) => first_last,
+                (true, false) => k.first,
+                (false, true) => last,
+                (false, false) => k.middle,
+            };
+            lcv = compress(b, &mut slots.hash, lcv, [m[0], m[1], m[2], m[3]], ctl);
+        }
+        cv = Some(match cv {
+            None => lcv,
+            Some(prev) => compress(
+                b,
+                &mut slots.hash,
+                k.iv,
+                [prev[0], prev[1], lcv[0], lcv[1]],
+                parent,
+            ),
+        });
+    }
+    for (j, w) in cv.expect("at least one signer").into_iter().enumerate() {
+        b.sb.publish(w);
+        b.publics.push(Source::Digest(j));
+    }
+}
+
 fn declare_constants(b: &mut Builder) -> Constants {
     Constants {
         iv: iv_words().map(|w| b.constant(w)),
@@ -433,49 +591,87 @@ impl XmssCircuit {
     /// The circuit for `n ≥ 1` signatures with `2^nu` rows per slot, or
     /// [`plan_nu`]'s choice.
     pub fn with_nu(n: usize, nu: Option<usize>) -> Self {
+        Self::with_options(n, nu, XmssOptions::DEFAULT)
+    }
+
+    /// [`Self::with_nu`], proving with `options`.
+    pub fn with_options(n: usize, nu: Option<usize>, options: XmssOptions) -> Self {
         assert!(n >= 1);
-        let kinds: Vec<(usize, usize)> = gates(3)
+        let mut kinds: Vec<(usize, usize)> = gates(3)
             .iter()
             .zip(GADGETS_PER_SIGNATURE)
             .map(|(g, per_sig)| (n * per_sig, g.k_log()))
             .collect();
+        if options.hashed_statement {
+            kinds[1].0 += statement_hash_compressions(n);
+        }
         let nu = nu.unwrap_or_else(|| plan_nu(&kinds));
         let mut b = Builder {
             sb: ShapeBuilder::new(nu),
             inputs: Vec::new(),
             publics: Vec::new(),
+            statement: options.hashed_statement.then(Vec::new),
         };
         // The step rows' bus words and every row's unused outputs need no
         // copy constraint, and the columns that only take constants or the
-        // signer's public words (IV, control words, address constants, P) are
-        // checked by the opening. That leaves dead cell-slots among live
-        // ones, so the grand product packs the live ones together.
-        b.sb.prune_unwired();
-        b.sb.open_public_columns();
-        b.sb.pack_live_slots();
+        // signer's public words (IV, control words, address constants, P) can
+        // be checked by the opening. That leaves dead cell-slots among live
+        // ones, so the grand product packs the live ones together. The
+        // recursion leaf keeps all of them in the wiring.
+        if options.prune_unwired {
+            b.sb.prune_unwired();
+        }
+        if options.public_columns {
+            b.sb.open_public_columns();
+        }
+        if options.pack_live_slots {
+            b.sb.pack_live_slots();
+        }
         let counts: Vec<usize> = kinds.iter().map(|&(count, _)| count).collect();
-        let (mut slots, gadgets) = declare_slots(&mut b, nu, &counts);
+        let (mut slots, gadgets) = declare_slots(&mut b, nu, &counts, options.zero_linear_words);
         let constants = declare_constants(&mut b);
         for s in 0..n {
             let island = b.sb.begin_island();
             signature(&mut b, &mut slots, &constants, s);
             b.sb.end_island(island);
         }
+        if options.hashed_statement {
+            hash_statement(&mut b, &mut slots, &constants);
+        }
         let shape = b.sb.finish().expect("the leanXMSS circuit is well formed");
         let plan = shape.fill_plan();
+        let compress = gadgets
+            .iter()
+            .find(|(_, gate)| gate.name() == compress::NAME)
+            .map(|(_, gate)| CompressPacker::new(gate))
+            .unwrap();
         XmssCircuit {
             n,
             nu,
             shape,
             plan,
             gadgets,
+            compress,
             inputs: b.inputs,
             publics: b.publics,
+            options,
         }
     }
 
     pub fn signatures(&self) -> usize {
         self.n
+    }
+
+    pub fn options(&self) -> XmssOptions {
+        self.options
+    }
+
+    pub(crate) fn challenger(&self) -> FsChallenger {
+        if self.options.chained_transcript {
+            FsChallenger::with_chained_blake3(FIAT_SHAMIR_DOMAIN)
+        } else {
+            FsChallenger::new(FIAT_SHAMIR_DOMAIN)
+        }
     }
 
     /// Each slot has `2^nu` rows.
@@ -505,17 +701,33 @@ impl XmssCircuit {
             Source::Start(s, l, c) => private().1[s][l].starts[c],
             Source::End(s, l, c) => private().1[s][l].ends[c],
             Source::Step(s, l, i, k) => private().1[s][l].steps[i][k],
+            Source::Digest(_) => unreachable!("the digest is an output"),
         }
     }
 
     /// The public words, in publication order: the shared constants, then
-    /// per signer `P`, the root and the message.
+    /// per signer `P`, the root and the message — or, with
+    /// [`XmssOptions::hashed_statement`], the statement digest's two words.
     pub fn public(&self, statements: &[Statement]) -> Vec<F128> {
         assert_eq!(statements.len(), self.n);
+        let digest = self
+            .options
+            .hashed_statement
+            .then(|| digest_words(&statement_digest(statements)));
         self.publics
             .iter()
-            .map(|&src| Self::resolve(src, statements, None))
+            .map(|&src| match src {
+                Source::Digest(k) => digest.expect("a hashed statement")[k],
+                _ => Self::resolve(src, statements, None),
+            })
             .collect()
+    }
+
+    /// The statement digest a [`XmssOptions::hashed_statement`] proof
+    /// publishes: [`statement_digest`].
+    pub fn statement_digest(&self, statements: &[Statement]) -> [u8; 32] {
+        assert_eq!(statements.len(), self.n);
+        statement_digest(statements)
     }
 
     /// The online phase: every gate evaluated, rows collected per slot. Each
@@ -538,13 +750,13 @@ impl XmssCircuit {
     /// The union instance. Every used column is committed at full height
     /// (dummy rows as zeros), so the opening takes the block-first transport
     /// instead of materializing the jagged weight.
-    fn union(&self) -> UnionInstance<'_> {
+    pub(crate) fn union(&self) -> UnionInstance<'_> {
         let mut union = UnionInstance::new(&self.shape.registry, self.shape.counts.clone());
         union.set_full_height_commit();
         union
     }
 
-    fn pcs_params(union: &UnionInstance<'_>) -> PcsParams {
+    pub(crate) fn pcs_params(union: &UnionInstance<'_>) -> PcsParams {
         let log_batch_size = embedded_initial_k_or_default(union.dense_m(), LigeritoProfile::Fast);
         PcsParams {
             m: union.dense_m(),
@@ -557,7 +769,7 @@ impl XmssCircuit {
     }
 
     /// Lincheck circuits in registry order.
-    fn lincheck_circuits(&self) -> Vec<&dyn LincheckCircuit> {
+    pub(crate) fn lincheck_circuits(&self) -> Vec<&dyn LincheckCircuit> {
         let mut by_slot: Vec<(usize, &dyn LincheckCircuit)> = self
             .gadgets
             .iter()
@@ -579,10 +791,14 @@ impl XmssCircuit {
             .iter()
             .map(|(id, gate)| {
                 let rows = witness.rows::<BooleanGate>(*id);
+                let compress = (gate.name() == compress::NAME).then_some(&self.compress);
                 (
                     self.shape.registry_slot(*id),
                     UnionSlotProverInput::in_place(
-                        move |dst| gate.pack_into(rows, dst),
+                        move |dst| match compress {
+                            Some(packer) => packer.pack_into(rows, dst),
+                            None => gate.pack_into(rows, dst),
+                        },
                         gate.r1cs().csc_lincheck_circuit(),
                     ),
                 )
@@ -595,7 +811,7 @@ impl XmssCircuit {
     pub fn prove(&self, witness: &CircuitWitness) -> XmssProof {
         let union = self.union();
         let pcs = Self::pcs_params(&union);
-        let mut challenger = FsChallenger::new(FIAT_SHAMIR_DOMAIN);
+        let mut challenger = self.challenger();
         let (proof, commitment, _claims) = prove_circuit(
             &union,
             &self.shape.circuit,
@@ -615,7 +831,7 @@ impl XmssCircuit {
     ) -> Result<(), FlockVerifyError> {
         let union = self.union();
         let pcs = Self::pcs_params(&union);
-        let mut challenger = FsChallenger::new(FIAT_SHAMIR_DOMAIN);
+        let mut challenger = self.challenger();
         verify_circuit(
             &union,
             &self.shape.circuit,
@@ -671,9 +887,12 @@ fn th64(b: &mut Builder, slots: &mut Slots, k: &Constants, m: [Wire; 4]) -> Wire
 /// Signature `s`: wires its inputs and checks both layers, ending at the
 /// public root.
 fn signature(b: &mut Builder, slots: &mut Slots, k: &Constants, s: usize) {
-    let pp = b.public(Source::Pp(s));
-    let root = b.public(Source::Root(s));
-    let msg = [b.public(Source::Msg(s, 0)), b.public(Source::Msg(s, 1))];
+    let pp = b.statement_word(Source::Pp(s));
+    let root = b.statement_word(Source::Root(s));
+    let msg = [
+        b.statement_word(Source::Msg(s, 0)),
+        b.statement_word(Source::Msg(s, 1)),
+    ];
     // The shift chain R_j = idx >> j (j = 0..32): R_16 is the top layer's
     // key index, and bit 0 of R_j is the Merkle direction at bit j of idx.
     let mut shifted = vec![b.input(Source::Idx(s))];

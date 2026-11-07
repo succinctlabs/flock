@@ -143,6 +143,31 @@ pub(super) struct MixedInner {
     pub(super) pcs: PcsParams,
     pub(super) work: DeferredMatrixWork,
     pub(super) sigma: SigmaAssertion,
+    /// Every used column committed at full height
+    /// ([`UnionInstance::set_full_height_commit`]): statement data, like the
+    /// counts. The leanXMSS leaf sets it; the chain leaf does not.
+    pub(super) full_height: bool,
+}
+
+impl MixedInner {
+    /// The boolean zerocheck's AG round-one grinding bits — the union's
+    /// schedule, which owes the linear check's extra bits when it drops
+    /// linear rows ([`UnionInstance::zerocheck_grinding`]).
+    pub(super) fn ag_round_one_bits(&self) -> Option<u32> {
+        self.union()
+            .zerocheck_grinding(self.pcs.zerocheck_grinding())
+            .ag_round_one_bits()
+    }
+
+    /// The union instance the proof was made over.
+    pub(super) fn union(&self) -> UnionInstance<'_> {
+        let mut union =
+            UnionInstance::new(&self.built.shape.registry, self.built.shape.counts.clone());
+        if self.full_height {
+            union.set_full_height_commit();
+        }
+        union
+    }
 }
 
 /// Check a single-slot Boolean union whose rows form a BLAKE3 hash chain.
@@ -578,6 +603,7 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
             pcs: pcs_params,
             work,
             sigma,
+            full_height: false,
         },
         n_blocks,
         h_start,
@@ -860,7 +886,8 @@ pub(super) fn chain_tape_regions_pinned() {
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
     let n_blocks = 256usize;
     let cp = build_chain_proof(cfg, h_start, n_blocks);
-    let ct = ChildTape::new(&cp.inner, DOMAIN);
+    let b3 = chain_blake_r1cs(cp.inner.nu);
+    let ct = ChildTape::new(&cp.inner, DOMAIN, &[b3.csc_lincheck_circuit()]);
 
     // The boolean-only shape facts.
     assert!(ct.el.is_none(), "no element PIOP region on a chain tape");
@@ -909,7 +936,8 @@ pub(super) fn chain_child_region_emits_alone() {
     let mut rng = Rng(0xC4A1_0005);
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp = build_chain_proof(cfg, h_start, 256);
-    let ct = ChildTape::new(&cp.inner, DOMAIN);
+    let b3 = chain_blake_r1cs(cp.inner.nu);
+    let ct = ChildTape::new(&cp.inner, DOMAIN, &[b3.csc_lincheck_circuit()]);
     let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
     let mut sb = ShapeBuilder::new(nu2);
     let mut cs = ChildSlots::new(&mut sb, nu2, ct.spread_w);

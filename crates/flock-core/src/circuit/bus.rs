@@ -145,6 +145,55 @@ pub struct BusProof {
     pub fingerprint_nonce: Vec<u64>,
 }
 
+/// A static column of the bus's leaf reconstruction: a port type's live-row
+/// indicator, or a row tag over that type's live rows. The verifier reads
+/// each at `ρ_row`; recursion defers them to the circuit-structure table
+/// ([`super::SigmaAssertion::bus`]) instead of evaluating them in-circuit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusColumn {
+    Live { ty: usize },
+    Tag { ty: usize, tag: RowTag },
+}
+
+impl BusColumn {
+    /// The column's entry at `row`: zero past the type's live rows.
+    pub fn entry(&self, circuit: &Circuit, row: usize) -> F128 {
+        let (ty, tag) = match *self {
+            BusColumn::Live { ty } => (ty, None),
+            BusColumn::Tag { ty, tag } => (ty, Some(tag)),
+        };
+        if row >= circuit.counts()[ty] {
+            return F128::ZERO;
+        }
+        tag.map_or(F128::ONE, |t| t.value(row))
+    }
+
+    /// `Σ_{j<live} eq(ρ_row, j)·entry(j)`.
+    fn eval(&self, circuit: &Circuit, rho_row: &[F128], eq_row: &[F128]) -> F128 {
+        let rows = eq_row.len();
+        match *self {
+            BusColumn::Live { ty } => {
+                LiveMask::eq_prefix_sum(rho_row, circuit.counts()[ty].min(rows))
+            }
+            BusColumn::Tag { ty, tag } => {
+                let live = circuit.counts()[ty].min(rows);
+                eq_row[..live]
+                    .iter()
+                    .enumerate()
+                    .fold(F128::ZERO, |a, (j, &e)| a + e * tag.value(j))
+            }
+        }
+    }
+}
+
+/// The bus's deferred static evaluations: `ρ_row` and each
+/// [`Bus::structure_columns`] entry's value there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusStructure {
+    pub rho_row: Vec<F128>,
+    pub values: Vec<F128>,
+}
+
 impl Bus {
     /// Check the bus against the circuit it rides on: every port names a
     /// registry type, carries `width` terms, and reads only that type's own
@@ -211,8 +260,33 @@ impl Bus {
         }
     }
 
+    /// The static columns the leaf reconstruction reads, each once: per port
+    /// in declaration order, its type's live indicator, then each row tag.
+    pub fn structure_columns(&self) -> Vec<BusColumn> {
+        let mut cols = Vec::new();
+        for port in &self.ports {
+            let live = BusColumn::Live { ty: port.ty };
+            let tags = port
+                .terms
+                .iter()
+                .filter_map(|t| t.row)
+                .map(|tag| BusColumn::Tag { ty: port.ty, tag });
+            for col in std::iter::once(live).chain(tags) {
+                if !cols.contains(&col) {
+                    cols.push(col);
+                }
+            }
+        }
+        cols
+    }
+
+    /// The column index of `col` in [`Self::structure_columns`].
+    pub fn column_index(cols: &[BusColumn], col: BusColumn) -> usize {
+        cols.iter().position(|&c| c == col).expect("a bus column")
+    }
+
     /// The cell-slots the ports read, ascending — the gather order.
-    fn words(&self) -> Vec<usize> {
+    pub fn words(&self) -> Vec<usize> {
         let mut words: Vec<usize> = self
             .ports
             .iter()
@@ -224,12 +298,12 @@ impl Bus {
     }
 
     /// Ports per side, in declaration order.
-    fn side(&self, dir: BusDirection) -> Vec<&BusPort> {
+    pub fn side(&self, dir: BusDirection) -> Vec<&BusPort> {
         self.ports.iter().filter(|p| p.dir == dir).collect()
     }
 
     /// Port-group bits: both sides share a `2^c` grid of port groups.
-    fn c_bits(&self) -> usize {
+    pub fn c_bits(&self) -> usize {
         let most = self
             .side(BusDirection::Send)
             .len()
@@ -350,14 +424,15 @@ pub(crate) fn prove_bus<C: Challenger>(
 }
 
 /// Replay the bus and check both products' leaf claims against the gather
-/// values. Returns the gather claims `(point, value)` in proof order.
+/// values. Returns the gather claims `(point, value)` in proof order and the
+/// static columns' evaluations the check read.
 pub(crate) fn verify_bus<C: Challenger>(
     circuit: &Circuit,
     bus: &Bus,
     proof: &BusProof,
     grinding: BatchedGrinding,
     ch: &mut C,
-) -> Result<Vec<(Vec<F128>, F128)>, WiringError> {
+) -> Result<(Vec<(Vec<F128>, F128)>, BusStructure), WiringError> {
     let cells = circuit.cells();
     let nu = cells.nu();
     let rows = 1usize << nu;
@@ -388,15 +463,21 @@ pub(crate) fn verify_bus<C: Challenger>(
     let claim = verify_leaves(nu + c, &proof.gkr, grinding, ch).map_err(WiringError::BusGkr)?;
     let (rho_row, rho_port) = claim.rho.split_at(nu);
     let eq_row = build_eq(rho_row);
+    debug_assert_eq!(eq_row.len(), rows);
     let eq_port = build_eq(rho_port);
     let gathered = |iota: usize| proof.gather[words.binary_search(&iota).expect("a bus word")];
+    let cols = bus.structure_columns();
+    let values: Vec<F128> = cols
+        .iter()
+        .map(|c| c.eval(circuit, rho_row, &eq_row))
+        .collect();
+    let column = |col: BusColumn| values[Bus::column_index(&cols, col)];
 
     // Each side: 1 + Σ_p eq(ρ_port, p)·[(β + 1)·E_p + Σ_k γ_k·(coordinate MLE)].
     let side = |dir: BusDirection| -> F128 {
         let mut acc = F128::ONE;
         for (g, port) in bus.side(dir).into_iter().enumerate() {
-            let live = circuit.counts()[port.ty].min(rows);
-            let mass = LiveMask::eq_prefix_sum(rho_row, live);
+            let mass = column(BusColumn::Live { ty: port.ty });
             let mut inner = (beta + F128::ONE) * mass;
             for (term, &gk) in port.terms.iter().zip(&gamma) {
                 let mut value = term.constant * mass;
@@ -404,10 +485,7 @@ pub(crate) fn verify_bus<C: Challenger>(
                     value += gathered(iota);
                 }
                 if let Some(tag) = term.row {
-                    value += eq_row[..live]
-                        .iter()
-                        .enumerate()
-                        .fold(F128::ZERO, |a, (j, &e)| a + e * tag.value(j));
+                    value += column(BusColumn::Tag { ty: port.ty, tag });
                 }
                 inner += gk * value;
             }
@@ -418,11 +496,18 @@ pub(crate) fn verify_bus<C: Challenger>(
     if side(BusDirection::Send) != claim.lhs || side(BusDirection::Recv) != claim.rhs {
         return Err(WiringError::BusRecombination);
     }
-    Ok(words
+    let gather = words
         .iter()
         .zip(&proof.gather)
         .map(|(&iota, &value)| (cells.gate_claim_point(iota, rho_row), value))
-        .collect())
+        .collect();
+    Ok((
+        gather,
+        BusStructure {
+            rho_row: rho_row.to_vec(),
+            values,
+        },
+    ))
 }
 
 /// Row `j`'s leaf in `port`: `β + Σ_k γ_k·t_k`, reading committed words

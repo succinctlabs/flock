@@ -536,16 +536,46 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     //     sumcheck just fixed. The slot's prefix weights and β are verifier
     //     scalars, so they stay out — what accumulates must be a claim about
     //     the static matrix alone.
-    proof.matrix_evals = registry
-        .boolean_types()
+    //     A type that drops words under η reports over its kept rows plus
+    //     the dropped rows' identity value: with `u = u_keep + η·u_drop`,
+    //     `A_0ᵀu_keep = A_0ᵀu + η·A_0ᵀu_drop` (char 2), and `A_0ᵀu_drop`
+    //     reads only the dropped rows — a sparse pass beside the fold.
+    let (evals, linear): (Vec<(F128, F128)>, Vec<Option<F128>>) = types
         .iter()
+        .enumerate()
         .zip(&split_combs)
-        .map(|(ty, (comb_a, comb_b))| {
+        .map(|((t, ty), (comb_a, comb_b))| {
             let inner = ty.k_log - k_skip;
             let w_col = col_weight(&proof.z_partial, &claim.r_inner_rest[..inner], k_skip);
-            (inner_product(&w_col, comb_a), inner_product(&w_col, comb_b))
+            let (v_a, v_b) = (inner_product(&w_col, comb_a), inner_product(&w_col, comb_b));
+            let zeroed = union.zeroed_word_cols(t);
+            let Some(eta) = eta.filter(|_| !zeroed.is_empty()) else {
+                return ((v_a, v_b), None);
+            };
+            let eq = build_quirky_eq_table_from_weights(
+                &x_ab.z_skip.weights(k_skip),
+                &x_ab.x_inner_rest[..inner],
+            );
+            let (mut d_a, mut d_b, mut d_id) = (F128::ZERO, F128::ZERO, F128::ZERO);
+            for &w in zeroed {
+                for i in 128 * w..128 * (w + 1) {
+                    let e = eq[i];
+                    d_a += e * ty.a_0.rows[i]
+                        .iter()
+                        .fold(F128::ZERO, |acc, &c| acc + w_col[c]);
+                    d_b += e * ty.b_0.rows[i]
+                        .iter()
+                        .fold(F128::ZERO, |acc, &c| acc + w_col[c]);
+                    d_id += e * w_col[i];
+                }
+            }
+            ((v_a + eta * d_a, v_b + eta * d_b), Some(d_a + d_id))
         })
-        .collect();
+        .unzip();
+    proof.matrix_evals = evals;
+    proof
+        .matrix_evals
+        .extend(linear.into_iter().flatten().map(|v| (v, F128::ZERO)));
 
     (proof, claim, captured)
 }
@@ -617,22 +647,19 @@ pub struct MatrixAssertion {
     pub target: F128,
     /// The prover's per-type `(⟨W_t, A_0⟩, ⟨W_t, B_0⟩)`, in slot order —
     /// unscaled, so each is a claim about a registry-static matrix and
-    /// nothing else. [`Self::check`] verifies they reproduce
+    /// nothing else. A type that drops words reports them over its KEPT
+    /// rows ([`Self::zeroed`]): the matrices are `A_0`/`B_0` with the
+    /// dropped rows cleared. [`Self::check`] verifies they reproduce
     /// [`Self::target`]; [`Self::claims`] hands them out for accumulation.
     pub evals: Vec<(F128, F128)>,
-}
-
-/// The reported per-matrix values name `A_0` and `B_0` at plain eq row
-/// weights; a type with zeroed words folds masked or `η`-scaled ones and
-/// adds the linear check's terms, which accumulation does not carry.
-fn assert_no_zeroed_words(registry: &Registry) {
-    assert!(
-        registry
-            .boolean_types()
-            .iter()
-            .all(|ty| ty.zeroed_word_cols.is_empty()),
-        "accumulating the lincheck of a type with zeroed words is not supported"
-    );
+    /// Per type, the union's dropped words
+    /// ([`UnionInstance::zeroed_word_cols`]).
+    pub zeroed: Vec<Vec<usize>>,
+    /// Per type, the dropped rows' identity value `⟨W_t, D_t·(A_0 + I)⟩`
+    /// when `η` checks them (the extra pairs of
+    /// [`LincheckProof::matrix_evals`]); it joins the target as `α·η·` it,
+    /// and [`Self::linear_claims`] hands it out.
+    pub linear_evals: Vec<Option<F128>>,
 }
 
 impl MatrixAssertion {
@@ -645,7 +672,6 @@ impl MatrixAssertion {
     /// would name a different polynomial in every proof. These name the
     /// static matrices, and fold forever.
     pub fn claims(&self, registry: &Registry) -> Vec<(MatrixClaim, MatrixClaim)> {
-        assert_no_zeroed_words(registry);
         let k_skip = K_SKIP;
         registry
             .boolean_types()
@@ -674,11 +700,34 @@ impl MatrixAssertion {
             .collect()
     }
 
+    /// The per-type linear-identity claims (`None` where the type reports
+    /// none): about `D_t·(A_0 + I)` — the dropped rows of `A_0` with the
+    /// identity added — at the same weights as [`Self::claims`].
+    pub fn linear_claims(&self, registry: &Registry) -> Vec<Option<MatrixClaim>> {
+        registry
+            .boolean_types()
+            .iter()
+            .zip(&self.linear_evals)
+            .map(|(ty, v)| {
+                v.map(|value| {
+                    let inner = ty.k_log - K_SKIP;
+                    MatrixClaim {
+                        row: Weight::low_eq(
+                            self.z_skip.weights(K_SKIP),
+                            self.x_inner_rest[..inner].to_vec(),
+                        ),
+                        col: Weight::low_eq(self.z_partial.clone(), self.rr[..inner].to_vec()),
+                        value,
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// Discharge the assertion: rebuild the per-type combs (`O(Σ_t nnz_t)`,
     /// the only place the base matrices are read) and check the closed-form
     /// Comb-hat collapse against [`Self::target`].
     pub fn check_reported(&self, registry: &Registry) -> Result<(), LincheckError> {
-        assert_no_zeroed_words(registry);
         let k_skip = K_SKIP;
         if self.evals.len() != registry.num_boolean() {
             return Err(LincheckError::BadVectorLength {
@@ -687,21 +736,45 @@ impl MatrixAssertion {
                 got: self.evals.len(),
             });
         }
-        // target = Σ_t P_t·w_t·(α·⟨W_t,A⟩ + ⟨W_t,B⟩) + Σ_t P_t·β_t·W_col_t[pin]
+        if self.linear_evals.len() != registry.num_boolean()
+            || self.zeroed.len() != registry.num_boolean()
+        {
+            return Err(LincheckError::BadVectorLength {
+                which: "linear_evals",
+                expected: registry.num_boolean(),
+                got: self.linear_evals.len(),
+            });
+        }
+        // A linear value exactly where η checks a type's dropped rows.
+        for (z, v) in self.zeroed.iter().zip(&self.linear_evals) {
+            if v.is_some() != (self.eta.is_some() && !z.is_empty()) {
+                return Err(LincheckError::ConsistencyFailed {
+                    which: "linear-evals",
+                });
+            }
+        }
+        // target = Σ_t P_t·w_t·(α·⟨W_t,A⟩ + ⟨W_t,B⟩ + α·η·⟨W_t,L⟩)
+        //        + Σ_t P_t·β_t·W_col_t[pin]
         // — the slot prefix weights on both sides (w_t from the row point,
-        // P_t from the bound column point) and β are all verifier scalars.
+        // P_t from the bound column point), η and β are all verifier
+        // scalars.
         let mut acc = F128::ZERO;
-        for (((ty, slot), &(v_a, v_b)), beta) in registry
+        for ((((ty, slot), &(v_a, v_b)), beta), v_l) in registry
             .boolean_types()
             .iter()
             .zip(registry.slots())
             .zip(&self.evals)
             .zip(&self.betas)
+            .zip(&self.linear_evals)
         {
             let inner = ty.k_log - k_skip;
             let w_t = eq_prefix_weight(&self.x_inner_rest[inner..], slot.prefix);
             let p_t = eq_prefix_weight(&self.rr[inner..], slot.prefix);
-            acc += p_t * w_t * (self.alpha * v_a + v_b);
+            let mut v = self.alpha * v_a + v_b;
+            if let (Some(v_l), Some(eta)) = (v_l, self.eta) {
+                v += self.alpha * eta * *v_l;
+            }
+            acc += p_t * w_t * v;
             if let (Some(col), Some(beta)) = (ty.const_pin, beta) {
                 let w_col = col_weight(&self.z_partial, &self.rr[..inner], k_skip);
                 acc += p_t * *beta * w_col[col];
@@ -1044,6 +1117,26 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     //    column coordinate k_skip + i.
     let mut rr = r_rounds;
     rr.reverse();
+    // The report: `T` pairs, then one linear-identity value per type that
+    // drops words under η.
+    let n_types = registry.num_boolean();
+    let zeroed: Vec<Vec<usize>> = (0..n_types)
+        .map(|t| union.zeroed_word_cols(t).to_vec())
+        .collect();
+    let checked = |z: &Vec<usize>| eta.is_some() && !z.is_empty();
+    let n_linear = zeroed.iter().filter(|z| checked(z)).count();
+    if proof.matrix_evals.len() != n_types + n_linear {
+        return Err(LincheckError::BadVectorLength {
+            which: "matrix_evals",
+            expected: n_types + n_linear,
+            got: proof.matrix_evals.len(),
+        });
+    }
+    let mut extra = proof.matrix_evals[n_types..].iter();
+    let linear_evals: Vec<Option<F128>> = zeroed
+        .iter()
+        .map(|z| checked(z).then(|| extra.next().expect("counted").0))
+        .collect();
     let assertion = MatrixAssertion {
         alpha,
         eta,
@@ -1055,7 +1148,9 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
         pin_point: x_ab.x_outer.clone(),
         pin_evals,
         target: running,
-        evals: proof.matrix_evals.clone(),
+        evals: proof.matrix_evals[..n_types].to_vec(),
+        zeroed,
+        linear_evals,
     };
 
     // 6.–7. Fresh skip challenge after z_partial, in the SAME basis as the

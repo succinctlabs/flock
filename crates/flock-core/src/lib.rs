@@ -58,13 +58,22 @@ pub mod verifier;
 pub mod zerocheck;
 
 /// Configure rayon's global thread pool to use only performance cores on
-/// Apple silicon (excluding efficiency cores).
+/// Apple silicon (excluding efficiency cores), unless the E-cluster is at
+/// least as large as the P-cluster.
 ///
 /// On M-series chips the 2 efficiency cores run at ~30-40% of perf-core
 /// speed and become stragglers in compute-bound parallel work — the
 /// work-stealing scheduler keeps assigning them tasks that hold up the perf
 /// cores at synchronization barriers. Empirically, 8 threads beats 10 by
 /// ~10-20% on `pcs::commit` and similar parallel-NTT workloads.
+///
+/// The exception is a chip whose E-cluster is at least as large as its
+/// P-cluster (M4: 4P+6E): there the P-only pool leaves most of the machine
+/// idle, and the pool takes every core. Measured on M4 at the m=32 BLAKE3
+/// prove (128-bit), all ten cores against the four P-cores plus the
+/// all-core hops: 457 → 415 ms. The challenge tree reaches the same
+/// E-cluster through a separate helper pool; on this topology the plain
+/// all-core pool captures it without one.
 ///
 /// Call this **once** at program startup, before any other parallel flock
 /// code runs (rayon's global pool is set on first use; if it's already
@@ -80,7 +89,8 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     if var("RAYON_NUM_THREADS").is_ok() {
         return None;
     }
-    let n = perf_core_count();
+    let (p, e) = (perf_core_count(), efficiency_core_count());
+    let n = if e >= p { p + e } else { p };
     match ThreadPoolBuilder::new()
         .num_threads(n)
         // 8 MB workers (default 2 MB): the prover's kernels carry large NEON
