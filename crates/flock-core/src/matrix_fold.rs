@@ -60,7 +60,8 @@
 use std::collections::BTreeMap;
 
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator, ParallelSliceMut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +74,13 @@ use crate::{
 };
 
 const DOMAIN: &[u8] = b"flock-matrix-fold-v0";
+
+/// The vector length from which the fold's sumcheck rounds, weight
+/// builds and μ-combination run on the pool. Below it a round is a few
+/// microseconds of work, and the pool's overhead costs more than it saves
+/// (measured at 2^12-2^14 in the tower's folds). The k_row = 18 sigma folds
+/// are the vectors this pays for.
+const FOLD_PAR_THRESHOLD: usize = 1 << 16;
 
 /// Rows per parallel block in the two matrix passes. Large enough that the
 /// per-block accumulator (one `2^k_col` vector in the scatter pass) is
@@ -139,7 +147,9 @@ impl Weight {
         out
     }
 
-    /// The full `2^k` vector — prover side only.
+    /// The full `2^k` vector — prover side only. Large vectors build in
+    /// parallel; every entry is written once, so the output is the same
+    /// either way.
     pub fn materialize(&self) -> Vec<F128> {
         let s = self.low.len().trailing_zeros() as usize;
         let mut out = vec![F128::ZERO; 1usize << self.n_vars()];
@@ -147,16 +157,34 @@ impl Weight {
         let mut eq = vec![F128::ONE];
         for &p in &self.point {
             let mut next = vec![F128::ZERO; eq.len() * 2];
-            for (i, &e) in eq.iter().enumerate() {
-                next[i] = e * (F128::ONE + p);
-                next[i + eq.len()] = e * p;
+            let (lo_half, hi_half) = next.split_at_mut(eq.len());
+            let one_minus = F128::ONE + p;
+            if eq.len() >= FOLD_PAR_THRESHOLD {
+                lo_half
+                    .par_iter_mut()
+                    .zip(hi_half.par_iter_mut())
+                    .zip(eq.par_iter())
+                    .for_each(|((l, h), &e)| {
+                        *l = e * one_minus;
+                        *h = e * p;
+                    });
+            } else {
+                for ((l, h), &e) in lo_half.iter_mut().zip(hi_half.iter_mut()).zip(&eq) {
+                    *l = e * one_minus;
+                    *h = e * p;
+                }
             }
             eq = next;
         }
-        for (hi, &e) in eq.iter().enumerate() {
-            for (lo, &l) in self.low.iter().enumerate() {
-                out[(hi << s) | lo] = e * l;
+        let fill = |(chunk, &e): (&mut [F128], &F128)| {
+            for (dst, &l) in chunk.iter_mut().zip(&self.low) {
+                *dst = e * l;
             }
+        };
+        if out.len() >= FOLD_PAR_THRESHOLD {
+            out.par_chunks_mut(1 << s).zip(eq.par_iter()).for_each(fill);
+        } else {
+            out.chunks_mut(1 << s).zip(eq.iter()).for_each(fill);
         }
         out
     }
@@ -258,17 +286,27 @@ pub enum FoldError {
 
 /// One degree-2 round over `k` pairs, λ-combined: returns `(q(1), q(∞))` for
 /// `Σ_i λ_i·a_i[x]·b_i[x]`, binding the LOW variable.
+/// Long vectors split across the pool; field addition is exact, so the
+/// sums are the same in any order.
 fn round_message(pairs: &[(Vec<F128>, Vec<F128>)], lambdas: &[F128]) -> (F128, F128) {
-    let (mut q1, mut qinf) = (F128::ZERO, F128::ZERO);
+    let term = |(a, b): (&[F128; 2], &[F128; 2])| {
+        let (a0, a1) = (a[0], a[1]);
+        let (b0, b1) = (b[0], b[1]);
+        (a1 * b1, (a0 + a1) * (b0 + b1))
+    };
+    let add = |x: (F128, F128), y: (F128, F128)| (x.0 + y.0, x.1 + y.1);
+    let zero = (F128::ZERO, F128::ZERO);
+    let (mut q1, mut qinf) = zero;
     for ((a, b), &lam) in pairs.iter().zip(lambdas) {
-        let half = a.len() / 2;
-        let (mut s1, mut sinf) = (F128::ZERO, F128::ZERO);
-        for x in 0..half {
-            let (a0, a1) = (a[2 * x], a[2 * x + 1]);
-            let (b0, b1) = (b[2 * x], b[2 * x + 1]);
-            s1 += a1 * b1;
-            sinf += (a0 + a1) * (b0 + b1);
-        }
+        let (a2, b2) = (a.as_chunks::<2>().0, b.as_chunks::<2>().0);
+        let (s1, sinf) = if a.len() >= FOLD_PAR_THRESHOLD {
+            a2.par_iter()
+                .zip(b2.par_iter())
+                .map(term)
+                .reduce(|| zero, add)
+        } else {
+            a2.iter().zip(b2).map(term).fold(zero, add)
+        };
         q1 += lam * s1;
         qinf += lam * sinf;
     }
@@ -277,8 +315,17 @@ fn round_message(pairs: &[(Vec<F128>, Vec<F128>)], lambdas: &[F128]) -> (F128, F
 
 /// Bind the LOW variable of `v` at `r`, halving it.
 fn fold_low(v: &mut Vec<F128>, r: F128) {
-    let half = v.len() / 2;
     let one_minus = F128::ONE + r;
+    if v.len() >= FOLD_PAR_THRESHOLD {
+        *v = v
+            .as_chunks::<2>()
+            .0
+            .par_iter()
+            .map(|p| p[0] * one_minus + p[1] * r)
+            .collect();
+        return;
+    }
+    let half = v.len() / 2;
     for x in 0..half {
         v[x] = v[2 * x] * one_minus + v[2 * x + 1] * r;
     }
@@ -461,8 +508,15 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
     let h = m.row_marginal(&eq_col, 1usize << k_row);
     let mut w_mu = vec![F128::ZERO; 1usize << k_row];
     for (claim, &mu) in claims.iter().zip(&mus) {
-        for (dst, src) in w_mu.iter_mut().zip(claim.row.materialize()) {
-            *dst += mu * src;
+        let w = claim.row.materialize();
+        if w_mu.len() >= FOLD_PAR_THRESHOLD {
+            w_mu.par_iter_mut()
+                .zip(w.par_iter())
+                .for_each(|(dst, &src)| *dst += mu * src);
+        } else {
+            for (dst, &src) in w_mu.iter_mut().zip(&w) {
+                *dst += mu * src;
+            }
         }
     }
 

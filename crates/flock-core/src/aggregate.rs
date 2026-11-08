@@ -42,7 +42,7 @@
 //! recursive proofs folds `4 → 1` (two inherited, two fresh).
 
 use matrix_fold::{
-    FoldError, FoldGrinding, FoldMatrix, JaggedAssertion, JaggedClaim, JaggedTable, col_marginal,
+    FoldError, FoldGrinding, FoldMatrix, JaggedAssertion, JaggedClaim, JaggedTable,
     discharge_jagged, prove_fold_jagged_with_grinding, prove_fold_with_grinding,
     verify_fold_jagged_with_grinding, verify_fold_with_grinding,
 };
@@ -335,26 +335,26 @@ pub fn prove_aggregate_classes_with_grinding<Ch: Challenger>(
     let mut per_type = Vec::with_capacity(registry.num_boolean());
     for (t, (ma, mb)) in mats.iter().enumerate() {
         let (ca, cb) = gather(registry, assertions, priors, t);
-        // The k·nnz work. ONE `fold_split` per claim yields the column
-        // marginals for BOTH matrices, so the A- and B-folds share it — and
-        // it runs on the type's tuned kernel rather than a generic sparse
-        // walk. Claims share their row weight (A and B are reported at the
-        // same point), so `ca` and `cb` agree here row-wise.
-        let n_cols = 1usize << registry.boolean_types()[t].k_log;
-        let mut combs_a = Vec::with_capacity(ca.len());
-        let mut combs_b = Vec::with_capacity(cb.len());
-        for (qa, qb) in ca.iter().zip(&cb) {
-            let (xa, xb) = if qa.row == qb.row {
-                circuits[t].fold_split(&qa.row.materialize())
-            } else {
-                (
-                    col_marginal(ma, &qa.row.materialize(), n_cols),
-                    col_marginal(mb, &qb.row.materialize(), n_cols),
-                )
-            };
-            combs_a.push(xa);
-            combs_b.push(xb);
-        }
+        // The k·nnz work: every claim's column marginals of A AND B, in ONE
+        // walk over the matrices on the type's tuned kernel
+        // (`fold_split_many`), so the A- and B-folds share it. A fresh
+        // claim reports A and B at one point and shares a row weight; a
+        // folded prior carries one weight per matrix.
+        let rows: Vec<(Vec<F128>, Option<Vec<F128>>)> = ca
+            .iter()
+            .zip(&cb)
+            .map(|(qa, qb)| {
+                let wa = qa.row.materialize();
+                let wb = (qa.row != qb.row).then(|| qb.row.materialize());
+                (wa, wb)
+            })
+            .collect();
+        let ws: Vec<(&[F128], &[F128])> = rows
+            .iter()
+            .map(|(wa, wb)| (wa.as_slice(), wb.as_deref().unwrap_or(wa)))
+            .collect();
+        let (combs_a, combs_b): (Vec<Vec<F128>>, Vec<Vec<F128>>) =
+            circuits[t].fold_split_many(&ws).into_iter().unzip();
         let (pa, out_a) = prove_fold_with_grinding(*ma, &combs_a, &ca, grinding, ch);
         let (pb, out_b) = prove_fold_with_grinding(*mb, &combs_b, &cb, grinding, ch);
         folds.push((pa, pb));
