@@ -196,10 +196,15 @@ pub fn affine_ladder(
 /// The m = 29 Slim entry is the recursion tower's outer envelope: four
 /// levels (final c = 5) because the in-circuit verifier checks the final
 /// level per query, which a 3-level ladder's c = 9 makes ~20x dearer.
+/// The m = 33 Fast entry is the tower's chain leaf: five levels (native
+/// columns 20, 16, 12, 8, 4), so its final level stays small enough for
+/// the first-level node's in-circuit residual. The fifth level needs 6
+/// fold bits. At m = 32 the same fifth level has 2^3 columns and no
+/// certificate, so the m = 32 entry stops at four levels.
 const AFFINE_LADDERS: &[((LigeritoProfile, usize, usize), &[usize], &[usize])] = &[
     ((LigeritoProfile::Fast, 17, 6), &[1, 5], &[4, 5]),
     ((LigeritoProfile::Fast, 25, 6), &[1, 3, 5, 7], &[4, 5, 5, 5]),
-    ((LigeritoProfile::Fast, 26, 6), &[1, 3, 5, 7], &[4, 5, 5, 5]),
+    ((LigeritoProfile::Fast, 26, 6), &[1, 3, 5, 7, 9], &[4, 5, 5, 5, 6]),
     ((LigeritoProfile::Slim, 22, 5), &[2, 4, 6, 8], &[4, 5, 5, 5]),
 ];
 
@@ -2334,6 +2339,18 @@ mod tests {
     /// The tower's m = 29 Slim outer ladder: the split ladder's first four
     /// rates on the native shapes, the shipped m29_slim query counts, final
     /// level of 2^5 columns.
+    /// The tower's m = 33 chain leaf: five levels on the native shapes,
+    /// final level of 2^4 columns, 6 fold bits on the last level.
+    #[test]
+    fn fast_affine_m33_leaf_ladder_is_registered() {
+        let (cfg, _) = super::affine_ladder_for(super::LigeritoProfile::FastAffine, 26, 6)
+            .expect("m33 fast-affine");
+        assert_eq!(cfg.log_inv_rates, [1, 3, 5, 7, 9]);
+        assert_eq!(cfg.recursive_ks, [4, 4, 4, 4]);
+        assert_eq!(cfg.recursive_log_msg_cols, [16, 12, 8, 4]);
+        assert_eq!(cfg.fold_grinding_bits, [4, 5, 5, 5, 6]);
+    }
+
     #[test]
     fn slim_affine_ladder_is_registered() {
         let (cfg, _) = super::affine_ladder_for(super::LigeritoProfile::SlimAffine, 22, 5)

@@ -18,8 +18,8 @@ use crate::tower::{
 /// envelope maxima. Measured at the m29 fixed point (envelope_registry_diff
 /// + the tower census, 2026-08-06):
 ///
-/// - `spread_w` 20 covers the m32 FAST chain leaf's L0 depth; the m29 Slim
-///   outer ladder needs 19 and leaves the high output unread.
+/// - `spread_w` 21 covers the m33 FAST chain leaf's L0 depth; the m29 Slim
+///   outer ladder needs 19 and leaves the high outputs unread.
 /// - The affine inner verifier rides five shape-free gates (keys 900..=904,
 ///   [`AffineEnvLayouts`]), independent of lanes and residual length.
 /// - `nu` 14: each of the two independent child verifiers has its own
@@ -263,11 +263,11 @@ pub(super) fn envelope_shape() -> EnvShape {
         // remains below 2^14 rows, while 256 cell slots give mu = 14 + 8 =
         // 22.
         nu: 14,
-        // 20 = the m32 FAST chain leaf's L0 depth (log_msg_cols 19 +
-        // log_inv_rate 1), which the B-fast PoC's first-level node walks;
-        // the m29 slim outer ladder needs only 19 and leaves the top
-        // output unread.
-        spread_w: 20,
+        // 21 = the m33 FAST chain leaf's L0 depth (log_msg_cols 20 +
+        // log_inv_rate 1), which the first-level node walks. Smaller
+        // leaves (m32 needs 20) and the m29 slim outer ladder (19) leave
+        // the top outputs unread.
+        spread_w: 21,
         // Six variants: pl = Σ_{levels above} fold count, so the deepest is
         // the m32 FAST chain ladder's level-0 (six levels, 5×3 folds above
         // it) — the m29 slim outer ladder's five stop at 12 and ride the

@@ -623,22 +623,22 @@ pub(super) fn chain_tower_e2e_with_lane() {
     );
 }
 
-/// **Task 7a: THE M32 HEADLINE.** The chain tower at the THROUGHPUT-OPTIMAL
-/// leaf size: 4 chain segments of `CHAIN_BLOCKS` (default 2^18 = 262,144)
-/// compressions each — fast profile, ~16.8 MB hashed per leaf — through
+/// **Task 7a: THE HEADLINE.** The chain tower at the THROUGHPUT-OPTIMAL
+/// leaf size: 4 chain segments of `CHAIN_BLOCKS` (default 2^19 = 524,288)
+/// compressions each — fast profile, ~33.6 MB hashed per leaf — through
 /// two first-level nodes and one internal node with the lane, timed per
-/// phase. The statement: h_end == H^(4·2^18)(h_start) ≈ one million
+/// phase. The statement: h_end == H^(4·2^19)(h_start) ≈ two million
 /// sequential compressions, proven and folded to one recursable proof.
 /// Warm-box numbers; the cold certification wants the reboot + probe
 /// ritual first (the recorded discipline).
 #[test]
 #[ignore] // The headline measurement — run explicitly with --nocapture.
-pub(super) fn chain_tower_m32_headline() {
+pub(super) fn chain_tower_headline() {
     let cfg = test_config();
     let n_blocks: usize = var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1 << 18);
+        .unwrap_or(1 << 19);
     let mut rng = Rng(0xC4A1_0008);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
 
@@ -781,7 +781,7 @@ pub(super) fn chain_tower_m32_headline() {
 /// first-touch allocator costs that are warmup, not marginal cost.
 ///
 /// Knobs: `BENCH_RUNS` (default 3), `CHAIN_BLOCKS` (default 256 — set
-/// 262144 for the m32 production leaf), `TOWER_CONFIG=chain128` for the
+/// 524288 for the m33 production leaf), `TOWER_CONFIG=chain128` for the
 /// 128-bit config. BOX DISCIPLINE: run the stability probe first and reboot if it
 /// is far out of band — this box's benchmarks self-corrupt under sustained
 /// load, and nothing here can tell you that happened.
@@ -1352,10 +1352,13 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 // the chain leaf and both registries are unchanged.
 // Re-blessed 2026-11-07: transcript-v4 (scalar runs share one header)
 // moves the same three; chain circuit and registries unchanged.
+// Re-blessed 2026-11-08: spread_w 20 -> 21 (the m33 production leaf's L0
+// depth) moves the three outer circuits and the outer registry; the chain
+// circuit and chain registry are unchanged.
 const PIN_CHAIN_CIRCUIT: &str = "f7a065447042245cccc573887e714d1a9f754583a7d0f120c9753e51d6037fa3";
-const PIN_FL_CIRCUIT: &str = "836df6b8094c0cd05d9014bcfc2d3b21d34bd62287052bc89d115a422b2b7c3b";
-const PIN_BASE_CIRCUIT: &str = "17626ba5d2beca46bc1e64529a6b3a51f848e19391fd63b8f493d7b4b8075322";
-const PIN_STEADY_CIRCUIT: &str = "5269f823a7b4c9a3ee93915aad0783150c1c195ec61ea3804b87cb2d9b94546d";
+const PIN_FL_CIRCUIT: &str = "97308534c5e654bd93095d2f6222d6536579cea439637b3620cc22c30be24200";
+const PIN_BASE_CIRCUIT: &str = "0622cf2d5b47a52ed6bed77ae37f8cba0aaa27c69192e2b28587ad12fc7f1620";
+const PIN_STEADY_CIRCUIT: &str = "ffec3c4f231711eb0444bdb366e0554ece411f48fc902c7ebc91b5269c97246c";
 const PIN_CHAIN_REGISTRY: &str = "c2a387fffa3d06ccf25e341c2faa4e5d9b62015fc3f74a8364206ff08abb24a3";
-const PIN_OUTER_REGISTRY: &str = "5bdf79293868d752b83306b0b77cf26067b86b779eb1edc1a4ac7f00ddb35520";
+const PIN_OUTER_REGISTRY: &str = "a43fd0fc4e667f662a0c3cef7b6bab0f1d4de9aa849e5e1c7cc106d2b2e62940";
 const PIN_PUBLICS_LEN: usize = 3712;

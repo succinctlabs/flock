@@ -1370,9 +1370,10 @@ pub(super) fn first_level_node_two_chains_fold_and_adjacency() {
 /// under free counts, against the m\*28 cap (2^21 packed words). The
 /// per-type breakdown (used_cols × rows, descending) is the diet map if the
 /// gap needs closing. `CHAIN_BLOCKS` sizes the leaves (the real question is
-/// 262144 = m32); `TOWER_CONFIG=chain128` selects the envelope config.
+/// 524288 = m33, the production leaf); `TOWER_CONFIG=chain128` selects the
+/// envelope config.
 #[test]
-#[ignore] // Heavy at m32 — four chain proofs, two FLs, one node.
+#[ignore] // Heavy at m33 — four chain proofs, two FLs, one node.
 pub(super) fn envelope_content_probe() {
     let cfg = test_config();
     let n_blocks: usize = var("CHAIN_BLOCKS")

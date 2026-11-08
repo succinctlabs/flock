@@ -8,8 +8,8 @@
 //!
 //! Defaults: 8 leaves x 256 compressions under the 128-bit tower — the
 //! smallest run that reaches the STEADY spine shape (a base plus two
-//! spine folds) and boards the passenger. The production leaf is 2^18
-//! compressions (`blocks_per_leaf = 262144`); expect minutes there.
+//! spine folds) and boards the passenger. The production leaf is 2^19
+//! compressions (`blocks_per_leaf = 524288`, m = 33); expect minutes there.
 //!
 //! With `verify`, the run also generates a verification key (a one-time
 //! six-leaf reference tower) and checks the root STANDALONE through
