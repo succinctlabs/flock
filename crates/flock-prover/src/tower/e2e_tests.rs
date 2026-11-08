@@ -767,8 +767,9 @@ pub(super) fn chain_tower_m32_headline() {
 }
 
 /// **THE ONLINE BENCH: leaf, first-level node, internal node.** One number
-/// per stage, measuring only what a prover pays PER STATEMENT — the walk,
-/// the child tape sources, witness assembly, and the prove. Per-SHAPE setup
+/// per stage, measuring only what a prover pays PER STATEMENT — for an
+/// FL/node the matrix-claim fold AND its outer proof (the walk, the child
+/// tape sources, witness assembly, and the prove). Per-SHAPE setup
 /// (circuit emit+finish, R1CS tables, PCS params, the fill plan, the tape
 /// pins) is timed but reported apart and never folded into a per-proof
 /// number: a shape is statement-independent, so a production prover builds

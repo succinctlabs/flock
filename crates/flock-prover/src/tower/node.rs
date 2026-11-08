@@ -429,6 +429,7 @@ pub fn build_node_outer_with(
         }
     });
     let priors: Vec<&Accumulator> = prior_acc.iter().collect();
+    let t_fold = Instant::now();
     let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
     let (agg, acc_p) = prove_aggregate_classes_with_grinding(
         registry,
@@ -457,6 +458,7 @@ pub fn build_node_outer_with(
         &mut rec,
     )
     .expect("the node fold verifies");
+    let main_fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
     assert_eq!(acc_v.jagged.len(), n_keys, "one jagged entry per key");
     let jag_tables: Vec<([u8; 32], &JaggedParams)> = (0..n_keys)
@@ -672,7 +674,9 @@ pub fn build_node_outer_with(
     // fold PRIORS-ONLY — natively here, in-circuit below. 3 groups
     // (bool A/B + sigma) × [priorL, priorR], no fresh claims. ----
     const LANE_DOMAIN: &[u8] = b"flock-chain-lane-v0";
+    let mut lane_fold_ms = 0.0;
     let lane_native = lane.as_ref().map(|ln| {
+        let t_lane = Instant::now();
         let el_asserts_l: [(&UnionInstance<'_>, ElementAssertion); 0] = [];
         // The jagged key rides PRIORS-ONLY through the lane, exactly like
         // the lane's other groups: the FL children's chain-keyed entries
@@ -707,6 +711,7 @@ pub fn build_node_outer_with(
             &mut lrec,
         )
         .expect("the lane fold verifies");
+        lane_fold_ms = t_lane.elapsed().as_secs_f64() * 1e3;
         assert_eq!(lacc_p, lacc_v, "lane prover and verifier agree");
         assert_eq!(
             lacc_v.jagged.len(),
@@ -2671,7 +2676,7 @@ pub fn build_node_outer_with(
              lagrange lows DERIVED in-circuit from each child's z_skip wire\n  \
              outer: BLAKE rows {} across {:?} | nu {} | dense_m {} | mu {} \
              (cell slots: {} gate + {} public)\n  \
-             PER PROOF (online): child tapes {:.0} + witgen/trace {:.0} + witness asm {:.0} + prove {:.0} \
+             PER PROOF (online): fold {:.0} + child tapes {:.0} + witgen/trace {:.0} + witness asm {:.0} + prove {:.0} \
              = {:.0} ms | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n  \
              SETUP: circuit build (per SHAPE, cacheable) {:.0} ms | tape pins+locates (shape-stable) {:.0} ms\n",
                 n_folds,
@@ -2684,11 +2689,12 @@ pub fn build_node_outer_with(
                 shape2.circuit.cells().mu(),
                 shape2.circuit.cells().num_gate_slots(),
                 shape2.circuit.cells().num_public_slots(),
+                main_fold_ms + lane_fold_ms,
                 tapes_ms,
                 trace_ms,
                 asm_ms,
                 prove_ms,
-                tapes_ms + trace_ms + asm_ms + prove_ms,
+                main_fold_ms + lane_fold_ms + tapes_ms + trace_ms + asm_ms + prove_ms,
                 verify_ms,
                 deferred_ms,
                 serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
@@ -2702,6 +2708,7 @@ pub fn build_node_outer_with(
                 witgen_ms: asm_ms,
                 prove_ms,
                 verify_ms,
+                fold_ms: main_fold_ms + lane_fold_ms,
                 wall_ms: 0.0,
             });
             if steady_left > 0 {
@@ -2749,6 +2756,7 @@ pub fn build_node_outer_with(
                 witgen_ms: asm_ms,
                 prove_ms,
                 verify_ms,
+                fold_ms: main_fold_ms + lane_fold_ms,
                 wall_ms: 0.0,
             },
             onlines,

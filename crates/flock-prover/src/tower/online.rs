@@ -22,6 +22,10 @@ use crate::tower::{MixedProof, PcsParams};
 //           around them in these tests is not this — it is per shape)
 //   witgen  witness/trace generation and packing into the union's blocks
 //   prove
+//   fold    (FL / node) the matrix-claim fold of the children's deferred
+//           claims: the aggregate prove plus the recorded verify the outer
+//           circuit replays. It feeds the outer circuit's values, so it is
+//           per statement, and an outer's cost is fold + its own proof.
 //
 // SETUP is per-SHAPE and cacheable, so it is timed separately and never
 // folded into a per-proof number: the circuit emit+finish, the R1CS tables,
@@ -39,6 +43,12 @@ pub(super) struct Online {
     pub(super) witgen_ms: f64,
     pub(super) prove_ms: f64,
     pub(super) verify_ms: f64,
+    /// The matrix-claim fold (FL / node; `0.0` for a leaf): the aggregate
+    /// prove plus its recorded verify, every group and lane. It runs ONCE
+    /// per build, before the online loop, because its transcript becomes
+    /// the outer circuit's values — so under steady repetition every
+    /// record carries that one measurement.
+    pub(super) fold_ms: f64,
     /// ONE timer around the whole online span (walk through prove), not the
     /// phase sum: everything between the phases — the union/PCS param
     /// construction, buffer drops, allocator work — lands here and nowhere
@@ -48,14 +58,16 @@ pub(super) struct Online {
 
 #[cfg(test)]
 impl Online {
-    /// The per-proof online total. The MEASURED wall where a stage supplies
-    /// it, the phase sum otherwise — a sum can only be a lower bound.
+    /// The per-proof online total: the fold plus the proof's own span —
+    /// the MEASURED wall where a stage supplies it, the phase sum otherwise
+    /// (a sum can only be a lower bound).
     pub(super) fn total(&self) -> f64 {
-        if self.wall_ms > 0.0 {
+        let own = if self.wall_ms > 0.0 {
             self.wall_ms
         } else {
             self.walk_ms + self.tapes_ms + self.witgen_ms + self.prove_ms
-        }
+        };
+        self.fold_ms + own
     }
 
     /// What the phases add up to — printed beside the wall so the gap between
@@ -246,8 +258,9 @@ pub(super) fn report_stage(name: &str, runs: &[Online]) {
     let mut tot: Vec<f64> = runs.iter().map(|o| o.total()).collect();
     tot.sort_by(|a, b| a.partial_cmp(b).unwrap());
     println!(
-        "    {name:9} walk {:6.1} + tapes {:5.1} + witgen {:5.1} + prove {:7.1} \
+        "    {name:9} fold {:5.1} + walk {:6.1} + tapes {:5.1} + witgen {:5.1} + prove {:7.1} \
          = {:7.1} ms [{:.1}-{:.1}] | verify {:4.1} | (setup {:.0})",
+        median_of(runs, |o| o.fold_ms),
         median_of(runs, |o| o.walk_ms),
         median_of(runs, |o| o.tapes_ms),
         median_of(runs, |o| o.witgen_ms),

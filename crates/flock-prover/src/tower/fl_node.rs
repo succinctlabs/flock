@@ -241,6 +241,7 @@ pub fn build_first_level_node_k(
     let jags: Vec<_> = cps.iter().map(|cp| &cp.inner.work.jagged).collect();
     let jagged_p: Vec<JaggedKeyProve<'_>> = vec![(chain_digest, &chain_params_j, jags.to_vec())];
     let jagged_v: Vec<JaggedKeyVerify<'_>> = vec![(chain_digest, jags.to_vec())];
+    let t_fold = Instant::now();
     let mut chp = FsChallenger::with_chained_blake3(FL_DOMAIN);
     let (agg, acc_p) = prove_aggregate_classes_with_grinding(
         registry,
@@ -269,6 +270,7 @@ pub fn build_first_level_node_k(
         &mut rec,
     )
     .expect("the first-level fold verifies");
+    let fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
     assert!(acc_v.per_element.is_empty(), "no element group accumulated");
     assert_eq!(acc_v.jagged.len(), 1, "one jagged key: the chain layout");
@@ -1276,6 +1278,7 @@ pub fn build_first_level_node_k(
                 witgen_ms: asm_ms,
                 prove_ms,
                 verify_ms: verify_ms2,
+                fold_ms,
                 wall_ms: 0.0,
             });
             fin = Some((built2, oproof, ocommit, acc_pub));
