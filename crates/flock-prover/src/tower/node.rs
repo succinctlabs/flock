@@ -429,36 +429,107 @@ pub fn build_node_outer_with(
         }
     });
     let priors: Vec<&Accumulator> = prior_acc.iter().collect();
-    let t_fold = Instant::now();
-    let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
-    let (agg, acc_p) = prove_aggregate_classes_with_grinding(
-        registry,
-        &mats,
-        &lcs,
-        &bool_asserts,
-        &el_mats,
-        &el_asserts,
-        &sigma_keys,
-        &jagged_p,
-        &priors,
-        tower_fold_grinding(cfg),
-        &mut chp,
-    )
-    .expect("the node fold proves");
-    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_NODE_DOMAIN));
-    let acc_v = verify_aggregate_classes_with_grinding(
-        registry,
-        &bool_asserts,
-        &el_asserts,
-        &sigma_keys,
-        &jagged_v,
-        &priors,
-        &agg,
-        tower_fold_grinding(cfg),
-        &mut rec,
-    )
-    .expect("the node fold verifies");
-    let main_fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
+    // THE TWO FOLDS RUN TOGETHER. The main fold and the lane fold share
+    // no input, output or transcript (the lane has its own domain and
+    // folds priors only), and each keeps only ~5 of the pool's cores busy
+    // (small sequential sumcheck rounds), so `join` overlaps them. The
+    // folds' results are unchanged; only the schedule moves.
+    const LANE_DOMAIN: &[u8] = b"flock-chain-lane-v0";
+    let lane_el_asserts: [(&UnionInstance<'_>, ElementAssertion); 0] = [];
+    let lane_jagged: Option<(Vec<JaggedKeyProve<'_>>, Vec<JaggedKeyVerify<'_>>)> =
+        lane.as_ref().map(|ln| {
+            // The jagged key rides PRIORS-ONLY through the lane, exactly
+            // like the lane's other groups: the FL children's chain-keyed
+            // entries fold with no fresh claims.
+            (
+                vec![(ln.circuit.digest(), ln.params, Vec::new())],
+                vec![(ln.circuit.digest(), Vec::new())],
+            )
+        });
+    let main_fold = || {
+        let t_fold = Instant::now();
+        let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
+        let (agg, acc_p) = prove_aggregate_classes_with_grinding(
+            registry,
+            &mats,
+            &lcs,
+            &bool_asserts,
+            &el_mats,
+            &el_asserts,
+            &sigma_keys,
+            &jagged_p,
+            &priors,
+            tower_fold_grinding(cfg),
+            &mut chp,
+        )
+        .expect("the node fold proves");
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_NODE_DOMAIN));
+        let acc_v = verify_aggregate_classes_with_grinding(
+            registry,
+            &bool_asserts,
+            &el_asserts,
+            &sigma_keys,
+            &jagged_v,
+            &priors,
+            &agg,
+            tower_fold_grinding(cfg),
+            &mut rec,
+        )
+        .expect("the node fold verifies");
+        (agg, acc_p, acc_v, rec, t_fold.elapsed().as_secs_f64() * 1e3)
+    };
+    let lane_fold = || {
+        lane.as_ref()
+            .zip(lane_jagged.as_ref())
+            .map(|(ln, (ljagged_p, ljagged_v))| {
+                let t_lane = Instant::now();
+                let mut chp = FsChallenger::with_chained_blake3(LANE_DOMAIN);
+                let (lagg, lacc_p) = prove_aggregate_classes_with_grinding(
+                    ln.registry,
+                    ln.mats,
+                    ln.circs,
+                    &[],
+                    &[],
+                    &lane_el_asserts,
+                    &[(ln.circuit, Vec::new())],
+                    ljagged_p,
+                    ln.priors,
+                    tower_fold_grinding(cfg),
+                    &mut chp,
+                )
+                .expect("the lane fold proves");
+                let mut lrec =
+                    RecordingChallenger::new(FsChallenger::with_chained_blake3(LANE_DOMAIN));
+                let lacc_v = verify_aggregate_classes_with_grinding(
+                    ln.registry,
+                    &[],
+                    &lane_el_asserts,
+                    &[(ln.circuit, Vec::new())],
+                    ljagged_v,
+                    ln.priors,
+                    &lagg,
+                    tower_fold_grinding(cfg),
+                    &mut lrec,
+                )
+                .expect("the lane fold verifies");
+                (
+                    lagg,
+                    lacc_p,
+                    lacc_v,
+                    lrec,
+                    t_lane.elapsed().as_secs_f64() * 1e3,
+                )
+            })
+    };
+    let t_folds = Instant::now();
+    let ((agg, acc_p, acc_v, rec, main_fold_ms), mut lane_folded) =
+        rayon::join(main_fold, lane_fold);
+    // The two folds' joint wall time, split back into the reported
+    // main / lane parts in proportion to their own times.
+    let folds_wall_ms = t_folds.elapsed().as_secs_f64() * 1e3;
+    let lane_own_ms = lane_folded.as_ref().map_or(0.0, |l| l.4);
+    let fold_scale = folds_wall_ms / (main_fold_ms + lane_own_ms).max(f64::MIN_POSITIVE);
+    let main_fold_ms = main_fold_ms * fold_scale;
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
     assert_eq!(acc_v.jagged.len(), n_keys, "one jagged entry per key");
     let jag_tables: Vec<([u8; 32], &JaggedParams)> = (0..n_keys)
@@ -673,45 +744,12 @@ pub fn build_node_outer_with(
     // ---- the LANE (task 6): the children's LOWER-registry accumulators
     // fold PRIORS-ONLY — natively here, in-circuit below. 3 groups
     // (bool A/B + sigma) × [priorL, priorR], no fresh claims. ----
-    const LANE_DOMAIN: &[u8] = b"flock-chain-lane-v0";
     let mut lane_fold_ms = 0.0;
     let lane_native = lane.as_ref().map(|ln| {
-        let t_lane = Instant::now();
-        let el_asserts_l: [(&UnionInstance<'_>, ElementAssertion); 0] = [];
-        // The jagged key rides PRIORS-ONLY through the lane, exactly like
-        // the lane's other groups: the FL children's chain-keyed entries
-        // fold with no fresh claims.
-        let ljagged_p: Vec<JaggedKeyProve<'_>> = vec![(ln.circuit.digest(), ln.params, Vec::new())];
-        let ljagged_v: Vec<JaggedKeyVerify<'_>> = vec![(ln.circuit.digest(), Vec::new())];
-        let mut chp = FsChallenger::with_chained_blake3(LANE_DOMAIN);
-        let (lagg, lacc_p) = prove_aggregate_classes_with_grinding(
-            ln.registry,
-            ln.mats,
-            ln.circs,
-            &[],
-            &[],
-            &el_asserts_l,
-            &[(ln.circuit, Vec::new())],
-            &ljagged_p,
-            ln.priors,
-            tower_fold_grinding(cfg),
-            &mut chp,
-        )
-        .expect("the lane fold proves");
-        let mut lrec = RecordingChallenger::new(FsChallenger::with_chained_blake3(LANE_DOMAIN));
-        let lacc_v = verify_aggregate_classes_with_grinding(
-            ln.registry,
-            &[],
-            &el_asserts_l,
-            &[(ln.circuit, Vec::new())],
-            &ljagged_v,
-            ln.priors,
-            &lagg,
-            tower_fold_grinding(cfg),
-            &mut lrec,
-        )
-        .expect("the lane fold verifies");
-        lane_fold_ms = t_lane.elapsed().as_secs_f64() * 1e3;
+        let (lagg, lacc_p, lacc_v, lrec, own_ms) = lane_folded
+            .take()
+            .expect("the lane fold ran beside the main fold");
+        lane_fold_ms = own_ms * fold_scale;
         assert_eq!(lacc_p, lacc_v, "lane prover and verifier agree");
         assert_eq!(
             lacc_v.jagged.len(),
