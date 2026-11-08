@@ -204,7 +204,11 @@ pub fn affine_ladder(
 const AFFINE_LADDERS: &[((LigeritoProfile, usize, usize), &[usize], &[usize])] = &[
     ((LigeritoProfile::Fast, 17, 6), &[1, 5], &[4, 5]),
     ((LigeritoProfile::Fast, 25, 6), &[1, 3, 5, 7], &[4, 5, 5, 5]),
-    ((LigeritoProfile::Fast, 26, 6), &[1, 3, 5, 7, 9], &[4, 5, 5, 5, 6]),
+    (
+        (LigeritoProfile::Fast, 26, 6),
+        &[1, 3, 5, 7, 9],
+        &[4, 5, 5, 5, 6],
+    ),
     ((LigeritoProfile::Slim, 22, 5), &[2, 4, 6, 8], &[4, 5, 5, 5]),
 ];
 
