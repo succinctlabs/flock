@@ -47,6 +47,19 @@ pub struct SparseBinaryMatrix {
     pub num_rows: usize,
     pub num_cols: usize,
     pub rows: Arc<Vec<Vec<usize>>>,
+    /// The same rows as one flat u32 CSR, built on first use and shared by
+    /// every clone (see [`Self::csr32`]).
+    csr32: Arc<OnceLock<Csr32>>,
+}
+
+/// A row-compressed copy of a [`SparseBinaryMatrix`] with u32 indices: row
+/// `r`'s columns are `cols[ptr[r]..ptr[r + 1]]`. Half the bytes of the
+/// `usize` rows and no per-row allocation, for the passes that stream
+/// every nonzero (the matrix fold's row marginal).
+#[derive(Debug)]
+pub struct Csr32 {
+    pub ptr: Vec<u32>,
+    pub cols: Vec<u32>,
 }
 
 impl SparseBinaryMatrix {
@@ -62,7 +75,27 @@ impl SparseBinaryMatrix {
             num_rows,
             num_cols,
             rows: Arc::new(rows),
+            csr32: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The rows as a u32 CSR ([`Csr32`]), built once per matrix.
+    pub fn csr32(&self) -> &Csr32 {
+        self.csr32.get_or_init(|| {
+            let nnz: usize = self.rows.iter().map(Vec::len).sum();
+            assert!(
+                nnz <= u32::MAX as usize && self.num_cols <= u32::MAX as usize,
+                "the matrix fits u32 indices"
+            );
+            let mut ptr = Vec::with_capacity(self.rows.len() + 1);
+            let mut cols = Vec::with_capacity(nnz);
+            ptr.push(0u32);
+            for row in self.rows.iter() {
+                cols.extend(row.iter().map(|&c| c as u32));
+                ptr.push(cols.len() as u32);
+            }
+            Csr32 { ptr, cols }
+        })
     }
 }
 
