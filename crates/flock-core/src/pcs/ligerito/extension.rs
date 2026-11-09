@@ -2889,7 +2889,11 @@ pub(crate) fn recursive_verifier_with_basis_succinct<Ch, F>(
     log_n: usize,
     target: F128,
     expected_initial_cap: &[Hash],
-    l0_num_lanes: usize,
+    // The L0 commitment's lane layout, as [`crate::pcs::PcsParams::num_lanes`]:
+    // `None` is the full power-of-two grid with the lanes as the LOW index
+    // bits; `Some(t)` is the lane-major grid (lane = HIGH index bits) with
+    // `t ≤ 2^initial_k` committed lanes — including `t = 2^initial_k`.
+    l0_num_lanes: Option<usize>,
     eval_b_residual: F,
     challenger: &mut Ch,
 ) -> bool
@@ -2927,7 +2931,8 @@ where
     let mut query_nonce = 0usize;
     let mut claim = F256::from(target);
     let mut ood_contexts = Vec::new();
-    let lane_major = l0_num_lanes < 1usize << initial_k;
+    let lane_major = l0_num_lanes.is_some();
+    let l0_num_lanes = l0_num_lanes.unwrap_or(1usize << initial_k);
 
     for _ in 0..ood_count(0) {
         let mut point = challenger.sample_f128_vec(log_n);

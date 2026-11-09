@@ -276,7 +276,10 @@ fn element_only_transcript_shape_is_pinned() {
     // aggressive +2/level ladder and 16-bit query PoW at every level — so
     // the per-level query counts, caps and Pow bits all move. Two
     // deterministic print runs agreed.
-    const EXPECTED: &str = "46b9b760ea72bcc0e549196bb31401e88993767d71636614de61270fd4cfdee3";
+    // Re-pinned 2026-11-06: `Fast` went back to the +1/level ladder
+    // (proof-IO v25), so the level count, per-level query counts and caps
+    // all move. Two deterministic print runs agreed.
+    const EXPECTED: &str = "5199dc5101d1380528ba4056ae0929c32ae4e0547129f156bc08720c4ea7d2a1";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
 

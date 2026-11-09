@@ -28,14 +28,15 @@ pub(super) fn pcs_batch_for(union: &UnionInstance, profile: LigeritoProfile) -> 
 /// query count follows the tower's security level: a 100-bit recursion
 /// carries a 100-bit leaf (Fast100, 448q — a 128-bit leaf under a 100-bit
 /// recursion balloons the FL's replayed transcript past the arity-2
-/// envelope), and the 128-bit aggressive recursion carries the aggressive
-/// Fast128 leaf (rate-1/2 on the rate+2 ladder; m32: Σq 675 → 527).
+/// envelope), and the 128-bit recursion carries the Fast leaf (rate 1/2,
+/// 16-bit query PoW; since 2026-11-06 on the +1/level ladder, m32 Σq 591,
+/// where the +2 ladder was 460).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TowerConfig {
     /// The 100-bit tower: Fast100 leaf, Slim100 outers.
     Chain100,
-    /// The 128-bit tower on the aggressive rate ladder: Fast128 leaf,
-    /// Slim128 outers.
+    /// The 128-bit tower: Fast leaf, Slim outers on the aggressive rate
+    /// ladder.
     Chain128,
 }
 

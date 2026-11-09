@@ -44,7 +44,7 @@ use flock_core::{
     lincheck::LincheckCircuit,
     merkle::HashKind,
     pcs::{
-        Commitment, PcsParams,
+        Commitment, LOG_PACKING, PcsParams,
         ligerito::{LigeritoProfile, embedded_initial_k_or_default},
     },
     union::UnionInstance,
@@ -380,22 +380,66 @@ const GADGETS_PER_SIGNATURE: [usize; 7] = [
     2 * HEIGHT,
 ];
 
-/// The `nu` whose layout has the smallest Boolean address space,
-/// `⌈log2 Σ_kind ⌈count/2^nu⌉·2^(nu + k_log)⌉`, preferring the larger `nu`
-/// (fewer slots) on a tie. Every slot has `2^nu` rows whatever its count, so
-/// a large `nu` inflates the small gadget kinds, and a small `nu` declares a
-/// heavy kind many times over.
+/// `(gate count, k_log)` per gate kind for `n` signatures, in [`Slots`]
+/// order: what [`plan_nu`] lays out.
+pub fn layout_kinds(n: usize, options: XmssOptions) -> Vec<(usize, usize)> {
+    let mut kinds: Vec<(usize, usize)> = gates(3)
+        .iter()
+        .zip(GADGETS_PER_SIGNATURE)
+        .map(|(g, per_sig)| (n * per_sig, g.k_log()))
+        .collect();
+    if options.hashed_statement {
+        kinds[1].0 += statement_hash_compressions(n);
+    }
+    kinds
+}
+
+/// The `nu` with the smallest [`layout_cost`]. Every slot has `2^nu` rows
+/// whatever its count, so a large `nu` inflates the small gadget kinds
+/// (more committed cells), and a small `nu` declares a heavy kind many times
+/// over (more columns, which the opening pays per column).
 pub fn plan_nu(kinds: &[(usize, usize)]) -> usize {
-    let space = |nu: usize| -> u32 {
-        let total: u128 = kinds
-            .iter()
-            .map(|&(count, k_log)| count.div_ceil(1 << nu).max(1) as u128 * (1u128 << (nu + k_log)))
-            .sum();
-        total.next_power_of_two().trailing_zeros()
-    };
     (3..=24)
-        .min_by_key(|&nu| (space(nu), std::cmp::Reverse(nu)))
+        .min_by(|&a, &b| layout_cost(kinds, a).total_cmp(&layout_cost(kinds, b)))
         .unwrap()
+}
+
+/// Used (committed) columns per declared column under the shipped options:
+/// pruned outputs and public columns are never committed. 0.727–0.734 over
+/// 128–2048 signatures and `nu` 10–16.
+const COMMITTED_FRACTION: f64 = 0.73;
+
+/// Modelled one-thread cost of the layout at slot height `2^nu`, in
+/// milliseconds of proving plus verifying (Apple M4, recursion-leaf sweep
+/// over 128–2048 signatures and `nu` 10–16):
+///
+/// - 0.39 ms per declared Mbit: witness, commit, zerocheck, lincheck;
+/// - 0.124 ms per declared 128-bit column: 0.054 proving (the opening's
+///   per-column statistics, one wiring port per slot), 0.070 verifying;
+/// - Ligerito on the dense stack, `2^m` words at 10.4 ns (75 ms floor).
+///
+/// The dense stack is estimated as [`COMMITTED_FRACTION`] of the declared
+/// cells.
+///
+/// The verifying term was the lincheck walking the compression gate's
+/// matrices once per slot. It now walks each gate once (`slot_marginals` in
+/// `flock_core::lincheck::union`), and verifying costs 12–18 ms at every
+/// layout. A refit without the term (0.38 ms/Mbit, 0.034 ms/column) moves
+/// 992 to `nu` 13 but 256 to 12 (5% slower). The weights above stay: on the
+/// one-thread sweep after the change (2026-11-06) their picks are within
+/// 2.6% of the best measured `nu` everywhere, and bigger `nu` keeps its
+/// edge at ten threads.
+fn layout_cost(kinds: &[(usize, usize)], nu: usize) -> f64 {
+    let (mut bits, mut columns) = (0f64, 0f64);
+    for &(count, k_log) in kinds {
+        let slots = count.div_ceil(1 << nu).max(1) as f64;
+        bits += slots * (1u128 << (nu + k_log)) as f64;
+        columns += slots * (1u64 << k_log.saturating_sub(LOG_PACKING)) as f64;
+    }
+    let dense = COMMITTED_FRACTION * bits / (1u64 << LOG_PACKING) as f64;
+    let m_words = (dense.log2().ceil() as usize).max(1);
+    let ligerito = (10.4e-6 * (1u64 << m_words) as f64).max(75.0);
+    0.39 * bits / 1e6 + 0.124 * columns + ligerito
 }
 
 /// The gate kinds at `nu`, in [`Slots`] order. The two compression kinds
@@ -622,14 +666,7 @@ impl XmssCircuit {
     /// [`Self::with_nu`], proving with `options`.
     pub fn with_options(n: usize, nu: Option<usize>, options: XmssOptions) -> Self {
         assert!(n >= 1);
-        let mut kinds: Vec<(usize, usize)> = gates(3)
-            .iter()
-            .zip(GADGETS_PER_SIGNATURE)
-            .map(|(g, per_sig)| (n * per_sig, g.k_log()))
-            .collect();
-        if options.hashed_statement {
-            kinds[1].0 += statement_hash_compressions(n);
-        }
+        let kinds = layout_kinds(n, options);
         let nu = nu.unwrap_or_else(|| plan_nu(&kinds));
         let mut b = Builder {
             sb: ShapeBuilder::new(nu),

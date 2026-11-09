@@ -81,7 +81,7 @@ pub(crate) mod extension;
 /// differ in regime/target, so the rate alone cannot key the config lookup.
 ///
 /// - `Fast`:   rate 1/2, Johnson list-decoding regime with two-point OOD
-///             binding, the aggressive recursion ladder (rate +2/level) and
+///             binding, the gradual recursion ladder (rate +1/level) and
 ///             16-bit query PoW at every level: the query term targets 112
 ///             bits and the PoW supplies the rest, work-normalized to 128.
 ///             MCA/fold arithmetic over F256. Default.
@@ -95,14 +95,17 @@ pub(crate) mod extension;
 /// History (2026-08-27): the grind-free `Fast`/`Slim` with the +1/level
 /// ladder were deleted and the `Fast128`/`Slim128` twins took their names
 /// (Ron's call, bloat ledger §C). Proof-IO v22 marks the transcript move.
+/// 2026-11-06: `Fast` went back to the +1/level ladder, keeping its PoW
+/// (Proof-IO v25). The +2 ladder's level-1 codeword is rate 1/8 at the
+/// same width from m28 to m30, so its recursive commits were a fixed
+/// ~41 ms (1T) that dominated small leanXMSS leaves: +1 trades Σq 435 →
+/// 550 at m29 (+13% proof) for 7–9% less prove time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LigeritoProfile {
-    /// The aggressive ladder climbs the rate +2 per level (vs +1), so the
-    /// same folds reach higher rates sooner and each tail level needs fewer
-    /// consistency queries; codewords still shrink per level because
-    /// `rate_gain` stays below the fold count. See
-    /// [`Self::derive_profile_ladder`].
+    /// The gradual ladder climbs the rate +1 per level: each recursive
+    /// codeword is half the size the +2 ladder commits, for more consistency
+    /// queries per tail level. See [`Self::derive_profile_ladder`].
     #[default]
     Fast,
     /// The 100-bit cost point kept for deployments on the chain100
@@ -1762,12 +1765,14 @@ impl LigeritoSecurityConfig {
     ///             MCA arithmetic.
     /// - `Secure`: Udr, rate 1/2, ε* = 1e-3, 120 bits per round.
     pub fn derive_profile(m: usize, profile: LigeritoProfile) -> Result<Self, String> {
-        // Ladder: 3 folds/level. Strict Fast/Slim climb the rate +2 per level
-        // (the aggressive ladder they inherited from Fast128/Slim128 in the
-        // 2026-08-27 consolidation; still < 3 folds, so codewords keep
-        // shrinking). Fast100/Slim100/Secure keep the shipped +1/level.
+        // Ladder: 3 folds/level. Strict Slim climbs the rate +2 per level
+        // (the aggressive ladder it inherited from Slim128 in the 2026-08-27
+        // consolidation; still < 3 folds, so codewords keep shrinking): the
+        // tower outers pay per query in-circuit. Fast went back to +1 on
+        // 2026-11-06: natively, the recursive commits cost more than the
+        // extra queries. Fast100/Slim100/Secure keep the shipped +1/level.
         let rate_gain = match profile {
-            LigeritoProfile::Slim | LigeritoProfile::Fast => 2,
+            LigeritoProfile::Slim => 2,
             _ => 1,
         };
         Self::derive_profile_ladder(m, profile, 3, rate_gain)
@@ -1824,8 +1829,8 @@ impl LigeritoSecurityConfig {
         // (rows ≈ 28-31 words). Soundness derives identically: Johnson
         // per-query bits depend on rate/η only, so per-level query counts
         // are unchanged; at the 2026-08-27 consolidation the Fast ladder
-        // re-derives as rates 1/3/5/7/9 (Σq 435) and the Slim ladder as
-        // 2/4/6/8/10 (Σq 279). Secure keeps 6 (unused by the recursion
+        // re-derived as rates 1/3/5/7/9 (Σq 435; +1/level since 2026-11-06:
+        // 1/2/3/4/5, Σq 550) and the Slim ladder as 2/4/6/8/10 (Σq 279). Secure keeps 6 (unused by the recursion
         // track).
         // m28 joined 2026-08-05 when the transcript-v3 duplex pushed the
         // slim L1 recursion node under 2^21 words: initial_k = 4 keeps the
@@ -5677,8 +5682,8 @@ mod tests {
 
     /// Both embedded TOMLs (m29_fast at rate 1/2 and m29_slim at rate 1/4)
     /// parse, validate, and produce ProverConfig/VerifierConfig with the
-    /// aggressive +2/level ladder and the same fold shape as
-    /// `default_config(22, 5, rate)` (which climbs +1/level).
+    /// fold shape of `default_config(22, 5, rate)`: Fast on its +1/level
+    /// ladder, Slim on the aggressive +2/level one.
     #[test]
     fn ligerito_security_config_m29_toml_loads() {
         let toml_str = include_str!("../../configs/ligerito/m29_fast.toml");
@@ -5707,8 +5712,9 @@ mod tests {
         assert!(cfg.levels.iter().skip(1).all(|lv| lv.ood_samples == 2));
         let (pv, _vc) = cfg.to_prover_verifier_configs().unwrap();
         let default = default_config(22, 5, 1).unwrap();
-        // Aggressive ladder: +2 rate per level (default_config climbs +1).
-        assert_eq!(pv.log_inv_rates, vec![1, 3, 5, 7, 9]);
+        // Gradual ladder: +1 rate per level, like default_config.
+        assert_eq!(pv.log_inv_rates, vec![1, 2, 3, 4, 5]);
+        assert_eq!(pv.log_inv_rates, default.log_inv_rates);
         assert_eq!(pv.recursive_ks, default.recursive_ks);
         assert_eq!(pv.queries[0], 244);
 
@@ -6263,7 +6269,7 @@ mod tests {
             log_n,
             target,
             &initial_cap(&v_cfg),
-            1usize << initial_k,
+            None,
             |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         );
@@ -6282,7 +6288,7 @@ mod tests {
             log_n,
             target,
             &initial_cap(&v_cfg),
-            1usize << initial_k,
+            None,
             |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         );
@@ -6408,7 +6414,7 @@ mod tests {
                     log_n,
                     target,
                     &cap0,
-                    1usize << initial_k,
+                    None,
                     |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                     &mut v_ch,
                 ),
@@ -6427,7 +6433,7 @@ mod tests {
                     log_n,
                     target,
                     &cap0,
-                    1usize << initial_k,
+                    None,
                     |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                     &mut v_ch,
                 ),
@@ -6445,7 +6451,7 @@ mod tests {
                     log_n,
                     target,
                     &cap0,
-                    1usize << initial_k,
+                    None,
                     |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                     &mut v_ch,
                 ),
@@ -6463,7 +6469,7 @@ mod tests {
                     log_n,
                     target,
                     &cap0,
-                    1usize << initial_k,
+                    None,
                     |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                     &mut v_ch,
                 ),
@@ -6484,7 +6490,7 @@ mod tests {
                     log_n,
                     target,
                     &cap0,
-                    1usize << initial_k,
+                    None,
                     |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                     &mut v_ch,
                 ),
@@ -7513,7 +7519,7 @@ mod tests {
             log_n,
             target,
             &cap,
-            1 << cfg.initial_k,
+            None,
             |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         ));
@@ -7618,7 +7624,7 @@ mod tests {
             log_n,
             target,
             &initial_cap(&v_cfg),
-            1usize << initial_k,
+            None,
             |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         );
@@ -8062,7 +8068,7 @@ mod tests {
             log_n,
             target,
             &initial_cap(&v_cfg),
-            1usize << v_cfg.initial_k,
+            None,
             |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         );
@@ -8196,7 +8202,7 @@ mod tests {
                 log_n,
                 target,
                 &initial_cap(&v_cfg),
-                1usize << v_cfg.initial_k,
+                None,
                 |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
                 &mut ch,
             )
@@ -8330,7 +8336,7 @@ mod tests {
                 log_n,
                 target,
                 &initial_cap(&v_cfg),
-                1usize << initial_k,
+                None,
                 |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
                 &mut v_ch,
             )
@@ -8421,7 +8427,7 @@ mod tests {
                 log_n,
                 target,
                 &initial_cap(&v_cfg),
-                1usize << initial_k,
+                None,
                 |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                 &mut v_ch,
             ),
@@ -8440,7 +8446,7 @@ mod tests {
                 log_n,
                 target,
                 &initial_cap(&v_cfg),
-                1usize << initial_k,
+                None,
                 |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                 &mut w_ch
             ),
@@ -8503,7 +8509,7 @@ mod tests {
                         log_n,
                         target,
                         &initial_cap(&v_cfg),
-                        1usize << initial_k,
+                        None,
                         |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                         &mut v_ch
                     ),
@@ -8524,7 +8530,7 @@ mod tests {
                         log_n,
                         target,
                         &initial_cap(&v_cfg),
-                        1usize << initial_k,
+                        None,
                         |ris, residual_log| { evaluate_dense_at_residual(&b, ris, residual_log) },
                         &mut w_ch
                     ),
@@ -8638,7 +8644,7 @@ mod tests {
             log_n,
             target,
             &initial_cap(&v_cfg),
-            1usize << initial_k,
+            None,
             |ris, residual_log| evaluate_dense_at_residual(&b, ris, residual_log),
             &mut v_ch,
         );

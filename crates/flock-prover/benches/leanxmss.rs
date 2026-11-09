@@ -160,6 +160,10 @@ fn main() {
         let t = Instant::now();
         circuit.verify(&statements, &proof).expect("verifies");
         let verify = t.elapsed().as_secs_f64();
+        if run == 0 {
+            let bytes = bincode::serialize(&proof.proof).unwrap().len();
+            eprintln!("proof size: {:.1} KiB", bytes as f64 / 1024.0);
+        }
         best = best.min(online + prove);
         eprintln!(
             "run {run}: online {:.0} ms, prove {:.0} ms, verify {:.1} ms; rss {:.2} GB before prove, peak {:.2} GB",

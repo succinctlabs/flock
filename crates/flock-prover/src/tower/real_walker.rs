@@ -341,6 +341,7 @@ impl<'p> RealTape<'p> {
             &chals,
             HashKind::Blake3,
             &strat_scheds(&lo.pcs),
+            lo.pcs.lane_major(),
         );
         assert!(
             geo[0].row_words <= geo[0].lanes,

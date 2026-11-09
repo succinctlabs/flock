@@ -1354,10 +1354,14 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 // #71), then FL, base and steady with the in-circuit nonzero check on every
 // product-GKR top (`emit_nonzero_top`). Chain circuit, both registries and
 // publics UNCHANGED. Two identical prints.
+// Re-blessed 2026-11-06: the Fast leaf's +1/level ladder (proof-IO v25)
+// moves the FL circuit (it replays the leaf's queries), and the lane pin
+// 28 → 31 moves all three outer circuits. Chain circuit, both registries
+// and publics UNCHANGED. Two identical prints.
 const PIN_CHAIN_CIRCUIT: &str = "b8f442da32b9961612ccaf9acb39cadcd4592e913b2b208a1b9740d01c10e9c9";
-const PIN_FL_CIRCUIT: &str = "a98b9ce451eb554f0d042d5a61150a1e753dd64e1fec4d4d63afa947b4432f4f";
-const PIN_BASE_CIRCUIT: &str = "fa8d664c3887ba956ba34abecd992ad0c82fdfb020dfd4508388f59b53456e6a";
-const PIN_STEADY_CIRCUIT: &str = "d32bc50c9ff5506fe27d3b50a76592a98fcba1083fb03774d6fec656f24ebc70";
+const PIN_FL_CIRCUIT: &str = "55db58ea52d8531d3c730e79fdede16a288ce44f79745b7ef9d347dba7155281";
+const PIN_BASE_CIRCUIT: &str = "eb7e5002ab1f8601d8d75a05288f9f02b4bb825309ccb0d2115f111d9ba906f5";
+const PIN_STEADY_CIRCUIT: &str = "d62eb551217b862c2aa7bd0ba437be79cf2268d484684efa3de43370a22ac4ba";
 const PIN_CHAIN_REGISTRY: &str = "3126c5ce825e8fc3942843c0548ba43964b1daa5751a834fcbbc1c3ab58e40fe";
 const PIN_OUTER_REGISTRY: &str = "c36112d619a1907c2132257f311ec7a90e81b932d20257b197d458b4267201c0";
 const PIN_PUBLICS_LEN: usize = 5684;

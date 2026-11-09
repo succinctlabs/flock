@@ -529,7 +529,7 @@ pub(super) fn emit_residual_region(
         let folded = od.z_len - yr_log;
         assert_eq!(folded, ris_full.len(), "L0 OOD spans every fold");
         let initial_k = levels[0].fold_fins.len();
-        let z_index = |j| level_zero_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
+        let z_index = |j| level_zero_ood_z_index(od.z_len, initial_k, geo[0].lane_major, j);
         let mut factors: Vec<([Wire; 2], [Wire; 2])> = (0..folded)
             .map(|j| {
                 (
@@ -706,7 +706,7 @@ pub(super) fn check_residual_publics(
             let folded = od.z_len - yr_log;
             assert_eq!(folded, pl_full, "L0 OOD spans every fold");
             let initial_k = levels[0].fold_chs.len();
-            let z_index = |j| level_zero_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
+            let z_index = |j| level_zero_ood_z_index(od.z_len, initial_k, geo[0].lane_major, j);
             let mut t = F256::from(chals[od.beta_ch]);
             for j in 0..folded {
                 t *= F256::ONE + F256::from(chals[od.z_ch + z_index(j)]) + ris_v[j];
