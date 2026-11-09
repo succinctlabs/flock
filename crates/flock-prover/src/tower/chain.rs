@@ -483,6 +483,41 @@ pub(super) fn walk_chain(h_start: [u32; 16], n_blocks: usize) -> ChainWalk {
     }
 }
 
+/// The leaf's union and commitment parameters for a chain shape.
+fn leaf_pcs_params(cfg: TowerConfig, cs: &ChainShape) -> (UnionInstance<'_>, PcsParams) {
+    let union = UnionInstance::new(&cs.shape.registry, cs.shape.counts.clone());
+    assert!(!union.has_element(), "a chain proof is boolean-only");
+    let batch = pcs_batch_for(&union, cfg.leaf_profile());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        // The chain leaf's WORKLOAD inner: the tower's security level,
+        // rate 1/2 (a 100-bit recursion carries a 100-bit leaf). The
+        // batch is keyed by the SAME profile as the params — the old
+        // Fast-keyed batch only worked because the Fast twins share
+        // initial_k at these m's.
+        profile: cfg.leaf_profile(),
+        log_batch_size: batch,
+        num_lanes: union.commit_lanes(batch),
+        merkle_hash: HashKind::Blake3,
+    };
+    (union, pcs_params)
+}
+
+/// Panic early, before any walk, when `cfg`'s leaf profile has no
+/// registered ladder at a `blocks_per_leaf` leaf (the affine profiles
+/// register only certified shapes, `ligerito::affine::affine_ladder_for`).
+pub(super) fn assert_leaf_supported(cfg: TowerConfig, blocks_per_leaf: usize) {
+    let (_, pcs) = leaf_pcs_params(cfg, &chain_shape_cached(blocks_per_leaf));
+    if let Err(e) = pcs.ligerito_prover_config() {
+        panic!(
+            "no {:?} leaf at blocks_per_leaf = {blocks_per_leaf} (m = {}): {e}",
+            cfg.leaf_profile(),
+            pcs.m
+        );
+    }
+}
+
 /// Prove a walked segment: witgen, prove, and the deferred verify (its
 /// claims are what the FL folds). `checks` gates only the discharges of
 /// those claims against the native tables.
@@ -520,21 +555,7 @@ pub(super) fn prove_chain_walk(cfg: TowerConfig, checks: SelfCheck, walk: ChainW
                 t0.elapsed().as_secs_f64() * 1e3,
             ),
         };
-        let union = UnionInstance::new(&cs.shape.registry, cs.shape.counts.clone());
-        assert!(!union.has_element(), "a chain proof is boolean-only");
-        let pcs_params = PcsParams {
-            m: union.dense_m(),
-            log_inv_rate: 1,
-            // The chain leaf's WORKLOAD inner: the tower's security level,
-            // rate 1/2 (a 100-bit recursion carries a 100-bit leaf). The
-            // batch is keyed by the SAME profile as the params — the old
-            // Fast-keyed batch only worked because the Fast twins share
-            // initial_k at these m's.
-            profile: cfg.leaf_profile(),
-            log_batch_size: pcs_batch_for(&union, cfg.leaf_profile()),
-            num_lanes: union.commit_lanes(pcs_batch_for(&union, cfg.leaf_profile())),
-            merkle_hash: HashKind::Blake3,
-        };
+        let (union, pcs_params) = leaf_pcs_params(cfg, &cs);
         let t1 = Instant::now();
         let wit = generate_witness_batch_major_partial(witness.rows::<Blake3Gate>(hash), nu);
         let witgen_ms = t1.elapsed().as_secs_f64() * 1e3;

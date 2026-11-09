@@ -54,6 +54,8 @@ pub(super) enum FoldMode {
 /// staying the linear form `lo + e`:
 pub(super) struct FoldChunkGate {
     pub(super) ty: Arc<ElementTableType>,
+    /// The row program, built once (`eval` runs it per row).
+    rows: Rows,
     width: usize,
 }
 
@@ -129,6 +131,7 @@ impl FoldChunkGate {
         let (rows, width) = chunk_rows();
         Self {
             ty: build(N_IN, &rows, width, "fold chunk gate"),
+            rows,
             width,
         }
     }
@@ -143,8 +146,7 @@ impl GateType for FoldChunkGate {
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
     fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
-        let (rows, _) = chunk_rows();
-        let z = run(&rows, self.width, N_IN, inputs);
+        let z = run(&self.rows, self.width, N_IN, inputs);
         outputs.push(z[self.width - 1]);
         z
     }
@@ -158,6 +160,8 @@ impl GateType for FoldChunkGate {
 /// r·(one + Ŵ)`, `pr' = pr·(one + p)`. A padded factor (`r = 0`) is one.
 pub(super) struct NovelPrefixGate {
     pub(super) ty: Arc<ElementTableType>,
+    /// The row program, built once (`eval` runs it per row).
+    rows: Rows,
     width: usize,
 }
 
@@ -182,6 +186,7 @@ impl NovelPrefixGate {
         let (rows, width) = prefix_rows();
         Self {
             ty: build(NP_IN, &rows, width, "novel prefix gate"),
+            rows,
             width,
         }
     }
@@ -196,8 +201,7 @@ impl GateType for NovelPrefixGate {
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
     fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
-        let (rows, _) = prefix_rows();
-        let z = run(&rows, self.width, NP_IN, inputs);
+        let z = run(&self.rows, self.width, NP_IN, inputs);
         outputs.push(z[self.width - 1]);
         z
     }

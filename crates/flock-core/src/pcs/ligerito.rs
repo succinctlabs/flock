@@ -124,14 +124,14 @@ pub enum LigeritoProfile {
     /// `Fast` with the affine F128 fold in the merged open's inner Ligerito
     /// opening (`ligerito::affine`, docs/affine-fold-f128.tex): the same
     /// commitment, transport and grinding as `Fast`, and an affine ladder
-    /// from [`affine::affine_ladder`] for the inner opening. EXPERIMENTAL:
-    /// registered shapes only ([`affine::affine_ladder_for`]), native prover and
-    /// verifier only (no recursion circuit or GPU twin yet).
+    /// from [`affine::affine_ladder`] for the inner opening. The recursion
+    /// tower's leaf profile (`TowerConfig::Chain128`), verified in-circuit
+    /// by the tower's affine walk. Registered shapes only
+    /// ([`affine::affine_ladder_for`]); no GPU twin yet.
     FastAffine,
     /// `Slim` with the affine F128 inner opening, as [`Self::FastAffine`] is
-    /// to `Fast`: the recursion tower's outer profile once its in-circuit
-    /// verifier speaks the affine opening. EXPERIMENTAL, registered shapes
-    /// only (the m = 29 envelope, (22,5)).
+    /// to `Fast`: the recursion tower's outer (node) profile. Registered
+    /// shapes only (the m = 29 envelope, (22,5)); no GPU twin yet.
     SlimAffine,
 }
 

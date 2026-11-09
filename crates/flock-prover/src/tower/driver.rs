@@ -29,7 +29,7 @@ use flock_core::{
 use crate::proof_io::TowerRootBundle;
 use crate::tower::{
     F128,
-    chain::{ChainProof, ChainWalk, prove_chain_walk, walk_chain},
+    chain::{ChainProof, ChainWalk, assert_leaf_supported, prove_chain_walk, walk_chain},
     config::{SelfCheck, TowerConfig},
     fl_node::{FlNode, build_first_level_node_k, chain_blake_r1cs, chain_jagged_params},
     gates_blake3::pack4,
@@ -207,6 +207,7 @@ impl Tower {
             "the tower pairs leaves into 2-ary FLs and roots at a node: \
              n_leaves must be even and >= 4, got {n_leaves}"
         );
+        assert_leaf_supported(cfg, blocks_per_leaf);
         // ---- LEAVES + FIRST LEVEL, interleaved: prove a segment pair
         // (each segment starts at the last h_end), fold it into its FL,
         // drop the pair ----

@@ -1483,7 +1483,7 @@ pub struct MergedOpenProof {
 pub enum MergedInnerOpen {
     /// The F256 split ladder on the mixed path: every shipped profile.
     Split(BatchOpeningProofLigerito),
-    /// The affine F128 ladder (`FastAffine`, lane-major commitments only):
+    /// The affine F128 ladder (`FastAffine`/`SlimAffine`, any lane count):
     /// one eq claim at `ρ` with weight one, its L0 OOD points sharing `ρ`'s
     /// column coordinates (sound because every coordinate of `ρ` is a
     /// merged-sumcheck challenge drawn after the commitment).
@@ -1491,13 +1491,14 @@ pub enum MergedInnerOpen {
 }
 
 impl MergedInnerOpen {
-    /// The split-ladder proof. Panics on an affine proof: the recursion
-    /// tower, its walkers and the GPU twin read split proofs only.
+    /// The split-ladder proof (the `Fast`/`Slim`/... profiles). Panics on an
+    /// affine proof, which has no split ladder: the recursion tower runs the
+    /// affine profiles and reads `Self::Affine` instead.
     pub fn split(&self) -> &BatchOpeningProofLigerito {
         match self {
             Self::Split(p) => p,
             Self::Affine(_) => {
-                panic!("affine inner open: no split-ladder proof (FastAffine is native-only)")
+                panic!("affine inner open: an affine profile has no split-ladder proof")
             }
         }
     }
@@ -1507,7 +1508,7 @@ impl MergedInnerOpen {
         match self {
             Self::Split(p) => p,
             Self::Affine(_) => {
-                panic!("affine inner open: no split-ladder proof (FastAffine is native-only)")
+                panic!("affine inner open: an affine profile has no split-ladder proof")
             }
         }
     }
@@ -2345,10 +2346,13 @@ pub fn open_batch_merged<Ch: Challenger>(
         },
         || {
             if commitment.params.profile.affine_fold() {
+                // Any lane count in [1, 2^k] works: a full-lane commit
+                // (`num_lanes = None`) is byte-identical to a lane-major one
+                // with all 2^k lanes.
                 let num_lanes = commitment.params.num_ntts();
                 assert!(
-                    num_lanes < 1usize << lig_config.initial_k,
-                    "the affine inner open needs an integer-lane (lane-major) commitment"
+                    num_lanes <= 1usize << lig_config.initial_k,
+                    "the affine inner open: more lanes than 2^initial_k"
                 );
                 MergedInnerOpen::Affine(prove_affine_l0(
                     lig_config,
@@ -2954,7 +2958,7 @@ fn verify_inner_affine<Ch: Challenger>(
     let log_n = commitment.params.m - LOG_PACKING;
     let k = lig_config.initial_k;
     let lanes = commitment.params.num_ntts();
-    if rho.len() != log_n || k >= log_n || lanes >= 1usize << k {
+    if rho.len() != log_n || k >= log_n || lanes > 1usize << k {
         return false;
     }
     let cols = log_n - k;

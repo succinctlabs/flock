@@ -377,6 +377,15 @@ pub(super) fn declare_envelope_slots(
     slot_cached(sb, cache, 601, AssistLayerGate::new);
     slot_cached(sb, cache, 8, || LeafEvalGate::new(8));
     slot_cached(sb, cache, 310 + env.pf_w, || PrefixGate::new(env.pf_w));
+    // The affine inner emits into the envelope's eq-prefix slot at
+    // `310 + affine_gates::PREFIX` (`AffineSlots::from_cache`), so the two
+    // widths must agree.
+    assert!(
+        env.affine.is_empty() || env.pf_w == crate::tower::affine_gates::PREFIX,
+        "envelope pf_w {} != the affine eq-prefix width {}",
+        env.pf_w,
+        crate::tower::affine_gates::PREFIX
+    );
     env.affine.declare(sb, cache);
     q
 }

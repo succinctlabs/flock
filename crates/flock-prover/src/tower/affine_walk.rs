@@ -122,8 +122,9 @@ pub(super) struct AffineEnvLayouts {
 }
 
 /// Envelope slot keys of the affine types (the keyed-cache scheme of
-/// [`super::envelope::slot_cached`]). The eq prefix rides the shared
-/// `PrefixGate(8)` at `310 + 8`.
+/// [`super::envelope::slot_cached`]). The eq prefix rides the envelope's
+/// shared `PrefixGate(PREFIX)` at `310 + PREFIX`; the envelope asserts its
+/// `pf_w` equals `PREFIX`.
 pub(super) const KEY_FOLD: usize = 900;
 pub(super) const KEY_LADDER: usize = 901;
 pub(super) const KEY_CHUNK: usize = 902;

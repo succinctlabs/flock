@@ -295,15 +295,19 @@ pub trait LincheckCircuit: Sync {
     /// a folded prior carries them at different points. The matrix fold
     /// needs one pair per claim over the SAME matrices, so an
     /// implementation that walks the nonzeros once for all of them is free
-    /// to override. The default splits per weight and keeps the halves it
-    /// needs.
+    /// to override. The default splits a shared weight once; for a folded
+    /// prior it takes `A` from a split at `wa` and `B` from one α = 0 fold
+    /// at `wb` (`fold(0) = B`).
     fn fold_split_many(&self, ws: &[(&[F128], &[F128])]) -> Vec<(Vec<F128>, Vec<F128>)> {
         ws.iter()
             .map(|&(wa, wb)| {
                 if std::ptr::eq(wa, wb) || wa == wb {
                     self.fold_split(wa)
                 } else {
-                    (self.fold_split(wa).0, self.fold_split(wb).1)
+                    (
+                        self.fold_split(wa).0,
+                        self.fold_alpha_batched(F128::ZERO, wb),
+                    )
                 }
             })
             .collect()
@@ -350,6 +354,21 @@ impl<'a> SparseMatrixCircuit<'a> {
     }
 }
 
+/// `w^T · m`: the column marginal of a sparse binary matrix.
+fn sparse_scatter(m: &SparseBinaryMatrix, w: &[F128]) -> Vec<F128> {
+    let mut out = vec![F128::ZERO; m.num_cols];
+    for (r, cols) in m.rows.iter().enumerate() {
+        let wr = w[r];
+        if wr == F128::ZERO {
+            continue;
+        }
+        for &c in cols {
+            out[c] += wr;
+        }
+    }
+    out
+}
+
 impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
     fn n_cols(&self) -> usize {
         self.a_0.num_cols
@@ -360,20 +379,16 @@ impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
     /// One scatter pass per matrix rather than the default's two folds over
     /// both — half the nonzero touches.
     fn fold_split(&self, eq_inner: &[F128]) -> (Vec<F128>, Vec<F128>) {
-        let scatter = |m: &SparseBinaryMatrix| {
-            let mut out = vec![F128::ZERO; m.num_cols];
-            for (r, cols) in m.rows.iter().enumerate() {
-                let w = eq_inner[r];
-                if w == F128::ZERO {
-                    continue;
-                }
-                for &c in cols {
-                    out[c] += w;
-                }
-            }
-            out
-        };
-        (scatter(self.a_0), scatter(self.b_0))
+        (
+            sparse_scatter(self.a_0, eq_inner),
+            sparse_scatter(self.b_0, eq_inner),
+        )
+    }
+    /// One scatter per matrix per claim, at that matrix's own weight.
+    fn fold_split_many(&self, ws: &[(&[F128], &[F128])]) -> Vec<(Vec<F128>, Vec<F128>)> {
+        ws.iter()
+            .map(|&(wa, wb)| (sparse_scatter(self.a_0, wa), sparse_scatter(self.b_0, wb)))
+            .collect()
     }
     fn const_pin_col(&self) -> Option<usize> {
         self.const_pin
@@ -2489,13 +2504,24 @@ mod tests {
         SparseBinaryMatrix::new(k, k, rows)
     }
 
-    /// The CSC kernel's one-walk multi-claim split equals the generic
-    /// column marginals, for shared and per-matrix weights, every group
+    /// The CSC kernel's one-walk multi-claim split, the sparse override and
+    /// the trait default all equal the generic column marginals, for shared and per-matrix weights, every group
     /// size and a remainder group, on both the serial (small) and the
     /// parallel (large) column path.
+    /// A circuit with only the required methods, so the trait defaults run.
+    struct DefaultsOnly<'a>(&'a super::SparseMatrixCircuit<'a>);
+    impl super::LincheckCircuit for DefaultsOnly<'_> {
+        fn n_cols(&self) -> usize {
+            self.0.n_cols()
+        }
+        fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+            self.0.fold_alpha_batched(alpha, eq_inner)
+        }
+    }
+
     #[test]
     fn csc_fold_split_many_matches_fold_split() {
-        use super::{CscCircuit, LincheckCircuit};
+        use super::{CscCircuit, LincheckCircuit, SparseMatrixCircuit};
         use crate::matrix_fold::col_marginal;
         let mut rng = Rng::new(0x5_7117);
         for k in [64usize, 1 << 13] {
@@ -2520,11 +2546,18 @@ mod tests {
                     .zip(&wb)
                     .map(|(a, b)| (a.as_slice(), b.as_slice()))
                     .collect();
-                let many = csc.fold_split_many(&ws);
-                assert_eq!(many.len(), n);
-                for (i, got) in many.iter().enumerate() {
-                    let want = (col_marginal(&a, &wa[i], k), col_marginal(&b, &wb[i], k));
-                    assert_eq!(*got, want, "k {k}, {n} claims, claim {i}");
+                let sparse = SparseMatrixCircuit::new(&a, &b);
+                let default = DefaultsOnly(&sparse);
+                for (name, many) in [
+                    ("csc", csc.fold_split_many(&ws)),
+                    ("sparse", sparse.fold_split_many(&ws)),
+                    ("default", default.fold_split_many(&ws)),
+                ] {
+                    assert_eq!(many.len(), n);
+                    for (i, got) in many.iter().enumerate() {
+                        let want = (col_marginal(&a, &wa[i], k), col_marginal(&b, &wb[i], k));
+                        assert_eq!(*got, want, "{name}: k {k}, {n} claims, claim {i}");
+                    }
                 }
             }
         }

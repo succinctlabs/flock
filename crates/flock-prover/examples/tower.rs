@@ -6,10 +6,13 @@
 //! cargo run --release --example tower -- [n_leaves] [blocks_per_leaf] [chain128] [verify] [checked]
 //! ```
 //!
-//! Defaults: 8 leaves x 256 compressions under the 128-bit tower — the
+//! Defaults: 8 leaves x 1024 compressions under the 128-bit tower — the
 //! smallest run that reaches the STEADY spine shape (a base plus two
-//! spine folds) and boards the passenger. The production leaf is 2^19
-//! compressions (`blocks_per_leaf = 524288`, m = 33); expect minutes there.
+//! spine folds) and boards the passenger, at the smallest leaf with a
+//! registered affine ladder. Leaves have registered ladders at 2^10, 2^18
+//! and 2^19 compressions; other sizes are refused before any work. The
+//! production leaf is 2^19 compressions (`blocks_per_leaf = 524288`,
+//! m = 33); expect minutes there.
 //!
 //! With `verify`, the run also generates a verification key (a one-time
 //! six-leaf reference tower) and checks the root STANDALONE through
@@ -33,7 +36,7 @@ fn main() {
     let n_leaves: usize = args
         .next()
         .map_or(8, |v| v.parse().expect("n_leaves: an even integer >= 4"));
-    let blocks_per_leaf: usize = args.next().map_or(256, |v| {
+    let blocks_per_leaf: usize = args.next().map_or(1024, |v| {
         v.parse().expect("blocks_per_leaf: a positive integer")
     });
     let cfg = match args.next().as_deref() {

@@ -1,8 +1,11 @@
 //! Affine F128 folds for the Ligerito ladder (docs/affine-fold-f128.tex).
 //!
-//! PROTOTYPE: the plain materialized-basis path only, with simple kernels.
-//! It replaces the F256 fold challenges and the coordinate split of
-//! [`super::extension`] with one F128 affine fold per round:
+//! The inner opening of the `FastAffine`/`SlimAffine` profiles, and so of
+//! every recursion-tower proof. L0 comes in two layouts ([`AffineL0`]): a
+//! dense table with a materialized basis, or a lane-major commitment whose
+//! first rounds fold the lanes. It replaces the F256 fold challenges and the
+//! coordinate split of [`super::extension`] with one F128 affine fold per
+//! round:
 //!
 //! `f' = f_0 + α f_1 + β X f_1`, `W' = W_0 + r (W_0 + W_1)`.
 //!
@@ -1652,7 +1655,7 @@ where
     Ch: Challenger,
     F: Fn(&[F128], usize) -> Vec<F128>,
 {
-    verify_affine_l0_traced(
+    verify_affine_l0_core(
         config,
         proof,
         log_n,
@@ -1661,6 +1664,7 @@ where
         lanes,
         eval_b_residual,
         challenger,
+        false,
     )
     .is_some()
 }
@@ -1685,9 +1689,41 @@ pub fn verify_affine_l0_traced<Ch, F>(
     log_n: usize,
     target: F128,
     expected_initial_cap: &[Hash],
+    lanes: (usize, Option<&[F128]>),
+    eval_b_residual: F,
+    challenger: &mut Ch,
+) -> Option<AffineVerifyTrace>
+where
+    Ch: Challenger,
+    F: Fn(&[F128], usize) -> Vec<F128>,
+{
+    verify_affine_l0_core(
+        config,
+        proof,
+        log_n,
+        target,
+        expected_initial_cap,
+        lanes,
+        eval_b_residual,
+        challenger,
+        true,
+    )
+}
+
+/// The affine verifier. `log_queries` keeps each level's query positions
+/// in the trace (the traced entry point); the plain verifier skips the
+/// copies and returns a trace with no queries.
+#[allow(clippy::too_many_arguments)]
+fn verify_affine_l0_core<Ch, F>(
+    config: &VerifierConfig,
+    proof: &AffineProof,
+    log_n: usize,
+    target: F128,
+    expected_initial_cap: &[Hash],
     (l0_num_lanes, lane_cols): (usize, Option<&[F128]>),
     eval_b_residual: F,
     challenger: &mut Ch,
+    log_queries: bool,
 ) -> Option<AffineVerifyTrace>
 where
     Ch: Challenger,
@@ -1851,7 +1887,9 @@ where
                 && li == proof.overflows.len()
                 && li == proof.recursive_caps.len()
                 && li == proof.consistency_batch_grinding_nonces.len();
-            query_log.push(queries);
+            if log_queries {
+                query_log.push(queries);
+            }
             return accepted.then_some(AffineVerifyTrace {
                 final_claim: claim,
                 enforced: enforced_log,
@@ -1909,7 +1947,9 @@ where
         let beta = challenger.verify_pow_and_sample_f128(nonce, claim_bits(li + 1))?;
         claim += beta * enforced;
         enforced_log.push(enforced);
-        query_log.push(queries.clone());
+        if log_queries {
+            query_log.push(queries.clone());
+        }
         contexts.push((
             c,
             Context::Consistency {
@@ -2189,10 +2229,12 @@ mod tests {
                 ligerito::LigeritoProfile,
             },
         };
-        let (log_n, initial_k, live) = (14usize, 3usize, 5usize);
+        // live = 2^initial_k is the full-lane commitment, which is
+        // byte-identical to the power-of-two (`num_lanes = None`) commit.
+        let (log_n, initial_k) = (14usize, 3usize);
         let c0 = log_n - initial_k;
         let d = 1usize << c0;
-        for ood in [0, 1, 2] {
+        for (live, ood) in [(5usize, 0usize), (5, 1), (5, 2), (8, 0), (8, 1)] {
             let levels = 4;
             let split = ProverConfig {
                 log_inv_rates: vec![1, 2, 2, 3],
@@ -2212,7 +2254,7 @@ mod tests {
                 stratified: vec![],
             };
             let (prover, verifier) = affine_configs(&split, log_n, &[2, 3, 3, 3]);
-            let mut rng = RandomChallenger::new(0xAFF1_0004 + ood as u64);
+            let mut rng = RandomChallenger::new(0xAFF1_0004 + (ood + 4 * live) as u64);
             let mut q = random_vec(&mut rng, live * d);
             q.resize(1 << log_n, F128::ZERO);
             let point = random_vec(&mut rng, log_n);
