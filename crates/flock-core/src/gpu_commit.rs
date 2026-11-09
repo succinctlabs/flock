@@ -6,13 +6,17 @@
 //! their dispatch geometry are the challenge's. Two things differ:
 //! - **Any lane count.** The challenge's kernels hard-code 64 interleaved
 //!   lanes and 1 KiB leaves. The union commit trims empty lanes (BLAKE3 at
-//!   2^18 commits 61), so every kernel here takes the lane count `t ≤ 64`:
+//!   2^18 commits 46), so every kernel here takes the lane count `t ≤ 64`:
 //!   element `(pos, lane)` sits at `pos·t + lane`, and a leaf is `16·t` bytes,
 //!   one BLAKE3 chunk whose last block may be short.
 //! - **Buffers.** The CPU writes the message straight into a persistent
 //!   shared Metal buffer, and the GPU leaves the codeword and the tree in two
 //!   more. The prover reads them in place during the open (unified memory),
-//!   through [`GpuCodeword`] and [`GpuMerkleTree`]; no 1 GiB copy-out.
+//!   through [`GpuCodeword`] and [`GpuMerkleTree`]; no 1 GiB copy-out. The
+//!   buffers of the last [`CACHED_SHAPES`] shapes stay allocated between
+//!   commits (about 1.2 GB per shape at BLAKE3 2^18), so a workload that
+//!   alternates two shapes, such as tower leaf and node commits, does not
+//!   reallocate on every switch. [`release`] frees them.
 //!
 //! The GPU graph (`log_d` = log2 positions, rate 1/2):
 //! 1. a from-message pass: layers 0..4, reading the message once and
@@ -50,6 +54,16 @@
 //! turns the GPU off for the rest of the process and the CPU result is used.
 //! A GPU error falls back to the CPU from the message buffer, which the GPU
 //! never writes.
+//!
+//! **The first commit is slow.** The first GPU commit in a process pays
+//! three one-time costs: compiling the kernels from MSL source
+//! (`newLibraryWithSource:`), allocating and first touching the shape's
+//! buffers, and the CPU check commit above. On an M4 Max, the first BLAKE3
+//! 2^18 commit took ~265 ms, against ~46 ms warm and ~64 ms for the CPU
+//! commit. A process that makes one proof is therefore slower with Metal on.
+//! A long-lived prover calls [`warm_up`] at startup with the shapes it will
+//! commit, which pays all three there. A new shape later (or one evicted
+//! from the cache) pays the allocation again.
 
 use crate::field::F128;
 use crate::merkle::Hash;
@@ -62,6 +76,13 @@ pub const ENV_METAL: &str = "FLOCK_METAL";
 /// Smallest codeword (log2 of F128 words) the GPU takes. Below it the
 /// dispatch and synchronization overheads are not worth paying.
 pub const MIN_CODEWORD_LOG: usize = 20;
+
+/// Shapes `(positions, lanes)` whose buffers stay allocated between commits.
+/// Two cover a workload that alternates shapes (tower leaf and node commits)
+/// without reallocating on every switch; a third shape evicts the least
+/// recently used one. The cost is memory: up to two shapes' message, codeword
+/// and tree buffers stay resident until [`release`].
+pub const CACHED_SHAPES: usize = 2;
 
 /// Whether this build has the Metal commit and the runtime switch allows it.
 pub fn metal_enabled() -> bool {
@@ -151,6 +172,50 @@ pub(crate) fn pass5_mixed_ok(log_d: usize, l: usize, f: usize) -> bool {
         && max_twiddle_bits(log_d, l + 3) <= 20
 }
 
+/// Whether the GPU takes commits with `params`: a covered shape with at
+/// least [`MIN_CODEWORD_LOG`] codeword words.
+fn gpu_eligible(params: &PcsParams) -> bool {
+    gpu_shape(params) && params.n_positions() * params.num_ntts() >= 1usize << MIN_CODEWORD_LOG
+}
+
+/// Pay the GPU commit's first-use costs ahead of the first proof: load
+/// Metal and compile the kernels, then, for each shape in `shapes` the GPU
+/// takes, allocate its buffers and run its checked first commit (GPU and
+/// CPU, compared byte for byte) on a synthetic message. Later commits of
+/// those shapes run warm.
+///
+/// A long-lived prover calls this once at startup with the parameters it
+/// will commit under; `&[]` only compiles the kernels. At most
+/// [`CACHED_SHAPES`] shapes stay cached, so later shapes in `shapes` evict
+/// earlier ones beyond that.
+///
+/// Returns `true` when the GPU is ready and every eligible shape is
+/// checked. Returns `false` when:
+/// - Metal is off or unavailable;
+/// - the GPU disagreed with the CPU (Metal is then off for the process);
+/// - an earlier GPU commit's prover data still holds the buffers.
+///
+/// Commits stay correct either way: they fall back to the CPU.
+pub fn warm_up(shapes: &[PcsParams]) -> bool {
+    if !metal_enabled() {
+        return false;
+    }
+    let shapes: Vec<(usize, usize)> = shapes
+        .iter()
+        .filter(|p| gpu_eligible(p))
+        .map(|p| (p.k_code(), p.num_ntts()))
+        .collect();
+    imp::warm_up(&shapes)
+}
+
+/// Free the cached GPU buffers that no prover data holds. Without this
+/// call they live as long as the process (see [`CACHED_SHAPES`]). The next
+/// GPU commit of a freed shape allocates its buffers again; the kernels and
+/// the shapes' checks are kept.
+pub fn release() {
+    imp::release();
+}
+
 /// The outcome of a commit the GPU took.
 #[cfg_attr(
     not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
@@ -178,11 +243,7 @@ pub(crate) fn try_commit(
     fill: impl Fn(&mut [F128], core::ops::Range<usize>),
     cpu: impl FnOnce(&[F128]) -> (Vec<F128>, Vec<Hash>),
 ) -> Option<GpuCommit> {
-    if !metal_enabled() || !gpu_shape(params) {
-        return None;
-    }
-    let words = params.n_positions() * params.num_ntts();
-    if words < 1usize << MIN_CODEWORD_LOG {
+    if !metal_enabled() || !gpu_eligible(params) {
         return None;
     }
     imp::try_commit(params.k_code(), params.num_ntts(), fill, cpu)
@@ -227,11 +288,19 @@ mod imp {
     ) -> Option<GpuCommit> {
         None
     }
+
+    pub(super) fn warm_up(_shapes: &[(usize, usize)]) -> bool {
+        false
+    }
+
+    pub(super) fn release() {}
 }
 
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 mod imp {
-    use super::{F128, GpuCommit, Hash, flat_twiddle_table, pass5_mixed_ok, plan_passes};
+    use super::{
+        CACHED_SHAPES, F128, GpuCommit, Hash, flat_twiddle_table, pass5_mixed_ok, plan_passes,
+    };
     use std::ffi::c_void;
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -250,25 +319,83 @@ mod imp {
 
     pub(crate) const NIL: Id = std::ptr::null_mut();
 
-    /// Function pointers resolved from libobjc and Metal at init.
+    /// Function pointers resolved from libobjc and Metal at init, and the
+    /// selectors the module sends.
     pub(crate) struct Api {
         msg_send: *const c_void,
         get_class: unsafe extern "C" fn(*const i8) -> Id,
-        sel_register: unsafe extern "C" fn(*const i8) -> Sel,
         pool_push: unsafe extern "C" fn() -> *mut c_void,
         pool_pop: unsafe extern "C" fn(*mut c_void),
         create_system_default_device: unsafe extern "C" fn() -> Id,
         copy_all_devices: unsafe extern "C" fn() -> Id,
+        sels: Sels,
     }
-    // SAFETY: all fields are process-global immutable function pointers.
+    // SAFETY: all fields are process-global immutable function pointers and
+    // selectors (registered selectors are never freed).
     unsafe impl Send for Api {}
     unsafe impl Sync for Api {}
 
-    /// `objc_msgSend` cast to a concrete signature per call site.
+    /// Declares [`Sels`], one field per selector, registered once when the
+    /// API loads rather than on every message.
+    macro_rules! selectors {
+        ($($field:ident = $name:literal,)*) => {
+            struct Sels {
+                $($field: Sel,)*
+            }
+
+            impl Sels {
+                unsafe fn register(
+                    register: unsafe extern "C" fn(*const i8) -> Sel,
+                ) -> Result<Sels, String> {
+                    let one = |name: &core::ffi::CStr| -> Result<Sel, String> {
+                        let sel = unsafe { register(name.as_ptr().cast()) };
+                        if sel.is_null() {
+                            Err(format!("sel_registerName {name:?} failed"))
+                        } else {
+                            Ok(sel)
+                        }
+                    };
+                    Ok(Sels {
+                        $($field: one($name)?,)*
+                    })
+                }
+            }
+        };
+    }
+
+    selectors! {
+        string_with_utf8_string = c"stringWithUTF8String:",
+        localized_description = c"localizedDescription",
+        utf8_string = c"UTF8String",
+        first_object = c"firstObject",
+        new_command_queue = c"newCommandQueue",
+        new_library_with_source = c"newLibraryWithSource:options:error:",
+        new_function_with_name = c"newFunctionWithName:",
+        new_compute_pipeline_state = c"newComputePipelineStateWithFunction:error:",
+        release = c"release",
+        new_buffer_with_length = c"newBufferWithLength:options:",
+        contents = c"contents",
+        command_buffer = c"commandBuffer",
+        compute_command_encoder = c"computeCommandEncoder",
+        set_compute_pipeline_state = c"setComputePipelineState:",
+        set_buffer = c"setBuffer:offset:atIndex:",
+        set_bytes = c"setBytes:length:atIndex:",
+        dispatch_threadgroups = c"dispatchThreadgroups:threadsPerThreadgroup:",
+        end_encoding = c"endEncoding",
+        commit = c"commit",
+        wait_until_completed = c"waitUntilCompleted",
+        status = c"status",
+        error = c"error",
+        gpu_start_time = c"GPUStartTime",
+        gpu_end_time = c"GPUEndTime",
+    }
+
+    /// `objc_msgSend` cast to a concrete signature per call site; `$sel`
+    /// names a field of [`Sels`].
     macro_rules! send {
-        ($api:expr, $ty:ty, $obj:expr, $sel:expr $(, $a:expr)* $(,)?) => {{
+        ($api:expr, $ty:ty, $obj:expr, $sel:ident $(, $a:expr)* $(,)?) => {{
             let f: $ty = core::mem::transmute($api.msg_send);
-            f($obj, ($api.sel_register)($sel.as_ptr()) $(, $a)*)
+            f($obj, $api.sels.$sel $(, $a)*)
         }};
     }
 
@@ -325,10 +452,6 @@ mod imp {
                         objc,
                         c"objc_getClass",
                     )?),
-                    sel_register: core::mem::transmute::<*mut c_void, SelFn>(sym(
-                        objc,
-                        c"sel_registerName",
-                    )?),
                     pool_push: core::mem::transmute::<*mut c_void, PushFn>(sym(
                         objc,
                         c"objc_autoreleasePoolPush",
@@ -344,6 +467,10 @@ mod imp {
                         metal,
                         c"MTLCopyAllDevices",
                     )?),
+                    sels: Sels::register(core::mem::transmute::<*mut c_void, SelFn>(sym(
+                        objc,
+                        c"sel_registerName",
+                    )?))?,
                 })
             }
         }
@@ -362,7 +489,7 @@ mod imp {
                     self,
                     unsafe extern "C" fn(Id, Sel, *const u8) -> Id,
                     cls,
-                    c"stringWithUTF8String:",
+                    string_with_utf8_string,
                     buf.as_ptr()
                 );
                 if ns.is_null() {
@@ -382,7 +509,7 @@ mod imp {
                     self,
                     unsafe extern "C" fn(Id, Sel) -> Id,
                     err,
-                    c"localizedDescription"
+                    localized_description
                 );
                 if desc.is_null() {
                     return "unknown error (nil description)".into();
@@ -391,7 +518,7 @@ mod imp {
                     self,
                     unsafe extern "C" fn(Id, Sel) -> *const u8,
                     desc,
-                    c"UTF8String"
+                    utf8_string
                 );
                 if cstr.is_null() {
                     return "unknown error (nil UTF8String)".into();
@@ -1247,6 +1374,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
     static GPU: OnceLock<Result<Gpu, String>> = OnceLock::new();
 
+    /// The init error of a machine without a Metal device (the only one the
+    /// tests treat as a skip rather than a failure).
+    const NO_DEVICE: &str = "no Metal device";
+
     fn gpu() -> Result<&'static Gpu, String> {
         GPU.get_or_init(init_gpu).as_ref().map_err(|e| e.clone())
     }
@@ -1263,22 +1394,17 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     // built-in GPU.
                     let all = (api.copy_all_devices)();
                     if !all.is_null() {
-                        device = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel) -> Id,
-                            all,
-                            c"firstObject"
-                        );
+                        device = send!(api, unsafe extern "C" fn(Id, Sel) -> Id, all, first_object);
                     }
                 }
                 if device.is_null() {
-                    return Err("no Metal device".into());
+                    return Err(NO_DEVICE.into());
                 }
                 let queue: Id = send!(
                     api,
                     unsafe extern "C" fn(Id, Sel) -> Id,
                     device,
-                    c"newCommandQueue"
+                    new_command_queue
                 );
                 if queue.is_null() {
                     return Err("newCommandQueue failed".into());
@@ -1289,7 +1415,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     api,
                     unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
                     device,
-                    c"newLibraryWithSource:options:error:",
+                    new_library_with_source,
                     src,
                     NIL,
                     &mut err
@@ -1303,7 +1429,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         api,
                         unsafe extern "C" fn(Id, Sel, Id) -> Id,
                         library,
-                        c"newFunctionWithName:",
+                        new_function_with_name,
                         ns
                     );
                     if f.is_null() {
@@ -1314,11 +1440,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         api,
                         unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
                         device,
-                        c"newComputePipelineStateWithFunction:error:",
+                        new_compute_pipeline_state,
                         f,
                         &mut err
                     );
-                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, release);
                     if p.is_null() {
                         return Err(format!("pipeline {name}: {}", api.error_string(err)));
                     }
@@ -1328,12 +1454,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 for (slot, name) in psos.iter_mut().zip(KERNELS) {
                     *slot = pso(name)?;
                 }
-                send!(
-                    api,
-                    unsafe extern "C" fn(Id, Sel) -> Id,
-                    library,
-                    c"release"
-                );
+                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, release);
                 Ok((device, queue, psos))
             })();
             (api.pool_pop)(pool);
@@ -1390,7 +1511,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel, u64, u64) -> Id,
                     self.device,
-                    c"newBufferWithLength:options:",
+                    new_buffer_with_length,
                     len as u64,
                     0u64 // MTLResourceStorageModeShared
                 );
@@ -1408,7 +1529,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel) -> *mut u8,
                     buf,
-                    c"contents"
+                    contents
                 )
             }
         }
@@ -1416,12 +1537,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         unsafe fn release(&self, obj: Id) {
             if !obj.is_null() {
                 unsafe {
-                    send!(
-                        self.api,
-                        unsafe extern "C" fn(Id, Sel) -> Id,
-                        obj,
-                        c"release"
-                    );
+                    send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, obj, release);
                 }
             }
         }
@@ -1432,7 +1548,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel) -> Id,
                     self.queue,
-                    c"commandBuffer"
+                    command_buffer
                 );
                 if cb.is_null() {
                     Err("commandBuffer failed".into())
@@ -1448,7 +1564,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel) -> Id,
                     cb,
-                    c"computeCommandEncoder"
+                    compute_command_encoder
                 );
                 if e.is_null() {
                     Err("computeCommandEncoder failed".into())
@@ -1464,7 +1580,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel, Id),
                     enc,
-                    c"setComputePipelineState:",
+                    set_compute_pipeline_state,
                     pso
                 );
             }
@@ -1476,7 +1592,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel, Id, u64, u64),
                     enc,
-                    c"setBuffer:offset:atIndex:",
+                    set_buffer,
                     buf,
                     offset as u64,
                     index as u64
@@ -1490,7 +1606,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel, *const c_void, u64, u64),
                     enc,
-                    c"setBytes:length:atIndex:",
+                    set_bytes,
                     (value as *const T).cast(),
                     core::mem::size_of::<T>() as u64,
                     index as u64
@@ -1504,7 +1620,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel, MtlSize, MtlSize),
                     enc,
-                    c"dispatchThreadgroups:threadsPerThreadgroup:",
+                    dispatch_threadgroups,
                     MtlSize {
                         width: groups,
                         height: 1,
@@ -1521,13 +1637,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
         unsafe fn end_encoding(&self, enc: Id) {
             unsafe {
-                send!(self.api, unsafe extern "C" fn(Id, Sel), enc, c"endEncoding");
+                send!(self.api, unsafe extern "C" fn(Id, Sel), enc, end_encoding);
             }
         }
 
         unsafe fn commit_async(&self, cb: Id) {
             unsafe {
-                send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
+                send!(self.api, unsafe extern "C" fn(Id, Sel), cb, commit);
             }
         }
 
@@ -1547,19 +1663,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     self.api,
                     unsafe extern "C" fn(Id, Sel),
                     cb,
-                    c"waitUntilCompleted"
+                    wait_until_completed
                 );
-                let status: u64 = send!(
-                    self.api,
-                    unsafe extern "C" fn(Id, Sel) -> u64,
-                    cb,
-                    c"status"
-                );
+                let status: u64 = send!(self.api, unsafe extern "C" fn(Id, Sel) -> u64, cb, status);
                 if status == 4 {
                     Ok(())
                 } else {
-                    let err: Id =
-                        send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                    let err: Id = send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, error);
                     Err(format!(
                         "command buffer status {status}: {}",
                         self.api.error_string(err)
@@ -1830,8 +1940,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     }
 
     struct State {
-        bufs: Option<Buffers>,
-        /// Prover data from the last GPU commit still reads the buffers.
+        /// The cached buffers, most recently used first, at most
+        /// [`CACHED_SHAPES`] of them.
+        bufs: Vec<Buffers>,
+        /// Prover data from the last GPU commit still reads `bufs[0]`. While
+        /// it does, no commit takes the GPU and nothing reorders or frees
+        /// the cache.
         in_use: bool,
         /// Shapes `(log_d, lanes)` whose GPU commit matched the CPU's.
         verified: Vec<(usize, usize)>,
@@ -1841,13 +1955,51 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         tunes: Vec<((usize, usize), Tune)>,
     }
 
-    static STATE: Mutex<State> = Mutex::new(State {
-        bufs: None,
-        in_use: false,
-        verified: Vec::new(),
-        disabled: false,
-        tunes: Vec::new(),
-    });
+    static STATE: Mutex<State> = Mutex::new(State::new());
+
+    impl State {
+        const fn new() -> State {
+            State {
+                bufs: Vec::new(),
+                in_use: false,
+                verified: Vec::new(),
+                disabled: false,
+                tunes: Vec::new(),
+            }
+        }
+
+        /// The buffers for `(log_d, lanes)`, moved to the front of the
+        /// cache: the cached ones, or new ones after evicting the least
+        /// recently used shape if the cache is full (freed first, so its
+        /// memory can be reused). Only without a lease.
+        fn take(&mut self, gpu: &Gpu, log_d: usize, lanes: usize) -> Result<Buffers, String> {
+            assert!(!self.in_use, "the cache changes only without a lease");
+            match self
+                .bufs
+                .iter()
+                .position(|b| (b.log_d, b.lanes) == (log_d, lanes))
+            {
+                Some(i) => self.bufs[..=i].rotate_right(1),
+                None => {
+                    while self.bufs.len() >= CACHED_SHAPES {
+                        let mut old = self.bufs.pop().expect("a full cache");
+                        unsafe { old.release(gpu) };
+                    }
+                    let new = unsafe { Buffers::new(gpu, log_d, lanes) }?;
+                    self.bufs.insert(0, new);
+                }
+            }
+            Ok(self.bufs[0])
+        }
+
+        /// Free every cached buffer except the leased `bufs[0]`, if any.
+        fn release_unleased(&mut self, gpu: &Gpu) {
+            let keep = usize::from(self.in_use);
+            for mut b in self.bufs.drain(keep..) {
+                unsafe { b.release(gpu) };
+            }
+        }
+    }
 
     /// One shape's hybrid split and the per-unit costs it is balanced on: ms
     /// per sixteenth of the first pass's tiles (`g1` GPU, `c1` CPU including
@@ -2008,13 +2160,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 gpu.api,
                 unsafe extern "C" fn(Id, Sel) -> f64,
                 cb,
-                c"GPUStartTime"
+                gpu_start_time
             );
             let t1: f64 = send!(
                 gpu.api,
                 unsafe extern "C" fn(Id, Sel) -> f64,
                 cb,
-                c"GPUEndTime"
+                gpu_end_time
             );
             (t1 - t0) * 1e3
         }
@@ -2265,6 +2417,105 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
     }
 
+    /// The GPU, or `None` (warning once) when Metal cannot load or compile.
+    fn available_gpu() -> Option<&'static Gpu> {
+        match gpu() {
+            Ok(g) => Some(g),
+            Err(e) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| eprintln!("[metal] GPU commit unavailable: {e}"));
+                None
+            }
+        }
+    }
+
+    /// See [`super::warm_up`]; `shapes` are `(log_d, lanes)` the GPU takes.
+    pub(super) fn warm_up(shapes: &[(usize, usize)]) -> bool {
+        let Some(gpu) = available_gpu() else {
+            return false;
+        };
+        // Every shape, even after a failure.
+        shapes.iter().fold(true, |ok, &(log_d, lanes)| {
+            warm_shape(gpu, log_d, lanes) && ok
+        })
+    }
+
+    /// Warm one shape. A checked shape only needs its buffers in the cache;
+    /// otherwise a commit of a synthetic message allocates them and runs
+    /// the shape's check against [`cpu_reference`].
+    fn warm_shape(gpu: &Gpu, log_d: usize, lanes: usize) -> bool {
+        {
+            let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if state.disabled || state.in_use {
+                return false;
+            }
+            if state.verified.contains(&(log_d, lanes)) {
+                return state.take(gpu, log_d, lanes).is_ok();
+            }
+        }
+        let done = try_commit(
+            log_d,
+            lanes,
+            |msg, pos| synthetic_fill(msg, lanes, pos),
+            |msg| cpu_reference(msg, log_d, lanes),
+        );
+        matches!(done, Some(GpuCommit::Gpu(..)))
+    }
+
+    /// See [`super::release`].
+    pub(super) fn release() {
+        // Nothing is cached before Metal loads; do not load it here.
+        if let Some(Ok(gpu)) = GPU.get() {
+            STATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .release_unleased(gpu);
+        }
+    }
+
+    /// Word `i` of the synthetic message [`warm_up`] commits: SplitMix64
+    /// output, a function of `i` alone, so any fill order writes the same
+    /// message.
+    fn synthetic_word(i: usize) -> F128 {
+        let mix = |x: u64| {
+            let mut z = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        F128::new(mix(2 * i as u64 + 1), mix(2 * i as u64 + 2))
+    }
+
+    /// Write message positions `pos` (`lanes` words each) of the synthetic
+    /// message.
+    fn synthetic_fill(msg: &mut [F128], lanes: usize, pos: core::ops::Range<usize>) {
+        use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+        const CHUNK: usize = 1 << 14;
+        let start = pos.start * lanes;
+        msg[start..pos.end * lanes]
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(c, chunk)| {
+                for (j, w) in chunk.iter_mut().enumerate() {
+                    *w = synthetic_word(start + c * CHUNK + j);
+                }
+            });
+    }
+
+    /// The CPU commit of a message: replicate it (rate 1/2), run the NTT
+    /// from layer 1, and build the BLAKE3 tree. [`warm_up`]'s check
+    /// reference and the tests'.
+    fn cpu_reference(msg: &[F128], log_d: usize, lanes: usize) -> (Vec<F128>, Vec<Hash>) {
+        let mut cw = vec![F128::ZERO; 2 * msg.len()];
+        cw[..msg.len()].copy_from_slice(msg);
+        cw[msg.len()..].copy_from_slice(msg);
+        crate::ntt::AdditiveNttF128::standard(log_d)
+            .forward_transform_interleaved_from_layer(&mut cw, lanes, 1);
+        let bytes = unsafe { core::slice::from_raw_parts(cw.as_ptr().cast::<u8>(), cw.len() * 16) };
+        let tree = crate::merkle::merkle_tree(bytes, 1 << log_d, crate::merkle::HashKind::Blake3);
+        (cw, tree)
+    }
+
     pub(super) fn try_commit(
         log_d: usize,
         lanes: usize,
@@ -2273,35 +2524,19 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     ) -> Option<GpuCommit> {
         let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
         let t0 = std::time::Instant::now();
-        let gpu = match gpu() {
-            Ok(g) => g,
-            Err(e) => {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| eprintln!("[metal] GPU commit unavailable: {e}"));
-                return None;
-            }
-        };
+        let gpu = available_gpu()?;
         // Take the buffers for this shape, or leave the commit to the CPU.
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         if state.disabled || state.in_use {
             return None;
         }
-        if state
-            .bufs
-            .as_ref()
-            .is_none_or(|b| (b.log_d, b.lanes) != (log_d, lanes))
-        {
-            if let Some(mut old) = state.bufs.take() {
-                unsafe { old.release(gpu) };
+        let bufs = match state.take(gpu, log_d, lanes) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[metal] buffer allocation failed ({e}); CPU commit");
+                return None;
             }
-            match unsafe { Buffers::new(gpu, log_d, lanes) } {
-                Ok(b) => state.bufs = Some(b),
-                Err(e) => {
-                    eprintln!("[metal] buffer allocation failed ({e}); CPU commit");
-                    return None;
-                }
-            }
-        }
+        };
         state.in_use = true;
         let verify = !state.verified.contains(&(log_d, lanes));
         let tune = match state
@@ -2314,7 +2549,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         };
         // The graph runs with the lock dropped: `in_use` keeps other commits
         // off the buffers, so they are neither reallocated nor written.
-        let bufs = state.bufs.expect("buffers just ensured");
         drop(state);
         let lease = Arc::new(Lease);
 
@@ -2391,253 +2625,93 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         Some(GpuCommit::Gpu(codeword, tree))
     }
 
-    // -----------------------------------------------------------------------
-    // AG zerocheck round 1 on the GPU: a prototype, test-only until it is
-    // wired into the prover (see `ag_round1_timing`).
-    // -----------------------------------------------------------------------
-
-    /// The prototype's library source: the commit kernels' field helpers,
-    /// the generated encode, and the kernel.
-    #[cfg(test)]
-    fn ag_round1_source() -> String {
-        format!(
-            "{MSL_SOURCE}\n{}\n{}",
-            include_str!("gpu_ag_round1_gen.msl"),
-            include_str!("gpu_ag_round1.msl")
-        )
-    }
-
-    /// The `ag_round1` pipeline, compiled on first use (kept as an address:
-    /// the pipeline object is thread-safe).
-    #[cfg(test)]
-    fn ag_round1_pso(gpu: &Gpu) -> Result<Id, String> {
-        static PSO: OnceLock<Result<usize, String>> = OnceLock::new();
-        PSO.get_or_init(|| unsafe {
-            let api = &gpu.api;
-            let pool = (api.pool_push)();
-            let made = (|| {
-                let src = api.nsstring(&ag_round1_source())?;
-                let mut err: Id = NIL;
-                let library: Id = send!(
-                    api,
-                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newLibraryWithSource:options:error:",
-                    src,
-                    NIL,
-                    &mut err
-                );
-                if library.is_null() {
-                    return Err(format!(
-                        "ag_round1 compile failed: {}",
-                        api.error_string(err)
-                    ));
-                }
-                let name = api.nsstring("ag_round1")?;
-                let f: Id = send!(
-                    api,
-                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                    library,
-                    c"newFunctionWithName:",
-                    name
-                );
-                if f.is_null() {
-                    return Err("ag_round1 not found".into());
-                }
-                let mut err: Id = NIL;
-                let pso: Id = send!(
-                    api,
-                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newComputePipelineStateWithFunction:error:",
-                    f,
-                    &mut err
-                );
-                if pso.is_null() {
-                    return Err(format!("ag_round1 pipeline: {}", api.error_string(err)));
-                }
-                Ok(pso as usize)
-            })();
-            (api.pool_pop)(pool);
-            made
-        })
-        .clone()
-        .map(|p| p as Id)
-    }
-
-    /// The prototype's sums over `eq.len()` Full blocks (a multiple of 8):
-    /// `(res, bank0, bank1)` as the CPU kernel returns them, plus the GPU
-    /// execution time in ms. Copies its inputs into fresh shared buffers.
-    #[cfg(test)]
-    pub(crate) fn ag_round1_on_gpu(
-        a: &[u8],
-        b: &[u8],
-        c: &[u8],
-        eq: &[F128],
-        groups: usize,
-    ) -> Result<([F128; 160], [F128; 64], [F128; 64], f64), String> {
-        let n = eq.len();
-        assert!(
-            n.is_multiple_of(8) && a.len() == n * 1024 && b.len() == a.len() && c.len() == a.len()
-        );
-        let gpu = gpu()?;
-        let pso = ag_round1_pso(gpu)?;
-        let groups = groups.clamp(1, n / 8);
-        unsafe {
-            let upload = |data: &[u8]| -> Result<Id, String> {
-                let buf = gpu.new_buffer(data.len().max(16))?;
-                core::ptr::copy_nonoverlapping(data.as_ptr(), gpu.contents(buf), data.len());
-                Ok(buf)
-            };
-            let eq_bytes = core::slice::from_raw_parts(eq.as_ptr().cast::<u8>(), n * 16);
-            let bufs = [
-                upload(a)?,
-                upload(b)?,
-                upload(c)?,
-                upload(eq_bytes)?,
-                gpu.new_buffer(groups * 288 * 16)?,
-            ];
-            let pool = (gpu.api.pool_push)();
-            let ran = (|| {
-                let cb = gpu.command_buffer()?;
-                let enc = gpu.compute_encoder(cb)?;
-                gpu.set_pipeline(enc, pso);
-                for (i, &buf) in bufs.iter().enumerate() {
-                    gpu.set_buffer(enc, buf, 0, i);
-                }
-                gpu.set_bytes(enc, &(n as u32), 5);
-                gpu.dispatch(enc, groups as u64, 32);
-                gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)?;
-                Ok::<f64, String>(gpu_exec_ms(gpu, cb))
-            })();
-            (gpu.api.pool_pop)(pool);
-            let ms = ran;
-            let partial =
-                core::slice::from_raw_parts(gpu.contents(bufs[4]).cast::<F128>(), groups * 288);
-            let mut sums = [F128::ZERO; 288];
-            for g in partial.as_chunks::<288>().0 {
-                for (s, &v) in sums.iter_mut().zip(g) {
-                    *s += v;
-                }
-            }
-            for buf in bufs {
-                gpu.release(buf);
-            }
-            let ms = ms?;
-            let mut res = [F128::ZERO; 160];
-            let mut b0 = [F128::ZERO; 64];
-            let mut b1 = [F128::ZERO; 64];
-            res.copy_from_slice(&sums[..160]);
-            b0.copy_from_slice(&sums[160..224]);
-            b1.copy_from_slice(&sums[224..]);
-            Ok((res, b0, b1, ms))
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
         use crate::test_rng::Rng;
 
-        /// The GPU AG round-1 prototype equals the CPU kernel on random Full
-        /// blocks: the 160 product sums and both c banks.
-        #[test]
-        fn ag_round1_matches_cpu() {
-            if let Err(e) = gpu() {
-                eprintln!("no Metal device ({e}); skipping");
-                return;
-            }
-            let mut rng = Rng::new(53);
-            let n = 64usize;
-            let bytes =
-                |rng: &mut Rng| -> Vec<u8> { (0..n * 1024).map(|_| rng.f128().lo as u8).collect() };
-            let (a, b, c) = (bytes(&mut rng), bytes(&mut rng), bytes(&mut rng));
-            let eq: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let coverage = vec![crate::zerocheck::BlockCoverage::Full; n];
-            let (res, b0, b1) = crate::genus95_curve_code::round1::round1_straight_line_program_packed_banks_fused_padded(
-                &a, &b, &c, &eq, &coverage,
-            );
-            for groups in [1usize, 3, 8] {
-                let (gres, gb0, gb1, _) = ag_round1_on_gpu(&a, &b, &c, &eq, groups).unwrap();
-                assert!(gb0 == b0, "bank0, {groups} groups");
-                assert!(gb1 == b1, "bank1, {groups} groups");
-                assert!(gres == res, "res, {groups} groups");
-            }
-        }
-
-        /// GPU vs CPU time of round 1 at production-like size: run with
-        /// `--ignored --nocapture` (`AG_BLOCKS` = log2 blocks, default 17).
-        #[test]
-        #[ignore]
-        fn ag_round1_timing() {
-            let lg: usize = std::env::var("AG_BLOCKS").map_or(17, |v| v.parse().unwrap());
-            let n = 1usize << lg;
-            let mut rng = Rng::new(7);
-            let bytes = |rng: &mut Rng| -> Vec<u8> {
-                let words: Vec<F128> = (0..n * 64).map(|_| rng.f128()).collect();
-                unsafe { core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), n * 1024) }
-                    .to_vec()
-            };
-            let (a, b, c) = (bytes(&mut rng), bytes(&mut rng), bytes(&mut rng));
-            let eq: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let coverage = vec![crate::zerocheck::BlockCoverage::Full; n];
-            for rep in 0..3 {
-                let t = std::time::Instant::now();
-                let cpu = crate::genus95_curve_code::round1::round1_straight_line_program_packed_banks_fused_padded(
-                    &a, &b, &c, &eq, &coverage,
-                );
-                let cpu_ms = t.elapsed().as_secs_f64() * 1e3;
-                for groups in [256usize, 1024, 4096] {
-                    let t = std::time::Instant::now();
-                    let (gres, ..) = ag_round1_on_gpu(&a, &b, &c, &eq, groups).unwrap();
-                    let wall = t.elapsed().as_secs_f64() * 1e3;
-                    let (_, _, _, gpu_ms) = ag_round1_on_gpu(&a, &b, &c, &eq, groups).unwrap();
-                    assert!(gres == cpu.0);
-                    eprintln!(
-                        "2^{lg} blocks rep {rep}: cpu {cpu_ms:.1} ms | gpu {groups} groups: {gpu_ms:.1} ms exec ({wall:.1} wall incl. copies)"
-                    );
+        /// The GPU, or `None` to skip on a machine without a Metal device
+        /// (hosted CI runners are VMs and may have none). Any other init
+        /// error, such as a kernel that no longer compiles, fails the test.
+        fn test_gpu() -> Option<&'static Gpu> {
+            match gpu() {
+                Ok(g) => Some(g),
+                Err(e) if e == NO_DEVICE => {
+                    eprintln!("{NO_DEVICE}; skipping");
+                    None
                 }
+                Err(e) => panic!("Metal init failed: {e}"),
             }
         }
 
-        /// GPU execution time of one command buffer (`GPUEndTime −
-        /// GPUStartTime`), in ms.
-        unsafe fn gpu_ms(gpu: &Gpu, cb: Id) -> f64 {
+        /// The codeword and tree buffers' contents.
+        unsafe fn outputs<'a>(gpu: &Gpu, bufs: &'a Buffers) -> (&'a [F128], &'a [Hash]) {
             unsafe {
-                let t0: f64 = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel) -> f64,
-                    cb,
-                    c"GPUStartTime"
-                );
-                let t1: f64 = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel) -> f64,
-                    cb,
-                    c"GPUEndTime"
-                );
-                (t1 - t0) * 1e3
+                (
+                    core::slice::from_raw_parts(
+                        gpu.contents(bufs.code_buf).cast::<F128>(),
+                        bufs.code_words(),
+                    ),
+                    core::slice::from_raw_parts(
+                        gpu.contents(bufs.tree_buf).cast::<Hash>(),
+                        bufs.tree_nodes(),
+                    ),
+                )
             }
+        }
+
+        /// Junk in the codeword and tree buffers, so stale bytes cannot pass
+        /// for output.
+        unsafe fn poison(gpu: &Gpu, bufs: &Buffers) {
+            unsafe {
+                core::ptr::write_bytes(gpu.contents(bufs.code_buf), 0xA5, bufs.code_words() * 16);
+                core::ptr::write_bytes(gpu.contents(bufs.tree_buf), 0x5A, bufs.tree_nodes() * 32);
+            }
+        }
+
+        /// The cache keeps the two most recently used shapes, in order, and
+        /// reuses their buffers; a third shape evicts the older one. Freeing
+        /// keeps the leased buffers. A local `State`, so the process-wide
+        /// cache (and the commits other tests run) are untouched.
+        #[test]
+        fn buffer_cache_keeps_two_shapes() {
+            let Some(gpu) = test_gpu() else { return };
+            let shapes = |st: &State| -> Vec<(usize, usize)> {
+                st.bufs.iter().map(|b| (b.log_d, b.lanes)).collect()
+            };
+            let mut st = State::new();
+            let a = st.take(gpu, 8, 6).unwrap();
+            let b = st.take(gpu, 9, 6).unwrap();
+            assert_eq!(shapes(&st), [(9, 6), (8, 6)]);
+            // A cached shape: the same buffers, moved to the front.
+            let a2 = st.take(gpu, 8, 6).unwrap();
+            assert_eq!((a2.msg_buf, a2.code_buf), (a.msg_buf, a.code_buf));
+            assert_eq!(shapes(&st), [(8, 6), (9, 6)]);
+            let b2 = st.take(gpu, 9, 6).unwrap();
+            assert_eq!(b2.tree_buf, b.tree_buf);
+            // A third shape evicts the least recently used, (8, 6).
+            st.take(gpu, 8, 1).unwrap();
+            assert_eq!(shapes(&st), [(8, 1), (9, 6)]);
+            // A lease keeps the front buffers through a release.
+            st.in_use = true;
+            st.release_unleased(gpu);
+            assert_eq!(shapes(&st), [(8, 1)]);
+            st.in_use = false;
+            st.release_unleased(gpu);
+            assert!(st.bufs.is_empty());
         }
 
         /// The hybrid commit (GPU prefix blocks, CPU suffix blocks, CPU top
         /// levels) equals the CPU commit for every split.
         #[test]
         fn hybrid_commit_matches_cpu() {
-            let gpu = match gpu() {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("no Metal device ({e}); skipping");
-                    return;
-                }
-            };
+            let Some(gpu) = test_gpu() else { return };
             let mut rng = Rng::new(29);
             for log_d in [12usize, 13] {
                 for lanes in [64usize, 61, 6] {
                     let bufs = unsafe { Buffers::new(gpu, log_d, lanes) }.unwrap();
                     let msg: Vec<F128> = (0..bufs.msg_words()).map(|_| rng.f128()).collect();
-                    let (cw_ref, tree_ref) = cpu_commit(&msg, log_d, lanes);
+                    let (cw_ref, tree_ref) = cpu_reference(&msg, log_d, lanes);
                     // The hybrid fills the message by ranges; every position
                     // must be covered exactly once across the two phases.
                     let fill = |m: &mut [F128], pos: core::ops::Range<usize>| {
@@ -2694,7 +2768,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         #[test]
         #[ignore]
         fn gpu_graph_timing() {
-            let gpu = gpu().expect("Metal device");
+            let Some(gpu) = test_gpu() else { return };
             let log_d: usize = std::env::var("GPU_LOG_D").map_or(20, |v| v.parse().unwrap());
             for lanes in [64usize, 46] {
                 let bufs = unsafe { Buffers::new(gpu, log_d, lanes) }.unwrap();
@@ -2712,7 +2786,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                             f(enc);
                             gpu.end_encoding(enc);
                             gpu.commit_and_wait(cb).unwrap();
-                            let ms = gpu_ms(gpu, cb);
+                            let ms = gpu_exec_ms(gpu, cb);
                             (gpu.api.pool_pop)(pool);
                             (name.to_string(), ms)
                         };
@@ -2739,7 +2813,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         encode_pass(gpu, enc, &bufs, l, f, true, 16);
                         gpu.end_encoding(enc);
                         gpu.commit_and_wait(cb).unwrap();
-                        line += &format!(" ({l},{f}) {:.1}", gpu_ms(gpu, cb));
+                        line += &format!(" ({l},{f}) {:.1}", gpu_exec_ms(gpu, cb));
                         (gpu.api.pool_pop)(pool);
                     }
                     eprintln!("2^{log_d} x {lanes} passes:{line}");
@@ -2747,20 +2821,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     b.release(gpu);
                 }
             }
-        }
-
-        /// The CPU reference: replicate the message, NTT from layer 1, hash.
-        fn cpu_commit(msg: &[F128], log_d: usize, lanes: usize) -> (Vec<F128>, Vec<Hash>) {
-            let mut cw = vec![F128::ZERO; 2 * msg.len()];
-            cw[..msg.len()].copy_from_slice(msg);
-            cw[msg.len()..].copy_from_slice(msg);
-            crate::ntt::AdditiveNttF128::standard(log_d)
-                .forward_transform_interleaved_from_layer(&mut cw, lanes, 1);
-            let bytes =
-                unsafe { core::slice::from_raw_parts(cw.as_ptr().cast::<u8>(), cw.len() * 16) };
-            let tree =
-                crate::merkle::merkle_tree(bytes, 1 << log_d, crate::merkle::HashKind::Blake3);
-            (cw, tree)
         }
 
         /// The GPU graph equals the CPU commit, codeword and tree, for full
@@ -2771,13 +2831,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         /// pass. From log_d 10 the f = 4 passes share tables (s >= 2).
         #[test]
         fn gpu_commit_matches_cpu() {
-            let gpu = match gpu() {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("no Metal device ({e}); skipping");
-                    return;
-                }
-            };
+            let Some(gpu) = test_gpu() else { return };
             let mut rng = Rng::new(17);
             for (log_d, mixed) in [
                 (8usize, true),
@@ -2806,7 +2860,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                             gpu.contents(bufs.tree_buf).cast::<Hash>(),
                             bufs.tree_nodes(),
                         );
-                        let (cw_ref, tree_ref) = cpu_commit(&msg, log_d, lanes);
+                        let (cw_ref, tree_ref) = cpu_reference(&msg, log_d, lanes);
                         assert!(cw == &cw_ref[..], "codeword, 2^{log_d} x {lanes}");
                         assert!(tree == &tree_ref[..], "tree, 2^{log_d} x {lanes}");
                     }
@@ -2814,6 +2868,60 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     unsafe { bufs.release(gpu) };
                 }
             }
+        }
+
+        /// The production shape, BLAKE3 2^18's level-0 commit (2^20
+        /// positions × 46 lanes), against the CPU commit byte for byte: the
+        /// whole GPU graph, the hybrid at several splits, and the checked
+        /// first commit that [`warm_up`] runs through `try_commit`. The tests
+        /// above stop at 2^13 positions. About 2 GB. Run it alone, since it
+        /// uses the process-wide cache: `cargo test --release -p flock-core
+        /// --features metal --lib production_shape -- --ignored`.
+        #[test]
+        #[ignore]
+        fn production_shape_matches_cpu() {
+            let Some(gpu) = test_gpu() else { return };
+            let (log_d, lanes) = (20usize, 46usize);
+            let fill = |m: &mut [F128], pos: core::ops::Range<usize>| synthetic_fill(m, lanes, pos);
+            let mut bufs = unsafe { Buffers::new(gpu, log_d, lanes) }.unwrap();
+            unsafe {
+                let msg = core::slice::from_raw_parts_mut(
+                    gpu.contents(bufs.msg_buf).cast::<F128>(),
+                    bufs.msg_words(),
+                );
+                fill(msg, 0..1 << (log_d - 1));
+                let (cw_ref, tree_ref) = cpu_reference(msg, log_d, lanes);
+                let check = |what: &str| {
+                    let (cw, tree) = outputs(gpu, &bufs);
+                    assert!(cw == &cw_ref[..], "codeword, {what}");
+                    assert!(tree == &tree_ref[..], "tree, {what}");
+                };
+                // The whole graph, with the mixed final pass (production at
+                // 2^20) and with the half-footprint one.
+                for mixed in [true, false] {
+                    poison(gpu, &bufs);
+                    run_graph(gpu, &bufs, mixed).unwrap();
+                    check(&format!("graph, mixed {mixed}"));
+                }
+                // The hybrid: the initial split (6/16, 7 blocks), the one an
+                // M4 Max tuned to (5/16, 10), and the extremes the env pins
+                // reach. The message buffer starts as junk, so the fill must
+                // cover it.
+                for (first16, k) in [(6usize, 7usize), (5, 10), (0, 1), (16, 15)] {
+                    msg.fill(F128::new(0xBAD, 0xBAD));
+                    poison(gpu, &bufs);
+                    run_hybrid(gpu, &bufs, first16, k, &fill, msg).unwrap();
+                    check(&format!("hybrid {first16}/16, {k}/16"));
+                }
+                bufs.release(gpu);
+            }
+            // The entry point: the checked first commit must take the GPU (a
+            // mismatch would return the CPU result and turn Metal off).
+            assert!(warm_up(&[(log_d, lanes)]), "warm-up at 2^{log_d} x {lanes}");
+            let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(state.verified.contains(&(log_d, lanes)) && !state.disabled);
+            drop(state);
+            release();
         }
     }
 }

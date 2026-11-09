@@ -37,6 +37,14 @@ The chain tower (`crates/flock-prover/src/tower/`) already verifies circuit-unio
 | Chain statement: `h_start`, `h_end`, span counter, `ChainLane` | `(pk, msg)` list, 4,046 public words at n = 1000 | `envelope.rs`, `fl_node.rs`, `node.rs` |
 | Envelope sized to the m32 chain leaf (m* = 29, ν = 14) | Larger verifier surface per child | `config.rs`, `envelope.rs` |
 
+## What the root proves
+
+Decided 2026-11-05 (Ron's #66 and #70 reviews): the epoch stays private.
+
+- **The statement.** For each listed `(pk, msg)`, some valid signature under `pk` on `msg` exists, at some epoch `< 2^32`. `statement_words` (`leanxmss/circuit.rs`) hashes only `P`, the root and the two message halves; the epoch `idx` is a private `b.input` of the leaf circuit.
+- **No distinct epochs, no replay protection.** The root cannot show that two entries use distinct epochs, and it accepts a replayed old signature. An application that needs slot binding must put the epoch (or a nonce it tracks) inside `msg`.
+- **`n_signatures` counts entries.** It is the number of listed `(pk, msg)` entries, not of distinct signers or signatures. Nothing deduplicates: one valid signature listed 992 times fills a leaf. "992 different signers" describes the test generator, not the statement.
+
 ## Phases
 
 **1. Recursion leaf.** Add an `XmssCircuit` option that proves in the tower's posture:
@@ -89,7 +97,8 @@ Phase 5's order: the dropped words first (half the cost, all in the zerocheck), 
 - `XmssTower::prove` runs the chain tower's spine over leanXMSS first-level nodes: the base over the last two, then each level prepends the next-earlier one. `xmss_statement` recomputes the root digest from the batches: `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))`.
 - `XmssTower::discharge_root`: the statement, the lane against the leaf tables per class, and the main fold and passenger (`discharge_outer`, shared with the chain tower).
 - **Tests.** `xmss_internal_node_over_two_first_level_nodes`, `xmss_tower_e2e` (8 batches, a steady root; refuses a wrong digest, a wrong count, a moved lane claim).
-- **Root verifier.** `XmssTowerVk::generate` builds the VK from a reference tower over six batches. `verify_xmss_root(vk, statement, bundle)` checks the root proof against the VK alone. It then reassembles the accumulator from the root's publics, checks the statement, and runs the discharge. `xmss_tower_e2e` also refuses swapped batches, an edited message and a forged public.
+- **Root verifier.** `XmssTowerVk::generate` builds the VK from a reference tower over six batches. `verify_xmss_root(vk, statement, bundle)` checks the root proof against the VK alone. It then reassembles the accumulator from the root's publics, checks the statement, and runs the discharge. `xmss_tower_e2e` also refuses swapped batches, an edited message and a forged public, and verifies the k = 2 (base) and k = 3 roots as well as k = 4.
+- **VK identity.** `XmssTowerVk::fingerprint` (the leaf, FL, base and steady circuit digests, both registries, the publics length, the leaf size), pinned at the test leaf by `xmss_tower_vk_fingerprint_pinned`.
 - **Full size.** 8 × 992 = 7,936 signatures, with the final leaf posture (phase 5): the end-to-end test passes, including the standalone verify. The root proof is 254 KiB. Per-stage timings are in the measured section below.
 
 **5. Put the leaf optimisations back.** Done: `RECURSION_LEAF` now has every optimisation of the default proof, plus the chained transcript and the hashed statement.
@@ -265,11 +274,20 @@ Measured on a quiet M4 at 1 thread, two alternating runs per binary, median of 6
 
 The Ligerito step inside the open is a per-transcript grinding draw that moved by up to ±8 ms between binaries (FL +8, base −4, spine −7). With it held equal, every node saves about 20–24 ms, of which the 28 pin is about 4–9 ms (Merkle 50.5 → 45.9 ms in every commit). The rest is the commit NTT (−4 ms on base and spine), wiring and expected PoW. The W build and merged sumcheck did not move. At 10 threads (n = 3, noisy) the spine went 154 → 147 ms with PoW excluded.
 
+## Review fixes (2026-11-05, Ron's #70 review)
+
+- **Leaf PoW in the first-level node.** `emit_child_region` now emits one PowMask row per recorded leaf `Pow` (347 on a leanXMSS leaf: fingerprint, GKR, lincheck, zerocheck, Ligerito). Before, only the AG round-one point was checked, so a recursive prover could skip every other leaf grind. The port of PR #71.
+- **Zero grand products.** Every product GKR the tower verifies (a leaf's wiring and bus, a node child's wiring) checks `top·t = 1` with a witness inverse, beside the native `top_lhs ≠ 0` check.
+- **Shared binding.** The tails of `x_inner_rest` and `rr` beyond the longest type head are wired to the child's challenges in-circuit, as every other absorbed word is.
+- **Aggregation.** The per-claim path refuses an assertion that drops words (it would never check `v_L`); the shared path refuses a linear value where `Dropped` gathers none.
+- **Guards.** The node walker refuses a child with a bus, public columns, pruned or packed slots; the main accumulator's empty `per_linear` is asserted on the outer registry.
+- **Negative tests.** A leaf nonce that misses its target, and a moved η or `A` report, each make the child region unsatisfiable.
+
 ## Open questions
 
 1. **Tree shape.** The driver is the chain tower's spine: a base over the last two first-level nodes, then each level prepends the next-earlier one. The statement is `H(D_fl0, H(D_fl1, … H(D_fl{k-2}, D_fl{k-1})))` over fixed 992-signature batches, and the verifier rebuilds it from the batches (`xmss_statement`). A balanced tree would need a second internal shape.
 2. **Leaf batch size.** It is 992. One more signature tips the statement hash's compressions into a third slot, and the layout planner to ν = 14.
-3. **Margin.** The first-level node runs at 27.21 of 28 lanes, and its main MAC slot at 7,399 of 2^14 rows. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
+3. **Margin.** The first-level node runs at 27.25 of 28 lanes (27.21 before the leaf PoW rows and nonzero-top checks of 2026-11-05), and its main MAC slot at 7,403 of 2^14 rows. The next diet: merge the lagrange-low evaluations of claims that share a low (the boolean claims of one child still evaluate the same 64-word low per claim in-circuit).
 4. **Node cost.** A node is 35–46% of a leaf's time for an eighth of its words (above). The candidates:
    - the ragged multipoint weight: aligned envelope columns, or a closed-form ragged weight;
    - the family tiles' bool-path witness;

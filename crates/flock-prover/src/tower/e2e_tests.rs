@@ -1349,10 +1349,15 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 // transpose dot (a new `TransposeDotGate` type) and the lane pin 29 → 28
 // move the three outer circuits and the outer registry; chain circuit,
 // chain registry and publics UNCHANGED. Two identical prints.
+// Re-blessed 2026-11-05 (Ron's #70 review): the FL circuit moves with the
+// leaf children's PoW predicate rows (`emit_child_region`, the port of PR
+// #71), then FL, base and steady with the in-circuit nonzero check on every
+// product-GKR top (`emit_nonzero_top`). Chain circuit, both registries and
+// publics UNCHANGED. Two identical prints.
 const PIN_CHAIN_CIRCUIT: &str = "b8f442da32b9961612ccaf9acb39cadcd4592e913b2b208a1b9740d01c10e9c9";
-const PIN_FL_CIRCUIT: &str = "f8aa9b438b09c1625ece4c4bc0fc4a543127db0138221d8977df91cd4957a4dd";
-const PIN_BASE_CIRCUIT: &str = "d7b4e50a2a039e380c46dd4030839cd83da0e0599d1e65952623443d6d70902e";
-const PIN_STEADY_CIRCUIT: &str = "10ab0cc502034be2426287487ab6d3a77e5b7ae518b7d04325f26f191e0e83e5";
+const PIN_FL_CIRCUIT: &str = "a98b9ce451eb554f0d042d5a61150a1e753dd64e1fec4d4d63afa947b4432f4f";
+const PIN_BASE_CIRCUIT: &str = "fa8d664c3887ba956ba34abecd992ad0c82fdfb020dfd4508388f59b53456e6a";
+const PIN_STEADY_CIRCUIT: &str = "d32bc50c9ff5506fe27d3b50a76592a98fcba1083fb03774d6fec656f24ebc70";
 const PIN_CHAIN_REGISTRY: &str = "3126c5ce825e8fc3942843c0548ba43964b1daa5751a834fcbbc1c3ab58e40fe";
 const PIN_OUTER_REGISTRY: &str = "c36112d619a1907c2132257f311ec7a90e81b932d20257b197d458b4267201c0";
 const PIN_PUBLICS_LEN: usize = 5684;

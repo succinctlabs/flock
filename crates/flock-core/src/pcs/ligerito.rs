@@ -2848,13 +2848,14 @@ pub fn induce_sumcheck_poly_via_ntt(
 ///
 /// The dense path costs `n_queries · 2^log_msg_cols` products; the NTT path
 /// costs the transpose layers past [`transpose_forward_ntt_sparse`]'s
-/// windowed prefix, `(log_block − 8) · 2^(log_block − 1)` butterflies of one
-/// product each. Measured on M4 at the strict-128 ladder's levels (rates
-/// 1/2 .. 1/2048), both cost ~1 ns per product at 1 and 10 threads, so the
-/// dispatch compares the two counts directly. The earlier `n_queries > 4 ·
-/// 2^log_inv_rate · log_block` rule (tuned at blake m=30, rate 1/2) kept the
-/// strict-128 L1 induce (2^16 columns, rate 1/8, 79 queries) dense at
-/// 5.45 ms ST where the NTT takes 2.74 ms.
+/// windowed prefix, `(log_block − SPARSE_WINDOW_LOG) · 2^(log_block − 1)`
+/// butterflies of one product each. Measured on M4 at the strict-128
+/// ladder's levels (rates 1/2 .. 1/2048), both cost ~1 ns per product at 1
+/// and 10 threads, so the dispatch compares the two counts directly. This
+/// cost model was measured only on the M4 (4P+6E), not on a Max chip or on
+/// x86. The earlier `n_queries > 4 · 2^log_inv_rate · log_block` rule (tuned
+/// at blake m=30, rate 1/2) kept the strict-128 L1 induce (2^16 columns,
+/// rate 1/8, 79 queries) dense at 5.45 ms ST where the NTT takes 2.74 ms.
 ///
 /// Both paths are byte-identical (see `induce_sumcheck_poly_via_ntt_matches_dense`),
 /// so a mis-dispatch only costs time.
@@ -2868,8 +2869,9 @@ pub(crate) fn induce_sumcheck_poly_auto(
     alpha: &[F128],
 ) -> (Vec<F128>, F128) {
     let log_block = log_msg_cols + log_inv_rate;
-    let use_ntt =
-        log_msg_cols >= 12 && queries.len() << log_msg_cols > (log_block - 8) << (log_block - 1);
+    // No underflow: `log_block >= log_msg_cols >= 12 > SPARSE_WINDOW_LOG`.
+    let use_ntt = log_msg_cols >= 12
+        && queries.len() << log_msg_cols > (log_block - SPARSE_WINDOW_LOG) << (log_block - 1);
     if use_ntt {
         induce_sumcheck_poly_via_ntt(
             log_msg_cols,
@@ -2891,6 +2893,11 @@ pub(crate) fn induce_sumcheck_poly_auto(
     }
 }
 
+/// Log2 of the windows [`transpose_forward_ntt_sparse`] transposes before it
+/// densifies (its prefix, from `log_d >= 12`). [`induce_sumcheck_poly_auto`]
+/// counts the NTT path's cost from the layers past it.
+const SPARSE_WINDOW_LOG: usize = 8;
+
 /// Sparse-prefix variant of [`transpose_forward_ntt`]: exploits that the input
 /// has only `positions.len()` nonzeros and that the first `k` transpose steps
 /// (forward layers `log_d-1 .. log_d-k`, pairing distances `1 .. 2^(k-1)`) mix
@@ -2906,7 +2913,7 @@ fn transpose_forward_ntt_sparse(
 ) -> Vec<F128> {
     let n = 1usize << log_d;
     // No prefix for small domains — just scatter + full dense transpose.
-    let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
+    let k = if log_d >= 12 { SPARSE_WINDOW_LOG } else { 0 };
 
     if k == 0 {
         let mut data = vec![F128::ZERO; n];

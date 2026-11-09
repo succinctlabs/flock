@@ -210,9 +210,17 @@ fn gadget_blocks_are_small() {
 
 /// The packed slot holds, for each row, a block that satisfies the gadget's
 /// relation with `A·z` and `B·z` alongside, dummy rows are zero, and the
-/// stripe transposes `z`.
+/// stripe transposes `z` — writing every word into poisoned buffers, or,
+/// with padding writes elided, only the live ones into zeroed buffers (the
+/// fresh-zeroed destination).
 #[test]
 fn packed_rows_satisfy_the_relation() {
+    for elide in [false, true] {
+        packed_rows_satisfy_the_relation_with(elide);
+    }
+}
+
+fn packed_rows_satisfy_the_relation_with(elide: bool) {
     let nu = 4;
     let gate = swap_gate(nu).unwrap();
     let single = swap_gate(0).unwrap();
@@ -225,18 +233,23 @@ fn packed_rows_satisfy_the_relation() {
         .map(|_| vec![rng.word(), rng.word(), rng.word()].into_boxed_slice())
         .collect();
     let len = cols << nu;
-    let poison = F128::new(0xDEAD, 0xBEEF);
-    let (mut z, mut a, mut b) = (vec![poison; len], vec![poison; len], vec![poison; len]);
+    let fill = if elide {
+        F128::ZERO
+    } else {
+        F128::new(0xDEAD, 0xBEEF)
+    };
+    let (mut z, mut a, mut b) = (vec![fill; len], vec![fill; len], vec![fill; len]);
     let stripe = gate.pack_into(
         &rows,
         SlotWitnessDest {
             z: &mut z,
             a: &mut a,
             b: &mut b,
-            elide_padding_writes: false,
+            elide_padding_writes: elide,
             dead_padding_unread: false,
         },
     );
+    // 11 rows fill both 8-row batches, so the whole stripe is live.
     assert_eq!(stripe.len(), (1 << nu) / 8 * k);
     let bits_of = |buf: &[F128], row: usize| -> Vec<bool> {
         (0..k)
@@ -296,4 +309,74 @@ fn native_evaluation_matches_the_circuit() {
             assert_eq!(eval_native(gate, &i), eval(gate, &i), "{}", gate.name());
         }
     }
+}
+
+/// A slot of fewer than 8 rows has no stripe batch, while the packer's first
+/// group writes one: it must refuse the slot, in either padding mode. With
+/// padding writes elided nothing else stopped it, and it wrote out of bounds
+/// (`swap_gate(2)`, 3 rows: SIGSEGV). Mismatched `a`/`b` buffers are refused
+/// too.
+#[test]
+fn packer_refuses_a_slot_under_eight_rows() {
+    let gate = swap_gate(2).unwrap();
+    let mut rng = Rng(9);
+    let rows: Vec<Box<[F128]>> = (0..3)
+        .map(|_| vec![rng.word(), rng.word(), rng.word()].into_boxed_slice())
+        .collect();
+    let len = 1usize << (2 + gate.k_log() - 7);
+    for elide in [false, true] {
+        for batched in [false, true] {
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (mut z, mut a, mut b) = (
+                    vec![F128::ZERO; len],
+                    vec![F128::ZERO; len],
+                    vec![F128::ZERO; len],
+                );
+                let dst = SlotWitnessDest {
+                    z: &mut z,
+                    a: &mut a,
+                    b: &mut b,
+                    elide_padding_writes: elide,
+                    dead_padding_unread: false,
+                };
+                if batched {
+                    gate.pack_into(&rows, dst)
+                } else {
+                    gate.pack_into_unbatched(&rows, dst)
+                }
+            }));
+            assert!(refused.is_err(), "elide {elide}, batched {batched}");
+        }
+    }
+    // Eight rows are enough; a short `b` is not.
+    let gate = swap_gate(3).unwrap();
+    let len = 1usize << (3 + gate.k_log() - 7);
+    let (mut z, mut a, mut b) = (
+        vec![F128::ZERO; len],
+        vec![F128::ZERO; len],
+        vec![F128::ZERO; len],
+    );
+    gate.pack_into(
+        &rows,
+        SlotWitnessDest {
+            z: &mut z,
+            a: &mut a,
+            b: &mut b,
+            elide_padding_writes: true,
+            dead_padding_unread: false,
+        },
+    );
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gate.pack_into(
+            &rows,
+            SlotWitnessDest {
+                z: &mut z,
+                a: &mut a,
+                b: &mut b[..len - 1],
+                elide_padding_writes: true,
+                dead_padding_unread: false,
+            },
+        )
+    }));
+    assert!(refused.is_err(), "a short b buffer");
 }

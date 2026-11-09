@@ -104,7 +104,9 @@ fn chain_step_row() {
 
 /// Packing with the BLAKE3 kernel writes exactly the slot the walk writes:
 /// `z`, `A·z`, `B·z` and the lincheck stripe, batched or not, and so does
-/// [`CompressPacker`].
+/// [`CompressPacker`]. With padding writes elided, each packer writes the
+/// same slot into zeroed buffers, and the same stripe on its live batches
+/// (the only ones a reader touches).
 #[test]
 fn kernel_packing_matches_the_walk() {
     let nu = 7;
@@ -124,37 +126,60 @@ fn kernel_packing_matches_the_walk() {
         })
         .collect();
     let len = 1usize << (nu + walked.k_log() - 7);
+    let k = 1usize << walked.k_log();
     for n in [1 << nu, 77, 64, 61, 8, 3] {
-        let pack = |packer: &dyn Fn(SlotWitnessDest<'_>) -> Vec<u8>| {
-            let poison = F128::new(0xDEAD, 0xBEEF);
-            let (mut z, mut a, mut b) = (vec![poison; len], vec![poison; len], vec![poison; len]);
+        let pack = |elide: bool, packer: &dyn Fn(SlotWitnessDest<'_>) -> Vec<u8>| {
+            let fill = if elide {
+                F128::ZERO
+            } else {
+                F128::new(0xDEAD, 0xBEEF)
+            };
+            let (mut z, mut a, mut b) = (vec![fill; len], vec![fill; len], vec![fill; len]);
             let stripe = packer(SlotWitnessDest {
                 z: &mut z,
                 a: &mut a,
                 b: &mut b,
-                elide_padding_writes: false,
+                elide_padding_writes: elide,
                 dead_padding_unread: false,
             });
             (z, a, b, stripe)
         };
         let rows_n = &all[..n];
-        let want = pack(&|dst| walked.pack_into_unbatched(rows_n, dst));
-        for (what, got) in [
-            ("walk, batched", pack(&|dst| walked.pack_into(rows_n, dst))),
-            (
-                "kernel",
-                pack(&|dst| kernel.pack_into_unbatched(rows_n, dst)),
-            ),
-            (
-                "kernel, batched",
-                pack(&|dst| kernel.pack_into(rows_n, dst)),
-            ),
-            ("CompressPacker", pack(&|dst| rows.pack_into(rows_n, dst))),
-        ] {
-            assert!(want.0 == got.0, "{what}, {n} rows: z differs");
-            assert!(want.1 == got.1, "{what}, {n} rows: A·z differs");
-            assert!(want.2 == got.2, "{what}, {n} rows: B·z differs");
-            assert!(want.3 == got.3, "{what}, {n} rows: stripe differs");
+        let want = pack(false, &|dst| walked.pack_into_unbatched(rows_n, dst));
+        let live = n.div_ceil(8) * k;
+        for elide in [false, true] {
+            for (what, got) in [
+                (
+                    "walk",
+                    pack(elide, &|dst| walked.pack_into_unbatched(rows_n, dst)),
+                ),
+                (
+                    "walk, batched",
+                    pack(elide, &|dst| walked.pack_into(rows_n, dst)),
+                ),
+                (
+                    "kernel",
+                    pack(elide, &|dst| kernel.pack_into_unbatched(rows_n, dst)),
+                ),
+                (
+                    "kernel, batched",
+                    pack(elide, &|dst| kernel.pack_into(rows_n, dst)),
+                ),
+                (
+                    "CompressPacker",
+                    pack(elide, &|dst| rows.pack_into(rows_n, dst)),
+                ),
+            ] {
+                let what = format!("{what}, elide {elide}, {n} rows");
+                assert!(want.0 == got.0, "{what}: z differs");
+                assert!(want.1 == got.1, "{what}: A·z differs");
+                assert!(want.2 == got.2, "{what}: B·z differs");
+                if elide {
+                    assert!(want.3[..live] == got.3[..live], "{what}: stripe differs");
+                } else {
+                    assert!(want.3 == got.3, "{what}: stripe differs");
+                }
+            }
         }
     }
 }
