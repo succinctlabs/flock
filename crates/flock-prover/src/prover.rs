@@ -476,8 +476,9 @@ fn build_union_witness(
     // argument that says nothing about `a`/`b`. Element registries are
     // excluded for the same reason they are there: their `a`/`b` are derived
     // by gather rather than run-list gated.
-    let dead_padding_unread =
-        !union.has_element() && union.m_total() - union.n_log() >= pcs::LOG_PACKING;
+    let dead_padding_unread = !union.has_element()
+        && union.m_total() - union.n_log() >= pcs::LOG_PACKING
+        && union.zerocheck_reads_exact();
     let nu = union.n_log();
     // Live-only element `pa`/`pb` derivation: when the region zerocheck will
     // take its sparse arm, dead rows of `a`/`b` are unread everywhere (their
@@ -491,7 +492,7 @@ fn build_union_witness(
     // the large boolean ones instead of queueing behind them.
     let slots: Vec<_> = union
         .slot_dests(&mut z, &mut a, &mut b, elide, dead_padding_unread)
-        .into_iter()
+        .into_par_iter()
         .zip(sources)
         .collect();
     let stripes = slots
@@ -925,9 +926,12 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
     // Flavor-independent since the AG round 1 + fold went run-list-gated
     // (Dead blocks skipped, Partial blocks cleansed — no declared-dead bit
     // is read on either flavor).
+    // And not below `nu = 6`, where the RS round 1 reads straddled windows
+    // ([`UnionInstance::zerocheck_reads_exact`]).
     let padding_unread = !union.has_element()
         && !union.compaction_is_identity()
-        && union.m_total() - union.n_log() >= LOG_PACKING;
+        && union.m_total() - union.n_log() >= LOG_PACKING
+        && union.zerocheck_reads_exact();
     let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
         build_union_witness(union, sources, padding_unread);
     // Where the witness buffers return: the dirty scratch pool for the pooled
@@ -1035,6 +1039,7 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
     // boolean-only registry, so nothing here changes for one.
     let padding = union.padding_spec();
     let bool_padding = union.boolean_padding_spec();
+    let zc_grinding = union.zerocheck_grinding(pcs_params.zerocheck_grinding());
     let m_bool = union.m_bool();
     let bool_words = union.boolean_packed_len();
 
@@ -1108,7 +1113,7 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
                             c_packed,
                             m_bool,
                             &bool_padding,
-                            pcs_params.zerocheck_grinding(),
+                            zc_grinding,
                             challenger,
                         );
                         (
@@ -1132,7 +1137,7 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
                             c_packed,
                             m_bool,
                             &bool_padding,
-                            pcs_params.zerocheck_grinding(),
+                            zc_grinding,
                             challenger,
                         );
                         (
@@ -1236,7 +1241,13 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
             // the lincheck's own fold; C's row point is the zerocheck's, so it
             // costs one more stripe fold — spent only when the open will use it.
             let nu = union.n_log();
-            let banks = if pcs::rectangular_prefix_columns(&union.jagged_heights(), nu).is_some() {
+            let banks = if pcs::full_height_columns(
+                &union.jagged_heights(),
+                nu,
+                union.dense_m() - LOG_PACKING,
+            )
+            .is_some()
+            {
                 let t_b = std::time::Instant::now();
                 assert!(zc_r_rest.len() > nu, "C claim point too short");
                 let bank_c = lincheck::union_bitbank_fold(union, &lc_slots, &zc_r_rest[1..1 + nu]);
@@ -1445,12 +1456,19 @@ fn prove_union_with_binding_zerocheck<Ch: Challenger>(
         Some(v) => (v, Some(z_packed)),
         None => (z_packed, None),
     };
+    // The C claim is `z` with the zeroed words masked out (C = diag(mask)).
+    let zeroed = union.zeroed_columns();
+    let zeroed_refs: Vec<&[usize]> = match z_claims.len() {
+        0 => Vec::new(),
+        _ => vec![&[], &zeroed],
+    };
     let pcs_open = open_batch_merged(
         open_witness,
         padded_owner.as_deref(),
         &prover_data,
         &commitment,
         &x_refs,
+        &zeroed_refs,
         &pre,
         &banks,
         &packed_direct,

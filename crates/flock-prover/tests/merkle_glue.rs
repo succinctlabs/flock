@@ -387,9 +387,19 @@ const DIRTY_DESTINATION_NU: usize = 5;
 /// holds a live row must match — the trailing partial group's dead lanes
 /// included, because the RS zerocheck's round 1 reads whole 512-bit
 /// sub-windows up to the last live row.
+///
+/// `shared_driver` is `Some(useful_bits)` for a table on the shared partial
+/// batch-major driver, whose padding contract is the BLAKE3 and SHA-2
+/// tables' ([`flock_core::union::SlotWitnessDest`]). Chunk-columns past the
+/// useful ones are left as found under elision (the destination is zero or
+/// unread). Without elision `z`'s are zeroed always, and `a`/`b`'s unless
+/// `dead_padding_unread`. A group's stripe rows past the useful words may
+/// stay stale under `dead_padding_unread`. `None` for the bool-path tables,
+/// which write every column.
 fn assert_in_place_matches_canonical_on_dirty_destination(
     count: usize,
     nu: usize,
+    shared_driver: Option<usize>,
     canonical: (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>),
     generate: impl Fn(SlotWitnessDest<'_>) -> Vec<u8>,
 ) {
@@ -428,6 +438,22 @@ fn assert_in_place_matches_canonical_on_dirty_destination(
             ] {
                 for column in 0..columns {
                     let start = column * capacity;
+                    if shared_driver.is_some_and(|useful| column >= useful.div_ceil(128)) {
+                        let column_words = &actual[start..start + capacity];
+                        if elide_padding_writes || (name != "z" && dead_padding_unread) {
+                            assert!(
+                                column_words.iter().all(|word| *word == STALE),
+                                "{name} padding chunk-column {column} was written ({mode})"
+                            );
+                        } else {
+                            assert_eq!(
+                                column_words,
+                                &expected[start..start + capacity],
+                                "{name} padding chunk-column {column} ({mode})"
+                            );
+                        }
+                        continue;
+                    }
                     assert_eq!(
                         actual[start..start + written_rows],
                         expected[start..start + written_rows],
@@ -443,11 +469,25 @@ fn assert_in_place_matches_canonical_on_dirty_destination(
                 }
             }
             let stripe_bytes = written_rows / 8 * group_bytes;
-            assert_eq!(
-                stripe[..stripe_bytes],
-                canonical_stripe[..stripe_bytes],
-                "stripe ({mode})"
-            );
+            match shared_driver.filter(|_| dead_padding_unread) {
+                // Only each group's useful rows are pinned.
+                Some(useful) => {
+                    let useful_bytes = useful.div_ceil(64) * 64;
+                    for g in 0..written_rows / 8 {
+                        let at = g * group_bytes;
+                        assert_eq!(
+                            stripe[at..at + useful_bytes],
+                            canonical_stripe[at..at + useful_bytes],
+                            "stripe group {g} ({mode})"
+                        );
+                    }
+                }
+                None => assert_eq!(
+                    stripe[..stripe_bytes],
+                    canonical_stripe[..stripe_bytes],
+                    "stripe ({mode})"
+                ),
+            }
         }
     }
 }
@@ -471,6 +511,7 @@ fn in_place_drivers_zero_trailing_group_in_dirty_destination() {
         assert_in_place_matches_canonical_on_dirty_destination(
             count,
             nu,
+            Some(SwapTable::USEFUL_BITS),
             SwapTable::generate_witness_batch_major(&swap_rows, nu),
             |dst| SwapTable::generate_witness_batch_major_into(&swap_rows, dst),
         );
@@ -486,6 +527,7 @@ fn in_place_drivers_zero_trailing_group_in_dirty_destination() {
         assert_in_place_matches_canonical_on_dirty_destination(
             count,
             nu,
+            Some(spread.useful_bits()),
             spread.generate_witness_batch_major(&spread_rows, nu),
             |dst| spread.generate_witness_batch_major_into(&spread_rows, dst),
         );
@@ -500,6 +542,7 @@ fn in_place_drivers_zero_trailing_group_in_dirty_destination() {
         assert_in_place_matches_canonical_on_dirty_destination(
             count,
             nu,
+            Some(pow_mask.useful_bits()),
             pow_mask.generate_witness_batch_major(&pow_mask_rows, nu),
             |dst| pow_mask.generate_witness_batch_major_into(&pow_mask_rows, dst),
         );
@@ -516,6 +559,7 @@ fn in_place_drivers_zero_trailing_group_in_dirty_destination() {
         assert_in_place_matches_canonical_on_dirty_destination(
             count,
             nu,
+            Some(FamilyTransposeTileTable::USEFUL_BITS),
             FamilyTransposeTileTable::generate_witness_batch_major(&tile_rows, nu),
             |dst| FamilyTransposeTileTable::generate_witness_batch_major_into(&tile_rows, dst),
         );

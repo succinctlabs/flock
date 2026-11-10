@@ -35,7 +35,7 @@ use crate::{
             round_msg_eval_and_lookahead_eq_point_blocked, verify_and_sample_queries,
             verify_level_opens,
         },
-        ring_switch::build_eq_scaled_parallel,
+        ring_switch::{build_eq_scaled_parallel, build_eq_split},
     },
     scratch::{give_f256, take_f256},
 };
@@ -1259,10 +1259,16 @@ impl VirtualEqBasis256 {
     }
 }
 
+/// Parallel tasks over a recursive level's table take at least this many
+/// elements: the deep levels' tables (`2^8`–`2^14`) otherwise split into
+/// rayon tasks whose dispatch costs more than their products.
+const SEQ_MIN_ELEMS: usize = 1 << 14;
+
 enum PendingBasis {
-    /// A base-valued basis on the current table (a level OOD's `eq(z, ·)`):
-    /// kept in F128, glued into `c0` only.
-    Base(Vec<F128>),
+    /// A level OOD's `eq(z, ·)` on the current table, kept as its exact
+    /// factors `eq = lo ⊗ hi` (see [`SumcheckProver256::introduce_ood_point`]);
+    /// glued into `c0` only.
+    Eq { lo: Vec<F128>, hi: Vec<F128> },
     /// A base-valued basis stated BEFORE the coordinate split (the induced
     /// query basis): its split form is the pairs `(B_j, 0), (0, B_j)`
     /// (`u·B_j = (0, B_j)`), kept as the `B_j` alone.
@@ -1530,7 +1536,7 @@ impl SumcheckProver256 {
     }
 
     /// The FIRST fold of a recursive level: the f-side is base-valued (the
-    /// code switch just split it — `introduce_ood_with_eval` asserts the
+    /// code switch just split it — `introduce_ood_point` asserts the
     /// same invariant), so its products are F256×F128 = 2 muls instead of
     /// the generic 3. The b-side has been through `split_basis` and glue
     /// and stays generic. Value-identical to [`Self::fold`].
@@ -1591,41 +1597,49 @@ impl SumcheckProver256 {
         round_msg_fbase(&self.f, &self.combined_basis)
     }
 
-    /// Introduce a base-field MLE claim on the currently split table. The
-    /// answer is one F128 value because every table word is in the subfield.
-    pub(super) fn introduce_ood_with_eval(
-        &mut self,
-        basis: Vec<F128>,
-    ) -> (SumcheckMessage256, F128) {
-        assert_eq!(basis.len(), self.f.len());
-        assert!(
-            self.f.par_iter().all(|f| f.c1.is_zero()),
-            "OOD table must be base-valued"
-        );
-        // The table is base-valued right after a code switch and the basis
-        // is base-valued by construction, so the evaluation AND the round
-        // message are three F128 products per pair in one sweep — no F256
-        // promotion of a 2^20 basis, no F256×F256 products. Same field
-        // elements as the promoted form (XOR-additive sums, order-free).
-        let (answer, u_0, u_2) = self
+    /// Introduce the level OOD claim `eq(z, ·)` on the currently split table.
+    /// The answer is one F128 value because every table word is in the
+    /// subfield.
+    ///
+    /// The eq table is never materialized (the challenge tree's lazy OOD):
+    /// it factors exactly as `eq(z, x) = lo[x mod 2^n_lo] · hi[x >> n_lo]`
+    /// ([`build_eq_split`]), so each `hi` block's pair sums run against the
+    /// L1-resident `lo` and are scaled by `hi[e]` once. Three F128 products
+    /// per pair as before, minus the `2^dim` eq build and its two re-reads;
+    /// the same field elements by distributivity (sums are order-free).
+    pub(super) fn introduce_ood_point(&mut self, z: &[F128]) -> (SumcheckMessage256, F128) {
+        assert_eq!(1usize << z.len(), self.f.len());
+        let (lo, hi) = build_eq_split(z, (z.len() / 2).max(1).min(z.len()));
+        // The base-valued invariant (true right after a code switch) is
+        // checked inside the sweep instead of by a separate pass over `f`.
+        let (answer, u_0, u_2, extension) = self
             .f
-            .par_chunks_exact(2)
-            .zip(basis.par_chunks_exact(2))
-            .map(|(fp, bp)| {
-                let (f0, f1) = (fp[0].c0, fp[1].c0);
-                let p0 = f0 * bp[0];
-                (p0 + f1 * bp[1], p0, (f0 + f1) * (bp[0] + bp[1]))
+            .par_chunks_exact(lo.len())
+            .zip(hi.par_iter())
+            .with_min_len((SEQ_MIN_ELEMS / lo.len()).max(1))
+            .map(|(fb, &h)| {
+                let (mut a, mut p, mut q, mut ext) = (F128::ZERO, F128::ZERO, F128::ZERO, false);
+                for (fp, lp) in fb.as_chunks::<2>().0.iter().zip(lo.as_chunks::<2>().0) {
+                    let (f0, f1) = (fp[0].c0, fp[1].c0);
+                    ext |= !(fp[0].c1.is_zero() && fp[1].c1.is_zero());
+                    let p0 = f0 * lp[0];
+                    a += p0 + f1 * lp[1];
+                    p += p0;
+                    q += (f0 + f1) * (lp[0] + lp[1]);
+                }
+                (a * h, p * h, q * h, ext)
             })
             .reduce(
-                || (F128::ZERO, F128::ZERO, F128::ZERO),
-                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+                || (F128::ZERO, F128::ZERO, F128::ZERO, false),
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 | b.3),
             );
+        assert!(!extension, "OOD table must be base-valued");
         let msg = SumcheckMessage256 {
             u_0: F256::from(u_0),
             u_2: F256::from(u_2),
         };
         self.transcript.push(msg);
-        self.pending = Some(PendingBasis::Base(basis));
+        self.pending = Some(PendingBasis::Eq { lo, hi });
         (msg, answer)
     }
 
@@ -1637,20 +1651,28 @@ impl SumcheckProver256 {
         claim: F256,
     ) -> SumcheckMessage256 {
         assert_eq!(2 * basis.len(), self.f.len());
-        assert!(
-            self.f.par_iter().all(|f| f.c1.is_zero()),
-            "presplit intake needs the base-valued post-switch table"
-        );
         // Split basis pairs `(B_j, 0), (0, B_j)` against base-valued pairs
         // `(f_0, f_1)`: `u_0 = Σ f_0·B_j` and `u_2 = Σ (f_0+f_1)·(B_j, B_j)
         // = (S, S)` — two F128 products per pair, no promotion, no split
-        // array. Same field elements as the materialized split form.
-        let (u_0, s) = self
+        // array. Same field elements as the materialized split form. The
+        // base-valued invariant is checked in the same sweep.
+        let (u_0, s, extension) = self
             .f
             .par_chunks_exact(2)
             .zip(basis.par_iter())
-            .map(|(fp, &bj)| (fp[0].c0 * bj, (fp[0].c0 + fp[1].c0) * bj))
-            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
+            .with_min_len(SEQ_MIN_ELEMS / 2)
+            .map(|(fp, &bj)| {
+                let ext = !(fp[0].c1.is_zero() && fp[1].c1.is_zero());
+                (fp[0].c0 * bj, (fp[0].c0 + fp[1].c0) * bj, ext)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO, false),
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 | b.2),
+            );
+        assert!(
+            !extension,
+            "presplit intake needs the base-valued post-switch table"
+        );
         debug_assert_eq!(
             self.f
                 .par_chunks_exact(2)
@@ -1671,16 +1693,23 @@ impl SumcheckProver256 {
     pub(super) fn glue(&mut self, beta: F128) {
         let pending = self.pending.take().expect("glue without introduce");
         match pending {
-            PendingBasis::Base(basis) => {
+            PendingBasis::Eq { lo, hi } => {
                 self.combined_basis
-                    .par_iter_mut()
-                    .zip(basis.par_iter())
-                    .for_each(|(dst, &src)| dst.c0 += src * beta);
+                    .par_chunks_exact_mut(lo.len())
+                    .zip(hi.par_iter())
+                    .with_min_len((SEQ_MIN_ELEMS / lo.len()).max(1))
+                    .for_each(|(dst, &h)| {
+                        let s = h * beta;
+                        for (d, &l) in dst.iter_mut().zip(&lo) {
+                            d.c0 += l * s;
+                        }
+                    });
             }
             PendingBasis::PresplitBase(basis) => {
                 self.combined_basis
                     .par_chunks_exact_mut(2)
                     .zip(basis.par_iter())
+                    .with_min_len(SEQ_MIN_ELEMS / 2)
                     .for_each(|(pair, &bj)| {
                         let v = bj * beta;
                         pair[0].c0 += v;
@@ -2453,7 +2482,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let _t = Instant::now();
     for _ in 0..ood_count(1) {
         let z = challenger.sample_f128_vec(current_split_dim);
-        let (msg, y) = sumcheck.introduce_ood_with_eval(build_eq_scaled_parallel(&z, F128::ONE));
+        let (msg, y) = sumcheck.introduce_ood_point(&z);
         challenger.observe_f128(y);
         ood_values.push(y);
         observe_message(challenger, msg);
@@ -2676,8 +2705,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let _t = Instant::now();
         for _ in 0..ood_count(next_level) {
             let z = challenger.sample_f128_vec(current_split_dim);
-            let (msg, y) =
-                sumcheck.introduce_ood_with_eval(build_eq_scaled_parallel(&z, F128::ONE));
+            let (msg, y) = sumcheck.introduce_ood_point(&z);
             challenger.observe_f128(y);
             ood_values.push(y);
             observe_message(challenger, msg);
@@ -2861,7 +2889,11 @@ pub(crate) fn recursive_verifier_with_basis_succinct<Ch, F>(
     log_n: usize,
     target: F128,
     expected_initial_cap: &[Hash],
-    l0_num_lanes: usize,
+    // The L0 commitment's lane layout, as [`crate::pcs::PcsParams::num_lanes`]:
+    // `None` is the full power-of-two grid with the lanes as the LOW index
+    // bits; `Some(t)` is the lane-major grid (lane = HIGH index bits) with
+    // `t ≤ 2^initial_k` committed lanes — including `t = 2^initial_k`.
+    l0_num_lanes: Option<usize>,
     eval_b_residual: F,
     challenger: &mut Ch,
 ) -> bool
@@ -2899,7 +2931,8 @@ where
     let mut query_nonce = 0usize;
     let mut claim = F256::from(target);
     let mut ood_contexts = Vec::new();
-    let lane_major = l0_num_lanes < 1usize << initial_k;
+    let lane_major = l0_num_lanes.is_some();
+    let l0_num_lanes = l0_num_lanes.unwrap_or(1usize << initial_k);
 
     for _ in 0..ood_count(0) {
         let mut point = challenger.sample_f128_vec(log_n);

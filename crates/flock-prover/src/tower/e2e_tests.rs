@@ -13,11 +13,11 @@ use flock_core::{
 use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
-        ChainLane, ChainProof, DEV_BLOCKS, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online,
-        RootBundle, RootDischargeFailure, SelfCheck, SpineIn, Tower, TowerProver, TowerVerifyError,
-        TowerVk, UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
-        chain_blake_r1cs, chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base,
-        env_pass_base,
+        ChainLane, ChainProof, DEV_BLOCKS, DOMAIN, F128, FlNode, FsChallenger, LaneFamily,
+        LeafOuter, Online, RootBundle, RootDischargeFailure, SelfCheck, SpineIn, Tower,
+        TowerProver, TowerVerifyError, TowerVk, UnionInstance, build_chain_proof,
+        build_first_level_node, build_node_outer_app, chain_blake_r1cs, chain_jagged_params,
+        env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
         envelope::STEADY_OVERRIDE,
         envelope_shape,
         gates_blake3::Rng,
@@ -120,6 +120,7 @@ pub(super) fn chain_spine_converges() {
             params: &chain_jp,
             priors: &[&fls[2].acc, &fls[3].acc],
             claims_base: acc_base,
+            family: LaneFamily::Chain,
         }),
         None,
     );
@@ -155,6 +156,7 @@ pub(super) fn chain_spine_converges() {
             params: &chain_jp,
             priors: &[&fls[1].acc, &base_lane],
             claims_base: acc_base,
+            family: LaneFamily::Chain,
         }),
         Some(SpineIn {
             node_child: 1,
@@ -195,6 +197,7 @@ pub(super) fn chain_spine_converges() {
             params: &chain_jp,
             priors: &[&fls[0].acc, &n2_lane],
             claims_base: acc_base,
+            family: LaneFamily::Chain,
         }),
         Some(SpineIn {
             node_child: 1,
@@ -278,6 +281,7 @@ pub(super) fn chain_spine_converges() {
         registry_digest: n3.acc.registry_digest,
         per_type: Vec::new(),
         per_element: Vec::new(),
+        per_linear: Vec::new(),
         sigma: vec![(base_d, pass[0].1.clone())],
         jagged: vec![(base_d, pass[1].1.clone())],
     };
@@ -345,6 +349,7 @@ pub(super) fn chain_spine_converges() {
             params: &chain_jp,
             priors: &[&fls[0].acc, &n2_lane],
             claims_base: acc_base,
+            family: LaneFamily::Chain,
         }),
         Some(SpineIn {
             node_child: 1,
@@ -454,6 +459,7 @@ pub(super) fn chain_tower_e2e_with_lane() {
         params: &chain_jp,
         priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
+        family: LaneFamily::Chain,
     };
     let out = build_node_outer_app(
         cfg,
@@ -680,6 +686,7 @@ pub(super) fn chain_tower_headline() {
         params: &chain_jp,
         priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
+        family: LaneFamily::Chain,
     };
     let t_in = Instant::now();
     let out = build_node_outer_app(
@@ -873,6 +880,7 @@ pub(super) fn tower_online_bench() {
             params: &chain_jp,
             priors: &[&fl0.acc, &fl1.acc],
             claims_base: fresh.fold_pub_base,
+            family: LaneFamily::Chain,
         }),
         None,
     );
@@ -894,6 +902,7 @@ pub(super) fn tower_online_bench() {
                 params: &chain_jp,
                 priors: &[&fresh.acc, &lane],
                 claims_base: fresh.fold_pub_base,
+                family: LaneFamily::Chain,
             }),
             Some(SpineIn {
                 node_child: 1,
@@ -1355,10 +1364,18 @@ pub(super) fn tower_vk_fingerprint_pinned() {
 // Re-blessed 2026-11-08: spread_w 20 -> 21 (the m33 production leaf's L0
 // depth) moves the three outer circuits and the outer registry; the chain
 // circuit and chain registry are unchanged.
+// Re-blessed 2026-11-10: main merged in (#66–#74). Family H by Horner with
+// the sum-first transpose dot and ĝ on forward Frobenius chains (three
+// envelope element types, mu 22 -> 23), the leaf children's PoW predicate
+// rows and in-circuit nonzero grand products, and the envelope re-fitted to
+// the leanXMSS first-level node (body 2614 -> 3382, ACC_MAIN 832 -> 896,
+// publics 3712 -> 4544) move the three outer circuits and the outer
+// registry. The chain circuit and chain registry are unchanged. Two
+// identical prints.
 const PIN_CHAIN_CIRCUIT: &str = "f7a065447042245cccc573887e714d1a9f754583a7d0f120c9753e51d6037fa3";
-const PIN_FL_CIRCUIT: &str = "97308534c5e654bd93095d2f6222d6536579cea439637b3620cc22c30be24200";
-const PIN_BASE_CIRCUIT: &str = "0622cf2d5b47a52ed6bed77ae37f8cba0aaa27c69192e2b28587ad12fc7f1620";
-const PIN_STEADY_CIRCUIT: &str = "ffec3c4f231711eb0444bdb366e0554ece411f48fc902c7ebc91b5269c97246c";
+const PIN_FL_CIRCUIT: &str = "e901fbb7c585d93a55a9066f32cf4c4619e0cce8ab43ff207648b35f323ab3c5";
+const PIN_BASE_CIRCUIT: &str = "9524b8680950f1b43a888731967a33b9a2b4a65a6ea194e945fa48458ecef111";
+const PIN_STEADY_CIRCUIT: &str = "56f87454d68e9a929980a8d2f2b8b8819109d0810d2a3333871945e2e009e588";
 const PIN_CHAIN_REGISTRY: &str = "c2a387fffa3d06ccf25e341c2faa4e5d9b62015fc3f74a8364206ff08abb24a3";
-const PIN_OUTER_REGISTRY: &str = "a43fd0fc4e667f662a0c3cef7b6bab0f1d4de9aa849e5e1c7cc106d2b2e62940";
-const PIN_PUBLICS_LEN: usize = 3712;
+const PIN_OUTER_REGISTRY: &str = "503617249dcb35d7d766340d0b5a0c3e3fb526bc686f3fb402b3a4ea914b9f1b";
+const PIN_PUBLICS_LEN: usize = 4544;

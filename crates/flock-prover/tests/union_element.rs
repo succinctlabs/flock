@@ -1297,45 +1297,61 @@ fn bundle_digest_merged(
 // Re-pinned 2026-08-31: merged main's profile consolidation (proof-IO v22,
 // Fast = former Fast128 schedule) on top of the BLAKE3 default — both
 // sides' pins were stale. Two deterministic print runs agreed.
+// Re-pinned 2026-10-26 (mix-merged-nu7-128-128 only): the block-first
+// transport now covers every layout whose used columns are all full height,
+// gaps allowed (`pcs::full_height_columns`), not just a full-height prefix.
+// At full counts the BLAKE3 table's 92 used chunk-columns of 128 leave a gap
+// before the element columns, so this fixture's merged sumcheck now binds
+// the dense column coordinates first. The other six fixtures are partial or
+// already a prefix and held byte-identical. Two deterministic print runs
+// agreed.
+// Re-pinned 2026-11-06: proof-IO VERSION 24 -> 25, `Fast` back on the
+// +1/level recursion ladder (rates 1/2/3/4/5, keeping its 16-bit query
+// PoW). All seven fixtures moved (level rates, query counts and
+// caps). Two deterministic print runs agreed.
+// Re-pinned 2026-11-10: #76 merged onto main, proof-IO VERSION 25 -> 26 —
+// the merged open's inner opening is an enum (`MergedInnerOpen`), a
+// variant tag on every merged payload. All seven fixtures moved. Two
+// deterministic print runs agreed.
 #[test]
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "5dfbd9c815612b1d83ca4aa40461af52b2afc19629f631729194f4f9f0f5a895",
+            "61b31a7a9a612ee2adf6a115d683432c8e31a82ecc7afc7ec447fc1b15e7958c",
         ),
         (
             "elem-merged-nu12-2731",
             2731,
-            "bf86fee5cb0cc60316724fa65ff0e93cc0f7a378057e0505e3bea425e1cda159",
+            "82b817eaf9383d6e2e3653879296c028cb92d7c1ccf7df53b4d2de5f127941af",
         ),
         (
             "elem-merged-nu12-0",
             0,
-            "7e3083c59e1da418be85cee410b1be795e06994189b84db3636cd7350342b79e",
+            "cb5baa4ef681d0c83dc3a0e0f8ac77ee659fec1802e6cf08e63e72e42cf64d8d",
         ),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "6c48d468d8b5cd29bdbbf5650092bcc9e47679c696971d380b80326bbf4b4e44",
+            "920d64c9b2500d9c3a42b2573d415b3d91cc0e616151c2b1768a66df4cfb7ae6",
         ),
         (
             "mix-merged-nu7-100-90",
             [100, 90],
-            "94da94fbc0dc14d4729dfb474c05808585daead319a87b9507805249ac6ff464",
+            "570cfc36e09b826ccad6563fc456faf748c53c19a57924363d9228686e0fcb2e",
         ),
         (
             "mix-merged-nu7-0-90",
             [0, 90],
-            "1595a4865e41fb2c8be006e31fe81dfdc23727dbac02244ca3b6fd0acd53e740",
+            "b306a40c299ad311191724257b920b1b42ac6fc20fa466a0d09a54fcf4d16af8",
         ),
         (
             "mix-merged-nu7-100-0",
             [100, 0],
-            "8ea355df858af1224aa71a6bdae94ca764eee28b0788d4794f1e46a8aba52709",
+            "0ae96ef966be0bac5deccefa6350639dac3860029fb7df7ed4237bd1d1ea0ae0",
         ),
     ];
 

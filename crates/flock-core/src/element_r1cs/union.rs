@@ -865,6 +865,7 @@ mod tests {
             const_pin: None,
             class: TableClass::Boolean,
             io_schema: Vec::new(),
+            zeroed_word_cols: Vec::new(),
         }
     }
 

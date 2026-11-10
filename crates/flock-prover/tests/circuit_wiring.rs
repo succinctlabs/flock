@@ -584,7 +584,11 @@ fn g_side_forgery_is_rejected() {
         })
         .collect();
 
-    let proof = WiringProof { gkr, gather };
+    let proof = WiringProof {
+        gkr,
+        gather,
+        bus: None,
+    };
     let mut ch = FsChallenger::new(DOMAIN);
     assert_eq!(
         verify_wiring(&circuit, &public, &proof, &mut ch),
@@ -692,6 +696,7 @@ fn fabricated_witness_fails_recombination() {
     let spliced = WiringProof {
         gkr: fake_proof.gkr.clone(),
         gather: real_gather,
+        bus: None,
     };
     let mut ch = FsChallenger::new(DOMAIN);
     assert_eq!(
@@ -832,6 +837,89 @@ fn element_chain_circuit() {
         )
         .is_err(),
         "a wrong public result must be rejected"
+    );
+}
+
+/// **A public column is checked by the opening.** The product chain with its
+/// multipliers' column wired only to public words, so
+/// [`Circuit::with_public_columns_opened`] takes it out of the grand product.
+/// A prover that runs the chain on other multipliers, publishing the true
+/// ones and its own chain's result, satisfies every gate and every remaining
+/// wire. Only the opening's check of the column against the public words can
+/// catch it, and it does.
+#[test]
+fn public_column_is_checked_by_the_opening() {
+    let (nu, kappa, n) = (12usize, 3usize, 20usize);
+    let registry = element_registry(nu, kappa);
+    let ty = registry.types()[0].element_type().expect("element type");
+
+    let mut rng = Rng::new(0xC4A1_0002);
+    let seed = rng.f128();
+    let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+    let (z, result) = chain_witness(ty, nu, &a, seed);
+    let mut public = vec![seed];
+    public.extend_from_slice(&a);
+    public.push(result);
+    const PUB: usize = 3;
+    let mut wires = vec![vec![Cell::new(PUB, 0), Cell::new(EL_B, 0)]];
+    for i in 0..n {
+        wires.push(vec![Cell::new(PUB, 1 + i), Cell::new(EL_A, i)]);
+    }
+    for i in 0..n - 1 {
+        wires.push(vec![Cell::new(EL_C, i), Cell::new(EL_B, i + 1)]);
+    }
+    wires.push(vec![Cell::new(EL_C, n - 1), Cell::new(PUB, 1 + n)]);
+
+    let union = UnionInstance::new(&registry, vec![n]);
+    let pcs_params = union_pcs_params(&union);
+    let circuit = Circuit::new(&registry, vec![n], public.len(), wires)
+        .expect("valid")
+        .with_public_columns_opened();
+    assert_eq!(
+        circuit.public_columns().map(|(i, _)| i).collect::<Vec<_>>(),
+        vec![EL_A]
+    );
+    let prove_and_verify = |z: &[F128], public: &[F128]| {
+        let z = z.to_vec();
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
+            &union,
+            &circuit,
+            public,
+            &pcs_params,
+            Vec::new(),
+            vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                dst.copy_from_slice(&z)
+            })],
+            &mut ch,
+        );
+        let mut ch = FsChallenger::new(DOMAIN);
+        verify_ligerito_union_circuit(
+            &union,
+            &circuit,
+            public,
+            &[],
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch,
+        )
+    };
+    prove_and_verify(&z, &public).expect("honest chain verifies");
+
+    // The chain over other multipliers, its result published with the true
+    // multipliers.
+    let mut other = a.clone();
+    other[7] += F128::ONE;
+    let (z_other, result_other) = chain_witness(ty, nu, &other, seed);
+    let mut forged = public.clone();
+    forged[1 + n] = result_other;
+    assert!(
+        matches!(
+            prove_and_verify(&z_other, &forged),
+            Err(FlockVerifyError::PcsOpen(_))
+        ),
+        "a multiplier off its public word must be rejected by the opening"
     );
 }
 

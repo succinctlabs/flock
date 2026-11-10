@@ -127,9 +127,7 @@ use {
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
-use crate::r1cs_hashes::common::{
-    BM_V, BmRow, add_carry_parts_v, fused_add3_parts_v, or_bit_row, or_u32_row,
-};
+use crate::r1cs_hashes::common::{BM_V, BmRow, or_u32_row};
 use crate::{
     prover::{UnionSlotProverInput, prove_fast_ligerito_union},
     r1cs_hashes::common::{
@@ -364,22 +362,30 @@ fn out_hi_bit(w: usize, b: usize) -> usize {
 
 /// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
 /// — i.e., `PERM^r [G_MSG_IDX[g]]`.
-fn per_round_msg_idx() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
+const fn per_round_msg_idx() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
     let mut perm = [0usize; 16];
-    for i in 0..16 {
+    let mut i = 0;
+    while i < 16 {
         perm[i] = i;
+        i += 1;
     }
     let mut out = [[[0usize; 2]; N_G_PER_ROUND]; N_ROUNDS];
-    for r in 0..N_ROUNDS {
-        for g in 0..N_G_PER_ROUND {
+    let mut r = 0;
+    while r < N_ROUNDS {
+        let mut g = 0;
+        while g < N_G_PER_ROUND {
             out[r][g][0] = perm[G_MSG_IDX[g][0]];
             out[r][g][1] = perm[G_MSG_IDX[g][1]];
+            g += 1;
         }
         let mut next = [0usize; 16];
-        for i in 0..16 {
+        let mut i = 0;
+        while i < 16 {
             next[i] = perm[MSG_PERMUTATION[i]];
+            i += 1;
         }
         perm = next;
+        r += 1;
     }
     out
 }
@@ -1551,6 +1557,8 @@ pub struct Blake3Setup {
     pub r1cs: BlockR1cs,
     pub registry: Registry,
     pub pcs_params: PcsParams,
+    /// Commit at full height ([`Self::with_full_height_commit`]).
+    full_height: bool,
 }
 
 impl Blake3Setup {
@@ -1587,6 +1595,54 @@ impl Blake3Setup {
 
     /// Build a setup for a named Ligerito profile (fast/slim/secure);
     /// the PCS rate follows the profile.
+    /// Commit every column at full height, the dummy compressions past
+    /// `n_blocks` as zeros, so the opening takes the block-first transport
+    /// whatever `n_blocks` is (as the leanXMSS circuit commits).
+    pub fn with_full_height_commit(mut self) -> Self {
+        self.full_height = true;
+        let union = self.union();
+        let m = union.dense_m();
+        let batch = embedded_initial_k_or_default(m, self.pcs_params.profile);
+        let num_lanes = union.commit_lanes(batch);
+        self.pcs_params.m = m;
+        self.pcs_params.log_batch_size = batch;
+        self.pcs_params.num_lanes = num_lanes;
+        self
+    }
+
+    /// Drop the input words' `x·1 = x` rows (cv, m and the params word)
+    /// from the boolean PIOP ([`TableType::with_zeroed_identity_words`]):
+    /// the zerocheck skips them and the C claim masks them out.
+    pub fn with_zeroed_identity_words(self) -> Self {
+        self.with_table(crate::schedule::TableType::with_zeroed_identity_words)
+    }
+
+    /// [`Self::with_zeroed_identity_words`] plus the four output words,
+    /// whose rows define each bit as an XOR (`(A z)·1 = x`)
+    /// ([`TableType::with_zeroed_linear_words`]): the lincheck checks them.
+    pub fn with_zeroed_linear_words(self) -> Self {
+        self.with_table(crate::schedule::TableType::with_zeroed_linear_words)
+    }
+
+    fn with_table(
+        mut self,
+        f: fn(crate::schedule::TableType) -> crate::schedule::TableType,
+    ) -> Self {
+        let table = crate::schedule::TableType::from_block_r1cs(&self.r1cs);
+        self.registry = Registry::new(vec![f(table)], self.registry.nu());
+        // Warm the digest, as the constructor does.
+        let _ = self.registry.digest();
+        self
+    }
+
+    fn union(&self) -> UnionInstance<'_> {
+        let mut union = UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        if self.full_height {
+            union.set_full_height_commit();
+        }
+        union
+    }
+
     pub fn with_profile(n_blocks: usize, profile: LigeritoProfile) -> Self {
         Self::with_profile_and_rate(n_blocks, profile, profile.log_inv_rate())
     }
@@ -1637,6 +1693,7 @@ impl Blake3Setup {
             r1cs,
             registry,
             pcs_params,
+            full_height: false,
         }
     }
 
@@ -1660,7 +1717,7 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (R1csProofMergedLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let union = UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let union = self.union();
         let slot = UnionSlotProverInput::new(
             generate_witness_batch_major_partial(blocks, self.n_blocks_log()),
             self.r1cs.csc_lincheck_circuit(),
@@ -1674,7 +1731,7 @@ impl Blake3Setup {
         proof: &R1csProofMergedLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, FlockVerifyError> {
-        let union = UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let union = self.union();
         let circuit = self.r1cs.csc_lincheck_circuit();
         let circs: [&dyn LincheckCircuit; 1] = [circuit];
         verify_ligerito_union(
@@ -1698,7 +1755,7 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (R1csProofMergedLigeritoAg, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let union = flock_core::union::UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let union = self.union();
         let nu = self.n_blocks_log();
         // IN-PLACE, not `new`: only this path reaches
         // `UnionInstance::slot_dests`, which is where the union certifies
@@ -1722,7 +1779,7 @@ impl Blake3Setup {
         proof: &R1csProofMergedLigeritoAg,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, FlockVerifyError> {
-        let union = UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let union = self.union();
         let circuit = self.r1cs.csc_lincheck_circuit();
         let circs: [&dyn LincheckCircuit; 1] = [circuit];
         verify_ligerito_union_ag(
@@ -1813,11 +1870,6 @@ impl Blake3Setup {
 // `common::drive_witness_batch_major`.
 // ---------------------------------------------------------------------------
 
-#[inline(always)]
-fn batch_major_xor_rotr(x: &[u32; BM_V], y: &[u32; BM_V], r: u32) -> [u32; BM_V] {
-    from_fn(|j| (x[j] ^ y[j]).rotate_right(r))
-}
-
 struct BmRows<'a> {
     z: &'a mut [BmRow],
     a: &'a mut [BmRow],
@@ -1831,64 +1883,193 @@ fn batch_major_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) 
     or_u32_row(rows.b, bit, &[0xFFFF_FFFF; BM_V]);
 }
 
-#[inline(always)]
-fn batch_major_add_inline(
-    rows: &mut BmRows<'_>,
-    x: &[u32; BM_V],
-    y: &[u32; BM_V],
-    carry_bit: usize,
-) -> [u32; BM_V] {
-    let (sum, left, right, carry) = add_carry_parts_v(x, y);
-    or_u32_row(rows.z, carry_bit, &carry);
-    or_u32_row(rows.a, carry_bit, &left);
-    or_u32_row(rows.b, carry_bit, &right);
-    sum
+/// One lane's run of consecutive bit fields, written to `rows[w][lane]` as
+/// whole words: a word is stored once it is complete and never read back.
+/// The bits below the run's start in its first word are kept, and the last
+/// partial word is OR'd in, so a run that starts or ends mid-word (the DSL
+/// kernel's) leaves its neighbours intact.
+struct LaneWords<'r> {
+    rows: &'r mut [BmRow],
+    lane: usize,
+    word: usize,
+    pending: u64,
+    used: usize,
 }
 
-#[inline(always)]
-fn batch_major_fused_add_inline(
-    rows: &mut BmRows<'_>,
-    x: &[u32; BM_V],
-    y: &[u32; BM_V],
-    m: &[u32; BM_V],
-    maj_bit: usize,
-    rip_bit: usize,
-) -> [u32; BM_V] {
-    let (sum, maj, rip) = fused_add3_parts_v(x, y, m);
-    or_u32_row(rows.z, maj_bit, &maj[2]);
-    or_u32_row(rows.a, maj_bit, &maj[0]);
-    or_u32_row(rows.b, maj_bit, &maj[1]);
-    or_u32_row(rows.z, rip_bit, &rip[2]);
-    or_u32_row(rows.a, rip_bit, &rip[0]);
-    or_u32_row(rows.b, rip_bit, &rip[1]);
-    sum
-}
-
-#[inline(always)]
-fn batch_major_const_add_inline(
-    rows: &mut BmRows<'_>,
-    k: u32,
-    y: &[u32; BM_V],
-    bit: usize,
-    n_rows: usize,
-) -> [u32; BM_V] {
-    let t = CARRY_BITS_PER_ADD - n_rows;
-    let mask = (1u32 << n_rows) - 1;
-    let mut sum = [0u32; BM_V];
-    let mut zc = [0u32; BM_V];
-    let mut ac = [0u32; BM_V];
-    let mut bc = [0u32; BM_V];
-    for j in 0..BM_V {
-        let (s, left, right, carry) = add_carry_parts(k, y[j]);
-        sum[j] = s;
-        zc[j] = (carry >> t) & mask;
-        ac[j] = (left >> t) & mask;
-        bc[j] = (right >> t) & mask;
+impl<'r> LaneWords<'r> {
+    #[inline(always)]
+    fn at(rows: &'r mut [BmRow], lane: usize, bit: usize) -> Self {
+        let (word, used) = (bit >> 6, bit & 63);
+        let pending = if used == 0 {
+            0
+        } else {
+            rows[word][lane] & ((1 << used) - 1)
+        };
+        Self {
+            rows,
+            lane,
+            word,
+            pending,
+            used,
+        }
     }
-    or_u32_row(rows.z, bit, &zc);
-    or_u32_row(rows.a, bit, &ac);
-    or_u32_row(rows.b, bit, &bc);
-    sum
+
+    /// Append a `width`-bit field (`width ≤ 32`, value pre-masked).
+    #[inline(always)]
+    fn push(&mut self, value: u32, width: usize) {
+        let v = value as u64;
+        self.pending |= v << self.used;
+        self.used += width;
+        if self.used >= 64 {
+            self.rows[self.word][self.lane] = self.pending;
+            self.word += 1;
+            self.used -= 64;
+            self.pending = v >> (width - self.used);
+        }
+    }
+
+    #[inline(always)]
+    fn finish(self) {
+        if self.used > 0 {
+            self.rows[self.word][self.lane] |= self.pending;
+        }
+    }
+}
+
+/// `per_round_msg_idx`, as a constant the unrolled rounds index literally.
+const MSG_IDX: [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] = per_round_msg_idx();
+
+/// One compression's G blocks, lane `lane` of the rows, starting at bit
+/// `region` ([`GS_BASE`] in this gate's own block); returns the final state.
+/// All 56 G's are expanded, so every state and message index is a literal
+/// and the state lives in registers, and the fields stream out in bit order
+/// (the block layout is their emission order).
+#[inline(always)]
+fn lane_rounds(
+    rows: &mut BmRows<'_>,
+    lane: usize,
+    region: usize,
+    cv: [u32; 8],
+    m: [u32; 16],
+    params: [u32; 4],
+) -> [u32; 16] {
+    let mut wz = LaneWords::at(rows.z, lane, region);
+    let mut wa = LaneWords::at(rows.a, lane, region);
+    let mut wb = LaneWords::at(rows.b, lane, region);
+    let mut s = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        params[0],
+        params[1],
+        params[2],
+        params[3],
+    ];
+    macro_rules! push3 {
+        ($width:expr, $z:expr, $a:expr, $b:expr) => {{
+            wz.push($z, $width);
+            wa.push($a, $width);
+            wb.push($b, $width);
+        }};
+    }
+    macro_rules! g {
+        ($r:literal, $gi:literal) => {{
+            const G: usize = $r * N_G_PER_ROUND + $gi;
+            const L: [usize; 4] = G_LANES[$gi];
+            const M: [usize; 2] = MSG_IDX[$r][$gi];
+            // Round 1's column G's add the constant IV word (it is still
+            // `s[L[2]]`) and drop the carries below its lowest set bit.
+            const C1_SHIFT: usize = CARRY_BITS_PER_ADD - g_c1_rows(G);
+            let (a, b, c, d) = (s[L[0]], s[L[1]], s[L[2]], s[L[3]]);
+            let (a_1, maj, rip) = fused_add3_parts(a, b, m[M[0]]);
+            push3!(CARRY_BITS_PER_ADD, maj[2], maj[0], maj[1]);
+            push3!(RIPPLE_BITS_PER_FADD, rip[2], rip[0], rip[1]);
+            let d_1 = (d ^ a_1).rotate_right(16);
+            let (c_1, left, right, carry) = add_carry_parts(c, d_1);
+            push3!(
+                g_c1_rows(G),
+                carry >> C1_SHIFT,
+                left >> C1_SHIFT,
+                right >> C1_SHIFT
+            );
+            let b_1 = (b ^ c_1).rotate_right(12);
+            let (a_2, maj, rip) = fused_add3_parts(a_1, b_1, m[M[1]]);
+            push3!(CARRY_BITS_PER_ADD, maj[2], maj[0], maj[1]);
+            push3!(RIPPLE_BITS_PER_FADD, rip[2], rip[0], rip[1]);
+            let d_2 = (d_1 ^ a_2).rotate_right(8);
+            let (c_2, left, right, carry) = add_carry_parts(c_1, d_2);
+            push3!(CARRY_BITS_PER_ADD, carry, left, right);
+            s[L[0]] = a_2;
+            s[L[1]] = (b_1 ^ c_2).rotate_right(7);
+            s[L[2]] = c_2;
+            s[L[3]] = d_2;
+        }};
+    }
+    macro_rules! round {
+        ($r:literal) => {{
+            g!($r, 0);
+            g!($r, 1);
+            g!($r, 2);
+            g!($r, 3);
+            g!($r, 4);
+            g!($r, 5);
+            g!($r, 6);
+            g!($r, 7);
+        }};
+    }
+    round!(0);
+    round!(1);
+    round!(2);
+    round!(3);
+    round!(4);
+    round!(5);
+    round!(6);
+    debug_assert_eq!((wz.word << 6) + wz.used, region + G_REGION_BITS);
+    wz.finish();
+    wa.finish();
+    wb.finish();
+    s
+}
+
+/// The seven rounds of eight compressions, lane by lane ([`lane_rounds`]),
+/// with the G region starting at bit `region`; returns the final state.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn batch_major_rounds(
+    rows: &mut BmRows<'_>,
+    region: usize,
+    cv: &[[u32; BM_V]; 8],
+    m: &[[u32; BM_V]; 16],
+    counter_lo: [u32; BM_V],
+    counter_hi: [u32; BM_V],
+    block_len: [u32; BM_V],
+    flags: [u32; BM_V],
+) -> [[u32; BM_V]; 16] {
+    let mut state = [[0u32; BM_V]; 16];
+    for j in 0..BM_V {
+        let params = [counter_lo[j], counter_hi[j], block_len[j], flags[j]];
+        let s = lane_rounds(
+            rows,
+            j,
+            region,
+            from_fn(|w| cv[w][j]),
+            from_fn(|i| m[i][j]),
+            params,
+        );
+        for (word, v) in state.iter_mut().zip(s) {
+            word[j] = v;
+        }
+    }
+    state
 }
 
 /// Build one V = 8 group of compressions into interleaved rows. Mirrors
@@ -1916,99 +2097,120 @@ pub(crate) fn build_group_batch_major(
     let block_len: [u32; BM_V] = from_fn(|j| inputs[j].3);
     let flags: [u32; BM_V] = from_fn(|j| inputs[j].4);
 
-    or_bit_row(rows.z, Z_CONST_POS);
-    or_bit_row(rows.a, Z_CONST_POS);
-    or_bit_row(rows.b, Z_CONST_POS);
-
-    for w in 0..8 {
-        batch_major_write_lin(&mut rows, chaining_value_bit(w, 0), &cv[w]);
+    // Every row in `[0, USEFUL_BITS / 64]` is stored whole, so the driver
+    // need not clear them: the I/O words here, the G region streamed, and
+    // the pin's word (the G region's last) stored before the stream ORs its
+    // tail in.
+    let pin_word = Z_CONST_POS / 64;
+    debug_assert_eq!(pin_word, (G_BASE[N_G] - 1) / 64);
+    for r in [&mut *rows.z, &mut *rows.a, &mut *rows.b] {
+        r[pin_word] = [1 << (Z_CONST_POS % 64); BM_V];
     }
-    for i in 0..16 {
-        batch_major_write_lin(&mut rows, m_bit(i, 0), &m[i]);
+    store_lin_words(&mut rows, CV_BASE, &cv);
+    store_lin_words(&mut rows, M_BASE, &m);
+    store_lin_words(
+        &mut rows,
+        T_LO_BASE,
+        &[counter_lo, counter_hi, block_len, flags],
+    );
+
+    let state = batch_major_rounds(
+        &mut rows, GS_BASE, &cv, &m, counter_lo, counter_hi, block_len, flags,
+    );
+
+    let lo: [[u32; BM_V]; 8] = from_fn(|w| from_fn(|j| state[w][j] ^ state[w + 8][j]));
+    let hi: [[u32; BM_V]; 8] = from_fn(|w| from_fn(|j| state[w + 8][j] ^ cv[w][j]));
+    store_lin_words(&mut rows, OUT_LO_BASE, &lo);
+    store_lin_words(&mut rows, OUT_HI_BASE, &hi);
+}
+
+/// Store consecutive 32-bit I/O words from the word-aligned bit `bit` as
+/// whole rows: `z = a =` the values, `b` all ones (`x·1 = x`).
+fn store_lin_words<const N: usize>(rows: &mut BmRows<'_>, bit: usize, vals: &[[u32; BM_V]; N]) {
+    debug_assert_eq!(bit % 64, 0);
+    for (k, [lo, hi]) in vals.as_chunks::<2>().0.iter().enumerate() {
+        let word: BmRow = from_fn(|j| lo[j] as u64 | (hi[j] as u64) << 32);
+        rows.z[bit / 64 + k] = word;
+        rows.a[bit / 64 + k] = word;
+        rows.b[bit / 64 + k] = [u64::MAX; BM_V];
     }
-    batch_major_write_lin(&mut rows, T_LO_BASE, &counter_lo);
-    batch_major_write_lin(&mut rows, T_HI_BASE, &counter_hi);
-    batch_major_write_lin(&mut rows, BLEN_BASE, &block_len);
-    batch_major_write_lin(&mut rows, FLAGS_BASE, &flags);
+}
 
-    let mut state: [[u32; BM_V]; 16] = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
-        [BLAKE3_IV[0]; BM_V],
-        [BLAKE3_IV[1]; BM_V],
-        [BLAKE3_IV[2]; BM_V],
-        [BLAKE3_IV[3]; BM_V],
-        counter_lo,
-        counter_hi,
-        block_len,
-        flags,
-    ];
-    let msg_idx = per_round_msg_idx();
-    for r in 0..N_ROUNDS {
-        for g_in_round in 0..N_G_PER_ROUND {
-            let g = r * N_G_PER_ROUND + g_in_round;
-            let [la, lb, lc, ld] = G_LANES[g_in_round];
-            let [mx_i, my_i] = msg_idx[r][g_in_round];
-            let mx = m[mx_i];
-            let my = m[my_i];
+/// Bits of the G blocks: the region a compression's carries occupy.
+pub const G_REGION_BITS: usize = G_BASE[N_G] - GS_BASE;
 
-            let a_val = state[la];
-            let b_val = state[lb];
-            let c_val = state[lc];
-            let d_val = state[ld];
+/// The hand-written generator as the kernel of the DSL's `blake3.compress`
+/// operation ([`super::blake3_dsl::compress_op`]): its G blocks, laid out as
+/// this gate's own from the operation's first column, then the materialized
+/// `out_lo`. Arguments: `cv`, the block, the counter, the block length and
+/// the flags, 896 bits.
+pub struct Blake3Kernel;
 
-            let a_1 = batch_major_fused_add_inline(
-                &mut rows,
-                &a_val,
-                &b_val,
-                &mx,
-                g_bit(g, OFF_MAJ1),
-                g_bit(g, OFF_RIP1),
-            );
-            let d_1 = batch_major_xor_rotr(&d_val, &a_1, 16);
-            let c_1 = if g < 4 {
-                batch_major_const_add_inline(
-                    &mut rows,
-                    BLAKE3_IV[g],
-                    &d_1,
-                    g_bit(g, OFF_C1),
-                    g_c1_rows(g),
-                )
-            } else {
-                batch_major_add_inline(&mut rows, &c_val, &d_1, g_bit(g, OFF_C1))
-            };
-            let b_1 = batch_major_xor_rotr(&b_val, &c_1, 12);
-            let a_2 = batch_major_fused_add_inline(
-                &mut rows,
-                &a_1,
-                &b_1,
-                &my,
-                g_bit(g, off_maj2(g)),
-                g_bit(g, off_rip2(g)),
-            );
-            let d_2 = batch_major_xor_rotr(&d_1, &a_2, 8);
-            let c_2 = batch_major_add_inline(&mut rows, &c_1, &d_2, g_bit(g, off_c2(g)));
-            let b_new = batch_major_xor_rotr(&b_1, &c_2, 7);
-            let d_new = d_2;
+impl flock_core::circuit::boolean::OperationKernel for Blake3Kernel {
+    fn arg_bits(&self) -> usize {
+        28 * WORD_BITS
+    }
 
-            state[la] = a_2;
-            state[lb] = b_new;
-            state[lc] = c_2;
-            state[ld] = d_new;
+    fn width(&self) -> usize {
+        G_REGION_BITS + 8 * WORD_BITS
+    }
+
+    fn fill8(
+        &self,
+        args: [&[u64]; 8],
+        base: usize,
+        z: &mut [[u64; 8]],
+        a: &mut [[u64; 8]],
+        b: &mut [[u64; 8]],
+    ) {
+        self.fill8_inline(args, base, z, a, b);
+    }
+}
+
+impl Blake3Kernel {
+    /// [`OperationKernel::fill8`], inlined into its caller: one whose `base`
+    /// is a constant mod 64 (`64·w + c`) gets every field's shift and every
+    /// word boundary resolved at compile time, as the hand-written layout
+    /// does — through the trait, `base` is a runtime value.
+    ///
+    /// When the G blocks end on a word boundary, every word of the run is
+    /// stored whole, the bits below `base` in its first word kept: such a
+    /// caller need not clear the run first.
+    ///
+    /// [`OperationKernel::fill8`]: flock_core::circuit::boolean::OperationKernel::fill8
+    #[inline(always)]
+    pub fn fill8_inline(
+        &self,
+        args: [&[u64]; 8],
+        base: usize,
+        z: &mut [[u64; 8]],
+        a: &mut [[u64; 8]],
+        b: &mut [[u64; 8]],
+    ) {
+        let word =
+            |i: usize| -> [u32; BM_V] { from_fn(|j| (args[j][i / 2] >> (32 * (i % 2))) as u32) };
+        let cv: [[u32; BM_V]; 8] = from_fn(word);
+        let m: [[u32; BM_V]; 16] = from_fn(|i| word(8 + i));
+        let mut rows = BmRows { z, a, b };
+        let state = batch_major_rounds(
+            &mut rows,
+            base,
+            &cv,
+            &m,
+            word(24),
+            word(25),
+            word(26),
+            word(27),
+        );
+        let lo: [[u32; BM_V]; 8] = from_fn(|w| from_fn(|j| state[w][j] ^ state[w + 8][j]));
+        let out = base + G_REGION_BITS;
+        if out.is_multiple_of(64) {
+            store_lin_words(&mut rows, out, &lo);
+        } else {
+            for (w, lo) in lo.iter().enumerate() {
+                batch_major_write_lin(&mut rows, out + w * WORD_BITS, lo);
+            }
         }
-    }
-
-    for w in 0..8 {
-        let lo: [u32; BM_V] = from_fn(|j| state[w][j] ^ state[w + 8][j]);
-        let hi: [u32; BM_V] = from_fn(|j| state[w + 8][j] ^ cv[w][j]);
-        batch_major_write_lin(&mut rows, out_lo_bit(w, 0), &lo);
-        batch_major_write_lin(&mut rows, out_hi_bit(w, 0), &hi);
     }
 }
 
@@ -2084,6 +2286,76 @@ pub fn generate_witness_batch_major_partial_into(
         dst,
         build_group_batch_major,
     )
+}
+
+/// One BLAKE3 compression as a wiring-layer gate type, wired as
+/// [`io_schema`] lays out: inputs `cv` (2 words), `m` (4 words) and the
+/// params word ([`params_word`]), outputs `out_lo` (2 words, the next
+/// chaining value) and `out_hi` (2 words). The relation pins none of the
+/// inputs, so a circuit wires `cv` and the params word to constants or to
+/// other gates' outputs.
+pub struct Blake3Gate {
+    pub nu: usize,
+}
+
+/// The params word: the 64-bit block counter in `lo`; `block_len` in the low
+/// half of `hi` and `flags` in its high half.
+pub fn params_word(counter: u64, block_len: u32, flags: u32) -> F128 {
+    F128::new(counter, block_len as u64 | (flags as u64) << 32)
+}
+
+/// Eight `u32`s as two words, four little-endian `u32`s per word.
+fn pack_u32x8(w: &[u32]) -> [F128; 2] {
+    let word = |w: &[u32]| {
+        F128::new(
+            w[0] as u64 | (w[1] as u64) << 32,
+            w[2] as u64 | (w[3] as u64) << 32,
+        )
+    };
+    [word(&w[..4]), word(&w[4..8])]
+}
+
+fn unpack_u32x4(v: F128) -> [u32; 4] {
+    [
+        v.lo as u32,
+        (v.lo >> 32) as u32,
+        v.hi as u32,
+        (v.hi >> 32) as u32,
+    ]
+}
+
+impl flock_core::circuit::builder::GateType for Blake3Gate {
+    type Row = Compression;
+    type Hint = ();
+
+    fn table(&self) -> flock_core::schedule::TableType {
+        flock_core::schedule::TableType::from_block_r1cs(&build_block_r1cs(self.nu))
+            .with_io_schema(io_schema())
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Compression {
+        let mut cv = [0u32; 8];
+        cv[..4].copy_from_slice(&unpack_u32x4(inputs[0]));
+        cv[4..].copy_from_slice(&unpack_u32x4(inputs[1]));
+        let mut m = [0u32; 16];
+        for (i, chunk) in m.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *chunk = unpack_u32x4(inputs[2 + i]);
+        }
+        let params = inputs[6];
+        let (counter, block_len, flags) = (params.lo, params.hi as u32, (params.hi >> 32) as u32);
+        let out = flock_hash::blake3_compress(&cv, &m, counter, block_len, flags);
+        outputs.extend(pack_u32x8(&out[..8]));
+        outputs.extend(pack_u32x8(&out[8..]));
+        (cv, m, counter, block_len, flags)
+    }
+
+    fn witness(
+        &self,
+        _rows: &[Compression],
+        _nu: usize,
+    ) -> flock_core::circuit::builder::SlotWitness {
+        flock_core::circuit::builder::SlotWitness::DeferredToRows
+    }
 }
 
 #[cfg(test)]
@@ -2603,6 +2875,107 @@ mod tests {
         let mut ch_p2 = FsChallenger::new(b"flock-union-ag-part");
         let (proof2, _, _) = setup.prove_fast_union_ag(&blocks, &mut ch_p2);
         assert_eq!(proof, proof2, "re-prove over pooled-dirty buffers");
+    }
+
+    fn random_blocks(n: usize, seed: u64) -> Vec<Compression> {
+        let mut rng = Rng::new(seed);
+        (0..n)
+            .map(|_| {
+                let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64u32, 11u32)
+            })
+            .collect()
+    }
+
+    /// The IO words: inputs, or inputs and outputs, ascending.
+    #[cfg(target_arch = "aarch64")]
+    fn io_words(outputs: bool) -> Vec<usize> {
+        let mut words: Vec<usize> = io_schema()
+            .iter()
+            .filter(|w| outputs || w.dir == IoDirection::In)
+            .map(|w| w.word_col)
+            .collect();
+        words.sort_unstable();
+        words
+    }
+
+    /// Degree-one words dropped from the zerocheck — the input words alone
+    /// (`x·1 = x`), or also the XORed output words — prove → verify through
+    /// the materialized weight (jagged) and the block-first opening (full
+    /// height), and the proof does not verify for the registry that keeps
+    /// the rows. At full height a partial slot commits dummy rows, so it
+    /// keeps its words ([`UnionInstance::zeroed_word_cols`]); a full one
+    /// drops them.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn zeroed_words_roundtrip() {
+        for (n, linear, full_height, drops) in [
+            (200, false, false, true),
+            (200, true, false, true),
+            (200, true, true, false),
+            (256, true, true, true),
+        ] {
+            let blocks = random_blocks(n, 0x2E80_1D5);
+            let setup = |zeroed: bool| {
+                let mut s = Blake3Setup::new(n);
+                if zeroed && linear {
+                    s = s.with_zeroed_linear_words();
+                } else if zeroed {
+                    s = s.with_zeroed_identity_words();
+                }
+                if full_height {
+                    s = s.with_full_height_commit();
+                }
+                s
+            };
+            let zeroed = setup(true);
+            let words = io_words(linear);
+            assert_eq!(zeroed.registry.boolean_types()[0].zeroed_word_cols, words);
+            let union = zeroed.union();
+            let dropped: &[usize] = if drops { &words } else { &[] };
+            assert_eq!(union.zeroed_word_cols(0), dropped);
+            assert_eq!(union.checks_linear_rows(), linear && drops);
+            let case = format!("n {n}, linear {linear}, full height {full_height}");
+            let mut ch = FsChallenger::new(b"flock-zeroed-words");
+            let (proof, commitment, claim_p) = zeroed.prove_fast_union_ag(&blocks, &mut ch);
+            let mut ch = FsChallenger::new(b"flock-zeroed-words");
+            let claim_v = zeroed
+                .verify_union_ag(&commitment, &proof, &mut ch)
+                .unwrap_or_else(|e| panic!("zeroed words rejected ({case}): {e:?}"));
+            assert_eq!(claim_p, claim_v);
+            let mut ch = FsChallenger::new(b"flock-zeroed-words");
+            assert!(
+                setup(false)
+                    .verify_union_ag(&commitment, &proof, &mut ch)
+                    .is_err(),
+                "a zeroed-words proof verified for the plain registry ({case})"
+            );
+        }
+    }
+
+    /// The RS zerocheck (the x86 default) with the input and output words
+    /// dropped: prove → verify, and the plain registry rejects the proof.
+    #[test]
+    fn zeroed_linear_words_roundtrip_rs() {
+        let n = 200;
+        let blocks = random_blocks(n, 0x2E80_1D6);
+        let zeroed = Blake3Setup::new(n).with_zeroed_linear_words();
+        assert!(zeroed.union().checks_linear_rows());
+        let mut ch = FsChallenger::new(b"flock-zeroed-words-rs");
+        let (proof, commitment, claim_p) = zeroed.prove_fast(&blocks, &mut ch);
+        let mut ch = FsChallenger::new(b"flock-zeroed-words-rs");
+        let claim_v = zeroed
+            .verify(&commitment, &proof, &mut ch)
+            .unwrap_or_else(|e| panic!("zeroed words rejected (RS): {e:?}"));
+        assert_eq!(claim_p, claim_v);
+        let mut ch = FsChallenger::new(b"flock-zeroed-words-rs");
+        assert!(
+            Blake3Setup::new(n)
+                .verify(&commitment, &proof, &mut ch)
+                .is_err(),
+            "a zeroed-words proof verified for the plain registry"
+        );
     }
 
     #[test]

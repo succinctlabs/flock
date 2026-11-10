@@ -1,7 +1,11 @@
 use std::{array::from_fn, iter::repeat_n};
 
 use flock_core::{
-    circuit::{CellSlot, CellSpace, SigmaAssertion, builder::SlotId},
+    circuit::{
+        CellSlot, Circuit, SigmaAssertion,
+        builder::SlotId,
+        bus::{Bus, BusColumn, BusDirection, BusStructure},
+    },
     genus95_curve_code::EvaluationPoint,
     zerocheck::{K_SKIP, univariate_skip::build_eq},
 };
@@ -10,6 +14,7 @@ use flock_hash::blake3_compress;
 use flock_transcript::challenger::has_leading_zero_bits;
 
 use crate::{
+    r1cs_hashes::fs_chain::FsChainTrace,
     schedule::Registry,
     tower::{
         CHUNK_END, CHUNK_START, F128, IV, PdRec, ROOT, ShapeBuilder, UnionInstance, Wire,
@@ -29,9 +34,29 @@ pub(super) struct GkrRec {
     pub(super) alpha_fin: usize,
     pub(super) beta_fin: usize,
     pub(super) top_v: usize,
+    /// The grand product's top, native (`top_lhs`): its inverse is the
+    /// witness of the in-circuit nonzero check ([`emit_nonzero_top`]).
+    pub(super) top: F128,
     pub(super) layers: Vec<GkrLayerRec>,
     pub(super) fgs_v: usize, // f_eval, g_eval, s_sigma consecutive
     pub(super) r_pt: Vec<F128>,
+}
+
+/// The tuple bus's region, located on the tape: β and the γs, the top
+/// pair, the layers (the wiring's shape), and where the walk lands — the
+/// point `(ρ_row, ρ_port)` and both leaf claims, which the side
+/// reconstruction must reproduce.
+pub(super) struct BusRec {
+    pub(super) beta_fin: usize,
+    pub(super) beta_ch: usize,
+    pub(super) gamma_fins: Vec<usize>,
+    pub(super) top_v: usize,
+    /// The bus product's top, native ([`GkrRec::top`]).
+    pub(super) top: F128,
+    pub(super) layers: Vec<GkrLayerRec>,
+    pub(super) r_pt: Vec<F128>,
+    pub(super) claim_l: F128,
+    pub(super) claim_r: F128,
 }
 
 /// **THE RECOMBINATION (round 4), pinned natively.** The wiring verifier's
@@ -48,7 +73,7 @@ pub(super) struct GkrRec {
 /// Returns `num_public_slots` (the emitters derive everything else from the
 /// gather count and `n_log_i`; `cells.nu()` is asserted against it here).
 pub(super) fn pin_recombination(
-    cells: &CellSpace,
+    circuit: &Circuit,
     n_log_i: usize,
     public: &[F128],
     gather: &[F128],
@@ -58,14 +83,12 @@ pub(super) fn pin_recombination(
     r_pt: &[F128],
     fgs_v: usize,
 ) -> usize {
+    let cells = circuit.cells();
     let (nu_c, c_bits) = (cells.nu(), cells.c_bits());
     assert_eq!(nu_c, n_log_i, "the cell space's row vars are the union's");
     assert_eq!(r_pt.len(), nu_c + c_bits, "ρ spans the cell space");
-    assert_eq!(
-        gather.len(),
-        cells.num_gate_slots(),
-        "one gather per gate slot"
-    );
+    let gathered = circuit.gathered_slots();
+    assert_eq!(gather.len(), gathered.len(), "one gather per gathered slot");
     assert_eq!(
         gammas.len(),
         n_el_pd + gather.len(),
@@ -79,22 +102,17 @@ pub(super) fn pin_recombination(
             n_el_pd + i
         );
     }
+    // Every slot sits at its grand-product position (packing moves them;
+    // pruned and public columns are dead there).
     let eq_row = build_eq(&r_pt[..nu_c]);
     let eq_slot = build_eq(&r_pt[nu_c..]);
     let mut acc = F128::ZERO;
+    for (&iota, &g) in gathered.iter().zip(gather) {
+        acc += eq_slot[circuit.gkr_slot(iota)] * g;
+    }
     for (iota, slot) in cells.slots().iter().enumerate() {
-        match *slot {
-            CellSlot::Gate { .. } => acc += eq_slot[iota] * gather[iota],
-            CellSlot::Public { s } => {
-                let base = s << nu_c;
-                let hi = ((base + (1usize << nu_c)).min(public.len())).saturating_sub(base);
-                let mut v = F128::ZERO;
-                for j in 0..hi {
-                    v += eq_row[j] * public[base + j];
-                }
-                acc += eq_slot[iota] * v;
-            }
-            CellSlot::Pad => {}
+        if let CellSlot::Public { s } = *slot {
+            acc += eq_slot[circuit.gkr_slot(iota)] * circuit.public_slot_eval(s, &eq_row, public);
         }
     }
     assert_eq!(
@@ -107,6 +125,257 @@ pub(super) fn pin_recombination(
         "f_eval == g_eval on the stream"
     );
     cells.num_public_slots()
+}
+
+/// The recombination's slot positions in the grand product: each gathered
+/// slot's, then each public slot's in segment order.
+pub(super) fn recombination_positions(circuit: &Circuit) -> (Vec<usize>, Vec<usize>) {
+    let gathered = circuit
+        .gathered_slots()
+        .into_iter()
+        .map(|iota| circuit.gkr_slot(iota))
+        .collect();
+    let mut public: Vec<(usize, usize)> = circuit
+        .cells()
+        .slots()
+        .iter()
+        .enumerate()
+        .filter_map(|(iota, slot)| match *slot {
+            CellSlot::Public { s } => Some((s, circuit.gkr_slot(iota))),
+            _ => None,
+        })
+        .collect();
+    public.sort_unstable();
+    (gathered, public.into_iter().map(|(_, q)| q).collect())
+}
+
+/// The product-GKR layer recursion in-circuit, from the agreed top pair
+/// (a copy constraint): per layer the λ-combined running claim through
+/// `ZcRoundGate` rounds (`g0` advice, zero deltas), the close
+/// `run == vl0·vl1 + λ·(vr0·vr1)`, and the `c_k` fold of both claims.
+/// Returns the final left and right leaf-claim wires and the point wires.
+/// Both grand products — the wiring's and the bus's — run this shape.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_gkr_layers(
+    sb: &mut ShapeBuilder,
+    macs: SlotId,
+    zcr: SlotId,
+    layers: &[GkrLayerRec],
+    top_v: usize,
+    top: F128,
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    vals: &mut Vec<F128>,
+    zw: Wire,
+    ow: Wire,
+    zassert: Wire,
+) -> (Wire, Wire, Vec<Wire>) {
+    let (mut cl_w, mut cr_w) = (wv(top_v), wv(top_v + 1));
+    sb.connect(cl_w, cr_w);
+    emit_nonzero_top(sb, macs, cl_w, top, vals, ow, zassert);
+    let mut pt_w: Vec<Wire> = Vec::new();
+    for lr in layers {
+        let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
+        let mut run_w = sb.gate(macs, &[cl_w, lam_w, cr_w])[0];
+        let mut pt_next: Vec<Wire> = Vec::with_capacity(lr.rounds.len() + 1);
+        for (t2, &(gv, rfin)) in lr.rounds.iter().enumerate() {
+            let rho_w = outs[trace.squeezes[rfin][0]][0];
+            vals.push(lr.g0s[t2]);
+            let g0w = sb.input();
+            let o = sb.gate(zcr, &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow]);
+            sb.connect(o[0], zassert);
+            run_w = o[1];
+            pt_next.push(rho_w);
+        }
+        // The layer close: run == vl0·vl1 + lambda·(vr0·vr1).
+        let (vl0, vl1) = (wv(lr.v_v), wv(lr.v_v + 1));
+        let (vr0, vr1) = (wv(lr.v_v + 2), wv(lr.v_v + 3));
+        let pl = sb.gate(macs, &[zw, vl0, vl1])[0];
+        let pr = sb.gate(macs, &[zw, vr0, vr1])[0];
+        let gate_w = sb.gate(macs, &[pl, lam_w, pr])[0];
+        sb.connect(gate_w, run_w);
+        // The claim fold: claim' = v0 + c·(v0 + v1).
+        let ck_w = outs[trace.squeezes[lr.ck_fin][0]][0];
+        let sl = sb.gate(macs, &[vl0, vl1, ow])[0];
+        let sr = sb.gate(macs, &[vr0, vr1, ow])[0];
+        cl_w = sb.gate(macs, &[vl0, ck_w, sl])[0];
+        cr_w = sb.gate(macs, &[vr0, ck_w, sr])[0];
+        pt_next.push(ck_w);
+        pt_w = pt_next;
+    }
+    (cl_w, cr_w, pt_w)
+}
+
+/// Reject a ZERO grand product in-circuit. The two tops are `connect`ed
+/// equal, but a product of `w + 1`-shaped leaves is zero as soon as one
+/// leaf is (a dead cell holding an io word of 1, a bus factor that
+/// vanishes), and two zero products agree whatever the rest of the
+/// multisets hold. A private witness `t = top⁻¹` and one MAC row
+/// `1 + top·t` on the assert-zero anchor force `top·t = 1`, so `top ≠ 0`.
+/// The native verifier makes the same check (`verify_reduction` rejects
+/// `top_lhs == 0`).
+pub(super) fn emit_nonzero_top(
+    sb: &mut ShapeBuilder,
+    macs: SlotId,
+    top_w: Wire,
+    top: F128,
+    vals: &mut Vec<F128>,
+    ow: Wire,
+    zassert: Wire,
+) {
+    assert_ne!(top, F128::ZERO, "an accepted grand product is nonzero");
+    vals.push(top.inv());
+    let t = sb.input();
+    let one_plus = sb.gate(macs, &[ow, top_w, t])[0];
+    sb.connect(one_plus, zassert);
+}
+
+/// The tuple bus in-circuit: its grand product's layers
+/// ([`emit_gkr_layers`]), then each side rebuilt from wires —
+/// `1 + Σ_p eq(ρ_port, p)·[(β + 1)·E_p + Σ_k γ_k·(c_k·E_p + ŵ_k + T_k)]` —
+/// and connected to the walk's leaf claims. β and the γs are squeeze
+/// wires, `ŵ_k` the bus gathers' pd value wires, `eq(ρ_port, ·)` MAC rows
+/// over the port bits, and the static columns `E_p`, `T_k` advice wires
+/// that the parent binds through the circuit-structure claims
+/// ([`circuit_structure_claim_wires`]). Returns the point wires and the
+/// column value wires.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_bus(
+    sb: &mut ShapeBuilder,
+    macs: SlotId,
+    zcr: SlotId,
+    circuit: &Circuit,
+    br: &BusRec,
+    structure: &BusStructure,
+    gather_w: &[Wire],
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+    zw: Wire,
+    ow: Wire,
+    zassert: Wire,
+) -> (Vec<Wire>, Vec<Wire>) {
+    let bus = circuit.bus().expect("a bus region needs a bus");
+    let nu = circuit.cells().nu();
+    let (cl_w, cr_w, pt_w) = emit_gkr_layers(
+        sb, macs, zcr, &br.layers, br.top_v, br.top, trace, outs, wv, vals, zw, ow, zassert,
+    );
+    assert_eq!(
+        pt_w.len(),
+        nu + bus.c_bits(),
+        "the bus point spans rows and ports"
+    );
+    let beta_w = outs[trace.squeezes[br.beta_fin][0]][0];
+    let gamma_w: Vec<Wire> = br
+        .gamma_fins
+        .iter()
+        .map(|&f| outs[trace.squeezes[f][0]][0])
+        .collect();
+    let cols = bus.structure_columns();
+    let col_w: Vec<Wire> = structure
+        .values
+        .iter()
+        .map(|&v| {
+            vals.push(v);
+            sb.input()
+        })
+        .collect();
+    let words = bus.words();
+    assert_eq!(gather_w.len(), words.len(), "one gather wire per bus word");
+    let n_ports = bus
+        .side(BusDirection::Send)
+        .len()
+        .max(bus.side(BusDirection::Recv).len());
+    let eq_port_w = emit_eq_prefix(sb, macs, &pt_w[nu..], n_ports, zw, ow);
+    for (dir, claim_w) in [(BusDirection::Send, cl_w), (BusDirection::Recv, cr_w)] {
+        let mut acc = ow;
+        for (g, port) in bus.side(dir).into_iter().enumerate() {
+            let mass = col_w[Bus::column_index(&cols, BusColumn::Live { ty: port.ty })];
+            // (β + 1)·E_p
+            let mut inner = sb.gate(macs, &[mass, beta_w, mass])[0];
+            for (term, &gk) in port.terms.iter().zip(&gamma_w) {
+                let mut value = zw;
+                if !term.constant.is_zero() {
+                    let c = cw(sb, vals, consts, term.constant);
+                    value = sb.gate(macs, &[value, c, mass])[0];
+                }
+                if let Some(iota) = term.word {
+                    let gw = gather_w[words.binary_search(&iota).expect("a bus word")];
+                    value = sb.gate(macs, &[value, gw, ow])[0];
+                }
+                if let Some(tag) = term.row {
+                    let tw = col_w[Bus::column_index(&cols, BusColumn::Tag { ty: port.ty, tag })];
+                    value = sb.gate(macs, &[value, tw, ow])[0];
+                }
+                inner = sb.gate(macs, &[inner, gk, value])[0];
+            }
+            acc = sb.gate(macs, &[acc, eq_port_w[g], inner])[0];
+        }
+        sb.connect(acc, claim_w);
+    }
+    (pt_w, col_w)
+}
+
+/// **The bus's side reconstruction, pinned natively** — the twin of
+/// [`pin_recombination`] for the tuple bus (`bus::verify_bus`): each side
+/// is `1 + Σ_p eq(ρ_port, p)·[(β + 1)·E_p + Σ_k γ_k·(c_k·E_p + ŵ_k + T_k)]`
+/// from located words — β and the γs, the bus gathers' pd values — and the
+/// deferred static columns (`E_p`, `T_k`) the sigma assertion carries. It
+/// must land on the walk's leaf claims; the emitter wires the same sum.
+pub(super) fn pin_bus_sides(
+    circuit: &Circuit,
+    bus: &Bus,
+    br: &BusRec,
+    chals: &[F128],
+    gather: &[F128],
+    structure: &BusStructure,
+) {
+    let nu = circuit.cells().nu();
+    assert_eq!(
+        structure.rho_row,
+        br.r_pt[..nu],
+        "the bus columns sit at the walk's row point"
+    );
+    let cols = bus.structure_columns();
+    assert_eq!(structure.values.len(), cols.len(), "one value per column");
+    let words = bus.words();
+    assert_eq!(gather.len(), words.len(), "one gather per bus word");
+    let beta = chals[br.beta_ch];
+    let gamma: Vec<F128> = (0..bus.width).map(|k| chals[br.beta_ch + 1 + k]).collect();
+    let eq_port = build_eq(&br.r_pt[nu..]);
+    let column = |col: BusColumn| structure.values[Bus::column_index(&cols, col)];
+    let side = |dir: BusDirection| -> F128 {
+        let mut acc = F128::ONE;
+        for (g, port) in bus.side(dir).into_iter().enumerate() {
+            let mass = column(BusColumn::Live { ty: port.ty });
+            let mut inner = (beta + F128::ONE) * mass;
+            for (term, &gk) in port.terms.iter().zip(&gamma) {
+                let mut value = term.constant * mass;
+                if let Some(iota) = term.word {
+                    value += gather[words.binary_search(&iota).expect("a bus word")];
+                }
+                if let Some(tag) = term.row {
+                    value += column(BusColumn::Tag { ty: port.ty, tag });
+                }
+                inner += gk * value;
+            }
+            acc += eq_port[g] * inner;
+        }
+        acc
+    };
+    assert_eq!(
+        side(BusDirection::Send),
+        br.claim_l,
+        "the send side rebuilds"
+    );
+    assert_eq!(
+        side(BusDirection::Recv),
+        br.claim_r,
+        "the receive side rebuilds"
+    );
 }
 
 /// The eq table's `live` prefix over `point_w` wires (LSB-first —
@@ -155,6 +424,8 @@ pub(super) fn circuit_structure_claim_wires(
     boolean_values: &[(usize, Wire)],
     element_point: Option<&[Wire]>,
     element_values: Option<(Wire, Wire)>,
+    bus: Option<(&[Wire], &[Wire])>,
+    public_columns: Option<(&[Wire], &[Wire])>,
     zw: Wire,
     ow: Wire,
 ) -> Vec<(Vec<Wire>, Vec<Wire>, Wire)> {
@@ -198,6 +469,39 @@ pub(super) fn circuit_structure_claim_wires(
             col.extend_from_slice(&selector(plane));
             out.push((vec![zw; sigma.nu], col, value_w));
         }
+    }
+    // The bus's static columns at its row point: plane 6, one column each.
+    if let Some(structure) = &sigma.bus {
+        let (row_w, value_w) = bus.expect("bus structure wires");
+        assert_eq!(row_w.len(), structure.rho_row.len(), "bus row point width");
+        assert_eq!(value_w.len(), structure.values.len(), "bus column wires");
+        for (c, &vw) in value_w.iter().enumerate() {
+            let mut col: Vec<Wire> = (0..sigma.base_bits).map(|j| bit((c >> j) & 1)).collect();
+            col.extend_from_slice(&selector(6));
+            out.push((row_w.to_vec(), col, vw));
+        }
+    } else {
+        assert!(bus.is_none(), "bus wires without a bus structure");
+    }
+    // The public columns' values at the wiring's row point: plane 7.
+    if let Some(structure) = &sigma.public_columns {
+        let (row_w, value_w) = public_columns.expect("public column wires");
+        assert_eq!(
+            row_w.len(),
+            structure.rho_row.len(),
+            "public column row point"
+        );
+        assert_eq!(value_w.len(), structure.values.len(), "public column wires");
+        for (c, &vw) in value_w.iter().enumerate() {
+            let mut col: Vec<Wire> = (0..sigma.base_bits).map(|j| bit((c >> j) & 1)).collect();
+            col.extend_from_slice(&selector(7));
+            out.push((row_w.to_vec(), col, vw));
+        }
+    } else {
+        assert!(
+            public_columns.is_none(),
+            "public column wires without the structure"
+        );
     }
     assert_eq!(
         out.len(),
@@ -274,11 +578,14 @@ pub(super) fn emit_boolean_reported_check(
     z_partial_w: &[Wire],
     beta_w: &[Option<Wire>],
     eval_w: &[(Wire, Wire)],
+    linear: Option<(Wire, &[Option<Wire>])>,
     target_w: Wire,
     zw: Wire,
     ow: Wire,
 ) {
     assert_eq!(eval_w.len(), registry.num_boolean(), "Boolean eval count");
+    // The linear check: `α·η·⟨W_t, D(A_0 + I)⟩` joins type t's term.
+    let alpha_eta = linear.map(|(eta_w, _)| assertion_mac(sb, spine, zw, alpha_w, eta_w, zw));
     assert_eq!(beta_w.len(), registry.num_boolean(), "Boolean beta count");
     assert_eq!(z_partial_w.len(), 1usize << K_SKIP, "Boolean low weight");
     let mut acc = zw;
@@ -304,7 +611,12 @@ pub(super) fn emit_boolean_reported_check(
             ow,
         );
         let p_t = emit_eq_product(sb, pfslot, pf_w, ow, &rr_w[inner..], &col_prefix, zw, ow);
-        let ab = assertion_mac(sb, spine, vb_w, alpha_w, va_w, zw);
+        let mut ab = assertion_mac(sb, spine, vb_w, alpha_w, va_w, zw);
+        if let (Some(ae), Some((_, lin))) = (alpha_eta, linear)
+            && let Some(vl_w) = lin[t]
+        {
+            ab = assertion_mac(sb, spine, ab, ae, vl_w, zw);
+        }
         let wp = assertion_mac(sb, spine, zw, w_t, p_t, zw);
         let term = assertion_mac(sb, spine, zw, wp, ab, zw);
         acc = assertion_mac(sb, spine, acc, term, ow, zw);
@@ -708,9 +1020,9 @@ pub(super) fn emit_recombination(
     le8: SlotId,
     pub_w: &[Wire],
     gather_w: &[Wire],
+    positions: &(Vec<usize>, Vec<usize>),
     pt_w: &[Wire],
     nu_c: usize,
-    n_pub_slots: usize,
     f_w: Wire,
     g_w: Wire,
     zw: Wire,
@@ -718,19 +1030,19 @@ pub(super) fn emit_recombination(
 ) {
     sb.connect(f_w, g_w);
     let rows = 1usize << nu_c;
+    let (gather_pos, public_pos) = positions;
+    assert_eq!(gather_pos.len(), gather_w.len(), "one position per gather");
     assert_eq!(
         pub_w.chunks(rows).count(),
-        n_pub_slots,
+        public_pos.len(),
         "public slots tile the child's segment"
     );
-    let eq_slot_w = emit_eq_prefix(
-        sb,
-        macs,
-        &pt_w[nu_c..],
-        gather_w.len() + n_pub_slots,
-        zw,
-        ow,
-    );
+    let live = gather_pos
+        .iter()
+        .chain(public_pos)
+        .max()
+        .map_or(1, |&q| q + 1);
+    let eq_slot_w = emit_eq_prefix(sb, macs, &pt_w[nu_c..], live, zw, ow);
     let max_chunks = pub_w
         .chunks(rows)
         .map(|s| s.len().div_ceil(8))
@@ -738,10 +1050,10 @@ pub(super) fn emit_recombination(
         .expect("a circuit child has publics");
     let eq_hi_w = emit_eq_prefix(sb, macs, &pt_w[3..nu_c], max_chunks, zw, ow);
     let mut acc = zw;
-    for (i, &gw2) in gather_w.iter().enumerate() {
-        acc = sb.gate(macs, &[acc, eq_slot_w[i], gw2])[0];
+    for (&q, &gw2) in gather_pos.iter().zip(gather_w) {
+        acc = sb.gate(macs, &[acc, eq_slot_w[q], gw2])[0];
     }
-    for (s, spub) in pub_w.chunks(rows).enumerate() {
+    for (spub, &q) in pub_w.chunks(rows).zip(public_pos) {
         let mut v = zw;
         for (h, chunk) in spub.chunks(8).enumerate() {
             let mut a_in: Vec<Wire> = chunk.to_vec();
@@ -751,7 +1063,7 @@ pub(super) fn emit_recombination(
             a_in.push(v);
             v = sb.gate(le8, &a_in)[0];
         }
-        acc = sb.gate(macs, &[acc, eq_slot_w[gather_w.len() + s], v])[0];
+        acc = sb.gate(macs, &[acc, eq_slot_w[q], v])[0];
     }
     sb.connect(acc, f_w);
 }
@@ -765,4 +1077,34 @@ pub(super) struct ElPiopRec {
     pub(super) alpha_fin: usize,
     pub(super) alpha_ch: usize,
     pub(super) lc_rounds: Vec<(usize, usize, usize)>,
+}
+
+/// [`emit_nonzero_top`]: an honest nonzero top passes with its inverse, and
+/// a zero top fails the row whatever the prover offers as `t` (`1 + 0·t`
+/// misses the assert-zero anchor), as does a nonzero top with a wrong `t`.
+#[test]
+fn nonzero_top_rejects_a_zero_product() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use crate::tower::MacGate;
+    let top = F128::new(0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210);
+    let mut sb = ShapeBuilder::new(3);
+    let macs = sb.slot(MacGate::new());
+    let mut vals = vec![F128::ONE, F128::ZERO, top];
+    let ow = sb.public_input();
+    let zassert = sb.public_input();
+    let top_w = sb.input();
+    emit_nonzero_top(&mut sb, macs, top_w, top, &mut vals, ow, zassert);
+    let shape = sb.finish().expect("the gadget builds");
+    let _ = shape.run(&vals, &[]);
+    let runs = |v: &[F128]| catch_unwind(AssertUnwindSafe(|| shape.run(v, &[]))).is_ok();
+    for t in [F128::ZERO, F128::ONE, top.inv(), F128::new(7, 9)] {
+        let mut bad = vals.clone();
+        bad[2] = F128::ZERO;
+        bad[3] = t;
+        assert!(!runs(&bad), "a zero top with t = {t:?}");
+    }
+    let mut bad = vals.clone();
+    bad[3] += F128::ONE;
+    assert!(!runs(&bad), "a nonzero top with a wrong inverse");
 }

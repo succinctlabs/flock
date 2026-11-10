@@ -1,6 +1,6 @@
 //! Allocation-reusing forward execution of compiled circuit walks.
 
-use super::{Action, WalkError, WalkPlan, checked_capacity, read_bool};
+use super::{Action, Source, WalkError, WalkPlan, checked_capacity, read_bool};
 use crate::circuit::boolean::RowKind;
 
 /// Values produced by forward walks, in contiguous physical R1CS block order.
@@ -191,6 +191,83 @@ impl WalkPlan {
             });
         }
         Ok(capacity)
+    }
+
+    /// Bit-sliced forward walk of up to 64 blocks at once: bit `r` of every
+    /// word belongs to block `r`. `inputs[i]` holds input `i` of each block and
+    /// `live` marks the blocks present; a dead lane has every input zero and
+    /// stays identically zero (the honest padding block).
+    ///
+    /// `z`, `a_z` and `b_z` are resized to `2^k_log` words and overwritten;
+    /// `c_z` is not produced (with identity `C` it is `z`). A row rejected by
+    /// any live block fails with that block's lane.
+    pub fn forward_sliced_into(
+        &self,
+        inputs: &[u64],
+        live: u64,
+        k_log: usize,
+        z: &mut Vec<u64>,
+        a_z: &mut Vec<u64>,
+        b_z: &mut Vec<u64>,
+        temporaries: &mut Vec<u64>,
+    ) -> Result<(), WalkError> {
+        if inputs.len() != self.input_positions.len() {
+            return Err(WalkError::InputCount {
+                expected: self.input_positions.len(),
+                actual: inputs.len(),
+            });
+        }
+        let capacity = self.validate_capacity(k_log)?;
+        for v in [&mut *z, &mut *a_z, &mut *b_z] {
+            v.clear();
+            v.resize(capacity, 0);
+        }
+        temporaries.clear();
+        temporaries.resize(self.stats.max_live_temporaries, 0);
+        let read = |source: Source, z: &[u64], t: &[u64]| match source {
+            Source::Zero => 0,
+            Source::Value(position) => z[position],
+            Source::Temporary(slot) => t[slot],
+        };
+        z[self.one_position] = live;
+        for (&position, &input) in self.input_positions.iter().zip(inputs) {
+            z[position] = input & live;
+        }
+        for action in &self.actions {
+            match action {
+                Action::Xor { output, terms } => {
+                    let value = terms
+                        .iter()
+                        .fold(0, |acc, &source| acc ^ read(source, z, temporaries));
+                    temporaries[*output] = value;
+                }
+                Action::Row {
+                    id,
+                    physical_row,
+                    kind,
+                    lhs,
+                    rhs,
+                    result,
+                    output,
+                } => {
+                    let lhs = read(*lhs, z, temporaries);
+                    let rhs = read(*rhs, z, temporaries);
+                    if let RowKind::And | RowKind::Materialize = kind {
+                        z[output.expect("definitional row must have an output")] = lhs & rhs;
+                    }
+                    let bad = ((lhs & rhs) ^ read(*result, z, temporaries)) & live;
+                    if bad != 0 {
+                        return Err(WalkError::UnsatisfiedBatchRow {
+                            block: bad.trailing_zeros() as usize,
+                            row: *id,
+                        });
+                    }
+                    a_z[*physical_row] = lhs;
+                    b_z[*physical_row] = rhs;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn execute_block(

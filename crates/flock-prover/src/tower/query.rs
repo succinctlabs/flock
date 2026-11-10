@@ -554,6 +554,20 @@ pub struct LeafOuter {
     pub(super) affine_env: crate::tower::affine_walk::AffineEnvLayouts,
 }
 
+impl LeafOuter {
+    /// The boolean zerocheck's AG round-one grinding bits as this outer's
+    /// verifier takes them: the outer union's schedule over the profile's
+    /// ([`crate::union::UnionInstance::zerocheck_grinding`]), raised when the
+    /// union checks dropped linear rows. A parent reads a node child's grind
+    /// here, as the first-level node reads a leaf's through
+    /// [`super::MixedInner::ag_round_one_bits`].
+    pub(super) fn ag_round_one_bits(&self) -> Option<u32> {
+        super::outer_union(&self.shape.registry, self.shape.counts.clone())
+            .zerocheck_grinding(self.pcs.zerocheck_grinding())
+            .ag_round_one_bits()
+    }
+}
+
 pub(super) fn leaf_boolean_lcs(lo: &LeafOuter) -> Vec<&dyn LincheckCircuit> {
     let mut ordered: Vec<(usize, &dyn LincheckCircuit)> = vec![
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),

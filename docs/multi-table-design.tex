@@ -940,11 +940,15 @@ soundness point: the transcript binds only the commitment \emph{root},
 while the opening reads the leaf width and lane count from the
 commitment's parameters, which therefore ride the proof
 attacker-controlled --- the union verifier requires them to equal the
-count-derived parameters (a rejection, not a panic). When the stack
+count-derived parameters (a rejection, not a panic). A stack that
 fills every lane ($L = 2^{k}$ --- in particular the
-identity-compaction single-slot path) the scheme is byte-identical to
-the power-of-two commit, which is what keeps the single-type anchors
-green.
+identity-compaction single-slot path) is committed lane-major too: the
+layout is read from the parameters (\code{PcsParams::lane\_major}),
+never inferred from $L < 2^k$, by the opener and by every verifier,
+native and in-circuit. (It used to fall back to the low-bit
+power-of-two grid, which kept those proofs byte-identical to the
+pre-lane-major format but lost the inner open's statistics ladder,
+roughly doubling Ligerito's cost at full fill.)
 
 \begin{remark}[The direct-commitment harness]\label{rem:harness}
 At full utilization ($n_t = 2^{\nu_t^{\max}}$ for all $t$) the union buffer

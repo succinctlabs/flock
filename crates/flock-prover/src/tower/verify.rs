@@ -23,12 +23,15 @@
 //! ([`Tower::discharge_root`]), not a consumer's input.
 
 use flock_core::{
-    aggregate::Accumulator, matrix_fold::MatrixClaim, pcs::Commitment, verifier::FlockVerifyError,
+    aggregate::Accumulator, matrix_fold::MatrixClaim, pcs::Commitment, schedule::Registry,
+    verifier::FlockVerifyError,
 };
 
 use crate::proof_io::{DeserializeError, TowerRootBundle};
+use flock_core::circuit::builder::CircuitShape;
+
 use crate::tower::{
-    DOMAIN, F128, FsChallenger, MixedProof, SelfCheck, TowerConfig,
+    DOMAIN, EnvShape, F128, FsChallenger, MixedProof, NodeOut, SelfCheck, TowerConfig,
     driver::{ChainStatement, RootDischargeFailure, Tower},
     env_acc_main_base, env_pass_base, envelope_shape,
     fold_region::read_acc_entry,
@@ -89,15 +92,23 @@ pub(super) struct AccLayout {
     /// one implied key — the chain circuit): per-type flat, then sigma,
     /// then jagged.
     lane_unkeyed: Vec<(usize, usize)>,
+    /// The lane's linear-identity entries (shared-binding lanes), after the
+    /// pairs.
+    lane_linear: Vec<(usize, usize)>,
     lane_sigma_w: (usize, usize),
     lane_jagged_w: (usize, usize),
 }
 
 impl AccLayout {
     fn from_tower(t: &Tower) -> AccLayout {
-        let env = envelope_shape();
+        AccLayout::from_parts(&envelope_shape(), t.fl.fold_pub_base, &t.root)
+    }
+
+    /// The decode plan of `root`'s published blocks under `env`, the lane
+    /// at `lane_base` — the shape constants every root of that tower
+    /// shares.
+    pub(super) fn from_parts(env: &EnvShape, lane_base: usize, root: &NodeOut) -> AccLayout {
         let w = |c: &MatrixClaim| (c.col.point.len(), c.row.point.len());
-        let root = &t.root;
         let mut main_unkeyed = Vec::new();
         for (a, b) in root.acc.per_type.iter().chain(root.acc.per_element.iter()) {
             main_unkeyed.push(w(a));
@@ -109,16 +120,18 @@ impl AccLayout {
             lane_unkeyed.push(w(a));
             lane_unkeyed.push(w(b));
         }
+        let lane_linear: Vec<(usize, usize)> = lane.per_linear.iter().map(w).collect();
         AccLayout {
-            main_base: env_acc_main_base(&env),
-            lane_base: t.fl.fold_pub_base,
-            pass_base: env_pass_base(&env),
+            main_base: env_acc_main_base(env),
+            lane_base,
+            pass_base: env_pass_base(env),
             main_unkeyed,
             n_per_type: root.acc.per_type.len(),
             sigma_w: w(&root.block.sigma[0].1),
             jagged_w: w(&root.block.jagged[0].1),
             pass_w: [w(&root.block.passenger[0].1), w(&root.block.passenger[1].1)],
             lane_unkeyed,
+            lane_linear,
             lane_sigma_w: w(&lane.sigma[0].1),
             lane_jagged_w: w(&lane.jagged[0].1),
         }
@@ -149,6 +162,25 @@ impl TowerVk {
     }
 }
 
+/// The tower's MAIN accumulator has no linear-identity group: the outer
+/// fold binds per claim (`prove_aggregate_classes_with_grinding`), which
+/// folds none and refuses an assertion that drops words, so `per_linear` is
+/// empty by construction, [`reassemble_parts`] rebuilds it empty and no
+/// discharge leg reads it. That holds only while no outer type drops a
+/// word; an outer registry that does would need shared binding and a
+/// discharged linear leg first. Asserted wherever the main fold is built
+/// or rebuilt.
+pub(super) fn assert_outer_drops_nothing(registry: &Registry) {
+    assert!(
+        registry
+            .types()
+            .iter()
+            .all(|ty| ty.zeroed_word_cols.is_empty()),
+        "an outer (node) type drops words: the main accumulator's per_linear \
+         would go undischarged"
+    );
+}
+
 /// Reassemble the published accumulators — main, passenger, chain lane —
 /// from a root's PUBLIC SEGMENT alone, per the VK's decode plan. Live
 /// keyed slots must name a circuit the VK knows (FL / steady / base);
@@ -159,15 +191,34 @@ pub(super) fn reassemble(
     public: &[F128],
     vk: &TowerVk,
 ) -> Result<(Accumulator, Vec<([F128; 2], MatrixClaim)>, Accumulator), TowerVerifyError> {
-    let l = &vk.layout;
-    let fl_lo = &vk.tower.fl.lo;
-    let steady_lo = &vk.tower.root.lo;
     let base_lo = &vk
         .tower
         .base
         .as_ref()
         .expect("the VK tower keeps its base")
         .lo;
+    reassemble_parts(
+        public,
+        &vk.layout,
+        &vk.tower.fl.lo,
+        &vk.tower.root.lo,
+        base_lo,
+        &vk.tower.chain.inner.built.shape,
+    )
+}
+
+/// [`reassemble`] over explicit material owners: FL 0, the steady root and
+/// the base (the circuits a live keyed slot may name), and the LEAF shape
+/// whose registry and circuit the lane is about.
+#[allow(clippy::type_complexity)]
+pub(super) fn reassemble_parts(
+    public: &[F128],
+    l: &AccLayout,
+    fl_lo: &LeafOuter,
+    steady_lo: &LeafOuter,
+    base_lo: &LeafOuter,
+    leaf: &CircuitShape,
+) -> Result<(Accumulator, Vec<([F128; 2], MatrixClaim)>, Accumulator), TowerVerifyError> {
     let known: [[u8; 32]; 3] = [
         fl_lo.shape.circuit.digest(),
         steady_lo.shape.circuit.digest(),
@@ -209,10 +260,12 @@ pub(super) fn reassemble(
             jagged.push((name(k)?, c));
         }
     }
+    assert_outer_drops_nothing(&steady_lo.shape.registry);
     let main = Accumulator {
         registry_digest: steady_lo.shape.registry.digest(),
         per_type,
         per_element,
+        per_linear: Vec::new(),
         sigma,
         jagged,
     };
@@ -227,7 +280,7 @@ pub(super) fn reassemble(
         .collect();
 
     // ---- ACC_CHAIN: the lane's un-keyed layout, key implied ----
-    let chain_d = vk.tower.chain.inner.built.shape.circuit.digest();
+    let chain_d = leaf.circuit.digest();
     let mut p = l.lane_base;
     let mut lflat: Vec<MatrixClaim> = Vec::with_capacity(l.lane_unkeyed.len());
     for &(kc, kr) in &l.lane_unkeyed {
@@ -240,12 +293,18 @@ pub(super) fn reassemble(
         .iter()
         .map(|[a, b]| (a.clone(), b.clone()))
         .collect();
+    let lane_linear: Vec<MatrixClaim> = l
+        .lane_linear
+        .iter()
+        .map(|&(kc, kr)| read_acc_entry(public, &mut p, false, kc, kr).1)
+        .collect();
     let (_, lsig) = read_acc_entry(public, &mut p, false, l.lane_sigma_w.0, l.lane_sigma_w.1);
     let (_, ljag) = read_acc_entry(public, &mut p, false, l.lane_jagged_w.0, l.lane_jagged_w.1);
     let lane = Accumulator {
-        registry_digest: vk.tower.chain.inner.built.shape.registry.digest(),
+        registry_digest: leaf.registry.digest(),
         per_type: lane_per_type,
         per_element: Vec::new(),
+        per_linear: lane_linear,
         sigma: vec![(chain_d, lsig)],
         jagged: vec![(chain_d, ljag)],
     };

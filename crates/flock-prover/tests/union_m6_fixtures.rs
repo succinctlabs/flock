@@ -209,9 +209,26 @@ fn merged_bundle_digest(
 #[test]
 // Default-run (~2 s for both anchors): these pins are what makes the
 // "fixture anchors byte-stable" claim enforceable in CI.
-// Re-pinned 2026-11-03: proof-IO v24 — the merged open's inner opening is
-// now an enum (`MergedInnerOpen`), adding a variant tag to every merged
-// payload; transcripts are unchanged. Two deterministic print runs agreed.
+// Re-pinned 2026-11-10: #76 merged onto main, proof-IO VERSION 25 -> 26 —
+// the merged open's inner opening is an enum (`MergedInnerOpen`, a variant
+// tag on every merged payload), so all six fixtures moved, both anchors
+// included. Two deterministic print runs agreed.
+// Re-pinned 2026-11-06: proof-IO VERSION 24 -> 25, `Fast` back on the
+// +1/level recursion ladder (rates 1/2/3/4/5, keeping its 16-bit query
+// PoW). All six fixtures moved, both anchors included (level rates, query counts and
+// caps). Two deterministic print runs agreed.
+// Re-pinned 2026-11-05: proof-IO VERSION 23 -> 24 (the leanXMSS stack's
+// wiring fields and transcript rules) — the four merged bundles moved with
+// the header byte, the header-less anchors did not. Two deterministic print
+// runs agreed.
+// Re-pinned 2026-10-26 (merged-nu10-1024-1024 only): the block-first
+// transport now covers every layout whose used columns are all full height,
+// gaps allowed (`pcs::full_height_columns`), not just a full-height prefix.
+// At full counts SHA-256's 199 used chunk-columns of 256 leave a gap before
+// BLAKE3's, so this fixture's merged sumcheck now binds the dense column
+// coordinates first. The partial and zero-count fixtures and both anchors
+// held byte-identical; the same full-count mix round-trips (with tampers)
+// in `union_mixed`. Two deterministic print runs agreed.
 // Re-pinned 2026-09-07: main's proof-IO v23 (the tower span counter) merged
 // onto the BLAKE3 default — the four merged bundles moved with the header
 // byte, the header-less anchors did not. Two deterministic print runs agreed.
@@ -223,22 +240,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "413efa2da695c0c11760e8775feec1aae1e79c0e6e951c1aea02147d73e92d95",
+            "2d91c705874516758a3efe1e7524d700b2c04f44c0cbe412afbebd66cd783d87",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "faf2e1f1329adffd8a118f90b8dbfd758f65e3ca5f0e15866547759363b191aa",
+            "413a7fecd4331febffa7e4ca7acca11072dcce889e2bb885df97be44705bf6a4",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "ec787e1dbf644867fb1aedf143d75b67fa8a919104e650a377d2846bbcc11a97",
+            "1f8356bdcc9b85fd751d3acdf18fb2c544fe36f7abe8ac1b731ace2baa86937f",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "5e28a10b77b5441fda124322df3f664314996c56b779e1dba85f43cf8b16752d",
+            "545d84f499802c498ac61f2c181d2a3307df2b7ffc9d91e2930cce8c379f39dd",
         ),
     ];
 
@@ -314,7 +331,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "8685433ab454131ccbfd84572230d2c39ec7a2093f3924c4efee86c93ccff7d6";
+        const EXPECTED: &str = "4e07cbd314f102de48b9833629a7a13c38ec70fc88c7854d0f379d829e534188";
         let n_blocks = 256usize;
         // The setup API IS the shipped single-slot union path since the
         // 2026-08-14 consolidation — the anchor pins it directly.
@@ -332,7 +349,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "306d4bdde36a97a775a501355c8263a5c823fce062d7fbd98e32965935ae0d6e";
+        const EXPECTED: &str = "a0674dabfefd3df31f08a02e824312605616ab5435ecdcdac1f42635647cc7ba";
         let n_blocks = 128usize;
         let setup = Sha256HybridSetup::new(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

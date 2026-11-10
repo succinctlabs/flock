@@ -14,6 +14,7 @@ unsound-challenger = [
     "flock-core/unsound-challenger",
     "flock-transcript/unsound-challenger",
 ]
+metal = ["flock-core/metal"]
 
 [dependencies]
 flock-core = { path = "../flock-core" }
@@ -45,6 +46,10 @@ harness = false
 
 [[bench]]
 name = "affine_l0_stats_probe"
+harness = false
+
+[[bench]]
+name = "leanxmss"
 harness = false
 
 [[bench]]
@@ -125,6 +130,10 @@ harness = false
 
 [[bench]]
 name = "genwitness_phase"
+harness = false
+
+[[bench]]
+name = "leanxmss_witgen"
 harness = false
 
 [[bench]]

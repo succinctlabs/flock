@@ -20,7 +20,7 @@ use std::{env::var_os, mem::take, ptr::write_bytes, thread::scope};
 use merkle::{cap_layer, merkle_tree};
 use rayon::{
     current_num_threads,
-    prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut},
+    prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut},
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,18 +66,24 @@ pub struct PcsParams {
     /// (`profile.log_inv_rate() == log_inv_rate`). Defaults to `Fast`.
     #[serde(default)]
     pub profile: LigeritoProfile,
-    /// **Integer-lane commit** (optional). `None` (the default) commits the
-    /// full `2^log_batch_size` interleaved lanes — today's power-of-two
-    /// scheme. `Some(t)` with `1 ≤ t ≤ 2^log_batch_size` commits exactly `t`
-    /// integer lanes, each of size `2^log_dim`, so the committed message is
-    /// `t · 2^log_dim ≤ 2^(m−7)` F_{2^128} words — eliminating the encode +
-    /// Merkle work of the `2^log_batch_size − t` zero lanes. The per-lane
-    /// codeword length (`n_positions = 2^k_code`, hence `n_leaves`) is
-    /// UNCHANGED; only the leaf width (`t` F128 = `t·16` bytes) and the total
-    /// codeword length shrink. When `t == 2^log_batch_size` the commit is
-    /// byte-identical to `None` (`num_ntts` and every derived quantity
-    /// coincide). The Ligerito `initial_k` stays `log_batch_size`; lanes
+    /// **Lane layout** of the committed grid. `None` (the default) is the
+    /// power-of-two scheme: all `2^log_batch_size` lanes, lane = the LOW
+    /// index bits (lane `l` holds words `l, l + 2^log_batch_size, …`).
+    ///
+    /// `Some(t)` with `1 ≤ t ≤ 2^log_batch_size` is the LANE-MAJOR layout
+    /// ([`commit_lane_major`]): lane = the HIGH index bits (lane `l` is the
+    /// contiguous block `q[l·2^log_dim .. (l+1)·2^log_dim)`), and only the
+    /// first `t` lanes are committed, so the encode + Merkle work of the
+    /// `2^log_batch_size − t` zero lanes disappears. The per-lane codeword
+    /// length (`n_positions = 2^k_code`, hence `n_leaves`) is UNCHANGED; only
+    /// the leaf width (`t` F128 = `t·16` bytes) and the total codeword length
+    /// shrink. The Ligerito `initial_k` stays `log_batch_size`; lanes
     /// `[t, 2^log_batch_size)` are definitionally zero on the opening side.
+    ///
+    /// `Some(2^log_batch_size)` is lane-major too — a full grid in the
+    /// rotated order, NOT the `None` grid: the opener and every verifier
+    /// read the layout from [`Self::lane_major`], never from `t`. (Only the
+    /// low-bit [`commit`] function ignores `num_lanes` at full width.)
     #[serde(default)]
     pub num_lanes: Option<usize>,
     /// Hash backing the Merkle commitment. Defaults to SHA-256, so params
@@ -202,6 +208,12 @@ impl PcsParams {
     pub fn num_ntts(&self) -> usize {
         self.num_lanes.unwrap_or(1usize << self.log_batch_size)
     }
+    /// Whether the committed grid is lane-major (lane = high index bits):
+    /// exactly when `num_lanes` is set, whatever its value. The opening and
+    /// every verifier — native and in-circuit — dispatch on this.
+    pub fn lane_major(&self) -> bool {
+        self.num_lanes.is_some()
+    }
     /// Committed message length in F_{2^128} words = `num_ntts() · 2^log_dim`.
     /// Equals `2^log_msg_len` on the power-of-two path (`num_lanes == None`).
     pub fn msg_len_f128(&self) -> usize {
@@ -301,15 +313,112 @@ pub struct Commitment {
 /// avoids ~4 GB of duplication at large `m`, dropping peak commit memory by
 /// a factor of ~1.5 (e.g. at m=35: 13 GB → 9 GB).
 pub struct ProverData {
-    pub codeword: Vec<F128>,
-    pub merkle_tree: Vec<Hash>,
+    pub codeword: CodewordBuf,
+    pub merkle_tree: MerkleTreeBuf,
 }
 
 // Recycle the codeword buffer (the prover's largest single allocation —
-// 128 MB at m = 29) through the scratch pool instead of unmapping it.
+// 128 MB at m = 29) through the scratch pool instead of unmapping it. A GPU
+// commit's buffers go back to the GPU when both views drop.
 impl Drop for ProverData {
     fn drop(&mut self) {
-        give_f128(take(&mut self.codeword));
+        // Irrefutable in builds without Metal, where `GpuCodeword` is empty.
+        #[allow(irrefutable_let_patterns)]
+        if let CodewordBuf::Cpu(v) = take(&mut self.codeword) {
+            give_f128(v);
+        }
+    }
+}
+
+/// The level-0 codeword: a vector from the CPU commit, or a view of the
+/// GPU's shared buffer after a Metal commit ([`crate::gpu_commit`]). Derefs
+/// to `[F128]` either way.
+pub enum CodewordBuf {
+    Cpu(Vec<F128>),
+    Gpu(crate::gpu_commit::GpuCodeword),
+}
+
+/// The level-0 Merkle tree, like [`CodewordBuf`].
+pub enum MerkleTreeBuf {
+    Cpu(Vec<Hash>),
+    Gpu(crate::gpu_commit::GpuMerkleTree),
+}
+
+impl Default for CodewordBuf {
+    fn default() -> Self {
+        Self::Cpu(Vec::new())
+    }
+}
+
+impl core::ops::Deref for CodewordBuf {
+    type Target = [F128];
+    fn deref(&self) -> &[F128] {
+        match self {
+            Self::Cpu(v) => v,
+            Self::Gpu(g) => g,
+        }
+    }
+}
+
+impl core::ops::Deref for MerkleTreeBuf {
+    type Target = [Hash];
+    fn deref(&self) -> &[Hash] {
+        match self {
+            Self::Cpu(v) => v,
+            Self::Gpu(g) => g,
+        }
+    }
+}
+
+impl From<Vec<F128>> for CodewordBuf {
+    fn from(v: Vec<F128>) -> Self {
+        Self::Cpu(v)
+    }
+}
+
+impl From<Vec<Hash>> for MerkleTreeBuf {
+    fn from(v: Vec<Hash>) -> Self {
+        Self::Cpu(v)
+    }
+}
+
+impl core::fmt::Debug for CodewordBuf {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CodewordBuf")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for MerkleTreeBuf {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MerkleTreeBuf")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl PartialEq for CodewordBuf {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Vec<F128>> for CodewordBuf {
+    fn eq(&self, other: &Vec<F128>) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq for MerkleTreeBuf {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Vec<Hash>> for MerkleTreeBuf {
+    fn eq(&self, other: &Vec<Hash>) -> bool {
+        **self == **other
     }
 }
 
@@ -346,6 +455,13 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     // `z_packed` into the lower half, and zero-fill JUST the upper half (the
     // RS-encoding zero coefficients that the NTT's first-layer butterfly will
     // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
+    if let Some(done) = crate::gpu_commit::try_commit(
+        params,
+        |msg, pos| copy_message(msg, z_packed, params.num_ntts(), pos),
+        |msg| cpu_commit_from_message(msg, params),
+    ) {
+        return gpu_commit_result(done, params);
+    }
     let codeword = take_f128(codeword_len);
     commit_into(z_packed, params, codeword)
 }
@@ -371,11 +487,75 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
+    if let Some(done) = crate::gpu_commit::try_commit(
+        params,
+        |msg, pos| copy_message(msg, z_packed, params.num_ntts(), pos),
+        |msg| cpu_commit_from_message(msg, params),
+    ) {
+        give_f128(codeword);
+        return gpu_commit_result(done, params);
+    }
     if leaf_pipeline_enabled(params) {
         return commit_into_pipelined(z_packed, params, codeword);
     }
     let codeword = commit_encode_into(z_packed, params, codeword);
     commit_merkle(codeword, params)
+}
+
+/// Parallel copy of message positions `pos` (`t` lanes each) of the
+/// interleaved message into the GPU's message buffer.
+fn copy_message(dst: &mut [F128], src: &[F128], t: usize, pos: core::ops::Range<usize>) {
+    const CHUNK: usize = 1 << 16;
+    let r = pos.start * t..pos.end * t;
+    dst[r.clone()]
+        .par_chunks_mut(CHUNK)
+        .zip(src[r].par_chunks(CHUNK))
+        .for_each(|(d, s)| d.copy_from_slice(s));
+}
+
+/// The CPU commit of an interleaved message (`msg[p·t + l]`, `t =
+/// num_ntts`): the replicate fill, the NTT from layer `log_inv_rate`, and the
+/// tree. The GPU commit's reference on the first commit of a shape, and its
+/// fallback.
+fn cpu_commit_from_message(msg: &[F128], params: &PcsParams) -> (Vec<F128>, Vec<Hash>) {
+    let mut codeword = take_f128(params.n_positions() * params.num_ntts());
+    replicate_message_fill(&mut codeword, msg);
+    let codeword = commit_encode_finish(codeword, params.num_ntts(), params);
+    let bytes: &[u8] = unsafe {
+        from_raw_parts(
+            codeword.as_ptr() as *const u8,
+            codeword.len() * size_of::<F128>(),
+        )
+    };
+    let tree = merkle_tree(bytes, params.n_leaves(), params.merkle_hash);
+    (codeword, tree)
+}
+
+/// Commitment and prover data from a commit the GPU took.
+fn gpu_commit_result(
+    done: crate::gpu_commit::GpuCommit,
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
+    let (codeword, merkle_tree) = match done {
+        crate::gpu_commit::GpuCommit::Gpu(c, t) => (CodewordBuf::Gpu(c), MerkleTreeBuf::Gpu(t)),
+        crate::gpu_commit::GpuCommit::Cpu(c, t) => (c.into(), t.into()),
+    };
+    let cap = cap_layer(
+        &merkle_tree,
+        params.n_leaves(),
+        params.level_zero_cap_depth(),
+    )
+    .to_vec();
+    (
+        Commitment {
+            cap,
+            params: params.clone(),
+        },
+        ProverData {
+            codeword,
+            merkle_tree,
+        },
+    )
 }
 
 /// Stage 1 of the staged commit: replicate-fill + NTT, returning the encoded
@@ -571,11 +751,23 @@ fn pipelined_commit(
         // transform alone, and 141 with the all-core deep pass and two
         // helpers. Queue depth 2× helpers bounds the unhashed window.
         //
-        // The split assumes the caller's pool is the P-core pool and the
-        // spare cores are the E-cores: a narrower caller pool would pin the
-        // deep pass to a few P-cores while helpers took the rest, so E-core
-        // hashing needs a caller pool at least as wide as the P-cluster, and
-        // the helpers never outnumber the E-cores.
+        // The split needs spare cores: the all-core pool at least two
+        // threads wider than the caller's pool, and the caller's pool at
+        // least as wide as the P-cluster (a narrower one would pin the deep
+        // pass to a few P-cores while helpers took the rest). The helpers
+        // never outnumber the E-cores. So the split runs only when the
+        // caller's pool is the P-core pool:
+        // - `init_perf_thread_pool` on a chip with fewer E- than P-cores
+        //   (M4 Max: 10P+4E);
+        // - a caller that installs a P-core-wide pool of its own (the
+        //   measurement above).
+        // It is off under the default pool on the M4 (4P+6E):
+        // `init_perf_thread_pool` builds an all-core global pool there, so
+        // `spare_cores = 0`. It is also off under `RAYON_NUM_THREADS`, which
+        // sizes both pools alike. The commit then takes the other arm: the
+        // deep pass on the global pool (every core) plus two helpers, 12
+        // threads on 10 cores on the M4. That arm is the 141 ms above,
+        // against 135 for the split.
         let spare_cores = crate::all_core_pool()
             .current_num_threads()
             .saturating_sub(current_num_threads())
@@ -681,8 +873,8 @@ fn pipelined_commit(
             params: params.clone(),
         },
         ProverData {
-            codeword,
-            merkle_tree,
+            codeword: codeword.into(),
+            merkle_tree: merkle_tree.into(),
         },
     )
 }
@@ -713,9 +905,9 @@ fn pipelined_commit(
 
 /// Number of nonzero high-bit lanes of a dense stack: `ceil(dense_words / D)`
 /// with `D = 2^log_dim`. Lanes `[t, 2^log_batch_size)` are wholly zero and are
-/// not committed. Returns `2^log_batch_size` when the stack is full (the
-/// power-of-two case — callers should then keep `num_lanes = None` so the
-/// commit stays byte-identical to today's).
+/// not committed. Returns `2^log_batch_size` when the stack is full — still
+/// a lane-major `num_lanes`, not the low-bit `None` grid (see
+/// `PcsParams::num_lanes`).
 pub fn dense_lanes(dense_words: usize, log_batch_size: usize, log_dim: usize) -> usize {
     dense_words
         .div_ceil(1usize << log_dim)
@@ -775,6 +967,15 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
         "lanes >= num_lanes must be identically zero"
     );
     let _ = lanes;
+    // Metal: the transpose fills the GPU's message buffer, which the GPU
+    // encodes and hashes (all `t` lanes; dead ones are zero either way).
+    if let Some(done) = crate::gpu_commit::try_commit(
+        params,
+        |msg, pos| transpose_lane_major_positions(msg, q, t, d, pos),
+        |msg| cpu_commit_from_message(msg, params),
+    ) {
+        return gpu_commit_result(done, params);
+    }
     // THE DEAD-LANE NTT SKIP: trailing all-zero lanes UNDER the committed
     // count — a pinned lane count (the envelope's `lanes*`) covering members
     // whose content needs fewer — are fixed points of every butterfly, so
@@ -863,6 +1064,34 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
     finalize_commit(codeword, live, params)
 }
 
+/// Transpose message positions `pos` of the lane-major stack `q` into the
+/// interleaved message `msg[p·t + l] = q[l·D + p]` (the GPU commit's ranged
+/// fill), cache-blocked over position tiles like
+/// [`replicate_lane_major_fill`].
+fn transpose_lane_major_positions(
+    msg: &mut [F128],
+    q: &[F128],
+    t: usize,
+    d: usize,
+    pos: core::ops::Range<usize>,
+) {
+    let threads = rayon::current_num_threads().max(1);
+    let tile = (pos.len() / (4 * threads)).clamp(64, 1024);
+    msg[pos.start * t..pos.end * t]
+        .par_chunks_mut(tile * t)
+        .enumerate()
+        .for_each(|(i, out)| {
+            let p0 = pos.start + i * tile;
+            let n = out.len() / t;
+            for lane in 0..t {
+                let src = &q[lane * d + p0..lane * d + p0 + n];
+                for (p, &v) in src.iter().enumerate() {
+                    out[p * t + lane] = v;
+                }
+            }
+        });
+}
+
 /// [`replicate_message_fill`] for a lane-major message: fill `codeword` with
 /// `2^r` replicas of the transposed `t`-lane extract, `msg[p·t + l] =
 /// q[l·D + p]`. Cache-blocked over position tiles (see
@@ -883,19 +1112,31 @@ fn replicate_lane_major_fill(codeword: &mut [F128], q: &[F128], t: usize, d: usi
     // small commits do not lose their parallelism to one huge tile.
     let threads = rayon::current_num_threads().max(1);
     let tile = (d / (4 * threads)).clamp(64, 1024);
-    codeword.par_chunks_mut(msg_len).for_each(|rep| {
-        rep.par_chunks_mut(tile * t)
-            .enumerate()
-            .for_each(|(tile_idx, out)| {
-                let p0 = tile_idx * tile;
-                let n = tile.min(d - p0);
-                for lane in 0..t {
-                    let src = &q[lane * d + p0..lane * d + p0 + n];
-                    for (p, &v) in src.iter().enumerate() {
-                        out[p * t + lane] = v;
-                    }
+    // TRANSPOSE ONCE. Only the first replica is transposed out of the
+    // lane-major stack; the others are straight copies of it. The strided
+    // transposition is the expensive part (one read stream per lane), the
+    // copies run at memcpy speed: at rate 1/4, 31 lanes, 2^17 positions the
+    // fill goes 14 → ~9 ms at one thread.
+    let (first, rest) = codeword.split_at_mut(msg_len);
+    first
+        .par_chunks_mut(tile * t)
+        .enumerate()
+        .for_each(|(tile_idx, out)| {
+            let p0 = tile_idx * tile;
+            let n = tile.min(d - p0);
+            for lane in 0..t {
+                let src = &q[lane * d + p0..lane * d + p0 + n];
+                for (p, &v) in src.iter().enumerate() {
+                    out[p * t + lane] = v;
                 }
-            });
+            }
+        });
+    let first = &*first;
+    const COPY_CHUNK: usize = 1 << 16;
+    rest.par_chunks_mut(msg_len).for_each(|rep| {
+        rep.par_chunks_mut(COPY_CHUNK)
+            .zip(first.par_chunks(COPY_CHUNK))
+            .for_each(|(dst, src)| dst.copy_from_slice(src));
     });
 }
 
@@ -1011,8 +1252,8 @@ pub fn commit_merkle(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, Pr
             params: params.clone(),
         },
         ProverData {
-            codeword,
-            merkle_tree,
+            codeword: codeword.into(),
+            merkle_tree: merkle_tree.into(),
         },
     )
 }
@@ -1350,11 +1591,11 @@ mod tests {
         }
     }
 
-    /// Oracle 1 (pow2 byte-identity anchor) at the commit level: committing
-    /// `num_lanes = Some(2^log_batch_size)` is byte-identical — root, codeword,
-    /// and full Merkle tree — to the default `num_lanes = None`. This is the
-    /// safety net: the integer-lane path collapses to today's path at full
-    /// lane utilization.
+    /// The low-bit [`commit`] function ignores `num_lanes` at full width:
+    /// `Some(2^log_batch_size)` commits the same bytes — root, codeword and
+    /// full Merkle tree — as `None`. (The OPENING does not: `Some` of any
+    /// value means the lane-major grid, which [`commit_lane_major`] builds;
+    /// see `PcsParams::num_lanes`.)
     #[test]
     fn commit_pow2_num_lanes_byte_identical() {
         let mut rng = Rng::new(0xA0C1);
@@ -1635,7 +1876,7 @@ mod tests {
         let (_, pd1) = commit(&pack(&z1), &params);
         let (_, pd2) = commit(&pack(&z2), &params);
         let (_, pd_x) = commit(&pack(&z_xor), &params);
-        for (i, (&c1, &c2)) in pd1.codeword.iter().zip(&pd2.codeword).enumerate() {
+        for (i, (&c1, &c2)) in pd1.codeword.iter().zip(pd2.codeword.iter()).enumerate() {
             assert_eq!(c1 + c2, pd_x.codeword[i], "linearity fails at i={i}");
         }
     }

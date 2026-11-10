@@ -44,11 +44,19 @@ pub use crate::tower::{
     config::{SelfCheck, TowerConfig},
     driver::{ChainStatement, RootDischargeFailure, Tower, TowerProver},
     fl_node::{FlNode, build_first_level_node, build_first_level_node_k},
-    node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app, build_node_outer_with},
+    node::{
+        ChainLane, LaneFamily, MainBlock, NodeOut, SpineIn, build_node_outer_app,
+        build_node_outer_with,
+    },
     query::LeafOuter,
     setup::{ShapeSlot, TowerShapes},
     verify::{
         RootBundle, TowerVerifyError, TowerVk, TowerVkFingerprint, verify_root, verify_root_bytes,
+    },
+    xmss_leaf::{XmssFlNode, XmssLeaf, build_xmss_first_level_node, build_xmss_leaf},
+    xmss_tower::{
+        XmssStatement, XmssTower, XmssTowerVk, XmssTowerVkFingerprint, verify_xmss_root,
+        xmss_statement,
     },
 };
 // The wire format (`proof_io`'s tower-root bundle) carries a `MixedProof`.
@@ -68,17 +76,20 @@ use crate::{
             leaf_zerocheck_ag, outer_union, outer_zerocheck_ag, pcs_batch_for, tower_fold_grinding,
         },
         envelope::{
-            ENV_ACC_MAIN_WORDS, EnvShape, EnvTail, declare_envelope_slots, env_acc_chain_base,
-            env_acc_main_base, env_app_base, env_pass_base, envelope_shape, outer_lanes,
-            pad_envelope_counts, span_count_word, steady_reps,
+            ENV_ACC_CHAIN_WORDS, ENV_ACC_MAIN_WORDS, ENV_APP_WORDS, EnvShape, EnvTail,
+            KEY_HORNER_STEP, KEY_SQUARE_CHAIN, KEY_TRANSPOSE_DOT, declare_envelope_slots,
+            env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base, envelope_shape,
+            envelope_shape_with_lane, lane_block_words, outer_lanes, pad_envelope_counts,
+            span_count_word, steady_reps,
         },
-        fl_node::chain_blake_r1cs,
+        fl_node::{FlApp, FlFamily, build_first_level_core, chain_blake_r1cs},
         fold_region::{
             FoldPub, challenge_word_locs, check_ag_skip_publics, check_fold_publics,
             check_jagged_fold_publics, emit_fold_region, emit_jagged_fold_region, fold_region_ops,
-            jagged_fold_region_ops, labeled_bytes_payloads, locate_and_pin_folds,
-            locate_and_pin_jagged_folds, read_acc_entry, replay_fold_endpoints,
-            replay_jagged_fold_endpoints,
+            fold_region_ops_bound, jagged_fold_region_ops, labeled_bytes_payloads,
+            locate_and_pin_folds, locate_and_pin_folds_from, locate_and_pin_jagged_folds,
+            locate_shared_binding, read_acc_entry, replay_fold_endpoints,
+            replay_jagged_fold_endpoints, shared_binding_ops,
         },
         fs_chain::{
             MergedChain, ag_seed_bytes, assert_chain_replays, bytes_payload_mask, cw,
@@ -95,8 +106,8 @@ use crate::{
         },
         gates_leaf::LeafEvalGate,
         gates_spine::{
-            AssistLayerGate, MacGate, MergedRoundGate, PrefixGate, ResidualWeightsGate, SpineGate,
-            SquareChainGate, ZcRoundGate, frobenius_orbit, frobenius_power,
+            AssistLayerGate, HornerStepGate, MacGate, MergedRoundGate, PrefixGate,
+            ResidualWeightsGate, SpineGate, SquareChainGate, TransposeDotGate, ZcRoundGate,
             live_element_input_from_rows,
         },
         geometry::{
@@ -104,9 +115,10 @@ use crate::{
             level_query_phase_blake3_rows, payload_words, query_phase_blake3_rows, strat_scheds,
         },
         gkr::{
-            ElPiopRec, GkrLayerRec, GkrRec, assertion_mac, circuit_structure_claim_wires,
-            emit_ag_point_binding, emit_boolean_reported_check, emit_element_reported_check,
-            emit_lagrange_lows, emit_recombination, pin_recombination,
+            BusRec, ElPiopRec, GkrLayerRec, GkrRec, assertion_mac, circuit_structure_claim_wires,
+            emit_ag_point_binding, emit_boolean_reported_check, emit_bus,
+            emit_element_reported_check, emit_gkr_layers, emit_lagrange_lows, emit_nonzero_top,
+            emit_recombination, pin_bus_sides, pin_recombination, recombination_positions,
         },
         online::Online,
         query::{emit_pow_checks, emit_recorded_pow_checks, leaf_boolean_lcs, leaf_boolean_mats},
@@ -149,3 +161,5 @@ mod setup;
 mod tape;
 mod verify;
 mod walker_common;
+mod xmss_leaf;
+mod xmss_tower;

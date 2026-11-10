@@ -33,6 +33,51 @@ pub const fn grinding_bits_for_degree(degree: usize) -> u32 {
     }
 }
 
+/// The PoW target ([`Challenger::grind_pow_below_and_sample_f128`]) that
+/// turns a Schwartz--Zippel event of degree at most `degree` into a strictly
+/// sub-`2^-128` event, like [`grinding_bits_for_degree`] but without rounding
+/// up to a power of two: a nonce passes with probability
+/// `target / 2^64 ≤ (2^64 − 1) / (2^64 · degree)`, so the expected work is
+/// `degree` hashes rather than up to `2·degree`. Degree zero needs no grind
+/// (`u64::MAX`, no constraint).
+#[inline]
+pub const fn grinding_target_for_degree(degree: usize) -> u64 {
+    if degree == 0 {
+        u64::MAX
+    } else {
+        u64::MAX / degree as u64
+    }
+}
+
+/// The PoW target equivalent to `bits` leading zero bits, `2^(64 − bits)`,
+/// for `1 ≤ bits ≤ 64`.
+#[inline]
+pub const fn pow_target_for_bits(bits: u32) -> u64 {
+    assert!(
+        bits >= 1 && bits <= 64,
+        "a 64-bit target expresses 1..=64 bits"
+    );
+    if bits == 64 { 1 } else { 1u64 << (64 - bits) }
+}
+
+/// The fewest leading-zero bits whose pass probability is at most
+/// `target / 2^64`: the bit grind a transcript without targets runs in place
+/// of `target`. For [`grinding_target_for_degree`] it is
+/// [`grinding_bits_for_degree`].
+#[inline]
+pub const fn pow_bits_covering(target: u64) -> u32 {
+    assert!(target >= 1, "a zero target never passes");
+    target.leading_zeros() + 1
+}
+
+/// Whether a PoW hash passes `target`: its first eight bytes, read
+/// big-endian, are below it. For `target = 2^(64 − bits)` this is
+/// [`has_leading_zero_bits`].
+#[inline]
+pub fn is_below_target(h: &[u8], target: u64) -> bool {
+    u64::from_be_bytes(h[..8].try_into().expect("a PoW hash has 8 bytes")) < target
+}
+
 // `Send` supertrait: the verifier runs its PIOP/PCS replay inside a dedicated
 // single-thread rayon pool (see `verifier::verifier_pool`), so the challenger
 // it threads through must be able to cross into that pool. Both concrete
@@ -128,6 +173,22 @@ pub trait Challenger: Send {
             return None;
         }
         Some(self.sample_f128())
+    }
+
+    /// Prover-side PoW + scalar squeeze at a 64-bit `target`: a nonce passes
+    /// when its PoW hash is below `target` ([`is_below_target`]), with
+    /// probability `target / 2^64`, so the grind need not be a power of two
+    /// ([`grinding_target_for_degree`]). The default grinds
+    /// [`pow_bits_covering`] leading-zero bits instead, which is never
+    /// weaker: a transcript without targets (the chained one the recursion
+    /// replays in-circuit) keeps its bit grinds.
+    fn grind_pow_below_and_sample_f128(&mut self, target: u64) -> (u64, F128) {
+        self.grind_pow_and_sample_f128(pow_bits_covering(target))
+    }
+
+    /// Verifier mirror of [`Self::grind_pow_below_and_sample_f128`].
+    fn verify_pow_below_and_sample_f128(&mut self, nonce: u64, target: u64) -> Option<F128> {
+        self.verify_pow_and_sample_f128(nonce, pow_bits_covering(target))
     }
 
     /// Prover-side fused PoW + vector squeeze.
@@ -910,72 +971,17 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
-        // Measurement knob: FLOCK_NO_GRIND=1 skips all PoW grinding (nonce 0,
-        // no hashing). Grind time is nonce-search luck, so it adds variance
-        // that paired A/B can't cancel; proofs made this way fail verification.
-        static NO_GRIND: LazyLock<bool> = LazyLock::new(|| var_os("FLOCK_NO_GRIND").is_some());
         let bits = if *NO_GRIND { 0 } else { bits };
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
-        // Aggregate-aware parallelism: decide on the grind's *expected hash
-        // work* (`2^bits`), not a raw bit threshold. Fold-challenge grinds are
-        // individually modest — e.g. 2^15 at L0 under the per-round profiles —
-        // but the prover issues one per lane fold (6× at L0, 3× per recursive
-        // level), so the per-level aggregate (~2^17–2^18 hashes) lands on the
-        // multi-threaded critical path. We go parallel once a single grind
-        // clears the rayon dispatch break-even (~2^13 hashes); the genuinely
-        // tiny deep-level grinds (2^3–2^11) stay sequential, where the serial
-        // loop beats parallel-dispatch overhead. `find_first` returns the
-        // globally smallest satisfying nonce, so the result is identical to the
-        // sequential search (deterministic proofs) regardless of this choice.
-        const PARALLEL_GRIND_MIN_HASHES: u64 = 1 << 13;
-        // Nonces per rayon task in the parallel search. Large enough to amortize
-        // task dispatch and to let the BLAKE3 batch run many `hash_many` calls
-        // per task, small enough to keep cancellation granular once an earlier
-        // task has found a match.
-        const GRIND_CHUNK: u64 = 1 << 10;
         let nonce = if bits == 0 {
             0
-        } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
-            // Sequential search: scan ascending blocks until a nonce lands.
-            // `pow_scan` returns the smallest match within the block it is
-            // given, so scanning blocks in order yields the globally smallest.
-            let mut start: u64 = 0;
-            loop {
-                if let Some(n) = pow_scan(&state_digest, start, GRIND_CHUNK, bits, kind) {
-                    break n;
-                }
-                start = start.saturating_add(GRIND_CHUNK);
-            }
         } else {
-            // Search ordered blocks in parallel and return the first match.
-            let block: u64 = 1 << (bits.min(24) + 1);
-            let n_chunks = block.div_ceil(GRIND_CHUNK);
-            let mut start: u64 = 0;
-            loop {
-                // `find_first` takes the earliest *chunk* that yields a match
-                // and cancels the rest; within a chunk `pow_scan` returns the
-                // smallest nonce. A later chunk cannot hold a smaller nonce, so
-                // this is exactly the globally smallest — identical to the
-                // sequential search, which is what keeps proofs deterministic.
-                let found = (0..n_chunks)
-                    .into_par_iter()
-                    .map(|c| {
-                        pow_scan(
-                            &state_digest,
-                            start.saturating_add(c * GRIND_CHUNK),
-                            GRIND_CHUNK,
-                            bits,
-                            kind,
-                        )
-                    })
-                    .find_first(|r| r.is_some())
-                    .flatten();
-                if let Some(n) = found {
-                    break n;
-                }
-                start = start.saturating_add(block);
-            }
+            search_nonce(1u64 << bits.min(63), |start, len| {
+                pow_scan(&state_digest, start, len, kind, |h| {
+                    has_leading_zero_bits(h, bits)
+                })
+            })
         };
         // Absorb the nonce so subsequent transcript state binds to it.
         // Verifier mirrors via verify_pow.
@@ -1019,6 +1025,35 @@ impl Challenger for FsChallenger {
         }
         let nonce = self.grind_pow(bits);
         (nonce, self.sample_f128())
+    }
+
+    fn grind_pow_below_and_sample_f128(&mut self, target: u64) -> (u64, F128) {
+        if matches!(self.state, FsState::Blake3Chain(_)) {
+            return self.grind_pow_and_sample_f128(pow_bits_covering(target));
+        }
+        let kind = self.hash_kind();
+        let state_digest = self.state_digest();
+        let nonce = if *NO_GRIND {
+            0
+        } else {
+            search_nonce(u64::MAX / target.max(1), |start, len| {
+                pow_scan(&state_digest, start, len, kind, |h| {
+                    is_below_target(h, target)
+                })
+            })
+        };
+        self.observe_bytes(&nonce.to_le_bytes());
+        (nonce, self.sample_f128())
+    }
+
+    fn verify_pow_below_and_sample_f128(&mut self, nonce: u64, target: u64) -> Option<F128> {
+        if matches!(self.state, FsState::Blake3Chain(_)) {
+            return self.verify_pow_and_sample_f128(nonce, pow_bits_covering(target));
+        }
+        let ok = pow_is_below_target(&self.state_digest(), nonce, target, self.hash_kind());
+        // Absorb regardless, as `verify_pow` does.
+        self.observe_bytes(&nonce.to_le_bytes());
+        ok.then(|| self.sample_f128())
     }
 
     fn verify_pow_and_sample_f128(&mut self, nonce: u64, bits: u32) -> Option<F128> {
@@ -1116,6 +1151,68 @@ fn blake3_pow_preimage(state_digest: &[u8; 32], nonce: u64) -> [u8; 64] {
     pre
 }
 
+/// Measurement knob: `FLOCK_NO_GRIND=1` skips all PoW grinding (nonce 0, no
+/// hashing). Grind time is nonce-search luck, so it adds variance that paired
+/// A/B can't cancel; proofs made this way fail verification.
+static NO_GRIND: LazyLock<bool> = LazyLock::new(|| var_os("FLOCK_NO_GRIND").is_some());
+
+/// The smallest nonce `scan` accepts, for a grind of `expected` hashes.
+/// `scan(start, len)` returns the smallest passing nonce in
+/// `start .. start + len`.
+///
+/// Aggregate-aware parallelism: decide on the grind's *expected hash work*,
+/// not a raw bit threshold. Fold-challenge grinds are individually modest —
+/// e.g. 2^15 at L0 under the per-round profiles — but the prover issues one
+/// per lane fold (6× at L0, 3× per recursive level), so the per-level
+/// aggregate (~2^17–2^18 hashes) lands on the multi-threaded critical path.
+/// We go parallel once a single grind clears the rayon dispatch break-even
+/// (~2^13 hashes); the genuinely tiny deep-level grinds (2^3–2^11) stay
+/// sequential, where the serial loop beats parallel-dispatch overhead.
+/// `find_first` returns the globally smallest satisfying nonce, so the result
+/// is identical to the sequential search (deterministic proofs) regardless of
+/// this choice.
+fn search_nonce(expected: u64, scan: impl Fn(u64, u64) -> Option<u64> + Sync) -> u64 {
+    const PARALLEL_GRIND_MIN_HASHES: u64 = 1 << 13;
+    // Nonces per rayon task in the parallel search. Large enough to amortize
+    // task dispatch and to let the BLAKE3 batch run many `hash_many` calls
+    // per task, small enough to keep cancellation granular once an earlier
+    // task has found a match.
+    const GRIND_CHUNK: u64 = 1 << 10;
+    if expected < PARALLEL_GRIND_MIN_HASHES {
+        // Sequential search: scan ascending blocks until a nonce lands.
+        // `scan` returns the smallest match within the block it is given,
+        // so scanning blocks in order yields the globally smallest.
+        let mut start: u64 = 0;
+        loop {
+            if let Some(n) = scan(start, GRIND_CHUNK) {
+                return n;
+            }
+            start = start.saturating_add(GRIND_CHUNK);
+        }
+    }
+    // Search ordered blocks of about twice the expected work in parallel
+    // and return the first match.
+    let block: u64 = expected.min(1 << 24).next_power_of_two() << 1;
+    let n_chunks = block.div_ceil(GRIND_CHUNK);
+    let mut start: u64 = 0;
+    loop {
+        // `find_first` takes the earliest *chunk* that yields a match and
+        // cancels the rest; within a chunk `scan` returns the smallest nonce.
+        // A later chunk cannot hold a smaller nonce, so this is exactly the
+        // globally smallest — identical to the sequential search, which is
+        // what keeps proofs deterministic.
+        let found = (0..n_chunks)
+            .into_par_iter()
+            .map(|c| scan(start.saturating_add(c * GRIND_CHUNK), GRIND_CHUNK))
+            .find_first(|r| r.is_some())
+            .flatten();
+        if let Some(n) = found {
+            return n;
+        }
+        start = start.saturating_add(block);
+    }
+}
+
 /// Whether `h` has at least `bits` leading zero bits — MSB-first within each
 /// serialized byte, the one PoW bit convention everywhere (the fused
 /// transcript PoW here, the recursion circuit's `PowMaskTable`, and the AG
@@ -1171,6 +1268,32 @@ pub fn pow_has_leading_zero_bits(
     }
 }
 
+/// The target PoW's specification: whether `H(pre-image(state_digest, nonce))`
+/// is below `target` ([`is_below_target`]), under the transcript's own hash.
+pub fn pow_is_below_target(
+    state_digest: &[u8; 32],
+    nonce: u64,
+    target: u64,
+    kind: HashKind,
+) -> bool {
+    is_below_target(&pow_hash(state_digest, nonce, kind), target)
+}
+
+/// The PoW hash of `nonce` under the transcript's own hash.
+fn pow_hash(state_digest: &[u8; 32], nonce: u64, kind: HashKind) -> [u8; 32] {
+    #[cfg(feature = "hash-count")]
+    POW_SHA256.fetch_add(1, Ordering::Relaxed);
+    match kind {
+        HashKind::Sha256 => {
+            let mut pre = [0u8; 40];
+            pre[..32].copy_from_slice(state_digest);
+            pre[32..].copy_from_slice(&nonce.to_le_bytes());
+            Sha256::digest(pre).into()
+        }
+        HashKind::Blake3 => *hash(&blake3_pow_preimage(state_digest, nonce)).as_bytes(),
+    }
+}
+
 /// Nonces hashed per `hash_many` call in the BLAKE3 grind.
 ///
 /// Must clear the widest `simd_degree` (16, under AVX-512) so the batch fills
@@ -1180,7 +1303,7 @@ pub fn pow_has_leading_zero_bits(
 /// of each other.
 const BLAKE3_POW_BATCH: usize = 32;
 
-/// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
+/// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash passes `pass`
 /// leading zeros, or `None`.
 ///
 /// Batches the independent nonce hashes through the crate's SIMD compression.
@@ -1188,7 +1311,12 @@ const BLAKE3_POW_BATCH: usize = 32;
 /// reproduces byte-for-byte given `CHUNK_START` / `CHUNK_END | ROOT` — so this
 /// agrees with `blake3::hash` on every nonce, which
 /// `blake3_batched_pow_matches_scalar` asserts.
-fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
+fn blake3_pow_scan(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u64,
+    pass: impl Fn(&[u8]) -> bool,
+) -> Option<u64> {
     // BLAKE3 constants, fixed by the spec.
     const IV: [u32; 8] = [
         0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
@@ -1228,7 +1356,7 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
             &mut out[..n * 32],
         );
         for i in 0..n {
-            if has_leading_zero_bits(&out[i * 32..(i + 1) * 32], bits) {
+            if pass(&out[i * 32..(i + 1) * 32]) {
                 return Some(base + i as u64);
             }
         }
@@ -1295,13 +1423,14 @@ fn pow_scan(
     state_digest: &[u8; 32],
     start: u64,
     len: u64,
-    bits: u32,
     kind: HashKind,
+    pass: impl Fn(&[u8]) -> bool,
 ) -> Option<u64> {
     match kind {
-        HashKind::Blake3 => blake3_pow_scan(state_digest, start, len, bits),
-        HashKind::Sha256 => (start..start.saturating_add(len))
-            .find(|&n| pow_has_leading_zero_bits(state_digest, n, bits, kind)),
+        HashKind::Blake3 => blake3_pow_scan(state_digest, start, len, pass),
+        HashKind::Sha256 => {
+            (start..start.saturating_add(len)).find(|&n| pass(&pow_hash(state_digest, n, kind)))
+        }
     }
 }
 
@@ -1311,7 +1440,9 @@ mod tests {
 
     use crate::challenger::{
         Challenger, F128, F256, FsChallenger, HashKind, RandomChallenger, blake3_pow_scan,
-        pow_has_leading_zero_bits,
+        grinding_bits_for_degree, grinding_target_for_degree, has_leading_zero_bits,
+        is_below_target, pow_bits_covering, pow_has_leading_zero_bits, pow_is_below_target,
+        pow_target_for_bits,
     };
 
     /// Every FsChallenger property must hold under both transcript hashes:
@@ -1480,7 +1611,7 @@ mod tests {
                 // `bits = 0` makes every nonce a match, so the scan must return
                 // `start` — and the per-lane hashes are all exercised below.
                 assert_eq!(
-                    blake3_pow_scan(&state, start, len, 0),
+                    blake3_pow_scan(&state, start, len, |_| true),
                     Some(start),
                     "start={start} len={len}"
                 );
@@ -1489,12 +1620,103 @@ mod tests {
                 let want = (start..start + len)
                     .find(|&n| pow_has_leading_zero_bits(&state, n, 6, HashKind::Blake3));
                 assert_eq!(
-                    blake3_pow_scan(&state, start, len, 6),
+                    blake3_pow_scan(&state, start, len, |h| has_leading_zero_bits(h, 6)),
                     want,
                     "start={start} len={len}"
                 );
             }
         }
+    }
+
+    /// A target is the leading-zero grind generalized: `2^(64 − bits)` passes
+    /// exactly the hashes with `bits` leading zeros, a degree's target is
+    /// sub-`2^-128` for it, and its covering bit count is that degree's bit
+    /// count (so a transcript without targets grinds what it always did).
+    #[test]
+    fn pow_targets_generalize_leading_zero_bits() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for bits in 1..=64u32 {
+            let target = pow_target_for_bits(bits);
+            assert_eq!(pow_bits_covering(target), bits);
+            let edge = target.wrapping_sub(1);
+            let mut values = vec![0, edge, target, target.wrapping_add(1), u64::MAX];
+            values.extend((0..16).map(|k| next() >> (bits - 1 + (k % 3)).min(63)));
+            for v in values {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&v.to_be_bytes());
+                h[8..16].copy_from_slice(&next().to_le_bytes());
+                assert_eq!(
+                    is_below_target(&h, target),
+                    has_leading_zero_bits(&h, bits),
+                    "bits={bits} v={v:#x}"
+                );
+            }
+        }
+        for degree in [
+            1usize,
+            2,
+            3,
+            4,
+            7,
+            8,
+            9,
+            1000,
+            1 << 20,
+            (1 << 20) + 1,
+            1_226_045,
+            1_873_045,
+            (1 << 21) - 1,
+            1 << 40,
+        ] {
+            let target = grinding_target_for_degree(degree);
+            assert!((target as u128) * (degree as u128) < 1u128 << 64);
+            assert_eq!(pow_bits_covering(target), grinding_bits_for_degree(degree));
+        }
+    }
+
+    /// A target grind returns the smallest passing nonce on both search paths
+    /// and under both hashes, the verifier accepts it and samples the same
+    /// challenge, and rejects a failing nonce. The chained transcript grinds
+    /// the covering bit count instead.
+    #[test]
+    fn target_grind_roundtrip() {
+        for kind in KINDS {
+            // ~10 expected hashes stays sequential; ~20k goes parallel.
+            for target in [u64::MAX / 10, u64::MAX / 20_000] {
+                let fresh = || {
+                    let mut ch = FsChallenger::with_hash(b"grind-target", kind);
+                    ch.observe_bytes(b"root");
+                    ch
+                };
+                let mut prover = fresh();
+                let digest = prover.state_digest();
+                let (nonce, challenge) = prover.grind_pow_below_and_sample_f128(target);
+                assert!(pow_is_below_target(&digest, nonce, target, kind));
+                assert!((0..nonce).all(|n| !pow_is_below_target(&digest, n, target, kind)));
+                assert_eq!(
+                    fresh().verify_pow_below_and_sample_f128(nonce, target),
+                    Some(challenge)
+                );
+                let bad = (0..)
+                    .find(|&n| !pow_is_below_target(&digest, n, target, kind))
+                    .unwrap();
+                assert_eq!(fresh().verify_pow_below_and_sample_f128(bad, target), None);
+            }
+        }
+        let target = u64::MAX / 3000;
+        let mut a = FsChallenger::with_chained_blake3(b"grind-target");
+        a.observe_bytes(b"root");
+        let mut b = a.clone();
+        assert_eq!(
+            a.grind_pow_below_and_sample_f128(target),
+            b.grind_pow_and_sample_f128(pow_bits_covering(target))
+        );
     }
 
     /// The grind must return the globally smallest satisfying nonce, on both

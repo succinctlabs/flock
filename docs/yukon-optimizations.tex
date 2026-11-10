@@ -55,7 +55,14 @@ that were landed on the new protocol --- among them the statistics
 ladder in the open, the any-size Merkle leaf batcher, and the
 promotion of the AG zerocheck --- which together took the $m{=}32$
 prove from $854$ to $438$\,ms multi-threaded and from $5.25$ to
-$2.91$\,s single-threaded.
+$2.91$\,s single-threaded. A last section (Section~\ref{sec:degreeone})
+records a protocol change rather than a kernel: whole words of degree-one
+constraint rows --- a gate's inputs, its XORed outputs, its constant's word
+--- leave the zerocheck and are checked by the lincheck as one linear
+identity, at no measurable lincheck cost; it includes a soundness gap the
+first version had under the full-height commit, and its fix, and a
+lookahead pass over live spans that lets the sparse tail run two rounds
+per pass on any layout, which more than halves the multi-threaded tail.
 \end{abstract}
 
 \section*{Preliminaries}
@@ -1159,6 +1166,12 @@ After it the sum is $\approx340$.
 \item[Result:] Merged sumcheck $46\to14\,$ms, weight build gone; open $137\to109\,$ms MT, prove $\approx-15\,$ms net of the C fold ($3/3$).
 \end{optsummary}
 
+The predicate was later widened from a full-height column prefix to any
+stack whose used columns are all full height, gaps allowed
+(\texttt{pcs::full\_height\_columns}); that moved the transcript of
+full-count layouts with a gap, a protocol change described with the
+predicate in the ring-switching note (\S\,``The prover's transport'').
+
 The full fusion (the weight as the open's level-0 basis, no merged
 sumcheck at all) was built to the native verifier and parked: the
 residual side of the recursive verifier does not twist for free, and
@@ -1210,6 +1223,518 @@ the phase it changed). And wiring the pool's large buffers with
 \code{mlock} measured nothing on a quiet box ($4$ pairs, mixed signs
 within $\pm10\,$ms on min, median and max) while adding $\approx63$k
 faults per prove for the wiring walks.
+
+\section{Degree-one rows out of the zerocheck}\label{sec:degreeone}
+
+The entries above change kernels and leave the statement alone. This one
+changes the protocol: it removes whole words of constraint rows from the
+zerocheck and has the lincheck check them as one linear identity instead.
+It was built on the leanXMSS verifier circuit (branch
+\code{zerocheck-input-rows}, stacked on \code{leanxmss}) and is
+measured there: on an Apple M4 (4P$+$6E), ten threads, at $1000$ leanXMSS
+signatures ($201{,}000$ BLAKE3 compressions over seven gate kinds) and on
+the pure BLAKE3 union at $2^{18}$ compressions.
+
+\subsection{The census: products the zerocheck does not need}\label{sec:census}
+
+\begin{optsummary}
+\item[Baseline:] Every constraint row of every Boolean gate went through the zerocheck, including rows with a constant factor.
+\item[Observation:] A gate's input words, its outputs that are copies or XORs, and the word that holds its constant wire consist entirely of rows that are linear once the constant is fixed --- $11$ of the compression gate's $92$ words, and every word of three of the five gadget gates.
+\item[Mechanism:] Drop such words from the zerocheck; check their linear identity in the lincheck (\S\ref{sec:degreeone-protocol}).
+\item[Result:] see \S\ref{sec:degreeone-measure}.
+\end{optsummary}
+
+A Boolean gate type is a square R1CS over $\Ftwo$: $k = 2^\kappa$
+positions per instance, matrices $A_0, B_0$ and $C_0 = I$, so constraint
+$i$ of an instance $z$ reads $(A_0 z)_i\,(B_0 z)_i = z_i$, and a constant
+wire $z_p$ that the lincheck's count target pins to $1$ on declared
+instances and $0$ on dummy ones. Call row $i$ \emph{degree-one} if
+$B_{0,i} = \{p\}$, or $A_{0,i} = B_{0,i} = \emptyset$. On a declared
+instance such a row reads $(A_0 z)_i = z_i$. Three kinds of words consist
+of nothing else:
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\item \emph{input words}: each bit has the row $z_i\cdot z_p = z_i$, i.e.\ $A_{0,i} = \{i\}$ --- a row every witness satisfies;
+\item \emph{output words} whose bits are copies or XORs of earlier bits: $(A_0z)_i\cdot z_p = z_i$; in the compression gate each is an XOR of about $5{,}000$ bits, because the circuit inlines BLAKE3's XORs into its linear forms;
+\item the \emph{constant's word}: the circuit builder gives the pin a word of its own, whose other $127$ rows are $0\cdot 0 = z_i$.
+\end{itemize}
+An exhaustive classification of every row of the seven leanXMSS gates
+(Table~\ref{tab:census}) shows chain, address and address-step contain
+no product at all --- they route and XOR bits --- and that the remaining
+mixed words (the codeword gate's $64/64$ halves, the compression gate's
+word $8$ with $70$ forced-zero bits) are not whole words and stay.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Gate & words & inputs & pin word & linear outputs & left in the zerocheck\\
+\midrule
+compression (leanXMSS) & 92 & 7 & 1 & 3 & 81\\
+chain & 7 & 4 & 1 & 2 & 0\\
+swap & 8 & 3 & 1 & 2 & 2\\
+codeword & 14 & 1 & 1 & 0 & 12\\
+address & 4 & 2 & 1 & 1 & 0\\
+address step & 5 & 2 & 1 & 2 & 0\\
+compression (hand-written) & 92 & 7 & --- & 4 & 81\\
+\bottomrule
+\end{tabular}
+\caption{Words per gate by kind of row. The hand-written BLAKE3 R1CS keeps
+its constant in a mixed word.}\label{tab:census}
+\end{table}
+
+\subsection{The protocol}\label{sec:degreeone-protocol}
+
+Let $D$ be the rows of the dropped words and $m_i = [i\notin D]$. The
+registry derives $D$ from the type's matrices, rejects any word with a
+degree-two row, and binds the list into its digest; the verifier never
+takes it from the proof.
+
+\paragraph{Zerocheck.} It proves $a'\circ b' = c'$ for
+$a' = \mathrm{diag}(m)A_0 z$, $b' = \mathrm{diag}(m)B_0 z$,
+$c' = \mathrm{diag}(m)z$. The run-list it reads marks $D$'s words as zero
+runs, and both round-1 kernels (AG and RS) are read-exact against the
+run-list, so the zerocheck reads nothing there --- no kernel changes.
+
+\paragraph{Lincheck.} The comb's row weights become
+$u_i = \eq_i\,(m_i + \eta\,(1 - m_i))$, with $\eq$ the row-eq table at the
+zerocheck's point $r$ and $\eta$ a fresh challenge sampled after the
+lincheck's $\alpha$. The usual fold gives $\alpha A_0^{\top}u + B_0^{\top}u$; an
+$O(k)$ pass then adds, for every $i\in D$, $\alpha u_i$ at column $i$
+and, if $B_{0,i} = \{p\}$, $u_i$ at the pin column, which cancels the
+$B$ share in characteristic two. The result is
+\[
+\mathrm{Comb} \;=\; \alpha\,A'^{\top}\eq + B'^{\top}\eq
+\;+\; \alpha\eta\sum_{i\in D}\eq_i\,(A_{0,i} + e_i),
+\]
+so the sumcheck proves
+$\alpha\,\hat a'(r) + \hat b'(r) + \alpha\eta\,\hat\rho(r) = \mathrm{target}$,
+where $\rho$ is the residual $(A_0 + I)z$ restricted to $D$. The target
+carries no $\eta$ term, so the identity forces $\hat\rho(r) = 0$. The fold
+touches the same nonzeros as before; the extra work is the $O(k)$ pass per
+distinct gate.
+
+\paragraph{The C claim.} $\hat c'(r_c) = \sum_x \eq(r_c,x)\,m(x)\,z(x)$.
+The mask depends only on the column, so the opening's weight for this
+claim is $\eq_{\mathrm{row}}\otimes(\eq_{\mathrm{col}}\odot m)$. Every
+ring-switched claim's weight is already a per-column factor times a row
+tensor, and a $0/1$ mask is fixed by Frobenius and passes through the
+$\Ftwo$-linear fold, so the mask enters each opening path --- block-first
+banks, the baked weight, the multipoint dual values, the anchor --- as one
+multiply on the column factor.
+
+\subsection{Soundness}\label{sec:degreeone-sound}
+
+\paragraph{The relation.} The PIOP proves the kept rows (zerocheck) and
+$(A_0z)_i = z_i$ for every $i\in D$ and every instance (lincheck). On a
+declared instance $z_p = 1$, so this is exactly the original relation.
+
+\paragraph{The $\eta$ batch.} $\eta$ is sampled after the commitment and
+after the zerocheck has fixed $\hat a'(r)$ and $\hat b'(r)$. The term
+$\alpha\eta\,\hat\rho(r)$ vanishes at $\eta = 0$ and also at $\alpha = 0$
+($\alpha$ is sampled first), so a nonzero $\hat\rho(r)$ survives with
+probability at most $2/|\mathbb{F}|$, not $1/|\mathbb{F}|$: once
+$\alpha \neq 0$ the identity is affine in $\eta$ with a nonzero
+coefficient. Each challenge still has at most one bad value, so $\eta$ is
+one more site like a pin's $\beta$, with one PoW bit in the strict
+schedule, and $\alpha$'s bit is unchanged.
+
+\paragraph{The point $r$.} $\rho$ is fixed by the commitment before $r$
+is drawn. A nonzero $\rho$ has $\hat\rho(r) = 0$ only if $r$ lands in a
+bad set, and these add to the zerocheck's own bad sets at the same
+challenges: at the skip coordinate, the zeros of one more base-code word
+(at most $158$ for the genus-$95$ AG code, $63$ for the RS skip); in each
+multilinear round, one more degree. The strict schedule grinds each
+challenge to $\mathrm{bits}(\text{bad set})$ with
+$\mathrm{bits}(n) = \lfloor\log_2 n\rfloor + 1$, so:
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+challenge & bad set before & with the linear check & PoW bits\\
+\midrule
+AG skip point $r_1$ & $316 + 158 = 474$ & $632$ & $9\to10$\\
+RS skip point & $127$ & $190$ & $7\to8$\\
+each multilinear round & $2$ & $3$ & $2$ (unchanged)\\
+\bottomrule
+\end{tabular}
+\end{center}
+The raised bits apply only when some dropped row is not $z_i\cdot z_p = z_i$
+(\S\ref{sec:identity-special}).
+
+\paragraph{Dummy rows.} A slot's dummy instances $n_t\le j<2^\nu$ have
+$z_p = 0$. There the \emph{original} row $(A_0z)_i\cdot z_p = z_i$ forces
+$z_i = 0$ for every input and output word, while the lincheck's identity,
+which has no pin, does not. Under the default height-$n_t$ stacking this
+is immaterial: dummy rows are not committed and are virtual zeros. Under
+the full-height commit (which the leanXMSS circuit uses, for the
+block-first transport of \S\ref{sec:blockfirst}) they are committed, and
+two arguments read them: the wiring's and the tuple bus's gathers take
+each committed word's whole column and assume dummy rows are zero. The
+masked wiring product gives a dead cell the leaf $1 + w$, so a dummy
+input word $w = 1$ would zero \emph{both} grand products and make every
+copy constraint vacuous; the bus's dead leaves $1 + \sum_k\gamma_k w_k$
+cannot be zeroed by the prover, but they enlarge the Schwartz--Zippel
+degree beyond the live entries its grinding is sized for. So a slot that
+commits dummy rows ($0 < n_t < 2^\nu$ under full height) keeps all of its
+rows, and the dropped set is read per slot from the instance, never from
+the type alone.
+
+\paragraph{Small slots.} Below $\nu = 6$ nothing drops either. A dropped
+word still holds its witness bits ($C$ aliases $z$). The RS zerocheck's
+round~1 reads each $8192$-bit window up to its highest useful bit, so it
+skips a dropped column only when the column, $2^{7+\nu}$ bits, covers whole
+windows. At $\nu = 5$ the round-1 message counted a dropped column that
+the fold treated as zero, and the final check failed on x86, where the RS
+route runs; the AG zerocheck reads per block and never showed it. The
+same window read a partial slot's dummy rows, which the union prover
+leaves dirty on the stated assumption that neither zerocheck reads a dead
+bit: a flaky failure that depended on what earlier tests had left in the
+scratch pool. One predicate, $7 + \nu \ge 13$, now gates both the dropped
+words and the dirty buffers. Production slots are far above the threshold
+($\nu = 15$ for leanXMSS at $1000$ signatures).
+
+The first version of this change dropped input words regardless of the
+commit mode. Reading the full-height soundness note against the wiring's
+dead-leaf formula found the gap; the version recorded here closes it.
+The cost is the partial slots: one per gate kind in leanXMSS --- including
+the only slot of the swap, codeword, address and address-step kinds ---
+or about a quarter of the droppable blocks at $1000$ signatures.
+
+\subsection{Identity words are the special case}\label{sec:identity-special}
+
+\begin{optsummary}
+\item[Question:] The input words could be handled by the general linear check, or by dedicated code (the first version of this change: clear their rows, mask the C claim). Is the general route slower?
+\item[Answer:] It is the same computation. For $A_{0,i} = \{i\}$, $B_{0,i}=\{p\}$ the $\eta$-scaled fold adds $\alpha\eta\,\eq_i$ at $i$ and $\eta\,\eq_i$ at $p$, and the fix-ups add the same two terms: they cancel, and $(A_0 + I)_i = 0$ makes $\rho\equiv 0$ there.
+\item[Mechanism:] With only identity words dropped the implementation samples no $\eta$ and keeps the grinding unchanged, so it runs exactly the first version's comb; a unit test checks the combs agree for random $\eta$, and that adding an XOR word changes the comb by exactly $\alpha\eta\,\eq\odot(A_0+I)$ over its rows.
+\item[Result:] see \S\ref{sec:degreeone-measure}.
+\end{optsummary}
+
+The prover-only reading of the same idea --- keep the transcript and
+special-case degree-one rows inside the zerocheck --- was weighed before
+the protocol change (not built) and saves less by construction. AG round~1 emits the $a\cdot b$
+and $c$ messages separately (the $c$ claim closes at $r_1$), so an
+identity block still costs its $c$-side bank, its $a$ fold, and its share
+of every tail round; only the $b$ side becomes a constant. Dropping the
+rows from the relation removes all three.
+
+\subsection{Measurements}\label{sec:degreeone-measure}
+
+\begin{optsummary}
+\item[Baseline:] leanXMSS at $1000$ signatures: zerocheck $156$, zerocheck$+$lincheck window $208$, prove $505\,$ms (10 threads, median of three alternating rounds' fastest proves).
+\item[Improvement:] Degree-one words out of the zerocheck in every full slot (\S\ref{sec:degreeone-protocol}).
+\item[Mechanism:] Round~1 and the skip$\to$multilinear fold read $\approx13\%$ fewer blocks; the tail, which overlaps the wiring GKR, moves least; the lincheck pays $+2\,$ms for the partial slots' own combs.
+\item[Result:] zerocheck $156\to140$, window $208\to194$, prove $505\to494\,$ms ($-2.2\%$, $3/3$); lincheck $19\,$ms in every pure-BLAKE3 arm (the linear check is free). Pure BLAKE3 at full utilization \emph{regresses} ($445\to463$), for a reason outside this change, which \S\ref{sec:livelookahead} removes.
+\end{optsummary}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+leanXMSS, $1000$ signatures & before & inputs, all slots & degree-one, full slots\\
+\midrule
+zerocheck & 156 & 144 & 140\\
+\quad round 1 / fold / tail & 53 / 40 / 61 & 50 / 36 / 57 & 44 / 34 / 55\\
+lincheck & 29 & 29 & 31\\
+zerocheck $+$ lincheck window & 208 & 195 & 194\\
+prove & 505 & 494 & 494\\
+\midrule
+pure BLAKE3, $2^{18}$ (one full slot) & none & inputs & inputs $+$ outputs\\
+\midrule
+zerocheck & 136 & 157 & 152\\
+\quad round 1 / fold / tail & 59 / 46 / 31 & 54 / 41 / 63 & 52 / 39 / 61\\
+lincheck & 19 & 19 & 19\\
+prove & 445 & 468 & 463\\
+\bottomrule
+\end{tabular}
+\caption{M4, ten threads, ms; phase rows are medians over three alternating
+rounds of each round's fastest prove, sub-phases medians over all proves.
+The middle leanXMSS column is the first version (unsound under the
+full-height commit, \S\ref{sec:degreeone-sound}); the identity-only
+pure-BLAKE3 arm built from that version measured the same as this one
+($471$ against $468$).}\label{tab:degreeone}
+\end{table}
+
+Two readings. First, the linear check costs nothing measurable: the
+lincheck is $19\,$ms in every pure-BLAKE3 arm, as
+\S\ref{sec:identity-special} predicts. Second, at full utilization the
+zerocheck gets \emph{slower} although round~1 and the fold shrink by the
+expected $12\%$: the multilinear tail doubles ($31\to61$--$63$). The sparse
+tail (\S\ref{sec:foldentry}) runs its two-rounds-per-pass lookahead only
+when the live layout is a single interval starting at $0$ --- exactly a
+full slot's used words --- and dropped words split it. leanXMSS never has
+that layout (many slots, gaps, partial columns), so its tail runs without
+the lookahead in every arm; at $55$--$61\,$ms it is its largest zerocheck
+phase. The remedy belongs to the tail, not to this change
+(\S\ref{sec:livelookahead}).
+
+\subsection{The lookahead over live spans}\label{sec:livelookahead}
+
+\begin{optsummary}
+\item[Baseline:] The sparse tail ran the lookahead ladder of \S\ref{sec:foldentry} only on a single live interval starting at~$0$. On any other layout it resolved the fold-level entry's deferred challenge with a \emph{serial} in-place fold over the whole live set, then ran one round per pass. leanXMSS never qualified: at the tail's entry its $34.6$M live positions form $227$ intervals, aligned only to $128$ positions, because a partial slot's columns are live on $2n_t$ of their $2^{\nu+1}$ positions. Pure BLAKE3 with dropped words is a single interval, but it starts at column~$11$.
+\item[Improvement:] A lookahead pass over live-span buffers. Every group of inputs (16 with two pending variables, 8 with one) is weighted by its global index. A run of groups inside one stored interval goes through the dense NEON kernel on the compacted slice; a group straddling a live/dead boundary gathers its inputs with the dead ones at their honest zero. The output layout is the group cover of the live set, merged where groups touch, so its intervals are multiples of $4$ and the ladder continues on any layout.
+\item[Mechanism:] Two effects, separated by a third arm that only parallelizes the resolve: the serial pass leaves the critical path, and the two-rounds-per-pass ladder reads and writes the live set about half as often. Single-threaded neither shows: both routes do about $3L$ multiplications for $L$ live positions.
+\item[Result:] Ten threads: tail $56\to24\,$ms on leanXMSS and $62\to28$ on pure BLAKE3 with dropped words; zerocheck $146\to110$ and $167\to129$; prove faster in $5/5$ rounds on each. One thread: tail unchanged.
+\end{optsummary}
+
+The pass needs nothing from the layout. Its eight sums are sums over
+groups of products of folded values, each group weighted by
+$\eq_{\mathrm{lo}}\cdot\eq_{\mathrm{hi}}$ at its global index; a group
+whose inputs are all dead folds to zero and contributes nothing, and a
+group with some dead inputs is computed exactly as the dense pass computes
+it on the expanded buffer. So the sums, and the stored outputs, are the
+dense pass's, and the transcript is unchanged. The tasks are cut at the
+$\eq_{\mathrm{hi}}$ boundaries, so each carries one high weight; on a
+dense prefix they are the dense pass's chunks. A unit test compares the
+pass with the dense one on expanded buffers for prefixes, an offset
+interval, slot-shaped runs, and intervals that start, end, or meet inside
+a group.
+
+The single-threaded null is the expected one. Per $16$ inputs a fold-2
+pass does $24$ folding multiplications, $4$ eq scalings and $8$ products,
+$2.25$ per input over $L, L/4, L/16,\dots$, so $3L$ in all. The classic
+route does $1$ per input for the resolve and $2$ per input for each
+fold-and-message round over $L/2, L/4,\dots$, again $3L$. What the ladder
+saves is traffic, and the old route's resolve was a single-threaded loop
+over the whole live set; both matter only when the cores compete for
+bandwidth and wait at the pass boundary. The decision was therefore taken
+on the ten-thread measurement (Table~\ref{tab:livelookahead}).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+ten threads & before & resolve parallel only & live-span lookahead\\
+\midrule
+leanXMSS, $1000$ signatures: tail & 56 & 43 & 24\\
+\quad zerocheck & 146 & 136 & 110\\
+\quad zerocheck $+$ lincheck window & 203 & 194 & 184\\
+pure BLAKE3 $2^{18}$, degree-one words dropped: tail & 62 & 50 & 28\\
+\quad zerocheck & 167 & 147 & 129\\
+\quad zerocheck $+$ lincheck window & 205 & 184 & 162\\
+\midrule
+one thread (tail) & before & & live-span lookahead\\
+\midrule
+leanXMSS, $1000$ signatures & 92 & & 91\\
+pure BLAKE3, degree-one words dropped & 112 & & 114\\
+pure BLAKE3, nothing dropped (single prefix) & 126 & & 126\\
+\bottomrule
+\end{tabular}
+\caption{M4, ms. Ten threads: medians over three alternating rounds of each
+round's fastest prove. One thread: medians over three rounds of each
+round's per-phase minimum. ``Before'' is \S\ref{sec:degreeone} as
+measured in Table~\ref{tab:degreeone}. The prove totals were faster in
+every one of five ten-thread rounds on both workloads, by medians of
+$28$ (leanXMSS) and $20\,$ms (pure BLAKE3); the desktop was shared, so the
+window is the steadier figure.}\label{tab:livelookahead}
+\end{table}
+
+With it, dropping words pays at full utilization too. Over the same
+ten-thread rounds pure BLAKE3's zerocheck has a median of $140\,$ms with
+nothing dropped ($136$--$146$, four proves) and $129$ with its degree-one
+words dropped ($121$--$143$, five), against $167$ before ($157$--$181$). leanXMSS's tail, its largest zerocheck phase in every arm of
+Table~\ref{tab:degreeone}, is now its smallest.
+
+\subsection{What is left}\label{sec:degreeone-left}
+
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\item \emph{Partial slots under full height.} Keeping their savings needs
+  the C claim's weight
+  $\eq_{\mathrm{row}}\otimes(\eq_{\mathrm{col}}\odot m)
+  + (\eq_{\mathrm{row}}\odot\mathrm{dead}_t)\otimes(\eq_{\mathrm{col}}\odot(1-m))$,
+  whose row factor is masked to each slot's dummy suffix; the zerocheck
+  then enforces $z_i = 0$ there, as the original relation did, at no
+  prover cost (honest dummy rows are zero). Every opening path would have
+  to carry a per-slot row mask; the dead suffix is $O(\nu)$ aligned
+  subcubes, so the verifier's evaluation stays succinct.
+\item \emph{Prover-only leftovers.} The C claim's column bit-bank fold
+  still folds the masked columns, and the witness packers still write
+  $A z$ and $B z$ for words nothing reads.
+\item \emph{Recursion.} The deferred verification paths (jagged-layout
+  export, matrix-claim accumulation) describe rows with plain eqs and
+  refuse zeroed words; carrying them needs a masked row weight and the
+  linear check's terms in the tower's fold region.
+\end{itemize}
+
+\section{The strict-128 audit against the current frontier}\label{sec:strict128}
+
+On 2026-10-30 the campaign was re-run against the challenge tree's
+newest frontier (\code{flock-challenge} \code{8d4b435}, sixteen
+submissions past the \code{c35c1c4} the earlier sections audited,
+$7$--$11\%$ faster than it on every arm) and for the \emph{strict-128}
+(\code{Fast}) profile only. Host: Apple M4 (4P$+$6E). Shape: the $m{=}32$
+BLAKE3 prove ($2^{18}$ compressions), grinding on. Protocol: alternating
+processes, each the minimum over its proves, then the median over four
+processes; the single-thread A/B decides compute changes, ten threads
+and the default pool decide parallelism. Every change here is
+proof-byte-identical (one digest across all $24$ A/B processes).
+
+\paragraph{Where strict-128 differs from Fast100.} Phase by phase at ten
+threads, the two profiles cost the same except in the Ligerito recursion:
+its five recursive commits ($44$ against $18\,$ms; $191$ against
+$69\,$ms single-threaded) and its query grinding ($2.4$--$3.7$ against
+$0.2\,$ms). Both follow from the strict ladder itself --- rates
+$1/8\,..\,1/2048$, climbing $+2$ per level, and $16$-bit query PoW --- not
+from an implementation gap: the recursive encodes already start past the
+$\log(1/\rho)$ copy-only layers, and their per-element cost matches the
+frontier's ($\approx2\,$ms per $2^{20}$ elements at ten threads on both).
+
+\paragraph{The audit.} Of the frontier's thirty switches that measured
+significant on their own (the 2026-10-29 switch campaign), the CPU-side
+ones map as follows. \emph{Live}: the streaming commit and its from-message
+top (NTT\_TOP\_EPOOL, NTT\_MERKLE\_PIPELINE, NTT\_FROM\_MSG;
+\S\ref{sec:streamcommit}, \S\ref{sec:rankedtop}), the zerocheck lookahead
+(\S\ref{sec:cascade}, \S\ref{sec:foldentry}), round-1 AB prep under the
+commit (\S\ref{sec:abhoist}), recursive commits from the message
+(\S\ref{sec:recursivefill}; the low-rate levels keep the replicate fill,
+which measured faster there), and the lincheck stripe kernels
+(\S\ref{sec:lcfold}). \emph{Re-derived for the union}: the direct-open
+family (LIG\_FOLD2, OPEN\_DIRECT\_AB/FOLD4/FOLD8, ZC\_LINCHECK\_C\_REUSE)
+lives on as the statistics ladder and the block-first merged sumcheck
+(\S\ref{sec:statsladder}, \S\ref{sec:blockfirst}). \emph{Measured null
+earlier}: the SIMD witness builder (\S\ref{sec:zpool}) and non-temporal
+witness stores (\S\ref{sec:mt}). \emph{Lost in the union's F256 rewrite
+of the recursion and restored below}: the lazy level OOD
+(\S\ref{sec:lazyood}); the induce truncation (\S\ref{sec:inducetrunc})
+was also lost and re-measured, see the rejections. Against the frontier
+at ten threads the prover now leads on witness generation and on commit
+plus zerocheck; it trails on the open (the union's two ring-switched
+claims and the F256 recursion --- protocol) and on everything the GPU
+does (the Metal track).
+
+\subsection{Lazy level OODs, again}\label{sec:lazyood2}
+
+\begin{optsummary}
+\item[Baseline:] Each recursive level's OOD sample built the dense $\eq(z,\cdot)$ table ($2^{20}$ entries at L1, two samples per level), swept it against the split table for the answer and the round message, then swept it again into the combined basis; both intakes also re-read the whole table for a base-valued \code{assert}.
+\item[Improvement:] Keep the sample as the exact factors $\eq = \mathrm{lo}\otimes\mathrm{hi}$ (\code{build\_eq\_split}): each $\mathrm{hi}$ block's pair sums run against the L1-resident $\mathrm{lo}$ and are scaled by $\mathrm{hi}[e]$ once, and the glue adds $\mathrm{lo}[h]\cdot(\beta\,\mathrm{hi}[e])$. The invariant check moves into the sweep. Tasks over a level's table take at least $2^{14}$ elements, so the deep levels ($2^8$--$2^{14}$) no longer split into dispatch-bound rayon tasks.
+\item[Mechanism:] The challenge tree's lazy OOD (LIG\_LAZY\_OOD and its per-level twins), re-derived on the F256 split table. Three F128 products per pair as before; the $2^{\mathrm{dim}}$ table build and its two re-reads are gone. The same field elements by distributivity, sums order-free.
+\item[Result:] Level OODs ST $10.7\to5.1\,$ms, 10T $5.9\to2.5\,$ms (both $4/4$).
+\end{optsummary}
+
+\subsection{The induce dispatch, by product count}\label{sec:inducecost}
+
+\begin{optsummary}
+\item[Baseline:] The induced query basis takes the dense path ($q\cdot2^{\mathrm{msg}}$ products) unless $q > 4\cdot2^{\log(1/\rho)}\cdot\log_2(\mathrm{block})$ --- a margin tuned at $m{=}30$, rate $1/2$. At strict-128's rate-$1/8$ L1 (msg $2^{16}$, $79$ queries) it chose dense: $5.45\,$ms ST.
+\item[Improvement:] Compare the two counts directly: dense $q\cdot2^{\mathrm{msg}}$ against the sparse transpose's $(\log\mathrm{block}-8)\cdot2^{\log\mathrm{block}-1}$ butterflies past its windowed prefix.
+\item[Mechanism:] Measured on the strict ladder's levels, both paths cost $\approx1\,$ns per product at one and at ten threads, so no margin is needed. L1 now takes the NTT ($2.74\,$ms ST); L2 and deeper stay dense, where the count says so (L2: $0.41$ dense against $1.33$). The equivalence test gains three shapes with $\log\mathrm{block}\ge12$, the first to exercise the windowed prefix.
+\item[Result:] Induce ST $15.2\to12.2\,$ms, 10T $7.1\to5.8\,$ms (both $4/4$, jointly with the task-size floor). Open bucket, all three changes: ST $382.9\to372.5$, 10T $97.1\to91.8\,$ms ($4/4$).
+\end{optsummary}
+
+\subsection{The default pool on an E-rich chip}\label{sec:erichpool}
+
+\begin{optsummary}
+\item[Baseline:] \code{init\_perf\_thread\_pool} sizes the pool to the P-cores --- right on 8P$+$2E (M1~Max) and 10P$+$4E, where the E-cores straggle --- so on the M4's 4P$+$6E the default prove ran four threads plus the all-core hops: $455.6\,$ms, against $416.5$ with \code{RAYON\_NUM\_THREADS=10}.
+\item[Improvement:] When the E-cluster is at least as large as the P-cluster, the pool takes every core.
+\item[Mechanism:] The challenge tree reaches the same E-cluster through its helper pool (\code{epool}, a $1.3$k-line module plus per-site queues); on this topology the plain all-core pool captures it with two lines. P-rich chips are unchanged.
+\item[Result:] Default pool $455.6\to410.3\,$ms ($-10\%$, $4/4$); the open alone $121.6\to92.0$.
+\end{optsummary}
+
+\subsection{The lincheck's circuit fold, in two chains}\label{sec:cscgather}
+
+\begin{optsummary}
+\item[Baseline:] Single-threaded the lincheck took $84.7\,$ms against the frontier's $77.8$, which read as a slower z-fold kernel: per useful bit ($11{,}707$ here, $15{,}409$ in the frontier's circuit) $43\%$ behind its hand-written EOR3 \code{process\_block16\_neon\_single\_sha3}. It is not: on the production shape ($m{=}32$, $k{=}2^{14}$, one thread) our eight-row kernel, a typed-table variant that compiles to the frontier's \code{ubfx} plus scaled-load sequence, a sixteen-row intrinsics variant and the frontier's assembly all fold in $53$--$55\,$ms. The z fold is load-bound and at parity per lookup. The difference is the lincheck's other term, the circuit fold \code{CscCircuit::fold\_split} ($A_0^{\top}u$ and $B_0^{\top}u$): $19.8\,$ms single-threaded over BLAKE3's $44.4$M nonzeros (linear substitution leaves rows of up to $5{,}320$ entries), where the frontier walks its circuit in $0.05\,$ms.
+\item[Improvement:] Each column's gather runs in two interleaved accumulators, indices masked by the power-of-two width (asserted at construction) so the bounds checks drop out. \code{fold\_split} (prover) and \code{fold\_alpha\_batched} (verifier) share it, so every \code{CscCircuit} gains: the BLAKE3 and SHA-2 encoders and every leanXMSS gate.
+\item[Mechanism:] One accumulator serializes on the XOR, about two cycles a nonzero; two leave the loop bound by its two loads. Four or eight chains and an L1-blocked two-pass row split measured no better. The same sums in another order: byte-identical.
+\item[Result:] The fold alone $19.8\to9.3\,$ms ST. BLAKE3 prove, lincheck ST $84.3\to73.6\,$ms, 10T $17.5\to16.7$ (both $4/4$), proof digest unchanged in all $16$; its verifier ST $20.7\to11.6\,$ms, 10T $4.8\to4.1$. leanXMSS[BLAKE3] at $1000$ signatures ($4$ pairs): lincheck ST $114.2\to90.8\,$ms, prove $1982\to1958$, verify $136.5\to69.3$ (all $4/4$); 10T lincheck $-2.0\,$ms and verify $26.6\to20.3$ ($4/4$), prove unchanged.
+\end{optsummary}
+
+\subsection{The witness builder, one lane at a time}\label{sec:lanebuilder}
+
+\begin{optsummary}
+\item[Baseline:] Single-threaded witness generation took $189$--$199\,$ms against the frontier's $139$ (which also writes its codeword's message half). The batch-major builder runs eight compressions in lockstep (\code{[u32; 8]} per word) and compiled to scalar code: $28$ NEON instructions among $3.7$k, $546$ stack stores and $440$ stack loads. The sixteen-word state is $32$ vector registers on its own, and the row writes --- widen, shift by a runtime amount, OR into the row --- do not vectorize, so LLVM scalarized the whole body and spilled. Every $31$-bit field was OR'd into a pre-cleared staging row (one or two read-modify-writes a field), and the non-temporal flush interleaved each chunk's even and odd rows through a stack buffer. Profile: $77\%$ builder, $17\%$ flush, $6\%$ clearing.
+\item[Improvement:] (1) Each lane's compression runs on its own with all $56$ G's expanded by macro, so every state and message index is a literal and the state lives in registers; the fields stream into whole row words (\code{LaneWords}: a word is stored once complete and never read back). Round 1's constant-IV adds fold into the generic add, whose state word still holds $\mathrm{IV}[g]$. The standalone builder and the DSL kernel (\code{Blake3Kernel::fill8}, every leanXMSS BLAKE3 gate) share it; the stream keeps the bits below its start and ORs its last word, so the kernel's mid-row placement stays exact. (2) The flush zips even and odd rows in registers straight into \code{stnp}. (3) The builder stores every useful row whole --- the I/O words directly, the pin's word before the stream ORs the G region's tail into it --- so the driver no longer clears the staging; SHA-2's builder, which still ORs its fields, clears its own.
+\item[Mechanism:] The frontier's scalar stream builder (\code{build\_block\_witness\_ab\_stream\_into}), on our fused-add circuit and batch-major rows. Stepwise at $2^{16}$ compressions, one thread: $53.3\to42.0$ (lane builder) $\to39.5$ (register zip) $\to35.5\,$ms (no clear). Rejected on the way: a register-accumulator stream inside the eight-lane lockstep ($76.6\,$ms --- more spills, not fewer). Byte-identical: the batch-major/row-major equality test, the DSL kernel-vs-walk test and the tower's pinned tape regions all pass.
+\item[Result:] BLAKE3 prove ($4$ pairs): witgen ST $196.9\to130.8\,$ms, 10T $35.5\to26.1$; prove ST $1858\to1789\,$ms ($-3.6\%$), 10T $417.5\to410.4$ (all $4/4$), proof digest unchanged in all $16$ --- single-threaded witness generation now under the frontier's $139$. leanXMSS[BLAKE3] at $1000$ signatures: witgen ST $183.0\to177.3\,$ms, 10T $34.5\to33.3$ (both $4/4$), every proof verified; its witness is mostly the DSL gate packing (\code{BooleanGate::pack\_into\_with}), which this does not touch.
+\end{optsummary}
+
+\subsection{The message transpose: measured, fusion held back}\label{sec:fusedmsg}
+
+The lane-major commit transposes the witness into the ranked top's
+position-major message, $\mathrm{msg}[p\cdot t+l]=q[l\cdot D+p]$
+($t=46$ lanes, $D=2^{19}$: $368\,$MB each way at $m{=}32$), in
+$24\,$ms ST and $13.6\,$ms at 10T --- it barely scales, being pure DRAM
+traffic. The frontier avoids it by writing its codeword's message half
+during witness generation. Three attempts:
+
+\begin{itemize}
+\item \emph{A faster transpose.} Every loop order measured the same in a
+standalone kernel on the production shape --- lane-major reads with
+scattered stores $22.3\,$ms, lane pairs $23.0$, lane quads $22.4$,
+position-major gathers $38.4$ --- and staging each tile in L2 and
+streaming it out non-temporally (skipping the destination's
+read-for-ownership) measured $25.7$--$27.5$ against $23.4$--$25.6$
+in-prove. It is bandwidth-bound; rejected.
+\item \emph{Fusing it into the first NTT pass}: the dual from-source
+radix-8 kernel takes $(\text{row},\text{lane})$ source strides, so the
+ranked top reads $q$ in place with strides $(1, D)$ instead of the
+message's $(t, 1)$ --- a ten-line change that would serve every
+application, BLAKE3 and leanXMSS alike, without touching a witness
+driver. Byte-identical (digest unchanged), but the first pass now pulls
+$8\times46=368$ concurrent streams $1\,$MB and $8\,$MB apart, which
+alias into the same cache sets: the ranked NTT went $436\to480\,$ms ST
+against the $24\,$ms transpose it saved ($+20\,$ms net), and the 10T
+commit $136\to132\,$ms. Consuming each stream line by line (lane-outer
+over an $8$-row tile) would end the aliasing but reads $368$ one-line
+bursts per tile, the pattern the transpose's own tiling measured at
+$\approx9\,$GB/s; long bursts need a multi-MB staging tile per worker,
+which does not fit L2 at 10T. Rejected.
+\item \emph{Writing the message from the witness driver}, as the frontier
+does: when $q$ is the single slot's $z$ (identity compaction) and the
+ranked top applies, the union prover lends the driver a
+\code{MessageDest}; the BLAKE3 driver writes each position's lane record
+from its staged rows with non-temporal stores, and
+\code{commit\_lane\_major\_with\_message} skips the transpose.
+Byte-identical (digest unchanged, $16/16$). Four pairs against
+\S\ref{sec:lanebuilder}: ST witgen $+16.6\,$ms, transpose $-24.2$, prove
+$-3.9$ ($3/4$); 10T witgen $+2.9$, transpose $-13.6$, prove
+$-8.5\,$ms ($4/4$, $-2\%$). The single-thread cost is the $368\,$MB of
+extra stores ($+11.5\,$ms at $\approx32\,$GB/s in a witgen-only probe, the
+single-core write floor), so the single-thread gain cannot exceed
+$\approx-8\,$ms. At $+184$ lines across $14$ files --- a new
+\code{SlotWitnessDest} field every driver and test site carries --- for a
+single-thread wash it is held back (branch \code{yukon-128-fused-msg});
+it is worth taking only for the 10T result. For leanXMSS the same
+write is possible --- under its full-height commit compaction is a
+per-slot contiguous copy, so a witness position's place in $q$, and
+hence in the message, is a per-slot offset --- but it buys the same
+trade from the generic DSL packer: its transpose is $30\,$ms ST against
+$\approx17\,$ms of extra message stores, and its compaction, which the
+open still needs, stays ($9\,$ms ST and 10T once the pool is warm;
+the $25\,$ms first-run figure is page faults). Not taken.
+\end{itemize}
+
+\subsection{The leanXMSS compression slots, without the walk}\label{sec:compresspacker}
+
+\begin{optsummary}
+\item[Baseline:] leanXMSS[BLAKE3] spends $201$ compressions a signature --- $201$k rows at $1000$ signatures, over seven $2^{15}$-row slots --- and the DSL gate's generic packer (\code{BooleanGate::pack\_into}) wrote them: of $176\,$ms single-threaded witness generation about $155$ are these slots, $0.78\,\mu$s a row against $0.48$ for the standalone BLAKE3 driver on the same compressions. The BLAKE3 kernel already wrote the rounds (\S\ref{sec:lanebuilder}); the profile was kernel $41\%$, the packer's own plumbing $51\%$ (staging clears, per-batch input and argument gathers, plane transposes for the six words the walk still owns, the column-run stores), the walk $2\%$.
+\item[Improvement:] A dedicated slot driver, \code{CompressPacker}, on the standalone generator's driver (\code{drive\_witness\_batch\_major\_partial\_into}: burst flush, stripe from the staged rows). Per eight rows the wired inputs and \code{next} go in as whole words (identity and linear rows, $z=Az$, $Bz=1$), the compression by the kernel, and the rest of the row --- the pin and the padding's $Bz$, the same in every row --- from a template the gate's own packer writes once on zero rows. The kernel body is now \code{\#[inline(always)]} (\code{Blake3Kernel::fill8\_inline}) and the driver calls it at bit $64w+6$ with the $6$ a constant, asserted against the layout, so every field's shift and word boundary resolve at compile time as in the standalone layout; and since the row's padding ends the rounds on a word boundary, the kernel stores its output words whole too, so no staging row needs clearing. The other five leanXMSS gates keep the generic packer.
+\item[Mechanism:] One slot ($28{,}715$ rows, one thread): generic $0.78\,\mu$s a row; dedicated driver through the trait $0.65$; constant bit offset $0.56$; no clearing $0.52$ (standalone generator: $0.48$). Byte-identical: \code{kernel\_packing\_matches\_the\_walk} now also checks the driver's $z$, $Az$, $Bz$ and stripe against the walk's, on poisoned buffers, at full, partial and sub-eight row counts.
+\item[Result:] leanXMSS[BLAKE3] at $1000$ signatures ($4$ pairs): witgen ST $176.1\to120.0\,$ms, 10T $32.8\to25.2$; prove ST $1943\to1883\,$ms ($-2.8\%$), 10T $454.5\to449.0$ (all $4/4$); proof digest unchanged in all $16$. $+184$ lines, test included.
+\end{optsummary}
+
+\paragraph{Rejected, and what is left.} The induce truncation of
+\S\ref{sec:inducetrunc} generalizes to every rate --- the low
+$2^{\mathrm{msg}}$ outputs of the last $\log(1/\rho)$ transpose steps are
+the XOR of the $2^{\log(1/\rho)}$ segments, since every entry they feed is
+a butterfly's top output $a+b$ --- and removes three of eleven dense layers
+at L1, but the segment XOR costs most of what it saves: $2.87\to2.49\,$ms
+ST at L1, $0.4\,$ms a prove, not worth its lines. Routing the query PoW
+through the eight-way or SME2 BLAKE3 kernel (grinding is $8\,$ms ST) needs
+the transcript crate to depend on the Merkle crate's kernels; estimated
+$-4\,$ms ST. Larger items remain, each above the bloat bar without
+an explicit call: the frontier's depth-three delayed sparse-dual
+induction (C2, $\approx500$ lines there), which would take most of the
+remaining induce ($7.0\,$ms ST at the L0 boundary, $2.7$ at L1); the
+rest of leanXMSS's witness generation --- its compression slots now run
+$0.04\,\mu$s a row off the standalone generator, and the five small gates
+left on the generic packer are $\approx15\,$ms ST; and the
+strict ladder itself, whose recursive commits are
+$+120\,$ms ST over Fast100 by construction --- a parameter decision, not
+an implementation one.
 
 \section*{Summary}
 
@@ -1271,6 +1796,18 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:blockfirst} & protocol transport & open: $137\to109\,$ms 8T & $3/3$\\
 \S\ref{sec:lanefill} & store pattern & lane fill: $-31\%$ ST & sweep\\
 \S\ref{sec:poolcap} & allocation & prove: $-68\,$ms 8T (mean) & $4/4$\\
+\midrule
+\multicolumn{4}{@{}l}{\emph{protocol, leanXMSS at $1000$ signatures, M4, ten threads}}\\
+\S\ref{sec:degreeone} & protocol (work removal) & zerocheck $156\to140$; prove $-2.2\%$ & $3/3$\\
+\S\ref{sec:livelookahead} & pass fusion, scheduling & zc tail: $56\to24\,$ms 10T, $\pm0$ ST & $5/5$\\
+\midrule
+\multicolumn{4}{@{}l}{\emph{strict-128 (Fast), $m{=}32$ BLAKE3, M4, grinding on}}\\
+\S\ref{sec:lazyood2} & work removal (algebra) & level OODs: $-5.6\,$ms ST, $-3.4$ 10T & $4/4$\\
+\S\ref{sec:inducecost} & dispatch & induce: $-3.1\,$ms ST, $-1.3$ 10T & $4/4$\\
+\S\ref{sec:erichpool} & scheduling & default-pool prove: $455.6\to410.3\,$ms & $4/4$\\
+\S\ref{sec:cscgather} & ILP & lincheck: $-10.6\,$ms ST; verify $20.7\to11.6$; leanXMSS verify $-49\%$ & $4/4$\\
+\S\ref{sec:lanebuilder} & representation, store pattern & witgen: $196.9\to130.8\,$ms ST, $-9.4$ 10T; prove $-3.6\%$ ST & $4/4$\\
+\S\ref{sec:compresspacker} & specialization & leanXMSS witgen: $176.1\to120.0\,$ms ST, $-7.5$ 10T; prove $-2.8\%$ ST & $4/4$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\

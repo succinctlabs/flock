@@ -477,7 +477,9 @@ pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
 // Producer contract: chunk-columns `[0, useful_chunks)` are FULLY written
 // every call; the padding suffix `[useful_chunks, k/128)` columns are never
 // written (the generators zero that contiguous buffer suffix themselves, so
-// recycled scratch buffers stay valid).
+// recycled scratch buffers stay valid). The group builder writes every
+// staging row in `[0, useful_words)` itself — the rows hold the previous
+// group's words on entry — so an OR-based builder clears them first.
 // ---------------------------------------------------------------------------
 
 /// Instances per lockstep group (= one lincheck-stripe group; one chunk-row
@@ -525,28 +527,39 @@ pub(crate) fn or_bit_row(rows: &mut [BmRow], bit: usize) {
     }
 }
 
-/// Non-temporal store of one interleaved 128-byte chunk-row.
+/// Non-temporal store of one 128-byte chunk-row: the lanes' even and odd
+/// words interleaved (`[e0, o0, e1, o1, …]`), zipped in registers.
 #[inline(always)]
-pub(crate) unsafe fn nt_store_row(src: *const u64, dst: *mut u64) {
+pub(crate) unsafe fn nt_store_chunk_row(even: &BmRow, odd: &BmRow, dst: *mut u64) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         std::arch::asm!(
-            "ldp {t0:q}, {t1:q}, [{s}]",
+            "ldp {e0:q}, {e1:q}, [{e}]",
+            "ldp {o0:q}, {o1:q}, [{o}]",
+            "zip1 {t0:v}.2d, {e0:v}.2d, {o0:v}.2d",
+            "zip2 {t1:v}.2d, {e0:v}.2d, {o0:v}.2d",
+            "zip1 {t2:v}.2d, {e1:v}.2d, {o1:v}.2d",
+            "zip2 {t3:v}.2d, {e1:v}.2d, {o1:v}.2d",
             "stnp {t0:q}, {t1:q}, [{d}]",
-            "ldp {t0:q}, {t1:q}, [{s}, #32]",
-            "stnp {t0:q}, {t1:q}, [{d}, #32]",
-            "ldp {t0:q}, {t1:q}, [{s}, #64]",
+            "stnp {t2:q}, {t3:q}, [{d}, #32]",
+            "ldp {e0:q}, {e1:q}, [{e}, #32]",
+            "ldp {o0:q}, {o1:q}, [{o}, #32]",
+            "zip1 {t0:v}.2d, {e0:v}.2d, {o0:v}.2d",
+            "zip2 {t1:v}.2d, {e0:v}.2d, {o0:v}.2d",
+            "zip1 {t2:v}.2d, {e1:v}.2d, {o1:v}.2d",
+            "zip2 {t3:v}.2d, {e1:v}.2d, {o1:v}.2d",
             "stnp {t0:q}, {t1:q}, [{d}, #64]",
-            "ldp {t0:q}, {t1:q}, [{s}, #96]",
-            "stnp {t0:q}, {t1:q}, [{d}, #96]",
-            s = in(reg) src, d = in(reg) dst,
-            t0 = out(vreg) _, t1 = out(vreg) _,
-            options(nostack),
+            "stnp {t2:q}, {t3:q}, [{d}, #96]",
+            e = in(reg) even.as_ptr(), o = in(reg) odd.as_ptr(), d = in(reg) dst,
+            e0 = out(vreg) _, e1 = out(vreg) _, o0 = out(vreg) _, o1 = out(vreg) _,
+            t0 = out(vreg) _, t1 = out(vreg) _, t2 = out(vreg) _, t3 = out(vreg) _,
+            options(nostack, preserves_flags),
         );
     }
     #[cfg(not(target_arch = "aarch64"))]
     unsafe {
-        copy_nonoverlapping(src, dst, 2 * BM_V);
+        let buf: [u64; 2 * BM_V] = from_fn(|i| if i % 2 == 0 { even[i / 2] } else { odd[i / 2] });
+        copy_nonoverlapping(buf.as_ptr(), dst, 2 * BM_V);
     }
 }
 
@@ -564,15 +577,12 @@ pub(crate) unsafe fn flush_rows_nt(
 ) {
     debug_assert!(2 * useful_chunks <= rows.len());
     for c in 0..useful_chunks {
-        let even = &rows[2 * c];
-        let odd = &rows[2 * c + 1];
-        let mut buf = [0u64; 2 * BM_V];
-        for j in 0..BM_V {
-            buf[2 * j] = even[j];
-            buf[2 * j + 1] = odd[j];
-        }
         unsafe {
-            nt_store_row(buf.as_ptr(), dest.add(((c << n_log) + o0) * 2));
+            nt_store_chunk_row(
+                &rows[2 * c],
+                &rows[2 * c + 1],
+                dest.add(((c << n_log) + o0) * 2),
+            );
         }
     }
 }
@@ -599,15 +609,12 @@ pub(crate) unsafe fn flush_rows_nt_burst(
     for c in 0..useful_chunks {
         for i in 0..n_sets {
             let rows = &rows_all[i * rows_per_set..(i + 1) * rows_per_set];
-            let even = &rows[2 * c];
-            let odd = &rows[2 * c + 1];
-            let mut buf = [0u64; 2 * BM_V];
-            for j in 0..BM_V {
-                buf[2 * j] = even[j];
-                buf[2 * j + 1] = odd[j];
-            }
             unsafe {
-                nt_store_row(buf.as_ptr(), dest.add(((c << n_log) + o0 + i * BM_V) * 2));
+                nt_store_chunk_row(
+                    &rows[2 * c],
+                    &rows[2 * c + 1],
+                    dest.add(((c << n_log) + o0 + i * BM_V) * 2),
+                );
             }
         }
     }
@@ -652,29 +659,6 @@ pub(crate) fn add_carry_parts_v(
         carry[j] = l & r;
     }
     (sum, left, right, carry)
-}
-
-/// V-wide [`fused_add3_parts`]: `(sum, [maj_left, maj_right, maj_prod],
-/// [rip_left, rip_right, rip_prod])` lanes.
-#[inline(always)]
-#[allow(clippy::type_complexity)]
-pub(crate) fn fused_add3_parts_v(
-    x: &[u32; BM_V],
-    y: &[u32; BM_V],
-    m: &[u32; BM_V],
-) -> ([u32; BM_V], [[u32; BM_V]; 3], [[u32; BM_V]; 3]) {
-    let mut sum = [0u32; BM_V];
-    let mut maj = [[0u32; BM_V]; 3];
-    let mut rip = [[0u32; BM_V]; 3];
-    for j in 0..BM_V {
-        let (s, mj, rp) = fused_add3_parts(x[j], y[j], m[j]);
-        sum[j] = s;
-        for t in 0..3 {
-            maj[t][j] = mj[t];
-            rip[t][j] = rp[t];
-        }
-    }
-    (sum, maj, rip)
 }
 
 /// Shared driver for the interleaved-row batch-major producers (sha2,
@@ -794,9 +778,6 @@ where
             )
         },
         move |(rz, ra, rb), g| {
-            rz[..useful_words].fill([0u64; BM_V]);
-            ra[..useful_words].fill([0u64; BM_V]);
-            rb[..useful_words].fill([0u64; BM_V]);
             let o0 = g * BM_V;
             let group: [&S; BM_V] = from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(padding));
             per_group(group, rz, ra, rb);
@@ -1010,12 +991,13 @@ where
             let rz = &mut rz_all[i * u64_per_block..(i + 1) * u64_per_block];
             let ra = &mut ra_all[i * u64_per_block..(i + 1) * u64_per_block];
             let rb = &mut rb_all[i * u64_per_block..(i + 1) * u64_per_block];
-            rz[..useful_words].fill([0u64; BM_V]);
-            ra[..useful_words].fill([0u64; BM_V]);
-            rb[..useful_words].fill([0u64; BM_V]);
             let o0 = g * BM_V;
             let live = n_declared.saturating_sub(o0).min(BM_V);
-            if live > 0 {
+            if live == 0 {
+                for rows in [&mut *rz, &mut *ra, &mut *rb] {
+                    rows[..useful_words].fill([0u64; BM_V]);
+                }
+            } else {
                 // Dead lanes get the group's first real input as a
                 // placeholder — their rows are zeroed below, so the
                 // placeholder's data never reaches the buffers.

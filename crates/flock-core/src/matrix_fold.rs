@@ -410,10 +410,12 @@ fn verify_grind_sample_vec_n<Ch: Challenger>(
 
 /// Bind the claims into the transcript — weights included, not just values.
 /// λ and μ must depend on everything being folded: two claim sets that agreed
-/// only on their values would otherwise draw the same challenges.
-fn observe_claims<Ch: Challenger>(claims: &[MatrixClaim], ch: &mut Ch) {
+/// only on their values would otherwise draw the same challenges. The last
+/// `n_bound` claims are already bound by the caller (the aggregate's shared
+/// binding: words that determine them sit earlier in this transcript).
+fn observe_claims<Ch: Challenger>(claims: &[MatrixClaim], n_bound: usize, ch: &mut Ch) {
     ch.observe_label(DOMAIN);
-    for c in claims {
+    for c in &claims[..claims.len() - n_bound] {
         for w in [&c.row, &c.col] {
             ch.observe_f128_slice(&w.low);
             ch.observe_f128_slice(&w.point);
@@ -444,7 +446,21 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
     grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> (FoldProof, MatrixClaim) {
+    prove_fold_bound_with_grinding(m, combs, claims, 0, grinding, ch)
+}
+
+/// [`prove_fold_with_grinding`] whose last `n_bound` claims the caller has
+/// already bound into `ch`: the fold observes only the others.
+pub fn prove_fold_bound_with_grinding<Ch: Challenger>(
+    m: &dyn FoldMatrix,
+    combs: &[Vec<F128>],
+    claims: &[MatrixClaim],
+    n_bound: usize,
+    grinding: FoldGrinding,
+    ch: &mut Ch,
+) -> (FoldProof, MatrixClaim) {
     assert!(!claims.is_empty(), "nothing to fold");
+    assert!(n_bound <= claims.len(), "bound claims are claims");
     assert_eq!(combs.len(), claims.len(), "one column marginal per claim");
     let k_row = claims[0].row.n_vars();
     let k_col = claims[0].col.n_vars();
@@ -454,7 +470,7 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
     }
 
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(k_row, k_col));
-    observe_claims(claims, ch);
+    observe_claims(claims, n_bound, ch);
     let lambdas = grind_sample_vec(
         ch,
         &mut grinding_nonces,
@@ -748,7 +764,19 @@ pub fn verify_fold_with_grinding<Ch: Challenger>(
     grinding: FoldGrinding,
     ch: &mut Ch,
 ) -> Result<MatrixClaim, FoldError> {
-    if claims.is_empty() || proof.bridge.len() != claims.len() {
+    verify_fold_bound_with_grinding(claims, 0, proof, grinding, ch)
+}
+
+/// [`verify_fold_with_grinding`] whose last `n_bound` claims the caller has
+/// already bound into `ch`.
+pub fn verify_fold_bound_with_grinding<Ch: Challenger>(
+    claims: &[MatrixClaim],
+    n_bound: usize,
+    proof: &FoldProof,
+    grinding: FoldGrinding,
+    ch: &mut Ch,
+) -> Result<MatrixClaim, FoldError> {
+    if claims.is_empty() || proof.bridge.len() != claims.len() || n_bound > claims.len() {
         return Err(FoldError::Malformed);
     }
     let k_row = claims[0].row.n_vars();
@@ -767,7 +795,7 @@ pub fn verify_fold_with_grinding<Ch: Challenger>(
     }
     let mut nonce_idx = 0usize;
 
-    observe_claims(claims, ch);
+    observe_claims(claims, n_bound, ch);
     let lambdas = verify_grind_sample_vec_n(
         ch,
         &proof.grinding_nonces,
@@ -962,6 +990,12 @@ pub enum JaggedRowWeight {
     /// count-derived). Fresh only, so no scale: a Combo never rides in as
     /// an inherited claim.
     Combo(Vec<(F128, u32)>),
+    /// `eq(point, ·)` with the `zeroed` layout columns cleared — a fresh
+    /// statement whose claim masks those columns out (the union's C claim
+    /// when slots drop words: `C = diag(mask)`). The mask is a constant of
+    /// the child circuit, bound by the group's key, so the transcript
+    /// carries only its size.
+    Masked(Vec<F128>, Vec<u32>),
 }
 
 impl JaggedRowWeight {
@@ -980,15 +1014,17 @@ impl JaggedRowWeight {
                 })
             }
             Self::Combo(terms) => terms.iter().fold(F128::ZERO, |acc, &(c, addr)| {
-                let e = rho.iter().enumerate().fold(F128::ONE, |e, (l, &r)| {
-                    e * if (addr >> l) & 1 == 1 {
-                        r
-                    } else {
-                        F128::ONE + r
-                    }
-                });
-                acc + c * e
+                acc + c * eq_at_index(rho, addr)
             }),
+            // eq(point, ρ) minus each zeroed column's share (char 2: plus).
+            Self::Masked(point, zeroed) => {
+                assert_eq!(point.len(), rho.len(), "point/arity mismatch");
+                zeroed
+                    .iter()
+                    .fold(Self::Eq(F128::ONE, point.clone()).eval(rho), |acc, &y| {
+                        acc + eq_at_index(point, y) * eq_at_index(rho, y)
+                    })
+            }
         }
     }
 
@@ -1012,6 +1048,14 @@ impl JaggedRowWeight {
                 }
                 out
             }
+            Self::Masked(point, zeroed) => {
+                assert_eq!(point.len(), k, "point/arity mismatch");
+                let mut out = Weight::eq(point.clone()).materialize();
+                for &y in zeroed {
+                    out[y as usize] = F128::ZERO;
+                }
+                out
+            }
         }
     }
 
@@ -1030,6 +1074,11 @@ impl JaggedRowWeight {
                     ch.observe_f128(F128::new(addr as u64, 0));
                 }
             }
+            Self::Masked(point, zeroed) => {
+                ch.observe_f128(F128::new(2, point.len() as u64));
+                ch.observe_f128(F128::new(zeroed.len() as u64, 0));
+                ch.observe_f128_slice(point);
+            }
         }
     }
 
@@ -1039,8 +1088,22 @@ impl JaggedRowWeight {
         match self {
             Self::Eq(_, point) => point.len() == k,
             Self::Combo(terms) => terms.iter().all(|&(_, addr)| (addr as usize) < (1 << k)),
+            Self::Masked(point, zeroed) => {
+                point.len() == k && zeroed.iter().all(|&y| (y as usize) < (1 << k))
+            }
         }
     }
+}
+
+/// `eq(point, index)` for an integer index read LSB-first.
+fn eq_at_index(point: &[F128], index: u32) -> F128 {
+    point.iter().enumerate().fold(F128::ONE, |e, (l, &p)| {
+        e * if (index >> l) & 1 == 1 {
+            p
+        } else {
+            F128::ONE + p
+        }
+    })
 }
 
 /// `Σ_y row(y) · Ĵ(y, col) = value` — one assist statement's `W`-value as a

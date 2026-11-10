@@ -11,7 +11,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 25)
+//!   byte  5       VERSION                  (currently 26)
 //!   bytes 6..7    flavor: 2 = R1cs, 4 = Mixed, 5 = TowerRoot, 6 = R1csAg
 //!                 (0/1 reserved: legacy BaseFold; 3 was the retired chain)
 //!   bytes 7..     bincode-serialized payload
@@ -72,16 +72,28 @@ const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 /// nine words (`g^{n_blocks}` composed child-to-parent), so every tower
 /// outer's transcript moved; a v22 tower-root bundle cannot verify under
 /// v23 shapes. R1cs/Mixed payloads are structurally unchanged.
-/// v24 (2026-11-03): the merged open's inner opening became an enum
-/// (`MergedInnerOpen::{Split, Affine}`, the `fast-affine` profile), which
-/// adds a variant tag to every merged-open payload.
-/// v25 (2026-11-07): transcript-v4 — the sponge-chained BLAKE3 transcript
-/// absorbs each run of consecutive scalar observes as ONE
+/// v24 (2026-11-05): the leanXMSS stack (#66–#70). Wiring proofs gained the
+/// tuple bus (`WiringProof::bus`, `BusProof`) and the public-column
+/// structure; the wiring and bus fingerprints grind to a target whenever
+/// `fingerprint_bits != 0`, so plain-transcript wiring proofs change bytes;
+/// the merged opening's block-first transport covers full-height layouts
+/// with gaps (`pcs::full_height_columns`); unions may drop zeroed linear
+/// words. A v23 bundle cannot be interpreted under v24 rules.
+/// v25 (2026-11-06): the `fast` schedule climbs its recursion ladder +1 per
+/// level (rates 1/2/3/4/5 at m29, Σq 550) instead of +2, so a v24 `fast`
+/// proof carries a different level count and query schedule. `fast100`,
+/// `slim`, `slim100` and `secure` payloads are unchanged.
+/// v26 (2026-11-10): the affine F128 fold (#76) on top of v25. The merged
+/// open's inner opening became an enum (`MergedInnerOpen::{Split, Affine}`,
+/// the `fast-affine` / `slim-affine` profiles), which adds a variant tag to
+/// every merged-open payload; and transcript-v4: the sponge-chained BLAKE3
+/// transcript absorbs each run of consecutive scalar observes as ONE
 /// `[header(KIND_RUN, n) | values]` record, so every tower outer's
 /// challenges moved and the `Chain100` config tag is gone. Payloads on the
-/// default (tree-BLAKE3 / SHA-256) transcripts are unchanged.
+/// default (tree-BLAKE3 / SHA-256) transcripts are otherwise unchanged.
+/// (#76 called these two changes v24 and v25 before it merged `main`.)
 /// (The per-version history this file used to carry lives in git.)
-const VERSION: u8 = 25;
+const VERSION: u8 = 26;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see

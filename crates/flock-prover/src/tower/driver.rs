@@ -34,11 +34,11 @@ use crate::tower::{
     fl_node::{FlNode, build_first_level_node_k, chain_blake_r1cs, chain_jagged_params},
     gates_blake3::pack4,
     node::{
-        ChainLane, NodeOut, SpineIn, build_node_outer_with, digest_f128, entry_live,
+        ChainLane, LaneFamily, NodeOut, SpineIn, build_node_outer_with, digest_f128, entry_live,
         node_jagged_params,
     },
     online::census_kib,
-    query::leaf_boolean_mats,
+    query::{LeafOuter, leaf_boolean_mats},
     setup::TowerShapes,
     span_count_word,
     verify::RootBundle,
@@ -285,6 +285,7 @@ impl Tower {
                 params: &chain_jp,
                 priors: &[&fls[k - 2].acc, &fls[k - 1].acc],
                 claims_base,
+                family: LaneFamily::Chain,
             }),
             None,
         );
@@ -311,6 +312,7 @@ impl Tower {
                         params: &chain_jp,
                         priors: &[&fls[i].acc, &prev_lane],
                         claims_base,
+                        family: LaneFamily::Chain,
                     }),
                     Some(SpineIn {
                         node_child: 1,
@@ -474,73 +476,99 @@ impl Tower {
         if !lane.discharge_jagged(&[(chain_circuit.digest(), &chain_jp)]) {
             return Err(ChainLaneJagged);
         }
-        // (3) the main fold vs the outer tables.
-        let fl_lo = &self.fl.lo;
-        if !main.discharge(&leaf_boolean_mats(fl_lo)) {
-            return Err(Boolean);
-        }
-        let el_mats: Vec<_> = fl_lo
-            .shape
-            .registry
-            .element_types()
-            .iter()
-            .map(|t| {
-                let e = t.element_type().expect("element table");
-                (e.a_0(), e.b_0())
-            })
-            .collect();
-        if !main.discharge_element(&el_mats) {
-            return Err(Element);
-        }
-        let fl_jp = node_jagged_params(fl_lo);
-        let root_jp = node_jagged_params(&self.root.lo);
-        let base_jp = self.base.as_ref().map(|b| node_jagged_params(&b.lo));
-        let mut circuits: Vec<&Circuit> = vec![&fl_lo.shape.circuit, &self.root.lo.shape.circuit];
-        let mut layouts: Vec<([u8; 32], &JaggedParams)> = vec![
-            (fl_lo.shape.circuit.digest(), &fl_jp),
-            (self.root.lo.shape.circuit.digest(), &root_jp),
-        ];
-        if let (Some(b), Some(jp)) = (&self.base, &base_jp) {
-            circuits.push(&b.lo.shape.circuit);
-            layouts.push((b.lo.shape.circuit.digest(), jp));
-        }
-        if !main.discharge_sigma(&circuits) {
-            return Err(Sigma);
-        }
-        if !main.discharge_jagged(&layouts) {
-            return Err(Jagged);
-        }
-        // (4) the passenger: (sigma-shaped, jagged-shaped), keyed by the
-        // base — the only orphan a spine ever makes.
-        let live = passenger.iter().any(|(_, c)| entry_live(c));
-        if live != expect_passenger {
+        // (3) + (4): the main fold and the passenger.
+        discharge_outer(
+            &self.fl.lo,
+            &self.root.lo,
+            self.base.as_ref(),
+            main,
+            passenger,
+            expect_passenger,
+        )
+    }
+}
+
+/// The root-side legs every tower shares, whatever its leaves: (3) the
+/// MAIN FOLD against the outer registry's matrices and element types and
+/// against the sigma/jagged tables of every circuit a keyed slot can name
+/// — the FL's, the root's own, and the base's; (4) the PASSENGER — the
+/// spine's single orphan — against the base's own tables, owed exactly
+/// when the root is steady.
+pub(super) fn discharge_outer(
+    fl_lo: &LeafOuter,
+    root_lo: &LeafOuter,
+    base: Option<&NodeOut>,
+    main: &Accumulator,
+    passenger: &[([F128; 2], MatrixClaim)],
+    expect_passenger: bool,
+) -> Result<(), RootDischargeFailure> {
+    use RootDischargeFailure::*;
+    // (3) the main fold vs the outer tables.
+    if !main.discharge(&leaf_boolean_mats(fl_lo)) {
+        return Err(Boolean);
+    }
+    let el_mats: Vec<_> = fl_lo
+        .shape
+        .registry
+        .element_types()
+        .iter()
+        .map(|t| {
+            let e = t.element_type().expect("element table");
+            (e.a_0(), e.b_0())
+        })
+        .collect();
+    if !main.discharge_element(&el_mats) {
+        return Err(Element);
+    }
+    let fl_jp = node_jagged_params(fl_lo);
+    let root_jp = node_jagged_params(root_lo);
+    let base_jp = base.map(|b| node_jagged_params(&b.lo));
+    let mut circuits: Vec<&Circuit> = vec![&fl_lo.shape.circuit, &root_lo.shape.circuit];
+    let mut layouts: Vec<([u8; 32], &JaggedParams)> = vec![
+        (fl_lo.shape.circuit.digest(), &fl_jp),
+        (root_lo.shape.circuit.digest(), &root_jp),
+    ];
+    if let (Some(b), Some(jp)) = (base, &base_jp) {
+        circuits.push(&b.lo.shape.circuit);
+        layouts.push((b.lo.shape.circuit.digest(), jp));
+    }
+    if !main.discharge_sigma(&circuits) {
+        return Err(Sigma);
+    }
+    if !main.discharge_jagged(&layouts) {
+        return Err(Jagged);
+    }
+    // (4) the passenger: (sigma-shaped, jagged-shaped), keyed by the
+    // base — the only orphan a spine ever makes.
+    let live = passenger.iter().any(|(_, c)| entry_live(c));
+    if live != expect_passenger {
+        return Err(Passenger);
+    }
+    if live {
+        let base = base.expect("a steady root keeps its base");
+        let base_d = base.lo.shape.circuit.digest();
+        if passenger.len() != 2
+            || passenger[0].0 != digest_f128(&base_d)
+            || passenger[1].0 != digest_f128(&base_d)
+            || !entry_live(&passenger[0].1)
+            || !entry_live(&passenger[1].1)
+        {
             return Err(Passenger);
         }
-        if live {
-            let base = self.base.as_ref().expect("a steady root keeps its base");
-            let base_d = base.lo.shape.circuit.digest();
-            if passenger.len() != 2
-                || passenger[0].0 != digest_f128(&base_d)
-                || passenger[1].0 != digest_f128(&base_d)
-                || !entry_live(&passenger[0].1)
-                || !entry_live(&passenger[1].1)
-            {
-                return Err(Passenger);
-            }
-            let pacc = Accumulator {
-                registry_digest: main.registry_digest,
-                per_type: Vec::new(),
-                per_element: Vec::new(),
-                sigma: vec![(base_d, passenger[0].1.clone())],
-                jagged: vec![(base_d, passenger[1].1.clone())],
-            };
-            let jp = base_jp.as_ref().expect("computed with the base");
-            if !pacc.discharge_sigma(&[&base.lo.shape.circuit])
-                || !pacc.discharge_jagged(&[(base_d, jp)])
-            {
-                return Err(Passenger);
-            }
+        let pacc = Accumulator {
+            registry_digest: main.registry_digest,
+            per_type: Vec::new(),
+            per_element: Vec::new(),
+            per_linear: Vec::new(),
+            sigma: vec![(base_d, passenger[0].1.clone())],
+            jagged: vec![(base_d, passenger[1].1.clone())],
+        };
+        let jp = base_jp.as_ref().expect("computed with the base");
+        if !pacc.discharge_sigma(&[&base.lo.shape.circuit])
+            || !pacc.discharge_jagged(&[(base_d, jp)])
+        {
+            return Err(Passenger);
         }
-        Ok(())
     }
+    Ok(())
 }

@@ -130,6 +130,13 @@ fn stats_ladder_matches_incremental_small() {
     );
 }
 
+/// The byte oracle on a FULL lane-major grid (64 of 64 lanes): union commits
+/// take the lane-major layout at every fill, so the ladder runs here too.
+#[test]
+fn stats_ladder_matches_incremental_full_grid() {
+    run(26, 6, 64, 1);
+}
+
 #[test]
 #[ignore] // Benchmark + byte oracle at the m32 leaf — run explicitly with --nocapture.
 fn stats_ladder_microbench() {
