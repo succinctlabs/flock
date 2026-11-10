@@ -8,6 +8,10 @@
 //! 13 (seeded s = 1..6, OOD s = 0..6).
 //!
 //! Run: `cargo bench --bench affine_l0_stats_probe`
+//!
+//! The NEON kernel is the point of the probe, so on other targets the bench
+//! builds and does nothing.
+#![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
 
 use std::time::Instant;
 
@@ -165,6 +169,12 @@ fn time<R>(f: impl FnOnce() -> R) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
+#[cfg(not(target_arch = "aarch64"))]
+fn main() {
+    eprintln!("affine_l0_stats_probe: the NEON kernel needs aarch64; nothing to run");
+}
+
+#[cfg(target_arch = "aarch64")]
 fn main() {
     init_perf_thread_pool();
     if std::env::args().any(|a| a == "materialize") {
