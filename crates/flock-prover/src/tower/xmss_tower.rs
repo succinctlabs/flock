@@ -164,8 +164,8 @@ impl XmssTower {
         let mut leaf0: Option<XmssLeaf> = None;
         let mut fls: Vec<XmssFlNode> = Vec::with_capacity(n_leaves / 2);
         for pair in batches.chunks(2) {
-            let l0 = build_xmss_leaf(circuit, &pair[0].0, &pair[0].1);
-            let l1 = build_xmss_leaf(circuit, &pair[1].0, &pair[1].1);
+            let l0 = build_xmss_leaf(cfg, circuit, &pair[0].0, &pair[0].1);
+            let l1 = build_xmss_leaf(cfg, circuit, &pair[1].0, &pair[1].1);
             fls.push(build_xmss_first_level_node(cfg, circuit, [&l0, &l1]));
             leaf0.get_or_insert(l0);
         }
@@ -839,8 +839,8 @@ fn xmss_tower_online_bench() {
 
     // ---- FL: the spine's fresh child, over batches 0 and 1 ----
     let (fresh, jp) = {
-        let l0 = build_xmss_leaf(&circuit, &batches[0].0, &batches[0].1);
-        let l1 = build_xmss_leaf(&circuit, &batches[1].0, &batches[1].1);
+        let l0 = build_xmss_leaf(cfg, &circuit, &batches[0].0, &batches[0].1);
+        let l1 = build_xmss_leaf(cfg, &circuit, &batches[1].0, &batches[1].1);
         STEADY_OVERRIDE.store(runs, Ordering::Relaxed);
         let fl = build_xmss_first_level_node(cfg, &circuit, [&l0, &l1]);
         STEADY_OVERRIDE.store(0, Ordering::Relaxed);
@@ -851,8 +851,8 @@ fn xmss_tower_online_bench() {
     // ---- BASE over two more first-level nodes, then the steady SPINE
     // node: the fresh FL plus the base as its node child ----
     let pair = |i: usize| {
-        let l0 = build_xmss_leaf(&circuit, &batches[i].0, &batches[i].1);
-        let l1 = build_xmss_leaf(&circuit, &batches[i + 1].0, &batches[i + 1].1);
+        let l0 = build_xmss_leaf(cfg, &circuit, &batches[i].0, &batches[i].1);
+        let l1 = build_xmss_leaf(cfg, &circuit, &batches[i + 1].0, &batches[i + 1].1);
         build_xmss_first_level_node(cfg, &circuit, [&l0, &l1])
     };
     let (fl1, fl2) = (pair(2), pair(4));
