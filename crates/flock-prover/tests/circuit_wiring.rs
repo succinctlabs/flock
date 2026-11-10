@@ -47,9 +47,11 @@ use flock_core::{
     aggregate,
     circuit::{
         Cell, CellSlot, Circuit, CircuitError, WiringError, WiringProof, prove_wiring,
-        verify_wiring,
+        prove_wiring_with_grinding, verify_wiring,
     },
-    element_r1cs::{ElementTableBuilder, ElementTableType, union::verify as verify_element_union},
+    element_r1cs::{
+        ElementTableBuilder, ElementTableType, union::verify_with_grinding as verify_element_union,
+    },
     field::F128,
     lincheck::LincheckCircuit,
     pcs::{
@@ -1113,10 +1115,17 @@ fn gather_claims_are_bound_by_the_opening() {
     verify_element_union(
         &union,
         proof.element.as_ref().expect("element half"),
+        pcs_params.element_grinding(),
         &mut ch,
     )
     .expect("the honest element PIOP replays");
-    let (fake_wiring, _) = prove_wiring(&circuit, &fake, &[], &mut ch);
+    let (fake_wiring, _) = prove_wiring_with_grinding(
+        &circuit,
+        &fake,
+        &[],
+        pcs_params.product_gkr_grinding(),
+        &mut ch,
+    );
 
     let mut spliced = proof.clone();
     spliced.wiring = fake_wiring;
