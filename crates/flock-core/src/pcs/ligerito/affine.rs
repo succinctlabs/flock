@@ -270,6 +270,18 @@ fn build_ladder(
         .map(|s| s.1)
         .collect();
     let cut = |v: &[usize]| v[..levels].to_vec();
+    // The claim- and consistency-batch grindings depend on the level's own
+    // rate (the Johnson list size) and query count (the consistency
+    // degree), so they are computed for THIS ladder's levels rather than
+    // copied from `split`, whose levels may sit at other rates (the Fast
+    // schedule climbs +1 per level; the registered ladders climb +2).
+    let (claim_batch, consistency_batch): (Vec<usize>, Vec<usize>) = (0..levels)
+        .map(|li| {
+            let (claim, _, consistency, ..) =
+                super::algebraic_grinding_schedule(rates[li], Some(LADDER_ETA), queries[li]);
+            (claim, consistency)
+        })
+        .unzip();
     let prover = ProverConfig {
         log_inv_rates: cut(rates),
         recursive_steps: ks.len(),
@@ -281,8 +293,8 @@ fn build_ladder(
         queries: cut(queries),
         grinding_bits: cut(&split.grinding_bits),
         fold_grinding_bits: cut(fold_grinding_bits),
-        claim_batch_grinding_bits: cut(&split.claim_batch_grinding_bits),
-        consistency_batch_grinding_bits: cut(&split.consistency_batch_grinding_bits),
+        claim_batch_grinding_bits: claim_batch,
+        consistency_batch_grinding_bits: consistency_batch,
         ood_samples: cut(&split.ood_samples),
         merkle_hash: split.merkle_hash,
         stratified: vec![],
@@ -2364,8 +2376,11 @@ mod tests {
         }
     }
 
-    /// At the split ladder's rates, the recomputed Johnson queries are the
-    /// shipped m32_fast counts; at L1 rate 1/4 they rise to 119.
+    /// At the split ladder's rates (Fast climbs +1 per level), the
+    /// recomputed Johnson queries are the shipped m32_fast counts, except at
+    /// the fifth level: its 2^7 columns make the affine fold's agreement
+    /// loss cost three more queries than the split analysis (51 vs 48). At
+    /// L1 rate 1/4 the queries are 119.
     #[test]
     fn ladder_queries_match_the_shipped_analysis() {
         let split = crate::pcs::ligerito::prover_config_for(
@@ -2374,8 +2389,10 @@ mod tests {
             crate::pcs::ligerito::LigeritoProfile::Fast,
         )
         .expect("m32 fast");
+        assert_eq!(split.log_inv_rates[..5], [1, 2, 3, 4, 5]);
         let (same, _) = affine_ladder(&split, 25, &split.log_inv_rates[..5], &[0; 5]);
-        assert_eq!(same.queries, split.queries[..5]);
+        assert_eq!(same.queries[..4], split.queries[..4]);
+        assert_eq!((same.queries[4], split.queries[4]), (51, 48));
         assert_eq!(same.recursive_ks, [4, 4, 4, 4]);
         let (fast, _) = affine_ladder(&split, 25, &[1, 2, 5, 7], &[4, 4, 5, 5]);
         assert_eq!(fast.queries, [244, 119, 48, 35]);
@@ -2395,6 +2412,30 @@ mod tests {
         assert_eq!(cfg.recursive_ks, [4, 4, 4, 4]);
         assert_eq!(cfg.recursive_log_msg_cols, [16, 12, 8, 4]);
         assert_eq!(cfg.fold_grinding_bits, [4, 5, 5, 5, 6]);
+    }
+
+    /// The batch grindings are computed at each affine level's own rate and
+    /// query count, not copied from the base config, whose levels sit at
+    /// other rates since Fast climbs +1 per level. The m33 and m32 leaves
+    /// and the m29 Slim outer come out equal to their base configs' +2
+    /// ladders level by level; the m24 test ladder's L1 (rate 1/32) needs
+    /// one bit more on each than the rate-1/8 level it used to copy.
+    #[test]
+    fn registered_ladders_batch_grinding() {
+        use super::LigeritoProfile::{FastAffine, SlimAffine};
+        for (profile, log_n, k, claim, consistency) in [
+            (FastAffine, 17, 6, &[6, 8][..], &[9, 10][..]),
+            (FastAffine, 25, 6, &[6, 7, 8, 9], &[9, 9, 10, 11]),
+            (FastAffine, 26, 6, &[6, 7, 8, 9, 10], &[9, 9, 10, 11, 12]),
+            (SlimAffine, 22, 5, &[6, 7, 8, 9], &[9, 10, 11, 11]),
+        ] {
+            let (cfg, _) = super::affine_ladder_for(profile, log_n, k).expect("registered");
+            assert_eq!(cfg.claim_batch_grinding_bits, claim, "{profile:?} {log_n}");
+            assert_eq!(
+                cfg.consistency_batch_grinding_bits, consistency,
+                "{profile:?} {log_n}"
+            );
+        }
     }
 
     #[test]
