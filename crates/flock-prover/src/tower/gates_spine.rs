@@ -1061,3 +1061,448 @@ impl GateType for ZcRoundGate {
         SlotWitness::element_from_rows(self.ty.width(), nu, rows)
     }
 }
+
+/// Squarings per [`SquareChainGate`] row: one input plus 31 squares fills
+/// the 32-column (`kappa = 5`) envelope exactly.
+pub(super) const SQ_N: usize = 31;
+
+/// A Frobenius chain: `x, x^2, x^4, …, x^(2^SQ_N)` — one `mult` column per
+/// squaring, every power an output. Rows chain (the next row's input is
+/// this row's last output), so `n` consecutive powers cost `ceil(n/31)`
+/// rows. Family H reads `x^(2^-j) = x^(2^(128-j))` off these chains: on
+/// F_{2^128} the Frobenius has order 128, so the inverse powers it needs are
+/// forward squarings and no square-root advice is involved.
+pub(super) struct SquareChainGate {
+    pub(super) ty: Arc<ElementTableType>,
+}
+
+impl SquareChainGate {
+    pub(super) fn new() -> Self {
+        let mut b = ElementTableBuilder::new(gate_kappa(1 + SQ_N));
+        b.free_wire(0);
+        for i in 1..=SQ_N {
+            b.mult(i, i - 1, i - 1);
+        }
+        Self {
+            ty: Arc::new(b.build().expect("square chain gate")),
+        }
+    }
+}
+
+impl GateType for SquareChainGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        let mut schema = vec![IoWord::input(0)];
+        schema.extend((1..=SQ_N).map(IoWord::output));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let mut z = vec![F128::ZERO; 1 + SQ_N];
+        z[0] = inputs[0];
+        for i in 1..=SQ_N {
+            z[i] = z[i - 1] * z[i - 1];
+        }
+        outputs.extend_from_slice(&z[1..]);
+        z
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
+    }
+}
+
+// HornerStepGate columns.
+const HS_G: usize = 7;
+const HS_V: usize = 8;
+const HS_HP: usize = 9;
+const HS_ONE: usize = 10;
+const HS_IN: usize = 11;
+const HS_M01: usize = 11;
+const HS_M02: usize = 12;
+const HS_M12: usize = 13;
+const HS_M012: usize = 14;
+const HS_P2: usize = 15; // p2..p6 at 15..=19
+const HS_E1: usize = 20; // e1..e3 at 20..=22
+const HS_X: usize = 23;
+const HS_GV: usize = 24;
+const HS_OUT: usize = 25;
+const HS_H2: usize = 26;
+const HS_H: usize = 27;
+const HS_K: usize = 28;
+
+/// One step of family H's Frobenius-twisted sum, by Horner:
+///
+/// ```text
+///   h = g · MLE_0(s) · v + hp²
+/// ```
+///
+/// where `MLE_0` is the multilinear extension of row 0 of the inverse Moore
+/// matrix (the trace-dual basis `d_t`) over its 7 index bits. Every row of
+/// that matrix is row 0 Frobenius-shifted, which is what lets ONE fixed row
+/// serve all 128 steps — so its constants live in the table's A/B rows
+/// instead of riding wires. Inputs: `s_0..s_6, g, v, hp, one`.
+///
+/// `d_t = g0·ratio^t + corr_t·[t < 7]` (the GHASH dual basis is geometric
+/// above index 6; [`family_h_dual_decomposition`]), so
+///
+/// ```text
+///   MLE_0(s) = g0·Π_q (1 + c_q·s_q)  +  E(s_3..s_6) · Q(s_0, s_1, s_2)
+/// ```
+///
+/// with `c_q = 1 + ratio^(2^q)`, `E = Π_{q≥3} (1 + s_q)`, and `Q` the
+/// correction polynomial in monomial form (`Q_S = Σ_{t ⊆ S, t<7} corr_t`).
+/// The constant `1` is the `one` input, so the all-zero padding row
+/// satisfies the relation.
+///
+/// [`family_h_dual_decomposition`]: crate::tower::real_walker::family_h_dual_decomposition
+pub(super) struct HornerStepGate {
+    pub(super) ty: Arc<ElementTableType>,
+    g0: F128,
+    c: [F128; 7],
+    /// Monomial coefficients of `Q`, indexed by the subset bitmask of
+    /// `{s_0, s_1, s_2}`.
+    q: [F128; 8],
+}
+
+impl HornerStepGate {
+    pub(super) fn new() -> Self {
+        let o = F128::ONE;
+        let (g0, ratio, corr) = crate::tower::real_walker::family_h_dual_decomposition();
+        let mut c = [F128::ZERO; 7];
+        let mut rq = ratio;
+        for cq in &mut c {
+            *cq = o + rq;
+            rq = rq * rq;
+        }
+        let mut q = [F128::ZERO; 8];
+        for (s, qs) in q.iter_mut().enumerate() {
+            for (t, &ct) in corr.iter().enumerate() {
+                if t & !s == 0 {
+                    *qs += ct;
+                }
+            }
+        }
+        let mut b = ElementTableBuilder::new(gate_kappa(HS_K));
+        for w in 0..HS_IN {
+            b.free_wire(w);
+        }
+        let one = HS_ONE;
+        b.mult(HS_M01, 0, 1)
+            .mult(HS_M02, 0, 2)
+            .mult(HS_M12, 1, 2)
+            .mult(HS_M012, HS_M01, 2);
+        // L0·L1 is linear once s0·s1 is a column.
+        let l01 = vec![(one, o), (0, c[0]), (1, c[1]), (HS_M01, c[0] * c[1])];
+        b.mult_lin(HS_P2, &l01, &[(one, o), (2, c[2])]);
+        for qi in 3..7 {
+            let at = HS_P2 + qi - 2;
+            b.mult_lin(at, &[(at - 1, o)], &[(one, o), (qi, c[qi])]);
+        }
+        b.mult_lin(HS_E1, &[(one, o), (3, o)], &[(one, o), (4, o)]);
+        b.mult_lin(HS_E1 + 1, &[(HS_E1, o)], &[(one, o), (5, o)]);
+        b.mult_lin(HS_E1 + 2, &[(HS_E1 + 1, o)], &[(one, o), (6, o)]);
+        let q_cols = [one, 0, 1, HS_M01, 2, HS_M02, HS_M12, HS_M012];
+        let q_terms: Vec<(usize, F128)> = q_cols
+            .iter()
+            .zip(&q)
+            .filter(|(_, qs)| **qs != F128::ZERO)
+            .map(|(&col, &qs)| (col, qs))
+            .collect();
+        b.mult_lin(HS_X, &q_terms, &[(HS_E1 + 2, o)]);
+        b.mult(HS_GV, HS_G, HS_V);
+        b.mult_lin(HS_OUT, &[(HS_GV, o)], &[(HS_P2 + 4, g0), (HS_X, o)]);
+        b.mult(HS_H2, HS_HP, HS_HP);
+        b.linear(HS_H, &[(HS_OUT, o), (HS_H2, o)]);
+        Self {
+            ty: Arc::new(b.build().expect("Horner step gate")),
+            g0,
+            c,
+            q,
+        }
+    }
+}
+
+impl GateType for HornerStepGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        let mut schema: Vec<IoWord> = (0..HS_IN).map(IoWord::input).collect();
+        schema.push(IoWord::output(HS_H));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let mut z = vec![F128::ZERO; HS_K];
+        z[..HS_IN].copy_from_slice(&inputs[..HS_IN]);
+        let (c, one) = (&self.c, z[HS_ONE]);
+        z[HS_M01] = z[0] * z[1];
+        z[HS_M02] = z[0] * z[2];
+        z[HS_M12] = z[1] * z[2];
+        z[HS_M012] = z[HS_M01] * z[2];
+        let l01 = one + c[0] * z[0] + c[1] * z[1] + c[0] * c[1] * z[HS_M01];
+        z[HS_P2] = l01 * (one + c[2] * z[2]);
+        for qi in 3..7 {
+            let at = HS_P2 + qi - 2;
+            z[at] = z[at - 1] * (one + c[qi] * z[qi]);
+        }
+        z[HS_E1] = (one + z[3]) * (one + z[4]);
+        z[HS_E1 + 1] = z[HS_E1] * (one + z[5]);
+        z[HS_E1 + 2] = z[HS_E1 + 1] * (one + z[6]);
+        let mono = [
+            one, z[0], z[1], z[HS_M01], z[2], z[HS_M02], z[HS_M12], z[HS_M012],
+        ];
+        let qv = mono
+            .iter()
+            .zip(&self.q)
+            .fold(F128::ZERO, |acc, (&m, &qs)| acc + qs * m);
+        z[HS_X] = qv * z[HS_E1 + 2];
+        z[HS_GV] = z[HS_G] * z[HS_V];
+        z[HS_OUT] = z[HS_GV] * (self.g0 * z[HS_P2 + 4] + z[HS_X]);
+        z[HS_H2] = z[HS_HP] * z[HS_HP];
+        z[HS_H] = z[HS_OUT] + z[HS_H2];
+        outputs.push(z[HS_H]);
+        z
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
+    }
+}
+
+/// Partial words summed per [`TransposeDotGate`] row: the 16 destination
+/// bytes of one transposed word.
+pub(super) const TD_PARTS: usize = 16;
+const TD_EQ: usize = 1;
+const TD_P: usize = 2;
+const TD_M: usize = TD_P + TD_PARTS;
+const TD_OUT: usize = TD_M + 1;
+
+/// One transposed word of family H's bit-transpose dot:
+///
+/// ```text
+///   out = acc + eq · (p_0 + … + p_15)
+/// ```
+///
+/// The 8×8 transpose tiles hand back transposed word `t` as 16 disjoint
+/// byte pieces (one per destination byte), so the word is their sum, and
+/// the sum is free inside one product of linear forms. Inputs: `acc, eq,
+/// p_0..p_15`; output `out`. 128 rows per claim, where multiplying every
+/// piece into the dot separately took 2,048 MACs.
+pub(super) struct TransposeDotGate {
+    pub(super) ty: Arc<ElementTableType>,
+}
+
+impl TransposeDotGate {
+    pub(super) fn new() -> Self {
+        let o = F128::ONE;
+        let mut b = ElementTableBuilder::new(gate_kappa(TD_OUT + 1));
+        for w in 0..TD_M {
+            b.free_wire(w);
+        }
+        let parts: Vec<(usize, F128)> = (TD_P..TD_M).map(|w| (w, o)).collect();
+        b.mult_lin(TD_M, &[(TD_EQ, o)], &parts);
+        b.linear(TD_OUT, &[(0, o), (TD_M, o)]);
+        Self {
+            ty: Arc::new(b.build().expect("transpose dot gate")),
+        }
+    }
+}
+
+impl GateType for TransposeDotGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        let mut schema: Vec<IoWord> = (0..TD_M).map(IoWord::input).collect();
+        schema.push(IoWord::output(TD_OUT));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let mut z = vec![F128::ZERO; TD_OUT + 1];
+        z[..TD_M].copy_from_slice(&inputs[..TD_M]);
+        let sum = z[TD_P..TD_M].iter().fold(F128::ZERO, |a, &p| a + p);
+        z[TD_M] = z[TD_EQ] * sum;
+        z[TD_OUT] = z[0] + z[TD_M];
+        outputs.push(z[TD_OUT]);
+        z
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        SlotWitness::element_from_rows(self.ty.width(), nu, rows)
+    }
+}
+
+#[cfg(test)]
+mod horner_tests {
+    use flock_core::pcs::ring_switch::moore_inverse;
+
+    use super::*;
+
+    /// splitmix64 — deterministic test values without a rand dependency.
+    struct StdRng(u64);
+    impl StdRng {
+        fn seed_from_u64(s: u64) -> Self {
+            Self(s)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+    }
+
+    fn rand_f(rng: &mut StdRng) -> F128 {
+        F128::new(rng.next(), rng.next())
+    }
+
+    fn frob(mut x: F128, j: usize) -> F128 {
+        for _ in 0..j {
+            x = x * x;
+        }
+        x
+    }
+
+    /// `Σ_t eq(s, t) · inv[row·128 + t]`, brute force.
+    fn moore_row_mle(row: usize, s: &[F128; 7]) -> F128 {
+        let minv = moore_inverse();
+        (0..128).fold(F128::ZERO, |acc, t| {
+            let eq = (0..7).fold(F128::ONE, |p, q| {
+                p * if (t >> q) & 1 == 1 {
+                    s[q]
+                } else {
+                    F128::ONE + s[q]
+                }
+            });
+            acc + eq * minv[row * 128 + t]
+        })
+    }
+
+    /// Lay `rows` out column-major at `n_log`, then check that the honest
+    /// layout satisfies and that `+1` on ANY used column of row 0 (a random
+    /// row) does not: the outputs are bound by their defining constraint and
+    /// every input feeds one. The regression Ron's probe asked to keep: the
+    /// honest-row tests above would pass a relation that left a column free.
+    fn assert_every_column_bound(ty: &ElementTableType, rows: &[Vec<F128>], n_log: usize) {
+        let layout = |rows: &[Vec<F128>]| {
+            let mut z = vec![F128::ZERO; ty.width() << n_log];
+            for (j, row) in rows.iter().enumerate() {
+                for (col, &x) in row.iter().enumerate() {
+                    z[(col << n_log) + j] = x;
+                }
+            }
+            z
+        };
+        assert!(
+            ty.satisfies(&layout(rows), n_log, rows.len()),
+            "the honest rows satisfy"
+        );
+        for col in 0..rows[0].len() {
+            let mut bad = rows.to_vec();
+            bad[0][col] += F128::ONE;
+            assert!(
+                !ty.satisfies(&layout(&bad), n_log, rows.len()),
+                "+1 on column {col} must break the relation"
+            );
+        }
+    }
+
+    #[test]
+    fn horner_step_rows_satisfy_and_evaluate_row_zero() {
+        let g = HornerStepGate::new();
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut rows = Vec::new();
+        for _ in 0..16 {
+            let s: [F128; 7] = std::array::from_fn(|_| rand_f(&mut rng));
+            let (gg, v, hp) = (rand_f(&mut rng), rand_f(&mut rng), rand_f(&mut rng));
+            let mut inp = s.to_vec();
+            inp.extend([gg, v, hp, F128::ONE]);
+            let mut out = Vec::new();
+            rows.push(g.eval(&inp, &(), &mut out));
+            assert_eq!(out[0], gg * moore_row_mle(0, &s) * v + hp * hp);
+        }
+        // The all-zero padding row.
+        let mut out = Vec::new();
+        rows.push(g.eval(&[F128::ZERO; HS_IN], &(), &mut out));
+        assert_eq!(out[0], F128::ZERO);
+        let n_log = 5;
+        let mut z = vec![F128::ZERO; g.ty.width() << n_log];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &x) in row.iter().enumerate() {
+                z[(col << n_log) + j] = x;
+            }
+        }
+        assert!(g.ty.satisfies(&z, n_log, rows.len()), "Horner rows satisfy");
+        assert_every_column_bound(&g.ty, &rows, n_log);
+    }
+
+    #[test]
+    fn square_chain_rows_satisfy() {
+        let g = SquareChainGate::new();
+        let mut rng = StdRng::seed_from_u64(9);
+        let x = rand_f(&mut rng);
+        let mut out = Vec::new();
+        let row = g.eval(&[x], &(), &mut out);
+        assert_eq!(out[SQ_N - 1], frob(x, SQ_N));
+        let n_log = 1;
+        let mut z = vec![F128::ZERO; g.ty.width() << n_log];
+        for (col, &v) in row.iter().enumerate() {
+            z[col << n_log] = v;
+        }
+        assert!(g.ty.satisfies(&z, n_log, 2));
+        // A second chained row: its input is the first row's last power.
+        let row2 = g.eval(&[out[SQ_N - 1]], &(), &mut Vec::new());
+        assert_every_column_bound(&g.ty, &[row, row2], n_log);
+    }
+
+    /// The identity family H's Horner chain rests on, end to end at the
+    /// gate level: `Σ_j γ·MLE_j(r)·v_j^(2^j)` equals the Horner chain over
+    /// `e_j = φ^-j(γ)·MLE_0(φ^-j(r))` with `φ^-j = φ^(128-j)`.
+    #[test]
+    fn horner_chain_matches_frobenius_twisted_sum() {
+        let g = HornerStepGate::new();
+        let mut rng = StdRng::seed_from_u64(11);
+        let r: [F128; 7] = std::array::from_fn(|_| rand_f(&mut rng));
+        let gamma = rand_f(&mut rng);
+        let v: Vec<F128> = (0..128).map(|_| rand_f(&mut rng)).collect();
+        let mut brute = F128::ZERO;
+        for j in 0..128 {
+            brute += gamma * moore_row_mle(j, &r) * frob(v[j], j);
+        }
+        let mut h = F128::ZERO;
+        for j in (0..128).rev() {
+            let i = (128 - j) % 128;
+            let mut inp: Vec<F128> = r.iter().map(|&x| frob(x, i)).collect();
+            inp.extend([frob(gamma, i), v[j], h, F128::ONE]);
+            let mut out = Vec::new();
+            g.eval(&inp, &(), &mut out);
+            h = out[0];
+        }
+        assert_eq!(h, brute);
+    }
+
+    #[test]
+    fn transpose_dot_rows_satisfy() {
+        let g = TransposeDotGate::new();
+        let mut rng = StdRng::seed_from_u64(13);
+        let mut rows = Vec::new();
+        for _ in 0..8 {
+            let inp: Vec<F128> = (0..TD_M).map(|_| rand_f(&mut rng)).collect();
+            let mut out = Vec::new();
+            rows.push(g.eval(&inp, &(), &mut out));
+            let sum = inp[TD_P..].iter().fold(F128::ZERO, |a, &p| a + p);
+            assert_eq!(out[0], inp[0] + inp[TD_EQ] * sum);
+        }
+        let mut out = Vec::new();
+        rows.push(g.eval(&[F128::ZERO; TD_M], &(), &mut out));
+        let n_log = 4;
+        let mut z = vec![F128::ZERO; g.ty.width() << n_log];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &x) in row.iter().enumerate() {
+                z[(col << n_log) + j] = x;
+            }
+        }
+        assert!(
+            g.ty.satisfies(&z, n_log, rows.len()),
+            "transpose dot rows satisfy"
+        );
+        assert_every_column_bound(&g.ty, &rows, n_log);
+    }
+}

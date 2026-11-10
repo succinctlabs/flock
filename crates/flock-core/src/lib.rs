@@ -39,6 +39,7 @@ pub mod circuit;
 pub mod element_r1cs;
 pub mod field;
 pub mod genus95_curve_code;
+pub mod gpu_commit;
 pub mod lincheck;
 pub mod matrix_fold;
 pub mod merkle;
@@ -57,13 +58,36 @@ pub mod verifier;
 pub mod zerocheck;
 
 /// Configure rayon's global thread pool to use only performance cores on
-/// Apple silicon (excluding efficiency cores).
+/// Apple silicon (excluding efficiency cores), unless the E-cluster is at
+/// least as large as the P-cluster.
 ///
 /// On M-series chips the 2 efficiency cores run at ~30-40% of perf-core
 /// speed and become stragglers in compute-bound parallel work — the
 /// work-stealing scheduler keeps assigning them tasks that hold up the perf
 /// cores at synchronization barriers. Empirically, 8 threads beats 10 by
 /// ~10-20% on `pcs::commit` and similar parallel-NTT workloads.
+///
+/// The exception is a chip whose E-cluster is at least as large as its
+/// P-cluster: there the P-only pool leaves most of the machine idle, and
+/// the pool takes every core. Measured on M4 (4P+6E) at the m=32 BLAKE3
+/// prove (128-bit), all ten cores against the four P-cores plus the
+/// all-core hops: 457 → 415 ms. Only the M4 was measured. The rule also
+/// gives every core to the other chips with `E ≥ P`: the base M1–M3
+/// (4P+4E) and the iPhone A-series (A17 Pro and A18 Pro: 2P+4E). The mobile
+/// crate does not depend on this choice: it sizes its pools itself through
+/// [`flock_parallel::init_all_core_pool`].
+///
+/// An all-core global pool leaves [`all_core_pool`] no wider than the
+/// caller's pool, which changes two things:
+/// - the all-core hops (lincheck, zerocheck, the PCS combine and the NTT's
+///   deep pass) check `all_core > current` and stay on the global pool,
+///   which already spans every core;
+/// - the PCS commit finds no spare cores, so its E-core hashing split
+///   (SME2 leaf hashing on the E-cluster while the P-cores transform) turns
+///   off. The commit runs its deep NTT pass on all cores with two
+///   utility-QoS hashing helpers on top. For the commit phase alone (`ntt +
+///   leaves`, BLAKE3 2^18, M4), the split measured 135 ms and this setup
+///   141 ms; the whole prove still gains, as above.
 ///
 /// Call this **once** at program startup, before any other parallel flock
 /// code runs (rayon's global pool is set on first use; if it's already
@@ -79,7 +103,8 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     if var("RAYON_NUM_THREADS").is_ok() {
         return None;
     }
-    let n = perf_core_count();
+    let (p, e) = (perf_core_count(), efficiency_core_count());
+    let n = if e >= p { p + e } else { p };
     match ThreadPoolBuilder::new()
         .num_threads(n)
         // 8 MB workers (default 2 MB): the prover's kernels carry large NEON

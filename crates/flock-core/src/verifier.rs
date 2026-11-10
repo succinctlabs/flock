@@ -544,6 +544,12 @@ fn verify_merged_opening<Ch: Challenger>(
             value: *value,
         })
         .collect();
+    // The C claim is `z` with the zeroed words masked out (C = diag(mask)).
+    let zeroed = union.zeroed_columns();
+    let zeroed_refs: Vec<&[usize]> = match cl.len() {
+        0 => Vec::new(),
+        _ => vec![&[], &zeroed],
+    };
     let lig_v_config = pcs_params
         .ligerito_verifier_config()
         .expect("Ligerito default verifier config");
@@ -554,6 +560,7 @@ fn verify_merged_opening<Ch: Challenger>(
                 &values,
                 &z_skips,
                 &x_refs,
+                &zeroed_refs,
                 &pd,
                 &union.jagged_heights(),
                 union.n_log(),
@@ -568,6 +575,7 @@ fn verify_merged_opening<Ch: Challenger>(
                 &values,
                 &z_skips,
                 &x_refs,
+                &zeroed_refs,
                 &pd,
                 &union.jagged_heights(),
                 union.n_log(),
@@ -651,6 +659,12 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
             value: *value,
         })
         .collect();
+    // The C claim is `z` with the zeroed words masked out (C = diag(mask)).
+    let zeroed = union.zeroed_columns();
+    let zeroed_refs: Vec<&[usize]> = match cl.len() {
+        0 => Vec::new(),
+        _ => vec![&[], &zeroed],
+    };
     let lig_v_config = pcs_params
         .ligerito_verifier_config()
         .expect("Ligerito default verifier config");
@@ -661,6 +675,7 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
                 &values,
                 &z_skips,
                 &x_refs,
+                &zeroed_refs,
                 &pd,
                 &union.jagged_heights(),
                 union.n_log(),
@@ -734,6 +749,12 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
             value: *value,
         })
         .collect();
+    // The C claim is `z` with the zeroed words masked out (C = diag(mask)).
+    let zeroed = union.zeroed_columns();
+    let zeroed_refs: Vec<&[usize]> = match cl.len() {
+        0 => Vec::new(),
+        _ => vec![&[], &zeroed],
+    };
     let lig_v_config = pcs_params
         .ligerito_verifier_config()
         .expect("Ligerito default verifier config");
@@ -748,6 +769,7 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
                 &values,
                 &z_skips,
                 &x_refs,
+                &zeroed_refs,
                 &pd,
                 &union.jagged_heights(),
                 union.n_log(),
@@ -850,7 +872,7 @@ fn verify_union_piops<Ch: Challenger>(
                             let zc = verify_zerocheck_with_grinding(
                                 union.m_bool(),
                                 &p.zerocheck,
-                                pcs_params.zerocheck_grinding(),
+                                union.zerocheck_grinding(pcs_params.zerocheck_grinding()),
                                 challenger,
                             )
                             .map_err(FlockVerifyError::Zerocheck)?;
@@ -868,7 +890,7 @@ fn verify_union_piops<Ch: Challenger>(
                             let ag = verify_ag_with_grinding(
                                 union.m_bool(),
                                 &p.ag,
-                                pcs_params.zerocheck_grinding(),
+                                union.zerocheck_grinding(pcs_params.zerocheck_grinding()),
                                 challenger,
                             )
                             .map_err(FlockVerifyError::Ag)?;

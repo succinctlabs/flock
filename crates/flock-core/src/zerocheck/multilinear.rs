@@ -1894,7 +1894,7 @@ fn uni_skip_fold_and_round_pair_optimized_packed_serial(
 // ---------------------------------------------------------------------------
 
 /// The reduced lookahead sums for one pass.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LookaheadSums {
     pub s10: F128,
     pub sinf0: F128,
@@ -2059,8 +2059,63 @@ unsafe fn lookahead_chunk_neon<const PER_U: usize>(
     }
 }
 
+/// The scalar fold of one lookahead input quad: `PER_U` 8 folds one pending
+/// variable (`r.0`) over `e[0..2]`, 16 folds two over `e[0..4]`.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn lookahead_fold<const PER_U: usize>(e: &[F128], r: (F128, F128)) -> F128 {
+    let x0 = e[0] + r.0 * (e[0] + e[1]);
+    if PER_U == 16 {
+        let x1 = e[2] + r.0 * (e[2] + e[3]);
+        x0 + r.1 * (x0 + x1)
+    } else {
+        x0
+    }
+}
+
+/// One run of a lookahead pass: folds the `ao.len() / 4` groups of `PER_U`
+/// inputs at the head of `a`/`b` into `ao`/`bo` (four outputs per group) and
+/// returns their eight lookahead products, group `j` weighted by `eq_lo[j]`;
+/// the caller applies `eq_hi`. `PER_U` 8 folds one pending variable
+/// (`rhos.0`), 16 folds two.
+#[inline(always)]
+fn lookahead_run<const PER_U: usize>(
+    a: &[F128],
+    b: &[F128],
+    ao: &mut [F128],
+    bo: &mut [F128],
+    eq_lo: &[F128],
+    rhos: (F128, F128),
+) -> [F256Unreduced; 8] {
+    let n = ao.len() / 4;
+    assert!(ao.len() == 4 * n && bo.len() == 4 * n);
+    assert!(a.len() >= PER_U * n && b.len() >= PER_U * n && eq_lo.len() >= n);
+    // SAFETY: aes is statically enabled; the asserts above bound every read
+    // and write of the run.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let acc = unsafe { lookahead_chunk_neon::<PER_U>(a, b, ao, bo, 0, eq_lo, rhos) };
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    let acc = {
+        let mut acc = [F256Unreduced::ZERO; 8];
+        for j in 0..n {
+            let mut ga = [F128::ZERO; 4];
+            let mut gb = [F128::ZERO; 4];
+            for v in 0..4usize {
+                let base = j * PER_U + v * (PER_U / 4);
+                ga[v] = lookahead_fold::<PER_U>(&a[base..], rhos);
+                gb[v] = lookahead_fold::<PER_U>(&b[base..], rhos);
+                ao[4 * j + v] = ga[v];
+                bo[4 * j + v] = gb[v];
+            }
+            lookahead_accum(&ga, &gb, eq_lo[j], &mut acc);
+        }
+        acc
+    };
+    acc
+}
+
 macro_rules! lookahead_pass {
-    ($name:ident, $per_u:expr, $fold:expr, $doc:literal) => {
+    ($name:ident, $per_u:expr, $doc:literal) => {
         #[doc = $doc]
         /// Writes the folded arrays into `a_out`/`b_out` and returns the 8
         /// lookahead sums over the next two variables. `r_y` is the eq coord of
@@ -2071,10 +2126,10 @@ macro_rules! lookahead_pass {
         /// `a` may be a PREFIX of the full domain (`a.len() <= PER_U <<
         /// rest.len()`, a multiple of `PER_U`): the eq tables are sized from
         /// `rest`, every position is weighted by its own global index, and
-        /// only the present positions are visited — so on a live-prefix layout
-        /// (the sparse tail's single interval) the sums are exactly the full
-        /// domain's with the dead suffix at zero, and the outputs are the dense
-        /// outputs' prefix. Full-domain callers are unchanged.
+        /// only the present positions are visited — so the sums are exactly
+        /// the full domain's with the dead suffix at zero, and the outputs are
+        /// the dense outputs' prefix. Full-domain callers are unchanged. Any
+        /// other live layout goes through [`fold_lookahead_sparse_into`].
         pub fn $name(
             a: &[F128],
             b: &[F128],
@@ -2097,74 +2152,184 @@ macro_rules! lookahead_pass {
             let eq_lo = build_eq(&rest[..n_lo]);
             let eq_hi = build_eq(&rest[n_lo..]);
             let lo_size = eq_lo.len();
-            let fold = $fold;
             let sums = a_out
                 .par_chunks_mut(4 * lo_size)
                 .zip(b_out.par_chunks_mut(4 * lo_size))
                 .enumerate()
                 .map(|(u_hi, (ao, bo))| {
-                    let base_u = u_hi * lo_size;
-                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-                    let acc = {
-                        let _ = &fold;
-                        // SAFETY: aes is statically enabled; the slices are
-                        // in range by the length asserts above.
-                        unsafe { lookahead_chunk_neon::<PER_U>(a, b, ao, bo, base_u, &eq_lo, rhos) }
-                    };
-                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-                    let mut acc = [F256Unreduced::ZERO; 8];
                     // A prefix's last chunk may be partial.
-                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-                    for u_lo in 0..ao.len() / 4 {
-                        let u = base_u + u_lo;
-                        let mut ga = [F128::ZERO; 4];
-                        let mut gb = [F128::ZERO; 4];
-                        for v in 0..4usize {
-                            let base = u * PER_U + v * (PER_U / 4);
-                            ga[v] = fold(&a[base..], rhos);
-                            gb[v] = fold(&b[base..], rhos);
-                            ao[4 * u_lo + v] = ga[v];
-                            bo[4 * u_lo + v] = gb[v];
-                        }
-                        lookahead_accum(&ga, &gb, eq_lo[u_lo], &mut acc);
-                    }
+                    let base = u_hi * lo_size * PER_U;
+                    let acc = lookahead_run::<PER_U>(&a[base..], &b[base..], ao, bo, &eq_lo, rhos);
                     let eh = eq_hi[u_hi];
-                    let mut out = [F128::ZERO; 8];
-                    for k in 0..8 {
-                        out[k] = eh * acc[k].reduce();
-                    }
-                    out
+                    from_fn(|k| eh * acc[k].reduce())
                 })
-                .reduce(
-                    || [F128::ZERO; 8],
-                    |mut p, q| {
-                        for k in 0..8 {
-                            p[k] += q[k];
-                        }
-                        p
-                    },
-                );
+                .reduce(|| [F128::ZERO; 8], add_lookahead_sums);
             lookahead_finish(sums)
         }
     };
 }
 
+fn add_lookahead_sums(mut p: [F128; 8], q: [F128; 8]) -> [F128; 8] {
+    for k in 0..8 {
+        p[k] += q[k];
+    }
+    p
+}
+
 lookahead_pass!(
     fold1_lookahead_into,
     8,
-    |e: &[F128], r: (F128, F128)| e[0] + r.0 * (e[0] + e[1]),
     "Entry lookahead pass: fold ONE pending variable (`rhos.0`; `rhos.1` unused), n → n/2."
 );
 lookahead_pass!(
     fold2_lookahead_into,
     16,
-    |e: &[F128], r: (F128, F128)| {
-        let x0 = e[0] + r.0 * (e[0] + e[1]);
-        let x1 = e[2] + r.0 * (e[2] + e[3]);
-        x0 + r.1 * (x0 + x1)
-    },
     "Steady-state lookahead pass: fold TWO pending variables (4→1), n → n/4."
 );
+
+/// The live layout a lookahead pass over `store` writes: every group of
+/// `per_u` inputs that meets a live interval yields its four outputs. A group
+/// straddling a live/dead boundary is stored whole: its dead inputs fold in
+/// as their honest zeros. Groups that touch or overlap merge, so the result
+/// is canonical, and its intervals are multiples of 4.
+pub fn lookahead_layout(store: &LiveLayout, per_u: usize) -> LiveLayout {
+    let mut groups: Vec<(usize, usize)> = Vec::with_capacity(store.intervals().len());
+    for &(s, e) in store.intervals() {
+        let (g0, g1) = (s / per_u, e.div_ceil(per_u));
+        match groups.last_mut() {
+            Some((_, prev)) if *prev >= g0 => *prev = (*prev).max(g1),
+            _ => groups.push((g0, g1)),
+        }
+    }
+    LiveLayout::new(
+        groups
+            .into_iter()
+            .map(|(g0, g1)| (4 * g0, 4 * g1))
+            .collect(),
+    )
+}
+
+/// [`fold1_lookahead_into`] (`PER_U` 8) or [`fold2_lookahead_into`] (16) over
+/// LIVE-SPAN buffers: `a`/`b` store `store_in`'s intervals, and
+/// `a_out`/`b_out` receive `store_out`, which must be
+/// [`lookahead_layout`]`(store_in, PER_U)`.
+///
+/// Each interval's groups are weighted by their GLOBAL index, so the dropped
+/// words and dead slots that split the live set cost nothing and the pass
+/// needs no prefix. A run of groups wholly inside one stored interval goes
+/// through the dense kernel on the compacted slice. A group straddling a
+/// live/dead boundary gathers its inputs with the dead ones at their honest
+/// zero. A dead group folds to zero and carries zero products, so the sums
+/// and the stored outputs equal the dense pass's on the expanded buffers.
+///
+/// Parallel over tasks cut at the eq-hi chunk boundaries, so each task has
+/// one `eq_hi` weight; on a dense prefix these are the dense pass's chunks.
+#[allow(clippy::too_many_arguments)]
+pub fn fold_lookahead_sparse_into<const PER_U: usize>(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: (F128, F128),
+    rest: &[F128],
+    store_in: &LiveLayout,
+    store_out: &LiveLayout,
+) -> LookaheadSums {
+    assert_eq!(a.len(), store_in.len());
+    assert_eq!(b.len(), store_in.len());
+    assert_eq!(a_out.len(), store_out.len());
+    assert_eq!(b_out.len(), store_out.len());
+    debug_assert_eq!(*store_out, lookahead_layout(store_in, PER_U));
+    assert!(
+        store_out
+            .intervals()
+            .last()
+            .is_none_or(|&(_, e)| e / 4 <= 1usize << rest.len()),
+        "rest coords must cover log2(domain/{PER_U})"
+    );
+    let n_lo = rest.len() / 2;
+    let eq_lo = build_eq(&rest[..n_lo]);
+    let eq_hi = build_eq(&rest[n_lo..]);
+    let lo_size = eq_lo.len();
+
+    // Each output interval's groups, cut at the eq-hi boundaries, in storage
+    // order, each task with its own disjoint output slices.
+    let mut work: Vec<(usize, usize, &mut [F128], &mut [F128])> = Vec::new();
+    let (mut a_rem, mut b_rem) = (a_out, b_out);
+    for &(s, e) in store_out.intervals() {
+        let (mut g, g1) = (s / 4, e / 4);
+        while g < g1 {
+            let next = ((g / lo_size + 1) * lo_size).min(g1);
+            let (ao, a_tail) = take(&mut a_rem).split_at_mut(4 * (next - g));
+            let (bo, b_tail) = take(&mut b_rem).split_at_mut(4 * (next - g));
+            (a_rem, b_rem) = (a_tail, b_tail);
+            work.push((g, next, ao, bo));
+            g = next;
+        }
+    }
+
+    let iv = store_in.intervals();
+    let sums = work
+        .into_par_iter()
+        .map(|(g0, g1, ao, bo)| {
+            let mut acc = [F256Unreduced::ZERO; 8];
+            let add = |acc: &mut [F256Unreduced; 8], r: [F256Unreduced; 8]| {
+                for k in 0..8 {
+                    acc[k] ^= r[k];
+                }
+            };
+            let mut cur = store_in.seek(g0 * PER_U);
+            let mut g = g0;
+            while g < g1 {
+                let y0 = g * PER_U;
+                while cur < iv.len() && iv[cur].1 <= y0 {
+                    cur += 1;
+                }
+                let (o, lo) = (4 * (g - g0), g % lo_size);
+                if let Some(&(s, e)) = iv.get(cur)
+                    && s <= y0
+                    && y0 + PER_U <= e
+                {
+                    // The groups wholly inside stored interval `cur`.
+                    let n = (e / PER_U).min(g1) - g;
+                    let at = store_in.offset_of(cur) + (y0 - s);
+                    let run = lookahead_run::<PER_U>(
+                        &a[at..at + PER_U * n],
+                        &b[at..at + PER_U * n],
+                        &mut ao[o..o + 4 * n],
+                        &mut bo[o..o + 4 * n],
+                        &eq_lo[lo..],
+                        rhos,
+                    );
+                    add(&mut acc, run);
+                    g += n;
+                    continue;
+                }
+                // A group straddling a live/dead boundary.
+                let mut ga = [F128::ZERO; PER_U];
+                let mut gb = [F128::ZERO; PER_U];
+                for j in 0..PER_U {
+                    if let Some(at) = store_in.rank(&mut cur, y0 + j) {
+                        (ga[j], gb[j]) = (a[at], b[at]);
+                    }
+                }
+                let run = lookahead_run::<PER_U>(
+                    &ga,
+                    &gb,
+                    &mut ao[o..o + 4],
+                    &mut bo[o..o + 4],
+                    &eq_lo[lo..],
+                    rhos,
+                );
+                add(&mut acc, run);
+                g += 1;
+            }
+            let eh = eq_hi[g0 / lo_size];
+            from_fn(|k| eh * acc[k].reduce())
+        })
+        .reduce(|| [F128::ZERO; 8], add_lookahead_sums);
+    lookahead_finish(sums)
+}
 
 /// `&[bool]` convenience wrapper around
 /// [`uni_skip_fold_and_round_pair_optimized_packed`]. Packs internally, builds
@@ -3495,6 +3660,80 @@ mod tests {
         assert!(!LiveLayout::new(vec![(1, 32)]).is_dense(32));
         assert!(!LiveLayout::new(vec![(0, 8), (16, 32)]).is_dense(32));
         assert!(!LiveLayout::new(vec![]).is_dense(32));
+    }
+
+    /// The live-span lookahead pass equals the dense pass on the expanded
+    /// buffers: the same eight sums, the dense outputs at every stored
+    /// position, and zero dense outputs everywhere it stores nothing. Over a
+    /// prefix, a single offset interval (pure BLAKE3 with dropped words),
+    /// 128-aligned slot runs, and intervals that start and end mid-group or
+    /// share a group, for both the one- and the two-variable fold.
+    #[test]
+    fn sparse_lookahead_matches_the_dense_pass() {
+        use crate::zerocheck::multilinear::{
+            expand_to_dense, fold_lookahead_sparse_into, fold1_lookahead_into,
+            fold2_lookahead_into, lookahead_layout,
+        };
+        let domain = 1usize << 12;
+        let layouts: Vec<Vec<(usize, usize)>> = vec![
+            vec![],
+            vec![(0, domain)],
+            vec![(0, 1408)],
+            vec![(1408, 3712)],
+            vec![(128, 512), (1024, 1152), (2048, 3200), (3968, 4096)],
+            vec![
+                (3, 5),
+                (17, 40),
+                (41, 60),
+                (100, 333),
+                (900, 1027),
+                (4000, 4093),
+            ],
+            vec![(15, 16), (16 * 7 + 9, 16 * 9 + 1), (16 * 200, 16 * 200 + 3)],
+        ];
+        let mut rng = Rng::new(31);
+        for per_u in [8usize, 16] {
+            let groups = domain / per_u;
+            let rest: Vec<F128> = (0..groups.trailing_zeros()).map(|_| rng.f128()).collect();
+            let rhos = (
+                rng.f128(),
+                if per_u == 16 { rng.f128() } else { F128::ZERO },
+            );
+            for iv in &layouts {
+                let store = LiveLayout::new(iv.clone());
+                let a: Vec<F128> = (0..store.len()).map(|_| rng.f128()).collect();
+                let b: Vec<F128> = (0..store.len()).map(|_| rng.f128()).collect();
+                let (a_full, b_full) = (
+                    expand_to_dense(&a, &store, domain),
+                    expand_to_dense(&b, &store, domain),
+                );
+                let (mut ad, mut bd) = (vec![F128::ZERO; 4 * groups], vec![F128::ZERO; 4 * groups]);
+                let dense = if per_u == 16 {
+                    fold2_lookahead_into(&a_full, &b_full, &mut ad, &mut bd, rhos, &rest)
+                } else {
+                    fold1_lookahead_into(&a_full, &b_full, &mut ad, &mut bd, rhos, &rest)
+                };
+                let out = lookahead_layout(&store, per_u);
+                let (mut ao, mut bo) = (vec![F128::ZERO; out.len()], vec![F128::ZERO; out.len()]);
+                let sparse = if per_u == 16 {
+                    fold_lookahead_sparse_into::<16>(
+                        &a, &b, &mut ao, &mut bo, rhos, &rest, &store, &out,
+                    )
+                } else {
+                    fold_lookahead_sparse_into::<8>(
+                        &a, &b, &mut ao, &mut bo, rhos, &rest, &store, &out,
+                    )
+                };
+                assert_eq!(sparse, dense, "sums, per_u {per_u}, {iv:?}");
+                assert_eq!(expand_to_dense(&ao, &out, 4 * groups), ad, "a, {iv:?}");
+                assert_eq!(expand_to_dense(&bo, &out, 4 * groups), bd, "b, {iv:?}");
+                assert!(
+                    out.intervals()
+                        .iter()
+                        .all(|&(s, e)| s % 4 == 0 && e % 4 == 0)
+                );
+            }
+        }
     }
 
     /// The task cut is a faithful partition of the live set: pieces

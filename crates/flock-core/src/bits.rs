@@ -56,6 +56,103 @@ pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
     bit_transpose_64bytes(input, out64);
 }
 
+/// Transpose a 64×64 bit matrix: bit `c` of `out[r]` is bit `r` of `m[c]`.
+///
+/// Six rounds, each swapping one bit of the row index with the same bit of
+/// the column index; the rounds commute.
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn transpose64(mut m: [u64; 64]) -> [u64; 64] {
+    let mut width = 32;
+    let mut mask: u64 = 0x0000_0000_FFFF_FFFF;
+    while width > 0 {
+        let mut base = 0;
+        while base < 64 {
+            for r in base..base + width {
+                let t = ((m[r] >> width) ^ m[r + width]) & mask;
+                m[r] ^= t << width;
+                m[r + width] ^= t;
+            }
+            base += 2 * width;
+        }
+        width >>= 1;
+        mask ^= mask << width;
+    }
+    m
+}
+
+/// Transpose a 64×64 bit matrix: bit `c` of `out[r]` is bit `r` of `m[c]`.
+///
+/// Six rounds, each swapping one bit of the row index with the same bit of
+/// the column index; the rounds commute. Register `i` holds rows `i` and
+/// `i + 32`, so the 32-wide round is one byte shuffle per register and
+/// every other round pairs registers: first the 16- and 8-wide rounds over
+/// each set of four registers they mix, then the rest over each run of
+/// eight, so either pass fits in registers.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn transpose64(m: [u64; 64]) -> [u64; 64] {
+    use std::arch::aarch64::{
+        uint64x2_t, vandq_u64, vcombine_u64, vdupq_n_u64, veorq_u64, vld1_u64, vld1q_u8,
+        vqtbl1q_u8, vreinterpretq_u8_u64, vreinterpretq_u64_u8, vshlq_n_u64, vshrq_n_u64,
+        vst1q_u64, vzip1q_u64, vzip2q_u64,
+    };
+    #[inline(always)]
+    unsafe fn swap<const WIDTH: i32>(a: &mut uint64x2_t, b: &mut uint64x2_t, mask: u64) {
+        unsafe {
+            let t = vandq_u64(veorq_u64(vshrq_n_u64::<WIDTH>(*a), *b), vdupq_n_u64(mask));
+            *a = veorq_u64(*a, vshlq_n_u64::<WIDTH>(t));
+            *b = veorq_u64(*b, t);
+        }
+    }
+    // SAFETY: NEON is baseline on aarch64, and every load and store stays
+    // inside `m`, `v`, `out` or the shuffle table.
+    unsafe {
+        let mut v = [vdupq_n_u64(0); 32];
+        for i in 0..8 {
+            let at = |j: usize| m.as_ptr().add(i + 8 * j);
+            let mut r: [uint64x2_t; 4] =
+                std::array::from_fn(|j| vcombine_u64(vld1_u64(at(j)), vld1_u64(at(j).add(32))));
+            let [r0, r1, r2, r3] = &mut r;
+            swap::<16>(r0, r2, 0x0000_FFFF_0000_FFFF);
+            swap::<16>(r1, r3, 0x0000_FFFF_0000_FFFF);
+            swap::<8>(r0, r1, 0x00FF_00FF_00FF_00FF);
+            swap::<8>(r2, r3, 0x00FF_00FF_00FF_00FF);
+            for (j, r) in r.into_iter().enumerate() {
+                v[i + 8 * j] = r;
+            }
+        }
+        // `[a_lo, a_hi, b_lo, b_hi]` as 32-bit halves becomes
+        // `[a_lo, b_lo, a_hi, b_hi]`.
+        let halves: [u8; 16] = [0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15];
+        let halves = vld1q_u8(halves.as_ptr());
+        let mut out = [0u64; 64];
+        for (b, block) in v.as_chunks::<8>().0.iter().enumerate() {
+            let mut r = *block;
+            for x in r.iter_mut() {
+                *x = vreinterpretq_u64_u8(vqtbl1q_u8(vreinterpretq_u8_u64(*x), halves));
+            }
+            for i in [0, 1, 2, 3] {
+                let (lo, hi) = r.split_at_mut(4);
+                swap::<4>(&mut lo[i], &mut hi[i], 0x0F0F_0F0F_0F0F_0F0F);
+            }
+            for i in [0, 1, 4, 5] {
+                let (lo, hi) = r.split_at_mut(i + 2);
+                swap::<2>(&mut lo[i], &mut hi[0], 0x3333_3333_3333_3333);
+            }
+            for i in [0, 2, 4, 6] {
+                let (lo, hi) = r.split_at_mut(i + 1);
+                swap::<1>(&mut lo[i], &mut hi[0], 0x5555_5555_5555_5555);
+            }
+            let first = 8 * b;
+            for j in 0..4 {
+                let (a, b) = (r[2 * j], r[2 * j + 1]);
+                vst1q_u64(out.as_mut_ptr().add(first + 2 * j), vzip1q_u64(a, b));
+                vst1q_u64(out.as_mut_ptr().add(32 + first + 2 * j), vzip2q_u64(a, b));
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::array::from_fn;

@@ -529,7 +529,7 @@ pub(super) fn emit_residual_region(
         let folded = od.z_len - yr_log;
         assert_eq!(folded, ris_full.len(), "L0 OOD spans every fold");
         let initial_k = levels[0].fold_fins.len();
-        let z_index = |j| level_zero_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
+        let z_index = |j| level_zero_ood_z_index(od.z_len, initial_k, geo[0].lane_major, j);
         let mut factors: Vec<([Wire; 2], [Wire; 2])> = (0..folded)
             .map(|j| {
                 (
@@ -706,7 +706,7 @@ pub(super) fn check_residual_publics(
             let folded = od.z_len - yr_log;
             assert_eq!(folded, pl_full, "L0 OOD spans every fold");
             let initial_k = levels[0].fold_chs.len();
-            let z_index = |j| level_zero_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
+            let z_index = |j| level_zero_ood_z_index(od.z_len, initial_k, geo[0].lane_major, j);
             let mut t = F256::from(chals[od.beta_ch]);
             for j in 0..folded {
                 t *= F256::ONE + F256::from(chals[od.z_ch + z_index(j)]) + ris_v[j];
@@ -1273,6 +1273,20 @@ pub struct LeafOuter {
     pub(super) spread_slot: usize,
     pub(super) pow_slot: usize,
     pub(super) family_slot: usize,
+}
+
+impl LeafOuter {
+    /// The boolean zerocheck's AG round-one grinding bits as this outer's
+    /// verifier takes them: the outer union's schedule over the profile's
+    /// ([`crate::union::UnionInstance::zerocheck_grinding`]), raised when the
+    /// union checks dropped linear rows. A parent reads a node child's grind
+    /// here, as the first-level node reads a leaf's through
+    /// [`super::MixedInner::ag_round_one_bits`].
+    pub(super) fn ag_round_one_bits(&self) -> Option<u32> {
+        super::outer_union(&self.shape.registry, self.shape.counts.clone())
+            .zerocheck_grinding(self.pcs.zerocheck_grinding())
+            .ag_round_one_bits()
+    }
 }
 
 pub(super) fn leaf_boolean_lcs(lo: &LeafOuter) -> Vec<&dyn LincheckCircuit> {

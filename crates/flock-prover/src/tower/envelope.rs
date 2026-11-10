@@ -3,15 +3,24 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use flock_core::circuit::builder::SlotId;
+use flock_core::{aggregate::Accumulator, circuit::builder::SlotId, matrix_fold::MatrixClaim};
 
 use crate::tower::{
     AssistLayerGate, BitSpreadGate, BitSpreadTable, Blake3Gate, CollapsedSlots, F128,
-    FamilyTransposeTileGate, GateType, LeafEvalGate, LeafEvalGate256, MacGate, MacGate256,
-    MergedRoundGate, PowMaskGate, PrefixGate, PrefixGate256, ResidualAccGate256,
+    FamilyTransposeTileGate, GateType, HornerStepGate, LeafEvalGate, LeafEvalGate256, MacGate,
+    MacGate256, MergedRoundGate, PowMaskGate, PrefixGate, PrefixGate256, ResidualAccGate256,
     ResidualPrefix3Gate256, ResidualWeightsGate256, SLOT_WORDS, ShapeBuilder, SpineGate,
-    SpineGate256, SwapGate, UnionInstance, Wire, ZcRoundGate, cw,
+    SpineGate256, SquareChainGate, SwapGate, TransposeDotGate, UnionInstance, Wire, ZcRoundGate,
+    cw,
 };
+
+/// Family H's Frobenius squaring chains ([`SquareChainGate`]).
+pub(super) const KEY_SQUARE_CHAIN: usize = 890;
+/// Family H's Horner steps ([`HornerStepGate`]).
+pub(super) const KEY_HORNER_STEP: usize = 891;
+/// Family H's bit-transpose dot, one row per transposed word
+/// ([`TransposeDotGate`]).
+pub(super) const KEY_TRANSPOSE_DOT: usize = 892;
 
 /// Wall 2's registry-geometry constants at the settled envelope (slim,
 /// m* = 29): the UNION of the leaf-outer's and the node's type sets, at the
@@ -26,8 +35,10 @@ use crate::tower::{
 /// - `nu` 14: each of the two independent child verifiers has its own
 ///   identical BLAKE slot, and the consolidated extension-field residual
 ///   gates keep every physical slot below 2^14 rows.
-/// - 29 table types occupy 511 gate slots; with one public slot, the cell
-///   address needs 9 bits and `mu = nu + 9 = 23` tower-wide.
+/// - 32 table types (family H's squaring chain and Horner step joined the
+///   29 on 2026-11-02, the transpose dot on 2026-11-03) declare 394 gate
+///   cell slots; with one public slot the cell address still fits 9 bits
+///   and `mu = nu + 9 = 23` tower-wide.
 ///
 /// A ladder that drifts off these constants surfaces as a NEW slot at
 /// emission time and hence a registry-digest mismatch — the failure is
@@ -41,7 +52,7 @@ pub(super) struct EnvShape {
     /// determine the circuit digest; `counts_el` remains the canonical
     /// element-slot key list and retains the old cap census for
     /// comparison.
-    pub(super) counts_el: [(usize, usize); 15],
+    pub(super) counts_el: [(usize, usize); 18],
     /// publics* — the ONE public-segment length every envelope outer pads
     /// to (published zeros appended after all real publics). The child's
     /// publics count is what a PARENT's walk consumes — H(publics) chain
@@ -54,6 +65,10 @@ pub(super) struct EnvShape {
     /// one aggregate of a child's layout that stays circuit structure
     /// under FREE COUNTS.
     pub(super) lanes: usize,
+    /// The ACC_CHAIN block's width: the leaf registry's lane. A tower fixes
+    /// it once for every level ([`ENV_ACC_CHAIN_WORDS`] for the chain
+    /// tower; [`lane_block_words`] of its lane for the others).
+    pub(super) acc_chain_words: usize,
 }
 
 /// The APPLICATION STATEMENT's width in the envelope's public segment:
@@ -162,6 +177,22 @@ pub(super) fn steady_reps() -> usize {
 /// shorter shape — a dev-size chain, a fold with fewer groups — rides the
 /// same layout and a reader simply stops at its own group widths.
 pub(super) const ENV_ACC_CHAIN_WORDS: usize = 160;
+
+/// The public segment's BODY: everything before the tail blocks. Fixed for
+/// every envelope, so a tower whose lane needs a wider ACC_CHAIN block
+/// grows `publics*` by exactly the difference.
+const ENV_BODY_WORDS: usize = 4266;
+
+/// The ACC_CHAIN width a lane accumulator needs: per folded group its
+/// published `[live | rho_col | rho_row | value]`, boolean A and B per group,
+/// the linear-identity groups, then sigma, then jagged.
+pub(super) fn lane_block_words(acc: &Accumulator) -> usize {
+    let w = |c: &MatrixClaim| 2 + c.col.point.len() + c.row.point.len();
+    acc.per_type.iter().map(|(a, b)| w(a) + w(b)).sum::<usize>()
+        + acc.per_linear.iter().map(w).sum::<usize>()
+        + acc.sigma.iter().map(|(_, c)| w(c)).sum::<usize>()
+        + acc.jagged.iter().map(|(_, c)| w(c)).sum::<usize>()
+}
 // F256 verification adds extension-field table claims to the shared
 // registry. A live node uses 1,028 words; keep a fixed-shape margin so the
 // same block carries the accumulator at every recursive level.
@@ -209,7 +240,7 @@ pub(super) fn env_acc_main_base(env: &EnvShape) -> usize {
 }
 
 pub(super) fn env_acc_chain_base(env: &EnvShape) -> usize {
-    env_acc_main_base(env) - ENV_ACC_CHAIN_WORDS
+    env_acc_main_base(env) - env.acc_chain_words
 }
 
 /// The reserved tail blocks an envelope outer hands to
@@ -231,6 +262,12 @@ pub(super) struct EnvTail<'w> {
 /// The fixed envelope shape — always on, no override: the registry
 /// convergence below is pinned to m* = 29's measured geometry.
 pub(super) fn envelope_shape() -> EnvShape {
+    envelope_shape_with_lane(ENV_ACC_CHAIN_WORDS)
+}
+
+/// [`envelope_shape`] with an ACC_CHAIN block of `acc_chain_words`: the
+/// same registry and body, the public segment longer by the difference.
+pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
     EnvShape {
         // The two-child envelope fits at 14 after consolidating the F256
         // residual tables and assigning each independent child verifier to
@@ -281,17 +318,39 @@ pub(super) fn envelope_shape() -> EnvShape {
             (881, 12690),  // three-factor extension prefix
             (882, 4150),   // eight-way residual accumulation
             (1008, 15000), // extension prefix w 8
+            // Census only, like every count here (free counts never pad to
+            // it). Square chains: family H's 16 Horner chains plus ĝ's
+            // forward chains, which scale with the child's geometry: 410
+            // live at the production first-level node (2 × 992 signatures),
+            // 340 at the 4-signature test leaf's (2026-11-05; 160 predated
+            // ĝ's chains). Horner: 256 steps per child region.
+            (KEY_SQUARE_CHAIN, 410),
+            (KEY_HORNER_STEP, 512),
+            // The transpose dot: 128 rows per claim, two claims per child.
+            (KEY_TRANSPOSE_DOT, 512),
         ],
-        // Preserve the existing public body while enlarging ACC_MAIN.
-        publics: 5684,
+        // Preserve the existing public body while enlarging ACC_MAIN:
+        // 5684 at the chain tower's lane width.
+        publics: ENV_BODY_WORDS
+            + acc_chain_words
+            + ENV_ACC_MAIN_WORDS
+            + ENV_PASS_WORDS
+            + ENV_APP_WORDS,
         // The committed lane count — the ONE piece of a child's layout that
         // stays circuit structure (the parent hashes `num_lanes`-word
         // leaves), so it is pinned while everything count-shaped rides the
-        // jagged claims. 24 covers every envelope member's content-derived
-        // count at min-one-row. F256 raises the largest live content to 25
-        // lanes; 31 stays below `2^initial_k = 32`, so children remain
-        // lane-major.
+        // jagged claims. The largest member is the leanXMSS first-level
+        // node over two 992-signature leaves: 30.32 lanes of 2^17 words
+        // since the Fast leaf went to the +1/level ladder (2026-11-06: Σq
+        // 435 → 550 replayed per leaf), 27.21 before; the m32 chain
+        // first-level node is 28.34 and the internal nodes 22.62. So 31
+        // covers every member; the outer asserts content ≤ pin. Lanes past
+        // the content are zero and the commit's NTT skips them, but the
+        // Merkle leaves and the parent's opened rows still carry them.
+        // 29–32 words all hash as 8 BLAKE3 blocks (28 was exactly 7); 31
+        // keeps the opened rows a word short of the full grid.
         lanes: 31,
+        acc_chain_words,
     }
 }
 
@@ -299,6 +358,7 @@ pub(super) fn envelope_shape() -> EnvShape {
 /// (0 spine / 8 leaf-eval / 400 mrs / 500 zcr / 600 mac / 601 assist /
 /// 602 fold-mac / 700 spine256 / 701 mac256 / 808 leaf-eval256 /
 /// 880 resid-weights / 881 resid-prefix3 / 882 resid-acc /
+/// 890 square-chain / 891 Horner step / 892 transpose dot /
 /// 310+w prefix / 1000+w prefix256). Every element-slot declaration on the
 /// recursion path routes through this, so the envelope can pre-seed the
 /// cache (fixing the declaration order registry-wide) while the
@@ -325,7 +385,7 @@ where
     }
 }
 
-/// Declare the envelope's 29 table types in one canonical order.
+/// Declare the envelope's 32 table types in one canonical order.
 /// `Registry::new` sorts class-major then k_log-descending with a
 /// STABLE sort, so the declaration order here fixes every same-k_log
 /// tie-break — the leaf-outer and node registries become the same sorted
@@ -366,8 +426,18 @@ pub(super) fn declare_envelope_slots(
     slot_cached(sb, cache, 882, ResidualAccGate256::new);
     slot_cached(sb, cache, 310 + env.pf_w, || PrefixGate::new(env.pf_w));
     slot_cached(sb, cache, 1000 + env.pf_w, || PrefixGate256::new(env.pf_w));
+    slot_cached(sb, cache, KEY_SQUARE_CHAIN, SquareChainGate::new);
+    slot_cached(sb, cache, KEY_HORNER_STEP, HornerStepGate::new);
+    slot_cached(sb, cache, KEY_TRANSPOSE_DOT, TransposeDotGate::new);
     q
 }
+
+/// Every envelope slot's count rounds up to a multiple of `2^8` rows
+/// ([`pad_envelope_counts`]): the alignment the opening's multipoint assist
+/// needs for its closed form, at a few percent of area (the first-level
+/// node over two 992-signature leaves: 30.47 → 30.96 lanes, measured before
+/// family H by Horner).
+pub(super) const ENV_ROW_ALIGN_LOG: usize = 8;
 
 /// Pad every envelope slot's declared count up to counts* (the counts pin:
 /// one declared-count vector for every envelope outer, so the union content
@@ -438,7 +508,19 @@ pub(super) fn pad_envelope_counts(
     // a singleton run and the run count is registry-derived EXCEPT through
     // the predicate `n_t > 0`. Keep every type non-empty and the counts
     // become pure values.
-    let floor1 = |sb: &ShapeBuilder, s| sb.rows_in_slot(s).max(1);
+    // COUNT ALIGNMENT: every slot rounds up to a multiple of
+    // `2^ENV_ROW_ALIGN_LOG` rows (real padding gates, as above), so every
+    // committed column height is too and the dense stack is aligned at that
+    // granularity — the multipoint assist's closed form over sub-columns
+    // instead of a 2^m weight. No dummy row is committed: the padding rows
+    // are live, declared gates.
+    let align = 1usize << ENV_ROW_ALIGN_LOG;
+    let floor1 = |sb: &ShapeBuilder, s| {
+        sb.rows_in_slot(s)
+            .max(1)
+            .next_multiple_of(align)
+            .min(1usize << env.nu)
+    };
     let t_b3 = floor1(sb, q.b3);
     let b3_alt = q.b3_alt.expect("the envelope declares two BLAKE slots");
     let t_b3_alt = floor1(sb, b3_alt);
@@ -513,7 +595,8 @@ pub(super) fn pad_envelope_counts(
     // this outer has no content for is zeros, built exactly as the padding
     // is.
     let body =
-        env.publics - ENV_ACC_CHAIN_WORDS - ENV_ACC_MAIN_WORDS - ENV_PASS_WORDS - ENV_APP_WORDS;
+        env.publics - env.acc_chain_words - ENV_ACC_MAIN_WORDS - ENV_PASS_WORDS - ENV_APP_WORDS;
+    debug_assert_eq!(body, ENV_BODY_WORDS);
     let live_pub = sb.public_len();
     report.push(format!("publics {live_pub}/{body}"));
     if live_pub > body {
@@ -524,7 +607,7 @@ pub(super) fn pad_envelope_counts(
             sb.public_input();
         }
         for (name, w, width) in [
-            ("acc_chain", tail.acc_chain, ENV_ACC_CHAIN_WORDS),
+            ("acc_chain", tail.acc_chain, env.acc_chain_words),
             ("acc_main", tail.acc_main, ENV_ACC_MAIN_WORDS),
             ("pass", tail.pass, ENV_PASS_WORDS),
             ("app", tail.app, ENV_APP_WORDS),

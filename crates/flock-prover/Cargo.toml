@@ -14,6 +14,7 @@ unsound-challenger = [
     "flock-core/unsound-challenger",
     "flock-transcript/unsound-challenger",
 ]
+metal = ["flock-core/metal"]
 
 [dependencies]
 flock-core = { path = "../flock-core" }
@@ -34,6 +35,10 @@ bincode = { workspace = true }
 # it available to test/bench/example builds without leaking into normal builds.
 flock-core = { path = "../flock-core", features = ["unsound-challenger"] }
 flock-transcript = { workspace = true, features = ["unsound-challenger"] }
+
+[[bench]]
+name = "leanxmss"
+harness = false
 
 [[bench]]
 name = "ag_breakdown"
@@ -113,6 +118,10 @@ harness = false
 
 [[bench]]
 name = "genwitness_phase"
+harness = false
+
+[[bench]]
+name = "leanxmss_witgen"
 harness = false
 
 [[bench]]

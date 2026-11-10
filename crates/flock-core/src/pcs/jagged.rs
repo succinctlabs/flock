@@ -102,20 +102,29 @@ use crate::{
     scratch::{give_f128, take_f128},
 };
 
-/// The block-first transport predicate (`pcs::open_batch_merged`): `Some(p)`
-/// when the committed stack is a full-height column prefix — columns `0..p`
-/// of height `2^n`, every later column empty. Public data, so prover and
-/// verifier agree on the coordinate order of the merged sumcheck.
-pub fn rectangular_prefix_columns(heights: &[u64], n: usize) -> Option<usize> {
-    if heights.len() < 2 || !heights.len().is_power_of_two() {
+/// The block-first transport predicate (`pcs::open_batch_merged`): the used
+/// columns, in order, when every used column is FULL (height `2^n`) and the
+/// `2^dense_log`-word stack has at least one column coordinate. Empty
+/// columns may sit anywhere: the stack holds the used columns back to back,
+/// so dense column `t` (bits `n..dense_log` of the dense index) is column
+/// `used[t]`, and every row lines up with the row cube. Public data, so
+/// prover and verifier agree on the coordinate order of the merged sumcheck.
+/// A full-height column prefix (identity compaction) is the case `used =
+/// 0..p`.
+pub fn full_height_columns(heights: &[u64], n: usize, dense_log: usize) -> Option<Vec<usize>> {
+    if heights.len() < 2 || !heights.len().is_power_of_two() || dense_log <= n {
         return None;
     }
     let full = 1u64 << n;
-    let p = heights
-        .iter()
-        .position(|&h| h != full)
-        .unwrap_or(heights.len());
-    (p >= 1 && heights[p..].iter().all(|&h| h == 0)).then_some(p)
+    let mut used = Vec::new();
+    for (y, &h) in heights.iter().enumerate() {
+        match h {
+            0 => {}
+            h if h == full => used.push(y),
+            _ => return None,
+        }
+    }
+    (!used.is_empty()).then_some(used)
 }
 
 /// Configuration of a jagged function: the (zero-padded to `2^k`) column
@@ -619,6 +628,7 @@ pub fn assist_boundaries(params: &JaggedParams) -> Vec<(u64, u64, u32)> {
 /// sharing the same `(t_{y-1}, t_y)` pair — zero-height columns, including the
 /// zero-padded tail — collapsed into one term of summed weight `Σ eq(z_col, y)`.
 /// Pure regrouping of identical summands: transcript-invariant.
+#[cfg(test)]
 fn assist_columns(params: &JaggedParams, z_col: &[F128]) -> Vec<(F128, u64, u64)> {
     assist_columns_at(&assist_boundaries(params), z_col)
 }
@@ -1528,6 +1538,8 @@ pub(crate) enum MergedWeightClaim<'a> {
         z_row: &'a [F128],
         z_col: &'a [F128],
         table: &'a [F128],
+        /// Columns whose weight is zero ([`FrobeniusClaim::zeroed_cols`]).
+        zeroed_cols: &'a [usize],
     },
     /// A GROUP of γ-scaled (F128-linear) packed-direct claims sharing one
     /// row point: `Σᵢ γᵢ·eq_rowᵢ(row)·eq_colᵢ(col) =
@@ -1591,9 +1603,10 @@ pub(crate) fn build_merged_weight_and_prime(
                 z_row,
                 z_col,
                 table,
+                zeroed_cols,
             } => (
                 build_eq_table(z_row),
-                ColSide::Baked(bake(&build_eq_table(z_col), table)),
+                ColSide::Baked(bake(&masked_eq(z_col, zeroed_cols), table)),
             ),
             MergedWeightClaim::Scalar { z_row, cols } => {
                 (build_eq_table(z_row), ColSide::Combined(cols))
@@ -1729,6 +1742,42 @@ pub struct FrobeniusClaim<'a> {
     pub z_row: &'a [F128],
     pub z_col: &'a [F128],
     pub coeffs: &'a [F128],
+    /// Columns, ascending, where the claim's weight is zero: its column side
+    /// is `eq(z_col, ·)` with these entries cleared ([`masked_eq`]). Empty
+    /// for a plain evaluation claim.
+    pub zeroed_cols: &'a [usize],
+}
+
+impl FrobeniusClaim<'_> {
+    /// The claim's column weights over the `2^k` columns.
+    fn eq_cols(&self) -> Vec<F128> {
+        masked_eq(self.z_col, self.zeroed_cols)
+    }
+}
+
+/// `eq(z_col, ·)` over the `2^|z_col|` columns with the `zeroed` entries
+/// cleared: the column side of a claim on `z` with those columns masked out
+/// (the union's C claim, `C = diag(mask)`). A 0/1 mask commutes with
+/// Frobenius, so the twist `j` of the masked weight is the masked twist.
+pub(crate) fn masked_eq(z_col: &[F128], zeroed: &[usize]) -> Vec<F128> {
+    let mut eq = build_eq_table(z_col);
+    for &y in zeroed {
+        eq[y] = F128::ZERO;
+    }
+    eq
+}
+
+/// [`assist_columns_at`] for a claim whose `zeroed` columns are masked out.
+fn masked_columns_at(
+    bounds: &[(u64, u64, u32)],
+    z_col: &[F128],
+    zeroed: &[usize],
+) -> Vec<(F128, u64, u64)> {
+    if zeroed.is_empty() {
+        assist_columns_at(bounds, z_col)
+    } else {
+        weights_columns_at(bounds, &masked_eq(z_col, zeroed))
+    }
 }
 
 /// A GROUP of γ-scaled (F128-linear) packed-direct claims sharing one row
@@ -1792,7 +1841,7 @@ fn frobenius_statements(
     let m = params.m;
     let sparse = assist_sparse_transitions();
     enum SpecCols<'b> {
-        Point(Vec<F128>),
+        Point(Vec<F128>, &'b [usize]),
         Weights(&'b [F128]),
     }
     let mut specs: Vec<(Vec<F128>, SpecCols<'_>, F128)> = Vec::new();
@@ -1802,7 +1851,11 @@ fn frobenius_statements(
         let mut zc = claim.z_col.to_vec();
         for &c in claim.coeffs.iter() {
             if !c.is_zero() {
-                specs.push((zr.clone(), SpecCols::Point(zc.clone()), c));
+                specs.push((
+                    zr.clone(),
+                    SpecCols::Point(zc.clone(), claim.zeroed_cols),
+                    c,
+                ));
             }
             for x in zr.iter_mut() {
                 *x = *x * *x;
@@ -1842,7 +1895,7 @@ fn frobenius_statements(
             let mut cols: Vec<(F128, u64, u64)> = Vec::new();
             for (i, (zc, c)) in members.iter().enumerate() {
                 let mut cs = match zc {
-                    SpecCols::Point(zc) => assist_columns_at(bounds, zc),
+                    SpecCols::Point(zc, zeroed) => masked_columns_at(bounds, zc, zeroed),
                     SpecCols::Weights(w) => weights_columns_at(bounds, w),
                 };
                 for (w, _, _) in cs.iter_mut() {
@@ -2621,12 +2674,79 @@ fn multipoint_values(
     claims: &[FrobeniusClaim<'_>],
     rho_pows: &[Vec<F128>],
 ) -> Vec<Vec<F128>> {
+    multipoint_values_full_height(params, claims, rho_pows)
+        .unwrap_or_else(|| multipoint_values_dp(params, claims, rho_pows))
+}
+
+/// [`multipoint_values`] when every column is empty or full height `2^n` at
+/// a multiple of `2^n`: the column of dense rank `t` covers
+/// `[t·2^n, (t+1)·2^n)`, so `eq(ρ, t·2^n + r) = eq(ρ[..n], r)·eq(ρ[n..], t)`
+/// and its row sum closes, `Σ_r eq(z_r, r)·eq(ρ[..n], r) = eq(z_r, ρ[..n])`.
+/// Per twist that is one eq table over the `2^(m−n)` dense columns, not a
+/// boundary DP over every column. The same field elements as
+/// [`multipoint_values_dp`]; `None` on any other layout.
+fn multipoint_values_full_height(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho_pows: &[Vec<F128>],
+) -> Option<Vec<Vec<F128>>> {
+    let (n, m) = (params.n, params.m);
+    if m <= n
+        || claims
+            .iter()
+            .any(|c| c.z_row.len() != n || c.z_col.len() != params.k)
+    {
+        return None;
+    }
+    let full = 1u64 << n;
+    // `(column, dense rank)` of every non-empty column.
+    let mut ranked: Vec<(usize, usize)> = Vec::new();
+    for (y, w) in params.col_prefix_sums.windows(2).enumerate() {
+        match w[1] - w[0] {
+            0 => {}
+            h if h == full && w[0] % full == 0 => ranked.push((y, (w[0] >> n) as usize)),
+            _ => return None,
+        }
+    }
+    Some(
+        claims
+            .iter()
+            .map(|claim| {
+                let weights = masked_eq(claim.z_col, claim.zeroed_cols);
+                (0..128usize)
+                    .into_par_iter()
+                    .map(|j| {
+                        let (lo, hi) = rho_pows[j].split_at(n);
+                        let row = claim
+                            .z_row
+                            .iter()
+                            .zip(lo)
+                            .fold(F128::ONE, |acc, (&z, &r)| acc * (F128::ONE + z + r));
+                        let eq_hi = build_eq_table(hi);
+                        let cols = ranked
+                            .iter()
+                            .fold(F128::ZERO, |acc, &(y, t)| acc + weights[y] * eq_hi[t]);
+                        row * cols
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// [`multipoint_values`] on any layout: the boundary DP per column.
+fn multipoint_values_dp(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho_pows: &[Vec<F128>],
+) -> Vec<Vec<F128>> {
     let m = params.m;
     let sparse = assist_sparse_transitions();
     claims
         .iter()
         .map(|claim| {
-            let cols = assist_columns(params, claim.z_col);
+            let cols =
+                masked_columns_at(&assist_boundaries(params), claim.z_col, claim.zeroed_cols);
             (0..128usize)
                 .into_par_iter()
                 .map(|j| {
@@ -3024,8 +3144,8 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
     let area = params.area() as usize;
     let mut pairs: Vec<Pair> = Vec::with_capacity(2);
     let mut msg0 = (F128::ZERO, F128::ZERO);
-    // The aligned full-count shape serves BOTH products' closed forms.
-    let aligned = aligned_full_columns(params);
+    // An aligned stack serves BOTH products' closed forms.
+    let aligned = aligned_columns(params);
     if n_rs > 0 {
         let basis = inv_frob_basis();
         let mut images = Box::new([F128::ZERO; 128]);
@@ -3035,7 +3155,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
             }
         }
         let partner = Partner::twisted(images);
-        if let Some(used) = aligned.clone() {
+        if let Some(al) = aligned.as_ref() {
             // Aligned full-count shape: the RS combined weight is, per used
             // column, a sum of plain scaled row-eq tensors — no fold tables
             // (they live in the dual values and the g partner) — so it runs
@@ -3045,14 +3165,11 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
             let coltabs: Vec<Vec<F128>> = claims
                 .iter()
                 .enumerate()
-                .map(|(i, c)| {
-                    let eq_c = build_eq_table(c.z_col);
-                    used.iter().map(|&y| gpow[128 * i] * eq_c[y]).collect()
-                })
+                .map(|(i, c)| al.coltab(gpow[128 * i], &c.eq_cols(), c.z_row))
                 .collect();
             let rows: Vec<(Vec<F128>, F128)> = claims
                 .iter()
-                .map(|c| (c.z_row.to_vec(), F128::ONE))
+                .map(|c| (c.z_row[..al.g].to_vec(), F128::ONE))
                 .collect();
             let closed = closed_rs_on().then(|| {
                 ClosedRs::build(
@@ -3060,8 +3177,8 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
                     &rows,
                     &gpow,
                     rho_pows.as_ref().expect("RS claims carry the conjugates"),
-                    params.n,
-                    used.len(),
+                    al.g,
+                    al.subcols.len(),
                 )
             });
             let ar = AlignedRsPair {
@@ -3070,8 +3187,8 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
                 partner,
                 rho: rho.to_vec(),
                 round: 0,
-                nu: params.n,
-                n_used: used.len(),
+                nu: al.g,
+                n_used: al.subcols.len(),
                 closed,
             };
             let msg = ar.round0_msg(&eq0);
@@ -3086,7 +3203,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
             msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
             pairs.push(Pair::LazyRs(lz));
         } else {
-            let eq_cs: Vec<Vec<F128>> = claims.iter().map(|c| build_eq_table(c.z_col)).collect();
+            let eq_cs: Vec<Vec<F128>> = claims.iter().map(FrobeniusClaim::eq_cols).collect();
             let sides: Vec<(F128, Vec<F128>, &[F128])> = claims
                 .iter()
                 .zip(&eq_cs)
@@ -3147,7 +3264,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
     let mut dense_group_support: Option<u64> = None;
     if n_g > 0
         && closed_rs_on()
-        && let Some(used) = aligned.as_ref()
+        && let Some(al) = aligned.as_ref()
     {
         // THE SAME CLOSED FORM, one conjugate. A group's weight is
         // `scale·cols[y]·eq(z_row, row)` — the RS side's shape exactly — and
@@ -3159,25 +3276,22 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
         let coltabs: Vec<Vec<F128>> = groups
             .iter()
             .enumerate()
-            .map(|(k, g)| {
-                let scale = gpow[128 * n_rs + k];
-                used.iter().map(|&y| scale * g.cols[y]).collect()
-            })
+            .map(|(k, g)| al.coltab(gpow[128 * n_rs + k], g.cols, g.z_row))
             .collect();
         let rows: Vec<(Vec<F128>, F128)> = groups
             .iter()
-            .map(|g| (g.z_row.to_vec(), F128::ONE))
+            .map(|g| (g.z_row[..al.g].to_vec(), F128::ONE))
             .collect();
         let pts = [rho.to_vec()];
-        let closed = ClosedRs::build(&coltabs, &rows, &[F128::ONE], &pts, params.n, used.len());
+        let closed = ClosedRs::build(&coltabs, &rows, &[F128::ONE], &pts, al.g, al.subcols.len());
         let ar = AlignedRsPair {
             coltabs,
             rows,
             partner: Partner::Scaled { s: F128::ONE },
             rho: rho.to_vec(),
             round: 0,
-            nu: params.n,
-            n_used: used.len(),
+            nu: al.g,
+            n_used: al.subcols.len(),
             closed: Some(closed),
         };
         let msg = ar.round0_msg(&eq0);
@@ -3324,6 +3438,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
             z_row: cl.z_row,
             z_col: cl.z_col,
             coeffs: co,
+            zeroed_cols: cl.zeroed_cols,
         })
         .collect();
     let anchor_groups: Vec<(ScalarGroupClaim<'_>, F128)> = groups
@@ -3507,22 +3622,55 @@ fn column_pair_msg(
     (g1, gi)
 }
 
-/// The used-column list when EVERY used column is FULL (height `2^n`) — the
-/// full-count shape whose dense stack is column-aligned at `2^n`
-/// boundaries: position `d` splits as `(rank j, row) = (d >> n, d & mask)`
-/// with `j` indexing the used columns in order.
-fn aligned_full_columns(params: &JaggedParams) -> Option<Vec<usize>> {
-    let full = 1u64 << params.n;
-    let pfx = &params.col_prefix_sums;
-    let mut used = Vec::new();
-    for y in 0..pfx.len() - 1 {
-        match pfx[y + 1] - pfx[y] {
-            0 => {}
-            h if h == full => used.push(y),
-            _ => return None,
-        }
+/// A dense stack ALIGNED at `2^g` rows: every used column's height is a
+/// multiple of `2^g`, so every column starts at a multiple of `2^g` and
+/// position `d` splits as `(rank, row) = (d >> g, d & (2^g − 1))`. Rank `s`
+/// is SUB-COLUMN `subcols[s] = (y, hi)`: rows `[hi·2^g, (hi+1)·2^g)` of
+/// column `y`. A row point then splits too — `eq(z_row, row) =
+/// eq(z_row[..g], low)·eq(z_row[g..], hi)` — so a claim's jagged weight is a
+/// sub-column table times a `g`-variable row tensor, the form the closed
+/// kernels need. The full-count shape (every used column of height `2^n`)
+/// is the case `g = n`, `hi = 0`.
+struct AlignedLayout {
+    g: usize,
+    subcols: Vec<(usize, usize)>,
+}
+
+impl AlignedLayout {
+    /// A claim's sub-column table: `scale·cols[y]·eq(z_row[g..], hi)`.
+    fn coltab(&self, scale: F128, cols: &[F128], z_row: &[F128]) -> Vec<F128> {
+        let eq_hi = build_eq_table(&z_row[self.g..]);
+        self.subcols
+            .iter()
+            .map(|&(y, hi)| scale * cols[y] * eq_hi[hi])
+            .collect()
     }
-    (!used.is_empty() && params.n >= 1).then_some(used)
+}
+
+/// Below this many aligned row bits the closed form's per-sub-column domain
+/// stops being small; such shapes keep the lazy/materialized paths.
+const ALIGNED_MIN_LOG: usize = 6;
+
+/// The coarsest alignment of the dense stack ([`AlignedLayout`]): the
+/// largest `g ≤ n` dividing every used column's height, if it reaches
+/// [`ALIGNED_MIN_LOG`] (or is `n` itself). Padded counts — the recursion
+/// envelope rounds every slot to a multiple of `2^8` — make partial-count
+/// shapes aligned without committing a single dummy row.
+fn aligned_columns(params: &JaggedParams) -> Option<AlignedLayout> {
+    let pfx = &params.col_prefix_sums;
+    let heights = || (0..pfx.len() - 1).map(|y| (y, pfx[y + 1] - pfx[y]));
+    let g = heights()
+        .filter(|&(_, h)| h > 0)
+        .map(|(_, h)| h.trailing_zeros() as usize)
+        .min()?
+        .min(params.n);
+    if params.n < 1 || g < ALIGNED_MIN_LOG.min(params.n) {
+        return None;
+    }
+    let subcols = heights()
+        .flat_map(|(y, h)| (0..(h >> g) as usize).map(move |hi| (y, hi)))
+        .collect();
+    Some(AlignedLayout { g, subcols })
 }
 
 /// The RS product of the two-product sumcheck in CLOSED FORM, for the
@@ -3585,28 +3733,29 @@ impl ClosedRs {
         n_used: usize,
     ) -> Self {
         let n_j = rho_pows.len();
-        let coldot: Vec<Vec<F128>> = coltabs
-            .iter()
-            .map(|ct| {
-                (0..n_j)
-                    .map(|j| {
-                        let hi = &rho_pows[j][nu..];
-                        (0..n_used)
-                            .map(|rank| {
-                                let mut e = ct[rank];
-                                for (b, &p) in hi.iter().enumerate() {
-                                    e *= if (rank >> b) & 1 == 1 {
-                                        p
-                                    } else {
-                                        F128::ONE + p
-                                    };
-                                }
-                                e
-                            })
-                            .fold(F128::ZERO, |a, x| a + x)
+        // One `eq(ρ⁽ʲ⁾[ν..], ·)` table per conjugate — built by doubling,
+        // shared by every claim — then a dot per claim: `O(2^(m−ν) + R·n_used)`
+        // multiplies per conjugate instead of a fresh `(m−ν)`-factor product
+        // per rank. The sub-column layouts of padded counts carry ~14k ranks
+        // over 14 bits, where the per-rank product was 50M multiplies.
+        let by_j: Vec<Vec<F128>> = (0..n_j)
+            .into_par_iter()
+            .map(|j| {
+                let eq_hi = build_eq_table(&rho_pows[j][nu..]);
+                debug_assert!(eq_hi.len() >= n_used);
+                coltabs
+                    .iter()
+                    .map(|ct| {
+                        ct[..n_used]
+                            .iter()
+                            .zip(&eq_hi)
+                            .fold(F128::ZERO, |a, (&c, &e)| a + c * e)
                     })
                     .collect()
             })
+            .collect();
+        let coldot: Vec<Vec<F128>> = (0..coltabs.len())
+            .map(|i| by_j.iter().map(|v| v[i]).collect())
             .collect();
         let suf: Vec<Vec<Vec<F128>>> = rows
             .iter()
@@ -4190,7 +4339,7 @@ impl LazyRsPair {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let eq_c = build_eq_table(c.z_col);
+                let eq_c = c.eq_cols();
                 // Same grouping as the materialized fill's `w = scale·cols[y]`.
                 let cols = eq_c.iter().map(|&e| gpow[128 * i] * e).collect();
                 (cols, build_eq_table(c.z_row))
@@ -4591,6 +4740,7 @@ fn verify_multipoint_twisted_core<C: Challenger>(
             z_row: cl.z_row,
             z_col: cl.z_col,
             coeffs: co,
+            zeroed_cols: cl.zeroed_cols,
         })
         .collect();
     let anchor_groups: Vec<(ScalarGroupClaim<'_>, F128)> = groups
@@ -4836,14 +4986,15 @@ mod tests {
                 AssistBlocks, Challenger, F128, FrobeniusClaim, JaggedAssistProof, JaggedParams,
                 JaggedSumcheckProof, MultipointGrinding, MultipointTwistedProof,
                 SPARSE_DENSIFY_FACTOR, ScalarGroupClaim, SparseGroupPair, VIRTUAL_A_OVERRIDE,
-                aligned_full_columns, assist_boundaries, assist_buckets, assist_columns_at,
+                aligned_columns, assist_boundaries, assist_buckets, assist_columns_at,
                 assist_eq_at_blocked, assist_shared_tail_blocked, assist_sparse_transitions,
                 assist_suffix_low_blocked, assist_suffix_rows_blocked,
                 assist_test_support::{assist_suffix_rows, assist_w_at, prove_assist_naive},
                 assist_w_at_blocked, build_eq_table, f_hat_t, fold_and_round_oop_par, fold_oop_par,
-                fold_partials, frob_inv, generate_f_and_claim, int_bit, point_bit, prove,
-                prove_assist, prove_frobenius_assist, prove_multipoint_twisted,
-                prove_multipoint_twisted_with_grinding, prove_with_assist,
+                fold_partials, frob_inv, generate_f_and_claim, int_bit, multipoint_values_dp,
+                multipoint_values_full_height, point_bit, prove, prove_assist,
+                prove_frobenius_assist, prove_multipoint_twisted,
+                prove_multipoint_twisted_with_grinding, prove_with_assist, rho_inverse_powers,
                 round_test_support::{fold_and_round_fused, round_msg, round_msg_par},
                 verify, verify_assist, verify_frobenius_assist, verify_multipoint_twisted,
                 verify_multipoint_twisted_with_grinding, verify_with_assist,
@@ -4957,6 +5108,7 @@ mod tests {
                     z_row: &c.0,
                     z_col: &c.1,
                     coeffs: &c.3,
+                    zeroed_cols: &[],
                 })
                 .collect();
             let fgroups = [(
@@ -5066,11 +5218,13 @@ mod tests {
                 z_row: &z1r,
                 z_col: &z1c,
                 coeffs: &c1,
+                zeroed_cols: &[],
             },
             FrobeniusClaim {
                 z_row: &z2r,
                 z_col: &z2c,
                 coeffs: &c2,
+                zeroed_cols: &[],
             },
         ];
         let groups = [
@@ -5170,6 +5324,7 @@ mod tests {
             z_row: &z_row,
             z_col: &z_col,
             coeffs: &coeffs,
+            zeroed_cols: &[],
         }];
         let groups = [ScalarGroupClaim {
             z_row: &group_row,
@@ -5315,6 +5470,7 @@ mod tests {
             z_row: &z1r,
             z_col: &z1c,
             coeffs: &c1,
+            zeroed_cols: &[],
         }];
         let groups = [
             ScalarGroupClaim {
@@ -5444,11 +5600,13 @@ mod tests {
                         z_row: &z1r,
                         z_col: &z1c,
                         coeffs: &c1,
+                        zeroed_cols: &[],
                     },
                     FrobeniusClaim {
                         z_row: &z2r,
                         z_col: &z2c,
                         coeffs: &c2,
+                        zeroed_cols: &[],
                     },
                 ];
                 let groups_all = [ScalarGroupClaim {
@@ -5536,11 +5694,13 @@ mod tests {
                 z_row: &z1r,
                 z_col: &z1c,
                 coeffs: &c1,
+                zeroed_cols: &[],
             },
             FrobeniusClaim {
                 z_row: &z2r,
                 z_col: &z2c,
                 coeffs: &c2,
+                zeroed_cols: &[],
             },
         ];
         let groups = [
@@ -5601,14 +5761,95 @@ mod tests {
                 heights[y] = 1 << n;
             }
             let params = JaggedParams::from_heights(&heights, n, m);
-            assert!(
-                aligned_full_columns(&params).is_some(),
-                "case must drive the aligned path"
+            assert_eq!(
+                aligned_columns(&params).map(|a| a.g),
+                Some(n),
+                "case must drive the full-height aligned path"
             );
             check_multipoint(
                 &params,
                 &mut ch,
                 &format!("aligned n={n} k={k} m={m} used={}", used.len()),
+            );
+        }
+    }
+
+    /// The full-height closed form of the multipoint values against the
+    /// boundary DP, with and without zeroed columns; partial heights fall
+    /// back.
+    #[test]
+    fn multipoint_values_full_height_match_the_dp() {
+        let mut ch = RandomChallenger::new(0xF0_11E1);
+        let cases: &[(usize, usize, usize, &[usize], &[usize])] = &[
+            (3, 2, 5, &[0, 1, 2, 3], &[]),
+            (4, 3, 7, &[0, 1, 2, 3, 4], &[2]),
+            (3, 4, 8, &[0, 2, 3, 7, 9, 12], &[3, 12, 5]),
+            (1, 3, 4, &[1, 4, 6], &[]),
+        ];
+        for &(n, k, m, used, zeroed) in cases {
+            let mut heights = vec![0u64; 1 << k];
+            for &y in used {
+                heights[y] = 1 << n;
+            }
+            let params = JaggedParams::from_heights(&heights, n, m);
+            let (zr, zc, c) = (
+                sample_vec(&mut ch, n),
+                sample_vec(&mut ch, k),
+                sample_vec(&mut ch, 128),
+            );
+            let claims = [FrobeniusClaim {
+                z_row: &zr,
+                z_col: &zc,
+                coeffs: &c,
+                zeroed_cols: zeroed,
+            }];
+            let rho_pows = rho_inverse_powers(&sample_vec(&mut ch, m));
+            assert_eq!(
+                multipoint_values_full_height(&params, &claims, &rho_pows),
+                Some(multipoint_values_dp(&params, &claims, &rho_pows)),
+                "n={n} k={k} m={m}"
+            );
+        }
+        let params = JaggedParams::from_heights(&[8, 4, 0, 8], 3, 5);
+        let (zr, zc, c) = (
+            sample_vec(&mut ch, 3),
+            sample_vec(&mut ch, 2),
+            sample_vec(&mut ch, 128),
+        );
+        let claims = [FrobeniusClaim {
+            z_row: &zr,
+            z_col: &zc,
+            coeffs: &c,
+            zeroed_cols: &[],
+        }];
+        let rho_pows = rho_inverse_powers(&sample_vec(&mut ch, 5));
+        assert_eq!(
+            multipoint_values_full_height(&params, &claims, &rho_pows),
+            None
+        );
+    }
+
+    /// Partially aligned shapes — every height a multiple of `2^g` below
+    /// the full `2^n`, with dead columns in between — drive the closed
+    /// forms over sub-columns, against the same brute force.
+    #[test]
+    fn multipoint_twisted_partially_aligned_matches_bruteforce() {
+        let mut ch = RandomChallenger::new(0xA119_ED02);
+        // (n, k, m, heights by column, expected g)
+        let cases: &[(usize, usize, usize, &[u64], usize)] = &[
+            (7, 3, 10, &[128, 64, 0, 64, 128, 0, 64, 0], 6),
+            (8, 3, 11, &[256, 64, 192, 128, 0, 64, 0, 0], 6),
+            (8, 2, 10, &[128, 0, 256, 128], 7),
+        ];
+        for &(n, k, m, hs, g) in cases {
+            let mut heights = vec![0u64; 1 << k];
+            heights[..hs.len()].copy_from_slice(hs);
+            let params = JaggedParams::from_heights(&heights, n, m);
+            assert_eq!(aligned_columns(&params).map(|a| a.g), Some(g));
+            check_multipoint(
+                &params,
+                &mut ch,
+                &format!("aligned g={g} n={n} k={k} m={m}"),
             );
         }
     }
