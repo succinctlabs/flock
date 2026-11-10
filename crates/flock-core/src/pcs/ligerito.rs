@@ -62,6 +62,7 @@ use crate::{
     scratch::{give_f128, take_f128},
 };
 
+pub mod affine;
 pub(crate) mod extension;
 
 // ===================================================================
@@ -123,14 +124,26 @@ pub enum LigeritoProfile {
     /// envelope's fixed point was iterated against). Frozen, like `Fast100`.
     Slim100,
     Secure,
+    /// `Fast` with the affine F128 fold in the merged open's inner Ligerito
+    /// opening (`ligerito::affine`, docs/affine-fold-f128.tex): the same
+    /// commitment, transport and grinding as `Fast`, and an affine ladder
+    /// from [`affine::affine_ladder`] for the inner opening. The recursion
+    /// tower's leaf profile (`TowerConfig::Chain128`), verified in-circuit
+    /// by the tower's affine walk. Registered shapes only
+    /// ([`affine::affine_ladder_for`]); no GPU twin yet.
+    FastAffine,
+    /// `Slim` with the affine F128 inner opening, as [`Self::FastAffine`] is
+    /// to `Fast`: the recursion tower's outer (node) profile. Registered
+    /// shapes only (the m = 29 envelope, (22,5)); no GPU twin yet.
+    SlimAffine,
 }
 
 impl LigeritoProfile {
     /// L0 code rate index for this profile (`rho_0 = 2^-log_inv_rate`).
     pub fn log_inv_rate(self) -> usize {
         match self {
-            Self::Fast100 | Self::Fast | Self::Secure => 1,
-            Self::Slim100 | Self::Slim => 2,
+            Self::Fast100 | Self::Fast | Self::FastAffine | Self::Secure => 1,
+            Self::Slim100 | Self::Slim | Self::SlimAffine => 2,
         }
     }
     /// Historical profile-local target. Strict Fast/Slim configs retain the
@@ -140,13 +153,34 @@ impl LigeritoProfile {
     /// query floor.
     pub fn security_bits(self) -> usize {
         match self {
-            Self::Fast100 | Self::Fast | Self::Slim100 | Self::Slim => 100,
+            Self::Fast100
+            | Self::Fast
+            | Self::FastAffine
+            | Self::Slim100
+            | Self::Slim
+            | Self::SlimAffine => 100,
             Self::Secure => 120,
+        }
+    }
+    /// Whether the merged open's inner opening uses the affine fold.
+    pub fn affine_fold(self) -> bool {
+        matches!(self, Self::FastAffine | Self::SlimAffine)
+    }
+    /// The profile whose embedded security config, transport and grinding
+    /// this one shares (itself, except `FastAffine` → `Fast` and
+    /// `SlimAffine` → `Slim`).
+    pub fn base(self) -> Self {
+        match self {
+            Self::FastAffine => Self::Fast,
+            Self::SlimAffine => Self::Slim,
+            other => other,
         }
     }
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Fast => "fast",
+            Self::FastAffine => "fast-affine",
+            Self::SlimAffine => "slim-affine",
             Self::Fast100 => "fast100",
             Self::Slim => "slim",
             Self::Slim100 => "slim100",
@@ -549,6 +583,9 @@ const EMBEDDED_CONFIGS: &[((usize, LigeritoProfile), &str)] =
 /// Look up the embedded security config TOML for `(m, profile)`.
 /// Returns `None` if no config has been derived for this combination yet.
 pub fn embedded_security_config(m: usize, profile: LigeritoProfile) -> Option<&'static str> {
+    // An affine profile commits exactly as its base does, so it reads the base TOML
+    // (for `initial_k`); its opening ladder comes from `affine_ladder_for`.
+    let profile = profile.base();
     EMBEDDED_CONFIGS.iter().find_map(|&(key, toml)| {
         if key == (m, profile) {
             Some(toml)
@@ -596,6 +633,9 @@ pub fn prover_config_for(
     log_batch_size: usize,
     profile: LigeritoProfile,
 ) -> Result<ProverConfig, String> {
+    if profile.affine_fold() {
+        return affine::affine_ladder_for(profile, log_n, log_batch_size).map(|(p, _)| p);
+    }
     let m = log_n + LOG_PACKING;
     let toml = embedded_security_config(m, profile).ok_or_else(|| {
         format!(
@@ -626,6 +666,9 @@ pub fn verifier_config_for(
     log_batch_size: usize,
     profile: LigeritoProfile,
 ) -> Result<VerifierConfig, String> {
+    if profile.affine_fold() {
+        return affine::affine_ladder_for(profile, log_n, log_batch_size).map(|(_, v)| v);
+    }
     let m = log_n + LOG_PACKING;
     let toml = embedded_security_config(m, profile).ok_or_else(|| {
         format!(
@@ -1257,7 +1300,10 @@ impl LigeritoSecurityConfig {
     fn validate_profile(&self, profile: LigeritoProfile) -> Result<(), String> {
         let expected = match profile {
             LigeritoProfile::Secure => "f256_split_no_row_union_over_ben_sasson_2025_cor_1_4",
-            LigeritoProfile::Fast | LigeritoProfile::Slim => {
+            LigeritoProfile::Fast
+            | LigeritoProfile::FastAffine
+            | LigeritoProfile::SlimAffine
+            | LigeritoProfile::Slim => {
                 "f256_split_johnson_two_point_ood_query128_c3_algebraic_row_union_over_bchks25_thm_4_6"
             }
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => {
@@ -1772,7 +1818,7 @@ impl LigeritoSecurityConfig {
         // 2026-11-06: natively, the recursive commits cost more than the
         // extra queries. Fast100/Slim100/Secure keep the shipped +1/level.
         let rate_gain = match profile {
-            LigeritoProfile::Slim => 2,
+            LigeritoProfile::Slim | LigeritoProfile::SlimAffine => 2,
             _ => 1,
         };
         Self::derive_profile_ladder(m, profile, 3, rate_gain)
@@ -1803,11 +1849,18 @@ impl LigeritoSecurityConfig {
         // took the `Fast` name in the 2026-08-27 consolidation. Fast100 stays
         // grind-free: it is the frozen historical cost point.
         let query_grind: usize = match profile {
-            LigeritoProfile::Slim100 | LigeritoProfile::Slim | LigeritoProfile::Fast => 16,
+            LigeritoProfile::Slim100
+            | LigeritoProfile::Slim
+            | LigeritoProfile::Fast
+            | LigeritoProfile::FastAffine
+            | LigeritoProfile::SlimAffine => 16,
             LigeritoProfile::Fast100 | LigeritoProfile::Secure => 0,
         };
         let query_target_bits = match profile {
-            LigeritoProfile::Fast | LigeritoProfile::Slim => LIST_DECODING_QUERY_TARGET_BITS,
+            LigeritoProfile::Fast
+            | LigeritoProfile::FastAffine
+            | LigeritoProfile::SlimAffine
+            | LigeritoProfile::Slim => LIST_DECODING_QUERY_TARGET_BITS,
             // Fast100 IS Fast at the pre-list-decoding cost point: the
             // query term targets the profile's own 100 bits, reproducing
             // the schedule shipped before the strict-128 milestone.
@@ -1840,6 +1893,8 @@ impl LigeritoSecurityConfig {
                 29,
                 LigeritoProfile::Fast100
                 | LigeritoProfile::Fast
+                | LigeritoProfile::FastAffine
+                | LigeritoProfile::SlimAffine
                 | LigeritoProfile::Slim100
                 | LigeritoProfile::Slim,
             ) => 5usize,
@@ -1847,6 +1902,8 @@ impl LigeritoSecurityConfig {
                 28,
                 LigeritoProfile::Fast100
                 | LigeritoProfile::Fast
+                | LigeritoProfile::FastAffine
+                | LigeritoProfile::SlimAffine
                 | LigeritoProfile::Slim100
                 | LigeritoProfile::Slim,
             ) => 4usize,
@@ -1862,6 +1919,8 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Secure => udr_per_query_bits_asymptotic(rate),
                 LigeritoProfile::Fast100
                 | LigeritoProfile::Fast
+                | LigeritoProfile::FastAffine
+                | LigeritoProfile::SlimAffine
                 | LigeritoProfile::Slim100
                 | LigeritoProfile::Slim => paper_per_query_bits(rate, JOHNSON_ETA),
             }
@@ -1908,6 +1967,8 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Secure => udr_per_query_bits(rate, cols, UDR_PROXIMITY_LOSS),
                 LigeritoProfile::Fast100
                 | LigeritoProfile::Fast
+                | LigeritoProfile::FastAffine
+                | LigeritoProfile::SlimAffine
                 | LigeritoProfile::Slim100
                 | LigeritoProfile::Slim => paper_per_query_bits(rate, JOHNSON_ETA),
             };
@@ -1938,6 +1999,8 @@ impl LigeritoSecurityConfig {
                 }
                 LigeritoProfile::Fast100
                 | LigeritoProfile::Fast
+                | LigeritoProfile::FastAffine
+                | LigeritoProfile::SlimAffine
                 | LigeritoProfile::Slim100
                 | LigeritoProfile::Slim => {
                     let eps_pg =
@@ -2007,7 +2070,10 @@ impl LigeritoSecurityConfig {
 
         let analysis_version = match profile {
             LigeritoProfile::Secure => "f256_split_no_row_union_over_ben_sasson_2025_cor_1_4",
-            LigeritoProfile::Fast | LigeritoProfile::Slim => {
+            LigeritoProfile::Fast
+            | LigeritoProfile::FastAffine
+            | LigeritoProfile::SlimAffine
+            | LigeritoProfile::Slim => {
                 "f256_split_johnson_two_point_ood_query128_c3_algebraic_row_union_over_bchks25_thm_4_6"
             }
             // Same analysis as Fast; only the query term's target differs
@@ -4131,12 +4197,12 @@ impl VirtualEqTerm {
 /// A factored sum of scaled equality tensors. It starts with the opening's
 /// basis and can absorb L0's additional OOD term without materializing a
 /// `2^log_n` vector.
-pub(crate) struct VirtualEqBasis {
+pub struct VirtualEqBasis {
     terms: Vec<VirtualEqTerm>,
 }
 
 impl VirtualEqBasis {
-    pub(crate) fn new(point: Vec<F128>, gamma: F128) -> Self {
+    pub fn new(point: Vec<F128>, gamma: F128) -> Self {
         Self {
             terms: vec![VirtualEqTerm::new(point, gamma)],
         }
@@ -4824,7 +4890,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
 /// zero regardless, since q's dead lanes are zero). No trailing verifier
 /// mirror: the transcript ends at the opening on this path.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenger>(
+pub fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     b_initial: Vec<F128>,

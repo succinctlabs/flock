@@ -164,8 +164,8 @@ impl XmssTower {
         let mut leaf0: Option<XmssLeaf> = None;
         let mut fls: Vec<XmssFlNode> = Vec::with_capacity(n_leaves / 2);
         for pair in batches.chunks(2) {
-            let l0 = build_xmss_leaf(circuit, &pair[0].0, &pair[0].1);
-            let l1 = build_xmss_leaf(circuit, &pair[1].0, &pair[1].1);
+            let l0 = build_xmss_leaf(cfg, circuit, &pair[0].0, &pair[0].1);
+            let l1 = build_xmss_leaf(cfg, circuit, &pair[1].0, &pair[1].1);
             fls.push(build_xmss_first_level_node(cfg, circuit, [&l0, &l1]));
             leaf0.get_or_insert(l0);
         }
@@ -488,7 +488,7 @@ fn xmss_tower_e2e() {
     let nu = std::env::var("XMSS_NU")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(if n < 64 { 9 } else { XMSS_LEAF_NU });
+        .unwrap_or(if n < 64 { 8 } else { XMSS_LEAF_NU });
     let circuit = XmssCircuit::with_options(
         n,
         Some(nu),
@@ -676,7 +676,7 @@ fn xmss_tower_vk_fingerprint_pinned() {
     let n = 4;
     let circuit = XmssCircuit::with_options(
         n,
-        Some(9),
+        Some(8),
         crate::leanxmss::circuit::XmssOptions::RECURSION_LEAF,
     );
     let batches: Vec<(Vec<Statement>, Vec<Signature>)> =
@@ -723,26 +723,32 @@ fn xmss_tower_vk_fingerprint_pinned() {
 // Re-blessed 2026-11-06: the Fast leaf's +1/level ladder (proof-IO v25)
 // and the lane pin 28 → 31 move the FL, base and steady circuits; the leaf
 // circuit, both registries and publics UNCHANGED. Two identical prints.
+// Re-blessed 2026-11-10: #76 merged onto main. The leaf proves FastAffine
+// and the nodes walk its affine F128 inner; the test leaf moves to 2^8-row
+// slots (m24, the smallest shape with a certified affine ladder), which
+// moves the leaf circuit and leaf registry; the envelope (family H by
+// Horner, body 3382, ACC_MAIN 896, lanes 26) moves the three outer circuits
+// and the outer registry; publics 5963 -> 4888. Two identical prints.
 #[cfg(test)]
 const PIN_XMSS_LEAF_CIRCUIT: &str =
-    "d83e5ba428a73c8488197e7d1a26c5ab9d17b6a0fc08cebae5465da314955ed4";
+    "9f0cc728db1bc3c6fe820f065a8f8f806dc94b8e16fe784b96f188b09c732204";
 #[cfg(test)]
 const PIN_XMSS_FL_CIRCUIT: &str =
-    "0578d284f96bb3708eced0076a138e745ddec978063f97b7ece658034eb0554f";
+    "6132df18f24d9680f0bcdce2b63f8ad0cd11fecd7ab8a296c33ee9cdf8c3a51e";
 #[cfg(test)]
 const PIN_XMSS_BASE_CIRCUIT: &str =
-    "e5c7a4268813111451ea4079b2e00f7f6c21c7cc5e94a98a0c184e10f06cb5db";
+    "ba1e1a06e20bcdc224a7265d95d5e898c6e8d375d348facc8c1a98cca181f1d3";
 #[cfg(test)]
 const PIN_XMSS_STEADY_CIRCUIT: &str =
-    "57446ae5e0c8fa5fbc82d605b2eadb04f64067842001df3cb573668c8dc71ab1";
+    "c4166530110b88c884970967465ccc35626018469b6f855083d2f931a3f3d71f";
 #[cfg(test)]
 const PIN_XMSS_LEAF_REGISTRY: &str =
-    "8ff30c7b07014589d55707fd8a968df8337fc9beb9d4520c350d31b23d56d85b";
+    "b03a3b64cb634b7b2319dc7e411ee527ede02dae820005f0b7acd3740f5f0248";
 #[cfg(test)]
 const PIN_XMSS_OUTER_REGISTRY: &str =
-    "c36112d619a1907c2132257f311ec7a90e81b932d20257b197d458b4267201c0";
+    "503617249dcb35d7d766340d0b5a0c3e3fb526bc686f3fb402b3a4ea914b9f1b";
 #[cfg(test)]
-const PIN_XMSS_PUBLICS_LEN: usize = 5963;
+const PIN_XMSS_PUBLICS_LEN: usize = 4888;
 
 /// Signing grinds each signature's digest onto a codeword (~30 s per
 /// 1000 signatures on every core), so the batches are signed once on a
@@ -833,8 +839,8 @@ fn xmss_tower_online_bench() {
 
     // ---- FL: the spine's fresh child, over batches 0 and 1 ----
     let (fresh, jp) = {
-        let l0 = build_xmss_leaf(&circuit, &batches[0].0, &batches[0].1);
-        let l1 = build_xmss_leaf(&circuit, &batches[1].0, &batches[1].1);
+        let l0 = build_xmss_leaf(cfg, &circuit, &batches[0].0, &batches[0].1);
+        let l1 = build_xmss_leaf(cfg, &circuit, &batches[1].0, &batches[1].1);
         STEADY_OVERRIDE.store(runs, Ordering::Relaxed);
         let fl = build_xmss_first_level_node(cfg, &circuit, [&l0, &l1]);
         STEADY_OVERRIDE.store(0, Ordering::Relaxed);
@@ -845,8 +851,8 @@ fn xmss_tower_online_bench() {
     // ---- BASE over two more first-level nodes, then the steady SPINE
     // node: the fresh FL plus the base as its node child ----
     let pair = |i: usize| {
-        let l0 = build_xmss_leaf(&circuit, &batches[i].0, &batches[i].1);
-        let l1 = build_xmss_leaf(&circuit, &batches[i + 1].0, &batches[i + 1].1);
+        let l0 = build_xmss_leaf(cfg, &circuit, &batches[i].0, &batches[i].1);
+        let l1 = build_xmss_leaf(cfg, &circuit, &batches[i + 1].0, &batches[i + 1].1);
         build_xmss_first_level_node(cfg, &circuit, [&l0, &l1])
     };
     let (fl1, fl2) = (pair(2), pair(4));

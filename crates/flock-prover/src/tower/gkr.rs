@@ -709,7 +709,7 @@ pub(super) fn emit_element_reported_check(
 /// moved with this emitter; the total stays `bits_for(474)`). The checker
 /// items left on this surface are the nonce range and `lows == bf(point)`
 /// ([`check_ag_skip_publics`] — the PowMask row pins only the nonce
-/// word's high half, and Chain100 emits no row).
+/// word's high half, and a profile without the r1 grind emits no row).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_ag_point_binding(
     sb: &mut ShapeBuilder,

@@ -22,11 +22,10 @@ use flock_transcript::transcript_record::{
 use crate::{
     r1cs_hashes::fs_chain::FsChainTrace,
     tower::{
-        BusRec, ChildSlots, F128, GkrLayerRec, GkrRec, InnerPd, KEY_HORNER_STEP, KEY_SQUARE_CHAIN,
-        KEY_TRANSPOSE_DOT, Lvl, MergedChain, MixedProof, MpRec, OpenLevel, PdRec, RoundRec,
-        ShapeBuilder, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays, duplex_row_count_model,
-        emit_family_h, emit_spine256, level_query_phase_blake3_rows, merge_chain,
-        squeeze_word_wire,
+        BusRec, ChildSlots, F128, GkrLayerRec, GkrRec, KEY_HORNER_STEP, KEY_SQUARE_CHAIN,
+        KEY_TRANSPOSE_DOT, Lvl, MergedChain, MpRec, PdRec, RoundRec, ShapeBuilder, Wire,
+        ZskipTapeRec, ZskipWires, assert_chain_replays, duplex_row_count_model, emit_family_h,
+        level_query_phase_blake3_rows, merge_chain, squeeze_word_wire,
     },
 };
 
@@ -292,30 +291,6 @@ pub(super) fn merge_and_replay_chain(
     mc
 }
 
-/// The residual pairing's rotation (lane-major inners, full grids
-/// included): a low-bit grid inner (`num_lanes: None`) takes the IDENTITY
-/// pairing, same as the native side's rotate gate — which reads
-/// `PcsParams::lane_major`, never the opened width. BOTH walkers must
-/// rotate identically.
-pub(super) fn parse_residual_rotation(
-    proof: &MixedProof,
-    geo: &[Lvl],
-    levels: &[OpenLevel],
-    w_rounds: &[RoundRec],
-) -> (usize, Vec<RoundRec>) {
-    let yr_len = proof.pcs_open().inner.ligerito.final_proof.yr.len() / 2;
-    let lane_major = geo[0].lane_major;
-    let w_resid: Vec<RoundRec> = if lane_major {
-        let k_rot = w_rounds.len() - levels[0].fold_fins.len();
-        let mut v = w_rounds[k_rot..].to_vec();
-        v.extend_from_slice(&w_rounds[..k_rot]);
-        v
-    } else {
-        w_rounds.to_vec()
-    };
-    (yr_len, w_resid)
-}
-
 /// The anchor's native endpoint: the anchor's claimed v folded through its
 /// own rounds. BOTH walkers must replay this exact fold.
 pub(super) fn parse_anchor_native_endpoint(vals_rec: &[F128], chals: &[F128], mp: &MpRec) -> F128 {
@@ -482,148 +457,6 @@ pub(super) fn emit_multipoint_intake(
     (mp_pws, mp_rho2_w, mp_sig_w, anc_w)
 }
 
-/// The ligerito SPINE walk: start gamma'·q_eval, the initial-OOD folds,
-/// the start message, then per level the eval/build fold pairs and the
-/// intro-folds consuming the query phase's accumulator wires. Returns the
-/// final `t_r` pair. BOTH walkers must emit this exact spine.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_ligerito_spine_walk(
-    sb: &mut ShapeBuilder,
-    spine256: SlotId,
-    outs: &[Vec<Wire>],
-    trace: &FsChainTrace,
-    wv: &impl Fn(usize) -> Wire,
-    levels: &[OpenLevel],
-    inner_pd: &InnerPd,
-    start_v: usize,
-    level_accs: &[[Wire; 2]],
-    zw: Wire,
-    ow: Wire,
-) -> [Wire; 2] {
-    let r_lvl = levels.len() - 1;
-    let gpw = outs[trace.squeezes[inner_pd.fin][0]][0];
-    let z2 = [zw, zw];
-    let tw0 = emit_spine256(
-        sb,
-        spine256,
-        z2,
-        z2,
-        z2,
-        z2,
-        z2,
-        z2,
-        [wv(inner_pd.q_v), zw],
-        gpw,
-        z2,
-    );
-    let mut tsp = tw0[3];
-    for od in &levels[0].initial_ood {
-        let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-        tsp = emit_spine256(
-            sb,
-            spine256,
-            z2,
-            z2,
-            z2,
-            tsp,
-            z2,
-            z2,
-            [wv(od.y_v), zw],
-            bw,
-            z2,
-        )[3];
-    }
-    let st = emit_spine256(
-        sb,
-        spine256,
-        z2,
-        z2,
-        z2,
-        z2,
-        [wv(start_v), wv(start_v + 1)],
-        [wv(start_v + 2), wv(start_v + 3)],
-        tsp,
-        ow,
-        z2,
-    );
-    let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
-    for (li, lvl) in levels.iter().enumerate() {
-        for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
-            let rw = [
-                squeeze_word_wire(outs, trace, lvl.fold_fins[j], 0),
-                squeeze_word_wire(outs, trace, lvl.fold_fins[j], 1),
-            ];
-            let ev = emit_spine256(sb, spine256, qc, qb, qa, z2, z2, z2, z2, zw, rw);
-            tsp = ev[4];
-            let bld = emit_spine256(
-                sb,
-                spine256,
-                z2,
-                z2,
-                z2,
-                z2,
-                [wv(mv), wv(mv + 1)],
-                [wv(mv + 2), wv(mv + 3)],
-                tsp,
-                ow,
-                z2,
-            );
-            (qc, qb, qa) = (bld[0], bld[1], bld[2]);
-        }
-        if li < r_lvl {
-            for od in &lvl.ood {
-                let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-                let f = emit_spine256(
-                    sb,
-                    spine256,
-                    qc,
-                    qb,
-                    qa,
-                    tsp,
-                    [wv(od.intro_v), wv(od.intro_v + 1)],
-                    [wv(od.intro_v + 2), wv(od.intro_v + 3)],
-                    [wv(od.y_v), zw],
-                    bw,
-                    z2,
-                );
-                (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
-            }
-            let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-            let f = emit_spine256(
-                sb,
-                spine256,
-                qc,
-                qb,
-                qa,
-                tsp,
-                [wv(lvl.intro_v), wv(lvl.intro_v + 1)],
-                [wv(lvl.intro_v + 2), wv(lvl.intro_v + 3)],
-                level_accs[li],
-                bw,
-                z2,
-            );
-            (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
-        } else {
-            let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-            let f = emit_spine256(
-                sb,
-                spine256,
-                z2,
-                z2,
-                z2,
-                tsp,
-                z2,
-                z2,
-                level_accs[li],
-                bw,
-                z2,
-            );
-            tsp = f[3];
-        }
-    }
-    tsp
-}
-
 /// The family-H relation's source wires, gathered from the tape: per RS
 /// statement the 128 shifted-value wires, the 128 multipoint values, the
 /// 7 reduced-dot words, and the batching gamma — every one an already
@@ -710,8 +543,8 @@ pub(super) fn baked_inner_t_vals(zskip: &ZskipTapeRec) -> Vec<F128> {
 // label maps (`child_walker::parse_label_map` and `RealTape::new`),
 // identical on both walkers: [zerocheck / AG skip | lincheck | element zc
 // | element lc | product GKR | merged open | ring switch | multipoint |
-// frobenius assist], with the opening-basis and inner packed-direct
-// labels inside the open phase (`tape::parse_open_levels`).
+// frobenius assist], with the affine opening's label inside the open
+// phase (`tape::parse_affine_open`).
 pub(super) const LBL_ZEROCHECK: &[u8] = b"flock-zerocheck-v0";
 pub(super) const LBL_AG_SKIP: &[u8] = b"flock-ag-skip-v1";
 pub(super) const LBL_AG_R1_POINT: &[u8] = b"flock-ag-skip-r1-point";
@@ -726,8 +559,8 @@ pub(super) const LBL_MERGED_OPEN: &[u8] = b"flock-merged-open-v1";
 pub(super) const LBL_RING_SWITCH: &[u8] = b"flock-ring-switch-v0";
 pub(super) const LBL_MULTIPOINT: &[u8] = b"flock-multipoint-twisted-v1";
 pub(super) const LBL_FROBENIUS: &[u8] = b"flock-frobenius-assist-v0";
-pub(super) const LBL_OPEN_BASIS: &[u8] = b"flock-ligerito-basis-f256-split-v0";
-pub(super) const LBL_INNER_PD: &[u8] = b"flock-pcs-packed-direct-v0";
+/// The affine F128 inner opening's domain label.
+pub(super) const LBL_AFFINE_OPEN: &[u8] = flock_core::pcs::ligerito::affine::LABEL;
 
 /// The boolean zerocheck's absorbed `z_partial` slice, in words. The
 /// checker's matrix block and the assertion publics count by it — BOTH
@@ -830,7 +663,7 @@ pub(super) fn emit_family_h_boundary(
     mp: &MpRec,
     gammas: &[PdRec],
     w_rounds: &[RoundRec],
-    inner_pd: &InnerPd,
+    q_v: usize,
     pfslot: SlotId,
     pf_w: usize,
     vals: &mut Vec<F128>,
@@ -874,7 +707,7 @@ pub(super) fn emit_family_h_boundary(
         vgrp_w = sb.gate(cs.macs, &[vgrp_w, ow, wv(vi)])[0];
     }
     let v_w = sb.gate(cs.macs, &[vrs_w, ow, vgrp_w])[0];
-    let rhs_v_w = sb.gate(cs.macs, &[zw, wv(inner_pd.q_v), v_w])[0];
+    let rhs_v_w = sb.gate(cs.macs, &[zw, wv(q_v), v_w])[0];
     sb.connect(runw, rhs_v_w);
     (tgt_w, runw)
 }
@@ -918,7 +751,7 @@ pub(super) fn zskip_wires(
     }
 }
 
-/// The residual region's prefix-slot product: every chunked (1 + a + b)
+/// The shared prefix-slot product: every chunked (1 + a + b)
 /// product rides the width-`pf_w` prefix gate, seeded by `ow`. BOTH
 /// walkers must chunk and pad identically.
 pub(super) fn prefix_product(

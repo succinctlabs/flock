@@ -14,6 +14,7 @@ use {
         tower::{
             ChildSlots, ChildTape, SLOT_WORDS, ShapeBuilder, Wire, check_child_region,
             child_walker::child_pow_rows_hold, emit_child_region, expected_child_tail_schedule,
+            test_config,
         },
     },
     std::{any::Any, time::Instant},
@@ -37,8 +38,8 @@ use crate::{
         reference::Signature,
     },
     tower::{
-        F128, FlApp, FlFamily, HashKind, LeafOuter, MixedInner, MixedProof, Online, TowerConfig,
-        build_first_level_core,
+        F128, FlApp, FlFamily, HashKind, LeafOuter, MixedInner, MixedProof, Online, SelfCheck,
+        ShapeSlot, TowerConfig, build_first_level_core,
     },
 };
 
@@ -51,7 +52,8 @@ pub(super) const XMSS_DOMAIN: &[u8] = FIAT_SHAMIR_DOMAIN;
 /// shape, and every slot adds claims the parent publishes, so the tower
 /// pins it rather than taking [`crate::leanxmss::circuit::plan_nu`]'s
 /// standalone choice: 992 signatures at `2^14`-row slots overshoot the
-/// envelope's publics (5065 > 4266).
+/// envelope's public body (4629 > 3382 words; 3301 at `2^15`, measured
+/// 2026-11-10 under the affine inner).
 #[cfg(test)]
 pub(crate) const XMSS_LEAF_NU: usize = 15;
 
@@ -62,8 +64,11 @@ pub struct XmssLeaf {
 }
 
 /// Prove `statements` (with their signatures) under `circuit`, which must
-/// be in the recursion posture, and deferred-verify the proof.
+/// be in the recursion posture, at the tower's leaf profile
+/// ([`TowerConfig::leaf_profile`], the affine F128 inner), and
+/// deferred-verify the proof.
 pub fn build_xmss_leaf(
+    cfg: TowerConfig,
     circuit: &XmssCircuit,
     statements: &[Statement],
     sigs: &[Signature],
@@ -74,13 +79,13 @@ pub fn build_xmss_leaf(
         "a tower leaf proves under the chained transcript with a hashed statement"
     );
     let witness = circuit.witness(statements, sigs);
-    let proof = circuit.prove(&witness);
+    let proof = circuit.prove_with_profile(&witness, cfg.leaf_profile());
     let built = BuiltCircuit {
         shape: circuit.shape().clone(),
         witness,
     };
     let union = circuit.union();
-    let pcs = XmssCircuit::pcs_params(&union);
+    let pcs = XmssCircuit::pcs_params_for(&union, cfg.leaf_profile());
     let lcs = circuit.lincheck_circuits();
     let mut ch = circuit.challenger();
     #[cfg(target_arch = "aarch64")]
@@ -190,7 +195,15 @@ pub fn build_xmss_first_level_node(
     assert_eq!(leaves[1].n, per_leaf, "one batch size per first-level node");
     let inners = [&leaves[0].inner, &leaves[1].inner];
     let app = FlApp::Batches { per_leaf };
-    let core = build_first_level_core(cfg, FL_DOMAIN, &inners, &xmss_family(circuit), &app);
+    let core = build_first_level_core(
+        cfg,
+        SelfCheck::Full,
+        &ShapeSlot::default(),
+        FL_DOMAIN,
+        &inners,
+        &xmss_family(circuit),
+        &app,
+    );
     XmssFlNode {
         lo: core.lo,
         acc: core.acc,
@@ -230,7 +243,7 @@ fn xmss_child_region_emits_alone() {
     let circuit = XmssCircuit::with_options(n, Some(6), XmssOptions::RECURSION_LEAF);
     let (statements, sigs) = signed(n, 17);
     let t = Instant::now();
-    let leaf = build_xmss_leaf(&circuit, &statements, &sigs);
+    let leaf = build_xmss_leaf(test_config(), &circuit, &statements, &sigs);
     eprintln!("leaf n={n} nu={} built in {:?}", circuit.nu(), t.elapsed());
     let lcs = circuit.lincheck_circuits();
     let ct = ChildTape::new(&leaf.inner, XMSS_DOMAIN, &lcs);
@@ -283,7 +296,7 @@ fn xmss_child_region_rejects_a_tampered_report() {
     let n = 4;
     let circuit = XmssCircuit::with_options(n, Some(6), XmssOptions::RECURSION_LEAF);
     let (statements, sigs) = signed(n, 17);
-    let leaf = build_xmss_leaf(&circuit, &statements, &sigs);
+    let leaf = build_xmss_leaf(test_config(), &circuit, &statements, &sigs);
     let lcs = circuit.lincheck_circuits();
     let mut ct = ChildTape::new(&leaf.inner, XMSS_DOMAIN, &lcs);
     let runs = |ct: &ChildTape<'_>| -> bool {
@@ -390,7 +403,7 @@ fn xmss_child_region_census() {
     let (statements, sigs) = cached_signatures(n).unwrap_or_else(|| keyless_batch(n, 1));
     let circuit = XmssCircuit::with_options(n, None, XmssOptions::RECURSION_LEAF);
     let t = Instant::now();
-    let leaf = build_xmss_leaf(&circuit, &statements, &sigs);
+    let leaf = build_xmss_leaf(test_config(), &circuit, &statements, &sigs);
     println!(
         "leanXMSS leaf n={n} nu={} in {:?}",
         circuit.nu(),
@@ -446,12 +459,13 @@ fn xmss_first_level_node_over_two_leaves() {
         .unwrap_or(4);
     // A tall slot keeps a small batch to a few slots per gate kind, the
     // shape a production leaf has (2^6-row slots would spread 4 signatures
-    // over twice the gather claims of a 1000-signature leaf); 2^9 still
-    // fills the step kind's first slot, so words drop.
+    // over twice the gather claims of a 1000-signature leaf); 2^8 still
+    // fills the big kinds' slots, so words drop, and keeps the leaf at m24,
+    // the smallest shape with a certified affine ladder (2^9 is m25).
     let nu = std::env::var("XMSS_NU")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(if n < 64 { 9 } else { XMSS_LEAF_NU });
+        .unwrap_or(if n < 64 { 8 } else { XMSS_LEAF_NU });
     let circuit = XmssCircuit::with_options(n, Some(nu), XmssOptions::RECURSION_LEAF);
     // A production-size batch reads the bench's signed-batch cache (seeds
     // 101 and 102), signing once if it is missing.
@@ -464,8 +478,8 @@ fn xmss_first_level_node_over_two_leaves() {
     };
     let (s0, g0) = batch(17);
     let (s1, g1) = batch(18);
-    let leaf0 = build_xmss_leaf(&circuit, &s0, &g0);
-    let leaf1 = build_xmss_leaf(&circuit, &s1, &g1);
+    let leaf0 = build_xmss_leaf(test_config(), &circuit, &s0, &g0);
+    let leaf1 = build_xmss_leaf(test_config(), &circuit, &s1, &g1);
     let t = Instant::now();
     let fl = build_xmss_first_level_node(test_config(), &circuit, [&leaf0, &leaf1]);
     println!(
@@ -509,11 +523,11 @@ fn xmss_internal_node_over_two_first_level_nodes() {
     };
     let cfg = test_config();
     let n = 4;
-    let circuit = XmssCircuit::with_options(n, Some(9), XmssOptions::RECURSION_LEAF);
+    let circuit = XmssCircuit::with_options(n, Some(8), XmssOptions::RECURSION_LEAF);
     let leaves: Vec<XmssLeaf> = (0..4u64)
         .map(|i| {
             let (st, sg) = signed(n, 17 + i);
-            build_xmss_leaf(&circuit, &st, &sg)
+            build_xmss_leaf(test_config(), &circuit, &st, &sg)
         })
         .collect();
     let fl0 = build_xmss_first_level_node(cfg, &circuit, [&leaves[0], &leaves[1]]);
@@ -599,7 +613,7 @@ fn xmss_dropped_words_tape_probe() {
     // drops its words under the full-height commit.
     let circuit = XmssCircuit::with_options(n, Some(8), options);
     let (statements, sigs) = signed(n, 17);
-    let leaf = build_xmss_leaf(&circuit, &statements, &sigs);
+    let leaf = build_xmss_leaf(test_config(), &circuit, &statements, &sigs);
     let union = leaf.inner.union();
     let dropping = (0..union.registry().num_boolean())
         .filter(|&t| !union.zeroed_word_cols(t).is_empty())
@@ -638,7 +652,7 @@ fn xmss_dropped_words_tape_probe() {
 #[ignore]
 fn xmss_masked_columns_census() {
     use flock_core::matrix_fold::JaggedRowWeight;
-    for (n, nu) in [(4usize, 8usize), (4, 10), (992, XMSS_LEAF_NU)] {
+    for (n, nu) in [(4usize, 6usize), (4, 8), (992, XMSS_LEAF_NU)] {
         let options = XmssOptions {
             zero_linear_words: true,
             ..XmssOptions::RECURSION_LEAF
@@ -649,7 +663,7 @@ fn xmss_masked_columns_census() {
         } else {
             crate::leanxmss::circuit::keyless_batch(n, 5)
         };
-        let leaf = build_xmss_leaf(&circuit, &st, &sg);
+        let leaf = build_xmss_leaf(test_config(), &circuit, &st, &sg);
         let union = leaf.inner.union();
         let dropping = (0..union.registry().num_boolean())
             .filter(|&t| !union.zeroed_word_cols(t).is_empty())

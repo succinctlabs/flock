@@ -821,7 +821,7 @@ pub(super) fn read_acc_entry(
 /// - the NONCE RANGE — the published nonce word (wire-connected to the
 ///   absorbed stream word) must be a native nonce: high half zero, low
 ///   half inside the schedule's scan budget. The in-circuit PowMask row
-///   pins only the word's high 64 bits (and Chain100 emits no row), so
+///   pins only the word's high 64 bits (and a profile without the r1 grind emits no row), so
 ///   without this item the circuit would accept nonce words no native
 ///   verifier accepts;
 /// - `lows == bf(point)` — the base functional at the published point.

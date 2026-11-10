@@ -819,12 +819,21 @@ impl XmssCircuit {
     }
 
     pub(crate) fn pcs_params(union: &UnionInstance<'_>) -> PcsParams {
-        let log_batch_size = embedded_initial_k_or_default(union.dense_m(), LigeritoProfile::Fast);
+        Self::pcs_params_for(union, LigeritoProfile::Fast)
+    }
+
+    /// [`Self::pcs_params`] under `profile`, which must be a rate-1/2 one
+    /// (`Fast` or `FastAffine`). The recursion tower's leaf proves under
+    /// `FastAffine` (`TowerConfig::leaf_profile`), whose affine inner
+    /// opening exists only at registered shapes.
+    pub(crate) fn pcs_params_for(union: &UnionInstance<'_>, profile: LigeritoProfile) -> PcsParams {
+        assert_eq!(profile.log_inv_rate(), 1, "leanXMSS proves at rate 1/2");
+        let log_batch_size = embedded_initial_k_or_default(union.dense_m(), profile);
         PcsParams {
             m: union.dense_m(),
             log_inv_rate: 1,
             log_batch_size,
-            profile: LigeritoProfile::Fast,
+            profile,
             num_lanes: union.commit_lanes(log_batch_size),
             merkle_hash: HashKind::Blake3,
         }
@@ -871,8 +880,18 @@ impl XmssCircuit {
     }
 
     pub fn prove(&self, witness: &CircuitWitness) -> XmssProof {
+        self.prove_with_profile(witness, LigeritoProfile::Fast)
+    }
+
+    /// [`Self::prove`] under the PCS profile `profile` (see
+    /// [`Self::pcs_params_for`]).
+    pub(crate) fn prove_with_profile(
+        &self,
+        witness: &CircuitWitness,
+        profile: LigeritoProfile,
+    ) -> XmssProof {
         let union = self.union();
-        let pcs = Self::pcs_params(&union);
+        let pcs = Self::pcs_params_for(&union, profile);
         let mut challenger = self.challenger();
         let (proof, commitment, _claims) = prove_circuit(
             &union,

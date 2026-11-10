@@ -42,8 +42,8 @@ use flock_hash::HashKind;
 use sha2::{Digest, Sha256};
 
 use crate::challenger::{
-    Challenger, KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE,
-    OP_SQUEEZE,
+    Challenger, KIND_NONE, KIND_RUN, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL,
+    OP_OBSERVE, OP_SQUEEZE,
 };
 
 /// One protocol-level transcript action, with values stripped.
@@ -519,15 +519,50 @@ impl TranscriptShape {
         let mut out = Vec::new();
         let mut finalize_after: Vec<usize> = Vec::new();
         let mut forks: Vec<ForkStream> = Vec::new();
+        // The duplex SCALAR RUN (transcript-v4, mirroring `FsChallenger`):
+        // consecutive `ObserveScalar` values, each with the fork whose merge
+        // digest it carries (if any), absorbed as ONE record when any other
+        // op — or the end — closes the run. `Forked`/`Merge` are transparent:
+        // the live challenger never sees them.
+        let mut run: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut digest_for: Option<usize> = None;
+        let flush = |run: &mut Vec<(usize, Option<usize>)>,
+                     out: &mut Vec<StreamWord>,
+                     forks: &mut Vec<ForkStream>| {
+            if run.is_empty() {
+                return;
+            }
+            out.push(header(OP_OBSERVE, KIND_RUN, run.len() as u64));
+            for (v, fork) in run.drain(..) {
+                if let Some(f) = fork {
+                    forks[f].parent_digest_word = out.len();
+                }
+                out.push(StreamWord::Value(v));
+            }
+        };
         // The domain is absorbed at construction, before recording starts.
         out.push(header(OP_DOMAIN, KIND_NONE, domain.len() as u64));
         padded(domain, &mut out);
 
         for op in ops {
+            let continues_run = duplex
+                && matches!(
+                    op,
+                    TranscriptOp::ObserveScalar
+                        | TranscriptOp::Forked { .. }
+                        | TranscriptOp::Merge { .. }
+                );
+            if !continues_run {
+                flush(&mut run, &mut out, &mut forks);
+            }
             match op {
                 TranscriptOp::Label(l) => {
                     out.push(header(OP_LABEL, KIND_NONE, l.len() as u64));
                     padded(l, &mut out);
+                }
+                TranscriptOp::ObserveScalar if duplex => {
+                    run.push((*values, digest_for.take()));
+                    *values += 1;
                 }
                 TranscriptOp::ObserveScalar => {
                     out.push(header(OP_OBSERVE, KIND_SCALAR, 1));
@@ -575,6 +610,8 @@ impl TranscriptShape {
                     let stream = Self::walk(child, label, duplex, values, payloads);
                     // The child's first ObserveScalar value word: after its
                     // domain header + padded label, plus the observe header.
+                    // (The seed pair opens the child's first scalar run, so the
+                    // header-first offset is the same under both framings.)
                     let child_seed_word = 1 + label.len().div_ceil(16) + 1;
                     assert!(
                         matches!(
@@ -596,6 +633,7 @@ impl TranscriptShape {
                         digest_squeeze,
                         // Filled by the matching `Merge` below.
                         parent_digest_word: usize::MAX,
+                        half_stride: if duplex { 1 } else { 2 },
                     });
                 }
                 // No words of its own: it marks that the next two
@@ -604,9 +642,14 @@ impl TranscriptShape {
                     let f = forks
                         .get_mut(*fork)
                         .expect("Merge names a fork that was not recorded");
-                    // The next op is an ObserveScalar: header at `out.len()`,
-                    // its value word immediately after.
-                    f.parent_digest_word = out.len() + 1;
+                    if duplex {
+                        // Placed when the run holding the digest flushes.
+                        digest_for = Some(*fork);
+                    } else {
+                        // The next op is an ObserveScalar: header at
+                        // `out.len()`, its value word immediately after.
+                        f.parent_digest_word = out.len() + 1;
+                    }
                 }
                 TranscriptOp::Pow { .. } => {
                     if duplex {
@@ -641,6 +684,7 @@ impl TranscriptShape {
                 }
             }
         }
+        flush(&mut run, &mut out, &mut forks);
         debug_assert!(
             forks.iter().all(|f| f.parent_digest_word != usize::MAX),
             "every fork must be merged"
@@ -684,14 +728,31 @@ pub struct ForkStream {
     /// Index into the PARENT's `finalize_after` of the seed squeeze: its two
     /// output halves are the child's first two absorbed words.
     pub seed_squeeze: usize,
-    /// Word index in the CHILD stream of the first seed word (the second is
-    /// the next `Value` word after it).
+    /// Word index in the CHILD stream of the first seed word; see
+    /// [`Self::seed_word`] for both halves.
     pub child_seed_word: usize,
     /// Index into the CHILD's `finalize_after` of the closing digest squeeze:
     /// its two output halves are what the parent absorbs at merge.
     pub digest_squeeze: usize,
-    /// Word index in the PARENT stream of the first merge-digest word.
+    /// Word index in the PARENT stream of the first merge-digest word; see
+    /// [`Self::digest_word`] for both halves.
     pub parent_digest_word: usize,
+    /// Words from one seed/digest half to the next: 1 under the duplex
+    /// scalar-run framing (the pair shares one run header), 2 under v2
+    /// (each scalar carries its own header).
+    pub half_stride: usize,
+}
+
+impl ForkStream {
+    /// CHILD-stream word index of seed half `half` (0 or 1).
+    pub fn seed_word(&self, half: usize) -> usize {
+        self.child_seed_word + self.half_stride * half
+    }
+
+    /// PARENT-stream word index of merge-digest half `half` (0 or 1).
+    pub fn digest_word(&self, half: usize) -> usize {
+        self.parent_digest_word + self.half_stride * half
+    }
 }
 
 /// A [`Challenger`] decorator that records the transcript's shape while
@@ -969,7 +1030,7 @@ mod tests {
     use flock_hash::{BLAKE3_IV, blake3_compress};
 
     use crate::{
-        challenger::FsChallenger,
+        challenger::{FsChallenger, KIND_RUN, OP_OBSERVE},
         transcript_record::{
             Challenger, F128, HashKind, RecordingChallenger, StreamWord, TranscriptOp,
             TranscriptShape,
@@ -1271,6 +1332,16 @@ mod tests {
         push16(&c2, &mut expected);
         let c3 = rec.sample_f128(); // back-to-back: empty-pending squeeze
         push16(&[c3], &mut expected);
+        // transcript-v4: a scalar RUN (three observes, one header), closed
+        // by a label, then a second run closed by the squeeze.
+        rec.observe_f128(vals[1]);
+        rec.observe_f128(vals[2]);
+        rec.observe_f128(vals[3]);
+        rec.observe_label(b"phase-two");
+        rec.observe_f128(vals[0]);
+        rec.observe_f128(vals[1]);
+        let c4 = rec.sample_f128();
+        push16(&[c4], &mut expected);
 
         let shape = rec.shape();
         let stream = shape.stream_words_duplex(domain);
@@ -1324,6 +1395,46 @@ mod tests {
             assert_eq!(got, expected[k], "squeeze {k}");
         }
         assert_eq!(at * 16, bytes.len(), "every stream word consumed");
+        // The runs cost one header each: 3 + 1 and 2 + 1 words.
+        let runs: Vec<usize> = stream
+            .words
+            .iter()
+            .filter_map(|w| match w {
+                StreamWord::Const(h) if h.lo == (OP_OBSERVE as u64 | ((KIND_RUN as u64) << 8)) => {
+                    Some(h.hi as usize)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            [1, 3, 2],
+            "one header per scalar run, carrying its length"
+        );
+    }
+
+    /// A scalar run is its own record kind: the same values observed as a
+    /// slice, or as two runs split by a squeeze, give different challenges.
+    #[test]
+    fn scalar_runs_are_domain_separated() {
+        let (a, b) = (F128::new(7, 8), F128::new(9, 10));
+        let run = |f: &dyn Fn(&mut FsChallenger)| {
+            let mut c = FsChallenger::with_chained_blake3(b"runs");
+            f(&mut c);
+            c.sample_f128()
+        };
+        let as_run = run(&|c| {
+            c.observe_f128(a);
+            c.observe_f128(b);
+        });
+        let as_slice = run(&|c| c.observe_f128_slice(&[a, b]));
+        let split = run(&|c| {
+            c.observe_f128(a);
+            let _ = c.sample_f128();
+            c.observe_f128(b);
+        });
+        assert_ne!(as_run, as_slice);
+        assert_ne!(as_run, split);
     }
 
     #[test]

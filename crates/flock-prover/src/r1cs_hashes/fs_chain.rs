@@ -44,6 +44,9 @@ pub struct ChildChain {
     pub digest_squeeze: usize,
     /// Word index in the PARENT stream of the first merge-digest word.
     pub parent_digest_word: usize,
+    /// Words between the two seed (and the two digest) halves — see
+    /// `ForkStream::half_stride`.
+    pub half_stride: usize,
 }
 
 impl ChildChain {
@@ -165,6 +168,7 @@ pub fn trace_duplex_forked(
                 child_seed_word: f.child_seed_word,
                 digest_squeeze: f.digest_squeeze,
                 parent_digest_word: f.parent_digest_word,
+                half_stride: f.half_stride,
             }
         })
         .collect();

@@ -474,7 +474,7 @@ fn element_claims_are_bound_by_the_opening() {
 
     // The inner eq-basis opening of q̂(ρ).
     let mut bad = proof.clone();
-    bad.pcs_open.inner.ligerito.initial_cap = vec![[0u8; 32]];
+    bad.pcs_open.inner.split_mut().ligerito.initial_cap = vec![[0u8; 32]];
     assert!(verify(&bad).is_err(), "tampered inner open root");
 }
 
@@ -1185,6 +1185,9 @@ fn boolean_only_mixed_class_matches_the_plain_entry() {
 // change with `ELEMENT_FIXTURES_PRINT=1 ... --nocapture`.
 // ---------------------------------------------------------------------------
 
+// Re-pinned 2026-11-03: proof-IO v24 — the merged open's inner opening is
+// an enum (`MergedInnerOpen`), adding a variant tag to the payload;
+// transcripts unchanged. Two deterministic print runs agreed.
 // Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
 // per-statement assist became 128K dual values + one product sumcheck +
 // one untwisted anchor; transcript + wire moved by design.
@@ -1306,45 +1309,49 @@ fn bundle_digest_merged(
 // +1/level recursion ladder (rates 1/2/3/4/5, keeping its 16-bit query
 // PoW). All seven fixtures moved (level rates, query counts and
 // caps). Two deterministic print runs agreed.
+// Re-pinned 2026-11-10: #76 merged onto main, proof-IO VERSION 25 -> 26 —
+// the merged open's inner opening is an enum (`MergedInnerOpen`), a
+// variant tag on every merged payload. All seven fixtures moved. Two
+// deterministic print runs agreed.
 #[test]
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "7c65c5c50df4681275d1104dc0c35a3491fb25609408026c58763319c31bc6db",
+            "61b31a7a9a612ee2adf6a115d683432c8e31a82ecc7afc7ec447fc1b15e7958c",
         ),
         (
             "elem-merged-nu12-2731",
             2731,
-            "66e7613dad6ff08b0bd4bda8cdae42d34841ecaa2fc961ac6dca240d5c160431",
+            "82b817eaf9383d6e2e3653879296c028cb92d7c1ccf7df53b4d2de5f127941af",
         ),
         (
             "elem-merged-nu12-0",
             0,
-            "9dca3abda0e33206b28d636147cddd0dd03ed4f5bee124511aa3a7b5bf9c7952",
+            "cb5baa4ef681d0c83dc3a0e0f8ac77ee659fec1802e6cf08e63e72e42cf64d8d",
         ),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "8aade9e5c3b2a6731dcab2dde43063b648a17465ac9b6a2b1e0b2d852d195767",
+            "920d64c9b2500d9c3a42b2573d415b3d91cc0e616151c2b1768a66df4cfb7ae6",
         ),
         (
             "mix-merged-nu7-100-90",
             [100, 90],
-            "a4e1f5e643828a377c949ed256784667de78236a7d0925a46e76b25d3a483ec8",
+            "570cfc36e09b826ccad6563fc456faf748c53c19a57924363d9228686e0fcb2e",
         ),
         (
             "mix-merged-nu7-0-90",
             [0, 90],
-            "3d5923643f364fffe0b089c0c092981a7888b92a53b3a82bbe927c7add7b7377",
+            "b306a40c299ad311191724257b920b1b42ac6fc20fa466a0d09a54fcf4d16af8",
         ),
         (
             "mix-merged-nu7-100-0",
             [100, 0],
-            "d41b43c4bb63facde33e941425f0620390b759dd602b0ae258fc782c2b249cdb",
+            "0ae96ef966be0bac5deccefa6350639dac3860029fb7df7ed4237bd1d1ea0ae0",
         ),
     ];
 

@@ -71,17 +71,47 @@ fn digest_bit(d: &[u32; SLOT_WORDS], j: usize) -> bool {
 /// The 128 bools at `[base, base+128)` as one `F128`.
 #[inline]
 fn pack_word(bits: &[bool], base: usize) -> F128 {
-    let mut lo = 0u64;
-    let mut hi = 0u64;
-    for t in 0..64 {
-        if bits[base + t] {
-            lo |= 1u64 << t;
+    let half = |at: usize| {
+        let mut out = 0u64;
+        for (byte, chunk) in bits[at..at + 64].as_chunks::<8>().0.iter().enumerate() {
+            // Eight 0/1 bytes -> one byte, lane t to bit t: the multiplier
+            // routes byte t's low bit to bit 56 + t with no carries between
+            // the partial products (their bit positions are all distinct).
+            let x = u64::from_le_bytes(chunk.map(u8::from));
+            out |= (x.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * byte);
         }
-        if bits[base + 64 + t] {
-            hi |= 1u64 << t;
-        }
+        out
+    };
+    F128 {
+        lo: half(base),
+        hi: half(base + 64),
     }
-    F128 { lo, hi }
+}
+
+/// Write each live row's packed words at its BatchMajor addresses, one
+/// chunk-column (`2^nu` contiguous words) per task: column `w` of row `i` is
+/// word `(w << nu) + i`, so the columns are disjoint slices.
+fn pack_columns(
+    per_row: &[[Vec<bool>; 3]],
+    words_per_block: usize,
+    nu: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+) {
+    let col = 1usize << nu;
+    z.par_chunks_mut(col)
+        .zip(a.par_chunks_mut(col))
+        .zip(b.par_chunks_mut(col))
+        .take(words_per_block)
+        .enumerate()
+        .for_each(|(w, ((zc, ac), bc))| {
+            for (i, [pz, pa, pb]) in per_row.iter().enumerate() {
+                zc[i] = pack_word(pz, w * 128);
+                ac[i] = pack_word(pa, w * 128);
+                bc[i] = pack_word(pb, w * 128);
+            }
+        });
 }
 
 /// Scatter per-row `(z, a, b)` bool vectors into the union's BatchMajor
@@ -105,14 +135,7 @@ fn scatter_zab(
     let mut z = vec![F128::ZERO; total];
     let mut a = vec![F128::ZERO; total];
     let mut b = vec![F128::ZERO; total];
-    for (i, [pz, pa, pb]) in per_row.iter().enumerate() {
-        for w in 0..words_per_block {
-            let addr = (w << nu) + i;
-            z[addr] = pack_word(pz, w * 128);
-            a[addr] = pack_word(pa, w * 128);
-            b[addr] = pack_word(pb, w * 128);
-        }
-    }
+    pack_columns(per_row, words_per_block, nu, &mut z, &mut a, &mut b);
 
     let mut stripe = vec![0u8; (n_total / 8) * k];
     stripe.par_chunks_mut(k).enumerate().for_each(|(g, chunk)| {
@@ -1269,6 +1292,34 @@ impl PowMaskTable {
             r.put(448, 63, 0, (i.pred >> 64) as u64, nonce_hi);
             r.put(self.const_pos(), 1, 1, 1, 1);
         })
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::{F128, pack_word};
+
+    #[test]
+    fn pack_word_matches_the_bit_loop() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..64 {
+            let bits: Vec<bool> = (0..256)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state & 1 == 1
+                })
+                .collect();
+            for base in [0, 64, 128] {
+                let (mut lo, mut hi) = (0u64, 0u64);
+                for t in 0..64 {
+                    lo |= u64::from(bits[base + t]) << t;
+                    hi |= u64::from(bits[base + 64 + t]) << t;
+                }
+                assert_eq!(pack_word(&bits, base), F128 { lo, hi });
+            }
+        }
     }
 }
 

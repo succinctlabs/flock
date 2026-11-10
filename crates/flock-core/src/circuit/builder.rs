@@ -541,6 +541,11 @@ impl ShapeBuilder {
         self.slots[s.0].n_in()
     }
 
+    /// A declared slot's output arity.
+    pub fn slot_outputs(&self, s: SlotId) -> usize {
+        self.slots[s.0].n_out()
+    }
+
     /// A free value entering the circuit. It gets no producing cell, so it
     /// must be constrained by something — published, or consumed by a gate
     /// whose relation pins it.
