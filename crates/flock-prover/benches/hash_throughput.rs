@@ -19,6 +19,7 @@ use flock_prover::{
     init_perf_thread_pool,
     r1cs_hashes::{
         blake3::{Blake3Setup, Compression},
+        minishake::{MiniShakeSetup, minishake128_block},
         sha2::Sha256HybridSetup,
     },
 };
@@ -154,6 +155,56 @@ fn bench_blake3(batch: usize, runs: usize) {
     report("blake3", batch, best);
 }
 
+/// MiniSHAKE128 on a 64-byte message: one Keccak-p[800, 12] call per hash.
+fn bench_minishake(batch: usize, runs: usize) {
+    eprintln!("  MiniSHAKE128, batch {batch}");
+    let setup = MiniShakeSetup::new(batch);
+    let input_sets: Vec<Vec<_>> = (0..=runs)
+        .map(|run| {
+            let mut rng = Rng::new(0x5A4E_0800 ^ batch as u64 ^ run as u64);
+            (0..batch)
+                .map(|_| minishake128_block(&from_fn(|_| rng.next_u32() as u8), 0x01))
+                .collect()
+        })
+        .collect();
+
+    #[cfg(target_arch = "aarch64")]
+    let best = {
+        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+        let (proof, commitment, _) = setup.prove_fast_union_ag(&input_sets[0], &mut challenger);
+        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+        setup
+            .verify_union_ag(&commitment, &proof, &mut challenger)
+            .expect("MiniSHAKE warm-up proof failed verification");
+        black_box(proof);
+        best_of(&input_sets, runs, |inputs| {
+            let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+            setup.prove_fast_union_ag(inputs, &mut challenger)
+        })
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let best = {
+        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+        let (proof, commitment, _) = setup.prove_fast(&input_sets[0], &mut challenger);
+        let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+        setup
+            .verify(&commitment, &proof, &mut challenger)
+            .expect("MiniSHAKE warm-up proof failed verification");
+        black_box(proof);
+        best_of(&input_sets, runs, |inputs| {
+            let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
+            setup.prove_fast(inputs, &mut challenger)
+        })
+    };
+    report("minishake128", batch, best);
+}
+
+/// `HASH_BENCH_HASHES` (space/comma list of sha2, blake3, minishake128;
+/// default all) picks which hashes run.
+fn enabled(hash: &str) -> bool {
+    var("HASH_BENCH_HASHES").map_or(true, |v| v.split([',', ' ']).any(|h| h == hash))
+}
+
 fn parse_log2_batches() -> Vec<u32> {
     let value = var("HASH_BENCH_LOG2S").unwrap_or_else(|_| "10 12 14 16 18".to_owned());
     let batches: Vec<u32> = value
@@ -219,9 +270,14 @@ fn main() {
     );
 
     for &log2 in &batches {
-        bench_sha2(1usize << log2, runs);
-    }
-    for &log2 in &batches {
-        bench_blake3(1usize << log2, runs);
+        if enabled("sha2") {
+            bench_sha2(1usize << log2, runs);
+        }
+        if enabled("blake3") {
+            bench_blake3(1usize << log2, runs);
+        }
+        if enabled("minishake128") {
+            bench_minishake(1usize << log2, runs);
+        }
     }
 }

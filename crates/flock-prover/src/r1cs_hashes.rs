@@ -56,6 +56,8 @@ pub mod merkle_glue;
 /// `ChunkPathInput`, `SLOT_WORDS`) that the tower's Merkle gates and
 /// [`merkle_glue`] build on.
 pub mod merkle_r1cs;
+/// MiniSHAKE (Keccak-p[800, 12]) walker encoder — benchmark branch.
+pub mod minishake;
 pub mod sha2;
 pub mod sha2_dsl;
 
