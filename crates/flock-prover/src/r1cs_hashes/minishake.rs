@@ -1,45 +1,44 @@
-//! **MiniSHAKE** (Keccak-p[800, 12]) per-permutation R1CS encoder — a
-//! benchmark port of the retired Keccak-f[1600] walker encoder (removed in
+//! **MiniSHAKE128** (Keccak-p[800, 12]) R1CS encoder for one-block hashes —
+//! a benchmark port of the retired Keccak-f[1600] walker encoder (removed in
 //! 0f0d632) to the 800-bit, 12-round permutation of ePrint 2026/2363.
 //!
 //! MiniSHAKE128 = sponge over Keccak-p[800, 12] with capacity 256, so the
 //! rate is 68 bytes: a 64-byte message (one 2-to-1 compression) plus its
-//! domain/padding bytes fits ONE permutation call. This module proves batches
-//! of that permutation; [`minishake128_block`] builds the absorbed state.
+//! domain/padding bytes fits ONE permutation call. One R1CS instance proves
+//! `digest = MiniSHAKE128(msg, D)[..32]` for a 64-byte `msg` and a fixed `D`.
 //!
 //! ## Encoding
 //!
-//! One R1CS instance per permutation, all 12 rounds folded inline. Only
-//! `state_0` (input), `state_12` (output) and the 12 χ AND-output vectors
-//! `t_0..t_11` are materialized. With `φ = π∘ρ∘θ` and ι folded into a
+//! All 12 rounds are folded inline. With `φ = π∘ρ∘θ` and ι folded into a
 //! constant, `state_{r+1} = φ(state_r) ⊕ t_r ⊕ RC_r`, so every `state_r` is a
-//! linear function of `(state_0, t_<r, 1)`. The substituted A/B rows are
-//! dense but never materialized: [`MiniShakeLincheckCircuit`] computes the
-//! lincheck column marginal by the backward transpose recurrence
-//! `K_r = φᵀ(K_{r+1}) ⊕ χ_r`.
+//! linear function of `(msg, t_<r, 1)`: the input's domain/padding lane and
+//! zero capacity are constants. Only the message, the digest and the χ
+//! AND-outputs are materialized; the last round keeps only the 8 `t` lanes
+//! the digest reads (χ is lane-local: `out = B ⊕ t ⊕ RC`). The substituted
+//! A/B rows are dense but never materialized: [`MiniShakeLincheckCircuit`]
+//! computes the lincheck column marginal by the backward transpose
+//! recurrence `K_r = φᵀ(K_{r+1}) ⊕ χ_r`.
 //!
 //! ## Witness layout per block (k = 2^14 = 16,384 bits)
 //!
 //! ```text
-//!   bit 0     .. 800    state_0   (aligned 1024-bit slot 0; 800..1024 zero)
-//!   bit 1024  .. 1824   state_12  (aligned 1024-bit slot 1; 1824..2048 zero)
-//!   bit 2048            constant 1
-//!   bit 2112  .. 11712  t_0 .. t_11 (800-bit stride, tight)
-//!   bit 11712 .. K      zero tail
+//!   bit 0     .. 512    msg       (state_0 lanes 0..16)
+//!   bit 512   .. 768    digest    (state_12 lanes 0..8)
+//!   bit 768             constant 1
+//!   bit 800   .. 9600   t_0 .. t_10 (800-bit stride)
+//!   bit 9600  .. 9856   t_11 lanes 0..8
+//!   bit 9856  .. K      zero tail
 //! ```
 //!
 //! A state vector is lane-major: bit `z` of lane `L = x + 5y` is at offset
-//! `32·L + z`, so a vector is the 25 lanes' `u32`s back to back.
+//! `32·L + z`, so a vector is its lanes' `u32`s back to back.
 //!
 //! ## Rows (C = I)
 //!
 //! - const row: `1·1 = 1`.
-//! - state_0 rows: `s·1 = s`.
+//! - message rows: `m·1 = m`.
 //! - t rows: `t_r[x,y,z] = ¬B_r[x+1,y,z] · B_r[x+2,y,z]`, `B_r = φ(state_r)`.
-//! - state_12 pin rows: `L_12(state_0, t_<12, 1)[j] · 1 = state_12[j]`.
-//!
-//! The table proves the permutation on an arbitrary `state_0`; it does not
-//! constrain the capacity or padding of the absorbed block.
+//! - digest pin rows: `L_12(msg, t_<12, 1)[j] · 1 = digest[j]`.
 
 use flock_core::{
     lincheck::LincheckCircuit,
@@ -266,33 +265,66 @@ pub fn minishake(c_bits: usize, msg: &[u8], d: u8, out_len: usize) -> Vec<u8> {
 }
 
 // ===========================================================================
-// Layout
+// Layout (hash mode: MiniSHAKE128 of a 64-byte message)
 // ===========================================================================
+
+/// Free input lanes: the 64-byte message. Lane 16 holds the domain and
+/// padding bytes (`D | 0x80 << 24`) and lanes 17..25 are the zero capacity —
+/// both constants, folded into the constant column by the walker.
+pub const MSG_LANES: usize = 16;
+pub const MSG_BITS: usize = MSG_LANES * LANE_BITS; // 512
+/// Digest lanes: the first 32 output bytes.
+pub const OUT_LANES: usize = 8;
+pub const OUT_BITS: usize = OUT_LANES * LANE_BITS; // 256
 
 pub const K_LOG: usize = 14;
 pub const K: usize = 1 << K_LOG;
-pub const SLOT_BITS: usize = 1024;
-pub const STATE0_BASE: usize = 0;
-pub const STATE_OUT_BASE: usize = SLOT_BITS;
-pub const Z_CONST: usize = 2 * SLOT_BITS; // 2048
-pub const T_BASE: usize = Z_CONST + 64; // 2112
-pub const USEFUL_BITS: usize = T_BASE + N_ROUNDS * STATE_BITS; // 11,712
+pub const MSG_BASE: usize = 0;
+pub const OUT_BASE: usize = MSG_BASE + MSG_BITS; // 512
+pub const Z_CONST: usize = OUT_BASE + OUT_BITS; // 768
+/// `t_r` vectors. Rounds `0..11` keep all 25 lanes; the last round keeps
+/// only the [`OUT_LANES`] lanes the digest reads (χ is lane-local there:
+/// `out = B ⊕ t ⊕ RC`).
+pub const T_BASE: usize = Z_CONST + LANE_BITS; // 800
+pub const USEFUL_BITS: usize = T_BASE + (N_ROUNDS - 1) * STATE_BITS + OUT_BITS; // 9,856
 const _: () = assert!(USEFUL_BITS <= K);
 
+/// Lanes of `t_r` that get AND rows.
 #[inline]
-pub fn z_pos_state0(s: usize) -> usize {
-    STATE0_BASE + s
+pub const fn t_lanes(r: usize) -> usize {
+    if r + 1 == N_ROUNDS {
+        OUT_LANES
+    } else {
+        N_LANES
+    }
 }
 #[inline]
-pub fn z_pos_state_out(s: usize) -> usize {
-    STATE_OUT_BASE + s
+pub fn z_pos_msg(s: usize) -> usize {
+    debug_assert!(s < MSG_BITS);
+    MSG_BASE + s
+}
+#[inline]
+pub fn z_pos_out(s: usize) -> usize {
+    debug_assert!(s < OUT_BITS);
+    OUT_BASE + s
 }
 #[inline]
 pub fn z_pos_t(r: usize, s: usize) -> usize {
+    debug_assert!(s < t_lanes(r) * LANE_BITS);
     T_BASE + r * STATE_BITS + s
 }
 
-/// Smallest `n_log` (≥ 3) holding `n` permutations.
+/// The constant input lanes (16..25) for domain byte `d`.
+#[inline]
+pub fn const_lane(l: usize, d: u8) -> u32 {
+    if l == MSG_LANES {
+        d as u32 | 0x8000_0000
+    } else {
+        0
+    }
+}
+
+/// Smallest `n_log` (≥ 3) holding `n` hashes.
 pub fn min_n_perms_log(n: usize) -> usize {
     assert!(n >= 1);
     n.max(8).next_power_of_two().trailing_zeros() as usize
@@ -302,6 +334,9 @@ pub fn min_n_perms_log(n: usize) -> usize {
 fn apply_phi_t(v: &[F128]) -> Vec<F128> {
     let mut out = vec![F128::ZERO; STATE_BITS];
     for (s_out, &val) in v.iter().enumerate() {
+        if val == F128::ZERO {
+            continue;
+        }
         let (lane, z) = (s_out / LANE_BITS, s_out % LANE_BITS);
         for s_in in theta_rho_pi_preimage(lane % 5, lane / 5, z) {
             out[s_in] += val;
@@ -338,25 +373,40 @@ pub fn build_block_r1cs(n_log: usize) -> BlockR1cs {
 // Witness generation (batch-major, V = 8 instances in lockstep)
 // ===========================================================================
 
+/// One hash input: the 64-byte message as 16 little-endian lanes.
+pub type Msg = [u32; MSG_LANES];
+
+/// Message bytes → lanes.
+pub fn msg_lanes(msg: &[u8; 64]) -> Msg {
+    std::array::from_fn(|i| u32::from_le_bytes(msg[4 * i..4 * i + 4].try_into().unwrap()))
+}
+
 type VLanes = [[u32; BM_V]; N_LANES];
 
-fn emit_vec(rows: &mut [BmRow], base: usize, v: &VLanes) {
+fn emit_lanes(rows: &mut [BmRow], base: usize, v: &[[u32; BM_V]]) {
     for (l, vals) in v.iter().enumerate() {
         or_u32_row(rows, base + LANE_BITS * l, vals);
     }
 }
 
-fn build_group(group: [&Lanes; BM_V], rz: &mut [BmRow], ra: &mut [BmRow], rb: &mut [BmRow]) {
-    let ones: VLanes = [[u32::MAX; BM_V]; N_LANES];
+fn build_group(d: u8, group: [&Msg; BM_V], rz: &mut [BmRow], ra: &mut [BmRow], rb: &mut [BmRow]) {
+    let ones = [[u32::MAX; BM_V]; MSG_LANES];
     for rows in [&mut *rz, &mut *ra, &mut *rb] {
         or_bit_row(rows, Z_CONST);
     }
-    let mut s: VLanes = std::array::from_fn(|i| std::array::from_fn(|j| group[j][i]));
-    emit_vec(rz, STATE0_BASE, &s);
-    emit_vec(ra, STATE0_BASE, &s);
-    emit_vec(rb, STATE0_BASE, &ones);
+    let mut s: VLanes = std::array::from_fn(|i| {
+        if i < MSG_LANES {
+            std::array::from_fn(|j| group[j][i])
+        } else {
+            [const_lane(i, d); BM_V]
+        }
+    });
+    emit_lanes(rz, MSG_BASE, &s[..MSG_LANES]);
+    emit_lanes(ra, MSG_BASE, &s[..MSG_LANES]);
+    emit_lanes(rb, MSG_BASE, &ones);
     for r in 0..N_ROUNDS {
         let (bs, t) = round_v(&mut s, r);
+        let n = t_lanes(r);
         let base = T_BASE + r * STATE_BITS;
         let not_b1: VLanes = std::array::from_fn(|i| {
             let (x, y) = (i % 5, i / 5);
@@ -366,30 +416,36 @@ fn build_group(group: [&Lanes; BM_V], rz: &mut [BmRow], ra: &mut [BmRow], rb: &m
             let (x, y) = (i % 5, i / 5);
             bs[(x + 2) % 5 + 5 * y]
         });
-        emit_vec(rz, base, &t);
-        emit_vec(ra, base, &not_b1);
-        emit_vec(rb, base, &b2);
+        emit_lanes(rz, base, &t[..n]);
+        emit_lanes(ra, base, &not_b1[..n]);
+        emit_lanes(rb, base, &b2[..n]);
     }
-    emit_vec(rz, STATE_OUT_BASE, &s);
-    emit_vec(ra, STATE_OUT_BASE, &s);
-    emit_vec(rb, STATE_OUT_BASE, &ones);
+    emit_lanes(rz, OUT_BASE, &s[..OUT_LANES]);
+    emit_lanes(ra, OUT_BASE, &s[..OUT_LANES]);
+    emit_lanes(rb, OUT_BASE, &ones[..OUT_LANES]);
 }
 
 /// `(z, a, b, stripe)` for `inputs` (dummy rows past `inputs.len()` zero).
 pub fn generate_witness_batch_major_partial(
-    inputs: &[Lanes],
+    inputs: &[Msg],
+    d: u8,
     n_log: usize,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-    drive_witness_batch_major_partial(inputs, n_log, K_LOG, USEFUL_BITS, build_group)
+    drive_witness_batch_major_partial(inputs, n_log, K_LOG, USEFUL_BITS, |g, z, a, b| {
+        build_group(d, g, z, a, b)
+    })
 }
 
 /// In-place counterpart of [`generate_witness_batch_major_partial`].
 pub fn generate_witness_batch_major_partial_into(
-    inputs: &[Lanes],
+    inputs: &[Msg],
+    d: u8,
     n_log: usize,
     dst: SlotWitnessDest<'_>,
 ) -> Vec<u8> {
-    drive_witness_batch_major_partial_into(inputs, n_log, K_LOG, USEFUL_BITS, dst, build_group)
+    drive_witness_batch_major_partial_into(inputs, n_log, K_LOG, USEFUL_BITS, dst, |g, z, a, b| {
+        build_group(d, g, z, a, b)
+    })
 }
 
 // ===========================================================================
@@ -398,13 +454,18 @@ pub fn generate_witness_batch_major_partial_into(
 
 /// Column marginals of the substituted A/B rows (see the module docs):
 ///
-/// - A side: `K^A_12 = pin weights`; `K^A_r = φᵀ(K^A_{r+1}) ⊕ χ^A_r`;
-///   `K^A_r` lands on `t_{r−1}` (and `K^A_0` on `state_0`).
-/// - B side: same recurrence from `K^B_12 = 0` (pin rows' B is the constant).
-/// - Constant column: the `¬` in every t row's A, the B = 1 of the state
-///   rows, and the round-constant accumulator `RC_r` dotted with each
-///   round's χ marginals and the pin weights.
-pub struct MiniShakeLincheckCircuit;
+/// - A side: `K^A_12 = digest pin weights`; `K^A_r = φᵀ(K^A_{r+1}) ⊕ χ^A_r`;
+///   `K^A_r` lands on `t_{r−1}`, and `K^A_0` on the message lanes of
+///   `state_0` (its constant lanes go to the constant column instead).
+/// - B side: the same recurrence from `K^B_12 = 0`.
+/// - Constant column: the `¬` of every t row's A, the B = 1 of the message
+///   and digest rows, and the constant part `RC_r` of each `state_r`
+///   (starting from the constant input lanes) dotted with that round's χ
+///   marginals and, for `RC_12`, the pin weights.
+pub struct MiniShakeLincheckCircuit {
+    /// Domain-separation byte `D`.
+    pub d: u8,
+}
 
 impl LincheckCircuit for MiniShakeLincheckCircuit {
     fn n_cols(&self) -> usize {
@@ -418,55 +479,59 @@ impl LincheckCircuit for MiniShakeLincheckCircuit {
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K);
         let mut comb = vec![F128::ZERO; K];
+        let mut c_a = F128::ZERO; // A-side weight on the constant column
+        let mut c_b = F128::ZERO; // B-side weight on the constant column
 
         // Const row: A = B = [Z_CONST].
-        let e0 = eq_inner[Z_CONST];
-        comb[Z_CONST] += alpha * e0 + e0;
+        c_a += eq_inner[Z_CONST];
+        c_b += eq_inner[Z_CONST];
 
-        // state_0 rows: A = [row], B = [Z_CONST].
-        for s in 0..STATE_BITS {
-            let row = z_pos_state0(s);
+        // Message rows: A = [row], B = [Z_CONST].
+        for s in 0..MSG_BITS {
+            let row = z_pos_msg(s);
             comb[row] += alpha * eq_inner[row];
-            comb[Z_CONST] += eq_inner[row];
+            c_b += eq_inner[row];
         }
 
-        // Pin rows: A = L_12[s], B = [Z_CONST].
-        let vec_pin: Vec<F128> = (0..STATE_BITS)
-            .map(|s| eq_inner[z_pos_state_out(s)])
-            .collect();
-        let sum_pin = vec_pin.iter().fold(F128::ZERO, |acc, &e| acc + e);
-        comb[Z_CONST] += sum_pin;
+        // Digest pin rows: A = L_12[s], B = [Z_CONST].
+        let mut vec_pin = vec![F128::ZERO; STATE_BITS];
+        for s in 0..OUT_BITS {
+            vec_pin[s] = eq_inner[z_pos_out(s)];
+            c_b += vec_pin[s];
+        }
 
         // χ marginals on state_r coordinates.
         let mut chi_a = vec![vec![F128::ZERO; STATE_BITS]; N_ROUNDS];
         let mut chi_b = vec![vec![F128::ZERO; STATE_BITS]; N_ROUNDS];
-        let mut sum_t = F128::ZERO;
         for r in 0..N_ROUNDS {
-            for y in 0..5 {
-                for x in 0..5 {
-                    for z in 0..LANE_BITS {
-                        let e = eq_inner[z_pos_t(r, state_idx(x, y, z))];
-                        sum_t += e;
-                        for s in theta_rho_pi_preimage((x + 1) % 5, y, z) {
-                            chi_a[r][s] += e;
-                        }
-                        for s in theta_rho_pi_preimage((x + 2) % 5, y, z) {
-                            chi_b[r][s] += e;
-                        }
+            for lane in 0..t_lanes(r) {
+                let (x, y) = (lane % 5, lane / 5);
+                for z in 0..LANE_BITS {
+                    let e = eq_inner[z_pos_t(r, state_idx(x, y, z))];
+                    c_a += e; // the ¬ in A = 1 ⊕ B_r[x+1]
+                    for s in theta_rho_pi_preimage((x + 1) % 5, y, z) {
+                        chi_a[r][s] += e;
+                    }
+                    for s in theta_rho_pi_preimage((x + 2) % 5, y, z) {
+                        chi_b[r][s] += e;
                     }
                 }
             }
         }
-        comb[Z_CONST] += alpha * sum_t; // the ¬ in A = 1 ⊕ B_r[x+1]
 
-        // Constant part of state_r: rc_0 = 0, rc_{r+1} = φ(rc_r) ⊕ RC_r.
+        // Constant part of state_r: rc_0 = the constant input lanes,
+        // rc_{r+1} = φ(rc_r) ⊕ RC_r.
         let mut rc = [false; STATE_BITS];
-        let (mut rc_a, mut rc_b) = (F128::ZERO, F128::ZERO);
+        for l in MSG_LANES..N_LANES {
+            for z in 0..LANE_BITS {
+                rc[LANE_BITS * l + z] = (const_lane(l, self.d) >> z) & 1 == 1;
+            }
+        }
         for r in 0..N_ROUNDS {
             for s in 0..STATE_BITS {
                 if rc[s] {
-                    rc_a += chi_a[r][s];
-                    rc_b += chi_b[r][s];
+                    c_a += chi_a[r][s];
+                    c_b += chi_b[r][s];
                 }
             }
             rc = apply_phi_bool(&rc);
@@ -476,20 +541,22 @@ impl LincheckCircuit for MiniShakeLincheckCircuit {
                 }
             }
         }
-        let rc_pin = (0..STATE_BITS)
-            .filter(|&s| rc[s])
-            .fold(F128::ZERO, |acc, s| acc + vec_pin[s]);
-        comb[Z_CONST] += alpha * (rc_a + rc_pin) + rc_b;
+        for s in 0..OUT_BITS {
+            if rc[s] {
+                c_a += vec_pin[s];
+            }
+        }
+        comb[Z_CONST] += alpha * c_a + c_b;
 
         // Transpose recurrences. state_r = φ(state_{r−1}) ⊕ t_{r−1} ⊕ RC, so
         // the weight K_r on state_r lands on t_{r−1} and K_{r−1} =
-        // φᵀ(K_r) ⊕ χ_{r−1}.
+        // φᵀ(K_r) ⊕ χ_{r−1}. K_12 is zero off the digest lanes, matching the
+        // last round's truncated t.
         let mut k_a = vec_pin;
         let mut k_b = vec![F128::ZERO; STATE_BITS];
         for r in (1..=N_ROUNDS).rev() {
-            for s in 0..STATE_BITS {
-                let pos = z_pos_t(r - 1, s);
-                comb[pos] += alpha * k_a[s] + k_b[s];
+            for s in 0..t_lanes(r - 1) * LANE_BITS {
+                comb[z_pos_t(r - 1, s)] += alpha * k_a[s] + k_b[s];
             }
             let mut na = apply_phi_t(&k_a);
             let mut nb = apply_phi_t(&k_b);
@@ -500,8 +567,8 @@ impl LincheckCircuit for MiniShakeLincheckCircuit {
             k_a = na;
             k_b = nb;
         }
-        for s in 0..STATE_BITS {
-            comb[z_pos_state0(s)] += alpha * k_a[s] + k_b[s];
+        for s in 0..MSG_BITS {
+            comb[z_pos_msg(s)] += alpha * k_a[s] + k_b[s];
         }
         comb
     }
@@ -511,28 +578,35 @@ impl LincheckCircuit for MiniShakeLincheckCircuit {
 // Setup
 // ===========================================================================
 
-/// Keccak-p[800, 12] R1CS + its single-slot union registry.
+/// MiniSHAKE128 (64-byte message, 32-byte digest) R1CS + its single-slot
+/// union registry.
 #[derive(Debug)]
 pub struct MiniShakeSetup {
-    pub n_perms: usize,
+    pub n_hashes: usize,
+    /// Domain-separation byte `D` (the paper's default is `0x01`).
+    pub d: u8,
     pub r1cs: BlockR1cs,
     pub registry: Registry,
     pub pcs_params: PcsParams,
 }
 
 impl MiniShakeSetup {
-    pub fn new(n_perms: usize) -> Self {
-        Self::with_profile(n_perms, LigeritoProfile::Fast)
+    pub fn new(n_hashes: usize) -> Self {
+        Self::with_profile(n_hashes, 0x01, LigeritoProfile::Fast)
     }
 
-    pub fn with_profile(n_perms: usize, profile: LigeritoProfile) -> Self {
-        let n_log = min_n_perms_log(n_perms);
+    pub fn with_profile(n_hashes: usize, d: u8, profile: LigeritoProfile) -> Self {
+        assert!(
+            (0x01..=0x7F).contains(&d),
+            "domain byte must be in 0x01..=0x7F"
+        );
+        let n_log = min_n_perms_log(n_hashes);
         let r1cs = build_block_r1cs(n_log);
         flock_core::scratch::prewarm_prover(r1cs.m);
         let registry = Registry::new(vec![TableType::from_block_r1cs(&r1cs)], n_log);
         let _ = registry.digest();
         let pcs_params = {
-            let union = UnionInstance::new(&registry, vec![n_perms]);
+            let union = UnionInstance::new(&registry, vec![n_hashes]);
             let m = union.dense_m();
             let batch = embedded_initial_k_or_default(m, profile);
             PcsParams {
@@ -545,7 +619,8 @@ impl MiniShakeSetup {
             }
         };
         Self {
-            n_perms,
+            n_hashes,
+            d,
             r1cs,
             registry,
             pcs_params,
@@ -560,20 +635,26 @@ impl MiniShakeSetup {
     }
 
     fn union(&self) -> UnionInstance<'_> {
-        UnionInstance::new(&self.registry, vec![self.n_perms])
+        UnionInstance::new(&self.registry, vec![self.n_hashes])
     }
 
-    /// Prove `n_perms` permutations of the given input states (RS zerocheck).
+    fn circuit(&self) -> MiniShakeLincheckCircuit {
+        MiniShakeLincheckCircuit { d: self.d }
+    }
+
+    /// Prove `n_hashes` MiniSHAKE128 digests of the given messages (RS
+    /// zerocheck).
     pub fn prove_fast<Ch: Challenger>(
         &self,
-        inputs: &[Lanes],
+        inputs: &[Msg],
         challenger: &mut Ch,
     ) -> (R1csProofMergedLigerito, Commitment, R1csClaim) {
-        assert_eq!(inputs.len(), self.n_perms);
-        let nu = self.n_log();
+        assert_eq!(inputs.len(), self.n_hashes);
+        let (nu, d) = (self.n_log(), self.d);
+        let circuit = self.circuit();
         let slot = UnionSlotProverInput::in_place(
-            move |dst| generate_witness_batch_major_partial_into(inputs, nu, dst),
-            &MiniShakeLincheckCircuit,
+            move |dst| generate_witness_batch_major_partial_into(inputs, d, nu, dst),
+            &circuit,
         );
         prove_fast_ligerito_union(&self.union(), &self.pcs_params, vec![slot], challenger)
     }
@@ -582,18 +663,19 @@ impl MiniShakeSetup {
     #[cfg(target_arch = "aarch64")]
     pub fn prove_fast_union_ag<Ch: Challenger>(
         &self,
-        inputs: &[Lanes],
+        inputs: &[Msg],
         challenger: &mut Ch,
     ) -> (
         flock_core::proof::R1csProofMergedLigeritoAg,
         Commitment,
         R1csClaim,
     ) {
-        assert_eq!(inputs.len(), self.n_perms);
-        let nu = self.n_log();
+        assert_eq!(inputs.len(), self.n_hashes);
+        let (nu, d) = (self.n_log(), self.d);
+        let circuit = self.circuit();
         let slot = UnionSlotProverInput::in_place(
-            move |dst| generate_witness_batch_major_partial_into(inputs, nu, dst),
-            &MiniShakeLincheckCircuit,
+            move |dst| generate_witness_batch_major_partial_into(inputs, d, nu, dst),
+            &circuit,
         );
         crate::prover::prove_fast_ligerito_union_ag(
             &self.union(),
@@ -609,7 +691,8 @@ impl MiniShakeSetup {
         proof: &R1csProofMergedLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, FlockVerifyError> {
-        let circs: [&dyn LincheckCircuit; 1] = [&MiniShakeLincheckCircuit];
+        let circuit = self.circuit();
+        let circs: [&dyn LincheckCircuit; 1] = [&circuit];
         verify_ligerito_union(
             &self.union(),
             &circs,
@@ -626,7 +709,8 @@ impl MiniShakeSetup {
         proof: &flock_core::proof::R1csProofMergedLigeritoAg,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, FlockVerifyError> {
-        let circs: [&dyn LincheckCircuit; 1] = [&MiniShakeLincheckCircuit];
+        let circuit = self.circuit();
+        let circs: [&dyn LincheckCircuit; 1] = [&circuit];
         flock_core::verifier::verify_ligerito_union_ag(
             &self.union(),
             &circs,
@@ -651,6 +735,10 @@ mod tests {
         std::array::from_fn(|_| rng.next_u32())
     }
 
+    fn random_msg(rng: &mut Rng) -> [u8; 64] {
+        std::array::from_fn(|_| rng.next_u32() as u8)
+    }
+
     #[test]
     fn permutation_matches_keccak_crate() {
         let mut rng = Rng::new(1);
@@ -666,11 +754,16 @@ mod tests {
     #[test]
     fn one_block_state_matches_generic_sponge() {
         let mut rng = Rng::new(2);
-        let msg: [u8; 64] = std::array::from_fn(|_| rng.next_u32() as u8);
+        let msg = random_msg(&mut rng);
         let mut s = minishake128_block(&msg, 0x01);
         keccak_p800_12(&mut s);
         let digest: Vec<u8> = s.iter().flat_map(|l| l.to_le_bytes()).take(32).collect();
         assert_eq!(digest, minishake(256, &msg, 0x01, 32));
+        // The walker's constant lanes are the same block.
+        let block = minishake128_block(&msg, 0x01);
+        for l in MSG_LANES..N_LANES {
+            assert_eq!(block[l], const_lane(l, 0x01));
+        }
     }
 
     #[test]
@@ -707,54 +800,85 @@ mod tests {
             .collect()
     }
 
-    /// For every block: rows satisfy `a·b = z`, the output slot holds the
-    /// permutation, and the walker's comb vector reproduces
+    /// For every block: rows satisfy `a·b = z`, the digest slot holds
+    /// MiniSHAKE128(msg), and the walker's comb vector reproduces
     /// `Σ_row eq[row]·(α·a[row] + b[row])` — i.e. `a = A·z`, `b = B·z`.
     #[test]
     fn witness_and_walker_are_consistent() {
+        for d in [0x01u8, 0x1F] {
+            let n_log = 3;
+            let mut rng = Rng::new(4 + d as u64);
+            let msgs: Vec<[u8; 64]> = (0..7).map(|_| random_msg(&mut rng)).collect();
+            let inputs: Vec<Msg> = msgs.iter().map(msg_lanes).collect();
+            let (z, a, b, _) = generate_witness_batch_major_partial(&inputs, d, n_log);
+            let alpha = F128::new(rng.next_u64(), rng.next_u64());
+            let eq: Vec<F128> = (0..K)
+                .map(|_| F128::new(rng.next_u64(), rng.next_u64()))
+                .collect();
+            let comb = MiniShakeLincheckCircuit { d }.fold_alpha_batched(alpha, &eq);
+            for i in 0..8 {
+                let (zb, ab, bb) = (
+                    block_bits(&z, n_log, i),
+                    block_bits(&a, n_log, i),
+                    block_bits(&b, n_log, i),
+                );
+                for row in 0..K {
+                    assert_eq!(ab[row] & bb[row], zb[row], "block {i} row {row}");
+                }
+                if let Some(msg) = msgs.get(i) {
+                    let digest = minishake(256, msg, d, 32);
+                    for s in 0..OUT_BITS {
+                        let bit = (digest[s / 8] >> (s % 8)) & 1 == 1;
+                        assert_eq!(zb[z_pos_out(s)], bit, "digest bit {s}");
+                    }
+                } else {
+                    assert!(zb.iter().all(|&v| !v), "dummy block must be zero");
+                }
+                let lhs = (0..K)
+                    .filter(|&c| zb[c])
+                    .fold(F128::ZERO, |acc, c| acc + comb[c]);
+                let rhs = (0..K).fold(F128::ZERO, |acc, row| {
+                    let mut v = F128::ZERO;
+                    if ab[row] {
+                        v += alpha;
+                    }
+                    if bb[row] {
+                        v += F128::ONE;
+                    }
+                    acc + eq[row] * v
+                });
+                assert_eq!(lhs, rhs, "block {i}");
+            }
+        }
+    }
+
+    /// A witness built for one domain byte must fail the walker of another:
+    /// the constant lanes are part of the relation.
+    #[test]
+    fn walker_binds_domain_byte() {
         let n_log = 3;
-        let mut rng = Rng::new(4);
-        let inputs: Vec<Lanes> = (0..7).map(|_| random_lanes(&mut rng)).collect();
-        let (z, a, b, _) = generate_witness_batch_major_partial(&inputs, n_log);
+        let mut rng = Rng::new(9);
+        let inputs: Vec<Msg> = (0..8).map(|_| msg_lanes(&random_msg(&mut rng))).collect();
+        let (z, a, b, _) = generate_witness_batch_major_partial(&inputs, 0x01, n_log);
         let alpha = F128::new(rng.next_u64(), rng.next_u64());
         let eq: Vec<F128> = (0..K)
             .map(|_| F128::new(rng.next_u64(), rng.next_u64()))
             .collect();
-        let comb = MiniShakeLincheckCircuit.fold_alpha_batched(alpha, &eq);
-        for i in 0..8 {
-            let (zb, ab, bb) = (
-                block_bits(&z, n_log, i),
-                block_bits(&a, n_log, i),
-                block_bits(&b, n_log, i),
-            );
-            for row in 0..K {
-                assert_eq!(ab[row] & bb[row], zb[row], "block {i} row {row}");
-            }
-            if let Some(input) = inputs.get(i) {
-                let mut want = *input;
-                keccak_p800_12(&mut want);
-                for s in 0..STATE_BITS {
-                    let bit = (want[s / LANE_BITS] >> (s % LANE_BITS)) & 1 == 1;
-                    assert_eq!(zb[z_pos_state_out(s)], bit);
-                }
-            } else {
-                assert!(zb.iter().all(|&v| !v), "dummy block must be zero");
-            }
-            let lhs = (0..K)
-                .filter(|&c| zb[c])
-                .fold(F128::ZERO, |acc, c| acc + comb[c]);
-            let rhs = (0..K).fold(F128::ZERO, |acc, row| {
-                let mut v = F128::ZERO;
-                if ab[row] {
-                    v += alpha;
-                }
-                if bb[row] {
-                    v += F128::ONE;
-                }
-                acc + eq[row] * v
-            });
-            assert_eq!(lhs, rhs, "block {i}");
-        }
+        let comb = MiniShakeLincheckCircuit { d: 0x02 }.fold_alpha_batched(alpha, &eq);
+        let (zb, ab, bb) = (
+            block_bits(&z, n_log, 0),
+            block_bits(&a, n_log, 0),
+            block_bits(&b, n_log, 0),
+        );
+        let lhs = (0..K)
+            .filter(|&c| zb[c])
+            .fold(F128::ZERO, |acc, c| acc + comb[c]);
+        let rhs = (0..K).fold(F128::ZERO, |acc, row| {
+            let v = if ab[row] { alpha } else { F128::ZERO }
+                + if bb[row] { F128::ONE } else { F128::ZERO };
+            acc + eq[row] * v
+        });
+        assert_ne!(lhs, rhs);
     }
 
     #[test]
@@ -764,7 +888,7 @@ mod tests {
         let n = 256;
         let setup = MiniShakeSetup::new(n);
         let mut rng = Rng::new(5);
-        let inputs: Vec<Lanes> = (0..n).map(|_| random_lanes(&mut rng)).collect();
+        let inputs: Vec<Msg> = (0..n).map(|_| msg_lanes(&random_msg(&mut rng))).collect();
         let mut ch = FsChallenger::new(b"minishake-test");
         let (proof, commitment, _) = setup.prove_fast(&inputs, &mut ch);
         let mut ch = FsChallenger::new(b"minishake-test");

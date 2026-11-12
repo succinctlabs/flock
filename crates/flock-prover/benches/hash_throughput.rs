@@ -19,7 +19,7 @@ use flock_prover::{
     init_perf_thread_pool,
     r1cs_hashes::{
         blake3::{Blake3Setup, Compression},
-        minishake::{MiniShakeSetup, minishake128_block},
+        minishake::{MiniShakeSetup, msg_lanes},
         sha2::Sha256HybridSetup,
     },
 };
@@ -155,7 +155,8 @@ fn bench_blake3(batch: usize, runs: usize) {
     report("blake3", batch, best);
 }
 
-/// MiniSHAKE128 on a 64-byte message: one Keccak-p[800, 12] call per hash.
+/// MiniSHAKE128 of a 64-byte message (D = 0x01, 32-byte digest): one
+/// Keccak-p[800, 12] call per hash.
 fn bench_minishake(batch: usize, runs: usize) {
     eprintln!("  MiniSHAKE128, batch {batch}");
     let setup = MiniShakeSetup::new(batch);
@@ -163,7 +164,7 @@ fn bench_minishake(batch: usize, runs: usize) {
         .map(|run| {
             let mut rng = Rng::new(0x5A4E_0800 ^ batch as u64 ^ run as u64);
             (0..batch)
-                .map(|_| minishake128_block(&from_fn(|_| rng.next_u32() as u8), 0x01))
+                .map(|_| msg_lanes(&from_fn(|_| rng.next_u32() as u8)))
                 .collect()
         })
         .collect();
