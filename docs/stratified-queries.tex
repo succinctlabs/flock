@@ -4,318 +4,269 @@
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{booktabs}
 \usepackage{enumitem}
-\usepackage{xspace}
-\usepackage{xcolor}
 \usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
 
-% ---------------------------------------------------------------------------
-% Macros (shared with multi-table-design.tex / circuit-wiring-design.tex)
-% ---------------------------------------------------------------------------
-\newcommand{\F}{\mathbb{F}}
-\newcommand{\code}[1]{\texttt{#1}}
-\newcommand{\miss}{\mathsf{miss}}
+\newcommand{\N}{N}
+\newcommand{\err}{\mathrm{err}}
+\newcommand{\Unif}{\mathcal{U}}
+\newcommand{\Strat}{\mathcal{S}}
 
 \newtheorem{theorem}{Theorem}
-\newtheorem{lemma}{Lemma}
-\newtheorem{remark}{Remark}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{remark}[theorem]{Remark}
 \theoremstyle{definition}
-\newtheorem{definition}{Definition}
+\newtheorem{definition}[theorem]{Definition}
 
-\title{Stratified Query Sampling:\\
-Protocol-Constant Merkle Strata via Binary Decomposition\\[0.6ex]
-\large Design note --- v1 (agreed design, pre-implementation)}
+\title{Stratified Query Sampling for\\ Merkle-Committed Proximity Tests}
 \author{Flock}
-\date{August 5, 2026}
+\date{August 5, 2026 --- revised October 15, 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-The Ligerito query phase samples its $q$ per-level queries uniformly over
-the codeword positions, so the circuit that replays the verifier cannot
-know, at build time, which subtree of the commitment's cap layer a query
-lands in. Everything expensive about the in-circuit query phase descends
-from that one fact: first the boundary-select publics, then (after the
-cap-hashing redesign) full-depth paths plus an in-circuit cap tree per
-level. This note records the fix: \emph{stratified sampling}. Write
-$q = \sum_i 2^{c_i}$ in binary; for each summand, sample one query
-uniformly inside each of the $2^{c_i}$ depth-$c_i$ subtrees. Every
-query's subtree --- and hence the Merkle node its path terminates at ---
-becomes a \emph{protocol constant}, so path tops wire structurally
-(copy constraints to fixed wires), paths shorten from $d$ to $d - c_i$
-rows, and the per-level cap tree collapses to a small shared upper tree.
-The soundness bound is \emph{exactly} the $(1-\gamma)^q$ we already
-charge: the miss probability factorizes over summands, each factor is
-bounded by AM--GM, and the uniform placement is the common maximizer of
-all factors, so no slack is lost. Any integer $q$ works --- no rounding,
-and the query-count knob stays free for the grinding schedule. At the
-slim L0 shape ($q = 90$, $d = 19$) the in-circuit query phase drops from
-$1{,}837$ to $1{,}298$ hash rows ($-29\%$) and the absorbed cap halves
-from $128$ to $64$ words.
+The query phase of a proximity test draws $q$ positions of a
+Merkle-committed codeword, and its soundness analysis charges a cheating
+prover $(1-\gamma)^q$: the probability that $q$ independent uniform draws
+all avoid a $\gamma$-fraction of disagreeing positions. Inside a
+recursive verifier, uniform sampling has a hidden cost: the commitment
+node at which a query's authentication path terminates is data-dependent.
+We show this cost is an artifact of the distribution, not of soundness.
+Writing $q = \sum_i 2^{c_i}$ in binary and drawing, for each summand,
+one uniform query inside each of the $2^{c_i}$ depth-$c_i$ subtrees, the
+worst-case all-miss probability is \emph{exactly} $(1-\gamma)^q$. Every
+path then terminates at a protocol-constant node, paths shorten from
+$d$ to $d - c_i$ hashes, and the commitment shrinks to the
+$2^{\lfloor \log_2 q \rfloor}$ nodes at the top set bit. Equal-size
+strata are necessary, the binary decomposition is hash-minimal, and the
+stratification survives FRI-style folding.
 \end{abstract}
 
-\section{Setting and the problem}
+\section{Setting}
 
-\paragraph{The query phase.}
-At each level of a Ligerito proof the prover has committed to a codeword
-of length $N = 2^d$ via a Merkle tree whose commitment is its depth-$c$
-\emph{cap layer}, $c = \lceil \log_2 q \rceil$ clamped to the tree depth
-(\code{merkle::cap\_depth}); the cap is absorbed into the transcript in
-place of a root. After the commitment is absorbed, the verifier draws
-$q$ query positions independently and uniformly \emph{with replacement}
-from $[N]$, via one batched squeeze per level
-(\code{pcs::ligerito::sample\_queries}), and checks the opened rows
-against the fold. The per-level count $q$ is set by the security
-schedule (\code{udr\_queries} and the grinding substitution): in the
-unique-decoding regime a cheating prover's oracle must \emph{disagree}
-with the pinned codeword on at least a $\gamma$ fraction of positions,
-each query independently hits a disagreement with probability at least
-$\gamma$, and the level charges
+A Merkle tree of depth $d$ commits $\N = 2^d$ leaves; the node at depth
+$k$ and index $j$ commits the leaf interval
+$S^{(k)}_j = [\, j 2^{d-k}, (j+1) 2^{d-k})$. A \emph{depth-$c$ cap}
+commitment publishes the $2^c$ nodes at depth $c$
+\cite{plonky2}; an opening of leaf $x$ carries $d - c$ siblings and is
+checked against cap word $\lfloor x / 2^{d-c} \rfloor$.
+
+Proximity tests of the Ligero and FRI families \cite{ligero,ligerito,fri}
+share a soundness template for their query phase. For every cheating
+prover and every transcript prefix up to the moment the queries are
+drawn, the analysis exhibits a set $A \subseteq [\N]$ of density at most
+$1-\gamma$ (the positions where the committed oracle agrees with what the
+verifier will check) such that the verifier accepts only if all $q$
+queries land in $A$. The set $A$ may depend on everything before the
+queries, including the verifier's earlier randomness, but not on the
+query randomness; nothing is assumed about its structure. The phase's
+error is therefore governed by one quantity of the sampling distribution.
+
+\begin{definition}
+For a distribution $\mathcal{D}$ on $[\N]^q$ and $\gamma \in (0,1]$, let
 \[
-\Pr[\text{all $q$ queries miss}] \;\le\; (1-\gamma)^q ,
+\err_\gamma(\mathcal{D}) \;=\;
+\max_{|A| \le (1-\gamma)\N}\;
+\Pr_{(x_1,\dots,x_q) \leftarrow \mathcal{D}}[\, x_1, \dots, x_q \in A \,].
 \]
-solved for the level's bit target. Nothing in this note changes that
-accounting; the entire point is that the sampling distribution below
-achieves the \emph{same} bound.
+\end{definition}
 
-\paragraph{The circuit cost.}
-The recursion circuit replays this verifier. Because a query's position
-is uniform over $[N]$, the circuit cannot know at build time which cap
-subtree the query lands in, and the query's Merkle path must somehow be
-bound to the \emph{correct} cap word. Two designs have shipped:
+For $q$ independent uniform draws, $\err_\gamma(\Unif^q) = \mu(A)^q$ at
+$|A| = \lfloor (1-\gamma)\N \rfloor$, i.e.\ $(1-\gamma)^q$ up to
+integrality; this is the benchmark. We write $\mu(A) = |A|/\N$ and
+$\mu_S(A) = |A \cap S| / |S|$.
 
-\begin{enumerate}[leftmargin=2em]
-\item \emph{Boundary select}: publish per-query (challenge, terminal
-digest) pairs and let the checker index the absorbed cap natively ---
-$3$ publics per query plus a checker tier.
-\item \emph{Cap hashing} (the current design): $2^c - 1$ in-circuit
-parent rows fold the absorbed cap to a single root; openings run
-\emph{full} depth $d$ (the $c$ cap-internal siblings per query are
-recomputed natively and supplied as witness hints) and connect to the
-one fixed root wire. No selects, no per-query publics --- but every
-query pays $c$ extra hash rows, every level pays the $2^c-1$ tree, and
-every query drags $c$ hint words of witness.
-\end{enumerate}
-
-Both designs pay because the terminal of a query's path is
-\emph{data-dependent}. The fix is to make it a constant of the protocol.
+The cost of uniformity appears when the verifier is replayed in a
+circuit. A uniform query authenticates against a cap word whose index is
+unknown at circuit-build time, so the circuit must bind the path's
+terminal dynamically: a multiplexer over the cap, per-query terminals as
+public inputs, or hashing the cap to a root in-circuit and extending
+every path to full depth. Each pays for the data dependence. We ask for
+distributions $\mathcal{D}$ with $\err_\gamma(\mathcal{D}) \le
+(1-\gamma)^q$ whose draws are confined to protocol-constant subtrees.
 
 \section{The construction}
 
-\subsection{Warm-up: $q$ a power of two}
-
-Suppose $q = 2^c$. Partition $[N]$ into the $2^c$ depth-$c$ subtrees
-$S_1, \dots, S_{2^c}$ (each of size $N/2^c$) and let query $j$ be
-uniform on $S_j$, all queries independent. Query $j$'s path then runs
-$d - c$ levels and terminates at cap word $j$ --- a fixed wire.
-
-\begin{lemma}[stratified sampling, equal strata]\label{lem:amgm}
-Fix any set $A \subseteq [N]$ of density $\mu(A) \le 1-\gamma$, and let
-$\mu_j = |A \cap S_j| / |S_j|$ be its density on stratum $j$. Then
+\begin{lemma}[equal strata]\label{lem:amgm}
+Fix $c \le d$ and $r \ge 1$, and let $\mathcal{D}_{c,r}$ draw,
+independently, $r$ uniform positions in each of the $2^c$ depth-$c$
+subtrees $S_1, \dots, S_{2^c}$. For every $A$,
 \[
-\Pr[\text{all queries land in } A] \;=\; \prod_{j=1}^{2^c} \mu_j
-\;\le\; \Big( \frac{1}{2^c} \sum_{j=1}^{2^c} \mu_j \Big)^{2^c}
-\;=\; \mu(A)^{2^c} \;\le\; (1-\gamma)^{q},
+\Pr_{\mathcal{D}_{c,r}}[\text{all in } A]
+= \prod_{j} \mu_{S_j}(A)^{r}
+\le \Big( \frac{1}{2^c} \sum_{j} \mu_{S_j}(A) \Big)^{r 2^c}
+= \mu(A)^{r 2^c},
 \]
-with equality throughout iff $\mu_j = \mu(A) = 1 - \gamma$ for all $j$.
+with equality iff $\mu_{S_j}(A) = \mu(A)$ for all $j$.
 \end{lemma}
 
 \begin{proof}
-The first equality is independence of the draws and uniformity within
-each stratum. The inequality is AM--GM. The middle equality holds
-because the strata are equal-sized, so the average of the stratum
-densities is the global density.
+The $r 2^c$ draws are independent, and a draw that is uniform on $S_j$
+lands in $A$ with probability $\mu_{S_j}(A)$; the $r$ draws in stratum
+$j$ contribute the factor $\mu_{S_j}(A)^r$, which gives the first
+equality. For the inequality, apply the AM--GM inequality to the $2^c$
+numbers $\mu_{S_1}(A), \dots, \mu_{S_{2^c}}(A) \in [0,1]$:
+\[
+\prod_{j} \mu_{S_j}(A) \;\le\; \Big( \frac{1}{2^c} \sum_j \mu_{S_j}(A) \Big)^{2^c},
+\]
+and raise both sides to the power $r$. For the last equality, the strata
+partition $[\N]$ into $2^c$ parts of equal size $\N / 2^c$, so
+\[
+\frac{1}{2^c} \sum_j \mu_{S_j}(A)
+= \frac{1}{2^c} \sum_j \frac{|A \cap S_j|}{\N/2^c}
+= \frac{|A|}{\N} = \mu(A).
+\]
+AM--GM is an equality iff all $2^c$ numbers coincide, and since their
+mean is $\mu(A)$ this means $\mu_{S_j}(A) = \mu(A)$ for every $j$.
 \end{proof}
 
-Here $A$ is the set of positions at which the committed oracle would
-answer consistently (the ``agreement set''); the proximity analysis
-guarantees $\mu(A) \le 1-\gamma$ whenever the prover cheats, and
-\emph{nothing} is assumed about $A$'s structure --- the placement is
-fully adversarial, and the adversary knows the stratification (it is a
-protocol constant). The bound is a maximum over placements, not an
-average, so knowing the allocation does not help.
-
-\subsection{General $q$: the binary decomposition}
-
-\begin{definition}[stratified query schedule]\label{def:scheme}
-Let $q$ have binary representation $q = \sum_{i=1}^{t} 2^{c_i}$ with
-$c_1 > c_2 > \dots > c_t$ distinct. The level's queries are grouped
-into $t$ \emph{summands}; summand $i$ partitions $[N]$ into the
-$2^{c_i}$ depth-$c_i$ subtrees and draws one query uniformly and
-independently inside each. In total: exactly $q$ queries, each an
-independent draw, query $(i,j)$ confined to a protocol-constant
-stratum and consuming $d - c_i$ squeeze bits.
+\begin{definition}[stratified schedule]
+A schedule is a multiset of depths $c_1 \ge \dots \ge c_t$ in $[0,d]$
+with query count $q = \sum_i 2^{c_i}$; its distribution $\Strat$ draws,
+independently across summands, one uniform position in each depth-$c_i$
+subtree (a repeated depth is a summand with $r = 2$). The
+\emph{canonical} schedule for $q \le \N$ is the binary representation of
+$q$, with $c_1 = \lfloor \log_2 q \rfloor$.
 \end{definition}
 
+Query $(i,j)$ is confined to the protocol-constant stratum
+$S^{(c_i)}_j$ and consumes $d - c_i$ random bits.
+
 \begin{theorem}[exactness]\label{thm:main}
-Under the schedule of Definition~\ref{def:scheme}, for every agreement
-set $A$ of density at most $1-\gamma$,
-\[
-\Pr[\text{all $q$ queries land in } A] \;\le\; (1-\gamma)^{q},
-\]
-and the bound is attained (up to integrality of $|A \cap S|$) by the
-placement that is uniform across the deepest summand's strata. The
-stratified schedule therefore charges exactly the same per-level bits
-as independent uniform sampling: no query count, grinding bit, or
-security parameter moves.
+For every schedule with query count $q$,
+$\err_\gamma(\Strat) \le (1-\gamma)^q$, with equality whenever
+$(1-\gamma)2^{d-c_1}$ is an integer.
 \end{theorem}
 
 \begin{proof}
-Fix $A$. All $q$ draws are independent, so the miss probability
-factorizes over summands:
-\[
-\Pr[\text{all miss}] \;=\; \prod_{i=1}^{t} \; \prod_{j=1}^{2^{c_i}}
-\mu^{(i)}_j ,
-\qquad
-\mu^{(i)}_j = \frac{|A \cap S^{(i)}_j|}{|S^{(i)}_j|},
-\]
-where $S^{(i)}_1, \dots, S^{(i)}_{2^{c_i}}$ is summand $i$'s partition.
-Each summand's partition is into equal parts, so
-Lemma~\ref{lem:amgm} applies to each factor separately:
-$\prod_j \mu^{(i)}_j \le \mu(A)^{2^{c_i}} \le (1-\gamma)^{2^{c_i}}$.
-Multiplying over $i$ gives $(1-\gamma)^{\sum_i 2^{c_i}} =
-(1-\gamma)^q$.
+Fix $A$. By independence across summands,
+$\Pr_{\Strat}[\text{all in } A] = \prod_i P_i(A)$ with
+$P_i(A) = \prod_j \mu_{S^{(c_i)}_j}(A)$, and Lemma~\ref{lem:amgm} gives
+$P_i(A) \le \mu(A)^{2^{c_i}} \le (1-\gamma)^{2^{c_i}}$; multiply.
 
-One step deserves emphasis. A single placement $A$ faces \emph{all}
-summands at once, so a priori bounding each factor by its own worst
-case only yields
-$\max_A \prod_i P_i(A) \le \prod_i \max_A P_i(A)$, which could be
-loose. Here it is an equality: by Lemma~\ref{lem:amgm} every factor is
-maximized at the \emph{same} placement --- $A$ spread uniformly, i.e.\
-$\mu^{(i)}_j = 1-\gamma$ for all $i, j$ --- and a placement uniform at
-the granularity of the deepest strata (size $2^{d-c_1}$) is
-simultaneously uniform for every shallower summand, since shallow
-strata are unions of deep ones. So the product-of-maxima is attained
-and no slack is introduced.
+A priori $\max_A \prod_i P_i(A) \le \prod_i \max_A P_i(A)$ could be
+strict, since one $A$ faces every summand. It is not: each $P_i$ is
+maximized by an $A$ of density $1-\gamma$ on every depth-$c_i$ stratum,
+and an $A$ uniform at the finest granularity (the depth-$c_1$ strata) is
+uniform on every coarser stratum, as those are unions of fine ones. Such
+an $A$ exists exactly under the integrality condition and attains every
+factor's maximum at once.
 \end{proof}
 
-\begin{remark}[any integer $q$, free knob]
-The schedule exists for every integer $q$ with no rounding: the query
-count remains a free output of the security schedule, and the grinding
-substitution (bits for queries, per level) is untouched. This is the
-decisive advantage over ``equal allocation'' variants, which need
-$2^c \mid q$ and hence quantize the knob.
+Hence stratified sampling is a drop-in replacement for independent
+uniform sampling under the template: no query count, security parameter,
+or query-for-grinding substitution moves, and a schedule exists for
+every integer $q$.
+
+\begin{remark}[equal strata are necessary]
+The lemma fails for unequal strata. Two strata of relative size $9/10$
+and $1/10$, one query each, $\mu(A) = 9/10$: the adversary takes
+$\mu_{S_2}(A) = 1$, $\mu_{S_1}(A) = 8/9$ and all-miss probability
+$8/9 > 0.81$. The weighted AM--GM
+$\prod_j \mu_{S_j}(A)^{w_j} \le \mu(A)$ shows the general rule: queries
+per stratum proportional to stratum size (Neyman's proportional
+allocation \cite{neyman}, here for a worst-case tail rather than a
+variance). One query per stratum forces equal sizes, hence dyadic
+subtrees and a decomposition of $q$ into powers of two.
 \end{remark}
 
-\begin{remark}[repeated positions]
-Queries in different summands (or repeats within a stratum across
-levels) may collide on a position. This is the with-replacement
-situation the sampler already lives in: repeated positions merge into
-one residual constraint with a combined weight, and the multilinear
-Schwartz--Zippel term $\lceil \log_2 Q \rceil / 2^{128}$ is unaffected
-(see the alpha-batching note at \code{udr\_queries} /
-\code{induce\_sumcheck\_evaluate\_at\_residual}).
+\begin{remark}[no free lunch; fewer collisions]
+Stratification does not beat $(1-\gamma)^q$ (equality case of
+Theorem~\ref{thm:main}); sampling without replacement does, by a
+lower-order factor the usual accounting ignores. Stratification does
+reduce collisions: queries of one summand lie in disjoint strata, so at
+least $2^{c_1}$ positions are always distinct.
 \end{remark}
 
-\begin{remark}[binary is the right decomposition]
-Any multiset of powers summing to $q$ yields a valid schedule with the
-same $(1-\gamma)^q$ bound (Theorem~\ref{thm:main} never used
-distinctness). Among them the binary representation minimizes path
-rows: merging two equal parts $2^c + 2^c \to 2^{c+1}$ always saves
-$2^{c+1}$ rows, since $2 \cdot 2^{c}(d-c) - 2^{c+1}(d-c-1) =
-2^{c+1}$. The counter-pressure --- a larger top summand means a larger
-absorbed cap --- is second-order: absorbed words ride the duplex
-sponge at a fraction of a hash row per word, while path rows are a
-full hash row each. Per-level fine-tuning (e.g.\ splitting the top
-summand to shrink a level's commitment) remains available but is not
-expected to pay.
+\begin{remark}[the schedule is part of the statement]
+The verifier must fix the schedule from $q$, never from the proof. A
+schedule that leaves one depth-$c$ stratum unqueried lets the adversary
+hide a $2^{-c}$-fraction of disagreement there, lowering the effective
+disagreement to $(\gamma - 2^{-c})/(1-2^{-c})$ and voiding the test when
+$2^{-c} \ge \gamma$. The invariant is that every summand covers the
+leaves with equal strata, each queried the same number of times.
 \end{remark}
 
-\section{Commitment and circuit shape}
+\section{Payoff in a recursive verifier}
 
-\paragraph{Commitment.}
-The cap is absorbed at depth $c_{\max} = c_1 = \lfloor \log_2 q
-\rfloor$ (the top set bit): $2^{c_{\max}}$ words. At slim L0 this
-halves the absorbed commitment ($128 \to 64$ words). Query counts and
-FS derivation order (cap absorbed, then queries squeezed) are
-unchanged; each query's squeeze narrows from $d$ to $d - c_i$ bits,
-a protocol-constant budget per level.
+Take the canonical schedule $c_1 > \dots > c_t$. The commitment is the
+$2^{c_1}$ cap nodes. A query of summand $i$ hashes $d - c_i$ rows and
+terminates on a wire holding node $(c_i, j)$: for $i = 1$ a cap word,
+otherwise a node of a shared \emph{upper tree} that folds the cap
+upward from depth $c_1$ to depth $c_t$ in $2^{c_1} - 2^{c_t}$ rows
+(every layer is either a terminal layer at a set bit or an operand of
+the next; no root is formed unless $q$ is odd). Siblings above the cap
+are verifier-recomputable witness, so the proof carries $d - c_1$
+siblings per query for every summand. Every terminal is a copy
+constraint to a fixed wire; the only data-dependent part of a query is
+its $d - c_i$ low bits driving the path's left/right selection. Total
+hash rows are
+\[
+\textstyle\sum_i 2^{c_i}(d - c_i) \;+\; 2^{c_1} - 2^{c_t}.
+\]
+The binary decomposition minimizes this over all schedules with the
+same $q \le \N$: merging two depth-$c$ summands into one depth-$(c+1)$
+summand saves $2^{c+1}$ path rows and adds at most $2^c$ upper-tree
+rows (when $c$ was the top depth). The counter-pressure, a larger
+absorbed cap, is second order since absorbed words cost a fraction of a
+row each.
 
-\paragraph{Terminals.}
-The deepest summand's $2^{c_{\max}}$ paths terminate directly on cap
-word wires. Shallower summands' terminals (depth $c_i < c_{\max}$
-nodes) are computed by a small shared \emph{upper tree}: parent rows
-fold the cap upward layer by layer, $2^{c_{\max}} - 2^{c_t}$ rows in
-total, stopping at the shallowest set bit --- no root is ever formed.
-Every computed node is used: layers at set bits serve as terminals
-(each summand queries \emph{every} stratum at its depth), layers
-between set bits are their parents' operands. Every terminal
-connection is a copy constraint to a fixed wire; the only
-data-dependent part of a query is its $d - c_i$ low bits, which drive
-the path's direction wires exactly as today. No selects, no per-query
-publics beyond the fold alphas, no cap-internal witness hints.
-
-\paragraph{Worked example: slim L0 ($d = 19$, $q = 90 = 64 + 16 + 8
-+ 2$).}
-Path rows are $64 \cdot 13 + 16 \cdot 15 + 8 \cdot 16 + 2 \cdot 18 =
-1{,}236$; the upper tree is $2^6 - 2^1 = 62$ rows.
+At a representative level, $d = 19$, $q = 90 = 64 + 16 + 8 + 2$:
 
 \begin{center}
-\begin{tabular}{lrr}
+\begin{tabular}{lrrr}
 \toprule
-& today (cap-hashing) & stratified \\
+& root & cap $+$ in-circuit root & stratified \\
 \midrule
-absorbed cap (words) & 128 & 64 \\
-native opening (sibling digests) & $90 \times 12 = 1{,}080$ & $1{,}236$ \\
-cap-internal witness hints (words) & $90 \times 7 = 630$ & 0 \\
-circuit path rows & $90 \times 19 = 1{,}710$ & $1{,}236$ \\
-circuit cap-tree rows & $127$ & $62$ \\
-\textbf{circuit hash rows, total} & $\mathbf{1{,}837}$ & $\mathbf{1{,}298}$ \\
-terminal binding & one root wire & fixed stratum wires \\
+absorbed commitment (words) & 1 & 128 & 64 \\
+circuit path rows & $1{,}710$ & $1{,}710$ & $1{,}236$ \\
+circuit tree rows & 0 & 127 & 62 \\
+\textbf{circuit hash rows} & $\mathbf{1{,}710}$ & $\mathbf{1{,}837}$ & $\mathbf{1{,}298}$ \\
+proof siblings per level & $1{,}710$ & $1{,}080$ & $1{,}170$ \\
+query randomness (bits) & $1{,}710$ & $1{,}710$ & $1{,}236$ \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-The circuit's query phase shrinks by $29\%$ at this level, and the
-absorbed cap's chain rows shrink with the halved commitment. Native
-proof bytes trade a halved cap against openings that lengthen by
-$c_{\mathrm{old}} - c_i$ siblings per query (the cap being one level
-shallower); at L0 this nets to a few KiB of growth per tree ---
-accepted, since the object under optimization is the recursion
-circuit. The same reshaping applies at every level of every tree
-(each with its own $q$, $d$, and binary decomposition); the recorded
-node-level estimate is roughly $-400$k words, which was projected to
-take the L2 tower node across the m28 boundary (gap at the time:
-$269$k). Both numbers are to be confirmed at implementation.
+Stratified is the first design that beats a root commitment in-circuit
+($-24\%$) while keeping the cap's proof-size advantage; against the cap
+design it saves $29\%$ of the query-phase rows and halves the absorbed
+commitment.
 
-\section{Implementation notes}
+\begin{remark}[query reuse under folding]
+FRI-style protocols reuse a query across levels, $x \mapsto x \bmod
+\N/2$. In bit-reversed storage (leaf $p$ holds index $\mathrm{rev}_d(p)$,
+so folded pairs are adjacent) the leaf position evolves as $p \mapsto
+\lfloor p/2 \rfloor$, which preserves the top $c$ bits of $p$. A query
+confined to depth-$c$ stratum $j$ stays in stratum $j$ at every later
+level until the tree depth drops below $c$, so one schedule, chosen at
+the first level, is inherited by the rest. For $a$-ary trees the same
+analysis holds with the base-$a$ representation of $q$.
+\end{remark}
 
-What changes:
-\begin{itemize}[leftmargin=2em]
-\item \emph{Authority.} The decomposition is computed from $q$
-\emph{once, at config-build time}, and stored in the per-level
-config as explicit fields (summand depths, counts, bit widths, cap
-depth); loading validates the stored schedule against $q$. Prover,
-verifier, and circuit all consume the stored schedule --- it is
-\emph{never} derived at proof time, and in particular never from the
-proof's own shape: the allocation is statement authority, and a
-verifier that adapted to the proof's geometry would accept a weaker,
-prover-chosen allocation. Tape parsing \emph{checks} the proof
-against the config schedule; mismatches reject.
-\item \code{pcs::ligerito::sample\_queries}: per-summand draws,
-$d - c_i$ bits per query, stratum offsets added structurally. The
-batched squeeze stays one-per-level with a new (protocol-constant)
-bit budget.
-\item Commit-time cap sizing (\code{merkle::cap\_depth},
-\code{PcsParams::l0\_queries} and its config-fallback mirror): cap
-depth becomes $\lfloor \log_2 q \rfloor$; the existing invariant that
-commit-time and open-time cap depths agree carries over unchanged.
-\item The circuit emitters (\code{emit\_query\_phase},
-\code{level\_sources} / \code{level\_geometry}): per-summand query
-groups with per-group path length, terminal copy constraints to cap /
-upper-tree wires, upper-tree rows replacing the root-fold tree, hint
-plumbing deleted.
-\item Wire format and pins: the FS shape moves (squeeze widths, cap
-width), so this is a \code{proof\_io} version bump with all byte pins
-and \code{transcript\_shape} re-pinned --- same blast radius as the
-original capping change.
-\end{itemize}
+\begin{thebibliography}{9}\small
 
-What does not change: query counts and the security schedule
-(\code{udr\_queries}, grinding substitution), the with-replacement
-residual merging and its Schwartz--Zippel term, completeness (the
-honest prover opens whatever is asked), and the per-level independence
-of query phases (fresh squeezes per level; level bounds multiply as
-today).
+\bibitem{ligero}
+S.~Ames, C.~Hazay, Y.~Ishai, M.~Venkitasubramaniam.
+\emph{Ligero: lightweight sublinear arguments without a trusted setup}.
+CCS 2017.
+
+\bibitem{ligerito}
+A.~Novakovi\'c, G.~Angeris. \emph{Ligerito}. [TODO: confirm venue.]
+
+\bibitem{fri}
+E.~Ben-Sasson, I.~Bentov, Y.~Horesh, M.~Riabzev.
+\emph{Fast Reed--Solomon interactive oracle proofs of proximity}.
+ICALP 2018.
+
+\bibitem{plonky2}
+Polygon Zero. \emph{Plonky2: fast recursive arguments with PLONK and
+FRI}. 2022. [TODO: confirm the cap-commitment reference.]
+
+\bibitem{neyman}
+J.~Neyman. \emph{On the two different aspects of the representative
+method}. J.\ Royal Statistical Society 97(4), 1934.
+
+\end{thebibliography}
 
 \end{document}
