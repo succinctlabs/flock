@@ -3,47 +3,65 @@
 //! residue.
 //!
 //! ```sh
-//! cargo run --release --example tower -- [n_leaves] [blocks_per_leaf] [chain128|chain100] [verify]
+//! cargo run --release --example tower -- [n_leaves] [blocks_per_leaf] [chain128] [verify] [checked]
 //! ```
 //!
-//! Defaults: 8 leaves x 256 compressions under the 128-bit tower — the
+//! Defaults: 8 leaves x 1024 compressions under the 128-bit tower — the
 //! smallest run that reaches the STEADY spine shape (a base plus two
-//! spine folds) and boards the passenger. The production leaf is 2^18
-//! compressions (`blocks_per_leaf = 262144`); expect minutes there.
+//! spine folds) and boards the passenger, at the smallest leaf with a
+//! registered affine ladder. Leaves have registered ladders at 2^10, 2^18
+//! and 2^19 compressions; other sizes are refused before any work. The
+//! production leaf is 2^19 compressions (`blocks_per_leaf = 524288`,
+//! m = 33); expect minutes there.
 //!
 //! With `verify`, the run also generates a verification key (a one-time
 //! six-leaf reference tower) and checks the root STANDALONE through
 //! `verify_root` — the consumer path, nothing prover-side trusted.
+//!
+//! The run has two phases. SETUP (once per config and leaf size) proves a
+//! six-leaf reference tower to build every kind's circuit and fill plan.
+//! The ONLINE prove then pays only per-statement work, and its time is the
+//! throughput number.
+//!
+//! The prove skips the builders' self-checks (`SelfCheck::Skip`, the
+//! production mode). With `checked`, every build re-checks its own output
+//! (`SelfCheck::Full`); the root is the same either way.
 
 use std::{env, time::Instant};
 
-use flock_prover::tower::{Tower, TowerConfig, TowerVk, verify_root_bytes};
+use flock_prover::tower::{SelfCheck, TowerConfig, TowerProver, TowerVk, verify_root_bytes};
 
 fn main() {
     let mut args = env::args().skip(1);
     let n_leaves: usize = args
         .next()
         .map_or(8, |v| v.parse().expect("n_leaves: an even integer >= 4"));
-    let blocks_per_leaf: usize = args.next().map_or(256, |v| {
+    let blocks_per_leaf: usize = args.next().map_or(1024, |v| {
         v.parse().expect("blocks_per_leaf: a positive integer")
     });
     let cfg = match args.next().as_deref() {
         None | Some("chain128") => TowerConfig::Chain128,
-        Some("chain100") => TowerConfig::Chain100,
-        Some(other) => panic!("unknown tower config {other:?}: chain128 or chain100"),
+        Some(other) => panic!("unknown tower config {other:?}: chain128"),
     };
-    let do_verify = match args.next().as_deref() {
-        None => false,
-        Some("verify") => true,
-        Some(other) => panic!("unknown flag {other:?}: only `verify`"),
-    };
+    let (mut do_verify, mut checks) = (false, SelfCheck::Skip);
+    for flag in args {
+        match flag.as_str() {
+            "verify" => do_verify = true,
+            "checked" => checks = SelfCheck::Full,
+            other => panic!("unknown flag {other:?}: `verify` or `checked`"),
+        }
+    }
 
     // The demo chain starts at the zero state; a deployment starts at its
     // application's own h_start.
     let h_start = [0u32; 16];
 
+    let t_setup = Instant::now();
+    let prover = TowerProver::setup(cfg, blocks_per_leaf);
+    let setup_s = t_setup.elapsed().as_secs_f64();
+
     let t0 = Instant::now();
-    let tower = Tower::prove(cfg, h_start, blocks_per_leaf, n_leaves);
+    let tower = prover.prove(checks, h_start, n_leaves);
     let prove_s = t0.elapsed().as_secs_f64();
 
     let t1 = Instant::now();
@@ -54,15 +72,17 @@ fn main() {
 
     let s = tower.statement();
     println!(
-        "\nTOWER {:?}: {n_leaves} leaves x {blocks_per_leaf} compressions = {} total\n  \
+        "\nTOWER {:?} ({checks:?} self-checks): {n_leaves} leaves x {blocks_per_leaf} compressions = {} total\n  \
          h_end = {:08x}{:08x}.. (== H^{}(h_start))\n  \
-         ONE root proof: {:.1} KiB | prove {prove_s:.1}s | root discharge {discharge_s:.3}s",
+         ONE root proof: {:.1} KiB | setup {setup_s:.1}s (once) | ONLINE prove {prove_s:.2}s \
+         = {:.0}k compressions/s | root discharge {discharge_s:.3}s",
         cfg,
         s.n_blocks,
         s.h_end[0],
         s.h_end[1],
         s.n_blocks,
         tower.root_proof_kib(),
+        s.n_blocks as f64 / prove_s / 1e3,
     );
 
     if do_verify {

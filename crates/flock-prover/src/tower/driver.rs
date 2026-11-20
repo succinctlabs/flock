@@ -19,6 +19,8 @@
 //! REASSEMBLED from the bundle's publics, after the native circuit
 //! verify.
 
+use std::thread::{ScopedJoinHandle, scope};
+
 use flock_core::{
     aggregate::Accumulator, circuit::Circuit, lincheck::LincheckCircuit, matrix_fold::MatrixClaim,
     pcs::jagged::JaggedParams,
@@ -27,16 +29,17 @@ use flock_core::{
 use crate::proof_io::TowerRootBundle;
 use crate::tower::{
     F128,
-    chain::{ChainProof, build_chain_proof},
-    config::TowerConfig,
-    fl_node::{FlNode, build_first_level_node, chain_blake_r1cs, chain_jagged_params},
+    chain::{ChainProof, ChainWalk, assert_leaf_supported, prove_chain_walk, walk_chain},
+    config::{SelfCheck, TowerConfig},
+    fl_node::{FlNode, build_first_level_node_k, chain_blake_r1cs, chain_jagged_params},
     gates_blake3::pack4,
     node::{
-        ChainLane, LaneFamily, NodeOut, SpineIn, build_node_outer_app, digest_f128, entry_live,
+        ChainLane, LaneFamily, NodeOut, SpineIn, build_node_outer_with, digest_f128, entry_live,
         node_jagged_params,
     },
     online::census_kib,
     query::{LeafOuter, leaf_boolean_mats},
+    setup::TowerShapes,
     span_count_word,
     verify::RootBundle,
 };
@@ -109,6 +112,52 @@ pub struct Tower {
     pub(super) blocks_per_leaf: usize,
 }
 
+/// A tower prover after its SETUP phase: the per-kind circuits and fill
+/// plans (see [`TowerShapes`]) are built, and the memory pools are warm.
+/// [`TowerProver::prove`] then pays only per-statement work: the leaves,
+/// and for every FL and node its fold prove, child tapes, input values,
+/// walk and outer prove.
+pub struct TowerProver {
+    cfg: TowerConfig,
+    blocks_per_leaf: usize,
+    shapes: TowerShapes,
+}
+
+impl TowerProver {
+    /// THE SETUP: prove a six-leaf reference tower (the smallest that
+    /// builds every kind: FL, base, spine) under [`SelfCheck::Full`], and
+    /// keep its shapes. Statement-independent, so it runs once per
+    /// `(cfg, blocks_per_leaf)`.
+    pub fn setup(cfg: TowerConfig, blocks_per_leaf: usize) -> TowerProver {
+        let shapes = TowerShapes::default();
+        Tower::prove_with(
+            cfg,
+            SelfCheck::Full,
+            &shapes,
+            [0u32; 16],
+            blocks_per_leaf,
+            6,
+        );
+        TowerProver {
+            cfg,
+            blocks_per_leaf,
+            shapes,
+        }
+    }
+
+    /// The ONLINE phase: [`Tower::prove`] over the setup's shapes.
+    pub fn prove(&self, checks: SelfCheck, h_start: [u32; 16], n_leaves: usize) -> Tower {
+        Tower::prove_with(
+            self.cfg,
+            checks,
+            &self.shapes,
+            h_start,
+            self.blocks_per_leaf,
+            n_leaves,
+        )
+    }
+}
+
 impl Tower {
     /// PROVE THE CHAIN: `n_leaves` sequential segments of
     /// `blocks_per_leaf` compressions each, folded to one root.
@@ -121,8 +170,34 @@ impl Tower {
     /// lane's material owner), so what stays resident is one leaf pair,
     /// the FL row (built forward, folded backward from the tail), and the
     /// current spine node.
+    ///
+    /// `checks` is [`SelfCheck::Full`] to re-check every build's own output
+    /// (tests), or [`SelfCheck::Skip`] for production speed. The root is
+    /// the same either way.
     pub fn prove(
         cfg: TowerConfig,
+        checks: SelfCheck,
+        h_start: [u32; 16],
+        blocks_per_leaf: usize,
+        n_leaves: usize,
+    ) -> Tower {
+        Tower::prove_with(
+            cfg,
+            checks,
+            &TowerShapes::default(),
+            h_start,
+            blocks_per_leaf,
+            n_leaves,
+        )
+    }
+
+    /// [`Tower::prove`] over a setup cache: each kind of build (FL, base,
+    /// spine) takes its finished circuit and fill plan from `shapes`, and
+    /// fills its slot on first use.
+    fn prove_with(
+        cfg: TowerConfig,
+        checks: SelfCheck,
+        shapes: &TowerShapes,
         h_start: [u32; 16],
         blocks_per_leaf: usize,
         n_leaves: usize,
@@ -132,21 +207,50 @@ impl Tower {
             "the tower pairs leaves into 2-ary FLs and roots at a node: \
              n_leaves must be even and >= 4, got {n_leaves}"
         );
+        assert_leaf_supported(cfg, blocks_per_leaf);
         // ---- LEAVES + FIRST LEVEL, interleaved: prove a segment pair
         // (each segment starts at the last h_end), fold it into its FL,
         // drop the pair ----
+        //
+        // The walks are PIPELINED: segment j + 1's walk (the single-threaded
+        // chain compute) runs on its own thread while segment j proves (and
+        // its FL folds) on the pool, so only the first walk is on the
+        // critical path. One walk in flight keeps one extra trace resident.
         let mut chain: Option<ChainProof> = None;
         let mut fls: Vec<FlNode> = Vec::with_capacity(n_leaves / 2);
-        let mut h = h_start;
-        for _ in 0..n_leaves / 2 {
-            let cp0 = build_chain_proof(cfg, h, blocks_per_leaf);
-            let cp1 = build_chain_proof(cfg, cp0.h_end, blocks_per_leaf);
-            h = cp1.h_end;
-            fls.push(build_first_level_node(cfg, &cp0, &cp1));
-            // Leaf 0 survives as the lane's chain-side material owner
-            // (one shape for every leaf); every other leaf drops here.
-            chain.get_or_insert(cp0);
-        }
+        let h = scope(|s| {
+            let mut ahead: Option<ScopedJoinHandle<ChainWalk>> = None;
+            let mut even: Option<ChainProof> = None;
+            let mut h = h_start;
+            for i in 0..n_leaves {
+                let walk = match ahead.take() {
+                    Some(t) => t.join().expect("the chain walk thread"),
+                    None => walk_chain(h_start, blocks_per_leaf),
+                };
+                if i + 1 < n_leaves {
+                    let h_next = walk.h_end;
+                    ahead = Some(s.spawn(move || walk_chain(h_next, blocks_per_leaf)));
+                }
+                let cp = prove_chain_walk(cfg, checks, walk);
+                match even.take() {
+                    None => even = Some(cp),
+                    Some(cp0) => {
+                        h = cp.h_end;
+                        fls.push(build_first_level_node_k(
+                            cfg,
+                            checks,
+                            &shapes.fl,
+                            &[&cp0, &cp],
+                        ));
+                        // Leaf 0 survives as the lane's chain-side material
+                        // owner (one shape for every leaf); every other leaf
+                        // drops here.
+                        chain.get_or_insert(cp0);
+                    }
+                }
+            }
+            h
+        });
         let statement = ChainStatement {
             h_start,
             h_end: h,
@@ -167,8 +271,10 @@ impl Tower {
         // ---- THE BASE: fresh-only over the LAST two FLs (the spine
         // grows by prepending, so the base covers the chain's tail) ----
         let k = fls.len();
-        let base = build_node_outer_app(
+        let base = build_node_outer_with(
             cfg,
+            checks,
+            &shapes.base,
             &[&fls[k - 2].lo, &fls[k - 1].lo],
             Some(app_base),
             Some(ChainLane {
@@ -192,8 +298,10 @@ impl Tower {
             for i in (0..k - 2).rev() {
                 let prev = cur.as_ref().unwrap_or(&base);
                 let prev_lane = prev.lane_acc.clone().expect("the lane rides every level");
-                let n = build_node_outer_app(
+                let n = build_node_outer_with(
                     cfg,
+                    checks,
+                    &shapes.spine,
                     &[&fls[i].lo, &prev.lo],
                     Some(app_base),
                     Some(ChainLane {

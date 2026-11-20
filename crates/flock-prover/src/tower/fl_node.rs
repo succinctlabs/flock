@@ -41,8 +41,8 @@ use std::env::var;
 #[cfg(test)]
 use {
     crate::tower::{
-        ChainLane, LaneFamily, build_chain_proof, build_node_outer_app, gates_blake3::Rng,
-        test_config,
+        ChainLane, DEV_BLOCKS, LaneFamily, build_chain_proof, build_node_outer_app,
+        gates_blake3::Rng, test_config,
     },
     bincode::serialize,
     std::array::from_fn,
@@ -61,15 +61,15 @@ use crate::{
         BitSpreadGate, BitSpreadTable, Blake3Gate, ChainProof, ChildSlots, ChildTape, DOMAIN,
         ENV_ACC_CHAIN_WORDS, ENV_APP_WORDS, EnvTail, F128, FamilyTransposeTileGate,
         FamilyTransposeTileTable, FsChallenger, HashKind, LeafOuter, MergedChain, MixedInner,
-        MixedProof, Online, PARENT, PcsParams, PowMaskGate, PowMaskTable, SLOT_WORDS, ShapeBuilder,
-        SwapGate, SwapTable, TowerConfig, UnionInstance, UnionSlotProverInput, Wire, ZskipTapeRec,
-        ZskipWires, assert_chain_replays, balance_extra_rows, bytes_payload_mask,
-        challenge_word_locs, check_ag_skip_publics, check_child_region, check_fold_publics,
-        check_jagged_fold_publics, cw, emit_ag_point_binding, emit_child_region,
-        emit_fiat_shamir_chain_partitioned, emit_fold_region, emit_jagged_fold_region,
-        emit_lagrange_lows, emit_recorded_pow_checks, env_acc_chain_base, env_app_base,
-        envelope_shape_with_lane, expected_child_tail_schedule, flatten_ops,
-        jagged_fold_region_ops, labeled_bytes_payloads, lane_block_words,
+        MixedProof, Online, PARENT, PcsParams, PowMaskGate, PowMaskTable, SLOT_WORDS, SelfCheck,
+        ShapeBuilder, ShapeSlot, SwapGate, SwapTable, TowerConfig, UnionInstance,
+        UnionSlotProverInput, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays,
+        balance_extra_rows, bytes_payload_mask, challenge_word_locs, check_ag_skip_publics,
+        check_child_region, check_fold_publics, check_jagged_fold_publics, cw,
+        emit_ag_point_binding, emit_child_region, emit_fiat_shamir_chain_partitioned,
+        emit_fold_region, emit_jagged_fold_region, emit_lagrange_lows, emit_recorded_pow_checks,
+        env_acc_chain_base, env_app_base, envelope_shape_with_lane, expected_child_tail_schedule,
+        flatten_ops, jagged_fold_region_ops, labeled_bytes_payloads, lane_block_words,
         live_element_input_from_rows, locate_and_pin_folds, locate_and_pin_jagged_folds,
         merge_chain, native_chain, outer_lanes, outer_union, outer_zerocheck_ag, pack_params,
         pack4, pack8, pad_envelope_counts, pcs_batch_for, replay_fold_endpoints,
@@ -233,7 +233,7 @@ pub(super) struct FlCore {
 }
 
 pub fn build_first_level_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
-    build_first_level_node_k(cfg, &[cp0, cp1])
+    build_first_level_node_k(cfg, SelfCheck::Full, &ShapeSlot::default(), &[cp0, cp1])
 }
 
 /// The 2-ary first-level node: two adjacent chain proofs verified deferred
@@ -242,7 +242,16 @@ pub fn build_first_level_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainPro
 /// the arity LEVER, but today it is pinned to exactly two children — the
 /// split-BLAKE slot assignment (`ChildSlots::new_env` sets `b3_alt` for
 /// child 1 only) has no slots for a third child.
-pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
+///
+/// `checks` gates the builder's self-checks (see [`SelfCheck`]); the
+/// proof is the same either way. `slot` is the FL kind's setup cache (see
+/// [`ShapeSlot`]): a fresh one finishes the circuit here.
+pub fn build_first_level_node_k(
+    cfg: TowerConfig,
+    checks: SelfCheck,
+    slot: &ShapeSlot,
+    cps: &[&ChainProof],
+) -> FlNode {
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
     let cp0 = cps[0];
     let cp_last = cps[cps.len() - 1];
@@ -271,6 +280,8 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
     let inners: Vec<&MixedInner> = cps.iter().map(|cp| &cp.inner).collect();
     let core = build_first_level_core(
         cfg,
+        checks,
+        slot,
         FL_DOMAIN,
         &inners,
         &family,
@@ -280,14 +291,16 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
             per_leaf,
         },
     );
-    assert_eq!(
-        cp_last.h_end,
-        native_chain(
-            &cp0.h_start,
-            cps.iter().map(|cp| cp.inner.built.shape.counts[0]).sum(),
-        ),
-        "the combined span IS the concatenated chain"
-    );
+    if checks.on() {
+        assert_eq!(
+            cp_last.h_end,
+            native_chain(
+                &cp0.h_start,
+                cps.iter().map(|cp| cp.inner.built.shape.counts[0]).sum(),
+            ),
+            "the combined span IS the concatenated chain"
+        );
+    }
     FlNode {
         lo: core.lo,
         acc: core.acc,
@@ -369,8 +382,11 @@ pub(super) fn fl_app_words(app: &FlApp, inners: &[&MixedInner]) -> Vec<F128> {
 /// assertions folded 2→1 in-circuit (two fold groups per boolean type,
 /// then sigma, then jagged), the fold surfaces copy-constrained to the
 /// regions' wires, and `app` published as the node's statement.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_first_level_core(
     cfg: TowerConfig,
+    checks: SelfCheck,
+    slot: &ShapeSlot,
     fl_domain: &'static [u8],
     inners: &[&MixedInner],
     family: &FlFamily<'_>,
@@ -423,6 +439,7 @@ pub(super) fn build_first_level_core(
     let jags: Vec<_> = inners.iter().map(|inner| &inner.work.jagged).collect();
     let jagged_p: Vec<JaggedKeyProve<'_>> = vec![(leaf_digest, &leaf_params_j, jags.to_vec())];
     let jagged_v: Vec<JaggedKeyVerify<'_>> = vec![(leaf_digest, jags.to_vec())];
+    let t_fold = Instant::now();
     let mut chp = FsChallenger::with_chained_blake3(fl_domain);
     let sigma_key = [(leaf_circuit, sigmas.iter().collect())];
     let grinding = tower_fold_grinding(cfg);
@@ -483,6 +500,7 @@ pub(super) fn build_first_level_core(
         ),
     }
     .expect("the first-level fold verifies");
+    let fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
     assert!(acc_v.per_element.is_empty(), "no element group accumulated");
     // The boolean fold groups: one per type, or one per matrix class under
@@ -517,16 +535,18 @@ pub(super) fn build_first_level_core(
             None => acc.discharge(mats),
         }
     };
-    assert!(discharges_boolean(&acc_v), "the boolean groups discharge");
-    assert!(
-        acc_v.discharge_sigma(&[leaf_circuit]),
-        "the sigma group discharges against the ONE leaf circuit"
-    );
     assert_eq!(acc_v.jagged.len(), 1, "one jagged key: the leaf layout");
-    assert!(
-        acc_v.discharge_jagged(&[(leaf_digest, &leaf_params_j)]),
-        "the folded jagged entry discharges against the leaf layout"
-    );
+    if checks.on() {
+        assert!(discharges_boolean(&acc_v), "the boolean groups discharge");
+        assert!(
+            acc_v.discharge_sigma(&[leaf_circuit]),
+            "the sigma group discharges against the ONE leaf circuit"
+        );
+        assert!(
+            acc_v.discharge_jagged(&[(leaf_digest, &leaf_params_j)]),
+            "the folded jagged entry discharges against the leaf layout"
+        );
+    }
 
     // The folds' claim lists — no priors, so fresh only: per boolean group
     // its A and B folds, then sigma. Claim `k·|members| + j` of a group is
@@ -758,11 +778,15 @@ pub(super) fn build_first_level_core(
         );
         assert_chain_replays(&ops, &trace, chals);
 
+        // The lane's ACC_CHAIN width, and the affine slot layouts: the
+        // leaf's plus the outer's, so every outer of this tower declares
+        // the same list.
         let env = envelope_shape_with_lane(
             family
                 .lane_words
                 .unwrap_or_else(|| lane_block_words(&acc_v)),
-        );
+        )
+        .with_affine(&inners[0].pcs, cfg.outer_profile());
         let split_b3 = tapes.len() == 2;
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = tapes[0].b3_rows;
@@ -1420,16 +1444,15 @@ pub(super) fn build_first_level_core(
             );
             env_app_base(&env)
         };
-        let shape2 = sb.finish().expect("the first-level node circuit builds");
+        let (shape2, fill_plan) = slot.finish(sb, checks, "first-level node");
         let hint_refs: Vec<&(dyn Any + Sync)> =
             hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
-        // THE INDEX-FILL RUNNER (setup), the node's path: compile the plan,
-        // then pin it row-identical against the generic walk before the
+        // THE INDEX-FILL RUNNER (setup), the node's path: the plan comes
+        // with the shape (compiled once per kind), then pin it row-identical against the generic walk before the
         // online run trusts it. run() stays the differential oracle — this
         // pin is what keeps it one, now that the FL no longer walks in the
-        // timed path either.
-        let fill_plan = shape2.fill_plan();
-        {
+        // timed path either. It is a self-check: `SelfCheck::Skip` drops it.
+        if checks.on() {
             let walk = shape2.run(&vals, &hint_refs);
             let fill = shape2.run_filled(&fill_plan, &vals, &hint_refs);
             assert_eq!(walk.public, fill.public, "fill plan: public segment");
@@ -1505,8 +1528,10 @@ pub(super) fn build_first_level_core(
         let mut fin = None;
         for _ in 0..reps {
             let t_tapes = Instant::now();
-            for inner in inners {
-                record_child_inner_verify(inner, family.domain, circs);
+            if checks.on() {
+                for inner in inners {
+                    record_child_inner_verify(inner, family.domain, circs);
+                }
             }
             let tapes_ms_i = t_tapes.elapsed().as_secs_f64() * 1e3;
             let t_run = Instant::now();
@@ -1515,79 +1540,87 @@ pub(super) fn build_first_level_core(
             let mut built2 = shape2.run_filled_deferred(&fill_plan, &vals, &hint_refs);
             let run_ms = t_run.elapsed().as_secs_f64() * 1e3;
 
-            // Child checkers (each child's whole deferred-verifier statement
-            // against its own native replicas), then the fold checker + the
-            // accumulator reassembled from publics, then the app statement.
-            let mut region_end = 0usize;
-            for (tk, rk) in tapes.iter().zip(&regions) {
-                let consumed = check_child_region(&built2.public, tk, rk);
-                assert!(
-                    region_end <= rk.pub_base && rk.pub_base + consumed <= fold_pub_base,
-                    "the regions' public blocks are disjoint and ordered"
+            // The checkers are self-checks: under `SelfCheck::Skip` the
+            // accumulator is the verifier's own (the checkers assert the
+            // public one equals it).
+            let acc_pub = if !checks.on() {
+                acc_v.clone()
+            } else {
+                // Child checkers (each child's whole deferred-verifier statement
+                // against its own native replicas), then the fold checker + the
+                // accumulator reassembled from publics, then the app statement.
+                let mut region_end = 0usize;
+                for (tk, rk) in tapes.iter().zip(&regions) {
+                    let consumed = check_child_region(&built2.public, tk, rk);
+                    assert!(
+                        region_end <= rk.pub_base && rk.pub_base + consumed <= fold_pub_base,
+                        "the regions' public blocks are disjoint and ordered"
+                    );
+                    region_end = rk.pub_base + consumed;
+                }
+                // ACC_CHAIN keeps the un-keyed entry layout: the lane's registry
+                // role has ONE key (the leaf circuit), so nothing to disambiguate.
+                let (rebuilt, _, _) = check_fold_publics(
+                    &built2.public,
+                    fold_pub_base,
+                    &locs,
+                    &alpha_recs,
+                    locs.len(),
                 );
-                region_end = rk.pub_base + consumed;
-            }
-            // ACC_CHAIN keeps the un-keyed entry layout: the lane's registry
-            // role has ONE key (the leaf circuit), so nothing to disambiguate.
-            let (rebuilt, _, _) = check_fold_publics(
-                &built2.public,
-                fold_pub_base,
-                &locs,
-                &alpha_recs,
-                locs.len(),
-            );
-            for (r, o) in rebuilt.iter().zip(&outs) {
-                assert_eq!(r, o, "published fold output == located native output");
-            }
-            let jag_pub_at =
-                fold_pub_base + locs.iter().map(|l| 2 + l.k_col + l.k_row).sum::<usize>();
-            let (jrebuilt, _, _) =
-                check_jagged_fold_publics(&built2.public, jag_pub_at, &jlocs, false);
-            assert_eq!(
-                jrebuilt[0], jouts[0],
-                "published jagged entry == located native"
-            );
-            let acc_pub = Accumulator {
-                registry_digest: registry.digest(),
-                per_type: (0..groups.len())
-                    .map(|t| (rebuilt[2 * t].clone(), rebuilt[2 * t + 1].clone()))
-                    .collect(),
-                per_element: Vec::new(),
-                per_linear: rebuilt[n_ab..sig_g].to_vec(),
-                sigma: vec![(leaf_digest, rebuilt[sig_g].clone())],
-                jagged: vec![(leaf_digest, jrebuilt[0].clone())],
+                for (r, o) in rebuilt.iter().zip(&outs) {
+                    assert_eq!(r, o, "published fold output == located native output");
+                }
+                let jag_pub_at =
+                    fold_pub_base + locs.iter().map(|l| 2 + l.k_col + l.k_row).sum::<usize>();
+                let (jrebuilt, _, _) =
+                    check_jagged_fold_publics(&built2.public, jag_pub_at, &jlocs, false);
+                assert_eq!(
+                    jrebuilt[0], jouts[0],
+                    "published jagged entry == located native"
+                );
+                let acc_pub = Accumulator {
+                    registry_digest: registry.digest(),
+                    per_type: (0..groups.len())
+                        .map(|t| (rebuilt[2 * t].clone(), rebuilt[2 * t + 1].clone()))
+                        .collect(),
+                    per_element: Vec::new(),
+                    per_linear: rebuilt[n_ab..sig_g].to_vec(),
+                    sigma: vec![(leaf_digest, rebuilt[sig_g].clone())],
+                    jagged: vec![(leaf_digest, jrebuilt[0].clone())],
+                };
+                assert_eq!(
+                    acc_pub, acc_v,
+                    "the Accumulator, reassembled from the public segment alone"
+                );
+                assert!(
+                    discharges_boolean(&acc_pub)
+                        && acc_pub.discharge_sigma(&[leaf_circuit])
+                        && acc_pub.discharge_jagged(&[(leaf_digest, &leaf_params_j)]),
+                    "the public-segment accumulator discharges all three groups"
+                );
+                if let Some((lam_base, _, _, _)) = &rs_lam {
+                    for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
+                        assert_eq!(built2.public[*lam_base + i], v, "λ const {i}");
+                    }
+                }
+                // The AG-skip blocks: the decode is in-circuit since phase D;
+                // the checker holds the nonce range and the row lows.
+                for (inner, base) in inners.iter().zip(&ag_pub_bases) {
+                    if let Some(base) = base {
+                        check_ag_skip_publics(&built2.public, *base, inner.ag_round_one_bits());
+                    }
+                }
+                for &(v, idx) in &jag_const_rec {
+                    assert_eq!(built2.public[idx], v, "jagged shared constant public");
+                }
+                // THE APPLICATION STATEMENT, against its native value.
+                assert_eq!(
+                    built2.public[stmt_base..stmt_base + ENV_APP_WORDS],
+                    fl_app_words(app, inners)[..],
+                    "the node statement"
+                );
+                acc_pub
             };
-            assert_eq!(
-                acc_pub, acc_v,
-                "the Accumulator, reassembled from the public segment alone"
-            );
-            assert!(
-                discharges_boolean(&acc_pub)
-                    && acc_pub.discharge_sigma(&[leaf_circuit])
-                    && acc_pub.discharge_jagged(&[(leaf_digest, &leaf_params_j)]),
-                "the public-segment accumulator discharges all three groups"
-            );
-            if let Some((lam_base, _, _, _)) = &rs_lam {
-                for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
-                    assert_eq!(built2.public[*lam_base + i], v, "λ const {i}");
-                }
-            }
-            // The AG-skip blocks: the decode is in-circuit since phase D;
-            // the checker holds the nonce range and the row lows.
-            for (inner, base) in inners.iter().zip(&ag_pub_bases) {
-                if let Some(base) = base {
-                    check_ag_skip_publics(&built2.public, *base, inner.ag_round_one_bits());
-                }
-            }
-            for &(v, idx) in &jag_const_rec {
-                assert_eq!(built2.public[idx], v, "jagged shared constant public");
-            }
-            // THE APPLICATION STATEMENT, against its native value.
-            assert_eq!(
-                built2.public[stmt_base..stmt_base + ENV_APP_WORDS],
-                fl_app_words(app, inners)[..],
-                "the node statement"
-            );
 
             // Everything from here to the prove is WITNESS ASSEMBLY — packing
             // the walk's rows into the union's slot inputs. It is per-statement
@@ -1720,18 +1753,20 @@ pub(super) fn build_first_level_core(
             };
             let prove_ms = t_prove.elapsed().as_secs_f64() * 1e3;
             let t_ver = Instant::now();
-            let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
-            oproof
-                .verify_circuit(
-                    &union2,
-                    &shape2.circuit,
-                    &built2.public,
-                    &lcs2,
-                    &ocommit,
-                    &pcs2,
-                    &mut ch2,
-                )
-                .expect("the first-level node verifies over the circuit path");
+            if checks.on() {
+                let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
+                oproof
+                    .verify_circuit(
+                        &union2,
+                        &shape2.circuit,
+                        &built2.public,
+                        &lcs2,
+                        &ocommit,
+                        &pcs2,
+                        &mut ch2,
+                    )
+                    .expect("the first-level node verifies over the circuit path");
+            }
             let verify_ms2 = t_ver.elapsed().as_secs_f64() * 1e3;
             onlines.push(Online {
                 setup_ms: build_ms,
@@ -1740,6 +1775,7 @@ pub(super) fn build_first_level_core(
                 witgen_ms: asm_ms,
                 prove_ms,
                 verify_ms: verify_ms2,
+                fold_ms,
                 wall_ms: 0.0,
             });
             fin = Some((built2, oproof, ocommit, acc_pub));
@@ -1772,6 +1808,7 @@ pub(super) fn build_first_level_core(
                 spread_slot: spread_ri,
                 pow_slot: pow_ri,
                 family_slot: family_ri,
+                affine_env: env.affine.clone(),
             },
             acc: acc_pub,
             stmt_base,
@@ -1789,7 +1826,7 @@ pub(super) fn build_first_level_core(
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn first_level_node_two_chains_fold_and_adjacency() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_0004);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
@@ -1828,15 +1865,16 @@ pub(super) fn first_level_node_two_chains_fold_and_adjacency() {
 /// under free counts, against the m\*28 cap (2^21 packed words). The
 /// per-type breakdown (used_cols × rows, descending) is the diet map if the
 /// gap needs closing. `CHAIN_BLOCKS` sizes the leaves (the real question is
-/// 262144 = m32); `TOWER_CONFIG=chain128` selects the envelope config.
+/// 524288 = m33, the production leaf); `TOWER_CONFIG=chain128` selects the
+/// envelope config.
 #[test]
-#[ignore] // Heavy at m32 — four chain proofs, two FLs, one node.
+#[ignore] // Heavy at m33 — four chain proofs, two FLs, one node.
 pub(super) fn envelope_content_probe() {
     let cfg = test_config();
     let n_blocks: usize = var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(256);
+        .unwrap_or(DEV_BLOCKS);
     let mut rng = Rng(0xC4A1_00CE);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let mut cps = Vec::new();

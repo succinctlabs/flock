@@ -288,6 +288,31 @@ pub trait LincheckCircuit: Sync {
         (a, b)
     }
 
+    /// The column marginals of `A_0` and `B_0` for several claims at once,
+    /// each with its OWN pair of row weights: `out[i] = ((wa_i^T·A_0),
+    /// (wb_i^T·B_0))` for `ws[i] = (wa_i, wb_i)`. A fresh claim reports A
+    /// and B at one point (`wa == wb`, one [`fold_split`](Self::fold_split));
+    /// a folded prior carries them at different points. The matrix fold
+    /// needs one pair per claim over the SAME matrices, so an
+    /// implementation that walks the nonzeros once for all of them is free
+    /// to override. The default splits a shared weight once; for a folded
+    /// prior it takes `A` from a split at `wa` and `B` from one α = 0 fold
+    /// at `wb` (`fold(0) = B`).
+    fn fold_split_many(&self, ws: &[(&[F128], &[F128])]) -> Vec<(Vec<F128>, Vec<F128>)> {
+        ws.iter()
+            .map(|&(wa, wb)| {
+                if std::ptr::eq(wa, wb) || wa == wb {
+                    self.fold_split(wa)
+                } else {
+                    (
+                        self.fold_split(wa).0,
+                        self.fold_alpha_batched(F128::ZERO, wb),
+                    )
+                }
+            })
+            .collect()
+    }
+
     /// Column index of a constant-one wire to pin, or `None` if the circuit has
     /// no such wire. When `Some(col)`, lincheck folds one extra `β`-term into the
     /// comb so the sumcheck also proves that the committed constant column is the
@@ -329,6 +354,21 @@ impl<'a> SparseMatrixCircuit<'a> {
     }
 }
 
+/// `w^T · m`: the column marginal of a sparse binary matrix.
+fn sparse_scatter(m: &SparseBinaryMatrix, w: &[F128]) -> Vec<F128> {
+    let mut out = vec![F128::ZERO; m.num_cols];
+    for (r, cols) in m.rows.iter().enumerate() {
+        let wr = w[r];
+        if wr == F128::ZERO {
+            continue;
+        }
+        for &c in cols {
+            out[c] += wr;
+        }
+    }
+    out
+}
+
 impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
     fn n_cols(&self) -> usize {
         self.a_0.num_cols
@@ -339,20 +379,16 @@ impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
     /// One scatter pass per matrix rather than the default's two folds over
     /// both — half the nonzero touches.
     fn fold_split(&self, eq_inner: &[F128]) -> (Vec<F128>, Vec<F128>) {
-        let scatter = |m: &SparseBinaryMatrix| {
-            let mut out = vec![F128::ZERO; m.num_cols];
-            for (r, cols) in m.rows.iter().enumerate() {
-                let w = eq_inner[r];
-                if w == F128::ZERO {
-                    continue;
-                }
-                for &c in cols {
-                    out[c] += w;
-                }
-            }
-            out
-        };
-        (scatter(self.a_0), scatter(self.b_0))
+        (
+            sparse_scatter(self.a_0, eq_inner),
+            sparse_scatter(self.b_0, eq_inner),
+        )
+    }
+    /// One scatter per matrix per claim, at that matrix's own weight.
+    fn fold_split_many(&self, ws: &[(&[F128], &[F128])]) -> Vec<(Vec<F128>, Vec<F128>)> {
+        ws.iter()
+            .map(|&(wa, wb)| (sparse_scatter(self.a_0, wa), sparse_scatter(self.b_0, wb)))
+            .collect()
     }
     fn const_pin_col(&self) -> Option<usize> {
         self.const_pin
@@ -517,6 +553,78 @@ impl LincheckCircuit for CscCircuit {
                 *pb = sb;
             });
         (xa, xb)
+    }
+
+    /// One walk over the nonzeros for up to [`SPLIT_LANES`] claims at a
+    /// time. The walk streams the CSC row indices, which dominate memory
+    /// traffic (~44M for BLAKE3), so each extra claim costs only its
+    /// gathers. Each matrix's weights are interleaved row-major so one
+    /// row's values for every claim share a cache line.
+    fn fold_split_many(&self, ws: &[(&[F128], &[F128])]) -> Vec<(Vec<F128>, Vec<F128>)> {
+        let mut out = Vec::with_capacity(ws.len());
+        for group in ws.chunks(SPLIT_LANES) {
+            match group.len() {
+                1 => out.extend(self.split_lanes::<1>(group)),
+                2 => out.extend(self.split_lanes::<2>(group)),
+                3 => out.extend(self.split_lanes::<3>(group)),
+                4 => out.extend(self.split_lanes::<4>(group)),
+                n => unreachable!("a group holds 1..={SPLIT_LANES} claims, got {n}"),
+            }
+        }
+        out
+    }
+}
+
+/// How many row weights [`CscCircuit::fold_split_many`] carries per walk.
+const SPLIT_LANES: usize = 4;
+
+impl CscCircuit {
+    /// `fold_split_many` for exactly `N` claims in one walk.
+    fn split_lanes<const N: usize>(
+        &self,
+        ws: &[(&[F128], &[F128])],
+    ) -> Vec<(Vec<F128>, Vec<F128>)> {
+        assert_eq!(ws.len(), N);
+        for (wa, wb) in ws {
+            assert_eq!(wa.len(), self.n_cols);
+            assert_eq!(wb.len(), self.n_cols);
+        }
+        let interleave = |w: [&[F128]; N]| -> Vec<[F128; N]> {
+            (0..self.n_cols)
+                .map(|r| std::array::from_fn(|i| w[i][r]))
+                .collect()
+        };
+        let lanes_a = interleave(std::array::from_fn(|i| ws[i].0));
+        let lanes_b = interleave(std::array::from_fn(|i| ws[i].1));
+        let gather = |lanes: &[[F128; N]], rows: &[u32]| {
+            let mut acc = [F128::ZERO; N];
+            for &r in rows {
+                let v = &lanes[r as usize];
+                for i in 0..N {
+                    acc[i] += v[i];
+                }
+            }
+            acc
+        };
+        let one_col = |c: usize| {
+            let a = gather(
+                &lanes_a,
+                &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize],
+            );
+            let b = gather(
+                &lanes_b,
+                &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize],
+            );
+            (a, b)
+        };
+        let cols: Vec<([F128; N], [F128; N])> = if self.n_cols < SUMCHECK_PAR_THRESHOLD {
+            (0..self.n_cols).map(one_col).collect()
+        } else {
+            (0..self.n_cols).into_par_iter().map(one_col).collect()
+        };
+        (0..N)
+            .map(|i| cols.iter().map(|(a, b)| (a[i], b[i])).unzip())
+            .collect()
     }
 }
 
@@ -2424,6 +2532,65 @@ mod tests {
             row.sort();
         }
         SparseBinaryMatrix::new(k, k, rows)
+    }
+
+    /// The CSC kernel's one-walk multi-claim split, the sparse override and
+    /// the trait default all equal the generic column marginals, for shared and per-matrix weights, every group
+    /// size and a remainder group, on both the serial (small) and the
+    /// parallel (large) column path.
+    /// A circuit with only the required methods, so the trait defaults run.
+    struct DefaultsOnly<'a>(&'a super::SparseMatrixCircuit<'a>);
+    impl super::LincheckCircuit for DefaultsOnly<'_> {
+        fn n_cols(&self) -> usize {
+            self.0.n_cols()
+        }
+        fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+            self.0.fold_alpha_batched(alpha, eq_inner)
+        }
+    }
+
+    #[test]
+    fn csc_fold_split_many_matches_fold_split() {
+        use super::{CscCircuit, LincheckCircuit, SparseMatrixCircuit};
+        use crate::matrix_fold::col_marginal;
+        let mut rng = Rng::new(0x5_7117);
+        for k in [64usize, 1 << 13] {
+            let a = random_sparse_matrix(k, 6 * k, &mut rng);
+            let b = random_sparse_matrix(k, 4 * k, &mut rng);
+            let csc = CscCircuit::from_matrices(&a, &b);
+            for n in 1..=9 {
+                // Even claims share one weight (fresh), odd ones carry two
+                // (a folded prior).
+                let wa: Vec<Vec<F128>> = (0..n).map(|_| rng.f128_vec(k)).collect();
+                let wb: Vec<Vec<F128>> = (0..n)
+                    .map(|i| {
+                        if i % 2 == 0 {
+                            wa[i].clone()
+                        } else {
+                            rng.f128_vec(k)
+                        }
+                    })
+                    .collect();
+                let ws: Vec<(&[F128], &[F128])> = wa
+                    .iter()
+                    .zip(&wb)
+                    .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                    .collect();
+                let sparse = SparseMatrixCircuit::new(&a, &b);
+                let default = DefaultsOnly(&sparse);
+                for (name, many) in [
+                    ("csc", csc.fold_split_many(&ws)),
+                    ("sparse", sparse.fold_split_many(&ws)),
+                    ("default", default.fold_split_many(&ws)),
+                ] {
+                    assert_eq!(many.len(), n);
+                    for (i, got) in many.iter().enumerate() {
+                        let want = (col_marginal(&a, &wa[i], k), col_marginal(&b, &wb[i], k));
+                        assert_eq!(*got, want, "{name}: k {k}, {n} claims, claim {i}");
+                    }
+                }
+            }
+        }
     }
 
     // ---- Unit tests for the kernels ----

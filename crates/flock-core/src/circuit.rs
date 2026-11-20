@@ -109,7 +109,9 @@ use product_gkr::{
     prove_batched_with_grinding, s_id_basis, verify_batched_with_grinding,
     verify_batched_with_sigma_and_grinding,
 };
-use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -1346,6 +1348,10 @@ impl SigmaAssertion {
 /// table deliberately implements only matrix marginals: materializing every
 /// plane would multiply the already-large sigma root table's memory, while a
 /// fold/root discharge needs just these two streaming passes.
+/// Rows per parallel task in [`CircuitStructureMatrix`]'s SIGMA-plane row
+/// marginal.
+const SIGMA_ROW_CHUNK: usize = 1 << 10;
+
 pub struct CircuitStructureMatrix<'a> {
     circuit: &'a Circuit,
     mask: LiveMask,
@@ -1384,6 +1390,17 @@ impl<'a> CircuitStructureMatrix<'a> {
     #[inline]
     fn base_cols(&self) -> usize {
         self.base_cols
+    }
+
+    /// The columns the fold marginals walk entry by entry: the bus plane's
+    /// structure columns and the public-column plane's columns. Every other
+    /// column of those two planes is zero.
+    fn walked_cols(&self) -> impl Iterator<Item = usize> + Clone {
+        let b = self.base_cols;
+        (SigmaAssertion::BUS_PLANE * b..SigmaAssertion::BUS_PLANE * b + self.bus_cols.len()).chain(
+            SigmaAssertion::PUBLIC_COLUMN_PLANE * b
+                ..SigmaAssertion::PUBLIC_COLUMN_PLANE * b + self.public_cols.len(),
+        )
     }
 
     #[inline]
@@ -1459,11 +1476,85 @@ impl<'a> CircuitStructureMatrix<'a> {
 }
 
 impl FoldMatrix for CircuitStructureMatrix<'_> {
+    /// `out[r] = Σ_c w[c] · entry(r, c)`. The SIGMA plane needs a per-cell
+    /// walk, and the bus and public-column planes walk their few nonzero
+    /// columns ([`Self::walked_cols`]). Live rows are a prefix of each slot,
+    /// so every other plane's row-r term is a sum over the slots still live
+    /// at `r`:
+    ///
+    /// * LIVE and the boolean pin plane add `w[c]` while `r < count`;
+    /// * MASKED_ID adds `w[c]·enc(slot<<ν | r) = w[c]·enc(slot<<ν) +
+    ///   w[c]·enc(r)` (`enc` places bits, so it is GF(2)-linear and the two
+    ///   fields are disjoint);
+    /// * the element planes do not depend on the row.
+    ///
+    /// Each slot's terms land in a bucket at its count, and a suffix sum
+    /// over the buckets gives every row's total. Addition in GF(2^128) is
+    /// exact, so this equals the plain double loop over [`Self::entry`].
     fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
         assert_eq!(n_rows, self.n_rows());
         assert_eq!(w.len(), self.n_cols());
+        let nu = self.circuit.cells().nu();
+        let base_cols = self.base_cols();
+        let cell_cols = 1usize << (self.circuit.cells().mu() - nu);
+        let col = |plane: usize, slot: usize| w[plane * base_cols + slot];
+        let element_const = [
+            SigmaAssertion::ELEMENT_A_PLANE,
+            SigmaAssertion::ELEMENT_B_PLANE,
+        ]
+        .into_iter()
+        .flat_map(|plane| plane * base_cols..(plane + 1) * base_cols)
+        .filter(|&c| !w[c].is_zero())
+        .fold(F128::ZERO, |acc, c| acc + w[c] * self.entry(0, c));
+        // Bucket k holds the terms valid for rows r < k.
+        let mut flat = vec![F128::ZERO; n_rows + 1];
+        let mut by_r = vec![F128::ZERO; n_rows + 1];
+        let mut sigma_slots: Vec<(usize, F128)> = Vec::new();
+        for slot in 0..cell_cols.min(base_cols) {
+            let cnt = self.mask.counts[slot];
+            let w_id = col(SigmaAssertion::MASKED_ID_PLANE, slot);
+            flat[cnt] +=
+                w_id * F128::new((slot << nu) as u64, 0) + col(SigmaAssertion::LIVE_PLANE, slot);
+            by_r[cnt] += w_id;
+            let w_sig = col(SigmaAssertion::SIGMA_PLANE, slot);
+            if !w_sig.is_zero() {
+                sigma_slots.push((slot, w_sig));
+            }
+        }
+        let registry = self.circuit.registry();
+        for slot in 0..registry.num_boolean().min(base_cols) {
+            if registry.boolean_types()[slot].const_pin.is_some() {
+                let cnt = self.circuit.counts()[slot].min(n_rows);
+                flat[cnt] += col(SigmaAssertion::BOOLEAN_PIN_PLANE, slot);
+            }
+        }
         let mut out = vec![F128::ZERO; n_rows];
-        for (c, &wc) in w.iter().enumerate() {
+        let (mut acc_flat, mut acc_r) = (F128::ZERO, F128::ZERO);
+        for r in (0..n_rows).rev() {
+            acc_flat += flat[r + 1];
+            acc_r += by_r[r + 1];
+            out[r] = element_const + acc_flat + acc_r * F128::new(r as u64, 0);
+        }
+        // The SIGMA plane, row chunks in parallel: inside a chunk each
+        // slot's σ entries are read contiguously.
+        let sigma = self.circuit.sigma();
+        out.par_chunks_mut(SIGMA_ROW_CHUNK)
+            .enumerate()
+            .for_each(|(k, dst)| {
+                let r0 = k * SIGMA_ROW_CHUNK;
+                for &(slot, w_sig) in &sigma_slots {
+                    let end = self.mask.counts[slot].min(r0 + dst.len());
+                    let base = slot << nu;
+                    for r in r0..end {
+                        dst[r - r0] += w_sig * F128::new(sigma[base + r] as u64, 0);
+                    }
+                }
+            });
+        // The bus and public-column planes have no closed form here, but
+        // only their first `bus_cols` / `public_cols` columns are nonzero:
+        // walk those directly.
+        for c in self.walked_cols() {
+            let wc = w[c];
             if wc.is_zero() {
                 continue;
             }
@@ -1474,14 +1565,87 @@ impl FoldMatrix for CircuitStructureMatrix<'_> {
         out
     }
 
+    /// `out[c] = Σ_r w[r] · entry(r, c)`, by plane. Live rows are a prefix
+    /// of each slot, so with prefix sums `P[k] = Σ_{r<k} w[r]` and
+    /// `Q[k] = Σ_{r<k} w[r]·enc(r)`:
+    ///
+    /// * LIVE is `P[count]`, and the boolean pin plane `P[rows]`;
+    /// * MASKED_ID is `enc(slot<<ν)·P[count] + Q[count]` (`enc` is
+    ///   GF(2)-linear and the two bit fields are disjoint);
+    /// * the element planes are `P[2^ν]` times one entry;
+    /// * SIGMA walks its live cells, and the bus and public-column planes
+    ///   their nonzero columns ([`Self::walked_cols`]).
+    ///
+    /// Columns run in parallel. Addition in GF(2^128) is exact, so this
+    /// equals the plain double loop over [`Self::entry`].
     fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
         assert_eq!(w.len(), self.n_rows());
         assert_eq!(n_cols, self.n_cols());
+        let nu = self.circuit.cells().nu();
+        let base_cols = self.base_cols();
+        let cell_cols = 1usize << (self.circuit.cells().mu() - nu);
+        let mut p = Vec::with_capacity(w.len() + 1);
+        let mut q = Vec::with_capacity(w.len() + 1);
+        let (mut sp, mut sq) = (F128::ZERO, F128::ZERO);
+        p.push(sp);
+        q.push(sq);
+        for (r, &wr) in w.iter().enumerate() {
+            sp += wr;
+            sq += wr * F128::new(r as u64, 0);
+            p.push(sp);
+            q.push(sq);
+        }
+        let registry = self.circuit.registry();
+        let sigma = self.circuit.sigma();
         (0..n_cols)
+            .into_par_iter()
             .map(|c| {
-                w.iter()
-                    .enumerate()
-                    .fold(F128::ZERO, |acc, (r, &wr)| acc + wr * self.entry(r, c))
+                let slot = c % base_cols;
+                match c / base_cols {
+                    SigmaAssertion::MASKED_ID_PLANE
+                    | SigmaAssertion::LIVE_PLANE
+                    | SigmaAssertion::SIGMA_PLANE
+                        if slot >= cell_cols =>
+                    {
+                        F128::ZERO
+                    }
+                    SigmaAssertion::MASKED_ID_PLANE => {
+                        let cnt = self.mask.counts[slot];
+                        F128::new((slot << nu) as u64, 0) * p[cnt] + q[cnt]
+                    }
+                    SigmaAssertion::LIVE_PLANE => p[self.mask.counts[slot]],
+                    SigmaAssertion::SIGMA_PLANE => {
+                        let base = slot << nu;
+                        w[..self.mask.counts[slot]]
+                            .iter()
+                            .zip(&sigma[base..])
+                            .fold(F128::ZERO, |acc, (&wr, &sx)| {
+                                acc + wr * F128::new(sx as u64, 0)
+                            })
+                    }
+                    SigmaAssertion::ELEMENT_A_PLANE | SigmaAssertion::ELEMENT_B_PLANE => {
+                        p[w.len()] * self.entry(0, c)
+                    }
+                    SigmaAssertion::BUS_PLANE | SigmaAssertion::PUBLIC_COLUMN_PLANE => {
+                        if self.walked_cols().any(|k| k == c) {
+                            w.iter()
+                                .enumerate()
+                                .fold(F128::ZERO, |acc, (r, &wr)| acc + wr * self.entry(r, c))
+                        } else {
+                            F128::ZERO
+                        }
+                    }
+                    SigmaAssertion::BOOLEAN_PIN_PLANE => {
+                        if slot < registry.num_boolean()
+                            && registry.boolean_types()[slot].const_pin.is_some()
+                        {
+                            p[self.circuit.counts()[slot].min(w.len())]
+                        } else {
+                            F128::ZERO
+                        }
+                    }
+                    _ => F128::ZERO,
+                }
             })
             .collect()
     }
@@ -1680,6 +1844,7 @@ mod tests {
             verify_wiring_deferred, verify_wiring_with_grinding,
         },
         element_r1cs::ElementTableBuilder,
+        matrix_fold::FoldMatrix,
         r1cs::SparseBinaryMatrix,
         schedule::{TableClass, TableType},
         test_rng::Rng,
@@ -2265,6 +2430,67 @@ mod tests {
             mc.value,
             "the MatrixClaim form discharges — the accumulator's path"
         );
+        // The plane-wise marginals equal the plain double loop over `entry`.
+        let (n_rows, n_cols) = (m.n_rows(), m.n_cols());
+        let w_row: Vec<F128> = (0..n_rows).map(|_| rng.f128()).collect();
+        let w_col: Vec<F128> = (0..n_cols).map(|_| rng.f128()).collect();
+        let naive_col: Vec<F128> = (0..n_cols)
+            .map(|c| (0..n_rows).fold(F128::ZERO, |a, r| a + w_row[r] * m.entry(r, c)))
+            .collect();
+        let naive_row: Vec<F128> = (0..n_rows)
+            .map(|r| (0..n_cols).fold(F128::ZERO, |a, c| a + w_col[c] * m.entry(r, c)))
+            .collect();
+        assert_eq!(m.col_marginal(&w_row, n_cols), naive_col, "col marginal");
+        assert_eq!(m.row_marginal(&w_col, n_rows), naive_row, "row marginal");
+        // The same oracle with the boolean type PINNED, so the pin plane's
+        // closed form is exercised too.
+        {
+            let mut types = reg.types().to_vec();
+            types
+                .iter_mut()
+                .find(|t| !t.is_element())
+                .expect("a boolean type")
+                .const_pin = Some(0);
+            let pinned = Registry::new(types, nu);
+            let pc = Circuit::new(
+                &pinned,
+                circuit.counts().to_vec(),
+                9,
+                vec![
+                    vec![Cell::new(2, 0), Cell::new(0, 1), Cell::new(3, 2)],
+                    vec![
+                        Cell::new(2, 1),
+                        Cell::new(4, 3),
+                        Cell::new(6, 0),
+                        Cell::new(8, 4),
+                    ],
+                    vec![Cell::new(5, 1), Cell::new(1, 2)],
+                ],
+            )
+            .expect("valid pinned circuit");
+            let pm = SigmaAssertion::matrix(&pc);
+            let pin_col = SigmaAssertion::BOOLEAN_PIN_PLANE * pm.base_cols();
+            assert!(
+                (0..n_rows).any(|r| !pm.entry(r, pin_col).is_zero()),
+                "the pinned type puts entries on the pin plane"
+            );
+            let naive_col: Vec<F128> = (0..pm.n_cols())
+                .map(|c| (0..n_rows).fold(F128::ZERO, |a, r| a + w_row[r] * pm.entry(r, c)))
+                .collect();
+            let naive_row: Vec<F128> = (0..n_rows)
+                .map(|r| (0..pm.n_cols()).fold(F128::ZERO, |a, c| a + w_col[c] * pm.entry(r, c)))
+                .collect();
+            assert_eq!(
+                pm.col_marginal(&w_row, pm.n_cols()),
+                naive_col,
+                "pinned col marginal"
+            );
+            assert_eq!(
+                pm.row_marginal(&w_col, n_rows),
+                naive_row,
+                "pinned row marginal"
+            );
+        }
 
         let mut bad = assertion.clone();
         bad.value += F128::ONE;
@@ -2821,5 +3047,50 @@ mod tests {
         );
         let mut ch = FsChallenger::new(b"circuit-unit");
         verify_wiring(&free, &public, &proof, &mut ch).expect("the plain verify");
+    }
+
+    /// The plane-wise fold marginals equal the plain double loop over
+    /// `entry` on a circuit with a bus and on one with public columns: the
+    /// two planes past the boolean pin plane.
+    #[test]
+    fn structure_marginals_cover_the_bus_and_public_column_planes() {
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let bus = bus_circuit(&reg, F128::new(7, 0));
+        let wires = vec![vec![Cell::new(8, 0), Cell::new(0, 0)]];
+        let plain = Circuit::new(&reg, vec![1, 4, 6], 1, wires.clone()).unwrap();
+        let mut rng = Rng::new(0xC1C0_0007);
+        let (_, public) = buffer_for(&reg, &plain, &mut rng);
+        let fixed = public.iter().map(|&p| Some(p)).collect();
+        let pubcols = Circuit::new_with_fixed_public(&reg, vec![1, 4, 6], fixed, wires)
+            .unwrap()
+            .with_public_columns_opened()
+            .with_live_slots_packed();
+        for (label, circuit, plane) in [
+            ("bus", &bus, SigmaAssertion::BUS_PLANE),
+            (
+                "public columns",
+                &pubcols,
+                SigmaAssertion::PUBLIC_COLUMN_PLANE,
+            ),
+        ] {
+            let m = SigmaAssertion::matrix(circuit);
+            let (n_rows, n_cols) = (m.n_rows(), m.n_cols());
+            let b = m.base_cols();
+            assert!(
+                (plane * b..(plane + 1) * b).any(|c| (0..n_rows).any(|r| !m.entry(r, c).is_zero())),
+                "{label}: the plane has entries"
+            );
+            let w_row: Vec<F128> = (0..n_rows).map(|_| rng.f128()).collect();
+            let w_col: Vec<F128> = (0..n_cols).map(|_| rng.f128()).collect();
+            let naive_col: Vec<F128> = (0..n_cols)
+                .map(|c| (0..n_rows).fold(F128::ZERO, |a, r| a + w_row[r] * m.entry(r, c)))
+                .collect();
+            let naive_row: Vec<F128> = (0..n_rows)
+                .map(|r| (0..n_cols).fold(F128::ZERO, |a, c| a + w_col[c] * m.entry(r, c)))
+                .collect();
+            assert_eq!(m.col_marginal(&w_row, n_cols), naive_col, "{label}: col");
+            assert_eq!(m.row_marginal(&w_col, n_rows), naive_row, "{label}: row");
+        }
     }
 }

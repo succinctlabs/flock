@@ -11,7 +11,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 24)
+//!   byte  5       VERSION                  (currently 26)
 //!   bytes 6..7    flavor: 2 = R1cs, 4 = Mixed, 5 = TowerRoot, 6 = R1csAg
 //!                 (0/1 reserved: legacy BaseFold; 3 was the retired chain)
 //!   bytes 7..     bincode-serialized payload
@@ -83,8 +83,17 @@ const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 /// level (rates 1/2/3/4/5 at m29, Σq 550) instead of +2, so a v24 `fast`
 /// proof carries a different level count and query schedule. `fast100`,
 /// `slim`, `slim100` and `secure` payloads are unchanged.
+/// v26 (2026-11-10): the affine F128 fold (#76) on top of v25. The merged
+/// open's inner opening became an enum (`MergedInnerOpen::{Split, Affine}`,
+/// the `fast-affine` / `slim-affine` profiles), which adds a variant tag to
+/// every merged-open payload; and transcript-v4: the sponge-chained BLAKE3
+/// transcript absorbs each run of consecutive scalar observes as ONE
+/// `[header(KIND_RUN, n) | values]` record, so every tower outer's
+/// challenges moved and the `Chain100` config tag is gone. Payloads on the
+/// default (tree-BLAKE3 / SHA-256) transcripts are otherwise unchanged.
+/// (#76 called these two changes v24 and v25 before it merged `main`.)
 /// (The per-version history this file used to carry lives in git.)
-const VERSION: u8 = 25;
+const VERSION: u8 = 26;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see

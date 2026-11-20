@@ -13,11 +13,11 @@ use flock_core::{
 use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
-        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LaneFamily, LeafOuter, Online,
-        RootBundle, RootDischargeFailure, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
-        UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
-        chain_blake_r1cs, chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base,
-        env_pass_base,
+        ChainLane, ChainProof, DEV_BLOCKS, DOMAIN, F128, FlNode, FsChallenger, LaneFamily,
+        LeafOuter, Online, RootBundle, RootDischargeFailure, SelfCheck, SpineIn, Tower,
+        TowerProver, TowerVerifyError, TowerVk, UnionInstance, build_chain_proof,
+        build_first_level_node, build_node_outer_app, chain_blake_r1cs, chain_jagged_params,
+        env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base,
         envelope::STEADY_OVERRIDE,
         envelope_shape,
         gates_blake3::Rng,
@@ -64,7 +64,7 @@ pub(super) fn chain_spine_converges() {
     let cfg = test_config();
 
     let env = envelope_shape();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_5B1E);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let mut cps = Vec::new();
@@ -430,7 +430,7 @@ pub(super) fn chain_spine_converges() {
 pub(super) fn chain_tower_e2e_with_lane() {
     let cfg = test_config();
 
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_0007);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
@@ -629,22 +629,22 @@ pub(super) fn chain_tower_e2e_with_lane() {
     );
 }
 
-/// **Task 7a: THE M32 HEADLINE.** The chain tower at the THROUGHPUT-OPTIMAL
-/// leaf size: 4 chain segments of `CHAIN_BLOCKS` (default 2^18 = 262,144)
-/// compressions each — fast profile, ~16.8 MB hashed per leaf — through
+/// **Task 7a: THE HEADLINE.** The chain tower at the THROUGHPUT-OPTIMAL
+/// leaf size: 4 chain segments of `CHAIN_BLOCKS` (default 2^19 = 524,288)
+/// compressions each — fast profile, ~33.6 MB hashed per leaf — through
 /// two first-level nodes and one internal node with the lane, timed per
-/// phase. The statement: h_end == H^(4·2^18)(h_start) ≈ one million
+/// phase. The statement: h_end == H^(4·2^19)(h_start) ≈ two million
 /// sequential compressions, proven and folded to one recursable proof.
 /// Warm-box numbers; the cold certification wants the reboot + probe
 /// ritual first (the recorded discipline).
 #[test]
 #[ignore] // The headline measurement — run explicitly with --nocapture.
-pub(super) fn chain_tower_m32_headline() {
+pub(super) fn chain_tower_headline() {
     let cfg = test_config();
     let n_blocks: usize = var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1 << 18);
+        .unwrap_or(1 << 19);
     let mut rng = Rng(0xC4A1_0008);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
 
@@ -769,13 +769,14 @@ pub(super) fn chain_tower_m32_headline() {
         serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
     proof_census_mixed("internal node", &node.proof, &node.pcs);
-    proof_census_mixed("chain leaf (m32 Fast)", &cp0.inner.proof, &cp0.inner.pcs);
+    proof_census_mixed("chain leaf", &cp0.inner.proof, &cp0.inner.pcs);
     proof_census_mixed("FL node", &fl0.lo.proof, &fl0.lo.pcs);
 }
 
 /// **THE ONLINE BENCH: leaf, first-level node, internal node.** One number
-/// per stage, measuring only what a prover pays PER STATEMENT — the walk,
-/// the child tape sources, witness assembly, and the prove. Per-SHAPE setup
+/// per stage, measuring only what a prover pays PER STATEMENT — for an
+/// FL/node the matrix-claim fold AND its outer proof (the walk, the child
+/// tape sources, witness assembly, and the prove). Per-SHAPE setup
 /// (circuit emit+finish, R1CS tables, PCS params, the fill plan, the tape
 /// pins) is timed but reported apart and never folded into a per-proof
 /// number: a shape is statement-independent, so a production prover builds
@@ -787,7 +788,7 @@ pub(super) fn chain_tower_m32_headline() {
 /// first-touch allocator costs that are warmup, not marginal cost.
 ///
 /// Knobs: `BENCH_RUNS` (default 3), `CHAIN_BLOCKS` (default 256 — set
-/// 262144 for the m32 production leaf), `TOWER_CONFIG=chain128` for the
+/// 524288 for the m33 production leaf), `TOWER_CONFIG=chain128` for the
 /// 128-bit config. BOX DISCIPLINE: run the stability probe first and reboot if it
 /// is far out of band — this box's benchmarks self-corrupt under sustained
 /// load, and nothing here can tell you that happened.
@@ -802,7 +803,7 @@ pub(super) fn tower_online_bench() {
     let n_blocks: usize = var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(256);
+        .unwrap_or(DEV_BLOCKS);
     let mut rng = Rng(0xC4A1_00BE);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
 
@@ -1002,11 +1003,11 @@ pub(super) fn tower_online_bench() {
 #[ignore] // Heavy — eight chain proofs and seven outers via the driver.
 pub(super) fn tower_driver_e2e() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xD41_4E12);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
 
-    let mut tower = Tower::prove(cfg, h0, n_blocks, 8);
+    let mut tower = Tower::prove(cfg, SelfCheck::Full, h0, n_blocks, 8);
     assert_eq!(
         tower.statement().h_start,
         h0,
@@ -1116,7 +1117,7 @@ pub(super) fn tower_driver_e2e() {
 #[ignore] // Heavy — four towers (6+8+6+4 leaves) end to end.
 pub(super) fn tower_verify_root_e2e() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let env = envelope_shape();
     let vk = TowerVk::generate(cfg, n_blocks);
 
@@ -1128,7 +1129,7 @@ pub(super) fn tower_verify_root_e2e() {
     // (1) a fresh k = 4 steady tower the VK never saw.
     let mut rng = Rng(0xD41_4E13);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
-    let tower = Tower::prove(cfg, h0, n_blocks, 8);
+    let tower = Tower::prove(cfg, SelfCheck::Full, h0, n_blocks, 8);
     let stmt = *tower.statement();
     verify_root(&vk, &stmt, &tower.root_bundle()).expect("the k = 4 root verifies");
 
@@ -1261,7 +1262,7 @@ pub(super) fn tower_verify_root_e2e() {
     );
 
     // (3) a fresh k = 3 tower — steady shape, passenger-less, exact span.
-    let t3 = Tower::prove(cfg, native_chain(&h0, 128), n_blocks, 6);
+    let t3 = Tower::prove(cfg, SelfCheck::Full, native_chain(&h0, 128), n_blocks, 6);
     verify_root(&vk, t3.statement(), &t3.root_bundle()).expect("the k = 3 root verifies");
     // A CROSS-CLASS span lie now dies on the statement leg too (the
     // counter mismatches before the passenger rule is consulted; the
@@ -1277,11 +1278,39 @@ pub(super) fn tower_verify_root_e2e() {
     );
 
     // (4) a fresh k = 2 base-rooted tower — the other root shape.
-    let t2 = Tower::prove(cfg, native_chain(&h0, 64), n_blocks, 4);
+    let t2 = Tower::prove(cfg, SelfCheck::Full, native_chain(&h0, 64), n_blocks, 4);
     verify_root(&vk, t2.statement(), &t2.root_bundle()).expect("the k = 2 root verifies");
 }
 
-/// **THE VK'S PUBLISHED IDENTITY, PINNED** (chain128 @ 256-block
+/// **SKIPPING THE SELF-CHECKS AND REUSING THE SETUP LEAVE THE ROOT
+/// ALONE.** The same eight-leaf tower (base + two spine folds, every
+/// builder kind, the spine slot reused) proved three ways ships the same
+/// wire bundle, byte for byte: `SelfCheck::Full` from scratch,
+/// `SelfCheck::Skip` from scratch, and `SelfCheck::Skip` over a
+/// [`TowerProver`] whose setup ran on a different statement. So the checks
+/// feed nothing, the cached shapes are the builds' own, and the `Full`
+/// run's self-verifies vouch for the other two roots.
+#[test]
+#[ignore] // Heavy — three eight-leaf towers and a six-leaf setup.
+pub(super) fn tower_skip_and_setup_byte_identical() {
+    let cfg = test_config();
+    let h0: [u32; 16] = from_fn(|i| 0x5E1F_C4EC ^ i as u32);
+    let full = Tower::prove(cfg, SelfCheck::Full, h0, DEV_BLOCKS, 8);
+    let skip = Tower::prove(cfg, SelfCheck::Skip, h0, DEV_BLOCKS, 8);
+    let prover = TowerProver::setup(cfg, DEV_BLOCKS);
+    let cached = prover.prove(SelfCheck::Skip, h0, 8);
+    let want = full.root_bundle_bytes();
+    for (name, t) in [("Skip", &skip), ("set-up Skip", &cached)] {
+        assert_eq!(t.statement(), full.statement(), "{name}: one statement");
+        assert!(
+            t.root_bundle_bytes() == want,
+            "the {name} root's wire bundle differs from the Full root's"
+        );
+        t.discharge_root().expect("the root's residue discharges");
+    }
+}
+
+/// **THE VK'S PUBLISHED IDENTITY, PINNED** (chain128 @ DEV_BLOCKS
 /// leaves): the digest fingerprint a consumer compares their locally
 /// generated VK against instead of trusting a shipped blob. Any
 /// deliberate shape change moves these — re-bless with
@@ -1290,12 +1319,7 @@ pub(super) fn tower_verify_root_e2e() {
 #[test]
 #[ignore] // Heavy — one VK generation (a six-leaf reference tower).
 pub(super) fn tower_vk_fingerprint_pinned() {
-    let cfg = test_config();
-    if cfg != TowerConfig::Chain128 {
-        eprintln!("the fingerprint pin is chain128-only; skipping under {cfg:?}");
-        return;
-    }
-    let vk = TowerVk::generate(cfg, 256);
+    let vk = TowerVk::generate(test_config(), DEV_BLOCKS);
     let fp = vk.fingerprint();
     let hex = |d: &[u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
     if var("TOWER_VK_FP_PRINT").is_ok() {
@@ -1307,7 +1331,7 @@ pub(super) fn tower_vk_fingerprint_pinned() {
         println!("outer_registry: {}", hex(&fp.outer_registry));
         println!("publics_len:    {}", fp.publics_len);
     }
-    assert_eq!(fp.blocks_per_leaf, 256);
+    assert_eq!(fp.blocks_per_leaf, DEV_BLOCKS);
     assert_eq!(hex(&fp.chain_circuit), PIN_CHAIN_CIRCUIT, "chain circuit");
     assert_eq!(hex(&fp.fl_circuit), PIN_FL_CIRCUIT, "FL circuit");
     assert_eq!(hex(&fp.base_circuit), PIN_BASE_CIRCUIT, "base circuit");
@@ -1329,39 +1353,29 @@ pub(super) fn tower_vk_fingerprint_pinned() {
     assert_eq!(fp.publics_len, PIN_PUBLICS_LEN, "publics length");
 }
 
-// The blessed chain128@256 fingerprint (see `tower_vk_fingerprint_pinned`).
-// Blessed 2026-09-07 (second cut: the grounded counter-base word)
-// (chain circuit + registries UNCHANGED by design; the three outer
-// circuits moved with the nine-word app block).
-// Re-blessed 2026-11-02: the three outer circuits move with the 2^8 slot
-// count alignment (`ENV_ROW_ALIGN_LOG`); chain circuit, registries and
-// publics UNCHANGED. The FL pin was already stale before (76f8… at
-// b30e6d9).
-// Re-blessed 2026-11-03: family H by Horner adds two envelope table types
-// (`SquareChainGate`, `HornerStepGate`), so the three outer circuits and
-// the outer registry move; chain circuit, chain registry and publics
-// UNCHANGED. Two identical prints.
-// Re-blessed 2026-11-03: the lane pin drops 31 → 29, so a parent opens
-// 29-word rows of its node children; the base and steady circuits move.
-// The FL circuit (leaf children), chain circuit, both registries and
-// publics UNCHANGED. Two identical prints.
-// Re-blessed 2026-11-03: ĝ on forward Frobenius chains, the sum-first
-// transpose dot (a new `TransposeDotGate` type) and the lane pin 29 → 28
-// move the three outer circuits and the outer registry; chain circuit,
-// chain registry and publics UNCHANGED. Two identical prints.
-// Re-blessed 2026-11-05 (Ron's #70 review): the FL circuit moves with the
-// leaf children's PoW predicate rows (`emit_child_region`, the port of PR
-// #71), then FL, base and steady with the in-circuit nonzero check on every
-// product-GKR top (`emit_nonzero_top`). Chain circuit, both registries and
-// publics UNCHANGED. Two identical prints.
-// Re-blessed 2026-11-06: the Fast leaf's +1/level ladder (proof-IO v25)
-// moves the FL circuit (it replays the leaf's queries), and the lane pin
-// 28 → 31 moves all three outer circuits. Chain circuit, both registries
-// and publics UNCHANGED. Two identical prints.
-const PIN_CHAIN_CIRCUIT: &str = "b8f442da32b9961612ccaf9acb39cadcd4592e913b2b208a1b9740d01c10e9c9";
-const PIN_FL_CIRCUIT: &str = "55db58ea52d8531d3c730e79fdede16a288ce44f79745b7ef9d347dba7155281";
-const PIN_BASE_CIRCUIT: &str = "eb7e5002ab1f8601d8d75a05288f9f02b4bb825309ccb0d2115f111d9ba906f5";
-const PIN_STEADY_CIRCUIT: &str = "d62eb551217b862c2aa7bd0ba437be79cf2268d484684efa3de43370a22ac4ba";
-const PIN_CHAIN_REGISTRY: &str = "3126c5ce825e8fc3942843c0548ba43964b1daa5751a834fcbbc1c3ab58e40fe";
-const PIN_OUTER_REGISTRY: &str = "c36112d619a1907c2132257f311ec7a90e81b932d20257b197d458b4267201c0";
-const PIN_PUBLICS_LEN: usize = 5684;
+// The blessed chain128 fingerprint at DEV_BLOCKS = 1024-block leaves (see
+// `tower_vk_fingerprint_pinned`). Re-blessed 2026-11-05: the affine F128
+// inner (FastAffine leaf, SlimAffine outers) moves every digest.
+// Re-blessed 2026-11-06: the envelope retune (publics 5684 -> 3712,
+// ACC_MAIN 1152 -> 832, lanes 31 -> 26) moves the three outer circuits;
+// the chain leaf and both registries are unchanged.
+// Re-blessed 2026-11-07: transcript-v4 (scalar runs share one header)
+// moves the same three; chain circuit and registries unchanged.
+// Re-blessed 2026-11-08: spread_w 20 -> 21 (the m33 production leaf's L0
+// depth) moves the three outer circuits and the outer registry; the chain
+// circuit and chain registry are unchanged.
+// Re-blessed 2026-11-10: main merged in (#66–#74). Family H by Horner with
+// the sum-first transpose dot and ĝ on forward Frobenius chains (three
+// envelope element types, mu 22 -> 23), the leaf children's PoW predicate
+// rows and in-circuit nonzero grand products, and the envelope re-fitted to
+// the leanXMSS first-level node (body 2614 -> 3382, ACC_MAIN 832 -> 896,
+// publics 3712 -> 4544) move the three outer circuits and the outer
+// registry. The chain circuit and chain registry are unchanged. Two
+// identical prints.
+const PIN_CHAIN_CIRCUIT: &str = "f7a065447042245cccc573887e714d1a9f754583a7d0f120c9753e51d6037fa3";
+const PIN_FL_CIRCUIT: &str = "e901fbb7c585d93a55a9066f32cf4c4619e0cce8ab43ff207648b35f323ab3c5";
+const PIN_BASE_CIRCUIT: &str = "9524b8680950f1b43a888731967a33b9a2b4a65a6ea194e945fa48458ecef111";
+const PIN_STEADY_CIRCUIT: &str = "56f87454d68e9a929980a8d2f2b8b8819109d0810d2a3333871945e2e009e588";
+const PIN_CHAIN_REGISTRY: &str = "c2a387fffa3d06ccf25e341c2faa4e5d9b62015fc3f74a8364206ff08abb24a3";
+const PIN_OUTER_REGISTRY: &str = "503617249dcb35d7d766340d0b5a0c3e3fb526bc686f3fb402b3a4ea914b9f1b";
+const PIN_PUBLICS_LEN: usize = 4544;

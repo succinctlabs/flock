@@ -28,7 +28,7 @@ flock-transcript = { path = "crates/flock-transcript" }
 rayon = "1.10"
 sha2 = { version = "0.10", features = ["asm"] }
 rand_core = "0.9"
-blake3 = "1.5"
+blake3 = { version = "1.5", features = ["rayon"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 toml = "0.8"

@@ -30,8 +30,8 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 #[cfg(test)]
 use {
     crate::tower::{
-        build_chain_proof, build_first_level_node, gates_blake3::Rng, native_chain, pack4,
-        test_config,
+        DEV_BLOCKS, build_chain_proof, build_first_level_node, gates_blake3::Rng, native_chain,
+        pack4, test_config,
     },
     std::array::from_fn,
 };
@@ -49,10 +49,10 @@ use crate::{
         BitSpreadGate, BitSpreadTable, Blake3Gate, ChildSlots, DOMAIN, ENV_ACC_MAIN_WORDS, EnvTail,
         F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FoldPub, FsChallenger, HashKind,
         LeafOuter, MatrixClaim, MergedChain, MixedProof, Online, PARENT, PcsParams, PowMaskGate,
-        PowMaskTable, RealRegion, RealTape, SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable,
-        TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire, ZskipTapeRec, ZskipWires,
-        assert_chain_replays, balance_extra_rows, bytes_payload_mask, challenge_word_locs,
-        check_ag_skip_publics, check_fold_publics, check_jagged_fold_publics,
+        PowMaskTable, RealRegion, RealTape, SLOT_WORDS, SelfCheck, ShapeBuilder, ShapeSlot,
+        SwapGate, SwapTable, TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire,
+        ZskipTapeRec, ZskipWires, assert_chain_replays, balance_extra_rows, bytes_payload_mask,
+        challenge_word_locs, check_ag_skip_publics, check_fold_publics, check_jagged_fold_publics,
         check_real_child_region, cw, emit_ag_point_binding, emit_fiat_shamir_chain,
         emit_fiat_shamir_chain_partitioned, emit_fold_region, emit_jagged_fold_region,
         emit_lagrange_lows, emit_real_child_region, emit_recorded_pow_checks, env_acc_chain_base,
@@ -266,6 +266,30 @@ pub fn build_node_outer_app(
     lane: Option<ChainLane<'_>>,
     spine: Option<SpineIn<'_>>,
 ) -> NodeOut {
+    build_node_outer_with(
+        cfg,
+        SelfCheck::Full,
+        &ShapeSlot::default(),
+        los,
+        app_stmt,
+        lane,
+        spine,
+    )
+}
+
+/// [`build_node_outer_app`] with its self-checks gated by `checks` (see
+/// [`SelfCheck`]): the same proof, publics and block either way. `slot` is
+/// this node kind's setup cache (see [`ShapeSlot`]).
+#[allow(clippy::too_many_arguments)]
+pub fn build_node_outer_with(
+    cfg: TowerConfig,
+    checks: SelfCheck,
+    slot: &ShapeSlot,
+    los: &[&LeafOuter],
+    app_stmt: Option<usize>,
+    lane: Option<ChainLane<'_>>,
+    spine: Option<SpineIn<'_>>,
+) -> NodeOut {
     const M11_NODE_DOMAIN: &[u8] = b"flock-mvp11-two-to-one-v0";
 
     // ARITY IS A KNOB: the node folds `k = los.len()` children in one
@@ -429,52 +453,165 @@ pub fn build_node_outer_app(
         }
     });
     let priors: Vec<&Accumulator> = prior_acc.iter().collect();
-    let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
-    let (agg, acc_p) = prove_aggregate_classes_with_grinding(
-        registry,
-        &mats,
-        &lcs,
-        &bool_asserts,
-        &el_mats,
-        &el_asserts,
-        &sigma_keys,
-        &jagged_p,
-        &priors,
-        tower_fold_grinding(cfg),
-        &mut chp,
-    )
-    .expect("the node fold proves");
-    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_NODE_DOMAIN));
-    let acc_v = verify_aggregate_classes_with_grinding(
-        registry,
-        &bool_asserts,
-        &el_asserts,
-        &sigma_keys,
-        &jagged_v,
-        &priors,
-        &agg,
-        tower_fold_grinding(cfg),
-        &mut rec,
-    )
-    .expect("the node fold verifies");
+    // THE TWO FOLDS RUN TOGETHER. The main fold and the lane fold share
+    // no input, output or transcript (the lane has its own domain and
+    // folds priors only), and each keeps only ~5 of the pool's cores busy
+    // (small sequential sumcheck rounds), so `join` overlaps them. The
+    // folds' results are unchanged; only the schedule moves.
+    const LANE_DOMAIN: &[u8] = b"flock-chain-lane-v0";
+    let lane_el_asserts: [(&UnionInstance<'_>, ElementAssertion); 0] = [];
+    let lane_jagged: Option<(Vec<JaggedKeyProve<'_>>, Vec<JaggedKeyVerify<'_>>)> =
+        lane.as_ref().map(|ln| {
+            // The jagged key rides PRIORS-ONLY through the lane, exactly
+            // like the lane's other groups: the FL children's chain-keyed
+            // entries fold with no fresh claims.
+            (
+                vec![(ln.circuit.digest(), ln.params, Vec::new())],
+                vec![(ln.circuit.digest(), Vec::new())],
+            )
+        });
+    let main_fold = || {
+        let t_fold = Instant::now();
+        let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
+        let (agg, acc_p) = prove_aggregate_classes_with_grinding(
+            registry,
+            &mats,
+            &lcs,
+            &bool_asserts,
+            &el_mats,
+            &el_asserts,
+            &sigma_keys,
+            &jagged_p,
+            &priors,
+            tower_fold_grinding(cfg),
+            &mut chp,
+        )
+        .expect("the node fold proves");
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_NODE_DOMAIN));
+        let acc_v = verify_aggregate_classes_with_grinding(
+            registry,
+            &bool_asserts,
+            &el_asserts,
+            &sigma_keys,
+            &jagged_v,
+            &priors,
+            &agg,
+            tower_fold_grinding(cfg),
+            &mut rec,
+        )
+        .expect("the node fold verifies");
+        (agg, acc_p, acc_v, rec, t_fold.elapsed().as_secs_f64() * 1e3)
+    };
+    let lane_fold = || {
+        lane.as_ref()
+            .zip(lane_jagged.as_ref())
+            .map(|(ln, (ljagged_p, ljagged_v))| {
+                let t_lane = Instant::now();
+                // A leanXMSS lane folds under the shared binding over its
+                // leaves' dropped words; the chain lane binds per claim.
+                let shared = match ln.family {
+                    LaneFamily::Batches { dropped, .. } => Some(dropped),
+                    LaneFamily::Chain => None,
+                };
+                let lsigma = [(ln.circuit, Vec::new())];
+                let grinding = tower_fold_grinding(cfg);
+                let mut chp = FsChallenger::with_chained_blake3(LANE_DOMAIN);
+                let (lagg, lacc_p) = match shared {
+                    Some(dropped) => prove_aggregate_classes_shared_with_grinding(
+                        ln.registry,
+                        dropped,
+                        ln.mats,
+                        ln.circs,
+                        &[],
+                        &[],
+                        &lane_el_asserts,
+                        &lsigma,
+                        ljagged_p,
+                        ln.priors,
+                        grinding,
+                        &mut chp,
+                    ),
+                    None => prove_aggregate_classes_with_grinding(
+                        ln.registry,
+                        ln.mats,
+                        ln.circs,
+                        &[],
+                        &[],
+                        &lane_el_asserts,
+                        &lsigma,
+                        ljagged_p,
+                        ln.priors,
+                        grinding,
+                        &mut chp,
+                    ),
+                }
+                .expect("the lane fold proves");
+                let mut lrec =
+                    RecordingChallenger::new(FsChallenger::with_chained_blake3(LANE_DOMAIN));
+                let lacc_v = match shared {
+                    Some(dropped) => verify_aggregate_classes_shared_with_grinding(
+                        ln.registry,
+                        dropped,
+                        &[],
+                        &lane_el_asserts,
+                        &lsigma,
+                        ljagged_v,
+                        ln.priors,
+                        &lagg,
+                        grinding,
+                        &mut lrec,
+                    ),
+                    None => verify_aggregate_classes_with_grinding(
+                        ln.registry,
+                        &[],
+                        &lane_el_asserts,
+                        &lsigma,
+                        ljagged_v,
+                        ln.priors,
+                        &lagg,
+                        grinding,
+                        &mut lrec,
+                    ),
+                }
+                .expect("the lane fold verifies");
+                (
+                    lagg,
+                    lacc_p,
+                    lacc_v,
+                    lrec,
+                    t_lane.elapsed().as_secs_f64() * 1e3,
+                )
+            })
+    };
+    let t_folds = Instant::now();
+    let ((agg, acc_p, acc_v, rec, main_fold_ms), mut lane_folded) =
+        rayon::join(main_fold, lane_fold);
+    // The two folds' joint wall time, split back into the reported
+    // main / lane parts in proportion to their own times.
+    let folds_wall_ms = t_folds.elapsed().as_secs_f64() * 1e3;
+    let lane_own_ms = lane_folded.as_ref().map_or(0.0, |l| l.4);
+    let fold_scale = folds_wall_ms / (main_fold_ms + lane_own_ms).max(f64::MIN_POSITIVE);
+    let main_fold_ms = main_fold_ms * fold_scale;
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
-    assert!(acc_v.discharge(&mats), "the boolean group discharges");
-    assert!(
-        acc_v.discharge_element(&el_mats),
-        "the element group discharges"
-    );
-    assert!(
-        acc_v.discharge_sigma(&key_circuits),
-        "the sigma group discharges"
-    );
     assert_eq!(acc_v.jagged.len(), n_keys, "one jagged entry per key");
     let jag_tables: Vec<([u8; 32], &JaggedParams)> = (0..n_keys)
         .map(|j| (key_digests[j], &params_j[j]))
         .collect();
-    assert!(
-        acc_v.discharge_jagged(&jag_tables),
-        "the folded jagged entries discharge against their children's layouts"
-    );
+    if checks.on() {
+        assert!(acc_v.discharge(&mats), "the boolean group discharges");
+        assert!(
+            acc_v.discharge_element(&el_mats),
+            "the element group discharges"
+        );
+        assert!(
+            acc_v.discharge_sigma(&key_circuits),
+            "the sigma group discharges"
+        );
+        assert!(
+            acc_v.discharge_jagged(&jag_tables),
+            "the folded jagged entries discharge against their children's layouts"
+        );
+    }
 
     // The fold groups in aggregate order, from the CHILDREN'S OWN
     // assertion data (the same constructors the verifier gathers with).
@@ -669,78 +806,12 @@ pub fn build_node_outer_app(
     // ---- the LANE (task 6): the children's LOWER-registry accumulators
     // fold PRIORS-ONLY — natively here, in-circuit below. 3 groups
     // (bool A/B + sigma) × [priorL, priorR], no fresh claims. ----
-    const LANE_DOMAIN: &[u8] = b"flock-chain-lane-v0";
+    let mut lane_fold_ms = 0.0;
     let lane_native = lane.as_ref().map(|ln| {
-        let el_asserts_l: [(&UnionInstance<'_>, ElementAssertion); 0] = [];
-        // The jagged key rides PRIORS-ONLY through the lane, exactly like
-        // the lane's other groups: the FL children's chain-keyed entries
-        // fold with no fresh claims.
-        let ljagged_p: Vec<JaggedKeyProve<'_>> = vec![(ln.circuit.digest(), ln.params, Vec::new())];
-        let ljagged_v: Vec<JaggedKeyVerify<'_>> = vec![(ln.circuit.digest(), Vec::new())];
-        let shared = match ln.family {
-            LaneFamily::Batches { dropped, .. } => Some(dropped),
-            LaneFamily::Chain => None,
-        };
-        let lsigma = [(ln.circuit, Vec::new())];
-        let grinding = tower_fold_grinding(cfg);
-        let mut chp = FsChallenger::with_chained_blake3(LANE_DOMAIN);
-        let (lagg, lacc_p) = match shared {
-            Some(dropped) => prove_aggregate_classes_shared_with_grinding(
-                ln.registry,
-                dropped,
-                ln.mats,
-                ln.circs,
-                &[],
-                &[],
-                &el_asserts_l,
-                &lsigma,
-                &ljagged_p,
-                ln.priors,
-                grinding,
-                &mut chp,
-            ),
-            None => prove_aggregate_classes_with_grinding(
-                ln.registry,
-                ln.mats,
-                ln.circs,
-                &[],
-                &[],
-                &el_asserts_l,
-                &lsigma,
-                &ljagged_p,
-                ln.priors,
-                grinding,
-                &mut chp,
-            ),
-        }
-        .expect("the lane fold proves");
-        let mut lrec = RecordingChallenger::new(FsChallenger::with_chained_blake3(LANE_DOMAIN));
-        let lacc_v = match shared {
-            Some(dropped) => verify_aggregate_classes_shared_with_grinding(
-                ln.registry,
-                dropped,
-                &[],
-                &el_asserts_l,
-                &lsigma,
-                &ljagged_v,
-                ln.priors,
-                &lagg,
-                grinding,
-                &mut lrec,
-            ),
-            None => verify_aggregate_classes_with_grinding(
-                ln.registry,
-                &[],
-                &el_asserts_l,
-                &lsigma,
-                &ljagged_v,
-                ln.priors,
-                &lagg,
-                grinding,
-                &mut lrec,
-            ),
-        }
-        .expect("the lane fold verifies");
+        let (lagg, lacc_p, lacc_v, lrec, own_ms) = lane_folded
+            .take()
+            .expect("the lane fold ran beside the main fold");
+        lane_fold_ms = own_ms * fold_scale;
         assert_eq!(lacc_p, lacc_v, "lane prover and verifier agree");
         assert_eq!(
             lacc_v.jagged.len(),
@@ -748,7 +819,7 @@ pub fn build_node_outer_app(
             "the lane carries the chain jagged key"
         );
         assert!(
-            lacc_v.discharge_jagged(&[(ln.circuit.digest(), ln.params)]),
+            !checks.on() || lacc_v.discharge_jagged(&[(ln.circuit.digest(), ln.params)]),
             "the lane's folded jagged entry discharges against the chain layout"
         );
         // Per boolean group (a type, or a matrix class under shared
@@ -782,7 +853,7 @@ pub fn build_node_outer_app(
             Op::ObserveBytes(32),
             Op::ObserveBytes(1),
         ];
-        if shared.is_some() {
+        if matches!(ln.family, LaneFamily::Batches { .. }) {
             // No fresh assertions: the shared block is its label alone.
             want.extend(shared_binding_ops(&[], &[]));
         }
@@ -877,10 +948,18 @@ pub fn build_node_outer_app(
         );
         assert_chain_replays(&ops, &trace, chals);
 
-        let env = match lane.as_ref().map(|l| l.family) {
+        // The lane's ACC_CHAIN width is the tower's; the affine layouts are
+        // the tower's too (the FL computed them from the leaf): every child
+        // carries the same list, and so does this node.
+        let mut env = match lane.as_ref().map(|l| l.family) {
             Some(LaneFamily::Batches { block_words, .. }) => envelope_shape_with_lane(block_words),
             _ => envelope_shape(),
         };
+        env.affine = los[0].affine_env.clone();
+        assert!(
+            los.iter().all(|lo| lo.affine_env == env.affine),
+            "every child declares the tower's affine layouts"
+        );
         let split_b3 = n_kids == 2;
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = rts[0].b3_rows;
@@ -2100,12 +2179,12 @@ pub fn build_node_outer_app(
             );
             app_w.as_ref().map(|_| env_app_base(&env))
         };
-        let shape2 = sb.finish().expect("the 2->1 node circuit builds");
-        // The two-limb Ligerito verifier plus the split BLAKE table stays
-        // below 512 cell slots, which pins the optimized mu=23 boundary.
+        let (shape2, fill_plan) = slot.finish(sb, checks, "2->1 node");
+        // The affine verifier plus the split BLAKE table stays below 512
+        // cell slots, which pins the optimized mu=23 boundary.
         assert!(
             shape2.circuit.cells().slots().len() <= 512,
-            "the F256 node's cell-slot budget regressed ({} slots)",
+            "the node's cell-slot budget regressed ({} slots)",
             shape2.circuit.cells().slots().len()
         );
         // ROUND-3 DATA (NODE_CENSUS=1): per-type schema words — each one a
@@ -2125,7 +2204,6 @@ pub fn build_node_outer_app(
                 (shape2.registry_slot(cs.zcr), "zcr".to_string()),
                 (shape2.registry_slot(cs.mrs), "mrs".to_string()),
                 (shape2.registry_slot(cs.spine), "spine".to_string()),
-                (shape2.registry_slot(cs.spine256), "spine256".to_string()),
                 (shape2.registry_slot(cs.alslot), "assist".to_string()),
             ];
             if let Some(slot) = cs.q.b3_alt {
@@ -2139,8 +2217,7 @@ pub fn build_node_outer_app(
                 // the shared mac (600) is already labeled above.
                 let name = match k {
                     600 => continue,
-                    k if k >= 310 => format!("pf{}", k - 310),
-                    k => format!("resid{}", k - 100),
+                    k => format!("pf{}", k - 310),
                 };
                 lab.push((shape2.registry_slot(s), name));
             }
@@ -2183,15 +2260,13 @@ pub fn build_node_outer_app(
         let hint_refs: Vec<&(dyn Any + Sync)> =
             hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
         let build_ms = build_ms + t_build2.elapsed().as_secs_f64() * 1e3;
-        // THE INDEX-FILL RUNNER (setup): compile the fill plan, then pin it
+        // THE INDEX-FILL RUNNER (setup): the fill plan comes with the shape
+        // (compiled once per kind), then pin it
         // row-identical against the generic walk before the online loop
         // trusts it — publics, every boolean row store, and every
         // element slot's packed witness, field for field. The walk stays the
         // differential oracle; only the plan runs in the timed loop.
-        let t_plan = Instant::now();
-        let fill_plan = shape2.fill_plan();
-        let build_ms = build_ms + t_plan.elapsed().as_secs_f64() * 1e3;
-        {
+        if checks.on() {
             let walk = shape2.run(&vals, &hint_refs);
             let fill = shape2.run_filled(&fill_plan, &vals, &hint_refs);
             assert_eq!(walk.public, fill.public, "fill plan: public segment");
@@ -2277,7 +2352,7 @@ pub fn build_node_outer_app(
             // above (tape_setup_ms) — its indices are shape-stable.
             let tapes_ms = {
                 let t = Instant::now();
-                {
+                if checks.on() {
                     los.par_iter()
                         .for_each(|lo| record_child_verify(lo, DOMAIN));
                 }
@@ -2291,22 +2366,24 @@ pub fn build_node_outer_app(
 
             // The two child regions' checker walks — each child's whole
             // deferred-verifier statement held against its own replicas.
-            let consumed: Vec<usize> = rts
-                .iter()
-                .zip(&regions)
-                .map(|(rt, r)| check_real_child_region(&built2.public, rt, r))
-                .collect();
-            for i in 0..n_kids {
-                let end = regions[i].pub_base + consumed[i];
-                let next = if i + 1 < n_kids {
-                    regions[i + 1].pub_base
-                } else {
-                    fold_pub_base
-                };
-                assert!(
-                    end <= next,
-                    "child {i}'s public block overruns the next region"
-                );
+            if checks.on() {
+                let consumed: Vec<usize> = rts
+                    .iter()
+                    .zip(&regions)
+                    .map(|(rt, r)| check_real_child_region(&built2.public, rt, r))
+                    .collect();
+                for i in 0..n_kids {
+                    let end = regions[i].pub_base + consumed[i];
+                    let next = if i + 1 < n_kids {
+                        regions[i + 1].pub_base
+                    } else {
+                        fold_pub_base
+                    };
+                    assert!(
+                        end <= next,
+                        "child {i}'s public block overruns the next region"
+                    );
+                }
             }
             // The fold checker + the accumulator, reassembled from publics —
             // and THE BLOCK, which is the accumulator plus the dead slots and
@@ -2399,17 +2476,18 @@ pub fn build_node_outer_app(
                 "the Accumulator, reassembled from the public segment alone"
             );
             assert!(
-                acc_pub.discharge(&mats)
-                    && acc_pub.discharge_element(&el_mats)
-                    && acc_pub.discharge_sigma(&key_circuits)
-                    && acc_pub.discharge_jagged(&jag_tables),
+                !checks.on()
+                    || (acc_pub.discharge(&mats)
+                        && acc_pub.discharge_element(&el_mats)
+                        && acc_pub.discharge_sigma(&key_circuits)
+                        && acc_pub.discharge_jagged(&jag_tables)),
                 "the public-segment accumulator discharges all four groups"
             );
             // THE PASSENGER, natively: the child's own, unless this node is
             // the one whose node slot could not fold — then the orphan itself.
             // The two are never both live in a spine, and the in-circuit form
             // is their SUM, so this select and that sum agree.
-            if !passenger.is_empty() {
+            if checks.on() && !passenger.is_empty() {
                 let dead = |k_col: usize, k_row: usize| {
                     (
                         [F128::ZERO; 2],
@@ -2459,7 +2537,7 @@ pub fn build_node_outer_app(
             };
             // The lagrange-low constants: the one public surface the in-circuit
             // derivation adds — validated against the verifier's own values.
-            {
+            if checks.on() {
                 if let Some((lam_base, _, _, _)) = &rs_lam {
                     for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
                         assert_eq!(built2.public[*lam_base + i], v, "λ const {i}");
@@ -2698,32 +2776,36 @@ pub fn build_node_outer_app(
             let prove_ms = t0p.elapsed().as_secs_f64() * 1e3;
             let t0v = Instant::now();
             let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
-            let vres = oproof.verify_circuit(
-                &union2,
-                &shape2.circuit,
-                &built2.public,
-                &lcs2,
-                &ocommit,
-                &pcs2,
-                &mut ch2,
-            );
+            // The forge test needs the verifier's refusal, so it always
+            // verifies.
+            let vres = (forge_match || checks.on()).then(|| {
+                oproof.verify_circuit(
+                    &union2,
+                    &shape2.circuit,
+                    &built2.public,
+                    &lcs2,
+                    &ocommit,
+                    &pcs2,
+                    &mut ch2,
+                )
+            });
             if forge_match {
                 // The forged world's rows all satisfy their relations — only
                 // the wiring product can object, and it MUST.
                 assert!(
                     matches!(
                         vres,
-                        Err(FlockVerifyError::Wiring(WiringError::Gkr(
+                        Some(Err(FlockVerifyError::Wiring(WiringError::Gkr(
                             ProductGkrError::ProductMismatch
-                        )))
+                        ))))
                     ),
                     "a forged live fold of a mismatched entry must die on the wiring product"
                 );
-            } else {
+            } else if let Some(vres) = vres {
                 vres.expect("the 2->1 node verifies");
             }
             let verify_ms = t0v.elapsed().as_secs_f64() * 1e3;
-            let deferred_ms = if forge_match {
+            let deferred_ms = if forge_match || !checks.on() {
                 0.0
             } else {
                 let t0d = Instant::now();
@@ -2755,7 +2837,7 @@ pub fn build_node_outer_app(
              lagrange lows DERIVED in-circuit from each child's z_skip wire\n  \
              outer: BLAKE rows {} across {:?} | nu {} | dense_m {} | mu {} \
              (cell slots: {} gate + {} public)\n  \
-             PER PROOF (online): child tapes {:.0} + witgen/trace {:.0} + witness asm {:.0} + prove {:.0} \
+             PER PROOF (online): fold {:.0} + child tapes {:.0} + witgen/trace {:.0} + witness asm {:.0} + prove {:.0} \
              = {:.0} ms | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n  \
              SETUP: circuit build (per SHAPE, cacheable) {:.0} ms | tape pins+locates (shape-stable) {:.0} ms\n",
                 n_folds,
@@ -2768,11 +2850,12 @@ pub fn build_node_outer_app(
                 shape2.circuit.cells().mu(),
                 shape2.circuit.cells().num_gate_slots(),
                 shape2.circuit.cells().num_public_slots(),
+                main_fold_ms + lane_fold_ms,
                 tapes_ms,
                 trace_ms,
                 asm_ms,
                 prove_ms,
-                tapes_ms + trace_ms + asm_ms + prove_ms,
+                main_fold_ms + lane_fold_ms + tapes_ms + trace_ms + asm_ms + prove_ms,
                 verify_ms,
                 deferred_ms,
                 serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
@@ -2786,6 +2869,7 @@ pub fn build_node_outer_app(
                 witgen_ms: asm_ms,
                 prove_ms,
                 verify_ms,
+                fold_ms: main_fold_ms + lane_fold_ms,
                 wall_ms: 0.0,
             });
             if steady_left > 0 {
@@ -2818,6 +2902,7 @@ pub fn build_node_outer_app(
                 spread_r1cs: spread_r1cs2,
                 pow_r1cs: pow_r1cs2,
                 family_r1cs: family_r1cs2,
+                affine_env: env.affine.clone(),
                 b3_slots: b3_slots2,
                 swap_slot: swap_slot2,
                 spread_slot: spread_slot2,
@@ -2832,6 +2917,7 @@ pub fn build_node_outer_app(
                 witgen_ms: asm_ms,
                 prove_ms,
                 verify_ms,
+                fold_ms: main_fold_ms + lane_fold_ms,
                 wall_ms: 0.0,
             },
             onlines,
@@ -2860,7 +2946,7 @@ pub fn build_node_outer_app(
 #[ignore] // Heavier — builds two chain leaves + one FL node.
 pub(super) fn real_tape_regions_pinned() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_0007);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
@@ -2953,27 +3039,27 @@ pub(super) fn real_tape_regions_pinned() {
 
     // Structural counts against the PROOF OBJECT, not the parse.
     let open = fl.lo.proof.pcs_open();
-    let lig = &open.inner.ligerito;
+    let flock_core::pcs::MergedInnerOpen::Affine(aff) = &open.inner else {
+        panic!("the tower's outers open with the affine fold")
+    };
+    let ai = &rt.affine;
+    let n_levels = ai.levels.len();
     assert_eq!(
-        rt.levels.len(),
-        lig.recursive_caps.len() + 1,
+        n_levels,
+        aff.recursive_caps.len() + 1,
         "one open level per recursive cap plus the base"
     );
-    assert_eq!(rt.levels.len(), rt.geo.len(), "one geometry per open level");
+    assert_eq!(n_levels, ai.geo.len(), "one geometry per open level");
+    assert_eq!(n_levels, ai.lvl_src.len(), "one source triple per level");
     assert_eq!(
-        rt.levels.len(),
-        rt.lvl_src.len(),
-        "one source triple per level"
-    );
-    assert_eq!(
-        rt.levels.len(),
+        n_levels,
         rt.cap_pays.len(),
         "one public cap payload per level"
     );
     assert_eq!(
-        rt.yr_len,
-        lig.final_proof.yr.len() / 2,
-        "the residual length is the proof's yr pairs"
+        (1usize << ai.cs[n_levels - 1]) + ai.ks[n_levels - 1],
+        aff.yr.len(),
+        "the final message is 2^c + k words"
     );
     assert_eq!(
         rt.rs_recs.len(),
@@ -3053,9 +3139,9 @@ pub(super) fn real_tape_regions_pinned() {
     println!(
         "\nREAL TAPE (FL leaf-outer as inner)\n           inner: dense_m {} | open levels {} | pows {} | yr {} | mu {}\n           zc rounds {} | lc rounds {} | betas {} | pd pts {} x {} | groups {}\n           b3 rows (tape model) {} | L0 lanes {} x {} words | pub slots (child) {}\n",
         union.dense_m(),
-        rt.levels.len(),
+        n_levels,
         rt.pows.len(),
-        rt.yr_len,
+        aff.yr.len(),
         rt.mu_i,
         rt.zc_rounds_b.len(),
         rt.lc_rounds_b.len(),
@@ -3064,8 +3150,8 @@ pub(super) fn real_tape_regions_pinned() {
         rt.pd_pts.first().map(|p| p.len()).unwrap_or(0),
         rt.groups_ix.len(),
         rt.b3_rows,
-        rt.geo[0].lanes,
-        rt.geo[0].row_words,
+        ai.geo[0].lanes,
+        ai.geo[0].row_words,
         rt.n_pub_slots_c,
     );
 }
@@ -3084,7 +3170,7 @@ pub(super) fn real_tape_regions_pinned() {
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn internal_node_over_two_first_level_nodes() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_0006);
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
