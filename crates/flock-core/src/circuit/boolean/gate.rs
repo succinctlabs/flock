@@ -277,10 +277,13 @@ impl BooleanGate {
                 })
             })
             .collect::<Result<_, _>>()?;
+        // The relation carries its walk, so its lincheck marginals (the
+        // prover's and the matrix fold's) walk the circuit, not the nonzeros.
+        let plan = Arc::new(plan);
         Ok(Self {
             name: name.into(),
-            r1cs: Arc::new(r1cs),
-            plan: Arc::new(plan),
+            r1cs: Arc::new(r1cs.with_walk(plan.clone())),
+            plan,
             io_schema,
             input_bits,
             n_in: inputs.len(),

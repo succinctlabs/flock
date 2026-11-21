@@ -361,6 +361,7 @@ impl SwapTable {
             const_pin: Some(Self::CONST),
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: None,
         }
     }
 
@@ -664,6 +665,7 @@ impl BitSpreadTable {
             const_pin: Some(self.const_pos()),
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: None,
         }
     }
 
@@ -995,6 +997,7 @@ impl FamilyTransposeTileTable {
             const_pin: Some(Self::CONST),
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: None,
         }
     }
 
@@ -1224,6 +1227,7 @@ impl PowMaskTable {
             const_pin: Some(self.const_pos()),
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: None,
         }
     }
 

@@ -108,6 +108,9 @@ pub enum WalkError {
         row: RowId,
     },
     IdentityCRequired,
+    /// [`WalkPlan::relabeled`]: a position the plan reads has no image in
+    /// the new layout, or two share one (`usize::MAX`).
+    Relabel(usize),
 }
 
 impl fmt::Display for WalkError {
@@ -159,6 +162,10 @@ impl fmt::Display for WalkError {
             ),
             Self::IdentityCRequired => {
                 f.write_str("identity-C walk requested for a non-identity C relation")
+            }
+            Self::Relabel(usize::MAX) => f.write_str("relabeling maps two positions to one"),
+            Self::Relabel(position) => {
+                write!(f, "relabeling leaves position {position} without an image")
             }
         }
     }
@@ -421,6 +428,206 @@ impl WalkPlan {
         self.transpose_inner(e_a, e_b, e_c, true)
     }
 
+    /// `(A_0ᵀ·w_a, B_0ᵀ·w_b)`: both matrices' column marginals, each at its
+    /// own row weight, in ONE reverse walk carrying an adjoint per matrix.
+    ///
+    /// This is the matrix fold's per-claim work (`u_iᵀA`, `u_iᵀB`) at
+    /// `O(edges)`. The materialized matrices substitute every virtual XOR
+    /// into the rows that read it, so their nonzeros outnumber the walk's
+    /// edges by orders of magnitude (BLAKE3: ~44M against ~145k).
+    pub fn transpose_ab(
+        &self,
+        w_a: &[F128],
+        w_b: &[F128],
+    ) -> Result<(Vec<F128>, Vec<F128>), WalkError> {
+        if w_a.len() != w_b.len() {
+            return Err(WalkError::WeightCount {
+                a: w_a.len(),
+                b: w_b.len(),
+                c: w_b.len(),
+            });
+        }
+        self.validate_marginal_len(w_a.len())?;
+        let mut col_a = vec![F128::ZERO; w_a.len()];
+        let mut col_b = vec![F128::ZERO; w_a.len()];
+        let mut temporaries = vec![[F128::ZERO; 2]; self.stats.max_live_temporaries];
+        for action in self.actions.iter().rev() {
+            match action {
+                Action::Row {
+                    physical_row,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    add_lane(*lhs, 0, w_a[*physical_row], &mut col_a, &mut temporaries);
+                    add_lane(*rhs, 1, w_b[*physical_row], &mut col_b, &mut temporaries);
+                }
+                Action::Xor { output, terms } => {
+                    let [adj_a, adj_b] =
+                        std::mem::replace(&mut temporaries[*output], [F128::ZERO; 2]);
+                    for &term in terms.iter() {
+                        match term {
+                            Source::Zero => {}
+                            Source::Value(position) => {
+                                col_a[position] += adj_a;
+                                col_b[position] += adj_b;
+                            }
+                            Source::Temporary(slot) => {
+                                let t = &mut temporaries[slot];
+                                t[0] += adj_a;
+                                t[1] += adj_b;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        debug_assert!(temporaries.iter().flatten().all(|value| value.is_zero()));
+        Ok((col_a, col_b))
+    }
+
+    /// `(A_0·v, B_0·v)`: the row marginals of both matrices at one column
+    /// vector, in ONE forward walk. Every XOR node is evaluated at `v` once
+    /// and each row reads its two sides. Rows the plan does not hold
+    /// (padding) are zero, as are their matrix rows.
+    pub fn apply_ab(&self, v: &[F128]) -> Result<(Vec<F128>, Vec<F128>), WalkError> {
+        self.validate_marginal_len(v.len())?;
+        let mut a = vec![F128::ZERO; v.len()];
+        let mut b = vec![F128::ZERO; v.len()];
+        let mut temporaries = vec![F128::ZERO; self.stats.max_live_temporaries];
+        let read = |source: Source, temporaries: &[F128]| match source {
+            Source::Zero => F128::ZERO,
+            Source::Value(position) => v[position],
+            Source::Temporary(slot) => temporaries[slot],
+        };
+        for action in &self.actions {
+            match action {
+                Action::Xor { output, terms } => {
+                    // Sum first: the output may reuse a source slot.
+                    let value = terms
+                        .iter()
+                        .fold(F128::ZERO, |acc, &term| acc + read(term, &temporaries));
+                    temporaries[*output] = value;
+                }
+                Action::Row {
+                    physical_row,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    a[*physical_row] = read(*lhs, &temporaries);
+                    b[*physical_row] = read(*rhs, &temporaries);
+                }
+            }
+        }
+        Ok((a, b))
+    }
+
+    /// The same walk over a relabeled layout: `map[p]` is the new position
+    /// of old position `p` (rows and values alike, as `C = I` makes a row's
+    /// position its defined value's), and `useful_bits` the new layout's
+    /// prefix. Every position the plan reads must map, injectively.
+    ///
+    /// This lets a relation that was laid out by hand, with the same values
+    /// in other positions, take the compiled walk of its DSL twin.
+    pub fn relabeled(&self, map: &[usize], useful_bits: usize) -> Result<Self, WalkError> {
+        let at = |position: usize| -> Result<usize, WalkError> {
+            match map.get(position) {
+                Some(&new) if new < useful_bits => Ok(new),
+                _ => Err(WalkError::Relabel(position)),
+            }
+        };
+        let mut targets: Vec<usize> = self
+            .occupied_positions
+            .iter()
+            .map(|&p| at(p))
+            .collect::<Result<_, _>>()?;
+        targets.sort_unstable();
+        if targets.windows(2).any(|w| w[0] == w[1]) {
+            return Err(WalkError::Relabel(usize::MAX));
+        }
+        let source = |s: Source| -> Result<Source, WalkError> {
+            Ok(match s {
+                Source::Value(position) => Source::Value(at(position)?),
+                other => other,
+            })
+        };
+        let actions = self
+            .actions
+            .iter()
+            .map(|action| {
+                Ok(match action {
+                    Action::Xor { output, terms } => Action::Xor {
+                        output: *output,
+                        terms: terms
+                            .iter()
+                            .map(|&t| source(t))
+                            .collect::<Result<_, WalkError>>()?,
+                    },
+                    Action::Row {
+                        id,
+                        physical_row,
+                        kind,
+                        lhs,
+                        rhs,
+                        result,
+                        output,
+                    } => Action::Row {
+                        id: *id,
+                        physical_row: at(*physical_row)?,
+                        kind: *kind,
+                        lhs: source(*lhs)?,
+                        rhs: source(*rhs)?,
+                        result: source(*result)?,
+                        output: output.map(at).transpose()?,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, WalkError>>()?;
+        let remap = |positions: &[usize]| {
+            positions
+                .iter()
+                .map(|&p| at(p))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        Ok(Self {
+            circuit: self.circuit,
+            actions,
+            input_positions: remap(&self.input_positions)?,
+            initialized_zero_positions: remap(&self.initialized_zero_positions)?,
+            one_position: at(self.one_position)?,
+            useful_bits,
+            c_is_identity: self.c_is_identity,
+            occupied_positions: targets,
+            expression_fanout: self.expression_fanout.clone(),
+            stats: self.stats,
+            sliced: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Every position a row or a materialized value occupies, ascending.
+    pub fn occupied_positions(&self) -> &[usize] {
+        &self.occupied_positions
+    }
+
+    /// The position of the statement-level constant one.
+    pub const fn one_position(&self) -> usize {
+        self.one_position
+    }
+
+    fn validate_marginal_len(&self, len: usize) -> Result<(), WalkError> {
+        if !len.is_power_of_two() {
+            return Err(WalkError::InvalidTransposeSize(len));
+        }
+        if len < self.useful_bits {
+            return Err(WalkError::Capacity {
+                required: self.useful_bits,
+                actual: len,
+            });
+        }
+        Ok(())
+    }
+
     fn transpose_inner(
         &self,
         e_a: &[F128],
@@ -483,7 +690,11 @@ impl WalkPlan {
         Ok(z)
     }
 
-    fn fold_alpha_batched(&self, alpha: F128, eq: &[F128]) -> Result<Vec<F128>, WalkError> {
+    pub(crate) fn fold_alpha_batched(
+        &self,
+        alpha: F128,
+        eq: &[F128],
+    ) -> Result<Vec<F128>, WalkError> {
         if !eq.len().is_power_of_two() {
             return Err(WalkError::InvalidTransposeSize(eq.len()));
         }
@@ -640,6 +851,21 @@ fn add_f128(source: Source, value: F128, values: &mut [F128], temporaries: &mut 
         Source::Zero => {}
         Source::Value(position) => values[position] += value,
         Source::Temporary(slot) => temporaries[slot] += value,
+    }
+}
+
+#[inline]
+fn add_lane(
+    source: Source,
+    lane: usize,
+    value: F128,
+    values: &mut [F128],
+    temporaries: &mut [[F128; 2]],
+) {
+    match source {
+        Source::Zero => {}
+        Source::Value(position) => values[position] += value,
+        Source::Temporary(slot) => temporaries[slot][lane] += value,
     }
 }
 

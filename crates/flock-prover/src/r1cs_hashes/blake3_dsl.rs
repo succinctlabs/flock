@@ -14,13 +14,13 @@ mod eval;
 pub use columns::{Blake3Cols, Blake3Schema, FirstC, GCols, round_columns};
 pub use eval::{OPERATION, compress, compress_op};
 
-const CV_FIELD: &str = "cv";
-const MESSAGE_FIELD: &str = "message";
-const COUNTER_FIELD: &str = "counter";
-const BLOCK_LEN_FIELD: &str = "block_len";
-const FLAGS_FIELD: &str = "flags";
-const OUT_LO_FIELD: &str = "out_lo";
-const OUT_HI_FIELD: &str = "out_hi";
+pub(crate) const CV_FIELD: &str = "cv";
+pub(crate) const MESSAGE_FIELD: &str = "message";
+pub(crate) const COUNTER_FIELD: &str = "counter";
+pub(crate) const BLOCK_LEN_FIELD: &str = "block_len";
+pub(crate) const FLAGS_FIELD: &str = "flags";
+pub(crate) const OUT_LO_FIELD: &str = "out_lo";
+pub(crate) const OUT_HI_FIELD: &str = "out_hi";
 
 /// One reusable BLAKE3 DSL artifact and its automatic aligned placement.
 #[derive(Debug)]

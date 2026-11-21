@@ -96,9 +96,15 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use std::{array::from_fn, mem::take, slice::from_raw_parts_mut, sync::OnceLock};
+use std::{
+    array::from_fn,
+    mem::take,
+    slice::from_raw_parts_mut,
+    sync::{Arc, OnceLock},
+};
 
 use flock_core::{
+    circuit::boolean::WalkPlan,
     lincheck::LincheckCircuit,
     pcs::{
         Commitment, PcsParams,
@@ -794,8 +800,67 @@ fn shared_matrices() -> &'static (SparseBinaryMatrix, SparseBinaryMatrix) {
     MATRICES.get_or_init(build_matrices)
 }
 
+/// The structural walk of THIS layout: the DSL twin's walk
+/// ([`super::blake3_dsl`]) relabeled, built once per process.
+///
+/// The two are one circuit. The DSL places the same values in the same
+/// evaluation order and differs only in where it puts the I/O words (its own
+/// aligned offsets) and the constant one (first, not last). So the I/O
+/// columns map word for word onto this layout's regions, the constant onto
+/// [`Z_CONST_POS`], and every other position the walk occupies, in order,
+/// onto the G region `[GS_BASE, Z_CONST_POS)`. `layout_walk_reproduces_matrices`
+/// checks the result against [`build_matrices`].
+pub fn layout_walk() -> Arc<WalkPlan> {
+    static WALK: OnceLock<Arc<WalkPlan>> = OnceLock::new();
+    WALK.get_or_init(|| {
+        use super::blake3_dsl::{
+            BLOCK_LEN_FIELD, COUNTER_FIELD, CV_FIELD, FLAGS_FIELD, MESSAGE_FIELD, OUT_HI_FIELD,
+            OUT_LO_FIELD, blake3_circuit,
+        };
+        let dsl = blake3_circuit();
+        let plan = dsl.walk_plan();
+        let mut map = vec![usize::MAX; plan.useful_bits()];
+        for (field, base) in [
+            (CV_FIELD, CV_BASE),
+            (OUT_LO_FIELD, OUT_LO_BASE),
+            (MESSAGE_FIELD, M_BASE),
+            (COUNTER_FIELD, T_LO_BASE),
+            (BLOCK_LEN_FIELD, BLEN_BASE),
+            (FLAGS_FIELD, FLAGS_BASE),
+            (OUT_HI_FIELD, OUT_HI_BASE),
+        ] {
+            let column = dsl
+                .circuit()
+                .column(field)
+                .expect("a declared BLAKE3 field");
+            for (bit, &value) in column.values.iter().enumerate() {
+                let at = dsl.layout().value_position(value).expect("a placed value");
+                map[at] = base + bit;
+            }
+        }
+        map[plan.one_position()] = Z_CONST_POS;
+        let mut next = GS_BASE;
+        for &at in plan.occupied_positions() {
+            if map[at] == usize::MAX {
+                map[at] = next;
+                next += 1;
+            }
+        }
+        assert_eq!(
+            next, Z_CONST_POS,
+            "the DSL's internal values fill the G region"
+        );
+        Arc::new(
+            plan.relabeled(&map, USEFUL_BITS)
+                .expect("the DSL layout maps one to one onto this one"),
+        )
+    })
+    .clone()
+}
+
 /// Build a [`BlockR1cs`] batching `2^n_blocks_log` independent BLAKE3
 /// compressions. `n_blocks_log ≥ 3` is required (lincheck needs `n_outer ≥ 8`).
+/// It carries [`layout_walk`], so its lincheck marginals walk the circuit.
 pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
     let (a_0, b_0) = shared_matrices().clone();
     build_block_r1cs_with_matrices(
@@ -809,6 +874,7 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
         // in every block. Requires padding blocks filled with valid compressions.
         Some(Z_CONST_POS),
     )
+    .with_walk(layout_walk())
 }
 
 // ---------------------------------------------------------------------------
@@ -3186,6 +3252,43 @@ mod tests {
         let csc = CscCircuit::from_matrices(&a_0, &b_0);
         let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
         assert_eq!(expected, got_csc, "CSC fold mismatch");
+    }
+
+    /// [`layout_walk`], the DSL twin's walk relabeled onto this layout,
+    /// reproduces [`build_matrices`] in both directions. One random weight
+    /// per side pins each matrix (a wrong entry survives a random F128
+    /// linear form with probability 2^-128), and the forward row marginals
+    /// at a random vector pin them again. The relation's lincheck circuit
+    /// walks it and keeps the constant pin.
+    #[test]
+    fn layout_walk_reproduces_matrices() {
+        use flock_core::{lincheck::MatrixSide, matrix_fold::FoldMatrix};
+        let mut rng = Rng::new(0xB1A3_3A1C);
+        let (a_0, b_0) = build_matrices();
+        let walk = super::layout_walk();
+        let [u_a, u_b, v] = [(); 3].map(|_| rng.f128_vec(K));
+        assert_eq!(
+            walk.transpose_ab(&u_a, &u_b).unwrap(),
+            (
+                FoldMatrix::col_marginal(&a_0, &u_a, K),
+                FoldMatrix::col_marginal(&b_0, &u_b, K)
+            )
+        );
+        assert_eq!(
+            walk.apply_ab(&v).unwrap(),
+            (
+                FoldMatrix::row_marginal(&a_0, &v, K),
+                FoldMatrix::row_marginal(&b_0, &v, K)
+            )
+        );
+        let r1cs = build_block_r1cs(3);
+        let lc = r1cs.csc_lincheck_circuit();
+        assert!(lc.walks());
+        assert_eq!(lc.const_pin_col(), Some(Z_CONST_POS));
+        assert_eq!(
+            lc.row_marginal(MatrixSide::B, &v),
+            Some(FoldMatrix::row_marginal(&b_0, &v, K))
+        );
     }
 
     /// to `pack_z_lincheck_from_packed(z)`.

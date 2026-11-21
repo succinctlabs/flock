@@ -42,6 +42,7 @@ fn identity_r1cs(m: usize, k_log: usize, k_skip: usize, useful_bits: usize) -> B
         const_pin: None,
         digest_cache: OnceLock::new(),
         csc_cache: OnceLock::new(),
+        walk: None,
     }
 }
 

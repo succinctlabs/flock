@@ -47,7 +47,7 @@ use matrix_fold::{
     prove_fold_with_grinding, verify_fold_bound_with_grinding, verify_fold_jagged_with_grinding,
     verify_fold_with_grinding,
 };
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -59,11 +59,11 @@ use crate::{
         union::{ElementAssertion, ElementUnionError},
     },
     field::F128,
-    lincheck::{LincheckCircuit, LincheckError, MatrixAssertion},
+    lincheck::{LincheckCircuit, LincheckError, MatrixAssertion, MatrixSide},
     matrix_fold::{self, FoldProof, MatrixClaim, Weight, bilinear},
     pcs::jagged::JaggedParams,
     r1cs::SparseBinaryMatrix,
-    schedule::Registry,
+    schedule::{Registry, TableType},
     union::UnionInstance,
     zerocheck::K_SKIP,
 };
@@ -385,14 +385,24 @@ impl SharedTables {
             .iter()
             .map(|m| types[m[0]].kept_matrices(&dropped.zeroed[m[0]]))
             .collect();
-        let linear = linear_groups(&groups, Some(dropped))
+        Self {
+            kept,
+            linear: Self::linear_tables(registry, dropped),
+        }
+    }
+
+    /// The linear groups' `D·(A_0 + I)` alone: only the dropped words' rows,
+    /// so cheap beside the kept tables' copy of every nonzero.
+    pub fn linear_tables(registry: &Registry, dropped: &Dropped) -> Vec<SparseBinaryMatrix> {
+        let groups = groups(registry, Some(dropped));
+        let types = registry.boolean_types();
+        linear_groups(&groups, Some(dropped))
             .into_iter()
             .map(|g| {
                 let t = groups[g][0];
                 types[t].linear_identity_matrix(&dropped.zeroed[t])
             })
-            .collect();
-        Self { kept, linear }
+            .collect()
     }
 
     /// The kept pairs as [`TypeMatrices`].
@@ -637,6 +647,68 @@ fn bind_shared<Ch: Challenger>(
     }
 }
 
+/// One matrix of a boolean fold group as the fold's row phase reads it.
+/// The row marginal comes from the type's lincheck circuit when it computes
+/// one (a structural walk), over the FULL matrix; under shared binding the
+/// dropped words' rows are then cleared, which is the kept matrix's row
+/// marginal exactly ([`TableType::kept_matrices`] empties those rows and
+/// nothing else). Otherwise the materialized matrix answers: the full one,
+/// or the kept one, built on first use.
+struct GroupSide<'a> {
+    circuit: &'a dyn LincheckCircuit,
+    side: MatrixSide,
+    full: &'a SparseBinaryMatrix,
+    /// Shared binding: the dropped words, the group's lazily built kept
+    /// pair, and the type that builds it.
+    #[allow(clippy::type_complexity)]
+    kept: Option<(
+        &'a [usize],
+        &'a OnceLock<(SparseBinaryMatrix, SparseBinaryMatrix)>,
+        &'a TableType,
+    )>,
+}
+
+impl GroupSide<'_> {
+    fn matrix(&self) -> &SparseBinaryMatrix {
+        let Some((dropped, kept, ty)) = self.kept else {
+            return self.full;
+        };
+        let (a, b) = kept.get_or_init(|| ty.kept_matrices(dropped));
+        match self.side {
+            MatrixSide::A => a,
+            MatrixSide::B => b,
+        }
+    }
+}
+
+impl FoldMatrix for GroupSide<'_> {
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        let walked = (w.len() == self.circuit.n_cols())
+            .then(|| self.circuit.row_marginal(self.side, w))
+            .flatten();
+        let Some(mut h) = walked else {
+            return self.matrix().row_marginal(w, n_rows);
+        };
+        h.resize(n_rows, F128::ZERO);
+        if let Some((dropped, ..)) = self.kept {
+            for &d in dropped {
+                let rows = (128 * d).min(n_rows)..(128 * (d + 1)).min(n_rows);
+                h[rows].fill(F128::ZERO);
+            }
+        }
+        h
+    }
+    fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        self.matrix().col_marginal(w, n_cols)
+    }
+    fn n_rows(&self) -> usize {
+        self.full.num_rows
+    }
+    fn n_cols(&self) -> usize {
+        self.full.num_cols
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_aggregate_impl<Ch: Challenger>(
     registry: &Registry,
@@ -665,7 +737,14 @@ fn prove_aggregate_impl<Ch: Challenger>(
     let groups = groups(registry, shared);
     let linear = linear_groups(&groups, shared);
     check_priors(registry, priors, groups.len(), linear.len(), el_mats.len())?;
-    let tables = shared.map(|d| SharedTables::new(registry, d));
+    // Under shared binding a group's claims are about its KEPT rows. Its
+    // fold reads the kept matrices only for the row marginal, which a
+    // walking circuit computes on the full matrix with the dropped rows
+    // then cleared ([`GroupSide`]): the kept copy of every nonzero is
+    // built only for a group whose circuit cannot.
+    let linear_tables = shared.map(|d| SharedTables::linear_tables(registry, d));
+    let kept: Vec<OnceLock<(SparseBinaryMatrix, SparseBinaryMatrix)>> =
+        groups.iter().map(|_| OnceLock::new()).collect();
 
     bind(registry, priors, ch);
     if shared.is_some() {
@@ -675,12 +754,17 @@ fn prove_aggregate_impl<Ch: Challenger>(
     let mut per_type = Vec::with_capacity(groups.len());
     for (g, members) in groups.iter().enumerate() {
         let t = members[0];
-        // Under shared binding a group's claims are about its KEPT rows.
-        let (ma, mb) = match &tables {
-            Some(tables) => (&tables.kept[g].0, &tables.kept[g].1),
-            None => mats[t],
-        };
         let dropped_rows = shared.map_or(&[][..], |d| &d.zeroed[t][..]);
+        let side = |side| GroupSide {
+            circuit: circuits[t],
+            side,
+            full: match side {
+                MatrixSide::A => mats[t].0,
+                MatrixSide::B => mats[t].1,
+            },
+            kept: shared.map(|_| (dropped_rows, &kept[g], &registry.boolean_types()[t])),
+        };
+        let (ma, mb) = (side(MatrixSide::A), side(MatrixSide::B));
         let (ca, cb) = gather(registry, assertions, priors, g, members);
         let n_bound = if shared.is_some() {
             assertions.len() * members.len()
@@ -712,8 +796,8 @@ fn prove_aggregate_impl<Ch: Challenger>(
             .collect();
         let (combs_a, combs_b): (Vec<Vec<F128>>, Vec<Vec<F128>>) =
             circuits[t].fold_split_many(&ws).into_iter().unzip();
-        let (pa, out_a) = prove_fold_bound_with_grinding(ma, &combs_a, &ca, n_bound, grinding, ch);
-        let (pb, out_b) = prove_fold_bound_with_grinding(mb, &combs_b, &cb, n_bound, grinding, ch);
+        let (pa, out_a) = prove_fold_bound_with_grinding(&ma, &combs_a, &ca, n_bound, grinding, ch);
+        let (pb, out_b) = prove_fold_bound_with_grinding(&mb, &combs_b, &cb, n_bound, grinding, ch);
         folds.push((pa, pb));
         per_type.push((out_a, out_b));
     }
@@ -723,7 +807,7 @@ fn prove_aggregate_impl<Ch: Challenger>(
     let mut per_linear = Vec::with_capacity(linear.len());
     for (lg, &g) in linear.iter().enumerate() {
         let members = &groups[g];
-        let m = &tables.as_ref().expect("linear groups are shared").linear[lg];
+        let m = &linear_tables.as_ref().expect("linear groups are shared")[lg];
         let claims = gather_linear(registry, assertions, priors, lg, members);
         let n_cols = 1usize << registry.boolean_types()[members[0]].k_log;
         let combs: Vec<Vec<F128>> = claims

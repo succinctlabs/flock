@@ -120,7 +120,10 @@ use std::{
     env::var,
     fmt::{Debug, Formatter, Result as FmtResult},
     mem::take,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -150,6 +153,7 @@ pub use crate::lincheck::union::{
 use crate::{
     all_core_pool, alloc_uninit_vec,
     challenger::Challenger,
+    circuit::boolean::WalkPlan,
     ecore_rich_topology,
     field::F128,
     genus95_curve_code::{
@@ -313,6 +317,15 @@ pub trait LincheckCircuit: Sync {
             .collect()
     }
 
+    /// The row marginal `M_0·v` of one base matrix (`out[r] = Σ_c M_0[r,c]·v[c]`,
+    /// `v.len() == n_cols()`), when the implementation computes it without
+    /// the materialized matrix. `None` sends the caller to the matrix. The
+    /// matrix fold's shared row marginal reads this.
+    fn row_marginal(&self, side: MatrixSide, v: &[F128]) -> Option<Vec<F128>> {
+        let _ = (side, v);
+        None
+    }
+
     /// Column index of a constant-one wire to pin, or `None` if the circuit has
     /// no such wire. When `Some(col)`, lincheck folds one extra `β`-term into the
     /// comb so the sumcheck also proves that the committed constant column is the
@@ -324,6 +337,13 @@ pub trait LincheckCircuit: Sync {
     fn const_pin_col(&self) -> Option<usize> {
         None
     }
+}
+
+/// Which of a block's two base matrices a marginal reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatrixSide {
+    A,
+    B,
 }
 
 /// Default `LincheckCircuit` over a pair of sparse binary matrices. Delegates
@@ -409,6 +429,14 @@ impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
 /// Construction costs one pass over the nonzeros (~4 ms / ~40 ms for the
 /// above) — do it once at setup, e.g. via
 /// [`crate::r1cs::BlockR1cs::csc_lincheck_circuit`].
+///
+/// A relation lowered from a circuit carries its structural walk
+/// ([`crate::r1cs::BlockR1cs::with_walk`]), and then every marginal walks
+/// the circuit instead ([`Self::from_walk`]): `O(edges)` where the gathers
+/// pay `O(nnz)`. The materialized rows substitute each virtual XOR into
+/// every row that reads it, so on BLAKE3 the walk touches ~145k edges
+/// against ~44M nonzeros — 0.28 ms against 12.8 ms for one claim's split
+/// marginals on one M4 core. No CSC arrays are built then.
 #[derive(Clone)]
 pub struct CscCircuit {
     n_cols: usize,
@@ -418,6 +446,9 @@ pub struct CscCircuit {
     b_rows: Vec<u32>,
     /// Constant-wire pin column (see [`LincheckCircuit::const_pin_col`]).
     const_pin: Option<usize>,
+    /// The relation's structural walk; when present every marginal takes
+    /// it and the CSC arrays above are empty.
+    walk: Option<Arc<WalkPlan>>,
 }
 
 /// Flatten one sparse matrix into CSC arrays: rows with a 1 in column `c` are
@@ -452,6 +483,7 @@ impl Debug for CscCircuit {
             .field("n_cols", &self.n_cols)
             .field("nnz_a", &self.a_rows.len())
             .field("nnz_b", &self.b_rows.len())
+            .field("walk", &self.walk.as_ref().map(|w| w.stats()))
             .finish()
     }
 }
@@ -471,7 +503,34 @@ impl CscCircuit {
             b_col_ptr,
             b_rows,
             const_pin: None,
+            walk: None,
         }
+    }
+
+    /// The marginals of a relation as its structural walk computes them,
+    /// over `n_cols` columns (a power of two holding the walk's layout).
+    /// The walk must reproduce the relation's `A_0`/`B_0`; one lowered with
+    /// it does by construction.
+    pub fn from_walk(walk: Arc<WalkPlan>, n_cols: usize) -> Self {
+        assert!(
+            n_cols.is_power_of_two() && n_cols >= walk.useful_bits(),
+            "the walk's layout ({} bits) must fit {n_cols} columns",
+            walk.useful_bits()
+        );
+        Self {
+            n_cols,
+            a_col_ptr: Vec::new(),
+            a_rows: Vec::new(),
+            b_col_ptr: Vec::new(),
+            b_rows: Vec::new(),
+            const_pin: None,
+            walk: Some(walk),
+        }
+    }
+
+    /// Whether the marginals walk the circuit rather than gather.
+    pub fn walks(&self) -> bool {
+        self.walk.is_some()
     }
 
     /// Set the constant-wire pin column (see `docs/const-wire-pin.md`).
@@ -518,6 +577,11 @@ impl LincheckCircuit for CscCircuit {
     }
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), self.n_cols);
+        if let Some(walk) = &self.walk {
+            return walk
+                .fold_alpha_batched(alpha, eq_inner)
+                .expect("from_walk checked the layout fits");
+        }
         let one_col = |c: usize| {
             let (sa, sb) = self.col_sums(c, eq_inner);
             alpha * sa + sb
@@ -538,6 +602,11 @@ impl LincheckCircuit for CscCircuit {
     /// multiply disappears. The default would walk twice.
     fn fold_split(&self, eq_inner: &[F128]) -> (Vec<F128>, Vec<F128>) {
         assert_eq!(eq_inner.len(), self.n_cols);
+        if let Some(walk) = &self.walk {
+            return walk
+                .transpose_ab(eq_inner, eq_inner)
+                .expect("from_walk checked the layout fits");
+        }
         let one_col = |c: usize| self.col_sums(c, eq_inner);
         if self.n_cols < SUMCHECK_PAR_THRESHOLD {
             return (0..self.n_cols).map(one_col).unzip();
@@ -560,7 +629,23 @@ impl LincheckCircuit for CscCircuit {
     /// traffic (~44M for BLAKE3), so each extra claim costs only its
     /// gathers. Each matrix's weights are interleaved row-major so one
     /// row's values for every claim share a cache line.
+    ///
+    /// Walking, each claim is one sequential reverse walk, and the claims
+    /// run in parallel.
     fn fold_split_many(&self, ws: &[(&[F128], &[F128])]) -> Vec<(Vec<F128>, Vec<F128>)> {
+        if let Some(walk) = &self.walk {
+            for (wa, wb) in ws {
+                assert_eq!(wa.len(), self.n_cols);
+                assert_eq!(wb.len(), self.n_cols);
+            }
+            return ws
+                .par_iter()
+                .map(|(wa, wb)| {
+                    walk.transpose_ab(wa, wb)
+                        .expect("from_walk checked the layout fits")
+                })
+                .collect();
+        }
         let mut out = Vec::with_capacity(ws.len());
         for group in ws.chunks(SPLIT_LANES) {
             match group.len() {
@@ -572,6 +657,17 @@ impl LincheckCircuit for CscCircuit {
             }
         }
         out
+    }
+
+    /// One forward walk when the relation carries its walk.
+    fn row_marginal(&self, side: MatrixSide, v: &[F128]) -> Option<Vec<F128>> {
+        let walk = self.walk.as_ref()?;
+        assert_eq!(v.len(), self.n_cols);
+        let (a, b) = walk.apply_ab(v).expect("from_walk checked the layout fits");
+        Some(match side {
+            MatrixSide::A => a,
+            MatrixSide::B => b,
+        })
     }
 }
 

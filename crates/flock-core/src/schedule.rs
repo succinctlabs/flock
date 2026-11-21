@@ -1062,6 +1062,7 @@ mod tests {
             const_pin: None,
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: None,
         };
 
         assert_eq!(reg.m_total(), r1cs.m);
