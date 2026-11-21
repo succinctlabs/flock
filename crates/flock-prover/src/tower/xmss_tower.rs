@@ -826,7 +826,9 @@ fn xmss_tower_online_bench() {
             let witness = circuit.witness(&batches[0].0, &batches[0].1);
             let witgen_ms = ms(t);
             let t = Instant::now();
-            let proof = circuit.prove(&witness);
+            // The tower's leaf proves under the config's leaf profile
+            // (FastAffine), not the standalone Fast of `circuit.prove`.
+            let proof = circuit.prove_with_profile(&witness, cfg.leaf_profile());
             let prove_ms = ms(t);
             drop((witness, proof));
             Online {
