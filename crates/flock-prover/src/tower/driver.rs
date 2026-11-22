@@ -466,6 +466,12 @@ impl Tower {
         if !lane.discharge(&chain_mats) {
             return Err(ChainLaneBoolean);
         }
+        // The chain family binds per claim (no dropped words), so its lane
+        // folds no linear-identity group and nothing here discharges one:
+        // refuse a non-empty one rather than let its claims go unchecked.
+        if !lane.per_linear.is_empty() {
+            return Err(ChainLaneBoolean);
+        }
         if !lane.per_element.is_empty() {
             return Err(ChainLaneElement);
         }

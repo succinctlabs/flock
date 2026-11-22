@@ -1096,6 +1096,29 @@ pub(super) fn tower_driver_e2e() {
         .1
         .value = saved;
 
+    // (f) a lane carrying a linear-identity claim. The chain family binds
+    // per claim, so nothing discharges one: it must be refused, not
+    // ignored.
+    let lane = tower.root.lane_acc.as_mut().expect("the lane rides");
+    assert!(
+        lane.per_linear.is_empty(),
+        "the chain lane folds no linear group"
+    );
+    let stray = lane.per_type[0].0.clone();
+    lane.per_linear.push(stray);
+    assert_eq!(
+        tower.discharge_root(),
+        Err(RootDischargeFailure::ChainLaneBoolean),
+        "a lane linear claim must be refused"
+    );
+    tower
+        .root
+        .lane_acc
+        .as_mut()
+        .expect("the lane rides")
+        .per_linear
+        .clear();
+
     tower
         .discharge_root()
         .expect("restored, the root discharges again");

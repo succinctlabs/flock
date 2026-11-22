@@ -793,8 +793,10 @@ pub struct MatrixAssertion {
     /// unscaled, so each is a claim about a registry-static matrix and
     /// nothing else. A type that drops words reports them over its KEPT
     /// rows ([`Self::zeroed`]): the matrices are `A_0`/`B_0` with the
-    /// dropped rows cleared. [`Self::check`] verifies they reproduce
-    /// [`Self::target`]; [`Self::claims`] hands them out for accumulation.
+    /// dropped rows cleared. [`Self::check_reported`] verifies they
+    /// reproduce [`Self::target`]; [`Self::claims`] hands them out for
+    /// accumulation. [`Self::check`] does not read them: it rebuilds the
+    /// combs from the matrices.
     pub evals: Vec<(F128, F128)>,
     /// Per type, the union's dropped words
     /// ([`UnionInstance::zeroed_word_cols`]).
@@ -868,9 +870,12 @@ impl MatrixAssertion {
             .collect()
     }
 
-    /// Discharge the assertion: rebuild the per-type combs (`O(Σ_t nnz_t)`,
-    /// the only place the base matrices are read) and check the closed-form
-    /// Comb-hat collapse against [`Self::target`].
+    /// Check the reported per-type evaluations ([`Self::evals`],
+    /// [`Self::linear_evals`]) reproduce [`Self::target`] — scalars only, no
+    /// matrix read. Sound only when [`Self::claims`] and
+    /// [`Self::linear_claims`] are discharged against the matrices elsewhere
+    /// (an accumulator, [`crate::aggregate`]); a non-deferred verifier must
+    /// use [`Self::check`].
     pub fn check_reported(&self, registry: &Registry) -> Result<(), LincheckError> {
         let k_skip = K_SKIP;
         if self.evals.len() != registry.num_boolean() {
