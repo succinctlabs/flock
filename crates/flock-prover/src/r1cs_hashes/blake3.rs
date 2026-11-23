@@ -801,59 +801,28 @@ fn shared_matrices() -> &'static (SparseBinaryMatrix, SparseBinaryMatrix) {
 }
 
 /// The structural walk of THIS layout: the DSL twin's walk
-/// ([`super::blake3_dsl`]) relabeled, built once per process.
+/// ([`super::blake3_dsl`]) relabeled onto it, built once per process.
 ///
-/// The two are one circuit. The DSL places the same values in the same
-/// evaluation order and differs only in where it puts the I/O words (its own
-/// aligned offsets) and the constant one (first, not last). So the I/O
-/// columns map word for word onto this layout's regions, the constant onto
-/// [`Z_CONST_POS`], and every other position the walk occupies, in order,
-/// onto the G region `[GS_BASE, Z_CONST_POS)`. `layout_walk_reproduces_matrices`
-/// checks the result against [`build_matrices`].
+/// The two are one circuit. The DSL puts its I/O words at its own aligned
+/// offsets and the constant one first. The map comes from matching values
+/// ([`super::dsl::relabel_onto`]); `layout_walk_reproduces_matrices` checks
+/// the result against [`build_matrices`].
 pub fn layout_walk() -> Arc<WalkPlan> {
     static WALK: OnceLock<Arc<WalkPlan>> = OnceLock::new();
     WALK.get_or_init(|| {
-        use super::blake3_dsl::{
-            BLOCK_LEN_FIELD, COUNTER_FIELD, CV_FIELD, FLAGS_FIELD, MESSAGE_FIELD, OUT_HI_FIELD,
-            OUT_LO_FIELD, blake3_circuit,
-        };
-        let dsl = blake3_circuit();
-        let plan = dsl.walk_plan();
-        let mut map = vec![usize::MAX; plan.useful_bits()];
-        for (field, base) in [
-            (CV_FIELD, CV_BASE),
-            (OUT_LO_FIELD, OUT_LO_BASE),
-            (MESSAGE_FIELD, M_BASE),
-            (COUNTER_FIELD, T_LO_BASE),
-            (BLOCK_LEN_FIELD, BLEN_BASE),
-            (FLAGS_FIELD, FLAGS_BASE),
-            (OUT_HI_FIELD, OUT_HI_BASE),
-        ] {
-            let column = dsl
-                .circuit()
-                .column(field)
-                .expect("a declared BLAKE3 field");
-            for (bit, &value) in column.values.iter().enumerate() {
-                let at = dsl.layout().value_position(value).expect("a placed value");
-                map[at] = base + bit;
-            }
-        }
-        map[plan.one_position()] = Z_CONST_POS;
-        let mut next = GS_BASE;
-        for &at in plan.occupied_positions() {
-            if map[at] == usize::MAX {
-                map[at] = next;
-                next += 1;
-            }
-        }
-        assert_eq!(
-            next, Z_CONST_POS,
-            "the DSL's internal values fill the G region"
-        );
-        Arc::new(
-            plan.relabeled(&map, USEFUL_BITS)
-                .expect("the DSL layout maps one to one onto this one"),
-        )
+        let plan = super::blake3_dsl::build_blake3_circuit().walk_plan();
+        let walk = super::dsl::relabel_onto(&plan, USEFUL_BITS, |rng| {
+            let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = from_fn(|_| rng.next_u32());
+            let (counter, block_len, flags) = (rng.next_u64(), rng.next_u32(), rng.next_u32());
+            let mut zab = [(); 3].map(|_| vec![0u64; K / 64]);
+            let [z, a, b] = &mut zab;
+            build_block_witness_ab_packed_into(&cv, &m, counter, block_len, flags, z, a, b);
+            let params = [counter as u32, (counter >> 32) as u32, block_len, flags];
+            ([cv.as_slice(), &m, &params].concat(), zab)
+        })
+        .expect("the BLAKE3 DSL twin is this circuit");
+        Arc::new(walk)
     })
     .clone()
 }
