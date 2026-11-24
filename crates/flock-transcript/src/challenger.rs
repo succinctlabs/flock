@@ -1228,10 +1228,7 @@ pub fn has_leading_zero_bits(h: &[u8], bits: u32) -> bool {
             return false;
         }
     }
-    if extra > 0 && (h[full_bytes] >> (8 - extra)) != 0 {
-        return false;
-    }
-    true
+    !(extra > 0 && (h[full_bytes] >> (8 - extra)) != 0)
 }
 
 /// Check whether `H(pre-image(state_digest, nonce))` has at least `bits`

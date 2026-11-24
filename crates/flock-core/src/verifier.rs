@@ -314,7 +314,7 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
             .map_err(FlockVerifyError::Lincheck)?;
     }
     if let Some(a) = el_matrix {
-        a.check_reported(union).map_err(FlockVerifyError::Element)?;
+        a.check(union).map_err(FlockVerifyError::Element)?;
     }
     verify_merged_opening(
         union,
@@ -440,7 +440,7 @@ pub fn verify_ligerito_union_circuit_ag<Ch: Challenger>(
             .map_err(FlockVerifyError::Lincheck)?;
     }
     if let Some(a) = el_matrix {
-        a.check_reported(union).map_err(FlockVerifyError::Element)?;
+        a.check(union).map_err(FlockVerifyError::Element)?;
     }
     verify_merged_opening(
         union,
@@ -631,7 +631,7 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
             .map_err(FlockVerifyError::Lincheck)?;
     }
     if let Some(a) = el_matrix {
-        a.check_reported(union).map_err(FlockVerifyError::Element)?;
+        a.check(union).map_err(FlockVerifyError::Element)?;
     }
 
     // Same construction as the boolean-only merged verifier: the PCS point
