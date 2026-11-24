@@ -328,7 +328,7 @@ pub fn verify_with_grinding<C: Challenger>(
     ch: &mut C,
 ) -> Result<Claims, ElementUnionError> {
     let (claims, assertion) = verify_deferred_with_grinding(union, proof, grinding, ch)?;
-    assertion.check_reported(union)?;
+    assertion.check(union)?;
     Ok(claims)
 }
 
@@ -617,8 +617,29 @@ impl ElementAssertion {
             .collect()
     }
 
+    /// Discharge the assertion against the base matrices: the reported
+    /// per-slot evaluations must BE `(⟨W,A_0⟩, ⟨W,B_0⟩)` at `(r_con, r_col)`,
+    /// and must reproduce the target. `O(Σ_t (2^{κ_t} + nnz_t))`.
+    ///
+    /// This is the non-deferred verifier's check. [`Self::check_reported`]
+    /// alone is NOT a substitute: it pins one linear combination of the
+    /// reported values, so a prover free to report them can satisfy it for
+    /// any sumcheck ending — the lincheck would then bind the zerocheck's
+    /// `A·z`/`B·z` claims to nothing.
+    pub fn check(&self, union: &UnionInstance<'_>) -> Result<(), ElementUnionError> {
+        self.check_reported(union)?;
+        // `slot_matrix_evals` reads the constraint point at `r[nu..]`;
+        // `r_con` already starts there, so `nu = 0`.
+        if slot_matrix_evals(&region_slots(union), 0, &self.r_con, &self.r_col) != self.evals {
+            return Err(ElementUnionError::LincheckFinalFailed);
+        }
+        Ok(())
+    }
+
     /// Check the reported values reproduce the target — scalars only, no
-    /// matrix read.
+    /// matrix read. Sound only when the reported values are discharged
+    /// elsewhere (an accumulator, [`crate::aggregate`]); a non-deferred
+    /// verifier must use [`Self::check`].
     pub fn check_reported(&self, union: &UnionInstance<'_>) -> Result<(), ElementUnionError> {
         let nu = union.n_log();
         let slots = region_slots(union);
@@ -1375,6 +1396,171 @@ mod tests {
                 )),
                 "slot {bad_slot}"
             );
+        }
+    }
+
+    /// **The reported matrix evaluations are the lincheck's only tie to the
+    /// matrices**, so the non-deferred verify must check them against the
+    /// matrices, not merely recombine them.
+    ///
+    /// The forgery: a NON-satisfying witness (one product word broken), a
+    /// zerocheck run on fake tables `pa' = z`, `pb' = 1` (which satisfy
+    /// `pa'·pb' + z = 0` everywhere, so its `A·z`/`B·z` claims are free), and
+    /// a lincheck run on a comb perturbed at one entry to make the false claim
+    /// sum correctly — with the reported per-slot evaluations solved so they
+    /// recombine to the perturbed comb's value. Both output claims are TRUE
+    /// evaluations of the committed witness, so an honest opening would
+    /// discharge them: `check_reported` alone accepts a false statement.
+    #[test]
+    fn forged_lincheck_with_consistent_report_is_rejected() {
+        use crate::challenger::Challenger;
+        use crate::element_r1cs::lincheck::{Proof as LcProof, column_sumcheck_prove};
+        let mut rng = Rng::new(0xBAD_2044);
+        let nu = 3usize;
+        let cases = vec![mult_case(2), mult_case(2)];
+        let mut h = build(vec![(10, 700)], &cases, nu, &[5, 6], &mut rng);
+        let union = UnionInstance::new(&h.registry, h.counts.clone());
+        // Break a product-column word of a real row of slot 0.
+        let range = union.slot_word_range(1);
+        let rows = 1usize << nu;
+        h.z[range.start + 2 * rows + 1] += F128::ONE;
+        assert!(
+            !cases[0].ty.satisfies(&h.z[range.clone()], nu, 5),
+            "the witness must NOT satisfy"
+        );
+        let z = region(&union, &h.z).to_vec();
+        let slots = region_slots(&union);
+        let (nu, e_vars) = (union.n_log(), union.m_elem() - 7);
+
+        // ---- forged zerocheck: pa' = z, pb' = 1 satisfies pa'·pb' + z = 0.
+        let pa_f = z.clone();
+        let pb_f = vec![F128::ONE; z.len()];
+        let mut ch = FsChallenger::new(b"poc");
+        let (zc_proof, zc) = zerocheck::prove_with_support_with_grinding(
+            super::ZC_LABEL,
+            &pa_f,
+            &pb_f,
+            &z,
+            e_vars,
+            nu,
+            None,
+            Grinding::disabled(),
+            &mut ch,
+        );
+        let (va, vb, _, _) = super::strip_constants(&slots, nu, &zc);
+
+        // ---- forged lincheck: perturb one comb entry so Σ comb'·G = va + α·vb.
+        ch.observe_label(super::LC_LABEL);
+        let alpha = ch.sample_f128();
+        let mut comb = region_comb(&slots, nu, e_vars, alpha, &zc.r);
+        let mut g = collapse_rows(&z, &zc.r[..nu], None);
+        let honest: F128 = comb
+            .iter()
+            .zip(&g)
+            .fold(F128::ZERO, |a, (x, y)| a + *x * *y);
+        let claimed = va + alpha * vb;
+        assert_ne!(honest, claimed, "the zerocheck's A·z/B·z claims are false");
+        let u0 = g
+            .iter()
+            .position(|v| *v != F128::ZERO)
+            .expect("nonzero column");
+        comb[u0] += (claimed + honest) * g[u0].inv();
+        let mut nonces = Vec::new();
+        let (rounds, bind_order) = column_sumcheck_prove(
+            &mut comb,
+            &mut g,
+            Grinding::disabled(),
+            &mut nonces,
+            &mut ch,
+        );
+        let r_col: Vec<F128> = bind_order.iter().rev().copied().collect();
+        // Report the honest evals, then shift slot 0's v_A so the scalar
+        // recombination hits comb'(r_col) instead of comb(r_col).
+        let mut evals = super::slot_matrix_evals(&slots, nu, &zc.r, &r_col);
+        let w = |s: &super::RegionSlot<'_>| {
+            let k = s.layout.kappa;
+            eq_prefix_weight(&zc.r[nu + k..], s.layout.region_prefix(nu))
+                * eq_prefix_weight(&r_col[k..], s.layout.region_prefix(nu))
+        };
+        let acc: F128 = slots
+            .iter()
+            .zip(&evals)
+            .fold(F128::ZERO, |a, (s, &(x, y))| a + w(s) * (x + alpha * y));
+        evals[0].0 += (comb[0] + acc) * w(&slots[0]).inv();
+        let forged = Proof {
+            zerocheck: zc_proof,
+            lincheck: LcProof {
+                rounds,
+                z_eval: g[0],
+                matrix_evals: evals,
+                grinding_nonces: nonces,
+            },
+        };
+
+        // The deferred replay plus the scalar check accepts, with claims
+        // that are true evaluations of the (non-satisfying) witness — which
+        // is the deferred contract: only the accumulator's discharge can
+        // catch this.
+        let mut ch_v = FsChallenger::new(b"poc");
+        let (claims, assertion) =
+            verify_deferred(&union, &forged, &mut ch_v).expect("deferred replay accepts");
+        assert!(
+            assertion.check_reported(&union).is_ok(),
+            "the report recombines"
+        );
+        assert_eq!(mle_eval(&h.z, &claims.c_point), claims.c_value);
+        assert_eq!(mle_eval(&h.z, &claims.lc_point), claims.lc_value);
+        // The matrix check catches it, and so does the composed verify.
+        assert_eq!(
+            assertion.check(&union),
+            Err(ElementUnionError::LincheckFinalFailed)
+        );
+        let mut ch_v = FsChallenger::new(b"poc");
+        assert_eq!(
+            verify(&union, &forged, &mut ch_v),
+            Err(ElementUnionError::LincheckFinalFailed)
+        );
+    }
+
+    /// The minimal consistent corruption: in characteristic 2,
+    /// `(v_A + α, v_B + 1)` leaves `v_A + α·v_B` unchanged, so it passes
+    /// `check_reported` — and must still fail `check` and `verify`.
+    #[test]
+    fn alpha_shifted_report_is_rejected() {
+        let mut rng = Rng::new(0xA1FA_5141);
+        for counts_elem in [vec![5usize], vec![6, 3]] {
+            let cases: Vec<Case> = if counts_elem.len() == 1 {
+                vec![mult_case(2)]
+            } else {
+                vec![mixed_case(&mut rng), mult_case(2)]
+            };
+            let h = build(vec![], &cases, 3, &counts_elem, &mut rng);
+            let union = UnionInstance::new(&h.registry, h.counts.clone());
+            let z_region = region(&union, &h.z).to_vec();
+            let pa = region(&union, &h.pa).to_vec();
+            let pb = region(&union, &h.pb).to_vec();
+            let mut ch_p = FsChallenger::new(b"element-alpha-shift");
+            let (proof, _) = prove(&union, &z_region, &pa, &pb, &mut ch_p);
+            let mut ch = FsChallenger::new(b"element-alpha-shift");
+            let (_, honest) = verify_deferred(&union, &proof, &mut ch).expect("honest");
+            assert_eq!(honest.check(&union), Ok(()), "honest report");
+
+            for t in 0..counts_elem.len() {
+                let mut bad = proof.clone();
+                bad.lincheck.matrix_evals[t].0 += honest.alpha;
+                bad.lincheck.matrix_evals[t].1 += F128::ONE;
+                let mut ch = FsChallenger::new(b"element-alpha-shift");
+                let (_, a) = verify_deferred(&union, &bad, &mut ch).expect("defers");
+                assert_eq!(a.alpha, honest.alpha, "alpha precedes the report");
+                assert!(a.check_reported(&union).is_ok(), "recombination unchanged");
+                assert_eq!(a.check(&union), Err(ElementUnionError::LincheckFinalFailed));
+                let mut ch = FsChallenger::new(b"element-alpha-shift");
+                assert_eq!(
+                    verify(&union, &bad, &mut ch),
+                    Err(ElementUnionError::LincheckFinalFailed),
+                    "counts {counts_elem:?}, slot {t}"
+                );
+            }
         }
     }
 

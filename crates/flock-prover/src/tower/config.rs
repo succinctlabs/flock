@@ -18,25 +18,18 @@ pub(super) fn pcs_batch_for(union: &UnionInstance, profile: LigeritoProfile) -> 
     embedded_initial_k_or_default(union.dense_m(), profile)
 }
 
-/// The two production recursion towers. The LEAF (the application's chain
-/// segment — the workload inner proof) proves under the rate-1/2 Fast twin
-/// of the tower's security level; the OUTERS (FL / internal / spine) prove
-/// under the Slim twin at the m* = 29 / nu* = 14 envelope, always ON.
+/// The production recursion tower. The LEAF (the application's chain
+/// segment — the workload inner proof) proves under the rate-1/2
+/// FastAffine profile; the OUTERS (FL / internal / spine) prove under
+/// SlimAffine at the m* = 29 / nu* = 14 envelope, always ON. Every inner
+/// opening is the affine F128 fold, so the walkers carry no F256 ladder.
 ///
-/// Fast leaf + Slim outers is deliberate. The leaf keeps the SAME tape
-/// structure as Fast (the FL/node tape walkers are level-blind), while its
-/// query count follows the tower's security level: a 100-bit recursion
-/// carries a 100-bit leaf (Fast100, 448q — a 128-bit leaf under a 100-bit
-/// recursion balloons the FL's replayed transcript past the arity-2
-/// envelope), and the 128-bit recursion carries the Fast leaf (rate 1/2,
-/// 16-bit query PoW; since 2026-11-06 on the +1/level ladder, m32 Σq 591,
-/// where the +2 ladder was 460).
+/// Fast leaf + Slim outers is deliberate: the leaf keeps the SAME tape
+/// structure as the outers (the FL/node tape walkers are level-blind) at
+/// the cheaper rate-1/2 commit.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TowerConfig {
-    /// The 100-bit tower: Fast100 leaf, Slim100 outers.
-    Chain100,
-    /// The 128-bit tower: Fast leaf, Slim outers on the aggressive rate
-    /// ladder.
+    /// The 128-bit tower: FastAffine leaf, SlimAffine outers.
     Chain128,
 }
 
@@ -44,29 +37,53 @@ impl TowerConfig {
     /// The chain leaf's WORKLOAD inner-proof profile (rate 1/2).
     pub fn leaf_profile(self) -> LigeritoProfile {
         match self {
-            TowerConfig::Chain100 => LigeritoProfile::Fast100,
-            TowerConfig::Chain128 => LigeritoProfile::Fast,
+            TowerConfig::Chain128 => LigeritoProfile::FastAffine,
         }
     }
     /// The recursion-path OUTER profile (rate 1/4, envelope-ON).
     pub fn outer_profile(self) -> LigeritoProfile {
         match self {
-            TowerConfig::Chain100 => LigeritoProfile::Slim100,
-            TowerConfig::Chain128 => LigeritoProfile::Slim,
+            TowerConfig::Chain128 => LigeritoProfile::SlimAffine,
         }
     }
 }
 
+/// Whether a tower build re-checks its own output. `Full` runs every
+/// prover-side self-check: the fold discharges, the fill-plan pin against
+/// the generic walk, the native checkers over the publics, the native
+/// chain re-hash, and the outer's self-verify. `Skip` drops them. The
+/// proof bytes are identical either way: no check feeds the proof.
+/// A skipped check only means a prover bug surfaces at the consumer's
+/// `verify_root` (or the root discharge) instead of at the build that
+/// caused it. Tests and benches run `Full`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SelfCheck {
+    Full,
+    Skip,
+}
+
+impl SelfCheck {
+    pub(super) fn on(self) -> bool {
+        self == SelfCheck::Full
+    }
+}
+
+/// The chain-leaf length the tower tests run at: 1024 blocks is the
+/// smallest leaf (`(Fast, log_n 17, initial_k 6)`, m = 24) with a
+/// certified affine ladder — at 256 blocks the affine fold bound has no
+/// valid certificate (`scripts/affine_fold_params.py`).
+#[cfg(test)]
+pub(super) const DEV_BLOCKS: usize = 1024;
+
 /// Bench/test knob: which production tower the ignored tower tests and
-/// benches exercise. `TOWER_CONFIG=chain100` selects [`TowerConfig::Chain100`];
-/// `TOWER_CONFIG=chain128`, or unset, the 128-bit production tower. Any other
-/// value is a typo and panics instead of silently selecting the default.
+/// benches exercise. `TOWER_CONFIG=chain128`, or unset, selects the one
+/// production tower; any other value is a typo and panics instead of
+/// silently selecting the default.
 #[cfg(test)]
 pub(super) fn test_config() -> TowerConfig {
     match var("TOWER_CONFIG").as_deref() {
-        Ok("chain100") => TowerConfig::Chain100,
         Ok("chain128") | Err(VarError::NotPresent) => TowerConfig::Chain128,
-        other => panic!("TOWER_CONFIG must be `chain100` or `chain128`, got {other:?}"),
+        other => panic!("TOWER_CONFIG must be `chain128`, got {other:?}"),
     }
 }
 

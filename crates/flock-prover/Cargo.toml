@@ -37,6 +37,18 @@ flock-core = { path = "../flock-core", features = ["unsound-challenger"] }
 flock-transcript = { workspace = true, features = ["unsound-challenger"] }
 
 [[bench]]
+name = "affine_fold_probe"
+harness = false
+
+[[bench]]
+name = "affine_vs_f256"
+harness = false
+
+[[bench]]
+name = "affine_l0_stats_probe"
+harness = false
+
+[[bench]]
 name = "leanxmss"
 harness = false
 

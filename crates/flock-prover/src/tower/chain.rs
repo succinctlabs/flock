@@ -6,7 +6,7 @@ use std::{
 use flock_core::{
     circuit::{
         Circuit, SigmaAssertion, WiringProof,
-        builder::{BuiltCircuit, CircuitShape, SlotId},
+        builder::{BuiltCircuit, CircuitShape, CircuitWitness, SlotId},
     },
     element_r1cs::union::Proof as ElementProof,
     lincheck::{LincheckCircuit, LincheckProof},
@@ -21,7 +21,7 @@ use {
     crate::{
         r1cs_hashes::blake3::{Compression, build_block_r1cs},
         tower::{
-            ChildSlots, ChildTape, PowMaskGate, SLOT_WORDS, check_child_region,
+            ChildSlots, ChildTape, DEV_BLOCKS, PowMaskGate, SLOT_WORDS, check_child_region,
             child_walker::child_pow_rows_hold, emit_child_region, expected_child_tail_schedule,
             gates_blake3::Rng, test_config,
         },
@@ -42,8 +42,9 @@ use crate::{
     r1cs_hashes::blake3::generate_witness_batch_major_partial,
     tower::{
         Blake3Gate, CHUNK_END, CHUNK_START, DOMAIN, F128, FsChallenger, HashKind, IV, Online,
-        PcsParams, ROOT, ShapeBuilder, TowerConfig, UnionInstance, UnionSlotProverInput, Wire,
-        chain_blake_r1cs, leaf_zerocheck_ag, pack_params, pack4, pack8, pcs_batch_for, steady_reps,
+        PcsParams, ROOT, SelfCheck, ShapeBuilder, TowerConfig, UnionInstance, UnionSlotProverInput,
+        Wire, chain_blake_r1cs, leaf_zerocheck_ag, pack_params, pack4, pack8, pcs_batch_for,
+        steady_reps,
     },
     verifier::{
         verify_ligerito_union_circuit, verify_ligerito_union_circuit_ag,
@@ -455,9 +456,108 @@ impl ChainProof {
 /// — the digest pin), the WALK is per-statement and is the chain compute
 /// itself, so it is reported apart from the proving phases.
 pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) -> ChainProof {
+    prove_chain_walk(cfg, SelfCheck::Full, walk_chain(h_start, n_blocks))
+}
+
+/// A walked chain segment: the circuit trace of `n_blocks` compressions from
+/// `h_start`, and the `h_end` it reaches (checked against the native chain).
+/// The walk is the chain's sequential compute; [`prove_chain_walk`] is the
+/// all-core part, so a driver can walk segment `j + 1` while it proves `j`.
+pub(super) struct ChainWalk {
+    cs: ChainShape,
+    witness: CircuitWitness,
+    h_start: [u32; 16],
+    pub(super) h_end: [u32; 16],
+    n_blocks: usize,
+    shape_ms: f64,
+    walk_ms: f64,
+}
+
+/// Walk one chain segment (single-threaded: the chain is sequential).
+pub(super) fn walk_chain(h_start: [u32; 16], n_blocks: usize) -> ChainWalk {
     let t_shape = Instant::now();
     let cs: ChainShape = chain_shape_cached(n_blocks).as_ref().clone();
     let shape_ms = t_shape.elapsed().as_secs_f64() * 1e3;
+    let t0 = Instant::now();
+    let witness = cs.shape.run(&chain_vals(&h_start), &[]);
+    let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
+    // The statement is bound end to end: publics[3..7] are h_start, the
+    // published tail is h_end, and h_end equals the native chain.
+    let h_end = native_chain(&h_start, n_blocks);
+    let public = &witness.public;
+    for j in 0..4 {
+        assert_eq!(
+            public[3 + j],
+            pack4(h_start[4 * j..4 * j + 4].try_into().unwrap()),
+            "public word {} is h_start[{}]",
+            3 + j,
+            j
+        );
+        assert_eq!(
+            public[public.len() - 4 + j],
+            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            "the published tail is the native h_end"
+        );
+    }
+    ChainWalk {
+        cs,
+        witness,
+        h_start,
+        h_end,
+        n_blocks,
+        shape_ms,
+        walk_ms,
+    }
+}
+
+/// The leaf's union and commitment parameters for a chain shape.
+fn leaf_pcs_params(cfg: TowerConfig, cs: &ChainShape) -> (UnionInstance<'_>, PcsParams) {
+    let union = UnionInstance::new(&cs.shape.registry, cs.shape.counts.clone());
+    assert!(!union.has_element(), "a chain proof is boolean-only");
+    let batch = pcs_batch_for(&union, cfg.leaf_profile());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        // The chain leaf's WORKLOAD inner: the tower's security level,
+        // rate 1/2 (a 100-bit recursion carries a 100-bit leaf). The
+        // batch is keyed by the SAME profile as the params — the old
+        // Fast-keyed batch only worked because the Fast twins share
+        // initial_k at these m's.
+        profile: cfg.leaf_profile(),
+        log_batch_size: batch,
+        num_lanes: union.commit_lanes(batch),
+        merkle_hash: HashKind::Blake3,
+    };
+    (union, pcs_params)
+}
+
+/// Panic early, before any walk, when `cfg`'s leaf profile has no
+/// registered ladder at a `blocks_per_leaf` leaf (the affine profiles
+/// register only certified shapes, `ligerito::affine::affine_ladder_for`).
+pub(super) fn assert_leaf_supported(cfg: TowerConfig, blocks_per_leaf: usize) {
+    let (_, pcs) = leaf_pcs_params(cfg, &chain_shape_cached(blocks_per_leaf));
+    if let Err(e) = pcs.ligerito_prover_config() {
+        panic!(
+            "no {:?} leaf at blocks_per_leaf = {blocks_per_leaf} (m = {}): {e}",
+            cfg.leaf_profile(),
+            pcs.m
+        );
+    }
+}
+
+/// Prove a walked segment: witgen, prove, and the deferred verify (its
+/// claims are what the FL folds). `checks` gates only the discharges of
+/// those claims against the native tables.
+pub(super) fn prove_chain_walk(cfg: TowerConfig, checks: SelfCheck, walk: ChainWalk) -> ChainProof {
+    let ChainWalk {
+        cs,
+        witness: walked,
+        h_start,
+        h_end,
+        n_blocks,
+        shape_ms,
+        walk_ms: walked_ms,
+    } = walk;
     let (nu, hash) = (cs.nu, cs.hash);
     let t_setup = Instant::now();
     let blake_r1cs = chain_blake_r1cs(nu);
@@ -466,29 +566,23 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
 
     // ONLINE, `1 + steady_reps()` iterations over the ONE shape: walk (the
     // chain compute itself), witgen, prove. Identical inputs, so every
-    // iteration's outputs match and the last one ships.
+    // iteration's outputs match and the last one ships. Iteration 0 takes
+    // the handed-in walk; the steady repeats re-walk inline so each one
+    // times the whole online span.
     let reps = 1 + steady_reps();
     let mut onlines: Vec<Online> = Vec::with_capacity(reps);
     let mut fin = None;
+    let mut walked = Some(walked);
     for _ in 0..reps {
         let t0 = Instant::now();
-        let witness = cs.shape.run(&chain_vals(&h_start), &[]);
-        let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
-        let union = UnionInstance::new(&cs.shape.registry, cs.shape.counts.clone());
-        assert!(!union.has_element(), "a chain proof is boolean-only");
-        let pcs_params = PcsParams {
-            m: union.dense_m(),
-            log_inv_rate: 1,
-            // The chain leaf's WORKLOAD inner: the tower's security level,
-            // rate 1/2 (a 100-bit recursion carries a 100-bit leaf). The
-            // batch is keyed by the SAME profile as the params — the old
-            // Fast-keyed batch only worked because the Fast twins share
-            // initial_k at these m's.
-            profile: cfg.leaf_profile(),
-            log_batch_size: pcs_batch_for(&union, cfg.leaf_profile()),
-            num_lanes: union.commit_lanes(pcs_batch_for(&union, cfg.leaf_profile())),
-            merkle_hash: HashKind::Blake3,
+        let (witness, walk_ms) = match walked.take() {
+            Some(w) => (w, walked_ms),
+            None => (
+                cs.shape.run(&chain_vals(&h_start), &[]),
+                t0.elapsed().as_secs_f64() * 1e3,
+            ),
         };
+        let (union, pcs_params) = leaf_pcs_params(cfg, &cs);
         let t1 = Instant::now();
         let wit = generate_witness_batch_major_partial(witness.rows::<Blake3Gate>(hash), nu);
         let witgen_ms = t1.elapsed().as_secs_f64() * 1e3;
@@ -526,7 +620,9 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
         // `t0` opened before the walk, so this is the whole online span in
         // ONE timer — the honest per-leaf number, against which the phase
         // sum is only a lower bound.
-        let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+        // The handed-in walk ran before `t0`; its time joins the span.
+        let pre_walk = if onlines.is_empty() { walked_ms } else { 0.0 };
+        let wall_ms = pre_walk + t0.elapsed().as_secs_f64() * 1e3;
         onlines.push(Online {
             setup_ms,
             walk_ms,
@@ -569,31 +665,14 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
         ),
     }
     .expect("the deferred verify accepts an honest chain proof");
-    work.boolean
-        .as_ref()
-        .expect("the b3 slot yields boolean matrix work")
-        .check(&union, &lcs)
-        .expect("the boolean matrix work discharges");
     assert!(work.element.is_none(), "no element class, no element work");
-    assert!(sigma.check(&built.shape.circuit), "sigma discharges");
-
-    // The statement is bound end to end: publics[3..7] are h_start, the
-    // published tail is h_end, and h_end equals the native chain.
-    let h_end = native_chain(&h_start, n_blocks);
-    let public = &built.witness.public;
-    for j in 0..4 {
-        assert_eq!(
-            public[3 + j],
-            pack4(h_start[4 * j..4 * j + 4].try_into().unwrap()),
-            "public word {} is h_start[{}]",
-            3 + j,
-            j
-        );
-        assert_eq!(
-            public[public.len() - 4 + j],
-            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
-            "the published tail is the native h_end"
-        );
+    if checks.on() {
+        work.boolean
+            .as_ref()
+            .expect("the b3 slot yields boolean matrix work")
+            .check(&union, &lcs)
+            .expect("the boolean matrix work discharges");
+        assert!(sigma.check(&built.shape.circuit), "sigma discharges");
     }
 
     ChainProof {
@@ -629,7 +708,7 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn chain_leaf_ag_roundtrip() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_00A6);
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
 
@@ -743,7 +822,7 @@ pub(super) fn chain_leaf_ag_roundtrip() {
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
     let cfg = test_config();
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let mut rng = Rng(0xC4A1_0002);
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
 
@@ -753,7 +832,11 @@ pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
     // h_start yields the same h_end.
     let cp = build_chain_proof(cfg, h_start, n_blocks);
     assert_eq!(cp.h_end, native_chain(&h_start, n_blocks));
-    assert_eq!(cp.inner.nu, 8);
+    assert_eq!(
+        cp.inner.nu,
+        n_blocks.trailing_zeros() as usize,
+        "the leaf is one block per row"
+    );
 
     // The tamper legs run on a fresh circuit build (the honest one's rows,
     // modified), against the PLAIN verifier so every check is in force.
@@ -886,7 +969,7 @@ pub(super) fn chain_tape_regions_pinned() {
     let cfg = test_config();
     let mut rng = Rng(0xC4A1_0003);
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
-    let n_blocks = 256usize;
+    let n_blocks = DEV_BLOCKS;
     let cp = build_chain_proof(cfg, h_start, n_blocks);
     let b3 = chain_blake_r1cs(cp.inner.nu);
     let ct = ChildTape::new(&cp.inner, DOMAIN, &[b3.csc_lincheck_circuit()]);
@@ -925,8 +1008,8 @@ pub(super) fn chain_tape_regions_pinned() {
         ct.mu_i,
         cp.inner.proof.wiring().gkr.layers.len(),
         ct.b3_rows,
-        ct.geo[0].lanes,
-        ct.geo[0].row_words,
+        ct.affine.geo[0].lanes,
+        ct.affine.geo[0].row_words,
     );
 }
 
@@ -937,7 +1020,7 @@ pub(super) fn chain_child_region_emits_alone() {
     let cfg = test_config();
     let mut rng = Rng(0xC4A1_0005);
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
-    let cp = build_chain_proof(cfg, h_start, 256);
+    let cp = build_chain_proof(cfg, h_start, DEV_BLOCKS);
     let b3 = chain_blake_r1cs(cp.inner.nu);
     let ct = ChildTape::new(&cp.inner, DOMAIN, &[b3.csc_lincheck_circuit()]);
     let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
@@ -994,7 +1077,7 @@ pub(super) fn chain_child_region_rejects_a_missed_leaf_grind() {
     let cfg = test_config();
     let mut rng = Rng(0xC4A1_0005);
     let h_start: [u32; 16] = from_fn(|_| rng.next_u32());
-    let cp = build_chain_proof(cfg, h_start, 256);
+    let cp = build_chain_proof(cfg, h_start, DEV_BLOCKS);
     let b3 = chain_blake_r1cs(cp.inner.nu);
     let mut ct = ChildTape::new(&cp.inner, DOMAIN, &[b3.csc_lincheck_circuit()]);
     let emit = |ct: &ChildTape<'_>| {

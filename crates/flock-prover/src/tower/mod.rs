@@ -1,11 +1,10 @@
 //! **The recursion tower**: chain leaves folded 2->1 up to a converging
-//! spine — the production chain100/chain128 pipeline.
+//! spine — the production chain128 pipeline.
 //!
-//! [`TowerConfig`] names the two production configurations: the LEAF (the
-//! application's BLAKE3 hash-chain segment) proves under the rate-1/2 Fast
-//! twin of the tower's security level, and every OUTER (FL / internal /
-//! spine) proves under the Slim twin at the m* = 29 / nu* = 14 envelope,
-//! always on. The pipeline is three builders:
+//! [`TowerConfig`] names the production configuration: the LEAF (the
+//! application's BLAKE3 hash-chain segment) proves under the rate-1/2
+//! FastAffine profile, and every OUTER (FL / internal / spine) proves under
+//! SlimAffine at the m* = 29 / nu* = 14 envelope, always on. The pipeline is three builders:
 //!
 //! - [`build_chain_proof`] — the LEAF: a Ligerito proof of one chain
 //!   segment (the workload).
@@ -23,8 +22,7 @@
 //! statement and [`Tower::root_bundle`]'s artifacts, and every table
 //! comes from a [`TowerVk`] derived from config.
 //!
-//! Bench knobs (`CHAIN_BLOCKS`, `BENCH_RUNS`, `TOWER_STEADY`, and the
-//! test-only `TOWER_CONFIG=chain100`) live in the `#[test]` harness; the
+//! Bench knobs (`CHAIN_BLOCKS`, `BENCH_RUNS`, `TOWER_STEADY`) live in the `#[test]` harness; the
 //! production geometry is typed, never env-var-driven.
 
 use flock_core::{
@@ -32,21 +30,26 @@ use flock_core::{
     matrix_fold::{MatrixClaim, Weight},
     pcs::{PcsParams, ligerito::LigeritoProfile},
 };
-use flock_field::{F128, F256};
+use flock_field::F128;
 use flock_merkle::HashKind;
 #[cfg(test)]
 use {
-    crate::tower::config::test_config, crate::tower::fl_node::chain_jagged_params,
+    crate::tower::config::{DEV_BLOCKS, test_config},
+    crate::tower::fl_node::chain_jagged_params,
     crate::tower::node::node_jagged_params,
 };
 
 pub use crate::tower::{
     chain::{ChainOnlineMs, ChainProof, build_chain_proof},
-    config::TowerConfig,
-    driver::{ChainStatement, RootDischargeFailure, Tower},
+    config::{SelfCheck, TowerConfig},
+    driver::{ChainStatement, RootDischargeFailure, Tower, TowerProver},
     fl_node::{FlNode, build_first_level_node, build_first_level_node_k},
-    node::{ChainLane, LaneFamily, MainBlock, NodeOut, SpineIn, build_node_outer_app},
+    node::{
+        ChainLane, LaneFamily, MainBlock, NodeOut, SpineIn, build_node_outer_app,
+        build_node_outer_with,
+    },
     query::LeafOuter,
+    setup::{ShapeSlot, TowerShapes},
     verify::{
         RootBundle, TowerVerifyError, TowerVk, TowerVkFingerprint, verify_root, verify_root_bytes,
     },
@@ -77,7 +80,7 @@ use crate::{
             KEY_HORNER_STEP, KEY_SQUARE_CHAIN, KEY_TRANSPOSE_DOT, declare_envelope_slots,
             env_acc_chain_base, env_acc_main_base, env_app_base, env_pass_base, envelope_shape,
             envelope_shape_with_lane, lane_block_words, outer_lanes, pad_envelope_counts,
-            slot_cached, span_count_word, steady_reps,
+            span_count_word, steady_reps,
         },
         fl_node::{FlApp, FlFamily, build_first_level_core, chain_blake_r1cs},
         fold_region::{
@@ -101,18 +104,15 @@ use crate::{
             BitSpreadGate, BitSpreadTable, FamilyTransposeTileGate, FamilyTransposeTileTable,
             PowMaskGate, PowMaskTable, SwapGate, SwapTable,
         },
-        gates_leaf::{LeafEvalGate, LeafEvalGate256, build_mac256},
+        gates_leaf::LeafEvalGate,
         gates_spine::{
-            AssistLayerGate, HornerStepGate, MacGate, MacGate256, MergedRoundGate, PrefixGate,
-            PrefixGate256, ResidualAccGate256, ResidualPrefix3Gate256, ResidualWeightsGate256,
-            SpineGate, SpineGate256, SquareChainGate, TransposeDotGate, ZcRoundGate, emit_mac256,
-            emit_spine256, live_element_input_from_rows,
+            AssistLayerGate, HornerStepGate, MacGate, MergedRoundGate, PrefixGate,
+            ResidualWeightsGate, SpineGate, SquareChainGate, TransposeDotGate, ZcRoundGate,
+            live_element_input_from_rows,
         },
         geometry::{
             CollapsedSlots, Lvl, balance_extra_rows, cap_payloads, cap_wires, emit_publics_hash,
-            level_geometry, level_query_phase_blake3_rows, level_sources, level_zero_ood_z_index,
-            observed_f256, payload_words, query_phase_blake3_rows, replay_ligerito_spine256,
-            strat_scheds,
+            level_query_phase_blake3_rows, payload_words, query_phase_blake3_rows, strat_scheds,
         },
         gkr::{
             BusRec, ElPiopRec, GkrLayerRec, GkrRec, assertion_mac, circuit_structure_claim_wires,
@@ -121,21 +121,22 @@ use crate::{
             emit_recombination, pin_bus_sides, pin_recombination, recombination_positions,
         },
         online::Online,
-        query::{
-            check_residual_publics, emit_pow_checks, emit_query_phase, emit_recorded_pow_checks,
-            emit_residual_region, leaf_boolean_lcs, leaf_boolean_mats,
-        },
+        query::{emit_pow_checks, emit_recorded_pow_checks, leaf_boolean_lcs, leaf_boolean_mats},
         real_walker::{
             RealRegion, RealTape, check_real_child_region, emit_family_h, emit_real_child_region,
             expected_real_tail_schedule,
         },
-        tape::{
-            InnerPd, MpRec, OpenLevel, PdRec, PiopRec, RoundRec, parse_open_levels,
-            squeeze_word_wire,
-        },
+        tape::{MpRec, PdRec, PiopRec, RoundRec, squeeze_word_wire},
     },
     union::UnionInstance,
 };
+#[cfg(test)]
+mod affine_fixture;
+mod affine_fold;
+mod affine_gates;
+mod affine_query;
+mod affine_residual;
+mod affine_walk;
 mod chain;
 mod child_walker;
 mod config;
@@ -156,6 +157,7 @@ mod node;
 mod online;
 mod query;
 mod real_walker;
+mod setup;
 mod tape;
 mod verify;
 mod walker_common;

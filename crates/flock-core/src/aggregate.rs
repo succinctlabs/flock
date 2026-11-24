@@ -60,7 +60,7 @@ use crate::{
     },
     field::F128,
     lincheck::{LincheckCircuit, LincheckError, MatrixAssertion},
-    matrix_fold::{self, FoldProof, MatrixClaim, bilinear},
+    matrix_fold::{self, FoldProof, MatrixClaim, Weight, bilinear},
     pcs::jagged::JaggedParams,
     r1cs::SparseBinaryMatrix,
     schedule::Registry,
@@ -687,32 +687,31 @@ fn prove_aggregate_impl<Ch: Challenger>(
         } else {
             0
         };
-        // The k·nnz work. ONE `fold_split` per claim yields the column
-        // marginals for BOTH matrices, so the A- and B-folds share it — and
-        // it runs on the type's tuned kernel rather than a generic sparse
-        // walk. Claims share their row weight (A and B are reported at the
-        // same point), so `ca` and `cb` agree here row-wise.
-        let n_cols = 1usize << registry.boolean_types()[t].k_log;
-        let mut combs_a = Vec::with_capacity(ca.len());
-        let mut combs_b = Vec::with_capacity(cb.len());
-        for (qa, qb) in ca.iter().zip(&cb) {
-            let (xa, xb) = if qa.row == qb.row {
-                // The tuned kernel folds the whole block: clearing the
-                // dropped rows' weights gives the kept block's marginals.
-                let mut row = qa.row.materialize();
-                for &w in dropped_rows {
-                    row[128 * w..128 * (w + 1)].fill(F128::ZERO);
-                }
-                circuits[t].fold_split(&row)
-            } else {
-                (
-                    col_marginal(ma, &qa.row.materialize(), n_cols),
-                    col_marginal(mb, &qb.row.materialize(), n_cols),
-                )
-            };
-            combs_a.push(xa);
-            combs_b.push(xb);
-        }
+        // The k·nnz work: every claim's column marginals of A AND B, in ONE
+        // walk over the matrices on the type's tuned kernel
+        // (`fold_split_many`), so the A- and B-folds share it. A fresh
+        // claim reports A and B at one point and shares a row weight; a
+        // folded prior carries one weight per matrix. The kernel folds the
+        // whole block: clearing the dropped rows' weights gives the kept
+        // block's marginals.
+        let weight = |row: &Weight| {
+            let mut w = row.materialize();
+            for &d in dropped_rows {
+                w[128 * d..128 * (d + 1)].fill(F128::ZERO);
+            }
+            w
+        };
+        let rows: Vec<(Vec<F128>, Option<Vec<F128>>)> = ca
+            .iter()
+            .zip(&cb)
+            .map(|(qa, qb)| (weight(&qa.row), (qa.row != qb.row).then(|| weight(&qb.row))))
+            .collect();
+        let ws: Vec<(&[F128], &[F128])> = rows
+            .iter()
+            .map(|(wa, wb)| (wa.as_slice(), wb.as_deref().unwrap_or(wa)))
+            .collect();
+        let (combs_a, combs_b): (Vec<Vec<F128>>, Vec<Vec<F128>>) =
+            circuits[t].fold_split_many(&ws).into_iter().unzip();
         let (pa, out_a) = prove_fold_bound_with_grinding(ma, &combs_a, &ca, n_bound, grinding, ch);
         let (pb, out_b) = prove_fold_bound_with_grinding(mb, &combs_b, &cb, n_bound, grinding, ch);
         folds.push((pa, pb));

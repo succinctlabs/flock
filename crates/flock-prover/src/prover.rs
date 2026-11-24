@@ -62,8 +62,8 @@ use pcs::{
     ring_switch::s_hat_v_from_z_vec,
 };
 use rayon::{
+    iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator},
     join,
-    prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator},
 };
 use zerocheck::{PaddingSpec, ZerocheckProof, prove_packed_padded_capture_s_hat_v_c_with_grinding};
 #[cfg(target_arch = "aarch64")]
@@ -486,13 +486,17 @@ fn build_union_witness(
     // same pay-per-live discipline the boolean side's run-lists apply. Gated
     // by the zerocheck's OWN predicate so the two cannot drift.
     let elem_live = union.has_element() && dead_rows_unread(union);
-    // Slots are disjoint blocks of the buffers, so their drivers run
-    // concurrently: a registry of many small slots would otherwise leave
-    // most cores idle while each small driver runs.
-    let stripes = union
+    let counts = union.counts();
+    // The slot blocks are disjoint borrows of the three buffers, so the slots
+    // generate concurrently; the many small element slots then hide behind
+    // the large boolean ones instead of queueing behind them.
+    let slots: Vec<_> = union
         .slot_dests(&mut z, &mut a, &mut b, elide, dead_padding_unread)
         .into_par_iter()
         .zip(sources)
+        .collect();
+    let stripes = slots
+        .into_par_iter()
         .enumerate()
         .map(|(i, (dst, source))| match source {
             UnionSlotWitnessSource::InPlace(generate) => generate(dst),
@@ -506,7 +510,7 @@ fn build_union_witness(
                 z_lincheck
             }
             UnionSlotWitnessSource::Element { ty, generate } => {
-                let live = elem_live.then(|| union.counts()[i]);
+                let live = elem_live.then(|| counts[i]);
                 fill_slot(&ty, nu, live, dst.z, dst.a, dst.b, generate);
                 Vec::new()
             }
