@@ -520,9 +520,19 @@ pub fn prove_fold_bound_with_grinding<Ch: Challenger>(
     );
     let eq_col = Weight::eq(rho_col.clone()).materialize();
     let h = m.row_marginal(&eq_col, 1usize << k_row);
-    let mut w_mu = vec![F128::ZERO; 1usize << k_row];
+    // Claims that share a row weight combine their μ first, so each
+    // distinct weight materializes once: the sigma group's ~120 claims
+    // read a handful of row points (12 ms of 2^15-entry weights otherwise).
+    let mut distinct: Vec<(&Weight, F128)> = Vec::new();
     for (claim, &mu) in claims.iter().zip(&mus) {
-        let w = claim.row.materialize();
+        match distinct.iter_mut().find(|(row, _)| **row == claim.row) {
+            Some((_, sum)) => *sum += mu,
+            None => distinct.push((&claim.row, mu)),
+        }
+    }
+    let mut w_mu = vec![F128::ZERO; 1usize << k_row];
+    for (row, mu) in distinct {
+        let w = row.materialize();
         if w_mu.len() >= FOLD_PAR_THRESHOLD {
             w_mu.par_iter_mut()
                 .zip(w.par_iter())

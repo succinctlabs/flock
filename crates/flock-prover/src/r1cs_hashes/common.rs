@@ -284,6 +284,7 @@ pub(crate) fn build_block_r1cs_with_matrices(
         const_pin,
         digest_cache: OnceLock::new(),
         csc_cache: OnceLock::new(),
+        walk: None,
     }
 }
 

@@ -30,6 +30,7 @@ use rayon::{
 
 use crate::{
     bits::transpose_8_u64s_to_64_bytes,
+    circuit::boolean::WalkPlan,
     field::F128,
     lincheck::{CscCircuit, QuirkyPoint, SkipPoint, SparseMatrixCircuit},
     zerocheck::PaddingSpec,
@@ -170,6 +171,10 @@ pub struct BlockR1cs {
     /// stale-cache caveat as [`Self::digest_cache`].
     #[doc(hidden)]
     pub csc_cache: OnceLock<CscCircuit>,
+    /// The relation's structural walk, when it was lowered from a circuit
+    /// ([`Self::with_walk`]). The lincheck circuit's marginals take it
+    /// instead of the materialized nonzeros.
+    pub walk: Option<Arc<WalkPlan>>,
 }
 
 // Manual Clone — std::sync::OnceLock doesn't derive Clone, and a fresh cache
@@ -188,6 +193,7 @@ impl Clone for BlockR1cs {
             const_pin: self.const_pin,
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: self.walk.clone(),
         }
     }
 }
@@ -237,10 +243,37 @@ impl BlockR1cs {
     /// over the nonzeros) out of the prove path. NOT meaningful for setups
     /// whose `BlockR1cs` carries empty matrix stubs (the tower's stub gates) — those
     /// must keep their circuit walkers.
+    ///
+    /// A relation that carries its walk ([`Self::with_walk`]) gets a circuit
+    /// whose marginals walk it, and builds no CSC arrays.
     pub fn csc_lincheck_circuit(&self) -> &CscCircuit {
         self.csc_cache.get_or_init(|| {
-            CscCircuit::from_matrices(&self.a_0, &self.b_0).with_const_pin(self.const_pin)
+            match &self.walk {
+                Some(walk) => CscCircuit::from_walk(walk.clone(), self.k()),
+                None => CscCircuit::from_matrices(&self.a_0, &self.b_0),
+            }
+            .with_const_pin(self.const_pin)
         })
+    }
+
+    /// Attach the structural walk that reproduces `a_0`/`b_0` — the plan this
+    /// relation was lowered with, or one relabeled onto its layout
+    /// ([`WalkPlan::relabeled`]). The lincheck marginals then walk it. The
+    /// walk is not checked against the matrices here (that is one pass over
+    /// every nonzero); its builders test the equality.
+    pub fn with_walk(mut self, walk: Arc<WalkPlan>) -> Self {
+        assert!(
+            walk.useful_bits() <= self.k(),
+            "the walk's layout ({} bits) must fit the block ({} bits)",
+            walk.useful_bits(),
+            self.k()
+        );
+        assert!(
+            self.csc_cache.get().is_none(),
+            "attach the walk before the lincheck circuit is built"
+        );
+        self.walk = Some(walk);
+        self
     }
 
     /// Apply `A = I_{2^n_log} ⊗ A_0` to a Boolean witness `z`. Returns
@@ -946,6 +979,7 @@ mod tests {
             const_pin: None,
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: None,
         };
         for seed in 0..4 {
             let z: Vec<bool> = (0..(1 << m)).map(|i| ((i ^ seed) & 1) == 1).collect();
@@ -971,6 +1005,7 @@ mod tests {
             const_pin: None,
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: None,
         };
         let z_zero = vec![false; 1 << m];
         assert!(r1cs.satisfies(&z_zero));
@@ -998,6 +1033,7 @@ mod tests {
             const_pin: None,
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: None,
         };
         let d0 = base.statement_digest();
 

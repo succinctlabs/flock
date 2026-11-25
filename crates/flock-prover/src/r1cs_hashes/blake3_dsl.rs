@@ -120,7 +120,7 @@ pub fn blake3_relation_projection(n_blocks_log: usize) -> Arc<BlockR1cs> {
     })
 }
 
-fn build_blake3_circuit() -> Blake3DslCircuit {
+pub(crate) fn build_blake3_circuit() -> Blake3DslCircuit {
     let compiled = CircuitBuilder::compile(Blake3Schema, eval::eval);
     let layout = compiled
         .circuit()

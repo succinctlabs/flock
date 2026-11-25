@@ -103,7 +103,7 @@ pub fn sha256_relation_projection(n_blocks_log: usize) -> Arc<BlockR1cs> {
     })
 }
 
-fn build_sha256_circuit() -> Sha256DslCircuit {
+pub(crate) fn build_sha256_circuit() -> Sha256DslCircuit {
     let compiled = CircuitBuilder::compile(Sha256Schema, eval::eval);
     let layout = compiled
         .circuit()

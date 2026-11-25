@@ -116,6 +116,7 @@ impl RelationRef<'_> {
             const_pin: Some(layout.value_positions[self.one.index]),
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: None,
         })
     }
 

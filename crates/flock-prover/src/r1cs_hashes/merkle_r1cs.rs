@@ -511,6 +511,7 @@ impl MerkleTreeLayout {
             const_pin: Some(self.const_pos()),
             digest_cache: OnceLock::new(),
             csc_cache: OnceLock::new(),
+            walk: None,
         }
     }
 

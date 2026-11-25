@@ -96,9 +96,15 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use std::{array::from_fn, mem::take, slice::from_raw_parts_mut, sync::OnceLock};
+use std::{
+    array::from_fn,
+    mem::take,
+    slice::from_raw_parts_mut,
+    sync::{Arc, OnceLock},
+};
 
 use flock_core::{
+    circuit::boolean::WalkPlan,
     lincheck::LincheckCircuit,
     pcs::{
         Commitment, PcsParams,
@@ -794,8 +800,36 @@ fn shared_matrices() -> &'static (SparseBinaryMatrix, SparseBinaryMatrix) {
     MATRICES.get_or_init(build_matrices)
 }
 
+/// The structural walk of THIS layout: the DSL twin's walk
+/// ([`super::blake3_dsl`]) relabeled onto it, built once per process.
+///
+/// The two are one circuit. The DSL puts its I/O words at its own aligned
+/// offsets and the constant one first. The map comes from matching values
+/// ([`super::dsl::relabel_onto`]); `layout_walk_reproduces_matrices` checks
+/// the result against [`build_matrices`].
+pub fn layout_walk() -> Arc<WalkPlan> {
+    static WALK: OnceLock<Arc<WalkPlan>> = OnceLock::new();
+    WALK.get_or_init(|| {
+        let plan = super::blake3_dsl::build_blake3_circuit().walk_plan();
+        let walk = super::dsl::relabel_onto(&plan, USEFUL_BITS, |rng| {
+            let cv: [u32; 8] = from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = from_fn(|_| rng.next_u32());
+            let (counter, block_len, flags) = (rng.next_u64(), rng.next_u32(), rng.next_u32());
+            let mut zab = [(); 3].map(|_| vec![0u64; K / 64]);
+            let [z, a, b] = &mut zab;
+            build_block_witness_ab_packed_into(&cv, &m, counter, block_len, flags, z, a, b);
+            let params = [counter as u32, (counter >> 32) as u32, block_len, flags];
+            ([cv.as_slice(), &m, &params].concat(), zab)
+        })
+        .expect("the BLAKE3 DSL twin is this circuit");
+        Arc::new(walk)
+    })
+    .clone()
+}
+
 /// Build a [`BlockR1cs`] batching `2^n_blocks_log` independent BLAKE3
 /// compressions. `n_blocks_log ≥ 3` is required (lincheck needs `n_outer ≥ 8`).
+/// It carries [`layout_walk`], so its lincheck marginals walk the circuit.
 pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
     let (a_0, b_0) = shared_matrices().clone();
     build_block_r1cs_with_matrices(
@@ -809,6 +843,7 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
         // in every block. Requires padding blocks filled with valid compressions.
         Some(Z_CONST_POS),
     )
+    .with_walk(layout_walk())
 }
 
 // ---------------------------------------------------------------------------
@@ -3186,6 +3221,43 @@ mod tests {
         let csc = CscCircuit::from_matrices(&a_0, &b_0);
         let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
         assert_eq!(expected, got_csc, "CSC fold mismatch");
+    }
+
+    /// [`layout_walk`], the DSL twin's walk relabeled onto this layout,
+    /// reproduces [`build_matrices`] in both directions. One random weight
+    /// per side pins each matrix (a wrong entry survives a random F128
+    /// linear form with probability 2^-128), and the forward row marginals
+    /// at a random vector pin them again. The relation's lincheck circuit
+    /// walks it and keeps the constant pin.
+    #[test]
+    fn layout_walk_reproduces_matrices() {
+        use flock_core::{lincheck::MatrixSide, matrix_fold::FoldMatrix};
+        let mut rng = Rng::new(0xB1A3_3A1C);
+        let (a_0, b_0) = build_matrices();
+        let walk = super::layout_walk();
+        let [u_a, u_b, v] = [(); 3].map(|_| rng.f128_vec(K));
+        assert_eq!(
+            walk.transpose_ab(&u_a, &u_b).unwrap(),
+            (
+                FoldMatrix::col_marginal(&a_0, &u_a, K),
+                FoldMatrix::col_marginal(&b_0, &u_b, K)
+            )
+        );
+        assert_eq!(
+            walk.apply_ab(&v).unwrap(),
+            (
+                FoldMatrix::row_marginal(&a_0, &v, K),
+                FoldMatrix::row_marginal(&b_0, &v, K)
+            )
+        );
+        let r1cs = build_block_r1cs(3);
+        let lc = r1cs.csc_lincheck_circuit();
+        assert!(lc.walks());
+        assert_eq!(lc.const_pin_col(), Some(Z_CONST_POS));
+        assert_eq!(
+            lc.row_marginal(MatrixSide::B, &v),
+            Some(FoldMatrix::row_marginal(&b_0, &v, K))
+        );
     }
 
     /// to `pack_z_lincheck_from_packed(z)`.
