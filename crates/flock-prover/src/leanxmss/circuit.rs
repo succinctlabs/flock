@@ -437,7 +437,12 @@ fn layout_cost(kinds: &[(usize, usize)], nu: usize) -> f64 {
         columns += slots * (1u64 << k_log.saturating_sub(LOG_PACKING)) as f64;
     }
     let dense = COMMITTED_FRACTION * bits / (1u64 << LOG_PACKING) as f64;
-    let m_words = (dense.log2().ceil() as usize).max(1);
+    // ⌈log2(dense)⌉ without `f64::log2`: the verifier re-runs this planner, and
+    // `log2` comes from the platform's libm, which need not round the same
+    // way everywhere. Rounding `dense` up first gives the same exponent
+    // (`2^m ≥ x` iff `2^m ≥ ⌈x⌉`), and the IEEE arithmetic above rounds the
+    // same on every platform.
+    let m_words = ((dense.ceil() as u64).next_power_of_two().trailing_zeros() as usize).max(1);
     let ligerito = (10.4e-6 * (1u64 << m_words) as f64).max(75.0);
     0.39 * bits / 1e6 + 0.124 * columns + ligerito
 }

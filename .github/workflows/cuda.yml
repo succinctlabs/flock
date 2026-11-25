@@ -9,8 +9,13 @@
 #     box with labels [self-hosted, gpu, blackwell]; it needs CUDA >= 12.8 and
 #     stable Rust (the oracles come from the Rust dump_* bins).
 #
-# Push-only trigger (no pull_request): standard precaution for self-hosted
-# runners, and the branch is the integration point anyway.
+# The test leg is off unless the repository variable BLACKWELL_RUNNER is
+# "true" (Settings > Secrets and variables > Actions > Variables). No runner
+# has picked up [self-hosted, gpu, blackwell] since 2026-08-26, and without
+# one the job sat queued on every PR until it was cancelled or timed out.
+# Set the variable once a Blackwell runner is registered again.
+#
+# Both legs run on pull_request and on workflow_dispatch.
 
 name: CUDA
 
@@ -54,6 +59,8 @@ jobs:
 
   test:
     name: Run CUDA tests (Blackwell GPU)
+    # Skipped, not queued, while no Blackwell runner exists; see the header.
+    if: vars.BLACKWELL_RUNNER == 'true'
     runs-on: [self-hosted, gpu, blackwell]
     steps:
       - name: Checkout sources
